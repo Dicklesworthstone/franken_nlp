@@ -96,3 +96,5 @@ fn reconstruction_checks_the_final_identity_full_work_source_and_factory_schedul
     let changed = first.with_chunk_cohorts().unwrap();
     assert!(changed.owns(&prepared).is_err());
 }
+
+mod compact;

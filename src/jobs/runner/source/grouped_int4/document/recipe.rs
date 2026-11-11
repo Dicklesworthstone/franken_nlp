@@ -22,6 +22,8 @@ pub struct Int4SourceDocumentJobRecipe {
     chunk_cohorts: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hierarchy_cohorts: Option<HierarchyCohortsRecipe>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<native_document::encoding::EncodingRecipe>,
 }
 #[derive(Serialize)]
 struct HierarchyCohortsRecipe { execution: &'static str, max_groups: usize }
@@ -38,11 +40,16 @@ impl Int4SourceDocumentJobRecipe {
             source, mapping: MappingRecipe { chunks, reduction, max_model_work,
                 max_trie_node_visits, checkpoint_interval_nodes, mask_visits_per_chunk,
                 max_mask_visits, verification }, task, lifetime, max_attempts,
-                chunk_cohorts: None, hierarchy_cohorts: None };
+                chunk_cohorts: None, hierarchy_cohorts: None, input_encoding: None };
         // Question bytes, options and every nested limit stay in this private
         // projection. Only JobRunner's per-job keyed commitment is persisted.
         bounded_json(&recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
         Ok(recipe)
+    }
+    pub(super) fn set_document_encoding(&mut self, planner: &SourceTaskPlanner) -> Result<(), BatchFault> {
+        self.input_encoding = native_document::encoding::recipe(planner)?;
+        bounded_json(self, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
+        Ok(())
     }
     pub(super) fn enable_chunk_cohorts(&mut self) -> Result<(), BatchFault> {
         self.chunk_cohorts = Some("native-document-chunk-cohorts-v1");

@@ -14,7 +14,7 @@ use crate::{
         hierarchy::Int4HierarchyCohortSchedule},
 };
 pub(in crate::hosted::grouped_int4) mod admission;
-use admission::DocumentAdmission;
+use admission::{check_encoding_preparation, DocumentAdmission};
 
 /// Simultaneous invocation reservations, excluding resident model weights,
 /// global runtime/preparation and RunLimits.cleanup_reserve_bytes. A pure quote
@@ -165,6 +165,8 @@ impl NlpEngine {
         if planner.group_width() != model.model_identity().group_width() { return Err(HostedError::ModelIdentity); }
         constrained_int4::check_model(planner.execution_identity(), model.model_identity())
             .map_err(|_| HostedError::ModelIdentity)?;
+        check_encoding_preparation(planner.encoding_workspace_bytes().map_err(HostedError::BatchSetup)?,
+            limits.preparation_reserve_bytes)?;
         let mapping = planner.document_limits();
         let required = int4_source_document_corpus_requirements(planner.group_width(), planner.task(),
             planner.task_budget(), planner.planning_limits(), mapping, planner.run_limits(), limits,
@@ -192,7 +194,7 @@ impl NlpEngine {
             checkpoint(control)?;
             let (planner, vocabulary) = input.value.preparation.take().ok_or(HostedError::CompletionMissing)?;
             let admission = DocumentAdmission { lease: &lease, model: model.model_identity(),
-                task_spec: &planner.execution_identity().task_spec,
+                base: planner.execution_identity(),
                 kv_bytes: required.native.kv_bytes, mapping, result_bytes, output_tokens };
             let result = if let Some(quote) = required.cohort {
                 let decoder = decoder.ok_or(HostedError::CompletionMissing)?;

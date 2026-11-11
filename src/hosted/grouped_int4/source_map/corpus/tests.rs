@@ -206,3 +206,43 @@ fn hierarchy_admission_keeps_all_pass_masks_and_transcript_tokens_through_delive
     send::<Charged<QuestionStreamInput<Cursor<Vec<u8>>, Vec<u8>>>>();
     let _host = NlpEngine::batch_int4_question_documents::<Cursor<Vec<u8>>, Vec<u8>>;
 }
+
+#[test]
+fn per_record_compact_qa_workspace_is_reserved_once_for_serial_and_chunk_cohorts() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding};
+    let call = SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 4096,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
+    let complete = SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 };
+    for chunks in [None, Some(1), Some(3)] {
+        let mut config = config(32, false);
+        config.mapping.reduction.map_batch_chunks = chunks.unwrap_or(1);
+        let (source_planner, _) = super::super::tests::fixture(SourceMapTask::Summarize(Default::default()), 32);
+        let mut id = identity(32);
+        id.tokenizer_digest = source_planner.tokenizer_digest();
+        id.template_digest = *source_planner.template_digest();
+        let compiler = Int4QuestionDocumentBatchPlanner::for_planning_fixture(
+            Arc::new(source_planner), id, 32, config).unwrap();
+        let compiler = if chunks.is_some() { compiler.with_chunk_cohorts().unwrap() } else { compiler };
+        assert_eq!(compiler.encoding_workspace_bytes().unwrap(), 0);
+        let mut host = limits();
+        let original_preparation = host.preparation_reserve_bytes;
+        let original = int4_question_document_corpus_requirements(32, config, host, 1 << 20, chunks, None).unwrap();
+        let compiler = compiler.with_map_document_encoding(UntrustedEncoding::SafeBpeV1(call), complete).unwrap();
+        let bytes = compiler.encoding_workspace_bytes().unwrap();
+        assert_eq!(bytes, call.requirements().unwrap().workspace_bytes + 512);
+        assert_eq!(compiler.map_document_encoding_limits(), Some(complete));
+        host.preparation_reserve_bytes = bytes;
+        check_encoding_preparation(bytes, host.preparation_reserve_bytes).unwrap();
+        let exact = int4_question_document_corpus_requirements(32, config, host, 1 << 20, chunks, None).unwrap();
+        assert_eq!(exact.input_bytes - bytes, original.input_bytes - original_preparation);
+        assert_eq!(exact.native, original.native);
+        assert_eq!(exact.workspace_bytes, original.workspace_bytes);
+        assert_eq!(exact.document_workspace_bytes, original.document_workspace_bytes);
+        assert_eq!(exact.output_reservation_bytes, original.output_reservation_bytes);
+        host.preparation_reserve_bytes -= 1;
+        assert!(check_encoding_preparation(bytes, host.preparation_reserve_bytes).is_err());
+        let short = int4_question_document_corpus_requirements(32, config, host, 1 << 20, chunks, None).unwrap();
+        assert_eq!(exact.input_bytes - short.input_bytes, 1);
+    }
+}

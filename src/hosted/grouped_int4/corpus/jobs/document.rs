@@ -4,7 +4,7 @@ use super::*;
 use super::document_native::DocumentNative;
 use crate::{
     hosted::grouped_int4::source_map::{workspace::document_bytes,
-        documents::admission::{DocumentAdmission, work_fits}},
+        documents::admission::{check_encoding_preparation, DocumentAdmission, work_fits}},
     jobs::runner::source::grouped_int4::document::{
         Int4SourceDocumentJobPlanner, Int4SourceDocumentJobProcessor, Int4SourceDocumentTask,
     },
@@ -72,6 +72,8 @@ impl NlpEngine {
         constrained_int4::check_model(planner.execution_identity(), model.model_identity())
             .map_err(|_| HostedError::ModelIdentity)?;
         planner.check_job_limits(request.limits).map_err(HostedError::BatchSetup)?;
+        check_encoding_preparation(planner.encoding_workspace_bytes().map_err(HostedError::BatchSetup)?,
+            limits.preparation_reserve_bytes)?;
         let mapping = planner.document_limits();
         let result_bytes = planner.max_result_bytes();
         let output_tokens = planner.output_token_ceiling().map_err(HostedError::BatchSetup)?;
@@ -124,7 +126,7 @@ impl NlpEngine {
                 required.native, kernel, kv, scratch, cohort)?;
             let admission = DocumentAdmission {
                 lease: &lease, model: model.model_identity(),
-                task_spec: &planner.execution_identity().task_spec,
+                base: planner.execution_identity(),
                 kv_bytes: required.native.kv_bytes, mapping, result_bytes, output_tokens,
             };
             let result = (|| {

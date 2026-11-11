@@ -57,6 +57,10 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let identity = source::identity(model.model_identity(), &source, BuiltInTask::Answer)?;
     let factory = Int4QuestionDocumentBatchPlanner::for_model(model.model_identity(), Arc::new(source),
         identity, limits.config).map_err(|fault| host_failure(HostedJobError::Host(HostedError::BatchSetup(fault))))?;
+    let factory = if let Some(encoding) = limits.encoding {
+        factory.with_map_document_encoding(encoding.policy(), encoding.complete).map_err(|fault| host_failure(
+            HostedJobError::Job(crate::jobs::runner::JobRunError::Processor(fault))))?
+    } else { factory };
     let factory = if job.questions.cohort_chunks.is_some() {
         factory.with_chunk_cohorts().map_err(|fault| host_failure(
             HostedJobError::Job(crate::jobs::runner::JobRunError::Processor(fault))))?
@@ -104,6 +108,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         quant_recipe: &identity.quant_recipe, group_width: model.model_identity().group_width(),
         integer_kernel: common.kernel.kind().id(), snapshot, cohort_chunks: job.questions.cohort_chunks,
         cohort_hierarchy_groups: job.questions.cohort_hierarchy_groups, output: &report };
+    let response = encoding::population_response(response, limits.encoding);
     publish_report(&response, output, &remaining)
 }
 

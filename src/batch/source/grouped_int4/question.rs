@@ -22,12 +22,14 @@ use crate::{
                         hierarchy::{Int4QuestionHierarchyPreflight, Int4QuestionHierarchyRun,
                             PreparedInt4QuestionHierarchy, QuestionHierarchyLimits}}}}}}},
     validation::grounded_fields::GroundingBudget,
+    tokenizer::untrusted::{SafeBpeWorkLimits, UntrustedEncoding},
 };
 mod planning;
 mod backend;
 pub mod memory;
 use planning::{Expected, NativePlan};
 use backend::Backend;
+use super::document::encoding;
 
 /// Frozen, reconstructed and admitted identities for every possible native row.
 pub const QUESTION_DOCUMENT_CHUNK_METADATA_BYTES: u64 = 32_768;
@@ -148,6 +150,32 @@ impl Int4QuestionDocumentBatchPlanner {
         Ok(Self { planner, identity, group_width, config, chunk_cohorts: false,
             hierarchy_groups: None, owner: Arc::new(()) })
     }
+    /// Explicit compact policy for each original source/question pair. The
+    /// operation retained by preparation also pays for execution reconstruction.
+    /// Evidence synthesis and hierarchy remain byte-only.
+    pub fn with_map_document_encoding(mut self, policy: UntrustedEncoding, complete: SafeBpeWorkLimits)
+        -> Result<Self, BatchFault> {
+        if self.config.synthesis.is_some() || self.config.hierarchy.is_some() {
+            return Err(BatchCode::InvalidLimits.into());
+        }
+        let planner = encoding::configure(&self.planner, policy, complete)?;
+        let mut identity = self.identity.clone(); identity.template_digest = *planner.template_digest();
+        super::check_configuration_with_document_encoding(&planner, &identity,
+            self.config.budget, self.config.planning, None, self.group_width)?;
+        check_identity_size(&identity)?;
+        self.planner = planner; self.identity = identity; self.owner = Arc::new(());
+        Ok(self)
+    }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.planner.document_encoding() }
+    pub fn map_document_encoding_limits(&self) -> Option<SafeBpeWorkLimits> {
+        self.planner.map_document_encoding_limits()
+    }
+    pub fn encoding_workspace_bytes(&self) -> Result<u64, BatchFault> {
+        self.planner.map_document_encoding_workspace_bytes().map_err(|_| BatchCode::InvalidLimits.into())
+    }
+    pub(crate) fn encoding_recipe(&self) -> Result<Option<encoding::EncodingRecipe>, BatchFault> {
+        encoding::recipe(&self.planner)
+    }
     pub fn config(&self) -> &Int4QuestionDocumentBatchConfig { &self.config }
     pub fn base_execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn group_width(&self) -> usize { self.group_width }
@@ -202,24 +230,26 @@ impl Int4QuestionDocumentBatchPlanner {
     }
     pub(crate) fn owns(&self, prepared: &PreparedInt4QuestionDocument) -> Result<(), BatchItemFailure> {
         if !Arc::ptr_eq(&self.owner, &prepared.owner) { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
-        Ok(())
+        encoding::verify_operation(&self.planner, &prepared.operation)
     }
     /// Seal a complete source/question pair without allocating native state.
     /// Executing processors still preflight the actual backend and reconstruct
     /// every exact native identity against this factory's private owner.
     pub fn prepare_with_control<C: DecodeStepControl>(&self, source: String,
         args: QuestionDocumentArgs, control: &mut C) -> Result<PreparedInt4QuestionDocument, BatchItemFailure> {
-        let plan = self.plan(&source, &args.question, control, false)?;
+        let operation = encoding::operation(&self.planner)?;
+        let plan = self.plan_with_operation(&source, &args.question, &operation, control, false)?;
         let (expected, identities) = self.snapshot(&plan, control)?;
         drop(plan);
         poll(control)?;
         Ok(PreparedInt4QuestionDocument { source, question: args.question,
-            expected, identities, owner: Arc::clone(&self.owner) })
+            expected, identities, owner: Arc::clone(&self.owner), operation })
     }
 }
 
 pub struct PreparedInt4QuestionDocument {
     source: String, question: String, expected: Expected, identities: Vec<ExecutionIdentity>, owner: Arc<()>,
+    operation: Arc<SourceTaskPlanner>,
 }
 impl PreparedInt4QuestionDocument {
     pub fn chunk_count(&self) -> usize { self.expected.discovery().chunk_count() }
@@ -227,6 +257,9 @@ impl PreparedInt4QuestionDocument {
     pub fn planned_work(&self) -> Int4Work { self.expected.work }
     pub fn reserved_mask_visits(&self) -> u64 { self.expected.masks }
     pub fn execution_identities(&self) -> &[ExecutionIdentity] { &self.identities }
+    pub fn map_document_encoding_work(&self) -> Result<Option<crate::tokenizer::untrusted::SafeBpeWork>, BatchFault> {
+        self.operation.map_document_encoding_work().map_err(|_| BatchCode::Admission.into())
+    }
 }
 #[derive(Serialize)]
 #[serde(untagged)]
@@ -280,12 +313,13 @@ impl<A: Int4QuestionDocumentBatchAdmission> BatchProcessor for NativeInt4Questio
             poll(control)?;
             self.backend.capacity(self.planner)?;
             let args = document.task_args.ok_or_else(|| BatchItemFailure::reject(BatchCode::Planning))?;
-            let plan = self.planner.plan(&document.text, &args.question, control, false)?;
+            let operation = encoding::operation(&self.planner.planner)?;
+            let plan = self.planner.plan_with_operation(&document.text, &args.question, &operation, control, false)?;
             let (expected, identities) = self.planner.snapshot(&plan, control)?;
             self.backend.preflight(self.planner, &plan, &identities, control)?;
             drop(plan); poll(control)?;
             Ok(PreparedInt4QuestionDocument { source: document.text, question: args.question,
-                expected, identities, owner: Arc::clone(&self.planner.owner) })
+                expected, identities, owner: Arc::clone(&self.planner.owner), operation })
         })();
         if !result.as_ref().is_err_and(|e: &BatchItemFailure| e.stop) && self.backend.clean() { self.ledger.failed = false; }
         result
@@ -303,7 +337,7 @@ impl<A: Int4QuestionDocumentBatchAdmission> BatchProcessor for NativeInt4Questio
         let result = (|| {
             poll(control)?;
             let kv = self.backend.capacity(self.planner)?;
-            let plan = self.planner.plan(&prepared.source, &prepared.question, control, true)?;
+            let plan = self.planner.plan_with_operation(&prepared.source, &prepared.question, &prepared.operation, control, true)?;
             self.planner.compare(&plan, &prepared, control)?;
             self.backend.preflight(self.planner, &plan, &prepared.identities, control)?;
             let c = &self.planner.config;

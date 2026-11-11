@@ -205,3 +205,56 @@ fn admission_keeps_complete_sequence_work_and_frozen_physical_peak() {
         assert!(check(&claim).is_err(), "axis {axis}");
     }
 }
+
+#[test]
+fn compact_factory_workspace_fits_once_inside_live_preparation_with_exact_boundary() {
+    use crate::{native_engine::strict_int4::weights::projection_fixture,
+        tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding}};
+    let (base, run, mut host) = fixture();
+    let (source_planner, _) = super::super::tests::fixture(SourceMapTask::Ner(Default::default()), WIDTH);
+    let (weights, _) = projection_fixture(WIDTH);
+    let task = Int4SourceDocumentTask::Map(SourceMapTask::Ner(Default::default()));
+    let compiler = Int4SourceDocumentBatchPlanner::for_model(weights.identity(), Arc::new(source_planner),
+        task, base.budget, base.planning, base.mapping, run).unwrap();
+    assert_eq!(compiler.encoding_workspace_bytes().unwrap(), 0);
+    check_encoding_preparation(0, host.preparation_reserve_bytes).unwrap();
+    let byte_identity = compiler.execution_identity().clone();
+    let byte_quote = quote(&base, compiler.task(), run, host, false, None).unwrap();
+    let old_preparation = host.preparation_reserve_bytes;
+    let call = SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 4096,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
+    let complete = SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 };
+    let compiler = compiler.with_map_document_encoding(UntrustedEncoding::SafeBpeV1(call), complete).unwrap();
+    let bytes = compiler.encoding_workspace_bytes().unwrap();
+    assert_eq!(bytes, call.requirements().unwrap().workspace_bytes + 512);
+    assert_eq!(compiler.map_document_encoding_limits(), Some(complete));
+    assert_ne!(compiler.execution_identity().template_digest, byte_identity.template_digest);
+    host.preparation_reserve_bytes = bytes;
+    check_encoding_preparation(bytes, host.preparation_reserve_bytes).unwrap();
+    let exact = quote(&base, compiler.task(), run, host, false, None).unwrap();
+    assert_eq!(exact.input_bytes - bytes, byte_quote.input_bytes - old_preparation);
+    assert_eq!(exact.native, byte_quote.native);
+    assert_eq!(exact.document_workspace_bytes, byte_quote.document_workspace_bytes);
+    assert_eq!(exact.output_reservation_bytes, byte_quote.output_reservation_bytes);
+    host.preparation_reserve_bytes -= 1;
+    assert!(check_encoding_preparation(bytes, host.preparation_reserve_bytes).is_err());
+    let short = quote(&base, compiler.task(), run, host, false, None).unwrap();
+    assert_eq!(exact.input_bytes - short.input_bytes, 1);
+}
+
+#[test]
+fn fixed_document_host_binds_encoding_identity_but_accepts_independent_chunk_prompts() {
+    let (base, _, _) = fixture();
+    let mut chunk = base.identity.clone();
+    chunk.prompt_digest = Sha256Digest::of_bytes(b"independent chunk prompt");
+    chunk.taskir_digest = Sha256Digest::of_bytes(b"independent chunk task");
+    admission::check_document_encoding_identity(&base.identity, &chunk).unwrap();
+    chunk.tokenizer_digest = Sha256Digest::of_bytes(b"different source tokenizer");
+    assert!(admission::check_document_encoding_identity(&base.identity, &chunk).is_err());
+    chunk.tokenizer_digest = base.identity.tokenizer_digest;
+    chunk.template_digest = Sha256Digest::of_bytes(b"different compact policy or cumulative ceiling");
+    assert!(admission::check_document_encoding_identity(&base.identity, &chunk).is_err());
+    // A correct model/task profile alone cannot authorize another encoder.
+    assert!(constrained_int4::check_profile(&chunk, WIDTH).is_ok());
+}

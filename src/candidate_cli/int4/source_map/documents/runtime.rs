@@ -82,6 +82,10 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let planner = Int4SourceDocumentBatchPlanner::for_model(model.model_identity(), Arc::new(compiler),
         task, budget, planning, limits.document.mapping, limits.run)
         .map_err(|fault| fault.cancellation.map(stopped).unwrap_or(CandidateError::Planning))?;
+    let planner = if let Some(encoding) = limits.document.encoding {
+        planner.with_map_document_encoding(encoding.policy(), encoding.complete)
+            .map_err(|fault| fault.cancellation.map(stopped).unwrap_or(CandidateError::Planning))?
+    } else { planner };
     let planner = if limits.document.cohort_chunks.is_some() {
         planner.with_chunk_cohorts()
             .map_err(|fault| fault.cancellation.map(stopped).unwrap_or(CandidateError::Planning))?
@@ -126,6 +130,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(), snapshot,
     };
+    let provenance = encoding::population_response(provenance, limits.document.encoding);
     let writer = CandidateWriter::new(output, &provenance, limits.transport.max_output_line_bytes, limits.output_bytes)?;
     let reader: Box<dyn BufRead + Send> = if args.input.as_os_str() == "-" {
         Box::new(BufReader::with_capacity(IO_BUFFER_BYTES, input))

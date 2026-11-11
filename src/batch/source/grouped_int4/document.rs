@@ -29,7 +29,9 @@ use crate::{
     validation::grounded_fields::GroundingBudget,
 };
 use std::{fmt, sync::Arc};
+use crate::tokenizer::untrusted::{SafeBpeWorkLimits, UntrustedEncoding};
 
+pub(crate) mod encoding;
 pub(crate) mod task;
 pub(crate) mod planning;
 pub(crate) mod backend;
@@ -138,6 +140,27 @@ impl Int4SourceDocumentBatchPlanner {
     pub fn max_result_bytes(&self) -> u64 { self.task.max_result_bytes(self.mapping) }
     pub fn output_token_ceiling(&self) -> Result<u64, BatchFault> { self.task.output_token_ceiling(self.mapping, self.budget) }
     pub fn retained_defaults_bytes(&self) -> Result<u64, BatchFault> { self.task.retained_bytes() }
+    /// Explicit compact policy for each complete original document. The
+    /// prepared record owns one ledger through preparation and reconstruction.
+    /// Synthesis/hierarchy remain byte-only; ordinary constructors are unchanged.
+    pub fn with_map_document_encoding(mut self, policy: UntrustedEncoding, complete: SafeBpeWorkLimits)
+        -> Result<Self, BatchFault> {
+        if !encoding::supported(&self.task) { return Err(BatchCode::InvalidLimits.into()); }
+        let planner = encoding::configure(&self.planner, policy, complete)?;
+        let mut identity = self.identity.clone();
+        identity.template_digest = *planner.template_digest();
+        super::check_configuration_with_document_encoding(&planner, &identity,
+            self.budget, self.planning, None, self.group_width)?;
+        self.planner = planner; self.identity = identity; self.owner = Arc::new(());
+        Ok(self)
+    }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.planner.document_encoding() }
+    pub fn map_document_encoding_limits(&self) -> Option<SafeBpeWorkLimits> {
+        self.planner.map_document_encoding_limits()
+    }
+    pub fn encoding_workspace_bytes(&self) -> Result<u64, BatchFault> {
+        self.planner.map_document_encoding_workspace_bytes().map_err(|_| BatchCode::InvalidLimits.into())
+    }
     pub fn with_chunk_cohorts(mut self) -> Result<Self, BatchFault> {
         if !self.chunk_cohorts { self.chunk_cohorts = true; self.owner = Arc::new(()); }
         self.cohort_requirements()?;

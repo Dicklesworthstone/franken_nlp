@@ -74,6 +74,10 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let identity = source::identity(model.model_identity(), &planner, BuiltInTask::Answer)?;
     let factory = Int4QuestionDocumentBatchPlanner::for_model(model.model_identity(), Arc::new(planner),
         identity, limits.config).map_err(|fault| fault.cancellation.map(stopped).unwrap_or(CandidateError::Planning))?;
+    let factory = if let Some(encoding) = limits.encoding {
+        factory.with_map_document_encoding(encoding.policy(), encoding.complete)
+            .map_err(|fault| fault.cancellation.map(stopped).unwrap_or(CandidateError::Planning))?
+    } else { factory };
     let factory = if command.stream.cohort_chunks.is_some() {
         factory.with_chunk_cohorts()
             .map_err(|fault| fault.cancellation.map(stopped).unwrap_or(CandidateError::Planning))?
@@ -120,6 +124,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(), snapshot,
     };
+    let provenance = encoding::population_response(provenance, limits.encoding);
     let writer = CandidateWriter::new(output, &provenance, limits.transport.max_output_line_bytes, limits.output_bytes)?;
     let reader: Box<dyn BufRead + Send> = if args.input.as_os_str() == "-" {
         Box::new(BufReader::with_capacity(IO_BUFFER_BYTES, input))

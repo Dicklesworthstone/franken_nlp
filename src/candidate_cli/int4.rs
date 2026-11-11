@@ -262,8 +262,10 @@ impl Int4Command {
                 clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "source corpus task required"))?;
             let kind = crate::candidate_cli::source::Kind::named(name).ok_or_else(||
                 clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source corpus task refused"))?;
+            let mut args = Int4Args::from_arg_matches(matches)?;
+            args.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
             return Ok(Self { task: Int4Task::SourceCorpus(source_map::documents::CorpusArgs::from_matches(kind, matches)?),
-                args: Int4Args::from_arg_matches(matches)?, batch: None, job: None });
+                args, batch: None, job: None });
         }
         if name == "text-job" {
             let (job, args) = text_job::JobCommand::from_matches(matches)?;
@@ -379,7 +381,8 @@ impl Int4Command {
         let mut args = Int4Args::from_arg_matches(matches)?;
         if matches!(name, "generate" | "chat" | "classify" | "classify-map" | "sentiment" | "sentiment-map" | "extract" | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch"
             | "extract-batch" | "ner-batch" | "keyphrases-batch" | "summarize-batch" | "answer-batch"
-            | "ner-map" | "keyphrases-map" | "summarize-map" | "answer-map") {
+            | "ner-map" | "keyphrases-map" | "summarize-map" | "answer-map"
+            | "ner-corpus" | "keyphrases-corpus" | "summarize-corpus" | "answer-corpus") {
             args.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
         }
         if matches!(name, "generate" | "chat" | "classify" | "sentiment" | "judge" | "extract"

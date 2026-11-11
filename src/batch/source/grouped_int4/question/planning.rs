@@ -86,8 +86,14 @@ impl NativePlan<'_> {
     }
 }
 impl Int4QuestionDocumentBatchPlanner {
+    #[cfg(test)]
     pub(super) fn plan<'s, C: DecodeStepControl>(&self, source: &'s str, question: &str,
         control: &mut C, fatal: bool) -> Result<NativePlan<'s>, BatchItemFailure> {
+        self.plan_with_operation(source, question, &self.planner, control, fatal)
+    }
+    pub(super) fn plan_with_operation<'s, C: DecodeStepControl>(&self, source: &'s str, question: &str,
+        operation: &SourceTaskPlanner, control: &mut C, fatal: bool) -> Result<NativePlan<'s>, BatchItemFailure> {
+        encoding::verify_operation(&self.planner, operation)?;
         poll(control)?;
         let reject = |code| if fatal { BatchItemFailure::fatal(code) } else { BatchItemFailure::reject(code) };
         let c = &self.config;
@@ -103,12 +109,12 @@ impl Int4QuestionDocumentBatchPlanner {
         owned_question.push_str(question);
         let question = SourceQuestion { question: owned_question, options: c.options, verification: c.verification };
         let plan = match (c.synthesis, c.hierarchy) {
-            (None, None) => NativePlan::Independent(self.planner.plan_int4_question_with_control(source, &question,
+            (None, None) => NativePlan::Independent(operation.plan_int4_question_with_control(source, &question,
                 c.budget, &context, c.planning, c.mapping, self.group_width, control).map_err(|e| map_failure(e, fatal))?),
-            (Some(limits), None) => NativePlan::Synthesis(self.planner.plan_int4_question_synthesis_with_control(source,
+            (Some(limits), None) => NativePlan::Synthesis(operation.plan_int4_question_synthesis_with_control(source,
                 &SourceQuestionSynthesis { question, limits }, c.budget, &context, c.planning, c.mapping,
                 self.group_width, control).map_err(|e| map_failure(e, fatal))?),
-            (Some(limits), Some(hierarchy)) => NativePlan::Hierarchy(self.planner.plan_int4_question_hierarchy_with_control(
+            (Some(limits), Some(hierarchy)) => NativePlan::Hierarchy(operation.plan_int4_question_hierarchy_with_control(
                 source, &SourceQuestionSynthesis { question, limits }, hierarchy, c.budget, &context,
                 c.planning, c.mapping, self.group_width, control).map_err(|e| map_failure(e, fatal))?),
             (None, Some(_)) => return Err(BatchItemFailure::fatal(BatchCode::InvalidLimits)),

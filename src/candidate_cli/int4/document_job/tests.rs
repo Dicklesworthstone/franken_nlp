@@ -381,3 +381,55 @@ fn unavailable_profile_refuses_before_keys_questions_options_model_or_population
         assert_eq!(c.execute_owned(args, NoIo, &mut NoIo).unwrap_err().code, "owned_document_job_profile_unavailable");
     }
 }
+
+#[test]
+fn compact_document_jobs_authenticate_selected_policy_without_changing_lifetime_envelopes() {
+    for &(task, mode, expected_mode) in MODES {
+        if mode.contains(&"--synthesize-summary") || mode.contains(&"--synthesize-answer") { continue; }
+        for operation in ["start", "resume"] {
+            for cohorts in [&[][..], &["--cohort-chunks", "2"][..]] {
+                let mut flags = mode.to_vec(); flags.extend_from_slice(cohorts);
+                let (plain, args) = command(operation, task, &flags);
+                let baseline = plain.args.validate(&args).unwrap();
+                flags.extend_from_slice(&["--input-encoding", "safe-bpe-v1",
+                    "--max-total-tokenizer-pair-checks", "123456",
+                    "--max-total-tokenizer-pair-bytes", "234567"]);
+                let (compact, args) = command(operation, task, &flags);
+                let admitted = compact.args.validate(&args).unwrap();
+                let encoding = admitted.encoding.unwrap();
+                assert_eq!(encoding.complete.max_pair_checks, 123456);
+                assert_eq!(encoding.complete.max_pair_bytes, 234567);
+                assert!(encoding.workspace_bytes().unwrap() < admitted.common.preparation_bytes);
+                assert_eq!(compact.args.mode_name(admitted), expected_mode);
+                assert_eq!(admitted.mapping.chunks, baseline.mapping.chunks);
+                assert_eq!(admitted.mapping.reduction, baseline.mapping.reduction);
+                assert_eq!(admitted.mapping.max_model_work, baseline.mapping.max_model_work);
+                assert_eq!(admitted.mapping.max_mask_visits, baseline.mapping.max_mask_visits);
+                assert_eq!(admitted.workspace_bytes, baseline.workspace_bytes);
+                assert_eq!(admitted.cohort, baseline.cohort);
+                let job = lifetime(&args, admitted);
+                let frozen = compact.args.lifetime_limits(&args, admitted, job).unwrap();
+                assert_eq!(frozen.map.encoding, admitted.encoding);
+                assert_eq!(frozen.map.mapping.max_model_work, admitted.mapping.max_model_work);
+                assert_eq!(frozen.map.mapping.max_mask_visits, admitted.mapping.max_mask_visits);
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_document_jobs_refuse_neural_modes_and_incomplete_tokenizer_authority() {
+    for &(task, mode, _) in MODES {
+        if !mode.contains(&"--synthesize-summary") && !mode.contains(&"--synthesize-answer") { continue; }
+        let mut flags = mode.to_vec(); flags.extend_from_slice(&["--input-encoding", "safe-bpe-v1"]);
+        let (job, args) = command("start", task, &flags);
+        assert!(job.args.validate(&args).is_err());
+    }
+    for flags in [
+        &["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-pair-bytes", "0"][..],
+        &["--max-total-tokenizer-input-bytes", "1"][..],
+    ] {
+        let (job, args) = command("resume", "ner", flags);
+        assert!(job.args.validate(&args).is_err());
+    }
+}

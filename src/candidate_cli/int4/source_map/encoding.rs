@@ -19,14 +19,14 @@ pub(super) struct EncodingArgs {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct EncodingLimits {
+pub(in crate::candidate_cli::int4) struct EncodingLimits {
     pub call: SafeBpeLimits,
     pub complete: SafeBpeWorkLimits,
 }
 impl EncodingLimits {
     #[cfg(feature = "asupersync-runtime")]
-    pub(super) fn policy(self) -> UntrustedEncoding { UntrustedEncoding::SafeBpeV1(self.call) }
-    pub(super) fn workspace_bytes(self) -> Result<u64, CandidateError> {
+    pub(in crate::candidate_cli::int4) fn policy(self) -> UntrustedEncoding { UntrustedEncoding::SafeBpeV1(self.call) }
+    pub(in crate::candidate_cli::int4) fn workspace_bytes(self) -> Result<u64, CandidateError> {
         self.complete.validate().map_err(|_| CandidateError::Arguments)?;
         self.call.requirements().map(|quote| quote.workspace_bytes + 512)
             .map_err(|_| CandidateError::Arguments)
@@ -67,7 +67,7 @@ pub(super) fn definition(command: clap::Command) -> clap::Command {
     input_encoding::definition(command)
         .mut_arg("max_tokenizer_pair_checks", |arg| arg.help("Safe-BPE pair checks per chunk encoding; the complete invocation also has --max-total-tokenizer-pair-checks"))
         .mut_arg("max_tokenizer_pair_bytes", |arg| arg.help("Safe-BPE pair bytes per chunk encoding; the complete invocation also has --max-total-tokenizer-pair-bytes"))
-        .after_long_help("--input-encoding safe-bpe-v1 preserves exact document bytes and excludes every template control token while compacting ordinary text. NER, keyphrase, plain cited-summary and independent document-answer maps support this option, including --cohort-chunks and exact reducers. QA encodes the question, canonical passage manifest and source under one per-call ceiling bounded by --max-input-bytes and the encoder's one-MiB limit. All chunk-size probes, real chunk plans and the hosted repeat preflight consume ONE nonrenewable tokenizer ledger. --max-total-tokenizer-input-bytes and --max-total-tokenizer-output-tokens default to eight times --max-input-bytes; total pair checks default to 268435456 and total examined pair bytes to 4294967296. Exhaustion refuses the whole document without retry or a partial result. Per-call tokenizer workspace is admitted before private input/model IO. Policy and every ceiling bind prompt identity; successful output reports cumulative work separately. Neural synthesis/hierarchies, corpora and durable jobs remain byte-only.")
+        .after_long_help("--input-encoding safe-bpe-v1 preserves exact document bytes and excludes every template control token while compacting ordinary text. NER, keyphrase, plain cited-summary and independent document-answer maps support this option, including --cohort-chunks and exact reducers. QA encodes the question, canonical passage manifest and source under one per-call ceiling bounded by --max-input-bytes and the encoder's one-MiB limit. All chunk-size probes, real chunk plans and the hosted repeat preflight consume ONE nonrenewable tokenizer ledger. --max-total-tokenizer-input-bytes and --max-total-tokenizer-output-tokens default to eight times --max-input-bytes; total pair checks default to 268435456 and total examined pair bytes to 4294967296. Exhaustion refuses the whole document without retry or a partial result. Per-call tokenizer workspace is admitted before private input/model IO. Policy and every ceiling bind prompt identity; successful output reports cumulative work separately. Neural synthesis and hierarchies remain byte-only. Source corpora and complete-document jobs admit a separate nonrenewable ledger per complete document attempt; see those commands for scope.")
 }
 
 #[cfg(feature = "asupersync-runtime")]
@@ -98,4 +98,37 @@ pub(super) struct EncodedResponse<'a, T: Serialize> {
     pub response: T,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_encoding: Option<&'a EncodingReport>,
+}
+
+pub(super) fn population_definition(command: clap::Command) -> clap::Command {
+    definition(command)
+        .mut_arg("max_total_tokenizer_input_bytes", |arg| arg.help("Cumulative encoded input bytes per COMPLETE document operation, including every probe and replan"))
+        .mut_arg("max_total_tokenizer_output_tokens", |arg| arg.help("Cumulative encoded output tokens per COMPLETE document operation, independent of model context"))
+        .mut_arg("max_total_tokenizer_pair_checks", |arg| arg.help("Cumulative Safe-BPE pair checks per COMPLETE document operation"))
+        .mut_arg("max_total_tokenizer_pair_bytes", |arg| arg.help("Cumulative Safe-BPE examined pair bytes per COMPLETE document operation"))
+        .after_long_help("--input-encoding safe-bpe-v1 applies to each complete NER, keyphrase, plain cited-summary or independent QA document. Each complete document operation owns ONE fresh admitted tokenizer ledger across all sizing probes, final plans and execution replanning. A chunk, flush or host boundary never renews it. The --max-total-tokenizer-* ceilings bound one document preparation plus execution reconstruction. Existing stream record/input/native limits remain whole-run bounds. Durable native work and persisted attempts retain their lifetime accounting, but tokenizer usage is not a persisted lifetime counter: an explicit resume may create a fresh ledger under the same authenticated ceilings, including after failed preparation. Per-call workspace is charged before private IO and reused across documents. Native chunk cohorts and exact reducers are supported; neural synthesis and hierarchies remain byte-only. Durable resume authenticates the selected policy and every complete-document ceiling. Public input_encoding provenance describes policy and limits, not an unexecuted factory's work usage.")
+}
+
+#[cfg(feature = "asupersync-runtime")]
+#[derive(Serialize)]
+pub(in crate::candidate_cli::int4) struct PopulationEncodingReport {
+    policy: UntrustedEncoding,
+    complete_document_limits: SafeBpeWorkLimits,
+    budget_scope: &'static str,
+}
+#[cfg(feature = "asupersync-runtime")]
+#[derive(Serialize)]
+pub(in crate::candidate_cli::int4) struct PopulationResponse<T: Serialize> {
+    #[serde(flatten)]
+    response: T,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<PopulationEncodingReport>,
+}
+#[cfg(feature = "asupersync-runtime")]
+pub(in crate::candidate_cli::int4) fn population_response<T: Serialize>(
+    response: T, limits: Option<EncodingLimits>) -> PopulationResponse<T> {
+    PopulationResponse { response, input_encoding: limits.map(|limits| PopulationEncodingReport {
+        policy: limits.policy(), complete_document_limits: limits.complete,
+        budget_scope: "complete_document_operation",
+    }) }
 }

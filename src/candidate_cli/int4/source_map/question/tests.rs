@@ -182,8 +182,8 @@ fn compact_document_qa_admits_complete_question_manifest_and_source_encoding() {
         assert_eq!(encoding.complete.max_output_tokens, 8 * args.max_input_bytes as u64);
         assert!(encoding.workspace_bytes().unwrap() < source.common.preparation_bytes);
         assert_eq!(source.cohort_chunks, chunks.map(|n| n.parse().unwrap()));
-        assert!(map.validate_corpus(&args).is_err());
-        assert!(map.validate_document_job(&args, false).is_err());
+        assert_eq!(map.validate_corpus(&args).unwrap().encoding, Some(encoding));
+        assert_eq!(map.validate_document_job(&args, false).unwrap().encoding, Some(encoding));
         args.source_dir = None; args.source_manifest = None;
         args.snapshot = Some(PathBuf::from("explicit.snapshot"));
         args.expected_model_sha256 = Some("ab".repeat(32));

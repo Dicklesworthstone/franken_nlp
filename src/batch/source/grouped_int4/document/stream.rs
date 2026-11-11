@@ -10,12 +10,16 @@ pub struct PreparedInt4SourceDocumentBatch {
     expected: planning::Expected,
     work: DocumentWork,
     owner: Arc<()>,
+    operation: Arc<SourceTaskPlanner>,
 }
 impl PreparedInt4SourceDocumentBatch {
     pub fn chunk_count(&self) -> usize { self.expected.chunk_count() }
     pub fn planned_work(&self) -> Int4Work { self.work.model }
     pub fn reserved_mask_visits(&self) -> u64 { self.work.mask_node_visits }
     pub fn execution_identities(&self) -> &[ExecutionIdentity] { &self.identities }
+    pub fn map_document_encoding_work(&self) -> Result<Option<crate::tokenizer::untrusted::SafeBpeWork>, BatchFault> {
+        self.operation.map_document_encoding_work().map_err(|_| BatchCode::Admission.into())
+    }
 }
 impl Int4SourceDocumentBatchPlanner {
     pub fn prepare_with_control<C: DecodeStepControl>(&self, document: BatchDocument<SourceDocumentArgs>,
@@ -29,7 +33,9 @@ impl Int4SourceDocumentBatchPlanner {
         if document.text.is_empty() || document.text.len() > self.mapping.chunks.max_input_bytes {
             return Err(BatchItemFailure::reject(BatchCode::DocumentLimit));
         }
-        let plan = self.configuration().plan(&document.text, control)?;
+        let operation = encoding::operation(&self.planner)?;
+        let mut config = self.configuration(); config.planner = &operation;
+        let plan = config.plan(&document.text, control)?;
         let expected = plan.expected();
         let identities = plan.identities(control)?;
         if identities.len() != expected.native_chunks() { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
@@ -37,11 +43,12 @@ impl Int4SourceDocumentBatchPlanner {
         if let Some(engine) = engine { engine.preflight(&plan, &identities, control)?; }
         drop(plan);
         poll(control)?;
-        Ok(PreparedInt4SourceDocumentBatch { source: document.text, identities, expected, work, owner: Arc::clone(&self.owner) })
+        Ok(PreparedInt4SourceDocumentBatch { source: document.text, identities, expected, work,
+            owner: Arc::clone(&self.owner), operation })
     }
     fn owns(&self, prepared: &PreparedInt4SourceDocumentBatch) -> Result<(), BatchItemFailure> {
         if !Arc::ptr_eq(&self.owner, &prepared.owner) { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
-        Ok(())
+        encoding::verify_operation(&self.planner, &prepared.operation)
     }
 }
 
@@ -112,7 +119,7 @@ impl<A: Int4SourceDocumentBatchAdmission> BatchProcessor for NativeInt4SourceDoc
             self.planner.run_limits, context)?;
         let result = (|| {
             poll(control)?;
-            let config = self.planner.configuration();
+            let mut config = self.planner.configuration(); config.planner = &prepared.operation;
             let kv = self.engine.check_capacity(&config)?;
             let plan = config.plan(&prepared.source, control)?;
             plan.compare_receipt(prepared.expected, prepared.work, &prepared.identities, control)?;

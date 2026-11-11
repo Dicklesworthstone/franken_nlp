@@ -63,7 +63,7 @@ impl<A: Int4SourceDocumentBatchAdmission> BatchProcessor for Int4SourceDocumentJ
         self.planner.owns(&prepared)?;
         poll(control)?;
         let kv = self.engine.check_capacity(&self.planner.configuration())?;
-        let plan = self.planner.plan(&prepared.source, control)?;
+        let plan = self.planner.plan_with_operation(&prepared.source, &prepared.operation, control)?;
         plan.compare(&prepared, control)?;
         self.engine.preflight(&plan, &prepared.identities, control)?;
         let (admitted, guard) = self.admission.admit(Int4SourceDocumentAdmission {
@@ -76,7 +76,7 @@ impl<A: Int4SourceDocumentBatchAdmission> BatchProcessor for Int4SourceDocumentJ
         poll(control)?;
         if admitted != prepared.identities { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
         self.engine.preflight(&plan, &admitted, control)?;
-        let output = self.engine.execute(plan, &admitted, &self.planner.planner, self.vocabulary, control)?;
+        let output = self.engine.execute(plan, &admitted, &prepared.operation, self.vocabulary, control)?;
         prepared.expected.verify(&output, self.planner.task())?;
         self.engine.check_capacity(&self.planner.configuration())?;
         poll(control)?;

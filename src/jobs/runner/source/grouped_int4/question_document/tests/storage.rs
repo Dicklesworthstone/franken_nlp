@@ -240,3 +240,57 @@ fn serialization_failure_releases_complete_output_without_committing_or_refundin
     assert_eq!(fs::metadata(root.0.join("results.spool")).unwrap().len(), 0);
     assert_eq!((events.values_dropped.get(), events.releases.get()), (1, 1)); assert!(!events.held.get());
 }
+
+#[test]
+fn compact_retained_attempts_resume_only_the_identical_encoding_contract() {
+    let root = Root::new(); let inputs = inputs(); let config = config(0); let limits = limits(config);
+    let events = Rc::new(Events::default());
+    let make = |total| {
+        let mut processor = Processor::new(config, limits, Rc::clone(&events));
+        processor.planner = processor.planner.with_map_document_encoding(super::compact::policy(), total).unwrap();
+        processor
+    };
+    let total = super::compact::allowance();
+    let mut job = JobRunner::create(&root.0, key(), JobId([9; 16]), limits, &inputs, make(total), &mut Continue).unwrap();
+    assert_eq!(job.step(&mut Continue).unwrap().unwrap().committed, 1); drop(job);
+    let spool = root.0.join("results.spool");
+    fs::OpenOptions::new().append(true).open(&spool).unwrap().write_all(b"private-uncommitted-tail").unwrap();
+    let before = fs::read(&spool).unwrap();
+    let mut changed = total; changed.max_pair_checks -= 1;
+    assert!(matches!(error(JobRunner::resume(&root.0, key(), JobId([9; 16]), limits, &inputs,
+        make(changed), TailPolicy::DiscardUncommitted, &mut Continue)),
+        JobRunError::Storage(JobError::Mismatch(_))));
+    assert_eq!(fs::read(&spool).unwrap(), before);
+    assert_eq!(events.executions.get(), 1);
+    let mut resumed = JobRunner::resume(&root.0, key(), JobId([9; 16]), limits, &inputs,
+        make(total), TailPolicy::DiscardUncommitted, &mut Continue).unwrap();
+    let progress = resumed.run(&mut Continue).unwrap();
+    assert_eq!((progress.committed, progress.attempts), (2, 2));
+    resumed.verify(&mut Continue).unwrap(); resumed.materialize_ordered(&mut Continue).unwrap();
+    assert_eq!((events.executions.get(), events.releases.get()), (2, 2));
+    let pair: serde_json::Value = serde_json::from_slice(&resumed.read_committed(0, &mut Continue).unwrap()).unwrap();
+    assert_eq!(pair[1], SOURCE); assert_eq!(pair[2], QUESTION);
+}
+
+#[test]
+fn preparation_exhaustion_is_local_and_does_not_claim_a_persisted_native_attempt() {
+    let root = Root::new(); let inputs = inputs(); let config = config(0); let limits = limits(config);
+    let events = Rc::new(Events::default());
+    let mut total = super::compact::allowance(); total.max_input_bytes = 1;
+    let make = || {
+        let mut processor = Processor::new(config, limits, Rc::clone(&events));
+        processor.planner = processor.planner.with_map_document_encoding(super::compact::policy(), total).unwrap();
+        processor
+    };
+    let mut job = JobRunner::create(&root.0, key(), JobId([9; 16]), limits, &inputs, make(), &mut Continue).unwrap();
+    assert!(matches!(error(job.step(&mut Continue)), JobRunError::Processor(_)));
+    assert_eq!((job.progress().attempts, job.progress().committed), (0, 0));
+    assert_eq!(job.progress().reserved_work, JobWork::default()); drop(job);
+    let mut resumed = JobRunner::resume(&root.0, key(), JobId([9; 16]), limits, &inputs,
+        make(), TailPolicy::Refuse, &mut Continue).unwrap();
+    assert!(matches!(error(resumed.step(&mut Continue)), JobRunError::Processor(_)));
+    assert_eq!((resumed.progress().attempts, resumed.progress().committed), (0, 0));
+    assert_eq!(resumed.progress().reserved_work, JobWork::default());
+    assert_eq!(events.executions.get(), 0);
+    assert_eq!(fs::metadata(root.0.join("results.spool")).unwrap().len(), 0);
+}

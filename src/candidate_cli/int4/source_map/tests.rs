@@ -263,9 +263,11 @@ fn compact_maps_require_one_complete_tokenizer_budget_and_admit_workspace() {
         assert_eq!(encoding.complete.max_pair_checks, 268_435_456);
         assert_eq!(encoding.complete.max_pair_bytes, 4_294_967_296);
         assert!(encoding.workspace_bytes().unwrap() <= limits.common.preparation_bytes);
-        assert!(map.validate_document_job(&args, false).is_err());
-        assert!(map.validate_document_job(&args, true).is_err());
-        assert!(map.validate_corpus(&args).is_err());
+        assert_eq!(map.validate_document_job(&args, false).unwrap().encoding, Some(encoding));
+        assert_eq!(map.validate_corpus(&args).unwrap().encoding, Some(encoding));
+        if kind == Kind::Summarize {
+            assert_eq!(map.validate_document_job(&args, true).unwrap().encoding, Some(encoding));
+        } else { assert!(map.validate_document_job(&args, true).is_err()); }
     }
     let (map, mut args) = arguments(Kind::Keyphrases, &["--input-encoding", "safe-bpe-v1",
         "--cohort-chunks", "2", "--reduce-keyphrases", "--max-total-tokenizer-input-bytes", "123456",
@@ -298,7 +300,7 @@ fn unsupported_compact_modes_and_invalid_total_ceilings_refuse_before_io() {
         assert_eq!(map.execute(args, &mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
     }
     for command in document_job_definitions().into_iter().chain(documents::definitions()) {
-        assert!(!command.get_arguments().any(|arg| arg.get_id() == "input_encoding"));
+        assert!(command.get_arguments().any(|arg| arg.get_id() == "input_encoding"));
     }
     let answer = definitions().into_iter().find(|command| command.get_name() == "answer-map").unwrap();
     assert!(answer.get_arguments().any(|arg| arg.get_id() == "input_encoding"));
@@ -680,4 +682,20 @@ fn unavailable_runtime_never_reads_options_document_or_model() {
             assert!(output.is_empty());
         }
     }
+}
+
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn population_encoding_provenance_preserves_byte_wire_and_never_invents_factory_usage() {
+    let plain = serde_json::json!({"protocol":"fixture","output":{"count":2}});
+    assert_eq!(serde_json::to_value(encoding::population_response(&plain, None)).unwrap(), plain);
+    let (map, args) = arguments(Kind::Ner, &["--input-encoding", "safe-bpe-v1",
+        "--max-total-tokenizer-input-bytes", "123456", "--max-total-tokenizer-output-tokens", "234567"]);
+    let limits = map.validate(&args).unwrap().encoding.unwrap();
+    let encoded = serde_json::to_value(encoding::population_response(&plain, Some(limits))).unwrap();
+    assert_eq!(encoded["output"], plain["output"]);
+    assert_eq!(encoded["input_encoding"]["budget_scope"], "complete_document_operation");
+    assert_eq!(encoded["input_encoding"]["complete_document_limits"]["max_input_bytes"], 123456);
+    assert_eq!(encoded["input_encoding"]["complete_document_limits"]["max_output_tokens"], 234567);
+    assert!(encoded["input_encoding"].get("work_used").is_none());
 }

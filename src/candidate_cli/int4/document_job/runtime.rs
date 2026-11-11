@@ -55,6 +55,10 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
     let (compiler, vocabulary) = source::planner()?;
     let planner = Int4SourceDocumentJobPlanner::for_model(model.model_identity(), Arc::new(compiler), task,
         budget, planning, map.mapping, lifetime, non_model_lifetime).map_err(|_| CandidateError::Planning)?;
+    let planner = if let Some(encoding) = map.encoding {
+        planner.with_map_document_encoding(encoding.policy(), encoding.complete)
+            .map_err(|_| CandidateError::Planning)?
+    } else { planner };
     let planner = if map.cohort_chunks.is_some() {
         planner.with_chunk_cohorts().map_err(|_| CandidateError::Planning)?
     } else { planner };
@@ -114,6 +118,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
     };
     // A metadata write failure can follow durable commits. No private source,
     // question, quote, task options, filesystem path or key is published here.
+    let response = source_map::encoding::population_response(response, map.encoding);
     publish(&response, job_cli::REPORT_BYTES, output).map_err(Failure::from)
 }
 

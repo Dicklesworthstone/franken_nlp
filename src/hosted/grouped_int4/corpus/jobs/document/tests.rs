@@ -366,3 +366,57 @@ fn retained_document_and_cohort_hosts_preserve_question_frontier_and_whole_work_
             job, host, 0, 8192, input).is_err());
     }
 }
+
+#[test]
+fn compact_source_job_funds_one_encoder_within_its_authenticated_input_owner() {
+    use crate::{
+        batch::source::grouped_int4::document::Int4SourceDocumentLifetime,
+        native_engine::strict_int4::weights::projection_fixture,
+        tasks::source_planning::SourceTaskPlanner,
+        tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding},
+    };
+    let (budget, planning, mapping, job, host) = fixture();
+    let controls = crate::tokenizer::pinned_controls::pinned().unwrap();
+    let eos = controls.template_controls().entries().iter()
+        .find(|entry| entry.special && entry.surface == crate::template::IM_END).unwrap().id;
+    let source_planner = SourceTaskPlanner::pinned(controls.template_controls(), eos).unwrap();
+    let (weights, _) = projection_fixture(WIDTH);
+    let lifetime = Int4SourceDocumentLifetime {
+        verification: GroundingBudget { max_fields: 1_000_000, max_matches: 1_000_000,
+            max_scan_steps: 1_000_000_000_000 },
+        summary_scan_steps: 1_000_000_000_000,
+    };
+    let task = Int4SourceDocumentTask::Map(
+        crate::tasks::source_planning::grouped_int4::long::SourceMapTask::Ner(Default::default()));
+    let planner = Int4SourceDocumentJobPlanner::for_model(weights.identity(), Arc::new(source_planner),
+        task, budget, planning, mapping, job, lifetime).unwrap();
+    assert_eq!(planner.encoding_workspace_bytes().unwrap(), 0);
+    check_encoding_preparation(0, host.preparation_reserve_bytes).unwrap();
+    let call = SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 4096,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
+    let complete = SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 };
+    let planner = planner.with_map_document_encoding(UntrustedEncoding::SafeBpeV1(call), complete).unwrap();
+    let bytes = planner.encoding_workspace_bytes().unwrap();
+    assert_eq!(bytes, call.requirements().unwrap().workspace_bytes + 512);
+    assert_eq!(planner.map_document_encoding_limits(), Some(complete));
+    let frontier = planner.workspace_bytes(host.native, 65_536).unwrap();
+    for ownership in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
+        let original = document_requirements(WIDTH, budget, planning, mapping, planner.max_result_bytes(),
+            job, host, frontier, private_question_bytes(planner.task()), ownership).unwrap();
+        let mut exact_host = host;
+        exact_host.preparation_reserve_bytes = bytes;
+        check_encoding_preparation(bytes, exact_host.preparation_reserve_bytes).unwrap();
+        let exact = document_requirements(WIDTH, budget, planning, mapping, planner.max_result_bytes(),
+            job, exact_host, frontier, private_question_bytes(planner.task()), ownership).unwrap();
+        assert_eq!(exact.input_bytes - bytes, original.input_bytes - host.preparation_reserve_bytes);
+        assert_eq!(exact.native, original.native);
+        assert_eq!(exact.native_workspace_bytes, original.native_workspace_bytes);
+        assert_eq!(exact.document_workspace_bytes, original.document_workspace_bytes);
+        exact_host.preparation_reserve_bytes -= 1;
+        assert!(check_encoding_preparation(bytes, exact_host.preparation_reserve_bytes).is_err());
+        let short = document_requirements(WIDTH, budget, planning, mapping, planner.max_result_bytes(),
+            job, exact_host, frontier, private_question_bytes(planner.task()), ownership).unwrap();
+        assert_eq!(exact.input_bytes - short.input_bytes, 1);
+    }
+}

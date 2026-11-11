@@ -297,3 +297,5 @@ fn real_native_processor_and_owned_factory_satisfy_durable_host_types() {
     durable::<Int4SourceDocumentJobProcessor<'static, 'static, 'static, 'static, Admission>>();
     send::<Int4SourceDocumentJobPlanner>(); send::<PreparedInt4SourceDocument>();
 }
+
+mod compact;

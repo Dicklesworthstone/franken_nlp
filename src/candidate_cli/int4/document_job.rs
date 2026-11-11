@@ -212,7 +212,9 @@ impl JobCommand {
             keyphrase_lifetime: if kind == Kind::Keyphrases {
                 Some(KeyphraseLifetimeArgs::from_arg_matches(matches)?)
             } else { None } };
-        Ok((Self { mode, args }, Int4Args::from_arg_matches(matches)?))
+        let mut common = Int4Args::from_arg_matches(matches)?;
+        common.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+        Ok((Self { mode, args }, common))
     }
     pub(super) fn run_owned<R: Read + Send + 'static>(self, args: Int4Args, input: R,
         output: &mut impl Write, diagnostics: &mut impl Write) -> ExitCode {

@@ -39,7 +39,7 @@ struct QuestionJobArgs {
 pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
     let operation = |name: &'static str, about: &'static str| {
         let command = source::definition(Kind::Answer).name(name).about(about)
-            .long_about("Retain complete original {id,text,task_args:{question}} NDJSON sources with one distinct private question per record. By default, supply the exact COMPLETE original population on start and every resume; explicit retained-input replay is available. Each task_args object contains only question; fixed AnswerOptions, discovery, evidence synthesis, optional hierarchy and native schedules belong to the authenticated job recipe. --synthesize-answer uses all collected verified quotes; --hierarchical-answer explicitly permits bounded lossy quote selection when that complete evidence cannot fit one pass. Generated answer prose is never factual evidence. Discovery and every hierarchy pass finish before the whole source/question result commits. --cohort-chunks and --cohort-hierarchy-groups independently select native schedules; repeat them on resume. Requires --store-results, protected existing --job-dir and --key-file, exact --job-id and immutable --limits. JobLimits.max_input_bytes_per_item bounds the entire encoded NDJSON record, including both source and question, JSON escaping, ids and framing. All five work flags and --max-total-mask-node-visits bound one complete document; JobLimits.max_work is the sole lifetime allowance including failures. Both verification lifetimes are derived with checked arithmetic from per-document verification and immutable max_attempts. Nothing renews on restart. Admit complete population, native phase peak, evidence frontier and output before population IO. Stdout reports metadata; --materialize publishes private results after all items commit. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
+            .long_about("Retain complete original {id,text,task_args:{question}} NDJSON sources with one distinct private question per record. By default, supply the exact COMPLETE original population on start and every resume; explicit retained-input replay is available. Each task_args object contains only question; fixed AnswerOptions, discovery, evidence synthesis, optional hierarchy and native schedules belong to the authenticated job recipe. --synthesize-answer uses all collected verified quotes; --hierarchical-answer explicitly permits bounded lossy quote selection when that complete evidence cannot fit one pass. Generated answer prose is never factual evidence. Discovery and every hierarchy pass finish before the whole source/question result commits. --cohort-chunks and --cohort-hierarchy-groups independently select native schedules; repeat them on resume. Requires --store-results, protected existing --job-dir and --key-file, exact --job-id and immutable --limits. JobLimits.max_input_bytes_per_item bounds the entire encoded NDJSON record, including both source and question, JSON escaping, ids and framing. All five work flags and --max-total-mask-node-visits bound one complete document; JobLimits.max_work is the sole lifetime allowance including failures. Both verification lifetimes are derived with checked arithmetic from per-document verification and immutable max_attempts. Persisted native-work, mask and attempt allowances do not renew on restart. Compact tokenizer usage is bounded for each complete preparation and execution operation, not persisted as a lifetime counter. Admit complete population, native phase peak, evidence frontier and output before population IO. Stdout reports metadata; --materialize publishes private results after all items commit. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
             .after_help(job_cli::INPUT_RETENTION_HELP)
             .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population with a question per record; omit with --use-retained-input; '-' reads stdin"))
             .mut_arg("max_input_bytes", |arg| arg.default_value("1048576")
@@ -51,6 +51,7 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
             question::QuestionPolicyArgs::augment_args(question::synthesis::SynthesisArgs::augment_args(
                 MappingArgs::augment_args(command)))))
             .mut_arg("store_results", |arg| arg.help("Required consent to retain private complete source/question results"));
+        let command = encoding::population_definition(command);
         if name == "resume" {
             command.arg(clap::Arg::new("discard_uncommitted_tail").long("discard-uncommitted-tail")
                 .action(clap::ArgAction::SetTrue)
@@ -68,6 +69,7 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
 struct JobExecutionLimits {
     common: Int4Limits,
     config: Int4QuestionDocumentBatchConfig,
+    encoding: Option<encoding::EncodingLimits>,
     transport: PopulationReadLimits,
     memory: Int4QuestionDocumentJobMemoryRequirement,
     reduction_reserve_bytes: u64,
@@ -91,7 +93,11 @@ impl JobArgs {
             || !(1..=MAX_INPUT_BYTES).contains(&self.questions.max_question_bytes) {
             return Err(Failure::usage("explicit_question_document_job_storage"));
         }
-        let common = self.source.validate(args)?;
+        let encoding = self.mapping.encoding.limits(args, &self.mapping,
+            !self.synthesis.flat.synthesize_answer, true)?;
+        let mut storage = args.clone();
+        storage.input_encoding = input_encoding::InputEncodingArgs::default();
+        let common = self.source.validate(&storage)?;
         self.mapping.validate(args, &self.source, common, self.questions.cohort_chunks)?;
         self.synthesis.validate()?;
         self.policy.verification()?;
@@ -107,7 +113,8 @@ impl JobArgs {
             u64::from(budget.max_grammar_states) * 512, shared::OPTIONS_BYTES as u64 * 2])?;
         let preparation_floor = sum(&[times(per_chunk, self.mapping.max_chunks as u64 + passes)?,
             256 * MIB, args.max_input_bytes as u64 * 64,
-            (self.mapping.max_map_result_bytes as u64 + 4096) * 2])?;
+            (self.mapping.max_map_result_bytes as u64 + 4096) * 2,
+            encoding.map(encoding::EncodingLimits::workspace_bytes).transpose()?.unwrap_or(0)])?;
         if common.preparation_bytes < preparation_floor {
             return Err(Failure::usage("question_document_preparation"));
         }
@@ -122,6 +129,8 @@ impl JobArgs {
     fn lifetime_limits(&self, args: &Int4Args, mut common: Int4Limits,
         options: AnswerOptions, job: JobLimits) -> Result<JobExecutionLimits, Failure> {
         job.validate().map_err(|_| Failure::usage("job_limits"))?;
+        let encoding = self.mapping.encoding.limits(args, &self.mapping,
+            !self.synthesis.flat.synthesize_answer, true)?;
         if job.max_input_bytes_per_item > args.max_input_bytes
             || self.questions.max_question_bytes > job.max_input_bytes_per_item {
             return Err(Failure::usage("stored_question_record_ceiling"));
@@ -160,7 +169,7 @@ impl JobArgs {
             return Err(Failure { exit: ErrorCode::AdmissionOrResourceLimit, code: "question_document_job_memory" });
         }
         let cli_preparation_bytes = sum(&[common.preparation_bytes, io_reserve_bytes])?;
-        Ok(JobExecutionLimits { common, config, transport, memory, reduction_reserve_bytes,
+        Ok(JobExecutionLimits { common, config, encoding, transport, memory, reduction_reserve_bytes,
             io_reserve_bytes, journal_reserve_bytes, serialization_reserve_bytes, cli_preparation_bytes })
     }
 }
@@ -188,7 +197,9 @@ impl JobCommand {
             mapping: MappingArgs::from_arg_matches(matches)?, policy: question::QuestionPolicyArgs::from_arg_matches(matches)?,
             synthesis: question::synthesis::SynthesisArgs::from_arg_matches(matches)?,
             questions: QuestionJobArgs::from_arg_matches(matches)?, storage: StorageArgs::from_arg_matches(matches)? };
-        Ok((Self { mode, args }, Int4Args::from_arg_matches(matches)?))
+        let mut common = Int4Args::from_arg_matches(matches)?;
+        common.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+        Ok((Self { mode, args }, common))
     }
     pub(in crate::candidate_cli::int4) fn run_owned<R: Read + Send + 'static>(self, args: Int4Args,
         input: R, output: &mut impl Write, diagnostics: &mut impl Write) -> ExitCode {

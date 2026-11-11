@@ -169,3 +169,27 @@ fn composed_map_capacity_refuses_a_compact_planner_before_chunk_probes() {
         SourcePlanningLimits::default(), limits, &mut PlanningContinue).err().unwrap();
     assert!(matches!(error, Int8SourceMapError::Source(_)), "must refuse before the chunk tokenizer");
 }
+
+#[test]
+fn population_operations_share_static_tables_but_never_share_work_allowances() {
+    use crate::tokenizer::untrusted::{SafeBpeWork, SafeBpeWorkLimits};
+    let complete = SafeBpeWorkLimits { max_input_bytes: 1 << 20, max_output_tokens: 1 << 20,
+        max_pair_checks: 1 << 28, max_pair_bytes: 1 << 32 };
+    let factory = planner(UntrustedEncoding::ByteFallback).with_map_document_encoding(policy(), complete).unwrap();
+    let first = factory.fork_map_document_operation().unwrap();
+    let second = factory.fork_map_document_operation().unwrap();
+    // A per-record scope must not duplicate the large pinned tokenizer.
+    assert!(Arc::ptr_eq(&factory.tokenizer, &first.tokenizer));
+    assert!(Arc::ptr_eq(&factory.controls, &first.controls));
+    assert_eq!(factory.template_digest(), first.template_digest());
+    let document = first.source_encoder().encode_with_control(SOURCE, 8192, 8192, &mut || None).unwrap();
+    assert_eq!(document.text(), SOURCE);
+    let spent = first.map_document_encoding_work().unwrap().unwrap();
+    assert_eq!(spent.input_bytes(), SOURCE.len());
+    assert!(spent.output_tokens() < SOURCE.len());
+    assert_eq!(second.map_document_encoding_work().unwrap(), Some(SafeBpeWork::default()));
+    assert_eq!(factory.map_document_encoding_work().unwrap(), Some(SafeBpeWork::default()));
+    first.source_encoder().encode_with_control(SOURCE, 8192, 8192, &mut || None).unwrap();
+    assert_eq!(first.map_document_encoding_work().unwrap(), Some(spent.checked_add(spent).unwrap()));
+    assert!(std::mem::size_of::<SourceTaskPlanner>() + 2 * std::mem::size_of::<usize>() <= 512);
+}

@@ -178,3 +178,62 @@ fn missing_runtime_refuses_before_options_question_model_or_population_io() {
         assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Unavailable));
     }
 }
+
+#[test]
+fn compact_source_populations_preserve_whole_run_limits_and_per_document_workspaces() {
+    for (name, mode) in [
+        ("ner-corpus", &[][..]), ("keyphrases-corpus", &[][..]),
+        ("keyphrases-corpus", &["--reduce-keyphrases"][..]),
+        ("summarize-corpus", &[][..]), ("answer", &[][..]),
+    ] {
+        for cohorts in [&[][..], &["--cohort-chunks", "2"][..]] {
+            let mut ordinary = mode.to_vec(); ordinary.extend_from_slice(cohorts);
+            let (baseline, args) = arguments(name, &ordinary);
+            let byte = baseline.validate(&args).unwrap();
+            let mut flags = ordinary;
+            flags.extend_from_slice(&["--input-encoding", "safe-bpe-v1",
+                "--max-total-tokenizer-input-bytes", "123456",
+                "--max-total-tokenizer-output-tokens", "234567"]);
+            let (compact, mut args) = arguments(name, &flags);
+            let admitted = compact.validate(&args).unwrap();
+            let encoding = admitted.document.encoding.unwrap();
+            assert_eq!(encoding.complete.max_input_bytes, 123456);
+            assert_eq!(encoding.complete.max_output_tokens, 234567);
+            assert!(encoding.workspace_bytes().unwrap() < admitted.common.preparation_bytes);
+            assert_eq!(admitted.transport, byte.transport);
+            assert_eq!(admitted.run.max_model_work, byte.run.max_model_work);
+            assert_eq!(admitted.run.max_mask_visits, byte.run.max_mask_visits);
+            assert_eq!(admitted.run.max_verification, byte.run.max_verification);
+            assert_eq!(admitted.document.mapping.chunks, byte.document.mapping.chunks);
+            assert_eq!(admitted.document.mapping.reduction, byte.document.mapping.reduction);
+            assert_eq!(admitted.document.workspace_bytes, byte.document.workspace_bytes);
+            assert_eq!(admitted.document.cohort, byte.document.cohort);
+            assert_eq!(admitted.common.minimum_memory_bytes, byte.common.minimum_memory_bytes);
+            args.preparation_mib = 1;
+            assert!(compact.validate(&args).is_err());
+        }
+    }
+}
+
+#[test]
+fn compact_source_populations_refuse_neural_modes_and_invalid_work_before_private_io() {
+    for (name, mode) in [
+        ("summarize-corpus", &["--synthesize-summary"][..]),
+        ("summarize-corpus", &["--synthesize-summary", "--hierarchical-summary"][..]),
+        ("answer", &["--synthesize-answer"][..]),
+        ("answer", &["--synthesize-answer", "--hierarchical-answer"][..]),
+    ] {
+        let mut flags = mode.to_vec(); flags.extend_from_slice(&["--input-encoding", "safe-bpe-v1"]);
+        let (options, args) = arguments(name, &flags);
+        assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+    for name in ["ner-corpus", "keyphrases-corpus", "summarize-corpus", "answer"] {
+        for extra in [
+            &["--max-total-tokenizer-input-bytes", "1"][..],
+            &["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-pair-checks", "0"][..],
+        ] {
+            let (options, args) = arguments(name, extra);
+            assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+        }
+    }
+}

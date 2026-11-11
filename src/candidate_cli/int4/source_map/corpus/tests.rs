@@ -294,3 +294,54 @@ fn actual_source_and_pinned_snapshot_cohorts_preserve_distinct_questions_and_ord
         }
     }
 }
+
+#[test]
+fn compact_per_record_questions_admit_one_full_encoder_and_keep_population_limits() {
+    for cohorts in [&[][..], &["--cohort-chunks", "2"][..]] {
+        let (byte, args) = arguments(cohorts);
+        let baseline = byte.validate(&args).unwrap();
+        let mut flags = cohorts.to_vec(); flags.extend_from_slice(&["--input-encoding", "safe-bpe-v1"]);
+        let (compact, mut args) = arguments(&flags);
+        let admitted = compact.validate(&args).unwrap();
+        let encoding = admitted.encoding.unwrap();
+        assert_eq!(encoding.call.max_input_bytes, args.max_input_bytes);
+        assert_eq!(encoding.complete.max_input_bytes, 8 * args.max_input_bytes as u64);
+        assert!(encoding.workspace_bytes().unwrap() < admitted.common.preparation_bytes);
+        assert_eq!(admitted.config.options, baseline.config.options);
+        assert_eq!(admitted.config.budget, baseline.config.budget);
+        assert_eq!(admitted.config.mapping.chunks, baseline.config.mapping.chunks);
+        assert_eq!(admitted.config.mapping.reduction, baseline.config.mapping.reduction);
+        assert_eq!(admitted.config.mapping.max_model_work, baseline.config.mapping.max_model_work);
+        assert_eq!(admitted.config.mapping.max_mask_visits, baseline.config.mapping.max_mask_visits);
+        assert_eq!(admitted.config.verification, baseline.config.verification);
+        assert_eq!(admitted.config.max_model_work, baseline.config.max_model_work);
+        assert_eq!(admitted.config.max_mask_visits, baseline.config.max_mask_visits);
+        assert_eq!(admitted.config.max_map_verification, baseline.config.max_map_verification);
+        assert_eq!(admitted.config.max_verification, baseline.config.max_verification);
+        assert_eq!(admitted.config.synthesis, baseline.config.synthesis);
+        assert_eq!(admitted.config.hierarchy, baseline.config.hierarchy);
+        assert_eq!(admitted.memory, baseline.memory);
+        assert_eq!(admitted.transport, baseline.transport);
+        args.source_dir = None; args.source_manifest = None;
+        args.snapshot = Some("explicit.snapshot".into());
+        args.expected_model_sha256 = Some("ab".repeat(32));
+        let snapshot = compact.validate(&args).unwrap();
+        assert_eq!(snapshot.encoding, admitted.encoding);
+        assert_eq!(snapshot.memory, admitted.memory);
+        args.preparation_mib = 1;
+        assert!(compact.validate(&args).is_err());
+    }
+}
+
+#[test]
+fn compact_per_record_question_refusals_happen_before_owned_population_io() {
+    for mode in [
+        &["--input-encoding", "safe-bpe-v1", "--synthesize-answer"][..],
+        &["--input-encoding", "safe-bpe-v1", "--synthesize-answer", "--hierarchical-answer"][..],
+        &["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-output-tokens", "0"][..],
+        &["--max-total-tokenizer-pair-bytes", "1"][..],
+    ] {
+        let (options, args) = arguments(mode);
+        assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+}

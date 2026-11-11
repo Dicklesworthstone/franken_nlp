@@ -1,5 +1,6 @@
 //! Complete original documents and private per-record questions on one stream.
 use super::*;
+use super::documents::admission::check_encoding_preparation;
 use std::io::{BufRead, Write};
 use crate::{
     batch::{self as stream, BatchCode, BatchItemFailure, BatchSummary,
@@ -70,6 +71,8 @@ impl NlpEngine {
             || config.planning.max_context_tokens != limits.native.context_tokens {
             return Err(HostedError::ModelIdentity);
         }
+        check_encoding_preparation(planner.encoding_workspace_bytes().map_err(HostedError::BatchSetup)?,
+            limits.preparation_reserve_bytes)?;
         let cohort_chunks = planner.uses_chunk_cohorts().then_some(config.mapping.reduction.map_batch_chunks);
         let hierarchy_groups = planner.hierarchy_cohort_schedule().map(|schedule| schedule.max_groups);
         let required = int4_question_document_corpus_requirements(planner.group_width(), config,

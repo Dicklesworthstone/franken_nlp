@@ -16,6 +16,7 @@ use crate::{
             question::{SourceQuestion, synthesis::{SourceQuestionSynthesis, QuestionSynthesisLimits,
                 hierarchy::QuestionHierarchyLimits}}}},
     validation::grounded_fields::GroundingBudget,
+    tokenizer::untrusted::{SafeBpeWorkLimits, UntrustedEncoding},
 };
 pub use crate::jobs::runner::source::document::SourceDocumentArgs;
 mod recipe;
@@ -83,6 +84,30 @@ impl Int4SourceDocumentJobPlanner {
         let recipe = Int4SourceDocumentJobRecipe::new(source.recipe, task, mapping, lifetime, limits.max_attempts)?;
         Ok(Self { planner: source.planner, identity: source.identity, group_width, budget,
             planning: source.planning, mapping, limits, recipe, owner: Arc::new(()) })
+    }
+    /// Admit compact source encoding for each complete document operation.
+    /// Preparation and reconstruction share one invocation-local ledger; the
+    /// authenticated recipe binds the policy and all four work ceilings.
+    /// Tokenizer counters are not journal columns. A preparation failure occurs
+    /// before the durable native-work debit and does not consume max_attempts;
+    /// a new invocation may prepare again under the same authenticated limits.
+    pub fn with_map_document_encoding(mut self, policy: UntrustedEncoding, complete: SafeBpeWorkLimits)
+        -> Result<Self, BatchFault> {
+        if !native_document::encoding::supported(self.task()) { return Err(BatchCode::InvalidLimits.into()); }
+        let planner = native_document::encoding::configure(&self.planner, policy, complete)?;
+        let mut identity = self.identity.clone(); identity.template_digest = *planner.template_digest();
+        crate::batch::source::grouped_int4::check_configuration_with_document_encoding(
+            &planner, &identity, self.budget, self.planning, None, self.group_width)?;
+        self.recipe.set_document_encoding(&planner)?;
+        self.planner = planner; self.identity = identity; self.owner = Arc::new(());
+        Ok(self)
+    }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.planner.document_encoding() }
+    pub fn map_document_encoding_limits(&self) -> Option<SafeBpeWorkLimits> {
+        self.planner.map_document_encoding_limits()
+    }
+    pub fn encoding_workspace_bytes(&self) -> Result<u64, BatchFault> {
+        self.planner.map_document_encoding_workspace_bytes().map_err(|_| BatchCode::InvalidLimits.into())
     }
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn group_width(&self) -> usize { self.group_width }
@@ -157,7 +182,7 @@ impl Int4SourceDocumentJobPlanner {
     }
     fn owns(&self, prepared: &PreparedInt4SourceDocument) -> Result<(), BatchItemFailure> {
         if !Arc::ptr_eq(&self.owner, &prepared.owner) { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
-        Ok(())
+        native_document::encoding::verify_operation(&self.planner, &prepared.operation)
     }
 }
 
@@ -169,11 +194,15 @@ pub struct PreparedInt4SourceDocument {
     expected: planning::Expected,
     work: JobWork,
     owner: Arc<()>,
+    operation: Arc<SourceTaskPlanner>,
 }
 impl PreparedInt4SourceDocument {
     pub fn chunk_count(&self) -> usize { self.expected.chunk_count() }
     pub fn planned_work(&self) -> JobWork { self.work }
     pub fn execution_identities(&self) -> &[ExecutionIdentity] { &self.identities }
+    pub fn map_document_encoding_work(&self) -> Result<Option<crate::tokenizer::untrusted::SafeBpeWork>, BatchFault> {
+        self.operation.map_document_encoding_work().map_err(|_| BatchCode::Admission.into())
+    }
 }
 
 fn validate_mapping(m: Int4SourceMapLimits, budget: TaskBudget, p: SourcePlanningLimits, job: JobLimits)

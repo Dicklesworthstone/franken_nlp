@@ -5,7 +5,7 @@ use crate::{grammar::mask::MaskWorkLimits, native_engine::strict_int4::Int4Work}
 pub(in crate::hosted::grouped_int4) struct DocumentAdmission<'a> {
     pub(in crate::hosted::grouped_int4) lease: &'a EngineLease,
     pub(in crate::hosted::grouped_int4) model: &'a Int4ModelIdentity,
-    pub(in crate::hosted::grouped_int4) task_spec: &'a str,
+    pub(in crate::hosted::grouped_int4) base: &'a ExecutionIdentity,
     pub(in crate::hosted::grouped_int4) kv_bytes: u64,
     pub(in crate::hosted::grouped_int4) mapping: Int4SourceMapLimits,
     pub(in crate::hosted::grouped_int4) result_bytes: u64,
@@ -15,12 +15,13 @@ impl Int4SourceDocumentBatchAdmission for DocumentAdmission<'_> {
     type Guard = Pending;
     fn admit(&mut self, request: Int4SourceDocumentAdmission<'_>)
         -> Result<(Vec<ExecutionIdentity>, Self::Guard), BatchItemFailure> {
-        check_document_request(self.model.group_width(), self.task_spec, self.kv_bytes,
+        check_document_request(self.model.group_width(), &self.base.task_spec, self.kv_bytes,
             self.mapping, self.result_bytes, self.output_tokens, &request)?;
         let mut identities = Vec::new();
         identities.try_reserve_exact(request.identities.len())
             .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
         for identity in request.identities {
+            check_document_encoding_identity(self.base, identity)?;
             constrained_int4::check_model(identity, self.model)
                 .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
             identities.push(identity.clone());
@@ -80,4 +81,27 @@ pub(in crate::hosted::grouped_int4) fn work_fits(work: Int4Work, ceiling: Int4Wo
         && work.attention_pairs <= ceiling.attention_pairs
         && work.projections.dot_products <= ceiling.projections.dot_products
         && work.projections.multiply_accumulates <= ceiling.projections.multiply_accumulates
+}
+
+/// A compact factory quotes one reusable encoder workspace, including its fresh
+/// per-document ledger owner. The existing input preparation reservation owns
+/// it through preflight, execution, cancellation and publication; do not add a
+/// second charge or multiply it by document/chunk/cohort population.
+pub(in crate::hosted::grouped_int4) fn check_encoding_preparation(required: u64, reserved: u64)
+    -> Result<(), HostedError> {
+    if required > reserved {
+        return Err(HostedError::Limits("INT4 source document encoding preparation reserve"));
+    }
+    Ok(())
+}
+
+/// Model identity and task are checked separately. These pinned identities
+/// bind the selected untrusted encoding and all complete-document ceilings,
+/// including when two policies happen to emit the same token sequence.
+pub(in crate::hosted::grouped_int4) fn check_document_encoding_identity(base: &ExecutionIdentity,
+    identity: &ExecutionIdentity) -> Result<(), BatchItemFailure> {
+    if identity.tokenizer_digest != base.tokenizer_digest || identity.template_digest != base.template_digest {
+        return Err(BatchItemFailure::fatal(BatchCode::Admission));
+    }
+    Ok(())
 }

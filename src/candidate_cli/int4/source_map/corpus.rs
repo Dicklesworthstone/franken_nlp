@@ -91,7 +91,7 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
         .mut_arg("max_checkpoints", |arg| arg.help("Nonrenewable cooperative checkpoint allowance for the ENTIRE stream"));
     let command = StreamArgs::augment_args(question::QuestionPolicyArgs::augment_args(
         question::synthesis::SynthesisArgs::augment_args(MappingArgs::augment_args(command))));
-    command
+    encoding::population_definition(command)
         .mut_arg("max_map_result_bytes", |arg| arg.help("Complete semantic answer document cap; transport and provenance framing are separate"))
         .mut_arg("max_total_mask_node_visits", |arg| arg.help("Complete-document mask allowance spanning discovery and optional synthesis"))
         .mut_arg("max_forward_positions", |arg| arg.help("Whole-stream forward ceiling across every document and synthesis pass"))
@@ -105,6 +105,7 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
 pub(in crate::candidate_cli::int4) struct CorpusLimits {
     common: Int4Limits,
     config: Int4QuestionDocumentBatchConfig,
+    encoding: Option<encoding::EncodingLimits>,
     transport: TransportLimits,
     memory: Int4QuestionDocumentMemoryRequirement,
     reduction_reserve_bytes: u64,
@@ -126,7 +127,11 @@ impl CorpusArgs {
         self.validate_options(args, AnswerOptions::default())
     }
     fn validate_options(&self, args: &Int4Args, options: AnswerOptions) -> Result<CorpusLimits, CandidateError> {
-        let mut common = self.source.validate(args)?;
+        let encoding = self.mapping.encoding.limits(args, &self.mapping,
+            !self.synthesis.flat.synthesize_answer, true)?;
+        let mut storage = args.clone();
+        storage.input_encoding = input_encoding::InputEncodingArgs::default();
+        let mut common = self.source.validate(&storage)?;
         let s = self.stream;
         self.mapping.validate(args, &self.source, common, s.cohort_chunks)?;
         self.synthesis.validate()?;
@@ -164,7 +169,8 @@ impl CorpusArgs {
             u64::from(budget.max_grammar_states) * 512, shared::OPTIONS_BYTES as u64 * 2])?;
         let passes = self.mapping.max_chunks as u64 + config.continuation_passes() as u64;
         let preparation_floor = sum(&[times(per_chunk, passes)?, 256 * MIB,
-            args.max_input_bytes as u64 * 64, (self.mapping.max_map_result_bytes as u64 + 4096) * 2])?;
+            args.max_input_bytes as u64 * 64, (self.mapping.max_map_result_bytes as u64 + 4096) * 2,
+            encoding.map(encoding::EncodingLimits::workspace_bytes).transpose()?.unwrap_or(0)])?;
         if common.preparation_bytes < preparation_floor { return Err(CandidateError::Arguments); }
         let framing = s.max_requests.checked_add(4).and_then(|n| n.checked_mul(FRAME_ALLOWANCE))
             .ok_or(CandidateError::Arguments)?;
@@ -191,7 +197,7 @@ impl CorpusArgs {
             memory.document_workspace_bytes, memory.output_reservation_bytes])?;
         common.minimum_memory_bytes = sum(&[grouped_memory_floor(args, common, execution)?, io_bytes])?;
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
-        Ok(CorpusLimits { common, config, transport, memory, reduction_reserve_bytes,
+        Ok(CorpusLimits { common, config, encoding, transport, memory, reduction_reserve_bytes,
             output_bytes: s.max_total_output_bytes, io_bytes, cli_preparation_bytes })
     }
     fn execute_owned<R: Read + Send + 'static, W: Write + Send + 'static>(

@@ -59,10 +59,8 @@ fn factory(synthesis: bool) -> Int4QuestionDocumentBatchPlanner {
     let p = planner(); Int4QuestionDocumentBatchPlanner::configured(Arc::clone(&p), identity(&p), WIDTH, config(synthesis)).unwrap()
 }
 fn prepared(factory: &Int4QuestionDocumentBatchPlanner, source: &str, question: &str) -> PreparedInt4QuestionDocument {
-    let plan = factory.plan(source, question, &mut Continue, false).unwrap();
-    let (expected, identities) = factory.snapshot(&plan, &mut Continue).unwrap();
-    PreparedInt4QuestionDocument { source: source.to_owned(), question: question.to_owned(),
-        expected, identities, owner: Arc::clone(&factory.owner) }
+    factory.prepare_with_control(source.to_owned(),
+        QuestionDocumentArgs { question: question.to_owned() }, &mut Continue).unwrap()
 }
 fn context(seq: u64, epoch: u64) -> BatchRequestContext {
     BatchRequestContext { request_seq: seq, epoch, input_line: seq, byte_offset: seq * 128 }
@@ -302,3 +300,5 @@ fn record_byte_limits_cancellation_and_metadata_bound_precede_native_authority()
     let mut c = config(false); c.max_verification.max_fields = 2_000_000;
     c.max_map_verification.max_matches = 2_000_000; c.validate().unwrap();
 }
+
+mod compact;

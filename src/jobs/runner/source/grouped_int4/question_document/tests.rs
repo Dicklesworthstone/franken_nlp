@@ -246,3 +246,5 @@ fn changed_schedule_cannot_spend_old_preparation_and_cancellation_stays_typed() 
         assert!(failure.stop); assert_eq!(failure.fault.cancellation, Some(cause));
     }
 }
+
+mod compact;

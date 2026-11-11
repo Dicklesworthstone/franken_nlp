@@ -14,8 +14,8 @@ use crate::{
 /// Retain this model-free encoder across corpus items. It emits no privileged
 /// template controls, even when their literal spellings occur in the document.
 pub struct SourceDocumentEncoder {
-    tokenizer: EmbeddedTokenizer,
-    controls: TemplateControlIds,
+    tokenizer: std::sync::Arc<EmbeddedTokenizer>,
+    controls: std::sync::Arc<TemplateControlIds>,
     control_digest: Sha256Digest,
     encoding: UntrustedEncoding,
     /// Explicit composed-operation authority, shared by every use of this
@@ -28,8 +28,8 @@ impl SourceDocumentEncoder {
             return Err(ExtractError::Contract("source control id outside vocabulary"));
         }
         Ok(Self {
-            tokenizer: EmbeddedTokenizer::pinned().map_err(|_| ExtractError::Tokenizer)?,
-            controls: controls.clone(), control_digest: control_digest(controls)?,
+            tokenizer: std::sync::Arc::new(EmbeddedTokenizer::pinned().map_err(|_| ExtractError::Tokenizer)?),
+            controls: std::sync::Arc::new(controls.clone()), control_digest: control_digest(controls)?,
             encoding: UntrustedEncoding::ByteFallback,
             encoding_work: None,
         })
@@ -57,6 +57,20 @@ impl SourceDocumentEncoder {
     pub fn cumulative_encoding_work(&self) -> Result<Option<SafeBpeWork>, ExtractError> {
         self.encoding_work.as_ref().map(|(_, work)| work.try_lock().map(|work| *work)
             .map_err(|_| ExtractError::Contract("source encoding ledger is busy or poisoned"))).transpose()
+    }
+    pub(crate) fn fork_map_document_operation(&self) -> Result<Self, ExtractError> {
+        let encoding_work = match (&self.encoding, self.cumulative_encoding_limits()) {
+            (UntrustedEncoding::ByteFallback, None) => None,
+            (UntrustedEncoding::SafeBpeV1(call), Some(limits)) => {
+                call.validate().and_then(|()| limits.validate())
+                    .map_err(|_| ExtractError::Contract("invalid document operation encoding policy"))?;
+                Some((limits, std::sync::Mutex::new(SafeBpeWork::default())))
+            },
+            _ => return Err(ExtractError::Contract("document operation requires a cumulative encoding policy")),
+        };
+        Ok(Self { tokenizer: std::sync::Arc::clone(&self.tokenizer),
+            controls: std::sync::Arc::clone(&self.controls), control_digest: self.control_digest,
+            encoding: self.encoding.clone(), encoding_work })
     }
     pub(crate) fn require_byte_encoding(&self) -> Result<(), ExtractError> {
         if self.encoding != UntrustedEncoding::ByteFallback {

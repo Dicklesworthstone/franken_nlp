@@ -16,6 +16,7 @@ use crate::{
                 QuestionSynthesisLimits, hierarchy::{INT4_QUESTION_HIERARCHY_EXECUTION,
                     QuestionHierarchyLimits}}}}},
     validation::grounded_fields::GroundingBudget,
+    tokenizer::untrusted::{SafeBpeWorkLimits, UntrustedEncoding},
 };
 pub use crate::batch::source::grouped_int4::question::QuestionDocumentArgs;
 pub mod memory;
@@ -46,6 +47,8 @@ pub struct Int4QuestionDocumentJobRecipe {
     hierarchy_cohorts: Option<HierarchyScheduleRecipe>,
     max_stored_result_bytes: u64,
     max_output_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<crate::batch::source::grouped_int4::document::encoding::EncodingRecipe>,
 }
 #[derive(Serialize)]
 struct MappingRecipe {
@@ -98,7 +101,8 @@ impl Int4QuestionDocumentJobRecipe {
                 max_mask_visits: per_document_masks, verification: map_verification },
             verification, synthesis, hierarchy, max_question_bytes, max_map_verification, max_verification,
             max_attempts: limits.max_attempts, chunk_cohorts: compiler.uses_chunk_cohorts(), hierarchy_cohorts,
-            max_stored_result_bytes: compiler.max_result_bytes(), max_output_tokens: compiler.max_output_tokens() };
+            max_stored_result_bytes: compiler.max_result_bytes(), max_output_tokens: compiler.max_output_tokens(),
+            input_encoding: compiler.encoding_recipe()? };
         bounded_json(&recipe, RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
         Ok(recipe)
     }
@@ -118,6 +122,21 @@ impl Int4QuestionDocumentJobPlanner {
         let recipe = Int4QuestionDocumentJobRecipe::new(&compiler, limits)?;
         Ok(Self { compiler, recipe, limits })
     }
+    /// One invocation-local source/question encoding scope pays preparation and
+    /// reconstruction. Tokenizer work is not a journal counter: preparation
+    /// failures precede persisted attempts, and resume enforces the same policy
+    /// and ceilings while allocating a new operation for the pending document.
+    pub fn with_map_document_encoding(mut self, policy: UntrustedEncoding, complete: SafeBpeWorkLimits)
+        -> Result<Self, BatchFault> {
+        self.compiler = self.compiler.with_map_document_encoding(policy, complete)?;
+        self.recipe = Int4QuestionDocumentJobRecipe::new(&self.compiler, self.limits)?;
+        Ok(self)
+    }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.compiler.document_encoding() }
+    pub fn map_document_encoding_limits(&self) -> Option<SafeBpeWorkLimits> {
+        self.compiler.map_document_encoding_limits()
+    }
+    pub fn encoding_workspace_bytes(&self) -> Result<u64, BatchFault> { self.compiler.encoding_workspace_bytes() }
     pub fn batch_planner(&self) -> &Int4QuestionDocumentBatchPlanner { &self.compiler }
     pub fn execution_identity(&self) -> &ExecutionIdentity { self.compiler.base_execution_identity() }
     pub fn config(&self) -> &Int4QuestionDocumentBatchConfig { self.compiler.config() }

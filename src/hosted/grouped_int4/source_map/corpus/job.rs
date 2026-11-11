@@ -68,6 +68,8 @@ impl NlpEngine {
             || config.planning.max_context_tokens != host.native.context_tokens {
             return Err(HostedError::ModelIdentity.into());
         }
+        check_encoding_preparation(planner.encoding_workspace_bytes().map_err(HostedError::BatchSetup)?,
+            host.preparation_reserve_bytes)?;
         let chunks = planner.uses_chunk_cohorts().then_some(config.mapping.reduction.map_batch_chunks);
         let groups = planner.hierarchy_cohort_schedule().map(|schedule| schedule.max_groups);
         let quote = int4_question_document_job_requirements(planner.group_width(), config,

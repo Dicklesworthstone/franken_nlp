@@ -16,7 +16,7 @@ mod question;
 pub(in crate::candidate_cli::int4) mod corpus;
 mod synthesis;
 mod keyphrases;
-mod encoding;
+pub(super) mod encoding;
 pub(super) mod documents;
 #[cfg(feature = "asupersync-runtime")]
 mod runtime;
@@ -110,7 +110,7 @@ pub(super) fn definitions() -> Vec<clap::Command> {
     }).collect()
 }
 pub(super) fn document_job_definitions() -> Vec<clap::Command> {
-    definitions_with_cohorts(true)
+    definitions_with_cohorts(true).into_iter().map(encoding::population_definition).collect()
 }
 fn definitions_with_cohorts(cohorts: bool) -> Vec<clap::Command> {
     [(Kind::Ner, "ner-map"), (Kind::Keyphrases, "keyphrases-map"),
@@ -168,7 +168,7 @@ pub(super) struct MapLimits {
     pub hierarchy_cohorts: Option<Int4HierarchyCohortSchedule>,
     /// Additional simultaneous plan/source owners beyond the existing reserve.
     pub hierarchy_preparation_bytes: u64,
-    encoding: Option<encoding::EncodingLimits>,
+    pub(super) encoding: Option<encoding::EncodingLimits>,
 }
 impl MapArgs {
     pub(super) fn planning(&self, args: &Int4Args) -> crate::tasks::source_planning::SourcePlanningLimits {
@@ -207,8 +207,8 @@ impl MapArgs {
             || self.cohort_chunks.is_some() || self.cohort_hierarchy_groups.is_some()) {
             return Err(CandidateError::Arguments);
         }
-        let encoding = m.encoding.limits(args, &m, !document_job && !map_only
-            && self.summary.is_none_or(|summary| !summary.synthesis.synthesize_summary),
+        let encoding = m.encoding.limits(args, &m,
+            self.summary.is_none_or(|summary| !summary.synthesis.synthesize_summary),
             self.kind == Kind::Answer)?;
         // Single-source storage validation prices the original input envelope.
         // Compact map probes instead use the separately quoted per-chunk

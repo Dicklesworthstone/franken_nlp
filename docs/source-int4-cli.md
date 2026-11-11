@@ -179,8 +179,10 @@ complete_limits)` once for the complete operation, retain that same planner
 through preflight/replanning, and admit
 `map_document_encoding_workspace_bytes()`. The one-request
 `with_document_encoding` constructor alone does not authorize repeated map
-probes. Neural summary/answer synthesis and hierarchies, source corpora and
-durable source jobs continue to require their existing byte-only policy.
+probes. Neural summary/answer synthesis and hierarchies continue to require
+their existing byte-only policy. Plain source corpora and complete-document
+jobs use explicitly configured population factories with per-document ledgers,
+as described below.
 
 #### Compact complete-document QA
 
@@ -226,9 +228,65 @@ and Unicode-scalar coordinates. Encoding literal role/tool marker text never
 grants it template-control authority. Structural citation validity does not
 certify semantic entailment or answer quality. Compact QA currently supports
 independent passage answers, native chunk cohorts and persistent numerical
-teams; combining it with
-neural synthesis, hierarchy, corpus or retained-job routes is refused before
-private IO. Numerical teams and chunk cohorts cannot be combined in one call.
+teams. Combining compact encoding with neural synthesis or hierarchy is
+refused before private IO. Independent QA also supports fixed-question corpora,
+per-record-question corpora and retained complete-document jobs through the
+population policy below. Numerical teams and chunk cohorts cannot be combined
+in one call.
+
+#### Compact source corpora and retained complete-document jobs
+
+The same explicit `--input-encoding safe-bpe-v1` policy is available on
+`ner-corpus`, `keyphrases-corpus`, `summarize-corpus`, and
+`source-corpus ner|keyphrases|summarize|answer`. The fixed-question
+`source-corpus answer` route keeps its existing question file; `answer-corpus`
+keeps each record's private question. Plain independent maps, exact keyphrase
+and cited-summary reducers, and their existing native chunk cohorts are
+supported. Neural synthesis and hierarchies remain byte-only.
+
+```sh
+fnlp candidate source-int4 ner-corpus documents.ndjson \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 16384 --input-encoding safe-bpe-v1 \
+  --max-chunk-bytes 8192 --cohort-chunks 2
+```
+
+Each complete document operation owns one fresh tokenizer ledger. The
+prepared record retains that exact planner through execution reconstruction,
+so rejected probes, complete preflight and final compilation all consume the
+same allowance. Immutable tokenizer and control-token assets are shared.
+A chunk or host boundary cannot renew the document's budget; a new document
+gets its own explicitly admitted scope. The four `--max-total-tokenizer-*`
+ceilings apply to that scope. Existing stream record, input, native-work,
+mask and verification limits continue to bound the complete stream across
+documents and flush controls. Encoder workspace is included in preparation
+admission before population IO and reused by successive documents.
+
+`document-job start|resume ner|keyphrases|summarize|answer` supports the same
+plain modes, including raw `summarize --map-only`.
+`answer-document-job start|resume` supports independent answers with per-record
+questions. The private retained recipe and execution identity authenticate
+the exact encoding policy and every per-document ceiling. Repeat the selected
+flags on resume; changing them is refused before results can be mixed.
+
+Tokenizer usage is **not** persisted as a lifetime counter. An explicit resume
+can create a fresh document-operation ledger under the same authenticated
+limits. Preparation occurs before the existing durable native-work/attempt
+debit, so failed preparation does not consume a persisted attempt. This policy
+does not replace or renew the existing durable native-work, mask or persisted
+attempt accounting. Neither chunks nor partially prepared documents become
+durable results.
+
+Compact population provenance adds `input_encoding` with the policy,
+`complete_document_limits`, and
+`budget_scope: "complete_document_operation"`. It does not report the unused
+factory ledger as consumed work. Byte-default frames and stored semantic
+document shapes remain unchanged. Library callers construct the existing
+byte-default source/question batch or job factory, then call
+`with_map_document_encoding(policy, complete_limits)` before selecting its
+native cohort schedule. The factory validates supported task modes and
+creates a private planner for each original document.
 
 Added regression definitions cover actual compact prompt work, Unicode and
 literal-control preservation, per-call and cumulative exhaustion, cancellation,

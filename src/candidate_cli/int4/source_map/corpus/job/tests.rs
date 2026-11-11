@@ -195,3 +195,42 @@ fn retained_question_resume_selects_no_external_population_or_fallback() {
     assert!(matches("resume", &["original.ndjson", "--use-retained-input",
         "--max-retained-input-mib", "8"]).is_err());
 }
+
+#[test]
+fn compact_question_jobs_keep_per_attempt_policy_separate_from_durable_lifetime() {
+    for mode in ["start", "resume"] {
+        for cohorts in [&[][..], &["--cohort-chunks", "2"][..]] {
+            let mut flags = cohorts.to_vec();
+            flags.extend_from_slice(&["--input-encoding", "safe-bpe-v1",
+                "--max-total-tokenizer-input-bytes", "123456",
+                "--max-total-tokenizer-pair-checks", "234567"]);
+            let (command, args) = parsed(mode, &flags);
+            let common = command.args.validate(&args).unwrap();
+            let job = lifetime(&command, &args);
+            let admitted = command.args.lifetime_limits(&args, common, AnswerOptions::default(), job).unwrap();
+            let encoding = admitted.encoding.unwrap();
+            assert_eq!(encoding.complete.max_input_bytes, 123456);
+            assert_eq!(encoding.complete.max_pair_checks, 234567);
+            assert!(encoding.workspace_bytes().unwrap() < common.preparation_bytes);
+            assert_eq!(admitted.config.max_model_work, job.max_work.int4_model_work());
+            assert_eq!(admitted.config.max_mask_visits, job.max_work.mask_node_visits);
+            assert_eq!(admitted.config.max_verification.max_fields,
+                admitted.config.verification.max_fields * job.max_attempts as usize);
+            let mut insufficient = args.clone(); insufficient.preparation_mib = 1;
+            assert!(command.args.validate(&insufficient).is_err());
+        }
+    }
+}
+
+#[test]
+fn compact_question_jobs_refuse_unimplemented_synthesis_and_unbounded_encoding_options() {
+    for flags in [
+        &["--input-encoding", "safe-bpe-v1", "--synthesize-answer"][..],
+        &["--input-encoding", "safe-bpe-v1", "--synthesize-answer", "--hierarchical-answer"][..],
+        &["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-input-bytes", "0"][..],
+        &["--max-total-tokenizer-output-tokens", "1"][..],
+    ] {
+        let (command, args) = parsed("start", flags);
+        assert!(command.args.validate(&args).is_err());
+    }
+}

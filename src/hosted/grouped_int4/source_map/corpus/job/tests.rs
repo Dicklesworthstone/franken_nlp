@@ -199,3 +199,49 @@ fn private_planner_request_reader_and_guards_cross_the_owned_send_boundary() {
     send::<Charged<QuestionJobInput<Cursor<Vec<u8>>>>>();
     let _host = NlpEngine::job_int4_question_documents::<Cursor<Vec<u8>>>;
 }
+
+#[test]
+fn compact_question_job_preparation_is_charged_once_for_both_population_owners() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding};
+    let (config, job, host) = fixture(0);
+    let (source_planner, _) = super::super::super::tests::fixture(SourceMapTask::Summarize(Default::default()), WIDTH);
+    let mut id = identity();
+    id.tokenizer_digest = source_planner.tokenizer_digest();
+    id.template_digest = *source_planner.template_digest();
+    let compiler = Int4QuestionDocumentBatchPlanner::for_planning_fixture(
+        Arc::new(source_planner), id, WIDTH, config).unwrap();
+    let planner = Int4QuestionDocumentJobPlanner::new(compiler, job).unwrap();
+    assert_eq!(planner.encoding_workspace_bytes().unwrap(), 0);
+    check_encoding_preparation(0, host.preparation_reserve_bytes).unwrap();
+    let call = SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 4096,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
+    let complete = SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 };
+    let planner = planner.with_map_document_encoding(UntrustedEncoding::SafeBpeV1(call), complete).unwrap();
+    let bytes = planner.encoding_workspace_bytes().unwrap();
+    assert_eq!(bytes, call.requirements().unwrap().workspace_bytes + 512);
+    assert_eq!(planner.map_document_encoding_limits(), Some(complete));
+    for ownership in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
+        let original = int4_question_document_job_requirements(WIDTH, config, job, host,
+            1 << 20, None, None, ownership).unwrap();
+        let mut exact_host = host;
+        exact_host.preparation_reserve_bytes = bytes;
+        check_encoding_preparation(bytes, exact_host.preparation_reserve_bytes).unwrap();
+        let exact = int4_question_document_job_requirements(WIDTH, config, job, exact_host,
+            1 << 20, None, None, ownership).unwrap();
+        assert_eq!(exact.document.input_bytes - bytes,
+            original.document.input_bytes - host.preparation_reserve_bytes);
+        assert_eq!(exact.population_buffer_bytes - bytes,
+            original.population_buffer_bytes - host.preparation_reserve_bytes);
+        assert_eq!(exact.document.native, original.document.native);
+        assert_eq!(exact.document.workspace_bytes, original.document.workspace_bytes);
+        assert_eq!(exact.document.document_workspace_bytes, original.document.document_workspace_bytes);
+        assert_eq!(exact.document.output_reservation_bytes, original.document.output_reservation_bytes);
+        exact_host.preparation_reserve_bytes -= 1;
+        assert!(check_encoding_preparation(bytes, exact_host.preparation_reserve_bytes).is_err());
+        let short = int4_question_document_job_requirements(WIDTH, config, job, exact_host,
+            1 << 20, None, None, ownership).unwrap();
+        assert_eq!(exact.document.input_bytes - short.document.input_bytes, 1);
+        assert_eq!(exact.population_buffer_bytes - short.population_buffer_bytes, 1);
+    }
+}

@@ -4,7 +4,7 @@
 //! TemplateBuilder. Caller text is spliced afterward as exact untrusted tokens.
 //! Prepared plans bind the WHOLE admitted identity, not merely task-owned fields.
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, sync::Arc};
 use serde::{Deserialize, Serialize};
 use crate::{
     canonjson,
@@ -189,9 +189,9 @@ fn check_envelope(result: &SourceTaskResult, cap: u64) -> Result<(), SourcePlann
 /// Reusable tokenizer, source encoder, control census and trusted prompt recipe.
 /// This is static dispatch over four shipped tasks, not a plugin registry.
 pub struct SourceTaskPlanner {
-    tokenizer: EmbeddedTokenizer,
+    tokenizer: Arc<EmbeddedTokenizer>,
     encoder: SourceDocumentEncoder,
-    controls: TemplateControlIds,
+    controls: Arc<TemplateControlIds>,
     eos: u32,
     template_digest: Sha256Digest,
     byte_template_digest: Sha256Digest,
@@ -222,7 +222,7 @@ impl SourceTaskPlanner {
             &(SOURCE_PROMPT_VERSION, templates, census, eos, assets)
         ).map_err(|_| SourcePlanningError::Serialization)?);
         let encoder = SourceDocumentEncoder::pinned(controls)?;
-        Ok(Self { tokenizer, encoder, controls: controls.clone(), eos, template_digest,
+        Ok(Self { tokenizer: Arc::new(tokenizer), encoder, controls: Arc::new(controls.clone()), eos, template_digest,
             byte_template_digest: template_digest })
     }
     /// Select one complete source request's untrusted encoding before deriving
@@ -247,7 +247,8 @@ impl SourceTaskPlanner {
     /// share this
     /// nonrenewable ledger for the planner's entire lifetime. Create another
     /// explicitly admitted planner for a different document; there is no reset.
-    /// Neural synthesis, corpus streams and durable jobs remain byte-only.
+    /// Population factories explicitly admit a fresh ledger per original
+    /// document and retain it through reconstruction. Neural synthesis stays byte-only.
     pub fn with_map_document_encoding(mut self, policy: UntrustedEncoding,
         work: crate::tokenizer::untrusted::SafeBpeWorkLimits) -> Result<Self, SourcePlanningError> {
         if !matches!(policy, UntrustedEncoding::SafeBpeV1(_)) {
@@ -267,6 +268,17 @@ impl SourceTaskPlanner {
     pub fn map_document_encoding_work(&self) -> Result<Option<crate::tokenizer::untrusted::SafeBpeWork>, SourcePlanningError> {
         Ok(self.encoder.cumulative_encoding_work()?)
     }
+    /// Internal population boundary: one explicitly admitted original document
+    /// owns a fresh ledger while immutable tokenizer/control tables are shared.
+    /// Its prepared receipt retains this operation through execution replanning;
+    /// neither chunk probes nor reconstruction call this factory again.
+    pub(crate) fn fork_map_document_operation(&self) -> Result<Self, SourcePlanningError> {
+        self.map_document_encoding_workspace_bytes()?;
+        Ok(Self { tokenizer: Arc::clone(&self.tokenizer),
+            encoder: self.encoder.fork_map_document_operation()?,
+            controls: Arc::clone(&self.controls), eos: self.eos,
+            template_digest: self.template_digest, byte_template_digest: self.byte_template_digest })
+    }
     /// Reserve this payload in addition to the retained task-plan estimate.
     /// The same workspace is reused sequentially by probes and chunk plans.
     pub fn map_document_encoding_workspace_bytes(&self) -> Result<u64, SourcePlanningError> {
@@ -274,6 +286,11 @@ impl SourceTaskPlanner {
             (UntrustedEncoding::ByteFallback, None) => Ok(0),
             (UntrustedEncoding::SafeBpeV1(call), Some(work)) => {
                 work.validate().map_err(|_| SourcePlanningError::Contract("invalid source map encoding budget"))?;
+                // The operation owns only shared immutable tables plus its
+                // private counter; the retained plan reserve prices all text.
+                if std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>() > 512 {
+                    return Err(SourcePlanningError::Contract("source document operation workspace"));
+                }
                 call.requirements().map(|quote| quote.workspace_bytes + 512)
                     .map_err(|_| SourcePlanningError::Contract("invalid source map encoding workspace"))
             },
