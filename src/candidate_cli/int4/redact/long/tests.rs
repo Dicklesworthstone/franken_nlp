@@ -303,3 +303,86 @@ fn source_scalar_and_pinned_snapshot_cohorts_match_after_complete_repartitioned_
         }
     }
 }
+
+#[test]
+fn document_teams_preserve_both_stage_authority_and_admit_one_worker_workspace() {
+    for group in [3, 128, 10752] {
+        let mut serial = command(&[]);
+        serial.args.group_width = group; serial.args.max_load_mib = 65536; serial.args.memory_mib = 65536;
+        let selected = options(&serial);
+        let baseline = selected.validate(&serial.args).unwrap();
+        let baseline_detector = selected.detector(&serial.args, baseline, NerOptions::default());
+        let baseline_request = crate::canonjson::canonical_bytes(&selected.request(&serial.args, baseline)).unwrap();
+        assert_eq!(baseline.common.compute.threads, 1);
+        assert_eq!(baseline.common.compute.workspace_bytes, 0);
+        for threads in [2, 3, 4, 64] {
+            let text = threads.to_string();
+            let mut threaded = command(&["--compute-threads", &text]);
+            threaded.args.group_width = group; threaded.args.max_load_mib = 65536; threaded.args.memory_mib = 65536;
+            let settings = options(&threaded);
+            let limits = settings.validate(&threaded.args).unwrap();
+            let detector = settings.detector(&threaded.args, limits, NerOptions::default());
+            let extra = crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(threads, group).unwrap();
+            assert_eq!(limits.common.compute.threads, threads);
+            assert_eq!(limits.common.compute.workspace_bytes, extra);
+            assert_eq!(limits.common.native, baseline.common.native);
+            assert_eq!(limits.workspace_bytes, baseline.workspace_bytes);
+            assert_eq!(limits.edit_bytes, baseline.edit_bytes);
+            assert!(limits.cohort.is_none());
+            assert_eq!(detector.per_chunk, baseline_detector.per_chunk);
+            assert_eq!(detector.mapping.chunks, baseline_detector.mapping.chunks);
+            assert_eq!(detector.mapping.max_model_work, baseline_detector.mapping.max_model_work);
+            assert_eq!(detector.mapping.mask_visits_per_chunk, baseline_detector.mapping.mask_visits_per_chunk);
+            assert_eq!(detector.mapping.max_mask_visits, baseline_detector.mapping.max_mask_visits);
+            assert_eq!(detector.mapping.verification, baseline_detector.mapping.verification);
+            assert_eq!(detector.mapping.reduction.map_batch_chunks, 1);
+            assert_eq!(detector.mapping.reduction.max_result_bytes, baseline_detector.mapping.reduction.max_result_bytes);
+            assert_eq!(crate::canonjson::canonical_bytes(&settings.request(&threaded.args, limits)).unwrap(), baseline_request);
+            // The existing loader/execution peak may dominate worker scratch.
+            // One persistent workspace can add at most its declared bytes;
+            // neither chunks nor the fresh verification stage multiply it.
+            assert!(limits.common.minimum_memory_bytes >= baseline.common.minimum_memory_bytes);
+            assert!(limits.common.minimum_memory_bytes <= baseline.common.minimum_memory_bytes + extra);
+            let mut no_verify = settings.clone(); no_verify.redaction.flags.no_verify = true;
+            let no_verify_limits = no_verify.validate(&threaded.args).unwrap();
+            assert_eq!(no_verify_limits.common.minimum_memory_bytes, limits.common.minimum_memory_bytes);
+            assert_eq!(no_verify_limits.common.compute, limits.common.compute);
+            let mut narrow = threaded.args.clone();
+            narrow.memory_mib = limits.common.minimum_memory_bytes.saturating_sub(1) / MIB;
+            assert!(settings.validate(&narrow).is_err());
+            narrow.memory_mib = limits.common.minimum_memory_bytes.div_ceil(MIB);
+            settings.validate(&narrow).unwrap();
+        }
+    }
+    let pin = "ab".repeat(32);
+    let snapshot = parsed(&["--snapshot", "existing.snapshot", "--expected-model-sha256", &pin,
+        "--compute-threads", "3"]).unwrap();
+    assert_eq!(options(&snapshot).validate(&snapshot.args).unwrap().common.compute.threads, 3);
+}
+
+#[test]
+fn mixed_or_unwired_document_team_schedules_refuse_before_any_private_io() {
+    for flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+        vec!["--compute-threads", "18446744073709551615"],
+        vec!["--compute-threads", "2", "--cohort-chunks", "1"],
+        vec!["--compute-threads", "2", "--cohort-chunks", "3"]] {
+        if let Ok(command) = parsed(&["--source-dir", "d", "--source-manifest", "m"]
+            .into_iter().chain(flags).collect::<Vec<_>>()) {
+            assert_eq!(command.execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+        }
+    }
+    let command = command(&["--compute-threads", "3"]);
+    let settings = options(&command);
+    assert!(settings.redaction.validate(&command.args).is_err(), "short redaction retains its serial owner");
+    for retained in [false, true] {
+        assert!(settings.validate_population(&command.args, retained).is_err(),
+            "a standalone team cannot enter corpus/job execution without an invocation owner");
+    }
+    let mut injected = settings.clone(); injected.cohort_chunks = Some(2);
+    assert_eq!(injected.execute(command.args.clone(), &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+    let help = definition().render_long_help().to_string().split_whitespace().collect::<Vec<_>>().join(" ");
+    for phrase in ["--compute-threads N", "freshly partitioned verification", "one worker workspace",
+        "Workers join before", "Cannot combine with --cohort-chunks"] {
+        assert!(help.contains(phrase), "missing {phrase}");
+    }
+}

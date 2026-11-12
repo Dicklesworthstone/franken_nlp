@@ -305,7 +305,8 @@ fnlp doctor                          # idempotent self-check/repair
 ## Explicit multicore INT4 tasks
 
 Buffered `fnlp candidate source-int4 generate`, `chat`, `classify`, `sentiment`,
-`judge`, `extract`, `ner`, `keyphrases`, `summarize` and `answer` accept
+`judge`, `extract`, `ner`, `keyphrases`, `summarize`, `answer` and
+`redact-document` accept
 `--compute-threads N`, as do live `stream generate|chat` requests and resident
 `score-batch --task classify|sentiment|judge`, `extract-batch`, `ner-batch`,
 `keyphrases-batch`, `summarize-batch` and `answer-batch` streams, and retained
@@ -378,13 +379,15 @@ schedule and declared width; it does not invent per-item projection receipts.
 The required `run_complete` is staged under the existing transport budget and
 published after all workers join, inside the original invocation and deadline.
 
-A worker count above one cannot combine with `--prefill-rows`, `--cohort-heads`
-or `--cohort-documents`; text batches, complete-document maps, other corpora and
-durable tasks other than generation/chat do not expose this option. Invalid
-widths, incompatible schedules and insufficient memory refuse before private
-IO, and a hosted request cannot exceed its installed child-thread envelope.
-Worker teams can combine with compact input on the tasks that expose it;
-judgment retains its byte-indexed evidence contract and byte-fallback input.
+A worker count above one cannot combine with explicit prompt or sequence
+cohort schedules such as `--prefill-rows`, `--cohort-heads`,
+`--cohort-documents` or `--cohort-chunks`. The task sections below describe
+additional supported complete-document maps, corpora and retained jobs.
+Invalid widths, incompatible schedules and insufficient memory refuse before
+private IO, and a hosted request cannot exceed its installed child-thread
+envelope. Worker teams can combine with compact input on the tasks that
+expose it, including judgment and faithfulness populations; original-source
+evidence remains byte-exact.
 
 Regression definitions cover exact row arithmetic, model/kernel binding,
 one-time work charging, persistent worker reuse, shared checkpoint exhaustion,
@@ -2231,7 +2234,19 @@ fnlp candidate source-int4 redact-document transcript.txt \
 
 The source-conversion alternative uses the same `--source-dir`,
 `--source-manifest`, `--group-width` and explicit kernel contract as
-single-context redaction. Masking remains the default. `--action placeholder`,
+single-context redaction.
+
+`--compute-threads N` reuses one admitted numerical output-row team across
+every original-source NER chunk and every fresh verification chunk. Width
+`1` keeps serial execution; widths `2..64` admit worker scratch and a process
+thread ceiling of `N + 1` before key, document or model IO. One engine and
+one set of native, mask and evidence allowances span the operation. Workers
+join before the guarded result is published. An optional `compute` receipt
+reports actual completed projections and rows; it is omitted in serial mode.
+Multiple workers cannot combine with any explicit `--cohort-chunks`.
+`redact-corpus` and `redact-job` retain their existing schedules.
+
+Masking remains the default. `--action placeholder`,
 `--action pseudonymize`, `--ner-options`, rule selection and sensitive
 `--include-map` use the same policy. Full256 pseudonymization still accepts a
 binary key only from stdin with a separate document file; an expected key
@@ -2287,7 +2302,9 @@ flushing. This command processes one document; it does not retain a job.
 
 Library callers use `Int4DocumentRedactor`, `Int4LongRedactionConfig` and
 `NlpEngine::redact_int4_document` with the actual resident model and pinned
-planner/vocabulary. Source, admission and receipt fixtures are authored;
+planner/vocabulary. `redact_int4_document_with_threads` adds an explicit
+physical width and returns the guarded semantic result with actual compute
+counters. Source, admission and receipt fixtures are authored;
 compilation, model-present execution and quality qualification remain pending
 controller-selected gates.
 

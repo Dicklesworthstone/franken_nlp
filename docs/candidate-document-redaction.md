@@ -265,9 +265,69 @@ run in this session. Shared physical-step counts are structural data, not a
 latency or throughput measurement. DSR compilation/tests, actual-model parity,
 NER quality and target-host performance remain pending.
 
+## Persistent numerical teams for INT4 document redaction
+
+The one-shot `source-int4 redact-document` command accepts
+`--compute-threads N`. Width one preserves serial execution; widths two
+through 64 keep one numerical output-row team alive across every original
+NER chunk, transactional editing, and every newly partitioned verification
+chunk. The same native engine uses the selected checked integer kernel and
+resident weights throughout the operation.
+
+```sh
+fnlp candidate source-int4 redact-document report.txt \
+  --snapshot ./model.int4 --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 24576 --compute-threads 4
+```
+
+The memory allowance remains illustrative. The CLI admits one reusable worker
+workspace and the process thread envelope before key, source, options or
+model IO. For width `N`, the configured process ceiling is `N + 1`: one
+runtime thread, one coordinator, and `N - 1` worker children. Worker scratch
+does not multiply with chunk count or with the verification stage. Actual
+process RSS and OS thread-stack memory are not certified by this quote.
+
+All five native work axes, mask visits, rule limits and both independent
+grounding pools retain their existing scopes. The transformed text still
+receives a fresh partition and detector scan under the remaining allowances.
+A new chunk or verification stage does not create a new team or renew work.
+The physical width does not change model, task, key or semantic identity.
+
+Multiple workers cannot combine with any explicit `--cohort-chunks`,
+including a width of one. The CLI also refuses prompt prefill and selected
+output rows on this route. Unsupported widths and incompatible schedules
+refuse before private IO. `redact`, `redact-corpus` and
+`redact-job start|resume` keep their existing schedules and do not expose
+this option.
+
+The threaded route keeps the serial
+`fnlp-candidate-int4-redact-document-v1` protocol and unchanged semantic
+`output`. An optional top-level `compute` receipt records actual completed
+team projections, output rows, worker rows and physical width; width-one
+responses omit it. These counters are not a throughput measurement, parity
+certificate or detector-quality claim. Residual detection and execution
+failure continue to prevent publication of a successful edited result.
+
+Embedding applications call `NlpEngine::redact_int4_document_with_threads`
+with the same source, planner, vocabulary, redaction configuration, optional
+pseudonym scope and kernel as the serial method, followed by explicit worker
+width and cancellation. It returns
+`HostedInt4TeamResult<Int4LongRedactionRun>`, retaining output ownership.
+The host requires an installed thread envelope that can admit the selected
+width. `int4_task_team_workspace_bytes` quotes the additional worker scratch.
+The team dispatch joins every worker before returning the guarded result,
+including cancellation and error paths; the CLI retains it through complete
+serialization, writing and flushing.
+
+Source regression definitions cover command routing, incompatible schedules,
+one-workspace admission, process-thread capacity, typed failure handling and
+serial/parallel response framing. Model-present parity gates require the
+separately authorized execution environment. Compilation, executable tests,
+actual-model parity and performance remain **UNRUN** for this change.
+
 ## Validation handoff
 
-The implementation adds 26 model-free regression definitions: 12 core, five host,
+The original INT8 composition adds 26 model-free regression definitions: 12 core, five host,
 five CLI (including a feature-disabled test), and four pinned-preflight/delivery
 checks. They cover whole-text rules across neural boundaries, repeated Unicode
 mentions, corrupt final evidence, full source coverage, overlap provenance,

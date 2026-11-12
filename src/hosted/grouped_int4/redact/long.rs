@@ -1,6 +1,7 @@
 //! Complete-document INT4 redaction on one physically owned invocation.
 use super::*;
 mod cohort;
+mod team;
 use crate::{
     tasks::{redact::{actions::VerificationStatus, grouped_int4::long::{
         Int4DocumentRedactor, Int4LongRedactionConfig, Int4LongRedactionError,

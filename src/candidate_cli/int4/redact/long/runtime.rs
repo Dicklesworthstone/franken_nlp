@@ -2,7 +2,7 @@
 use super::*;
 use std::{sync::Arc, time::{Duration, Instant}};
 use crate::{
-    NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
+    NlpEngine, MemoryClass,
     hosted::{CancellationToken, HostedError, Int4HostError, NativeLimits, RunLimits,
         RedactConfig, RedactionPseudonyms},
     native_engine::{decode::{DecodeCancellationKind, DecodeStepControl},
@@ -42,6 +42,8 @@ fn execution_error(error: HostedError) -> CandidateError {
             error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution),
         HostedError::Int4(Int4HostError::Redaction(error)) =>
             error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution),
+        HostedError::Int4(Int4HostError::Native(
+            crate::native_engine::strict_int4::StrictInt4Error::Cancelled(cause))) => cancelled(cause),
         HostedError::Reservation(_) => CandidateError::Memory,
         HostedError::ModelIdentity | HostedError::ResourceDomain => CandidateError::Identity,
         _ => CandidateError::Execution,
@@ -132,12 +134,8 @@ pub(super) fn execute(args: Int4Args, command: DocumentArgs, _admitted: Document
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: common.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().map_err(|_| CandidateError::Runtime)?;
+    let engine = NlpEngine::builder().resource_config(compute::resource_config(common))
+        .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
     let _preparation = lease.reserve(MemoryClass::JobBuffers, common.preparation_bytes)
         .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
@@ -228,10 +226,18 @@ pub(super) fn execute(args: Int4Args, command: DocumentArgs, _admitted: Document
             .and_then(|bytes| bytes.checked_add(4096)).ok_or(CandidateError::Arguments)?;
         publish_complete(&Response { provenance: &provenance, output: result.result() }, cap, output, &remaining)
     } else {
-        let result = engine.redact_int4_document(&model, text, Arc::new(planner), Arc::new(vocabulary),
-            config, secret, common.kernel, cancellation).map_err(execution_error)?;
+        let result = if common.compute.threads == 1 {
+            compute::Completion::serial(engine.redact_int4_document(&model, text,
+                Arc::new(planner), Arc::new(vocabulary), config, secret, common.kernel, cancellation)
+                .map_err(execution_error)?)
+        } else {
+            compute::Completion::Team(engine.redact_int4_document_with_threads(&model, text,
+                Arc::new(planner), Arc::new(vocabulary), config, secret, common.kernel,
+                common.compute.threads, cancellation).map_err(execution_error)?)
+        };
         check_completed(expected, result.result(), &request, &detector)?;
-        publish_complete(&Response { provenance: &provenance, output: result.result() },
+        let response = Response { provenance: &provenance, output: result.result() };
+        publish_complete(&compute::Response { response: &response, compute: result.compute() },
             common.result_bytes + 4096, output, &remaining)
     }
 }

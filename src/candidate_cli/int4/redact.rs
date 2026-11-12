@@ -68,7 +68,22 @@ impl RedactArgs {
         self.validate_input(args, args.input.as_os_str() == "-")
     }
     fn validate_input(&self, args: &Int4Args, population_stdin: bool) -> Result<RedactLimits, CandidateError> {
-        let mut common = self.source.validate(args)?;
+        let common = self.source.validate(args)?;
+        self.validate_redaction_input(args, population_stdin, common)
+    }
+    // Only the complete-document owner keeps one admitted team through both
+    // original and edited-source maps. Short requests and populations retain
+    // their existing schedule guards until they have their own native owner.
+    fn validate_input_with_threads(&self, args: &Int4Args, population_stdin: bool)
+        -> Result<RedactLimits, CandidateError> {
+        if args.prefill()?.is_some() || !args.input_encoding.is_default() {
+            return Err(CandidateError::Arguments);
+        }
+        let common = self.source.validate_batch_with_prefill(args)?;
+        self.validate_redaction_input(args, population_stdin, common)
+    }
+    fn validate_redaction_input(&self, args: &Int4Args, population_stdin: bool, mut common: Int4Limits)
+        -> Result<RedactLimits, CandidateError> {
         if self.flags.rules.is_empty() || !(1..=16_384).contains(&self.flags.max_detections)
             || !(1..=1_000_000_000_000).contains(&self.flags.max_rule_work) {
             return Err(CandidateError::Arguments);

@@ -88,7 +88,7 @@ fn unsupported_compute_widths_and_prompt_schedules_refuse_before_io() {
     }
     // The option is absent from workflows without a persistent numerical team.
     for route in [vec!["text-batch"], vec!["text-corpus"],
-        vec!["classify-corpus"], vec!["sentiment-corpus"]] {
+        vec!["resolve"], vec!["resolve-corpus"], vec!["redact"], vec!["redact-corpus"]] {
         let mut argv = vec!["candidate", "source-int4"];
         argv.extend(route);
         argv.extend(["--source-dir", "private-source", "--source-manifest", "private-manifest",

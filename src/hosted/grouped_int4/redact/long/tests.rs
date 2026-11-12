@@ -12,7 +12,7 @@ use crate::{
             pipeline::LeakReport, pseudonym::PseudonymKey, redact_rules}},
 };
 
-fn config(width: usize) -> RedactConfig<Int4LongRedactionConfig> {
+pub(super) fn config(width: usize) -> RedactConfig<Int4LongRedactionConfig> {
     let d = Sha256Digest::of_bytes(b"int4-document-redaction-host-fixture");
     let context = 128;
     let mut request = RedactionRequest::default();

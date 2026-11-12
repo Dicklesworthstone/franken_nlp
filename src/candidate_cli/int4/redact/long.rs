@@ -73,6 +73,7 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
     serial_definition().arg(clap::Arg::new("cohort_chunks").long("cohort-chunks")
         .value_parser(clap::value_parser!(usize)).value_name("N")
         .help("Run up to N independent NER chunks together in BOTH stages (1..=64); admit the full window, never shrink or fall back"))
+        .after_long_help("--compute-threads N instead keeps one persistent INT4 output-row team across every original-source chunk, the transactional edit, and every freshly partitioned verification chunk. Width 1 preserves serial execution; widths 2..64 admit one worker workspace and the process thread envelope before key/document/model IO. All native, mask, rule and grounding limits remain unchanged. Workers join before the complete guarded result and optional actual compute receipt can be published. Cannot combine with --cohort-chunks, --prefill-rows or selected output rows. Corpus and retained-job commands keep their existing schedules. Physical worker count does not change semantic identity, and does not establish speed, NER quality or parity.")
 }
 fn serial_definition() -> clap::Command {
     MappingFlags::augment_args(super::definition().name("redact-document")
@@ -98,7 +99,12 @@ impl DocumentArgs {
         self.validate_output(args, false, args.input.as_os_str() == "-" && !retained_input)
     }
     fn validate_output(&self, args: &Int4Args, cohort_envelope: bool, population_stdin: bool) -> Result<DocumentLimits, CandidateError> {
-        let short = self.redaction.validate_input(args, population_stdin)?;
+        let threaded = args.compute.threads() != 1;
+        if threaded && (!cohort_envelope || self.cohort_chunks.is_some()) {
+            return Err(CandidateError::Arguments);
+        }
+        let short = if threaded { self.redaction.validate_input_with_threads(args, population_stdin)? }
+            else { self.redaction.validate_input(args, population_stdin)? };
         let mut common = short.common;
         let m = self.mapping;
         if args.max_input_bytes < 4 || !(1..=256).contains(&m.max_ner_chunks)

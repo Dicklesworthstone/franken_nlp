@@ -211,3 +211,75 @@ fn serialization_and_writer_flush_cannot_escape_the_original_deadline() {
     assert_eq!(publish_complete(&"complete", 64, &mut writer, &remaining), Err(CandidateError::Timeout));
     assert_eq!(writer.bytes, b"\"complete\"\n", "transport bytes may exist but late flush cannot report success");
 }
+
+#[test]
+fn document_team_receipt_preserves_complete_redaction_bytes_and_publication_limits() {
+    let (expected, run, request, detector) = fixture(true, true);
+    check_completed(expected, &run, &request, &detector).unwrap();
+    let provenance = Provenance { protocol: "fnlp-candidate-int4-redact-document-v1", schema_version: 1,
+        scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "redact",
+        redaction_mode: "complete_document", model_id: "Nanbeige4.2-3B", source_revision: "fixture",
+        source_root_sha256: "fixture-source", model_content_sha256: "fixture-model",
+        candidate_format: "fixture-format", quant_recipe: "fixture:group=128", group_width: 128,
+        integer_kernel: "s_scalar_i32", snapshot: None };
+    // Physical counters are a serialization fixture, never model evidence.
+    let receipt = crate::hosted::Int4ComputeReceipt { schedule: "int4-output-row-team-v1",
+        compute_threads: 3, completed_projections: 70, completed_rows: 4096, completed_worker_rows: 2700 };
+    let response = Response { provenance: &provenance, output: &run };
+    let remaining = || Ok(Duration::from_secs(1));
+    let mut original = Vec::new();
+    publish_complete(&response, 16384, &mut original, &remaining).unwrap();
+    let mut serial = Vec::new();
+    publish_complete(&compute::Response { response: &response, compute: None },
+        16384, &mut serial, &remaining).unwrap();
+    assert_eq!(serial, original, "default wire bytes remain unchanged");
+    let wrapped = compute::Response { response: &response, compute: Some(&receipt) };
+    let mut bytes = Vec::new();
+    publish_complete(&wrapped, 16384, &mut bytes, &remaining).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value.as_object_mut().unwrap().remove("compute").unwrap(), serde_json::to_value(receipt).unwrap());
+    assert_eq!(value, serde_json::from_slice::<serde_json::Value>(&original).unwrap());
+    let mut exact = Vec::new();
+    publish_complete(&wrapped, bytes.len(), &mut exact, &remaining).unwrap();
+    assert_eq!(exact, bytes);
+    let mut refused = Vec::new();
+    assert_eq!(publish_complete(&wrapped, bytes.len() - 1, &mut refused, &remaining), Err(CandidateError::Output));
+    assert!(refused.is_empty(), "late receipt growth cannot publish a redacted prefix");
+}
+
+#[test]
+fn stale_team_admission_cannot_open_a_key_document_or_model_under_new_schedules() {
+    struct NoIo;
+    impl Read for NoIo {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("stale team read private input"); }
+    }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("stale team published an edit"); }
+        fn flush(&mut self) -> io::Result<()> { panic!("stale team flushed an edit"); }
+    }
+    let selected = command(&["private-document", "--compute-threads", "3",
+        "--action", "pseudonymize", "--key-stdin", "--key-id", "fixture", "--namespace", "fixture"]);
+    let settings = options(&selected);
+    let limits = settings.validate(&selected.args).unwrap();
+    let mut changed = settings.clone(); changed.cohort_chunks = Some(1);
+    assert_eq!(execute(selected.args.clone(), changed, limits, &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+    let invalid = command(&["--compute-threads", "65"]);
+    assert_eq!(execute(invalid.args, settings.clone(), limits, &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+}
+
+#[test]
+fn original_and_verification_team_failures_preserve_all_cancellation_causes() {
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let expected = if matches!(cause, Deadline | Timeout) { CandidateError::Timeout } else { CandidateError::Execution };
+        assert_eq!(execution_error(HostedError::Int4(Int4HostError::Redaction(
+            Int4RedactionError::Cancelled(cause)))), expected);
+        assert_eq!(execution_error(HostedError::Int4(Int4HostError::SourceMap(
+            Int4SourceError::Cancelled(cause).into()))), expected);
+        assert_eq!(execution_error(HostedError::Int4(Int4HostError::Native(
+            crate::native_engine::strict_int4::StrictInt4Error::Cancelled(cause)))), expected);
+    }
+}
+
+mod teams;

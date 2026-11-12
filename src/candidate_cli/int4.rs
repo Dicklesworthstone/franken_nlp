@@ -225,7 +225,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(resolve::definition())
         .subcommand(resolve::corpus::definition())
         .subcommand(redact::definition())
-        .subcommand(redact::long::definition())
+        .subcommand(compute::definition(redact::long::definition()))
         .subcommand(redact::long::corpus::definition())
         .subcommand(redact::long::jobs::definition())
         .subcommand(compute::definition(input_encoding::definition(prefill::definition(extract::one_off_definition()))))
@@ -390,7 +390,7 @@ impl Int4Command {
             | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch" | "extract-batch"
             | "ner-batch" | "keyphrases-batch" | "summarize-batch" | "answer-batch"
             | "classify-map" | "classify-corpus" | "sentiment-map" | "sentiment-corpus" | "extract-map" | "extract-corpus"
-            | "faithfulness-corpus"
+            | "faithfulness-corpus" | "redact-document"
             | "ner-map" | "keyphrases-map" | "summarize-map" | "answer-map"
             | "ner-corpus" | "keyphrases-corpus" | "summarize-corpus" | "answer-corpus") {
             args.compute = compute::Args::from_matches(matches)?;
