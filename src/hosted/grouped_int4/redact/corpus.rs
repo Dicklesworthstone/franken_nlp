@@ -29,6 +29,17 @@ struct CorpusInput<R, W> {
     writer: W,
 }
 
+/// Retain private preparation and the charged stream owner through physical
+/// join and the final write. Field order releases owned buffers before charge.
+struct DeferredRedactionStream<R, W> {
+    completion: stream::deferred::DeferredCompletion,
+    planner: Arc<SourceTaskPlanner>,
+    vocabulary: Arc<ExtractionVocabulary>,
+    secret: Option<RedactionPseudonyms>,
+    input: Charged<CorpusInput<R, W>>,
+    lease: EngineLease,
+}
+
 impl NlpEngine {
     /// Reuse one model, native allocation and immutable full256 key scope for
     /// the complete ordered stream. Every item may span multiple NER contexts
@@ -42,7 +53,23 @@ impl NlpEngine {
         reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
         self.batch_int4_redact_documents_for_schedule(model, planner, vocabulary, config,
-            pseudonyms, limits, kernel, reader, writer, cancellation, false)
+            pseudonyms, limits, kernel, reader, writer, cancellation, false, None)
+    }
+
+    /// Reuse one fixed numerical row team across every document and both NER
+    /// detection stages. The full256 key scope, original-source rules, edit
+    /// transactions and all work allowances match the serial stream. Complete
+    /// success is published only after physical join under the same deadline.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int4_redact_documents_with_threads<R, W>(&self, model: &ResidentInt4,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: RedactionCorpusConfig<Int4DocumentRedactionBatchConfig>,
+        pseudonyms: Option<RedactionPseudonyms>, limits: CorpusLimits, kernel: PackedInt4Kernel,
+        compute_threads: usize, reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        self.batch_int4_redact_documents_for_schedule(model, planner, vocabulary, config,
+            pseudonyms, limits, kernel, reader, writer, cancellation, false, Some(compute_threads))
     }
 
     /// Stream ordered documents with native chunk cohorts in both detection
@@ -58,7 +85,7 @@ impl NlpEngine {
         reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
         self.batch_int4_redact_documents_for_schedule(model, planner, vocabulary, config,
-            pseudonyms, limits, kernel, reader, writer, cancellation, true)
+            pseudonyms, limits, kernel, reader, writer, cancellation, true, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -66,11 +93,16 @@ impl NlpEngine {
         planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
         config: RedactionCorpusConfig<Int4DocumentRedactionBatchConfig>,
         pseudonyms: Option<RedactionPseudonyms>, limits: CorpusLimits, kernel: PackedInt4Kernel,
-        reader: R, writer: W, cancellation: CancellationToken, cohorts: bool) -> Result<BatchSummary, HostedError>
+        reader: R, writer: W, cancellation: CancellationToken, cohorts: bool,
+        compute_threads: Option<usize>) -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
+        match compute_threads {
+            Some(width) => dispatch::preflight_int4_team(self, limits.native.run, width)?,
+            None => dispatch::preflight(self, limits.native.run)?,
+        }
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
         redact_task::check_model(&config.batch.ner_identity, model.model_identity()).map_err(redaction_error)?;
+        check_team_schedule(compute_threads, cohorts, config.batch.detector.mapping.reduction.map_batch_chunks)?;
         if cohorts {
             document_batch::check_cohort_configuration(&planner, &config.batch, model.model_identity(),
                 limits.native.context_tokens).map_err(HostedError::BatchSetup)?;
@@ -80,6 +112,8 @@ impl NlpEngine {
         }
         let width = model.model_identity().group_width();
         let required = corpus_requirements(&config, limits, width, pseudonyms.as_ref(), cohorts)?;
+        check_team_workspace(compute_threads, width, required.input_bytes,
+            required.native.kv_bytes, required.workspace_bytes)?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(CorpusInput { preparation: Some(Preparation { planner, vocabulary, config, secret: pseudonyms }),
@@ -88,7 +122,8 @@ impl NlpEngine {
         let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch,
             required.workspace_bytes)?;
         let model = model.clone();
-        dispatch::run(self, limits.native.run, cancellation, move |control| {
+        match compute_threads {
+        None => dispatch::run(self, limits.native.run, cancellation, move |control| {
             let mut input = input;
             checkpoint(control)?;
             let Preparation { planner, vocabulary, config, secret } =
@@ -138,8 +173,66 @@ impl NlpEngine {
             drop(input); // Owned reader/writer and preparation before their charge.
             drop(lease);
             result
-        })
+        }),
+        Some(threads) => dispatch::run_int4_team_with_finalize(self, limits.native.run, cancellation,
+            model, threads, kernel, move |weights, control, team| {
+                let mut input = input;
+                checkpoint(control)?;
+                let Preparation { planner, vocabulary, config, secret } =
+                    input.value.preparation.take().ok_or(HostedError::CompletionMissing)?;
+                let context = pseudonym_context(secret.as_ref(), &config.batch.request)?;
+                let admission = DocumentAdmission {
+                    lease: &lease, model: weights.identity(),
+                    fixed: FixedItem::new(&config.batch, width, required.native.kv_bytes,
+                        limits.transport.max_output_line_bytes as u64),
+                };
+                let mut engine = allocate_native(kv, workspace, || {
+                    StrictInt4Engine::new(weights, limits.native.context_tokens, Int4MemoryBudget {
+                        max_kv_bytes: required.native.kv_bytes, max_rope_bytes: required.native.rope_bytes,
+                        max_scratch_payload_bytes: required.native.scratch_payload_bound,
+                    }).map_err(native_error)?.with_kernel(kernel)
+                        .with_projection_executor(team).map_err(native_error)
+                })?;
+                let completion = {
+                    let mut processor = NativeInt4DocumentRedactionBatch::new(&planner, config.batch,
+                        &mut engine.value, &vocabulary, context.as_ref(), admission).map_err(HostedError::BatchSetup)?;
+                    stream::deferred::run_ndjson_deferred(&mut input.value.reader, &mut input.value.writer,
+                        &mut processor, limits.transport, control).map_err(HostedError::Batch)?
+                };
+                drop(engine);
+                drop(context);
+                Ok(DeferredRedactionStream { completion, planner, vocabulary, secret, input, lease })
+            }, |pending, control| pending.publish(control)),
+        }
     }
+}
+
+impl<R, W: Write> DeferredRedactionStream<R, W> {
+    fn publish<C: crate::native_engine::decode::DecodeStepControl>(self, control: &mut C)
+        -> Result<BatchSummary, HostedError> {
+        let Self { completion, planner, vocabulary, secret, mut input, lease } = self;
+        let result = completion.publish(&mut input.value.writer, control).map_err(HostedError::Batch);
+        drop(secret); drop(vocabulary); drop(planner); drop(input); drop(lease);
+        result
+    }
+}
+
+fn check_team_schedule(threads: Option<usize>, cohorts: bool, map_batch_chunks: usize)
+    -> Result<(), HostedError> {
+    if threads.is_some() && (cohorts || map_batch_chunks != 1) {
+        return Err(HostedError::Limits("INT4 redaction population teams require serial chunk scheduling"));
+    }
+    Ok(())
+}
+
+/// The dispatcher owns and charges this additional workspace once. Combining
+/// it with the ordinary quote here rejects arithmetic overflow before any IO.
+fn check_team_workspace(threads: Option<usize>, group_width: usize, input_bytes: u64,
+    kv_bytes: u64, workspace_bytes: u64) -> Result<u64, HostedError> {
+    let extra = threads.map(|width| int4_task_team_workspace_bytes(width, group_width))
+        .transpose()?.unwrap_or(0);
+    sum(&[input_bytes, kv_bytes, workspace_bytes, extra])?;
+    Ok(extra)
 }
 
 struct CorpusRequirements {

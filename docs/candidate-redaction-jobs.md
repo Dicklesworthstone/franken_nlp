@@ -110,6 +110,76 @@ explicit resumes. Complete attempts are reserved before execution, including
 verification whose exact prompt exists only after editing. No observed-work
 refund or partial-document success is introduced.
 
+## Grouped INT4 retained jobs and numerical worker width
+
+`fnlp candidate source-int4 redact-job start|resume` retains complete-document
+INT4 redaction through the same authenticated job runner. Its syntax uses
+explicit `start` and `resume` subcommands, `--key-file` for the protected
+job secret and `--limits` for immutable lifetime limits. The separate
+`--key-stdin` option supplies a pseudonym key when that action is selected.
+The job requires `metadata-store` and `asupersync-runtime` on Linux x86-64
+or AArch64.
+
+```sh
+fnlp candidate source-int4 redact-job start documents.ndjson \
+  --snapshot ./nanbeige.int4 --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 16384 --compute-threads 4 \
+  --store-results --job-dir ./protected-job --job-id "$JOB_ID" \
+  --key-file ./job.key --limits ./job-limits.json --materialize
+```
+
+The memory ceiling is illustrative. Supply the complete original ordered
+population on resume unless explicit [retained-input replay](retained-inputs.md)
+was selected. Both external input and retained replay support numerical teams.
+Original bytes/order, model identity, detector/action/verification policy,
+all semantic limits and the actual full256 key/scope still authenticate before
+repair or inference. Each original document remains one durable result.
+
+`--compute-threads N` defaults to one. Widths two through 64 keep one team
+and native engine through the complete physical invocation: all pending
+documents, original and edited-source NER, result serialization and durable
+commit. One worker workspace and the process thread envelope are admitted
+before private IO. They do not multiply with population size or verification
+stages. The borrowed authenticated population and native processor drain under
+the existing runner, journal and spool ownership; public success follows
+physical worker join.
+
+Physical worker width is excluded from the immutable recipe. A job started
+at width four may explicitly resume at width two or one while keeping all
+authenticated inputs and semantic settings the same. This does not renew
+attempts, the five persisted native work axes or mask visits. Failed attempts
+retain the original complete-document debit, including the fresh verification
+envelope; chunk/stage boundaries never become resumable partial results.
+
+Existing native chunk cohorts remain a separate schedule. They authenticate
+their explicit width and context in the job recipe and must be repeated on
+resume. Multiple numerical workers cannot combine with any
+`--cohort-chunks`, including a width of one. Unsupported widths and mixed
+schedules refuse before key, population or model IO.
+
+Stdout keeps the metadata-only
+`fnlp-candidate-int4-redact-job-v1` report. An optional `compute_schedule`
+records the declared numerical width and schedule version; serial responses
+omit it. No per-item physical projection count or speedup is fabricated.
+Stored edited results, materialization and original serial recipe bytes are
+unchanged. The same output-delivery and post-commit cancellation rules apply:
+a later error does not imply that already committed work was rolled back.
+
+The library entry point is
+`NlpEngine::job_int4_redact_document_with_threads`, with the same arguments
+as the serial method through the kernel, then explicit worker width, owned
+reader and cancellation. It returns the existing `JobProgress`. Serial and
+native-cohort entry points remain available; the implementation reuses the
+existing batch processor, authenticated runner and storage format.
+
+New source regression definitions cover admitted numerical widths, unchanged
+lifetime budgets and key authority, retained/external population memory,
+result guards and optional metadata. Recipe preservation and physical drain
+were reviewed against the existing durable processor and shared dispatcher.
+Compilation, executable regressions, model parity, crash-recovery execution
+and performance remain **UNRUN** for this change pending controller-authorized
+DSR validation.
+
 ## Validation scope
 
 Added tests cover keyed scope/recipe mismatches, work and memory boundaries,

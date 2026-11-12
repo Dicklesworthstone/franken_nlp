@@ -264,3 +264,68 @@ fn source_scalar_and_pinned_snapshot_simd_match_across_document_and_flush_bounda
         assert!(grouped.iter().all(|row| row["chunk_schedule"]["declared_max_chunks"] == width.parse::<u64>().unwrap()));
     }
 }
+
+#[test]
+fn one_corpus_team_preserves_complete_document_policy_and_whole_run_authority() {
+    let (serial, args) = arguments(&["--max-requests", "3"]);
+    let baseline = serial.validate(&args).unwrap();
+    let request = crate::canonjson::canonical_bytes(&serial.document.request(&args, baseline.document)).unwrap();
+    for threads in [2, 3, 64] {
+        let width = threads.to_string();
+        let (threaded, mut args) = arguments(&["--max-requests", "3", "--compute-threads", &width]);
+        args.memory_mib = 65536;
+        let limits = threaded.validate(&args).unwrap();
+        let extra = crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(threads, args.group_width).unwrap();
+        assert_eq!(limits.common.compute.threads, threads);
+        assert_eq!(limits.common.compute.workspace_bytes, extra);
+        assert_eq!(limits.common.native, baseline.common.native);
+        assert_eq!(limits.document.workspace_bytes, baseline.document.workspace_bytes);
+        assert!(limits.document.cohort.is_none());
+        assert_eq!(limits.model_work, baseline.model_work);
+        assert_eq!(limits.masks, baseline.masks);
+        assert_eq!(limits.transport, baseline.transport);
+        assert_eq!(limits.document.mapping.max_model_work, baseline.document.mapping.max_model_work);
+        assert_eq!(limits.document.mapping.verification, baseline.document.mapping.verification);
+        assert_eq!(crate::canonjson::canonical_bytes(&threaded.document.request(&args, limits.document)).unwrap(), request);
+        assert!(limits.common.minimum_memory_bytes >= baseline.common.minimum_memory_bytes);
+        assert!(limits.common.minimum_memory_bytes <= baseline.common.minimum_memory_bytes + extra,
+            "one workspace is not multiplied by documents, chunks or the verification stage");
+        let mut no_verify = threaded.clone(); no_verify.document.redaction.flags.no_verify = true;
+        assert_eq!(no_verify.validate(&args).unwrap().common.minimum_memory_bytes, limits.common.minimum_memory_bytes);
+        let mut narrow = args.clone();
+        narrow.memory_mib = limits.common.minimum_memory_bytes.saturating_sub(1) / MIB;
+        assert!(threaded.validate(&narrow).is_err());
+        narrow.memory_mib = limits.common.minimum_memory_bytes.div_ceil(MIB);
+        threaded.validate(&narrow).unwrap();
+    }
+    let pin = "ab".repeat(32);
+    let snapshot = parsed(&["--snapshot", "existing.snapshot", "--expected-model-sha256", &pin,
+        "--compute-threads", "3"]).unwrap();
+    let Int4Task::RedactCorpus(settings) = snapshot.task else { panic!("redaction corpus required"); };
+    let limits = settings.validate(&snapshot.args).unwrap();
+    assert_eq!(limits.common.compute.threads, 3);
+    assert!(limits.common.snapshot_pin.is_some());
+}
+
+#[test]
+fn unsupported_corpus_team_widths_mixed_cohorts_and_key_conflicts_refuse_before_io() {
+    for flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+        vec!["--compute-threads", "3", "--cohort-chunks", "1"],
+        vec!["--compute-threads", "3", "--cohort-chunks", "3"],
+        vec!["--compute-threads", "3", "--action", "pseudonymize", "--key-stdin",
+            "--key-id", "k", "--namespace", "n"]] {
+        let (options, args) = arguments(&flags);
+        assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+    // The existing physical chunk schedule still works with its serial
+    // numerical lane, including an explicit width-one selection.
+    for chunks in ["1", "3"] {
+        let (grouped, args) = arguments(&["--cohort-chunks", chunks, "--compute-threads", "1"]);
+        assert!(grouped.validate(&args).unwrap().document.cohort.is_some());
+    }
+    let help = definition().render_long_help().to_string().split_whitespace().collect::<Vec<_>>().join(" ");
+    for phrase in ["--compute-threads", "entire ordered stream", "one worker workspace",
+        "after all workers physically join", "whole-corpus native/mask allowances never renew"] {
+        assert!(help.contains(phrase), "missing {phrase}");
+    }
+}

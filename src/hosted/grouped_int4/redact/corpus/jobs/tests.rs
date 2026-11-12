@@ -250,9 +250,11 @@ fn owned_population_preparation_secrets_and_reader_cross_one_physical_boundary()
     send::<JobPreparation>();
     send::<JobInput<Cursor<Vec<u8>>>>();
     send::<Charged<JobInput<Cursor<Vec<u8>>>>>();
+    send::<JobExecution<Cursor<Vec<u8>>>>();
     send::<SourceJobRequest>();
     send::<RedactionCorpusConfig<Int4RedactionJobConfig>>();
     let _host = NlpEngine::job_int4_redact_document::<Cursor<Vec<u8>>>;
+    let _team = NlpEngine::job_int4_redact_document_with_threads::<Cursor<Vec<u8>>>;
     let _cohorts = NlpEngine::job_int4_redact_document_cohorts::<Cursor<Vec<u8>>>;
 }
 
@@ -331,5 +333,83 @@ fn retained_cohort_quotes_refuse_bad_windows_per_row_authority_and_unadmitted_me
             _ => c.batch.batch.detector.per_chunk.max_output_bytes = u64::MAX,
         }
         assert!(job_requirements_for_schedule(&c, job, host, 127, None, true, JobInputMemory::CompletePopulation).is_err(), "axis {axis}");
+    }
+}
+
+
+#[test]
+fn retained_jobs_add_one_team_beside_either_population_memory_owner_and_one_full256_scope() {
+    let mut c = config();
+    c.batch.batch.detector.mapping.reduction.map_batch_chunks = 1;
+    c.batch.batch.request.actions.default_action = RedactionAction::Pseudonymize;
+    let secret = secret();
+    c.batch.batch.request.actions.expected_key_commitment = Some(secret.key.commitment());
+    let (job, host) = limits(&c);
+    let complete = job_requirements(&c, job, host, 127, Some(&secret), JobInputMemory::CompletePopulation).unwrap();
+    let retained = job_requirements(&c, job, host, 127, Some(&secret), JobInputMemory::RetainedRecord).unwrap();
+    assert_eq!(complete.input_bytes - retained.input_bytes, 2 * job.max_snapshot_bytes);
+    assert_eq!(complete.native, retained.native);
+    assert_eq!(complete.workspace_bytes, retained.workspace_bytes);
+    for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
+        let quote = job_requirements(&c, job, host, 127, Some(&secret), input).unwrap();
+        let without_secret = job_requirements(&c, job, host, 127, None, input).unwrap();
+        assert_eq!(quote.input_bytes - without_secret.input_bytes, secret.namespace.capacity() as u64 + 2048);
+        assert_eq!(quote.input_bytes, host.required_buffer_bytes_for_input(job, input).unwrap()
+            + long::document_workspace_bytes(&c.batch.batch.detector, c.edit_reserve_bytes).unwrap()
+            + secret.namespace.capacity() as u64 + 2048 + 4 * INT4_REDACTION_JOB_RECIPE_BYTES as u64);
+        let item = FixedItem::new(&c.batch.batch, 127, quote.native.kv_bytes, job.max_result_bytes as u64);
+        assert_eq!(item.model_work, c.batch.batch.item_model_work());
+        assert_eq!(item.mask_visits, c.batch.batch.detector.mapping.max_mask_visits);
+        assert_eq!(item.result_bytes, c.batch.batch.detector.max_result_bytes);
+        check_admission(&item, &admission_request(&item)).unwrap();
+        for threads in [2, 3, 4, 64] {
+            check_team_schedule(Some(threads), false,
+                c.batch.batch.detector.mapping.reduction.map_batch_chunks).unwrap();
+            let extra = check_team_workspace(Some(threads), 127, quote.input_bytes,
+                quote.native.kv_bytes, quote.workspace_bytes).unwrap();
+            assert_eq!(extra, int4_task_team_workspace_bytes(threads, 127).unwrap());
+            let scope = pseudonym_context(Some(&secret), &c.batch.batch.request).unwrap().unwrap();
+            assert_eq!(scope.identity().key_commitment, secret.key.commitment());
+            assert_eq!(scope.identity().encoding, crate::tasks::redact::pseudonym::PseudonymEncoding::Full256);
+            assert!(quote.cohort.is_none());
+        }
+    }
+    let wrong = RedactionPseudonyms {
+        key: Arc::new(PseudonymKey::from_bytes(&[0x94; 32], "opaque-key-id").unwrap()),
+        namespace: secret.namespace.clone(),
+    };
+    assert!(pseudonym_context(Some(&wrong), &c.batch.batch.request).is_err());
+    assert!(pseudonym_context(None, &c.batch.batch.request).is_err());
+}
+
+#[test]
+fn physical_team_admission_cannot_widen_persisted_work_or_the_complete_result_guard() {
+    let mut c = config();
+    c.batch.batch.detector.mapping.reduction.map_batch_chunks = 1;
+    let (job, host) = limits(&c);
+    for threads in [2, 4] {
+        let quote = job_requirements(&c, job, host, 127, None, JobInputMemory::RetainedRecord).unwrap();
+        check_team_schedule(Some(threads), false, 1).unwrap();
+        check_team_workspace(Some(threads), 127, quote.input_bytes,
+            quote.native.kv_bytes, quote.workspace_bytes).unwrap();
+        for axis in 0..6 {
+            let mut changed = job;
+            let counter = match axis {
+                0 => &mut changed.max_work.model.forward_positions,
+                1 => &mut changed.max_work.model.projected_logits,
+                2 => &mut changed.max_work.model.attention_pairs,
+                3 => &mut changed.max_work.model.projections.dot_products,
+                4 => &mut changed.max_work.model.projections.multiply_accumulates,
+                _ => &mut changed.max_work.mask_node_visits,
+            };
+            *counter += 1;
+            assert!(job_requirements(&c, changed, host, 127, None, JobInputMemory::RetainedRecord).is_err());
+        }
+        let item = FixedItem::new(&c.batch.batch, 127, quote.native.kv_bytes, job.max_result_bytes as u64);
+        let mut expanded = admission_request(&item); expanded.max_result_bytes = job.max_result_bytes as u64;
+        assert!(job.max_result_bytes as u64 > item.result_bytes);
+        assert_eq!(check_admission(&item, &expanded).unwrap_err().fault.code, BatchCode::InvalidExecution);
+        assert!(check_team_schedule(Some(threads), true, 1).is_err());
+        assert!(check_team_schedule(Some(threads), false, 3).is_err());
     }
 }

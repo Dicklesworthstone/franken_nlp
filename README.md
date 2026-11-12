@@ -2244,7 +2244,8 @@ one set of native, mask and evidence allowances span the operation. Workers
 join before the guarded result is published. An optional `compute` receipt
 reports actual completed projections and rows; it is omitted in serial mode.
 Multiple workers cannot combine with any explicit `--cohort-chunks`.
-`redact-corpus` and `redact-job` retain their existing schedules.
+The same team option is available on `redact-corpus` and `redact-job` under
+the population contracts below.
 
 Masking remains the default. `--action placeholder`,
 `--action pseudonymize`, `--ner-options`, rule selection and sensitive
@@ -2353,6 +2354,16 @@ larger edited-text partition. Per-chunk task KV, all work limits and document
 ordering remain unchanged. There is no automatic width reduction or serial
 fallback. Omit the flag for the existing serial schedule.
 
+Alternatively, `--compute-threads N` selects one persistent numerical team
+for the entire corpus. Widths `2..64` reuse the same engine and worker scratch
+across documents, both detector stages and flush boundaries. Native chunk
+cohorts remain a separate explicit schedule; multiple workers cannot combine
+with any `--cohort-chunks`, including one. The existing per-document and
+whole-corpus work, mask and evidence contracts remain in force. The team and
+its owners drain before the terminal `run_complete` is delivered. Optional
+`compute_schedule` provenance records physical width, without fabricating
+per-document projection counts; width-one output omits it.
+
 `--max-input-bytes` bounds each decoded original document, while
 `--max-line-bytes` bounds the complete JSON envelope before LF, including
 escaping and a trailing CR. The default line ceiling is 4 MiB. Total input
@@ -2404,8 +2415,9 @@ work, and its transformed partition is planned freshly. Library callers use
 `NlpEngine::batch_int4_redact_documents` with owned reader/writer handles.
 Explicit cohorts use `NativeInt4DocumentRedactionBatch::new_cohorts` or
 `NlpEngine::batch_int4_redact_documents_cohorts` with the same fixed policy and
-semantic output contract.
-Source and resource fixtures are authored; compilation, model-present
+semantic output contract. `NlpEngine::batch_int4_redact_documents_with_threads`
+takes an explicit physical width after the kernel and owns one team through
+the complete stream. Source and resource fixtures are authored; compilation, model-present
 execution and quality qualification remain pending controller-selected gates.
 
 ## Implemented candidate INT4 redaction jobs
@@ -2528,6 +2540,18 @@ document is still one durable attempt and one result commit; chunks and
 verification stages do not become checkpoints. No work allowance increases
 with cohort width, population size or resume.
 
+`--compute-threads N` instead keeps one numerical team across the complete
+job invocation, including original/transformed NER and authenticated result
+commits. Widths `2..64` admit one worker workspace and the process thread
+capacity before private IO; width one preserves the serial route. Multiple
+workers cannot combine with any explicit native chunk-cohort schedule.
+Physical worker width is excluded from the immutable recipe, so explicit
+resume may change it while preserving the model, detector/action/key scope,
+original inputs, attempt debits and lifetime work limits. External and
+explicitly retained input routes share this behavior. Successful public
+progress follows worker join; `compute_schedule` records only the selected
+physical width and is omitted for serial execution.
+
 Memory admission includes the complete frozen population and ID index,
 journal and serialization staging, private recipe, both preparation owners,
 full resident KV, complete-map/edit workspace, secret metadata and guarded
@@ -2559,7 +2583,9 @@ Library callers use `Int4RedactionJobConfig` and
 `SourceJobRequest`, `JobHostLimits` and
 `RedactionCorpusConfig` wrappers. Select
 `NlpEngine::job_int4_redact_document_cohorts` for authenticated native chunk
-cohorts through the same runner and storage contract. No parallel job storage format or implicit
+cohorts through the same runner and storage contract. The persistent numerical
+team entry point is `NlpEngine::job_int4_redact_document_with_threads`, with
+explicit worker width after the kernel. No parallel job storage format or implicit
 input spool is introduced. Fixtures cover authority, resource, privacy and
 resume contracts; compilation, model-present execution, crash recovery and
 quality qualification remain pending controller-selected gates.

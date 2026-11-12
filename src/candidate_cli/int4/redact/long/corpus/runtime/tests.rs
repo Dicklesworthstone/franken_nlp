@@ -19,7 +19,7 @@ fn provenance() -> Provenance<'static> {
         redaction_mode: "complete_document", model_id: "Nanbeige4.2-3B", source_revision: "fixture",
         source_root_sha256: "fixture-source", model_content_sha256: "fixture-model",
         candidate_format: "fixture-format", quant_recipe: "fixture:group=128", group_width: 128,
-        integer_kernel: "s_scalar_i32", chunk_schedule: None, snapshot: Some(SnapshotRecord::new("loaded",
+        integer_kernel: "s_scalar_i32", chunk_schedule: None, compute_schedule: None, snapshot: Some(SnapshotRecord::new("loaded",
             Int4SnapshotRequirements::for_group_width(128).unwrap())) }
 }
 
@@ -145,4 +145,60 @@ fn failed_writer_flush_poisoning_prevents_a_second_terminal_or_retry() {
     }
     assert_eq!(output.0.iter().filter(|&&b| b == b'\n').count(), 1);
     assert!(!std::str::from_utf8(&output.0).unwrap().contains("run_complete"));
+}
+
+#[test]
+fn corpus_compute_schedule_is_physical_metadata_on_every_event_and_omitted_by_default() {
+    let events = [
+        serde_json::json!({"event":"item_fixture","id":"one","result":{"text":"[redacted:email]"}}),
+        serde_json::json!({"event":"flush","epoch":1}),
+        serde_json::json!({"event":"error","code":"fixture_no_result"}),
+        serde_json::json!({"event":"run_complete","succeeded":1,"failed":1}),
+    ];
+    let mut plain = Vec::new(); let mut threaded = Vec::new();
+    for (output, threads) in [(&mut plain, 1), (&mut threaded, 3)] {
+        let mut metadata = provenance();
+        metadata.compute_schedule = compute::Schedule::for_threads(threads);
+        let mut writer = CandidateWriter::new(output, &metadata, 8192, 65536).unwrap();
+        for event in &events {
+            let mut bytes = crate::canonjson::canonical_bytes(event).unwrap(); bytes.push(b'\n');
+            writer.write_all(&bytes).unwrap(); writer.flush().unwrap();
+        }
+    }
+    let plain: Vec<serde_json::Value> = std::str::from_utf8(&plain).unwrap().lines()
+        .map(|line| serde_json::from_str(line).unwrap()).collect();
+    let threaded: Vec<serde_json::Value> = std::str::from_utf8(&threaded).unwrap().lines()
+        .map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(plain.len(), events.len()); assert_eq!(threaded.len(), events.len());
+    for (index, (serial, mut scheduled)) in plain.into_iter().zip(threaded).enumerate() {
+        assert!(serial.get("compute_schedule").is_none());
+        assert_eq!(scheduled.as_object_mut().unwrap().remove("compute_schedule").unwrap(),
+            serde_json::json!({"execution":"int4-output-row-team-v1","declared_compute_threads":3}));
+        assert_eq!(scheduled, serial);
+        assert_eq!(serial["record"], events[index]);
+    }
+}
+
+#[test]
+fn admitted_corpus_team_cannot_switch_to_cohorts_before_private_io() {
+    let (mut command, args) = arguments(&["--compute-threads", "3"]);
+    let admitted = command.validate(&args).unwrap();
+    let process = compute::resource_config(admitted.common);
+    assert_eq!(process.runtime_workers, 1);
+    assert_eq!(process.scoped_cpu_children_per_coordinator, 2);
+    assert_eq!(process.thread_ceiling, 4);
+    command.document.cohort_chunks = Some(1);
+    assert_eq!(execute(args, command, admitted, NoIo, NoIo), Err(CandidateError::Arguments));
+}
+
+#[test]
+fn corpus_team_setup_keeps_every_typed_cancellation_fatal() {
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let expected = if matches!(cause, Timeout | Deadline) { CandidateError::Timeout } else { CandidateError::Batch };
+        assert_eq!(execution_error(HostedError::Int4(Int4HostError::Native(
+            crate::native_engine::strict_int4::StrictInt4Error::Cancelled(cause)))), expected);
+        assert_eq!(execution_error(HostedError::BatchSetup(BatchFault::cancelled(cause))), expected);
+    }
 }

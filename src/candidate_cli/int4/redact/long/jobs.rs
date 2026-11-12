@@ -38,14 +38,15 @@ struct JobExecutionLimits {
 
 pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
     let operation = |name: &'static str, about: &'static str| {
-        StorageArgs::augment_args(super::definition().name(name).about(about)
+        compute::definition(StorageArgs::augment_args(super::definition().name(name).about(about)
             .long_about("Create or explicitly resume one retained complete-document INT4 redaction job. Requires --store-results, an existing owner-only --job-dir, original --job-id, an independent protected --key-file and exact immutable --limits. By default, supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation; explicit retained-input replay is available. IDs are unique across the complete population, flush controls are refused, and task_args cannot override the fixed detector, action, verification or key policy. --max-input-bytes caps decoded ORIGINAL text; JobLimits.max_input_bytes_per_item separately caps the encoded JSON envelope. Whole-document rules and every native NER chunk feed one edited result; fresh transformed detection remains the default. Serial execution preserves existing recipes. Explicit --cohort-chunks N shares native layers across independent NER chunks in both stages using one admitted peak; the schedule, width and native context are authenticated, so repeat the same selection on resume. Stored semantic results and complete-document commit boundaries are unchanged. Pseudonymization uses one full256 scope: its separate binary --key-stdin requires a population FILE unless --use-retained-input is selected, and its commitment is checked before population IO. The job key file is never used as the pseudonym key. Exact model/group, original envelope bytes/order, detector limits, policy and actual key commitment authenticate before job repair or inference. Lifetime native and mask work comes solely from --limits and is never multiplied or renewed by attempts or resume. Stdout contains completion metadata only; private text and maps remain in the explicitly retained spool. --materialize publishes verified materialized.ndjson only after all items commit. Optional model snapshot creation occurs during setup and remains if later job authentication or execution fails. Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64.")
             .after_help(job_cli::INPUT_RETENTION_HELP)
             .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population; omit with --use-retained-input; '-' reads stdin unless stdin supplies the pseudonym key"))
             .mut_arg("max_input_bytes", |arg| arg.help("Maximum decoded ORIGINAL document bytes per item; the immutable JobLimits cap separately bounds encoded JSON"))
             .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoints for this invocation; persisted work and attempts never renew")))
             .mut_arg("store_results", |arg| arg.help("Required consent to retain sensitive edited text and optional maps in the owner-only result spool"))
-            .mut_arg("key_file", |arg| arg.help("Independent protected job-authentication key: exactly 32 raw bytes; never the pseudonym key"))
+            .mut_arg("key_file", |arg| arg.help("Independent protected job-authentication key: exactly 32 raw bytes; never the pseudonym key")))
+            .after_long_help(format!("--compute-threads N reuses one persistent INT4 output-row team for the entire retained invocation, including every original document and fresh edited-source verification map. Width 1 preserves serial execution; widths 2..64 admit one worker workspace and process capacity before private IO. Multiple workers cannot combine with --cohort-chunks. Physical worker count is excluded from the authenticated recipe: an explicit resume may select a different width without renewing lifetime native/mask work, attempts, changing policy or replacing either key scope. The same full256 pseudonym commitment authenticates every item and resume. Workers join before success metadata is published; optional compute_schedule reports the declared physical width only. Retained-input replay, source conversion, pinned snapshot reload and materialization keep their existing contracts. Width-one recipes, semantic results and progress bytes remain unchanged.\n\n{}", job_cli::INPUT_RETENTION_HELP))
     };
     let start = operation("start", "Create a new retained complete-document INT4 redaction job");
     let resume = operation("resume", "Authenticate the original population and redact pending INT4 job items")
@@ -151,7 +152,9 @@ impl JobCommand {
         };
         let job = JobArgs { document: DocumentArgs::from_matches(matches)?,
             storage: StorageArgs::from_arg_matches(matches)? };
-        Ok((Self { mode, args: job }, Int4Args::from_arg_matches(matches)?))
+        let mut args = Int4Args::from_arg_matches(matches)?;
+        args.compute = compute::Args::from_matches(matches)?;
+        Ok((Self { mode, args: job }, args))
     }
     pub(in crate::candidate_cli::int4) fn run_owned<R: Read + Send + 'static>(
         self, args: Int4Args, input: R, output: &mut impl Write, diagnostics: &mut impl Write) -> ExitCode {

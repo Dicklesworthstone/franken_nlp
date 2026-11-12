@@ -3,7 +3,7 @@ use super::*;
 use crate::jobs::JobInputMemory;
 use std::{sync::Arc, time::{Duration, Instant}};
 use crate::{
-    NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
+    NlpEngine, MemoryClass,
     candidate_cli::runtime::owned_jobs::{host_failure, job_failure, open_mode, progress_report},
     hosted::{CancellationToken, HostedError, Int4HostError, NativeLimits, RunLimits, RedactionPseudonyms,
         corpus::{RedactionCorpusConfig, jobs::{HostedJobError, JobHostLimits, SourceJobRequest}}},
@@ -23,12 +23,8 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: admitted.common.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().map_err(|_| CandidateError::Runtime)?;
+    let engine = NlpEngine::builder().resource_config(compute::resource_config(admitted.common))
+        .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
     // Declared before private allocations; survives their drop and final report flush.
     let _preparation = lease.reserve(MemoryClass::JobBuffers, admitted.common.preparation_bytes)
@@ -89,9 +85,12 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let progress = if limits.document.cohort.is_some() {
         engine.job_int4_redact_document_cohorts(&model, Arc::new(planner), Arc::new(vocabulary),
             config, secret, request, host, common.kernel, reader, cancellation)
-    } else {
+    } else if common.compute.threads == 1 {
         engine.job_int4_redact_document(&model, Arc::new(planner), Arc::new(vocabulary),
             config, secret, request, host, common.kernel, reader, cancellation)
+    } else {
+        engine.job_int4_redact_document_with_threads(&model, Arc::new(planner), Arc::new(vocabulary),
+            config, secret, request, host, common.kernel, common.compute.threads, reader, cancellation)
     }.map_err(execution_failure)?;
     remaining()?;
     let report = progress_report(progress, job_id, lifetime, materialize, mode, "redact")?;
@@ -104,11 +103,25 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(),
-        snapshot, chunk_schedule: job.document.cohort_chunks.map(ChunkSchedule::new), output: &report,
+        snapshot, chunk_schedule: job.document.cohort_chunks.map(ChunkSchedule::new),
+        compute_schedule: compute::Schedule::for_threads(common.compute.threads), output: &report,
     };
     // Metadata only. Delivery failure may follow durable progress and never
     // authorizes automatic replay, tail repair or an unrequested rollback.
-    publish(&response, job_cli::REPORT_BYTES, output).map_err(Failure::from)
+    publish_report(&response, output, &remaining)
+}
+fn publish_report<T: Serialize>(response: &T, output: &mut impl Write,
+    remaining: &impl Fn() -> Result<Duration, CandidateError>) -> Result<(), Failure> {
+    remaining()?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(job_cli::REPORT_BYTES).map_err(|_| CandidateError::Memory)?;
+    let mut staged = BoundedOutput { bytes, cap: job_cli::REPORT_BYTES };
+    serde_json::to_writer(&mut staged, response).map_err(|_| CandidateError::Output)?;
+    staged.write_all(b"\n").map_err(|_| CandidateError::Output)?;
+    remaining()?;
+    output.write_all(&staged.bytes).and_then(|()| output.flush()).map_err(|_| CandidateError::Output)?;
+    remaining()?;
+    Ok(())
 }
 fn key_scope(job: &JobArgs, input: &mut impl Read, request: &RedactionRequest)
     -> Result<Option<RedactionPseudonyms>, CandidateError> {
@@ -180,6 +193,8 @@ fn execution_failure(error: HostedJobError) -> Failure {
         HostedJobError::Host(HostedError::Int4(Int4HostError::Redaction(error))) =>
             error.cancellation().map(cancelled).unwrap_or(Failure {
                 exit: ErrorCode::StructuredTaskNoResult, code: "job_task_failed" }),
+        HostedJobError::Host(HostedError::Int4(Int4HostError::Native(
+            crate::native_engine::strict_int4::StrictInt4Error::Cancelled(cause)))) => cancelled(cause),
         HostedJobError::Job(JobRunError::Storage(JobError::Mismatch(field))) => Failure {
             exit: ErrorCode::ArtifactIntegrityOrFormatOrVersion,
             code: match field {
@@ -209,6 +224,8 @@ struct Response<'a, T: Serialize> {
     snapshot: Option<SnapshotRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     chunk_schedule: Option<ChunkSchedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compute_schedule: Option<compute::Schedule>,
     output: &'a T,
 }
 #[cfg(test)]

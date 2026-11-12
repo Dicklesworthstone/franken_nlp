@@ -71,9 +71,9 @@ impl RedactArgs {
         let common = self.source.validate(args)?;
         self.validate_redaction_input(args, population_stdin, common)
     }
-    // Only the complete-document owner keeps one admitted team through both
-    // original and edited-source maps. Short requests and populations retain
-    // their existing schedule guards until they have their own native owner.
+    // Complete-document owners keep one admitted team through original and
+    // edited-source maps, including a whole resident corpus or job invocation.
+    // Short redaction retains its existing serial schedule guard.
     fn validate_input_with_threads(&self, args: &Int4Args, population_stdin: bool)
         -> Result<RedactLimits, CandidateError> {
         if args.prefill()?.is_some() || !args.input_encoding.is_default() {

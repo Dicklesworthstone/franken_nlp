@@ -290,3 +290,104 @@ fn unavailable_owned_profile_refuses_without_reading_keys_or_the_population() {
         assert_eq!(job.execute_owned(args, NoIo, &mut NoIo).unwrap_err().code, "owned_job_profile_unavailable");
     }
 }
+
+#[test]
+fn retained_job_team_admits_one_workspace_without_replenishing_any_lifetime_axis() {
+    for operation in ["start", "resume"] {
+        let (serial, args) = command(operation, &[]);
+        let document = serial.args.validate(&args).unwrap();
+        let stored = lifetime(&args, document);
+        let baseline = serial.args.lifetime_limits(&args, document, stored).unwrap();
+        let request = crate::canonjson::canonical_bytes(
+            &serial.args.document.request(&args, baseline.document)).unwrap();
+        for threads in [2, 3, 64] {
+            let width = threads.to_string();
+            let (threaded, mut args) = command(operation, &["--compute-threads", &width]);
+            let document = threaded.args.validate(&args).unwrap();
+            let selected = threaded.args.lifetime_limits(&args, document, stored).unwrap();
+            let extra = crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(
+                threads, args.group_width).unwrap();
+            assert_eq!(selected.common.compute.threads, threads);
+            assert_eq!(selected.common.compute.workspace_bytes, extra);
+            assert!(document.cohort.is_none());
+            assert_eq!(document.mapping.reduction.map_batch_chunks, 1);
+            assert_eq!(selected.common.native, baseline.common.native);
+            assert_eq!(selected.common.result_bytes, baseline.common.result_bytes);
+            assert_eq!(selected.document.workspace_bytes, baseline.document.workspace_bytes);
+            assert_eq!(selected.document.mapping.max_model_work, baseline.document.mapping.max_model_work);
+            assert_eq!(selected.document.mapping.verification, baseline.document.mapping.verification);
+            assert_eq!(selected.buffer_bytes, baseline.buffer_bytes);
+            assert_eq!(selected.model_work, stored.max_work.int4_model_work());
+            assert_eq!(selected.masks, stored.max_work.mask_node_visits);
+            assert_eq!(selected.transport, baseline.transport);
+            assert_eq!(crate::canonjson::canonical_bytes(
+                &threaded.args.document.request(&args, selected.document)).unwrap(), request);
+            assert!(selected.common.minimum_memory_bytes >= baseline.common.minimum_memory_bytes);
+            assert!(selected.common.minimum_memory_bytes <= baseline.common.minimum_memory_bytes + extra);
+            let mut more_attempts = stored; more_attempts.max_items *= 2; more_attempts.max_attempts *= 2;
+            let unchanged = threaded.args.lifetime_limits(&args, document, more_attempts).unwrap();
+            assert_eq!(unchanged.model_work, selected.model_work);
+            assert_eq!(unchanged.masks, selected.masks);
+            for axis in 0..6 {
+                let mut narrow = stored;
+                match axis {
+                    0 => narrow.max_work.model.forward_positions -= 1,
+                    1 => narrow.max_work.model.projected_logits -= 1,
+                    2 => narrow.max_work.model.attention_pairs -= 1,
+                    3 => narrow.max_work.model.projections.dot_products -= 1,
+                    4 => narrow.max_work.model.projections.multiply_accumulates -= 1,
+                    _ => narrow.max_work.mask_node_visits -= 1,
+                }
+                assert!(matches!(threaded.args.lifetime_limits(&args, document, narrow),
+                    Err(Failure { code: "lifetime_native_or_mask_limits", .. })));
+            }
+            args.memory_mib = selected.common.minimum_memory_bytes.saturating_sub(1) / MIB;
+            assert!(threaded.args.validate(&args)
+                .and_then(|document| threaded.args.lifetime_limits(&args, document, stored)).is_err());
+            args.memory_mib = selected.common.minimum_memory_bytes.div_ceil(MIB);
+            let admitted = threaded.args.validate(&args).unwrap();
+            threaded.args.lifetime_limits(&args, admitted, stored).unwrap();
+        }
+    }
+}
+
+#[test]
+fn population_teams_keep_retained_input_and_pseudonym_key_authority_separate() {
+    for operation in ["start", "resume"] {
+        for flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+            vec!["--compute-threads", "3", "--cohort-chunks", "1"],
+            vec!["--compute-threads", "3", "--cohort-chunks", "3"],
+            vec!["--compute-threads", "3", "--action", "pseudonymize", "--key-stdin",
+                "--key-id", "rotation", "--namespace", "private-scope"]] {
+            let (job, args) = command(operation, &flags);
+            assert_eq!(job.execute_owned(args, NoIo, &mut NoIo).unwrap_err().code, "invalid_job_options");
+        }
+        for chunks in ["1", "3"] {
+            let (grouped, args) = command(operation, &["--cohort-chunks", chunks, "--compute-threads", "1"]);
+            assert!(grouped.args.validate(&args).unwrap().cohort.is_some());
+        }
+        let mut words = argv(operation);
+        let at = words.iter().position(|s| s == "--source-dir").unwrap(); words.drain(at..at + 4);
+        words.extend(["--snapshot", "pinned.int4", "--expected-model-sha256"]
+            .into_iter().map(str::to_owned));
+        words.push("ab".repeat(32));
+        words.extend(["--compute-threads", "3"].into_iter().map(str::to_owned));
+        let (snapshot, args) = parse(words).unwrap();
+        let admitted = snapshot.args.validate(&args).unwrap();
+        assert!(admitted.common.snapshot_pin.is_some());
+        assert_eq!(admitted.common.compute.threads, 3);
+    }
+    let (retained, args) = command("resume", &["--compute-threads", "3",
+        "--use-retained-input", "--max-retained-input-mib", "16", "--action", "pseudonymize",
+        "--key-stdin", "--key-id", "rotation", "--namespace", "private-scope"]);
+    let admitted = retained.args.validate(&args).unwrap();
+    assert_eq!(admitted.common.compute.threads, 3);
+    assert_eq!(retained.args.storage.key_file, PathBuf::from("private-job-key"));
+    assert_eq!(args.input, PathBuf::from("-"));
+    let help = definition().find_subcommand_mut("resume").unwrap().render_long_help().to_string()
+        .split_whitespace().collect::<Vec<_>>().join(" ");
+    for phrase in ["--compute-threads", "--use-retained-input", "entire retained invocation",
+        "Physical worker count", "never renew"] {
+        assert!(help.contains(phrase), "missing {phrase}");
+    }
+}

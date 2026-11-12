@@ -93,7 +93,9 @@ fn all_cancellation_classes_survive_storage_processor_native_and_physical_scope_
             physical_error: Some(Box::new(HostedError::Int4(
                 Int4HostError::Redaction(Int4RedactionError::Cancelled(cause))))),
         }));
-        for actual in [storage, processor, native, nested] {
+        let setup = execution_failure(HostedJobError::Host(HostedError::Int4(
+            Int4HostError::Native(crate::native_engine::strict_int4::StrictInt4Error::Cancelled(cause)))));
+        for actual in [storage, processor, native, nested, setup] {
             assert_eq!(actual.exit, exit); assert_eq!(actual.code, cancelled(cause).code);
         }
     }
@@ -182,7 +184,7 @@ fn metadata_only_report_has_public_provenance_and_keeps_sensitive_results_in_the
         source_root_sha256: "fixture-public-source", model_content_sha256: "fixture-public-model",
         candidate_format: "fixture-format", quant_recipe: "fixture-grouped-int4", group_width: 128,
         integer_kernel: "s_scalar_i32", snapshot: Some(SnapshotRecord::new("loaded", document.common.snapshot_need)),
-        chunk_schedule: None, output: &report,
+        chunk_schedule: None, compute_schedule: None, output: &report,
     };
     let mut bytes = Vec::new(); publish(&response, job_cli::REPORT_BYTES, &mut bytes).unwrap();
     let event: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -198,6 +200,17 @@ fn metadata_only_report_has_public_provenance_and_keeps_sensitive_results_in_the
     assert!(bytes.ends_with(b"\n"));
     assert_eq!(publish(&response, 1, &mut NoIo), Err(CandidateError::Output));
     assert!(event.get("chunk_schedule").is_none());
+    assert!(event.get("compute_schedule").is_none());
+    let mut staged = Vec::new();
+    publish_report(&response, &mut staged, &|| Ok(Duration::from_secs(1))).unwrap();
+    assert_eq!(staged, bytes, "serial publication preserves the complete wire bytes");
+    response.compute_schedule = compute::Schedule::for_threads(3);
+    let mut threaded = serde_json::to_value(&response).unwrap();
+    assert_eq!(threaded["compute_schedule"]["execution"], "int4-output-row-team-v1");
+    assert_eq!(threaded["compute_schedule"]["declared_compute_threads"], 3);
+    threaded.as_object_mut().unwrap().remove("compute_schedule");
+    assert_eq!(threaded, event, "physical width cannot alter durable output or provenance");
+    response.compute_schedule = None;
     response.chunk_schedule = Some(ChunkSchedule::new(3));
     let grouped = serde_json::to_value(&response).unwrap();
     assert_eq!(grouped["output"], event["output"]);
@@ -221,7 +234,7 @@ fn report_delivery_or_flush_failure_cannot_erase_or_retry_durable_completion() {
     let before = serde_json::to_value(&report).unwrap();
     for fail_write in [false, true] {
         let mut sink = Broken { bytes: Vec::new(), fail_write };
-        let failure = Failure::from(publish(&report, job_cli::REPORT_BYTES, &mut sink).unwrap_err());
+        let failure = publish_report(&report, &mut sink, &|| Ok(Duration::from_secs(1))).unwrap_err();
         assert_eq!(failure.code, "report_delivery");
         assert_eq!(serde_json::to_value(&report).unwrap(), before);
         if !fail_write { assert_eq!(sink.bytes.iter().filter(|&&b| b == b'\n').count(), 1); }
@@ -275,4 +288,54 @@ fn source_to_snapshot_resume_reuses_commits_and_materialization_without_new_atte
     let mut output = Vec::new();
     assert_eq!(changed.execute_owned(args, Cursor::new(input.to_vec()), &mut output).unwrap_err().code, "job_mismatch_recipe");
     assert!(output.is_empty()); assert_eq!(std::fs::read(&materialized).unwrap(), committed);
+}
+
+#[test]
+fn admitted_retained_team_cannot_switch_to_a_chunk_cohort_before_any_private_io() {
+    for operation in ["start", "resume"] {
+        let (mut job, args) = command(operation, &["--compute-threads", "3"]);
+        let admitted = job.args.validate(&args).unwrap();
+        let process = compute::resource_config(admitted.common);
+        assert_eq!(process.scoped_cpu_children_per_coordinator, 2);
+        assert_eq!(process.thread_ceiling, 4);
+        job.args.document.cohort_chunks = Some(1);
+        assert_eq!(execute(job.mode, args, job.args, admitted, NoIo, &mut NoIo)
+            .unwrap_err().code, "invalid_job_options");
+    }
+}
+
+#[test]
+fn durable_success_publication_keeps_the_original_deadline_through_the_final_flush() {
+    use std::cell::Cell;
+    let report = serde_json::json!({ "status": "complete", "committed": 2 });
+    for stop_at in [1, 2] {
+        let polls = Cell::new(0);
+        let remaining = || {
+            polls.set(polls.get() + 1);
+            if polls.get() == stop_at { Err(CandidateError::Timeout) }
+                else { Ok(Duration::from_secs(1)) }
+        };
+        let failure = publish_report(&report, &mut NoIo, &remaining).unwrap_err();
+        assert_eq!(failure.exit, ErrorCode::BudgetOrTimeout);
+        assert_eq!(polls.get(), stop_at);
+    }
+    struct Flushed { bytes: Vec<u8>, flushes: usize }
+    impl Write for Flushed {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes); Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> { self.flushes += 1; Ok(()) }
+    }
+    let polls = Cell::new(0);
+    let remaining = || {
+        polls.set(polls.get() + 1);
+        if polls.get() == 3 { Err(CandidateError::Timeout) }
+            else { Ok(Duration::from_secs(1)) }
+    };
+    let mut sink = Flushed { bytes: Vec::new(), flushes: 0 };
+    let failure = publish_report(&report, &mut sink, &remaining).unwrap_err();
+    assert_eq!(failure.exit, ErrorCode::BudgetOrTimeout);
+    assert_eq!(sink.flushes, 1);
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&sink.bytes).unwrap(), report);
+    assert_eq!(polls.get(), 3, "final delivery cannot reset the original invocation deadline");
 }

@@ -227,10 +227,12 @@ fn one_full256_scope_prices_retained_namespace_capacity_and_rejects_the_wrong_co
 fn owned_stream_capture_keeps_reader_writer_key_and_configuration_in_one_send_package() {
     fn send<T: Send + 'static>() {}
     send::<CorpusInput<std::io::Cursor<Vec<u8>>, Vec<u8>>>();
+    send::<DeferredRedactionStream<std::io::Cursor<Vec<u8>>, Vec<u8>>>();
     send::<Preparation>();
     send::<RedactionPseudonyms>();
     send::<RedactionCorpusConfig<Int4DocumentRedactionBatchConfig>>();
     let _host = NlpEngine::batch_int4_redact_documents::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    let _team = NlpEngine::batch_int4_redact_documents_with_threads::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
     let _cohorts = NlpEngine::batch_int4_redact_documents_cohorts::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
 }
 
@@ -308,5 +310,79 @@ fn impossible_cohort_windows_contexts_and_reservations_fail_without_clamping() {
             _ => c.batch.detector.per_chunk.max_output_bytes = u64::MAX,
         }
         assert!(corpus_requirements(&c, l, 127, None, true).is_err(), "axis {axis}");
+    }
+}
+
+
+#[test]
+fn one_population_team_workspace_is_independent_of_chunks_and_verification_stages() {
+    for group in [3, 127, 128, 10752] {
+        let mut c = config(group);
+        c.batch.detector.mapping.reduction.map_batch_chunks = 1;
+        let initial = corpus_requirements(&c, limits(), group, None, false).unwrap();
+        let fixed = fixed(&c, group);
+        for chunks in [1, 3, 256] {
+            c.batch.detector.mapping.chunks.max_chunks = chunks;
+            for verify in [false, true] {
+                c.batch.request.verify = verify;
+                let quote = corpus_requirements(&c, limits(), group, None, false).unwrap();
+                assert_eq!(quote.native, initial.native);
+                assert_eq!(quote.workspace_bytes, initial.workspace_bytes);
+                assert!(quote.cohort.is_none());
+                let item = FixedItem::new(&c.batch, group, quote.native.kv_bytes, 131_072);
+                assert_eq!(item.identity, fixed.identity);
+                assert_eq!(item.model_work, fixed.model_work);
+                assert_eq!(item.mask_visits, fixed.mask_visits);
+                assert_eq!(item.result_bytes, fixed.result_bytes);
+                check_admission(&item, &request(&item)).unwrap();
+                assert_eq!(check_team_workspace(None, group, quote.input_bytes,
+                    quote.native.kv_bytes, quote.workspace_bytes).unwrap(), 0);
+                for threads in [2, 3, 4, 64] {
+                    check_team_schedule(Some(threads), false,
+                        c.batch.detector.mapping.reduction.map_batch_chunks).unwrap();
+                    let expected = int4_task_team_workspace_bytes(threads, group).unwrap();
+                    assert_eq!(check_team_workspace(Some(threads), group, quote.input_bytes,
+                        quote.native.kv_bytes, quote.workspace_bytes).unwrap(), expected);
+                    // The dispatcher owns exactly this additional reservation.
+                    // Full stream buffers, original/edited maps and per-item
+                    // output retain their independent existing owners.
+                    assert_eq!(sum(&[quote.input_bytes, quote.native.kv_bytes, quote.workspace_bytes, expected]).unwrap()
+                        - sum(&[quote.input_bytes, quote.native.kv_bytes, quote.workspace_bytes]).unwrap(), expected);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn team_selection_refuses_every_cohort_mix_without_reinterpreting_legacy_schedules() {
+    check_team_schedule(None, false, 8).unwrap();
+    check_team_schedule(None, true, 3).unwrap();
+    for threads in [2, 3, 4, 64] {
+        check_team_schedule(Some(threads), false, 1).unwrap();
+        for chunks in [0, 2, 3, 8, 64, usize::MAX] {
+            assert!(check_team_schedule(Some(threads), false, chunks).is_err());
+        }
+        for chunks in [1, 3] {
+            assert!(check_team_schedule(Some(threads), true, chunks).is_err(),
+                "an explicit cohort, including width one, cannot silently become a row team");
+        }
+    }
+}
+
+#[test]
+fn complete_team_reservation_checks_exact_total_overflow_and_invalid_geometry() {
+    let extra = int4_task_team_workspace_bytes(4, 128).unwrap();
+    let input = u64::MAX - extra - 3 - 5;
+    assert_eq!(check_team_workspace(Some(4), 128, input, 3, 5).unwrap(), extra);
+    assert!(check_team_workspace(Some(4), 128, input + 1, 3, 5).is_err());
+    assert_eq!(check_team_workspace(None, 128, u64::MAX, 0, 0).unwrap(), 0);
+    assert!(check_team_workspace(None, 128, u64::MAX, 1, 0).is_err());
+    for threads in [0, 1, 65, usize::MAX] {
+        assert!(check_team_workspace(Some(threads), 128, 1, 1, 1).is_err());
+    }
+    assert!(check_team_workspace(Some(2), 0, 1, 1, 1).is_err());
+    for (input, kv, scratch) in [(u64::MAX, 1, 1), (1, u64::MAX, 1), (1, 1, u64::MAX)] {
+        assert!(check_team_workspace(Some(2), 128, input, kv, scratch).is_err());
     }
 }

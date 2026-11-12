@@ -192,7 +192,8 @@ explicit width of 1 selects the cohort executor; omitting the option selects the
 existing serial executor. The last window may contain fewer rows because the
 document has ended. The implementation never silently lowers the selected
 window or retries serial execution after a refusal. `redact-corpus` and
-`redact-job start|resume` reject this option until those routes support it.
+`redact-job start|resume` support the same explicit native chunk schedule;
+retained jobs authenticate the schedule and width on resume.
 
 The complete declared cohort window is priced before key, document or model I/O.
 Its native KV, RoPE, scratch and decoder workspace remain reserved through both
@@ -296,9 +297,11 @@ The physical width does not change model, task, key or semantic identity.
 Multiple workers cannot combine with any explicit `--cohort-chunks`,
 including a width of one. The CLI also refuses prompt prefill and selected
 output rows on this route. Unsupported widths and incompatible schedules
-refuse before private IO. `redact`, `redact-corpus` and
-`redact-job start|resume` keep their existing schedules and do not expose
-this option.
+refuse before private IO. The short `redact` command keeps its existing
+schedule. `redact-corpus` and `redact-job start|resume` also support a persistent
+team across their complete invocation; see the [corpus guide](candidate-redaction-corpus.md)
+and [job guide](candidate-redaction-jobs.md) for their population ownership,
+completion and immutable resume contracts.
 
 The threaded route keeps the serial
 `fnlp-candidate-int4-redact-document-v1` protocol and unchanged semantic

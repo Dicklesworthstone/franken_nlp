@@ -2,7 +2,7 @@
 use super::*;
 use std::{io::{BufRead, BufReader}, sync::Arc, time::{Duration, Instant}};
 use crate::{
-    NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
+    NlpEngine, MemoryClass,
     candidate_cli::batch::{CandidateWriter, completed},
     hosted::{CancellationToken, HostedError, Int4HostError, NativeLimits, RunLimits, RedactionPseudonyms,
         corpus::{CorpusLimits as HostCorpusLimits, RedactionCorpusConfig}},
@@ -28,6 +28,8 @@ fn execution_error(error: HostedError) -> CandidateError {
             error.cancellation().map(cancelled).unwrap_or(CandidateError::Batch),
         HostedError::Int4(Int4HostError::Redaction(error)) =>
             error.cancellation().map(cancelled).unwrap_or(CandidateError::Batch),
+        HostedError::Int4(Int4HostError::Native(
+            crate::native_engine::strict_int4::StrictInt4Error::Cancelled(cause))) => cancelled(cause),
         HostedError::Reservation(_) => CandidateError::Memory,
         HostedError::ModelIdentity | HostedError::ResourceDomain => CandidateError::Identity,
         _ => CandidateError::Batch,
@@ -53,12 +55,8 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: common.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().map_err(|_| CandidateError::Runtime)?;
+    let engine = NlpEngine::builder().resource_config(compute::resource_config(common))
+        .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
     let _preparation = lease.reserve(MemoryClass::JobBuffers, common.preparation_bytes)
         .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
@@ -110,6 +108,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(), snapshot,
         chunk_schedule: command.document.cohort_chunks.map(ChunkSchedule::new),
+        compute_schedule: compute::Schedule::for_threads(common.compute.threads),
     };
     let writer = CandidateWriter::new(output, &provenance, limits.transport.max_output_line_bytes, limits.output_bytes)?;
     let reader: Box<dyn BufRead + Send> = if args.input.as_os_str() == "-" {
@@ -128,10 +127,14 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let summary = if limits.document.cohort.is_some() {
         engine.batch_int4_redact_documents_cohorts(&model, Arc::new(planner), Arc::new(vocabulary),
             config, secret, host, common.kernel, reader, writer, cancellation)
-    } else {
+    } else if common.compute.threads == 1 {
         engine.batch_int4_redact_documents(&model, Arc::new(planner), Arc::new(vocabulary),
             config, secret, host, common.kernel, reader, writer, cancellation)
+    } else {
+        engine.batch_int4_redact_documents_with_threads(&model, Arc::new(planner), Arc::new(vocabulary),
+            config, secret, host, common.kernel, common.compute.threads, reader, writer, cancellation)
     }.map_err(execution_error)?;
+    remaining()?;
     // The host emitted the sole terminal frame. Earlier completed rows remain
     // valid, but any failed record still makes the process unsuccessful.
     completed(summary)
@@ -153,6 +156,8 @@ struct Provenance<'a> {
     snapshot: Option<SnapshotRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     chunk_schedule: Option<ChunkSchedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compute_schedule: Option<compute::Schedule>,
 }
 
 #[cfg(test)]

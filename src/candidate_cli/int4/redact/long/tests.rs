@@ -361,7 +361,7 @@ fn document_teams_preserve_both_stage_authority_and_admit_one_worker_workspace()
 }
 
 #[test]
-fn mixed_or_unwired_document_team_schedules_refuse_before_any_private_io() {
+fn mixed_or_short_document_team_schedules_refuse_before_any_private_io() {
     for flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
         vec!["--compute-threads", "18446744073709551615"],
         vec!["--compute-threads", "2", "--cohort-chunks", "1"],
@@ -375,8 +375,9 @@ fn mixed_or_unwired_document_team_schedules_refuse_before_any_private_io() {
     let settings = options(&command);
     assert!(settings.redaction.validate(&command.args).is_err(), "short redaction retains its serial owner");
     for retained in [false, true] {
-        assert!(settings.validate_population(&command.args, retained).is_err(),
-            "a standalone team cannot enter corpus/job execution without an invocation owner");
+        let population = settings.validate_population(&command.args, retained).unwrap();
+        assert_eq!(population.common.compute.threads, 3,
+            "complete-document populations have their own persistent invocation owner");
     }
     let mut injected = settings.clone(); injected.cohort_chunks = Some(2);
     assert_eq!(injected.execute(command.args.clone(), &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));

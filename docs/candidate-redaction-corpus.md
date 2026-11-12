@@ -171,6 +171,77 @@ planner/vocabulary, optional `RedactionPseudonyms`, corpus limits and cancellati
 The default `RedactionCorpusConfig` and existing `batch_int8_redact` still select
 the short-document path. Both reuse the same process-owned corpus infrastructure.
 
+## Grouped INT4 streams and persistent numerical teams
+
+`fnlp candidate source-int4 redact-corpus` applies complete-document redaction
+to the same ordered source population with one grouped-INT4 resident model.
+Use an explicitly selected source conversion or independently pinned snapshot.
+This command always uses the complete-document path; it accepts exact live
+flush controls and publishes the existing semantic result under
+`fnlp-candidate-int4-redact-corpus-v1` provenance.
+
+```sh
+fnlp candidate source-int4 redact-corpus documents.ndjson \
+  --snapshot ./nanbeige.int4 --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 16384 --compute-threads 4 \
+  --max-requests 1000
+```
+
+The memory ceiling is illustrative, not a measured requirement. Width one
+preserves serial execution. Widths two through 64 admit one coordinator and
+`N - 1` persistent numerical output-row workers plus the existing runtime
+thread, for a configured process ceiling of `N + 1`. Worker scratch and
+thread capacity are admitted before key, source, NER-options or model IO.
+One team and native engine span every document, original NER chunk, fresh
+edited-source verification chunk and flush epoch. The model is shared.
+
+Each document retains the original complete detection/edit/verification
+contract. Fixed rules, NER types, full256 pseudonym scope, actions and optional
+coordinate maps cannot be overridden by a row. All five per-document native
+axes and mask visits continue to debit the separate whole-corpus ledger.
+The two grounding pools still span both stages of each document. A worker,
+chunk, new document or flush never enlarges any existing work allowance.
+
+Native chunk cohorts remain available with `--cohort-chunks N` under the
+serial numerical schedule. Any explicit cohort setting, including one, is
+incompatible with multiple numerical workers. The selected cohort window
+is never silently reduced, and the threaded path does not switch schedules
+after a refusal. Compact input, prompt prefill and selected-output-row modes
+remain unavailable on this redaction route.
+
+The optional `compute_schedule` field records
+`execution: "int4-output-row-team-v1"` and `declared_compute_threads`.
+It describes the invocation's physical schedule; it does not invent
+per-document projection counts. Width-one output omits it. The inner events,
+final edited text, result limits and byte-mode policy keep their existing
+contracts. Private keys, namespace, source text and rejected edited results
+do not enter public provenance.
+
+Successful document events can be delivered while the stream is running.
+The terminal `run_complete` is deferred until all numerical workers have
+joined, under the original deadline and transport budget. Charged IO and
+key/planner ownership survive that drain and terminal delivery. Writer
+failure, cancellation and poisoned execution continue to end the stream;
+earlier completed document events remain usable. Whole-run success still
+requires both `run_complete` and exit zero.
+
+Library callers use
+`NlpEngine::batch_int4_redact_documents_with_threads` with the same model,
+source planner, vocabulary, fixed configuration, optional pseudonym scope,
+corpus limits and kernel as the serial method, then explicit worker width,
+owned reader/writer and cancellation. The returned `BatchSummary` keeps the
+existing stream contract. The serial method and
+`batch_int4_redact_documents_cohorts` remain available. The existing core
+batch processor receives the team's native engine; no alternate detector,
+result constructor or recipe is introduced.
+
+New source regressions cover thread and workspace admission, schedule
+refusals, fixed work/result bounds and optional metadata. Terminal delivery
+and failure cleanup were reviewed against the existing shared dispatcher and
+deferred-stream contracts and fixtures. Compilation, executable regressions,
+actual-model parity, detector quality and performance remain **UNRUN** for
+this change pending the repository's controller-authorized DSR route.
+
 ## Limits of detection and validation
 
 NER chunks may split entities or lose context. Whole-source rules only cover

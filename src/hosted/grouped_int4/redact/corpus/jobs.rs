@@ -6,6 +6,7 @@ use crate::{
     jobs::{JobInputMemory, JobLimits, JobProgress, runner::{JobRunError,
         redact::grouped_int4::{self as redact_job, Int4RedactionJobConfig,
             Int4RedactionJobProcessor, INT4_REDACTION_JOB_RECIPE_BYTES}}},
+    native_engine::strict_int4::{projection::Int4ProjectionExecutor, weights::Int4ModelWeights},
 };
 
 struct JobPreparation {
@@ -16,6 +17,16 @@ struct JobPreparation {
     request: SourceJobRequest,
 }
 struct JobInput<R> { preparation: Option<JobPreparation>, reader: R }
+
+struct JobExecution<R> {
+    input: Charged<JobInput<R>>,
+    kv: Pending,
+    workspace: Pending,
+    limits: JobHostLimits,
+    required: JobRequirements,
+    width: usize,
+    lease: EngineLease,
+}
 
 impl NlpEngine {
     /// Create or explicitly resume an owned complete-document redaction job
@@ -35,7 +46,22 @@ impl NlpEngine {
         reader: R, cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
         self.job_int4_redact_document_for_schedule(model, planner, vocabulary, config,
-            pseudonyms, request, limits, kernel, reader, cancellation, false)
+            pseudonyms, request, limits, kernel, reader, cancellation, false, None)
+    }
+
+    /// Reuse one persistent numerical row team across all retained documents
+    /// and both detection stages in this invocation. Physical team width does
+    /// not change the authenticated recipe, full256 key scope, per-document
+    /// work debit or lifetime work authority. Workers join before return.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int4_redact_document_with_threads<R>(&self, model: &ResidentInt4,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: RedactionCorpusConfig<Int4RedactionJobConfig>, pseudonyms: Option<RedactionPseudonyms>,
+        request: SourceJobRequest, limits: JobHostLimits, kernel: PackedInt4Kernel,
+        compute_threads: usize, reader: R, cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        self.job_int4_redact_document_for_schedule(model, planner, vocabulary, config,
+            pseudonyms, request, limits, kernel, reader, cancellation, false, Some(compute_threads))
     }
 
     /// Create or resume the explicit native chunk-cohort schedule. The frozen
@@ -50,7 +76,7 @@ impl NlpEngine {
         reader: R, cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
         self.job_int4_redact_document_for_schedule(model, planner, vocabulary, config,
-            pseudonyms, request, limits, kernel, reader, cancellation, true)
+            pseudonyms, request, limits, kernel, reader, cancellation, true, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -58,12 +84,18 @@ impl NlpEngine {
         planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
         config: RedactionCorpusConfig<Int4RedactionJobConfig>, pseudonyms: Option<RedactionPseudonyms>,
         request: SourceJobRequest, limits: JobHostLimits, kernel: PackedInt4Kernel,
-        reader: R, cancellation: CancellationToken, cohorts: bool) -> Result<JobProgress, HostedJobError>
+        reader: R, cancellation: CancellationToken, cohorts: bool, compute_threads: Option<usize>)
+        -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
+        match compute_threads {
+            Some(width) => dispatch::preflight_int4_team(self, limits.native.run, width)?,
+            None => dispatch::preflight(self, limits.native.run)?,
+        }
         if !Arc::ptr_eq(self.resources(), model.resources()) {
             return Err(HostedError::ResourceDomain.into());
         }
+        check_team_schedule(compute_threads, cohorts,
+            config.batch.batch.detector.mapping.reduction.map_batch_chunks)?;
         if cohorts {
             redact_job::check_cohort_configuration(&planner, &config.batch, model.model_identity(),
                 request.limits, limits.native.context_tokens).map_err(HostedError::BatchSetup)?;
@@ -79,76 +111,96 @@ impl NlpEngine {
             job_requirements(&config, request.limits, limits, width, pseudonyms.as_ref(),
                 request.mode.input_memory())?
         };
+        check_team_workspace(compute_threads, width, required.input_bytes,
+            required.native.kv_bytes, required.workspace_bytes)?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(JobInput { preparation: Some(JobPreparation {
                 planner, vocabulary, config, secret: pseudonyms, request }), reader }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
         let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes)?;
+        let execution = JobExecution { input, kv, workspace, limits, required, width, lease };
         let model = model.clone();
-        let completed = dispatch::run(self, limits.native.run, cancellation, move |control| {
-            // Capture the complete charged owner, including queued cancellation.
-            let mut input = input;
-            checkpoint(control)?;
-            let JobPreparation { planner, vocabulary, config, secret, request } =
-                input.value.preparation.take().ok_or(HostedError::CompletionMissing)?;
-            // The actual pseudonym key commitment is checked before any
-            // population IO; the independent job secret authenticates storage.
-            let context = pseudonym_context(secret.as_ref(), &config.batch.batch.request)?;
-            let population = match read_population(&mut input.value.reader, &request,
-                limits.transport, control) {
-                Ok(population) => population,
-                Err(error) => return Ok(Err(JobRunError::Storage(error))),
-            };
-            checkpoint(control)?;
-            // Each document contains independent native contexts. A
-            // concatenated-sequence admission would reject valid work.
-            let admission = DocumentAdmission {
-                lease: &lease, model: model.model_identity(),
-                fixed: FixedItem::new(&config.batch.batch, width, required.native.kv_bytes,
-                    request.limits.max_result_bytes as u64),
-            };
-            let result = if let Some(quote) = required.cohort {
-                let result = (|| {
-                    let processor = Int4RedactionJobProcessor::new_cohorts(&planner, config.batch,
-                        &model.inner.loaded.value, &vocabulary, context.as_ref(),
-                        native_cohort_budget(quote, limits.native.context_tokens), kernel, admission)
-                        .map_err(JobRunError::Processor)?;
-                    run_population(request, &population, processor, control)
-                })();
-                // All exact-sized windows drain before returning; keep the
-                // full reservation live through spool and journal commits.
-                drop(workspace); drop(kv);
-                result
-            } else {
-                let mut engine = allocate_native(kv, workspace, || {
-                    StrictInt4Engine::new(&model.inner.loaded.value, limits.native.context_tokens, Int4MemoryBudget {
-                        max_kv_bytes: required.native.kv_bytes, max_rope_bytes: required.native.rope_bytes,
-                        max_scratch_payload_bytes: required.native.scratch_payload_bound,
-                    }).map(|engine| engine.with_kernel(kernel)).map_err(native_error)
-                })?;
-                let result = (|| {
-                    let processor = Int4RedactionJobProcessor::new(&planner, config.batch,
-                        &mut engine.value, &vocabulary, context.as_ref(), admission)
-                        .map_err(JobRunError::Processor)?;
-                    run_population(request, &population, processor, control)
-                })();
-                drop(engine);
-                result
-            };
-            // Runner, journal, spool and guarded outputs finish first.
-            drop(population);
-            drop(context);
-            drop(secret);
-            drop(vocabulary);
-            drop(planner);
-            drop(input);
-            drop(lease);
-            Ok(result)
-        })?;
+        let completed = match compute_threads {
+            None => dispatch::run(self, limits.native.run, cancellation, move |control|
+                execution.run(&model.inner.loaded.value, kernel, None, control)),
+            Some(threads) => dispatch::run_int4_team(self, limits.native.run, cancellation,
+                model, threads, kernel, move |weights, control, team|
+                    execution.run(weights, kernel, Some(team), control)),
+        }?;
         // Physical cancellation/drain failure takes precedence even if the
         // last durable result committed before its acknowledgement was lost.
         completed.map_err(HostedJobError::Job)
+    }
+}
+
+impl<R: BufRead> JobExecution<R> {
+    fn run<'weights>(self, weights: &'weights Int4ModelWeights, kernel: PackedInt4Kernel,
+        projection: Option<&'weights mut (dyn Int4ProjectionExecutor + 'weights)>,
+        control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
+        let Self { input, kv, workspace, limits, required, width, lease } = self;
+        // Capture the complete charged owner, including queued cancellation.
+        let mut input = input;
+        checkpoint(control)?;
+        let JobPreparation { planner, vocabulary, config, secret, request } =
+            input.value.preparation.take().ok_or(HostedError::CompletionMissing)?;
+        // The actual pseudonym key commitment is checked before any
+        // population IO; the independent job secret authenticates storage.
+        let context = pseudonym_context(secret.as_ref(), &config.batch.batch.request)?;
+        let population = match read_population(&mut input.value.reader, &request,
+            limits.transport, control) {
+            Ok(population) => population,
+            Err(error) => return Ok(Err(JobRunError::Storage(error))),
+        };
+        checkpoint(control)?;
+        // Each document contains independent native contexts. A
+        // concatenated-sequence admission would reject valid work.
+        let admission = DocumentAdmission {
+            lease: &lease, model: weights.identity(),
+            fixed: FixedItem::new(&config.batch.batch, width, required.native.kv_bytes,
+                request.limits.max_result_bytes as u64),
+        };
+        let result = if let Some(quote) = required.cohort {
+            let result = (|| {
+                let processor = Int4RedactionJobProcessor::new_cohorts(&planner, config.batch,
+                    weights, &vocabulary, context.as_ref(),
+                    native_cohort_budget(quote, limits.native.context_tokens), kernel, admission)
+                    .map_err(JobRunError::Processor)?;
+                run_population(request, &population, processor, control)
+            })();
+            // All exact-sized windows drain before returning; keep the
+            // full reservation live through spool and journal commits.
+            drop(workspace); drop(kv);
+            result
+        } else {
+            let mut engine = allocate_native(kv, workspace, || {
+                let engine = StrictInt4Engine::new(weights, limits.native.context_tokens, Int4MemoryBudget {
+                    max_kv_bytes: required.native.kv_bytes, max_rope_bytes: required.native.rope_bytes,
+                    max_scratch_payload_bytes: required.native.scratch_payload_bound,
+                }).map_err(native_error)?.with_kernel(kernel);
+                match projection {
+                    Some(team) => engine.with_projection_executor(team).map_err(native_error),
+                    None => Ok(engine),
+                }
+            })?;
+            let result = (|| {
+                let processor = Int4RedactionJobProcessor::new(&planner, config.batch,
+                    &mut engine.value, &vocabulary, context.as_ref(), admission)
+                    .map_err(JobRunError::Processor)?;
+                run_population(request, &population, processor, control)
+            })();
+            drop(engine);
+            result
+        };
+        // Runner, journal, spool and guarded outputs finish first.
+        drop(population);
+        drop(context);
+        drop(secret);
+        drop(vocabulary);
+        drop(planner);
+        drop(input);
+        drop(lease);
+        Ok(result)
     }
 }
 
