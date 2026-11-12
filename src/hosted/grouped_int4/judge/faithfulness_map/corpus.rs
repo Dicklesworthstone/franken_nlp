@@ -66,6 +66,11 @@ pub(super) fn document_output_bytes(mapping: Int4FaithfulnessMapLimits, cohort_c
 
 struct StreamInput<R, W> { planner: Option<Int4FaithfulnessDocumentBatchPlanner>, reader: R, writer: W }
 
+struct DeferredFaithfulnessStream<R, W> {
+    completion: stream::deferred::DeferredCompletion,
+    input: Charged<StreamInput<R, W>>,
+}
+
 impl NlpEngine {
     /// Audit complete original sources and per-row exact claims under one
     /// resident model, deadline and five-axis invocation work ledger. A result
@@ -80,7 +85,35 @@ impl NlpEngine {
         planner: Int4FaithfulnessDocumentBatchPlanner, limits: CorpusLimits, kernel: PackedInt4Kernel,
         reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
+        self.run_int4_faithfulness_documents(model, planner, limits, kernel, None,
+            reader, writer, cancellation)
+    }
+
+    /// Use one persistent numerical row team across the complete stream:
+    /// every original source, exact claim, chunk and evidence scoring head.
+    /// The existing evidence finalizer and five-axis work ledger remain in
+    /// force. Terminal completion follows physical join under the original
+    /// deadline. Explicit native chunk cohorts cannot be combined.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int4_faithfulness_documents_with_threads<R, W>(&self, model: &ResidentInt4,
+        planner: Int4FaithfulnessDocumentBatchPlanner, limits: CorpusLimits, kernel: PackedInt4Kernel,
+        compute_threads: usize, reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        self.run_int4_faithfulness_documents(model, planner, limits, kernel, Some(compute_threads),
+            reader, writer, cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_int4_faithfulness_documents<R, W>(&self, model: &ResidentInt4,
+        planner: Int4FaithfulnessDocumentBatchPlanner, limits: CorpusLimits, kernel: PackedInt4Kernel,
+        compute_threads: Option<usize>, reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        match compute_threads {
+            Some(width) => dispatch::preflight_int4_team(self, limits.native.run, width)?,
+            None => dispatch::preflight(self, limits.native.run)?,
+        }
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
         judge_task::check_model(planner.base_execution_identity(), model.model_identity()).map_err(judge_error)?;
         if planner.group_width() != model.model_identity().group_width() {
@@ -90,9 +123,14 @@ impl NlpEngine {
         crate::batch::judge::grouped_int4::validate_limits(planner.task_budget(), planner.planning_limits(),
             mapping, planner.max_run_work()).map_err(HostedError::BatchSetup)?;
         let cohort_chunks = planner.cohort_chunks();
+        check_team_schedule(compute_threads, cohort_chunks)?;
         let required = int4_faithfulness_document_corpus_requirements_with_max_heads(
             planner.group_width(), planner.task_budget(), planner.planning_limits(), mapping,
             limits, planner.max_heads(), cohort_chunks)?;
+        let team_scratch = compute_threads.map(|width|
+            int4_task_team_workspace_bytes(width, planner.group_width())).transpose()?.unwrap_or(0);
+        sum(&[required.input_bytes, required.native.kv_bytes, required.workspace_bytes,
+            required.output_reservation_bytes, team_scratch])?;
         let capacity = DocumentCapacity { context: limits.native.context_tokens, kv_bytes: required.native.kv_bytes,
             mapping, cohort_chunks, max_heads: planner.max_heads(),
             max_result_bytes: planner.max_result_bytes(), task_budget: planner.task_budget() };
@@ -102,7 +140,8 @@ impl NlpEngine {
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes)?;
         let model = model.clone();
-        dispatch::run(self, limits.native.run, cancellation, move |control| {
+        match compute_threads {
+        None => dispatch::run(self, limits.native.run, cancellation, move |control| {
             let mut input = input;
             checkpoint(control)?;
             let planner = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
@@ -138,7 +177,46 @@ impl NlpEngine {
             drop(input); // Retained private IO precedes physical completion.
             drop(lease);
             result
-        })
+        }),
+        Some(width) => dispatch::run_int4_team_with_finalize(self, limits.native.run, cancellation,
+            model, width, kernel, move |weights, control, team| {
+                let mut input = input;
+                checkpoint(control)?;
+                let planner = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
+                let admission = DocumentAdmission { lease: &lease, model: weights.identity(),
+                    capacity, output_bytes: required.output_reservation_bytes };
+                let mut engine = allocate_native(kv, scratch, || {
+                    StrictInt4Engine::new(weights, limits.native.context_tokens,
+                        native_budget(required.native)).map_err(native_error)?.with_kernel(kernel)
+                        .with_projection_executor(team).map_err(native_error)
+                })?;
+                let completion = {
+                    let mut processor = NativeInt4FaithfulnessDocumentBatch::new(planner,
+                        &mut engine.value, admission).map_err(HostedError::BatchSetup)?;
+                    stream::deferred::run_ndjson_deferred(&mut input.value.reader, &mut input.value.writer,
+                        &mut processor, limits.transport, control).map_err(HostedError::Batch)?
+                };
+                drop(engine); drop(lease);
+                Ok(DeferredFaithfulnessStream { completion, input })
+            }, |pending, control| pending.publish(control)),
+        }
+    }
+}
+
+fn check_team_schedule(threads: Option<usize>, cohort_chunks: Option<usize>) -> Result<(), HostedError> {
+    if threads.is_some() && cohort_chunks.is_some() {
+        return Err(HostedError::Limits("INT4 faithfulness corpus team cannot combine with native chunk cohorts"));
+    }
+    Ok(())
+}
+
+impl<R, W: Write> DeferredFaithfulnessStream<R, W> {
+    fn publish<C: crate::native_engine::decode::DecodeStepControl>(self, control: &mut C)
+        -> Result<BatchSummary, HostedError> {
+        let Self { completion, mut input } = self;
+        let result = completion.publish(&mut input.value.writer, control).map_err(HostedError::Batch);
+        drop(input);
+        result
     }
 }
 

@@ -1,4 +1,7 @@
 //! Pure durable-host contracts, without fake model execution or quality claims.
+#[cfg(feature = "asupersync-runtime")]
+mod team;
+
 use super::*;
 use std::time::Duration;
 use crate::{jobs::population::PopulationReadLimits,
@@ -148,6 +151,7 @@ fn invalid_host_capacity_and_overflow_refuse_before_private_population_io() {
 #[test]
 fn owned_reader_and_private_recipe_share_the_existing_job_boundary() {
     let _host = NlpEngine::job_int4_faithfulness_document::<std::io::Cursor<Vec<u8>>>;
+    let _team = NlpEngine::job_int4_faithfulness_document_with_threads::<std::io::Cursor<Vec<u8>>>;
     fn send<T: Send + 'static>() {}
     send::<JobInput<std::io::Cursor<Vec<u8>>>>();
 }

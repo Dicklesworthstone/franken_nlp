@@ -1,5 +1,8 @@
 //! Pure reservation and admission regressions. Synthetic identities below
 //! cannot construct a native model or attest to faithfulness quality.
+#[cfg(feature = "asupersync-runtime")]
+mod team;
+
 use super::*;
 use std::time::Duration;
 use crate::{artifact::converter::PINNED_REVISION, batch::BatchLimits,
@@ -205,6 +208,7 @@ fn missing_reservations_output_capacity_and_arithmetic_fail_before_io() {
 #[test]
 fn owned_stream_and_quote_are_available_on_the_existing_host_surface() {
     let _host = NlpEngine::batch_int4_faithfulness_documents::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    let _team = NlpEngine::batch_int4_faithfulness_documents_with_threads::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
     let _quote = crate::hosted::int4_faithfulness_document_corpus_requirements;
     let _capped_quote = crate::hosted::int4_faithfulness_document_corpus_requirements_with_max_heads;
     fn send<T: Send + 'static>() {}

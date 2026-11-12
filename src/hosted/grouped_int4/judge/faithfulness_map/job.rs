@@ -8,11 +8,22 @@ use crate::{
     jobs::{JobInputMemory, JobLimits, JobProgress, JobWork,
         runner::{JobRunError, scored::grouped_int4::faithfulness_document::{
             Int4FaithfulnessDocumentJobPlanner, Int4FaithfulnessDocumentJobProcessor}}},
+    native_engine::strict_int4::{projection::Int4ProjectionExecutor, weights::Int4ModelWeights},
 };
 
 struct JobInput<R> {
     preparation: Option<(Int4FaithfulnessDocumentJobPlanner, SourceJobRequest)>,
     reader: R,
+}
+
+struct JobExecution<R> {
+    input: Charged<JobInput<R>>,
+    kv: Pending,
+    scratch: Pending,
+    limits: JobHostLimits,
+    required: Int4FaithfulnessMapMemoryRequirement,
+    capacity: DocumentCapacity,
+    lease: EngineLease,
 }
 
 impl NlpEngine {
@@ -31,7 +42,35 @@ impl NlpEngine {
         limits: JobHostLimits, kernel: PackedInt4Kernel, reader: R,
         cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
+        self.run_int4_faithfulness_document_job(model, planner, request, limits, kernel, None,
+            reader, cancellation)
+    }
+
+    /// Reuse one persistent numerical row team through every source, claim,
+    /// chunk and evidence head in this durable invocation. Physical width
+    /// does not change policy, authenticated recipes or lifetime work debits.
+    /// Worker scratch is admitted before population IO and all workers join
+    /// before return. Explicit native chunk cohorts cannot be combined.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int4_faithfulness_document_with_threads<R>(&self, model: &ResidentInt4,
+        planner: Int4FaithfulnessDocumentJobPlanner, request: SourceJobRequest,
+        limits: JobHostLimits, kernel: PackedInt4Kernel, compute_threads: usize, reader: R,
+        cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        self.run_int4_faithfulness_document_job(model, planner, request, limits, kernel, Some(compute_threads),
+            reader, cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_int4_faithfulness_document_job<R>(&self, model: &ResidentInt4,
+        planner: Int4FaithfulnessDocumentJobPlanner, request: SourceJobRequest,
+        limits: JobHostLimits, kernel: PackedInt4Kernel, compute_threads: Option<usize>, reader: R,
+        cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        match compute_threads {
+            Some(width) => dispatch::preflight_int4_team(self, limits.native.run, width)?,
+            None => dispatch::preflight(self, limits.native.run)?,
+        }
         if !Arc::ptr_eq(self.resources(), model.resources()) {
             return Err(HostedError::ResourceDomain.into());
         }
@@ -42,8 +81,13 @@ impl NlpEngine {
         planner.check_job_limits(request.limits).map_err(HostedError::BatchSetup)?;
         let mapping = planner.document_limits();
         let cohort_chunks = planner.cohort_chunks();
+        check_team_schedule(compute_threads, cohort_chunks)?;
         let required = requirements(planner.group_width(), planner.task_budget(), planner.planning_limits(),
             mapping, request.limits, limits, planner.max_heads(), cohort_chunks, request.mode.input_memory())?;
+        let team_scratch = compute_threads.map(|width|
+            int4_task_team_workspace_bytes(width, planner.group_width())).transpose()?.unwrap_or(0);
+        sum(&[required.input_bytes, required.native.kv_bytes, required.workspace_bytes,
+            required.output_reservation_bytes, team_scratch])?;
         if planner.max_result_bytes() != document_output_bytes(mapping, cohort_chunks)? {
             return Err(HostedError::Limits("faithfulness document job result envelope").into());
         }
@@ -55,50 +99,76 @@ impl NlpEngine {
             || Ok(JobInput { preparation: Some((planner, request)), reader }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes)?;
+        let execution = JobExecution { input, kv, scratch, limits, required, capacity, lease };
         let model = model.clone();
-        let completed = dispatch::run(self, limits.native.run, cancellation, move |control| {
-            // Capture the aggregate owner so an already-cancelled queued task
-            // cannot outlive its reader, private recipe or resource charge.
-            let mut input = input;
-            checkpoint(control)?;
-            let (planner, request) = input.value.preparation.take().ok_or(HostedError::CompletionMissing)?;
-            let population = match read_population(&mut input.value.reader,
-                &request, limits.transport, control) {
-                Ok(population) => population,
-                Err(error) => return Ok(Err(JobRunError::Storage(error))),
-            };
-            checkpoint(control)?;
-            let admission = DocumentAdmission { lease: &lease, model: model.model_identity(),
-                capacity, output_bytes: required.output_reservation_bytes };
-            let result = if cohort_chunks.is_some() {
-                let kv = kv.commit()?; let scratch = scratch.commit()?;
-                let result = (|| {
-                    let processor = Int4FaithfulnessDocumentJobProcessor::new_cohorts(planner,
-                        &model.inner.loaded.value, kernel, map_memory(limits), admission)
-                        .map_err(JobRunError::Processor)?;
-                    run_population(request, &population, processor, control)
-                })();
-                drop(scratch); drop(kv);
-                result
-            } else {
-                let mut engine = allocate_native(kv, scratch, || {
-                    StrictInt4Engine::new(&model.inner.loaded.value, limits.native.context_tokens,
-                        native_budget(required.native)).map(|engine| engine.with_kernel(kernel)).map_err(native_error)
-                })?;
-                let result = (|| {
-                    let processor = Int4FaithfulnessDocumentJobProcessor::new(planner, &mut engine.value, admission)
-                        .map_err(JobRunError::Processor)?;
-                    run_population(request, &population, processor, control)
-                })();
-                drop(engine);
-                result
-            };
-            // Complete guarded outputs drop inside run_population before the
-            // original population and its journal/serialization reservation.
-            drop(population); drop(input); drop(lease);
-            Ok(result)
-        })?;
+        let completed = match compute_threads {
+            None => dispatch::run(self, limits.native.run, cancellation, move |control|
+                execution.run(&model.inner.loaded.value, kernel, None, control)),
+            Some(width) => dispatch::run_int4_team(self, limits.native.run, cancellation,
+                model, width, kernel, move |weights, control, team|
+                    execution.run(weights, kernel, Some(team), control)),
+        }?;
+        // Physical drain and terminal cancellation take precedence over an
+        // individual durable acknowledgement. Explicit resume reconciles it.
         completed.map_err(HostedJobError::Job)
+    }
+}
+
+fn check_team_schedule(threads: Option<usize>, cohort_chunks: Option<usize>) -> Result<(), HostedError> {
+    if threads.is_some() && cohort_chunks.is_some() {
+        return Err(HostedError::Limits("INT4 faithfulness document job team cannot combine with native chunk cohorts"));
+    }
+    Ok(())
+}
+
+impl<R: BufRead> JobExecution<R> {
+    fn run<'weights>(self, weights: &'weights Int4ModelWeights, kernel: PackedInt4Kernel,
+        projection: Option<&'weights mut (dyn Int4ProjectionExecutor + 'weights)>,
+        control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
+        // Capture the aggregate owner so an already-cancelled queued task
+        // cannot outlive its reader, private recipe or resource charge.
+        let Self { mut input, kv, scratch, limits, required, capacity, lease } = self;
+        checkpoint(control)?;
+        let (planner, request) = input.value.preparation.take().ok_or(HostedError::CompletionMissing)?;
+        let population = match read_population(&mut input.value.reader,
+            &request, limits.transport, control) {
+            Ok(population) => population,
+            Err(error) => return Ok(Err(JobRunError::Storage(error))),
+        };
+        checkpoint(control)?;
+        let admission = DocumentAdmission { lease: &lease, model: weights.identity(),
+            capacity, output_bytes: required.output_reservation_bytes };
+        let result = if capacity.cohort_chunks.is_some() {
+            let kv = kv.commit()?; let scratch = scratch.commit()?;
+            let result = (|| {
+                let processor = Int4FaithfulnessDocumentJobProcessor::new_cohorts(planner,
+                    weights, kernel, map_memory(limits), admission)
+                    .map_err(JobRunError::Processor)?;
+                run_population(request, &population, processor, control)
+            })();
+            drop(scratch); drop(kv);
+            result
+        } else {
+            let mut engine = allocate_native(kv, scratch, || {
+                let engine = StrictInt4Engine::new(weights, limits.native.context_tokens,
+                    native_budget(required.native)).map_err(native_error)?.with_kernel(kernel);
+                match projection {
+                    Some(team) => engine.with_projection_executor(team).map_err(native_error),
+                    None => Ok(engine),
+                }
+            })?;
+            let result = (|| {
+                let processor = Int4FaithfulnessDocumentJobProcessor::new(planner, &mut engine.value, admission)
+                    .map_err(JobRunError::Processor)?;
+                run_population(request, &population, processor, control)
+            })();
+            drop(engine);
+            result
+        };
+        // Complete guarded outputs drop inside run_population before the
+        // population reader and its journal/serialization reservation.
+        drop(population); drop(input); drop(lease);
+        Ok(result)
     }
 }
 
