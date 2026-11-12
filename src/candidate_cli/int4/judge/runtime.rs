@@ -46,6 +46,8 @@ pub(super) fn execute(args: Int4Args, command: JudgeArgs, _admitted: Int4Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
     let started = Instant::now();
     let limits = command.validate(&args)?;
+    let encoding = command.encoding.policy(&args)?;
+    let preparation_bytes = sum(&[limits.preparation_bytes, command.encoding.workspace_bytes(&args)?])?;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
@@ -56,7 +58,7 @@ pub(super) fn execute(args: Int4Args, command: JudgeArgs, _admitted: Int4Limits,
         leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
     }).build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
-    let _preparation = lease.reserve(MemoryClass::JobBuffers, limits.preparation_bytes)
+    let _preparation = lease.reserve(MemoryClass::JobBuffers, preparation_bytes)
         .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
     remaining()?;
     let text = if args.input.as_os_str() == "-" { read_input(input, args.max_input_bytes)? }
@@ -75,7 +77,8 @@ pub(super) fn execute(args: Int4Args, command: JudgeArgs, _admitted: Int4Limits,
     // The model-bound planner owns the pinned EOS and full-vocabulary scoring
     // policy. Neither the request nor CLI flags can replace those semantics.
     let planner = Int4JudgePlanner::for_model(model.model_identity(), budget,
-        command.scoring.judge_limits(budget)).map_err(planning_error)?;
+        command.scoring.judge_limits(budget)).and_then(|planner| planner.with_document_encoding(encoding.clone()))
+        .map_err(planning_error)?;
     remaining()?;
     let plan = planner.plan_with_control(&request, &mut DeadlineControl { started, deadline })
         .map_err(planning_error)?;
@@ -85,6 +88,7 @@ pub(super) fn execute(args: Int4Args, command: JudgeArgs, _admitted: Int4Limits,
         return Err(CandidateError::Identity);
     }
     let expected_work = plan.planned_work();
+    let input_encoding_work = plan.input_encoding_work();
     let identity = plan.execution_identity().clone();
     drop(planner);
     drop(request);
@@ -133,6 +137,7 @@ pub(super) fn execute(args: Int4Args, command: JudgeArgs, _admitted: Int4Limits,
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: limits.kernel.kind().id(), snapshot,
+        input_encoding: input_encoding::reported_policy(&encoding), input_encoding_work,
     };
     // Both guards survive bounded staging, writing and flushing. Inference
     // failure never emits a prefix; a writer error remains an output failure.
@@ -159,6 +164,10 @@ struct Provenance<'a> {
     group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<SnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<&'a UntrustedEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding_work: Option<crate::tokenizer::untrusted::SafeBpeWork>,
 }
 #[derive(Serialize)]
 struct Response<'a, 'b, T: Serialize> {

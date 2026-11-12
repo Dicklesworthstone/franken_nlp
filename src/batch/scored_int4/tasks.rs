@@ -125,6 +125,7 @@ impl Int4ScoredTask for Int4JudgePlanner {
     type Plan = PreparedInt4Judge;
     type Output = Int4JudgeRun;
     const TASK: &'static str = "judge-v1";
+    fn document_encoding(&self) -> &UntrustedEncoding { self.document_encoding() }
     fn plan_document<C: DecodeStepControl>(&self, text: String, args: Self::Args, control: &mut C)
         -> Result<Self::Plan, BatchItemFailure> {
         self.plan_with_control(&args.into_request(text), control).map_err(|e| judge_error(e, false))

@@ -5,10 +5,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     canonjson,
     execution_identity::Sha256Digest,
-    native_engine::lmhead::{NANBEIGE_VOCAB_SIZE, scoring::{
+    native_engine::{decode::DecodeCancellationKind, lmhead::{NANBEIGE_VOCAB_SIZE, scoring::{
         CandidateLogits, CandidateScorer, CandidateScores, ProjectionRows,
         ScoringError, ScoringLimits, ScoringMode, ScoringWork,
-    }},
+    }}},
     tasks::ir::{DecodeStrategy, DependencyScope, FinitePostcondition, PromptSegment,
         PromptSegmentKind, ScoreSpace, TaskIR, TaskPlan},
     tokenizer::specials::TemplateControlIds,
@@ -42,6 +42,7 @@ pub enum JudgeError {
     InvalidScores,
     AllocationRefused,
     Serialization,
+    Cancelled(DecodeCancellationKind),
 }
 impl fmt::Display for JudgeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -52,6 +53,7 @@ impl fmt::Display for JudgeError {
             Self::InvalidScores => f.write_str("judge result failed complete-score validation"),
             Self::AllocationRefused => f.write_str("judge allocation refused"),
             Self::Serialization => f.write_str("judge serialization failed"),
+            Self::Cancelled(_) => f.write_str("judge planning cancelled"),
         }
     }
 }

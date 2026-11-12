@@ -16,7 +16,8 @@ use crate::{
     tokenizer::{bpe::EncodeOptions,
         embedded::{EmbeddedTokenizer, PINNED_TOKENIZER_MODEL_BYTES, PINNED_ADDED_TOKENS_BYTES,
             PINNED_TOKENIZER_CONFIG_BYTES, PINNED_SPECIAL_TOKENS_MAP_BYTES},
-        specials::TemplateControlIds, untrusted::UntrustedDocumentEncoder},
+        specials::TemplateControlIds, untrusted::{SafeBpeWork, UntrustedDocumentEncoder,
+            UntrustedDocumentError, UntrustedEncoding}},
 };
 use super::{
     common::{Bundle, JUDGE_SCORER_VERSION, add, reserved}, native,
@@ -111,9 +112,18 @@ impl Executable {
 
 /// Private, non-deserializable plan and complete identity. The caller admits
 /// the engine against this identity. Execution checks it without repairing it.
-pub struct PreparedJudge { executable: Executable, identity: ExecutionIdentity }
+pub struct PreparedJudge {
+    executable: Executable, identity: ExecutionIdentity,
+    encoding: UntrustedEncoding, encoding_work: SafeBpeWork,
+}
 impl PreparedJudge {
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
+    pub fn input_encoding(&self) -> &UntrustedEncoding { &self.encoding }
+    /// Work spent by this exact planning pass. Composed callers retain the
+    /// enclosing ledger separately so reconstruction cannot renew its limits.
+    pub fn input_encoding_work(&self) -> Option<SafeBpeWork> {
+        matches!(self.encoding, UntrustedEncoding::SafeBpeV1(_)).then_some(self.encoding_work)
+    }
     pub fn planned_work(&self) -> ScoringWork { self.executable.bundle().work }
     pub fn verify_identity(&self, admitted: &ExecutionIdentity) -> Result<(), JudgeError> {
         admitted.validate().map_err(|_| JudgeError::Contract("invalid admitted judge identity"))?;
@@ -159,6 +169,8 @@ pub struct JudgePlanner {
     rubric_candidates: Vec<Candidate>,
     faithfulness: FaithfulnessCompiler,
     template_digest: Sha256Digest,
+    byte_template_digest: Sha256Digest,
+    document_encoding: UntrustedEncoding,
 }
 impl JudgePlanner {
     pub fn pinned(controls: &TemplateControlIds, eos: u32) -> Result<Self, JudgeError> {
@@ -203,20 +215,50 @@ impl JudgePlanner {
                 PINNED_SPECIAL_TOKENS_MAP_BYTES].map(Sha256Digest::of_bytes) };
         let template_digest = digest(&witness)?;
         Ok(Self { tokenizer, controls: controls.clone(), eos, pairwise_fragments, rubric_fragments,
-            pairwise_candidates, rubric_candidates, faithfulness, template_digest })
+            pairwise_candidates, rubric_candidates, faithfulness, template_digest,
+            byte_template_digest: template_digest, document_encoding: UntrustedEncoding::ByteFallback })
+    }
+    /// Select the bounded encoding of all untrusted text in one judgment.
+    /// Pairwise orders, rubric criteria and faithfulness evidence heads share
+    /// one tokenizer allowance; response verbalizers keep their fixed language.
+    /// The caller admits the encoder workspace before private input IO.
+    pub fn with_document_encoding(mut self, encoding: UntrustedEncoding) -> Result<Self, JudgeError> {
+        encoding.validate().map_err(|_| JudgeError::Contract("invalid judge input encoding policy"))?;
+        self.template_digest = if encoding == UntrustedEncoding::ByteFallback { self.byte_template_digest }
+            else { digest(&("judge-untrusted-encoding-v1", self.byte_template_digest, &encoding))? };
+        self.document_encoding = encoding;
+        Ok(self)
+    }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { &self.document_encoding }
+    pub fn document_encoding_workspace_bytes(&self) -> Result<u64, JudgeError> {
+        match &self.document_encoding {
+            UntrustedEncoding::ByteFallback => Ok(0),
+            UntrustedEncoding::SafeBpeV1(limits) => limits.requirements().map(|quote| quote.workspace_bytes)
+                .map_err(|_| JudgeError::Contract("invalid judge input encoding workspace")),
+        }
     }
     pub fn template_digest(&self) -> &Sha256Digest { &self.template_digest }
     pub fn tokenizer_digest(&self) -> Sha256Digest { Sha256Digest::of_bytes(PINNED_TOKENIZER_MODEL_BYTES) }
 
     pub fn plan(&self, request: &JudgeRequest, context: &PlanContext<'_>, limits: JudgeLimits)
         -> Result<PreparedJudge, JudgeError> {
-        self.plan_with_profile(request, context, limits, NumericsProfile::HfBf16Eager)
+        self.plan_with_control(request, context, limits, &mut Continue)
+    }
+    pub fn plan_with_control<C: DecodeStepControl>(&self, request: &JudgeRequest,
+        context: &PlanContext<'_>, limits: JudgeLimits, control: &mut C)
+        -> Result<PreparedJudge, JudgeError> {
+        self.plan_with_profile_and_work(request, context, limits, NumericsProfile::HfBf16Eager,
+            control, &mut SafeBpeWork::default())
     }
     // Only the private native wrappers can obtain a non-eager inner plan. There
     // is no public conversion from it to PreparedJudge or an eager executor.
-    fn plan_with_profile(&self, request: &JudgeRequest, context: &PlanContext<'_>,
-        limits: JudgeLimits, profile: NumericsProfile) -> Result<PreparedJudge, JudgeError> {
+    #[allow(clippy::too_many_arguments)]
+    fn plan_with_profile_and_work<C: DecodeStepControl>(&self, request: &JudgeRequest,
+        context: &PlanContext<'_>, limits: JudgeLimits, profile: NumericsProfile,
+        control: &mut C, work: &mut SafeBpeWork) -> Result<PreparedJudge, JudgeError> {
+        planning_checkpoint(control)?;
         self.check_context(context, profile)?;
+        let before = *work;
         let budget = request.budget();
         budget.validate().map_err(|_| JudgeError::Contract("judge task budget"))?;
         if !fits(budget, *context.budget_ceiling()) { return Err(JudgeError::Limit("plan_context")); }
@@ -226,8 +268,14 @@ impl JudgePlanner {
                     return Err(JudgeError::Contract("pairwise requires criterion and both answers"));
                 }
                 let len = add(add(criterion.len(), a.len(), "input_bytes")?, b.len(), "input_bytes")?;
-                check_prompt_lengths(&[len, len], &self.pairwise_fragments, budget, limits)?;
-                let criterion = self.encode(criterion)?; let a = self.encode(a)?; let b = self.encode(b)?;
+                if self.document_encoding == UntrustedEncoding::ByteFallback {
+                    check_prompt_lengths(&[len, len], &self.pairwise_fragments, budget, limits)?;
+                }
+                let criterion = self.encode_with_work(criterion, work, control)?;
+                let a = self.encode_with_work(a, work, control)?;
+                let b = self.encode_with_work(b, work, control)?;
+                let tokens = add(add(criterion.len(), a.len(), "prompt_tokens")?, b.len(), "prompt_tokens")?;
+                check_prompt_lengths(&[tokens, tokens], &self.pairwise_fragments, budget, limits)?;
                 let ab = task(&self.pairwise_fragments, &[&criterion, &a, &b], &self.pairwise_candidates, context, budget)?;
                 let ba = task(&self.pairwise_fragments, &[&criterion, &b, &a], &self.pairwise_candidates, context, budget)?;
                 let plan = PairwisePlan::from_task_plans(&ab, &ba, self.eos, &self.controls, *policy, limits)?;
@@ -242,12 +290,18 @@ impl JudgePlanner {
                 let fragments = &self.rubric_fragments[usize::from(rubric.scale_maximum) - 1];
                 let lengths = ordered.iter().map(|c| add(c.description.len(), document.len(), "input_bytes"))
                     .collect::<Result<Vec<_>, _>>()?;
-                check_prompt_lengths(&lengths, fragments, budget, limits)?;
-                let document = self.encode(document)?;
+                if self.document_encoding == UntrustedEncoding::ByteFallback {
+                    check_prompt_lengths(&lengths, fragments, budget, limits)?;
+                }
+                let document = self.encode_with_work(document, work, control)?;
                 let candidates = &self.rubric_candidates[..=usize::from(rubric.scale_maximum)];
                 let mut inputs = reserved(ordered.len())?;
+                let mut token_lengths = reserved(ordered.len())?;
                 for criterion in &ordered {
-                    let description = self.encode(&criterion.description)?;
+                    planning_checkpoint(control)?;
+                    let description = self.encode_with_work(&criterion.description, work, control)?;
+                    token_lengths.push(add(description.len(), document.len(), "prompt_tokens")?);
+                    check_prompt_lengths(&token_lengths, fragments, budget, limits)?;
                     inputs.push(RubricHeadInput { criterion_id: criterion.id.clone(), weight: criterion.weight,
                         task: task(fragments, &[&description, &document], candidates, context, budget)? });
                 }
@@ -259,7 +313,8 @@ impl JudgePlanner {
                     digest(&(RUBRIC_VERSION, rubric.scale_maximum, weights, policy, self.eos, JUDGE_SCORER_VERSION))?)
             }
             JudgeRequest::Faithfulness { source, claim, policy, .. } => {
-                let plan = self.faithfulness.plan(source, claim, *policy, context, budget, &self.controls, self.eos, limits)?;
+                let plan = self.faithfulness.plan_with_encoding_work(source, claim, *policy, context,
+                    budget, &self.controls, self.eos, limits, &self.document_encoding, work, control)?;
                 (Executable::Faithfulness(plan), digest(&("judge-faithfulness-result-v1", FAITHFULNESS_VERSION))?,
                     digest(&(FAITHFULNESS_VERSION, EVIDENCE_PARTITION_VERSION, policy, self.eos, JUDGE_SCORER_VERSION))?)
             }
@@ -270,7 +325,9 @@ impl JudgePlanner {
         identity.schema_digest = schema; identity.decision_policy_digest = decision;
         identity.grammar_compiler_version = "none".to_owned(); identity.sampler_version = JUDGE_SCORER_VERSION.to_owned();
         identity.validate().map_err(|_| JudgeError::Contract("prepared judge identity"))?;
-        Ok(PreparedJudge { executable, identity })
+        planning_checkpoint(control)?;
+        let encoding_work = work.checked_sub(before).ok_or(JudgeError::Contract("judge encoding work accounting"))?;
+        Ok(PreparedJudge { executable, identity, encoding: self.document_encoding.clone(), encoding_work })
     }
     fn check_context(&self, context: &PlanContext<'_>, profile: NumericsProfile) -> Result<(), JudgeError> {
         let id = context.execution_identity();
@@ -281,11 +338,36 @@ impl JudgePlanner {
         }
         Ok(())
     }
-    fn encode(&self, source: &str) -> Result<Vec<u32>, JudgeError> {
-        let doc = UntrustedDocumentEncoder::new(self.tokenizer.tokenizer(), &self.controls).encode(source.as_bytes())
-            .map_err(|_| JudgeError::Contract("byte-preserving judge data encoding refused"))?;
-        if doc.ids().len() != source.len() { return Err(JudgeError::Contract("judge byte-token accounting diverged")); }
+    fn encode_with_work<C: DecodeStepControl>(&self, source: &str, work: &mut SafeBpeWork,
+        control: &mut C) -> Result<Vec<u32>, JudgeError> {
+        planning_checkpoint(control)?;
+        let mut cancelled = None;
+        let doc = UntrustedDocumentEncoder::new(self.tokenizer.tokenizer(), &self.controls)
+            .encode_with_policy(source.as_bytes(), &self.document_encoding, work, &mut || {
+                cancelled = control.prefill_checkpoint(0); cancelled.is_none()
+            });
+        if let Some(cause) = cancelled { return Err(JudgeError::Cancelled(cause)); }
+        let doc = doc.map_err(encoding_error)?;
+        if self.document_encoding == UntrustedEncoding::ByteFallback && doc.ids().len() != source.len() {
+            return Err(JudgeError::Contract("judge byte-token accounting diverged"));
+        }
+        planning_checkpoint(control)?;
         Ok(doc.ids().to_vec())
+    }
+}
+fn planning_checkpoint<C: DecodeStepControl>(control: &mut C) -> Result<(), JudgeError> {
+    match control.prefill_checkpoint(0) { Some(cause) => Err(JudgeError::Cancelled(cause)), None => Ok(()) }
+}
+fn encoding_error(error: UntrustedDocumentError) -> JudgeError {
+    match error {
+        UntrustedDocumentError::AllocationRefused => JudgeError::AllocationRefused,
+        UntrustedDocumentError::InvalidEncodingLimits { .. } => JudgeError::Contract("invalid judge input encoding limits"),
+        UntrustedDocumentError::EncodingBudget { resource: "input bytes" } => JudgeError::Limit("tokenizer_input_bytes"),
+        UntrustedDocumentError::EncodingBudget { resource: "output tokens" } => JudgeError::Limit("tokenizer_output_tokens"),
+        UntrustedDocumentError::EncodingBudget { resource: "pair checks" } => JudgeError::Limit("tokenizer_pair_checks"),
+        UntrustedDocumentError::EncodingBudget { resource: "pair bytes" } => JudgeError::Limit("tokenizer_pair_bytes"),
+        UntrustedDocumentError::EncodingBudget { .. } => JudgeError::Limit("tokenizer_work"),
+        _ => JudgeError::Contract("byte-preserving judge data encoding refused"),
     }
 }
 fn byte_candidate(tokenizer: &EmbeddedTokenizer, controls: &TemplateControlIds, id: String, text: &str)

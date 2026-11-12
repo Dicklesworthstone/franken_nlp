@@ -8,7 +8,7 @@ use crate::{
     native_engine::{decode::DecodeStepControl, hf_bf16_eager::{HfBf16EagerEngine,
         candidate_scoring::PrefixBudget}, lmhead::scoring::{CandidateScores, ScoringWork}},
     tasks::{extract::SourceDocument, ir::{DecodeStrategy, PromptSegmentKind, TaskPlan}},
-    tokenizer::specials::TemplateControlIds,
+    tokenizer::{specials::TemplateControlIds, untrusted::UntrustedEncoding},
     validation::{SourceSpan, validate_source_span, grounded_fields::VerifiedSourceSpan},
 };
 use super::{common::{Bundle, reserved}, native, EagerJudgeRun, JudgeError, JudgeLimits, JudgeLogits, JudgeNativeError};
@@ -113,6 +113,8 @@ impl FaithfulnessPlan {
         -> Result<Self, JudgeError> {
         policy.validate()?;
         if source.text().is_empty() || claim.text().is_empty()
+            || source.document_encoding() != &UntrustedEncoding::ByteFallback
+            || claim.document_encoding() != &UntrustedEncoding::ByteFallback
             || source.token_ids().len() != source.text().len() || claim.token_ids().len() != claim.text().len() {
             return Err(JudgeError::Contract("faithfulness requires exact nonempty byte-token sources"));
         }
@@ -124,13 +126,48 @@ impl FaithfulnessPlan {
                 else { spans[index - 1].byte_start..spans[index - 1].byte_end };
             validate_head(task, &tasks[0], &source.token_ids()[range], claim.token_ids())?;
         }
+        Self::bind(tasks, source.text(), spans, eos, controls, policy, limits)
+    }
+    /// Only the pinned compiler can supply independently encoded evidence
+    /// windows. Byte coordinates address original text, never compact IDs;
+    /// each exact window must agree with the deterministic complete partition.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_encoded_task_plans(tasks: &[TaskPlan], source: &SourceDocument,
+        claim: &SourceDocument, windows: &[SourceDocument], eos: u32,
+        controls: &TemplateControlIds, policy: FaithfulnessPolicy, limits: JudgeLimits)
+        -> Result<Self, JudgeError> {
+        policy.validate()?;
+        if source.text().is_empty() || claim.text().is_empty()
+            || !matches!(source.document_encoding(), UntrustedEncoding::SafeBpeV1(_))
+            || source.document_encoding() != claim.document_encoding() {
+            return Err(JudgeError::Contract("faithfulness compact source and claim policy"));
+        }
+        let spans = partition_evidence(source.text(), policy)?;
+        let count = if spans.len() == 1 { 1 } else { spans.len() + 1 };
+        let window_count = if spans.len() == 1 { 0 } else { spans.len() };
+        if tasks.len() != count || windows.len() != window_count {
+            return Err(JudgeError::Contract("faithfulness requires every compact evidence head"));
+        }
+        validate_head(&tasks[0], &tasks[0], source.token_ids(), claim.token_ids())?;
+        for ((task, window), span) in tasks.iter().skip(1).zip(windows).zip(&spans) {
+            if window.document_encoding() != source.document_encoding()
+                || source.text().get(span.byte_start..span.byte_end) != Some(window.text()) {
+                return Err(JudgeError::Contract("faithfulness compact evidence bytes differ"));
+            }
+            validate_head(task, &tasks[0], window.token_ids(), claim.token_ids())?;
+        }
+        Self::bind(tasks, source.text(), spans, eos, controls, policy, limits)
+    }
+    fn bind(tasks: &[TaskPlan], source: &str, spans: Vec<VerifiedSourceSpan>, eos: u32,
+        controls: &TemplateControlIds, policy: FaithfulnessPolicy, limits: JudgeLimits)
+        -> Result<Self, JudgeError> {
         #[derive(Serialize)]
         struct Policy<'a> { algorithm: &'static str, partition: &'static str,
             policy: FaithfulnessPolicy, spans: &'a [VerifiedSourceSpan] }
         let refs: Vec<_> = tasks.iter().collect();
         let bundle = Bundle::compile(&refs, eos, controls,
             &Policy { algorithm: FAITHFULNESS_VERSION, partition: EVIDENCE_PARTITION_VERSION, policy, spans: &spans }, limits)?;
-        Ok(Self { bundle, source: source.text().to_owned(), spans, policy })
+        Ok(Self { bundle, source: source.to_owned(), spans, policy })
     }
     pub fn binding_digest(&self) -> &Sha256Digest { &self.bundle.binding }
     pub fn planned_work(&self) -> ScoringWork { self.bundle.work }

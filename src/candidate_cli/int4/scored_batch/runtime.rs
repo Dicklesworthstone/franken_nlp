@@ -48,7 +48,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let started = Instant::now();
     let limits = batch.validate(&args)?;
     let common = limits.common;
-    let encoding = args.input_encoding.policy(args.max_input_bytes, common.max_prompt_tokens)?;
+    let encoding = batch.input_encoding(&args, common)?;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
@@ -81,7 +81,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
                 .and_then(|planner| planner.with_document_encoding(encoding.clone())).map_err(|_| CandidateError::Planning)?;
             let planner = Int4ScoredBatchPlanner::new_with_document_encoding(planner, defaults, limits.native)
                 .map_err(|_| CandidateError::Planning)?;
-            stream(&engine, &model, planner, "classify", &args, limits, started, deadline, reader, output, cancellation)
+            stream(&engine, &model, planner, "classify", &args, limits, encoding, started, deadline, reader, output, cancellation)
         }
         Defaults::Sentiment { args: defaults, policy } => {
             let planner = Int4SentimentPlanner::for_model(model.model_identity(), sentiment_options(policy)?, budget,
@@ -89,13 +89,15 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
                 .and_then(|planner| planner.with_document_encoding(encoding.clone())).map_err(|_| CandidateError::Planning)?;
             let planner = Int4ScoredBatchPlanner::new_with_document_encoding(planner, Some(defaults), limits.native)
                 .map_err(|_| CandidateError::Planning)?;
-            stream(&engine, &model, planner, "sentiment", &args, limits, started, deadline, reader, output, cancellation)
+            stream(&engine, &model, planner, "sentiment", &args, limits, encoding, started, deadline, reader, output, cancellation)
         }
         Defaults::Judge(defaults) => {
             let planner = Int4JudgePlanner::for_model(model.model_identity(), budget,
-                batch.scoring.judge_limits(budget)).map_err(|_| CandidateError::Planning)?;
-            let planner = Int4ScoredBatchPlanner::new(planner, defaults, limits.native).map_err(|_| CandidateError::Planning)?;
-            stream(&engine, &model, planner, "judge", &args, limits, started, deadline, reader, output, cancellation)
+                batch.scoring.judge_limits(budget))
+                .and_then(|planner| planner.with_document_encoding(encoding.clone())).map_err(|_| CandidateError::Planning)?;
+            let planner = Int4ScoredBatchPlanner::new_with_document_encoding(planner, defaults, limits.native)
+                .map_err(|_| CandidateError::Planning)?;
+            stream(&engine, &model, planner, "judge", &args, limits, encoding, started, deadline, reader, output, cancellation)
         }
     }
 }
@@ -103,14 +105,14 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
 #[allow(clippy::too_many_arguments)]
 fn stream<P: Int4ScoredTask + Send + 'static, W: Write + Send + 'static>(engine: &NlpEngine,
     model: &ResidentInt4, planner: Int4ScoredBatchPlanner<P>, task: &'static str, args: &Int4Args,
-    limits: BatchLimits, started: Instant, deadline: Duration, reader: Box<dyn BufRead + Send>,
+    limits: BatchLimits, encoding: crate::tokenizer::untrusted::UntrustedEncoding,
+    started: Instant, deadline: Duration, reader: Box<dyn BufRead + Send>,
     output: W, cancellation: CancellationToken) -> Result<(), CandidateError> {
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
     remaining()?;
     let common = limits.common;
     let identity = planner.base_execution_identity().clone();
-    let encoding = args.input_encoding.policy(args.max_input_bytes, common.max_prompt_tokens)?;
     if planner.group_width() != model.model_identity().group_width()
         || planner.document_encoding() != &encoding
         || planner.encoding_workspace_bytes() != limits.encoding_workspace_bytes {

@@ -48,12 +48,17 @@ impl Error for Int4JudgeError {
             Self::Native(e) => Some(e), _ => None }
     }
 }
-impl From<JudgeError> for Int4JudgeError { fn from(e: JudgeError) -> Self { Self::Task(e) } }
+impl From<JudgeError> for Int4JudgeError {
+    fn from(e: JudgeError) -> Self {
+        match e { JudgeError::Cancelled(cause) => Self::Cancelled(cause), other => Self::Task(other) }
+    }
+}
 impl From<Int4ScoringError> for Int4JudgeError { fn from(e: Int4ScoringError) -> Self { Self::Scoring(e) } }
 impl From<StrictInt4Error> for Int4JudgeError { fn from(e: StrictInt4Error) -> Self { Self::Native(e) } }
 impl Int4JudgeError {
     pub fn cancellation(&self) -> Option<DecodeCancellationKind> {
-        match self { Self::Cancelled(c) | Self::Native(StrictInt4Error::Cancelled(c)) => Some(*c),
+        match self { Self::Cancelled(c) | Self::Task(JudgeError::Cancelled(c))
+            | Self::Native(StrictInt4Error::Cancelled(c)) => Some(*c),
             Self::Scoring(e) => e.cancellation(), _ => None }
     }
 }
@@ -94,10 +99,15 @@ impl JudgePlanner {
     fn compile_int4<C: DecodeStepControl>(&self, request: &JudgeRequest,
         context: &PlanContext<'_>, limits: JudgeLimits, group_width: usize,
         control: &mut C) -> Result<PreparedInt4Judge, Int4JudgeError> {
+        self.compile_int4_with_work(request, context, limits, group_width, control, &mut SafeBpeWork::default())
+    }
+    pub(super) fn compile_int4_with_work<C: DecodeStepControl>(&self, request: &JudgeRequest,
+        context: &PlanContext<'_>, limits: JudgeLimits, group_width: usize,
+        control: &mut C, work: &mut SafeBpeWork) -> Result<PreparedInt4Judge, Int4JudgeError> {
         checkpoint(control)?;
         check_profile(context.execution_identity())?;
-        let inner = self.plan_with_profile(request, context, limits,
-            NumericsProfile::StrictQuantized { version: 2 })?;
+        let inner = self.plan_with_profile_and_work(request, context, limits,
+            NumericsProfile::StrictQuantized { version: 2 }, control, work)?;
         checkpoint(control)?;
         PreparedInt4Judge::compile(inner, request.budget(), request.request_digest()?, group_width, control)
     }
@@ -128,6 +138,16 @@ impl PreparedInt4Judge {
     }
     pub(crate) fn request_digest(&self) -> Sha256Digest { self.request_digest }
     pub fn execution_identity(&self) -> &ExecutionIdentity { self.inner.execution_identity() }
+    pub fn input_encoding(&self) -> &UntrustedEncoding { self.inner.input_encoding() }
+    pub fn input_encoding_work(&self) -> Option<SafeBpeWork> { self.inner.input_encoding_work() }
+    /// Source token geometry belongs to the sealed full-source faithfulness
+    /// head. Other judge modes have no designated citation source.
+    pub fn source_token_count(&self) -> Option<usize> {
+        if !matches!(&self.inner.executable, Executable::Faithfulness(_)) { return None; }
+        self.inner.executable.bundle().heads.first()?.ir.prompt_segments().iter()
+            .find(|segment| segment.kind() == PromptSegmentKind::Document)
+            .map(|segment| segment.token_ids().len())
+    }
     pub fn planned_work(&self) -> Int4Work { self.work }
     pub fn group_width(&self) -> usize { self.group_width }
     pub fn head_count(&self) -> usize { self.schedules.len() }

@@ -65,7 +65,7 @@ impl<P: Int4ScoredTask> Int4ScoredBatchPlanner<P> {
         }
         Self::new_with_document_encoding(planner, defaults, limits)
     }
-    /// Admit the selected single-document encoding of a classify/sentiment
+    /// Admit the selected single-document encoding of a classify/sentiment/judge
     /// compiler. Every document owns one cumulative segment ledger; this does
     /// not grant a fresh native work allowance at a document or flush boundary.
     /// Hosts reserve the quoted encoder workspace once alongside all retained
@@ -74,7 +74,7 @@ impl<P: Int4ScoredTask> Int4ScoredBatchPlanner<P> {
         limits: Int4ScoredBatchLimits) -> Result<Self, BatchFault> {
         limits.validate()?;
         let encoding_workspace_bytes = memory::encoding_workspace_bytes(planner.document_encoding())?;
-        if encoding_workspace_bytes != 0 && !matches!(P::TASK, "classify-v1" | "sentiment-v1") {
+        if encoding_workspace_bytes != 0 && !matches!(P::TASK, "classify-v1" | "sentiment-v1" | "judge-v1") {
             return Err(BatchCode::InvalidLimits.into());
         }
         constrained_int4::check_profile(planner.base_identity(), planner.group_width())

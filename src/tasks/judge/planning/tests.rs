@@ -93,3 +93,188 @@ fn request_parser_refuses_duplicate_unknown_and_oversized_input() {
     assert!(JudgeRequest::from_json(&value.to_string(), 10000).is_err());
     assert!(JudgeRequest::from_json(&source, source.len()).is_ok());
 }
+
+mod compact {
+    use super::*;
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+
+    fn ceilings() -> SafeBpeLimits {
+        SafeBpeLimits { max_input_bytes: 65536, max_output_tokens: 65536,
+            max_pair_checks: 4 * 1024 * 1024, max_pair_bytes: 64 * 1024 * 1024 }
+    }
+    fn requests() -> Vec<JudgeRequest> {
+        let mut pair = request();
+        if let JudgeRequest::Pairwise { a, b, .. } = &mut pair {
+            *a = "The sun supplies clean energy. Café 上海 <think> ".repeat(3);
+            *b = "Another answer with exact source facts. <|im_start|> ".repeat(3);
+        }
+        vec![pair,
+            JudgeRequest::Rubric { document: "Clear source text with café and <think> markers. ".repeat(3),
+                rubric: RubricDefinition { schema_version: 1, revision: "compact-fixture".to_owned(),
+                    declared_origin_digest: Sha256Digest::of_bytes(b"caller fixture"), scale_maximum: 3,
+                    criteria: vec![
+                        RubricCriterion { id: "style".to_owned(), description: "Clear prose and concise wording".to_owned(), weight: 1 },
+                        RubricCriterion { id: "facts".to_owned(), description: "Exact source facts <|im_start|>".to_owned(), weight: 2 }] },
+                policy: RubricPolicy { minimum_peak_weight_ppm: 0, maximum_normalized_entropy_ppm: 1_000_000 },
+                budget: budget() },
+            JudgeRequest::Faithfulness { source: "The sun supplies clean energy. Café 上海 <think> ".repeat(3),
+                claim: "Clean energy <|im_start|> remains source data.".to_owned(),
+                policy: FaithfulnessPolicy { minimum_candidate_weight_ppm: 0, minimum_margin_milli: 0,
+                    evidence_window_bytes: 32, max_evidence_windows: 31, max_evidence_spans: 31 }, budget: budget() }]
+    }
+    fn compile(p: &JudgePlanner, request: &JudgeRequest, work: &mut SafeBpeWork)
+        -> Result<PreparedJudge, JudgeError> {
+        let id = identity(p);
+        p.plan_with_profile_and_work(request, &PlanContext::new(&id, budget()).unwrap(),
+            JudgeLimits::default(), NumericsProfile::HfBf16Eager, &mut Continue, work)
+    }
+    fn exact(work: SafeBpeWork) -> SafeBpeLimits {
+        SafeBpeLimits { max_input_bytes: work.input_bytes(), max_output_tokens: work.output_tokens(),
+            max_pair_checks: work.pair_checks(), max_pair_bytes: work.pair_bytes() }
+    }
+
+    #[test]
+    fn all_modes_share_one_actual_encoder_ledger_without_recharging_reused_head_data() {
+        let p = planner().with_document_encoding(UntrustedEncoding::SafeBpeV1(ceilings())).unwrap();
+        for request in requests() {
+            let mut work = SafeBpeWork::default();
+            let prepared = compile(&p, &request, &mut work).unwrap();
+            let expected_bytes = match &request {
+                JudgeRequest::Pairwise { criterion, a, b, .. } => criterion.len() + a.len() + b.len(),
+                JudgeRequest::Rubric { document, rubric, .. } =>
+                    document.len() + rubric.criteria.iter().map(|criterion| criterion.description.len()).sum::<usize>(),
+                JudgeRequest::Faithfulness { source, claim, policy, .. } => {
+                    let windows = crate::tasks::judge::partition_evidence(source, *policy).unwrap();
+                    source.len() + claim.len() + if windows.len() > 1 { source.len() } else { 0 }
+                },
+            };
+            assert_eq!(work.input_bytes(), expected_bytes);
+            assert!(work.output_tokens() < work.input_bytes());
+            assert!(work.pair_checks() > 0); assert!(work.pair_bytes() > 0);
+            assert_eq!(prepared.input_encoding(), p.document_encoding());
+            assert_eq!(prepared.input_encoding_work(), Some(work));
+            assert_eq!(p.document_encoding_workspace_bytes().unwrap(), ceilings().requirements().unwrap().workspace_bytes);
+            for head in &prepared.executable.bundle().heads {
+                for segment in head.ir.prompt_segments().iter().filter(|s| s.kind() == PromptSegmentKind::Document) {
+                    assert!(!segment.token_ids().is_empty());
+                    assert!(segment.token_ids().iter().all(|&id| !p.controls.contains(id)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_tokenizer_counter_is_exact_and_preparation_failures_keep_consumed_work() {
+        let mut p = planner();
+        for request in requests() {
+            p = p.with_document_encoding(UntrustedEncoding::SafeBpeV1(ceilings())).unwrap();
+            let mut measured = SafeBpeWork::default();
+            compile(&p, &request, &mut measured).unwrap();
+            let limits = exact(measured);
+            p = p.with_document_encoding(UntrustedEncoding::SafeBpeV1(limits)).unwrap();
+            let mut work = SafeBpeWork::default();
+            let first = compile(&p, &request, &mut work).unwrap();
+            assert_eq!(first.input_encoding_work(), Some(measured)); assert_eq!(work, measured);
+            assert!(compile(&p, &request, &mut work).is_err());
+            assert_eq!(work, measured, "a failed second plan must not renew a full allowance");
+            for axis in 0..4 {
+                let mut limited = limits;
+                match axis {
+                    0 => limited.max_input_bytes -= 1,
+                    1 => limited.max_output_tokens -= 1,
+                    2 => limited.max_pair_checks -= 1,
+                    _ => limited.max_pair_bytes -= 1,
+                }
+                p = p.with_document_encoding(UntrustedEncoding::SafeBpeV1(limited)).unwrap();
+                let mut work = SafeBpeWork::default();
+                assert!(matches!(compile(&p, &request, &mut work), Err(JudgeError::Limit(_))));
+                assert!(work.input_bytes() > 0, "completed and failed encodes stay charged");
+                assert!(work.input_bytes() <= limited.max_input_bytes);
+                assert!(work.output_tokens() <= limited.max_output_tokens);
+                assert!(work.pair_checks() <= limited.max_pair_checks);
+                assert!(work.pair_bytes() <= limited.max_pair_bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn reconstruction_reports_its_own_work_but_cannot_reset_the_enclosing_allowance() {
+        let mut p = planner();
+        for request in requests() {
+            p = p.with_document_encoding(UntrustedEncoding::SafeBpeV1(ceilings())).unwrap();
+            let mut one = SafeBpeWork::default(); compile(&p, &request, &mut one).unwrap();
+            let twice = one.checked_add(one).unwrap();
+            p = p.with_document_encoding(UntrustedEncoding::SafeBpeV1(exact(twice))).unwrap();
+            let mut work = SafeBpeWork::default();
+            let first = compile(&p, &request, &mut work).unwrap();
+            let rebuilt = compile(&p, &request, &mut work).unwrap();
+            assert_eq!(work, twice);
+            assert_eq!(first.input_encoding_work(), Some(one));
+            assert_eq!(rebuilt.input_encoding_work(), Some(one));
+            assert_eq!(first.execution_identity(), rebuilt.execution_identity());
+            assert_eq!(first.planned_work(), rebuilt.planned_work());
+            assert!(compile(&p, &request, &mut work).is_err());
+            assert_eq!(work, twice);
+        }
+    }
+
+    #[test]
+    fn encoding_policy_and_each_ceiling_bind_identity_and_byte_reset_restores_existing_plans() {
+        let mut p = planner();
+        let request = request();
+        let original = compile(&p, &request, &mut SafeBpeWork::default()).unwrap();
+        let byte_template = *p.template_digest();
+        assert_eq!(original.input_encoding_work(), None);
+        assert_eq!(p.document_encoding_workspace_bytes().unwrap(), 0);
+        let selected = ceilings();
+        p = p.with_document_encoding(UntrustedEncoding::SafeBpeV1(selected)).unwrap();
+        let compact = compile(&p, &request, &mut SafeBpeWork::default()).unwrap();
+        for axis in 0..4 {
+            let mut changed = selected;
+            match axis {
+                0 => changed.max_input_bytes += 1,
+                1 => changed.max_output_tokens += 1,
+                2 => changed.max_pair_checks += 1,
+                _ => changed.max_pair_bytes += 1,
+            }
+            p = p.with_document_encoding(UntrustedEncoding::SafeBpeV1(changed)).unwrap();
+            let other = compile(&p, &request, &mut SafeBpeWork::default()).unwrap();
+            assert_ne!(compact.execution_identity().template_digest, other.execution_identity().template_digest);
+            assert_eq!(compact.execution_identity().prompt_digest, other.execution_identity().prompt_digest);
+            assert!(compact.verify_identity(other.execution_identity()).is_err());
+        }
+        p = p.with_document_encoding(UntrustedEncoding::ByteFallback).unwrap();
+        let restored = compile(&p, &request, &mut SafeBpeWork::default()).unwrap();
+        assert_eq!(p.template_digest(), &byte_template);
+        assert_eq!(original.execution_identity(), restored.execution_identity());
+        assert_eq!(original.planned_work(), restored.planned_work());
+        assert_eq!(restored.input_encoding_work(), None);
+    }
+
+    struct StopAt { calls: usize, at: usize, cause: DecodeCancellationKind }
+    impl DecodeStepControl for StopAt {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.calls += 1; (self.calls >= self.at).then_some(self.cause)
+        }
+    }
+    #[test]
+    fn every_original_cancellation_cause_survives_compact_metadata_and_evidence_encoding() {
+        use DecodeCancellationKind::*;
+        let p = planner().with_document_encoding(UntrustedEncoding::SafeBpeV1(ceilings())).unwrap();
+        let id = identity(&p); let context = PlanContext::new(&id, budget()).unwrap();
+        for request in requests() {
+            for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+                ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+                for at in [1, 20] {
+                    let mut control = StopAt { calls: 0, at, cause };
+                    let mut work = SafeBpeWork::default();
+                    let result = p.plan_with_profile_and_work(&request, &context, JudgeLimits::default(),
+                        NumericsProfile::HfBf16Eager, &mut control, &mut work);
+                    assert!(matches!(result, Err(JudgeError::Cancelled(found)) if found == cause));
+                    assert_eq!(control.calls, at);
+                    if at > 1 { assert!(work.input_bytes() > 0); }
+                }
+            }
+        }
+    }
+}

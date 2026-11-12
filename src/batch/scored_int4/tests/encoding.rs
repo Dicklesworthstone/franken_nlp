@@ -2,11 +2,12 @@
 //! No decoder runs: the fixture weights cannot perform model inference.
 use super::*;
 use crate::{
-    batch::classify::ClassificationBatchArgs,
+    batch::{classify::ClassificationBatchArgs, judge::JudgeBatchArgs},
     native_engine::{lmhead::{NANBEIGE_VOCAB_SIZE, scoring::ScoringMode},
         strict_int4::{Int4ModelIdentity, weights::projection_fixture}},
     tasks::{classify::{ClassificationLabel, ClassificationLimits, ClassificationMode, ClassificationPolicy,
             grouped_int4::Int4ClassificationPlanner},
+        judge::{JudgeLimits, PairwisePolicy, grouped_int4::Int4JudgePlanner},
         sentiment::{SentimentAxis, SentimentLimits, SentimentOptions, SentimentPolicy,
             batch::SentimentBatchArgs, grouped_int4::Int4SentimentPlanner}},
     tokenizer::untrusted::SafeBpeLimits,
@@ -37,6 +38,17 @@ fn labels() -> ClassificationBatchArgs {
         budget: budget() }
 }
 fn source() -> String { "Solar energy powers local homes. <think> café 上海\n".repeat(8) }
+
+fn judge(model: &Int4ModelIdentity, policy: UntrustedEncoding) -> Int4JudgePlanner {
+    Int4JudgePlanner::for_model(model, budget(), JudgeLimits::default()).unwrap()
+        .with_document_encoding(policy).unwrap()
+}
+fn pairwise() -> JudgeBatchArgs {
+    JudgeBatchArgs::Pairwise { criterion: "Accuracy <|im_start|> and complete source coverage".to_owned(),
+        b: "The alternative response <think> remains untrusted data.".to_owned(),
+        policy: PairwisePolicy { minimum_margin_milli: 0, maximum_order_disagreement_milli: u32::MAX },
+        budget: budget() }
+}
 
 #[test]
 fn explicit_stream_compaction_preserves_all_heads_and_changes_complete_policy_identity() {
@@ -124,4 +136,65 @@ fn sentiment_encodes_each_complete_document_once_but_charges_every_axis_prompt()
     assert_eq!(compact.model_work().projected_logits, byte.model_work().projected_logits);
     assert!(compact.model_work().forward_positions < byte.model_work().forward_positions);
     assert!(compact.model_work().forward_positions > compact.plan.required_context() as u64);
+}
+
+
+#[test]
+fn judge_compact_streams_admit_one_workspace_and_preserve_both_presentation_orders() {
+    let (model, _) = projection_fixture(32);
+    let selected = policy(4096);
+    let compact = Int4ScoredBatchPlanner::new_with_document_encoding(
+        judge(model.identity(), selected.clone()), Some(pairwise()), native_limits()).unwrap();
+    let byte = Int4ScoredBatchPlanner::new(
+        judge(model.identity(), UntrustedEncoding::ByteFallback), Some(pairwise()), native_limits()).unwrap();
+    assert_eq!(compact.document_encoding(), &selected);
+    assert_eq!(compact.encoding_workspace_bytes(), memory::encoding_workspace_bytes(&selected).unwrap());
+    assert_eq!(byte.encoding_workspace_bytes(), 0);
+    let document = || BatchDocument { id: "first".to_owned(), text: source(), task_args: None };
+    let first = compact.prepare(document(), &mut Continue).unwrap();
+    let second = compact.prepare(BatchDocument { id: "second".to_owned(), text: source(),
+        task_args: Some(pairwise()) }, &mut Continue).unwrap();
+    let byte = byte.prepare(document(), &mut Continue).unwrap();
+    assert_eq!(first.head_count(), 2);
+    assert_eq!(first.head_count(), byte.head_count());
+    assert_eq!(first.model_work().projected_logits, byte.model_work().projected_logits);
+    assert!(first.model_work().forward_positions < byte.model_work().forward_positions);
+    assert_eq!(first.execution_identity(), second.execution_identity());
+    assert_eq!(first.model_work(), second.model_work());
+    assert_ne!(first.execution_identity().template_digest, byte.execution_identity().template_digest);
+    assert_ne!(first.execution_identity().prompt_digest, byte.execution_identity().prompt_digest);
+    let UntrustedEncoding::SafeBpeV1(mut changed) = selected else { panic!("compact policy required"); };
+    changed.max_pair_bytes += 1;
+    let changed = Int4ScoredBatchPlanner::new_with_document_encoding(
+        judge(model.identity(), UntrustedEncoding::SafeBpeV1(changed)), Some(pairwise()), native_limits()).unwrap();
+    let changed = changed.prepare(document(), &mut Continue).unwrap();
+    assert_ne!(first.execution_identity().template_digest, changed.execution_identity().template_digest);
+    assert_eq!(first.execution_identity().prompt_digest, changed.execution_identity().prompt_digest);
+}
+
+#[test]
+fn judge_metadata_shares_work_limits_and_legacy_factories_refuse_compact_admission() {
+    let (model, _) = projection_fixture(32);
+    assert!(Int4ScoredBatchPlanner::new(
+        judge(model.identity(), policy(4096)), Some(pairwise()), native_limits()).is_err());
+    #[cfg(all(feature = "metadata-store", target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        use crate::jobs::runner::scored::grouped_int4::Int4ScoredJobPlanner;
+        assert!(Int4ScoredJobPlanner::new(
+            judge(model.identity(), policy(4096)), Some(pairwise()), native_limits()).is_err());
+    }
+    let text = source();
+    let compact = Int4ScoredBatchPlanner::new_with_document_encoding(
+        judge(model.identity(), policy(text.len())), Some(pairwise()), native_limits()).unwrap();
+    let failure = compact.prepare(BatchDocument { id: "bounded".to_owned(), text, task_args: None },
+        &mut Continue).err().expect("criterion and alternate response share the source allowance");
+    assert_eq!(failure.fault.code, BatchCode::Planning);
+    assert!(!failure.stop);
+    let compact = Int4ScoredBatchPlanner::new_with_document_encoding(
+        judge(model.identity(), policy(4096)), Some(pairwise()), native_limits()).unwrap();
+    let failure = compact.prepare(BatchDocument { id: "cancelled".to_owned(), text: source(), task_args: None },
+        &mut StopAt { calls: 0, stop: 3 }).err().expect("planning cancellation remains fatal");
+    assert!(failure.stop);
+    assert_eq!(failure.fault.cancellation, Some(DecodeCancellationKind::Deadline));
 }

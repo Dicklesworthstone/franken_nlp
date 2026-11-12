@@ -1,8 +1,9 @@
 //! Raw faithfulness and preflight for complete native second-reader batches.
 //! Uses the shared pinned planner, identities, scorer and native engine.
 use super::*;
-use crate::{tasks::{extract::SourceDocumentEncoder, judge::partition_evidence},
-    native_engine::{hf_bf16_eager::candidate_scoring::PrefixScoringError, kv::KV_BYTES_PER_TOKEN}};
+use crate::{tasks::{extract::{SourceDocument, SourceDocumentEncoder, ExtractError}, judge::partition_evidence},
+    native_engine::{constrained::JsonDecodeError,
+        hf_bf16_eager::candidate_scoring::PrefixScoringError, kv::KV_BYTES_PER_TOKEN}};
 
 pub(super) struct FaithfulnessCompiler {
     pub(super) fragments: Vec<Vec<u32>>,
@@ -26,6 +27,15 @@ impl FaithfulnessCompiler {
     pub(super) fn source_capacity(&self, claim: &str, policy: FaithfulnessPolicy,
         budget: TaskBudget, ceiling: TaskBudget, limits: JudgeLimits, context_tokens: usize)
         -> Result<usize, JudgeError> {
+        self.source_token_capacity_with_work(claim, policy, budget, ceiling, limits,
+            context_tokens, &UntrustedEncoding::ByteFallback, &mut SafeBpeWork::default(), &mut Continue)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn source_token_capacity_with_work<C: DecodeStepControl>(&self, claim: &str,
+        policy: FaithfulnessPolicy, budget: TaskBudget, ceiling: TaskBudget, limits: JudgeLimits,
+        context_tokens: usize, encoding: &UntrustedEncoding, work: &mut SafeBpeWork, control: &mut C)
+        -> Result<usize, JudgeError> {
+        planning_checkpoint(control)?;
         policy.validate()?;
         budget.validate().map_err(|_| JudgeError::Contract("judge task budget"))?;
         ceiling.validate().map_err(|_| JudgeError::Contract("judge task ceiling"))?;
@@ -33,11 +43,23 @@ impl FaithfulnessCompiler {
         if budget.max_output_tokens < 2 || limits.per_head.max_depth < 2 {
             return Err(JudgeError::Limit("candidate_tokens"));
         }
-        let fixed = self.fragments.iter().try_fold(claim.len(), |n, ids| add(n, ids.len(), "prompt_tokens"))?;
+        let claim_tokens = match encoding {
+            UntrustedEncoding::ByteFallback => claim.len(),
+            UntrustedEncoding::SafeBpeV1(_) => self.encode_with_work(claim, encoding,
+                budget.max_input_tokens as usize, work, control)?.token_ids().len(),
+        };
+        let fixed = self.fragments.iter().try_fold(claim_tokens, |n, ids| add(n, ids.len(), "prompt_tokens"))?;
         let prompt_cap = context_tokens.checked_sub(1).ok_or(JudgeError::Limit("context_tokens"))?
             .min(budget.max_input_tokens as usize).min(limits.max_total_prompt_tokens);
         let capacity = prompt_cap.checked_sub(fixed).filter(|&n| n != 0)
             .ok_or(JudgeError::Limit("faithfulness_source_tokens"))?;
+        let evidence_bytes = Self::source_byte_limit(policy)?;
+        // Byte fallback's public capacity retains its exact original meaning.
+        // Compact maps independently apply the evidence byte cap to chunks.
+        Ok(if *encoding == UntrustedEncoding::ByteFallback { capacity.min(evidence_bytes) } else { capacity })
+    }
+    pub(super) fn source_byte_limit(policy: FaithfulnessPolicy) -> Result<usize, JudgeError> {
+        policy.validate()?;
         let window = policy.evidence_window_bytes as usize;
         // A nonfinal window may end up to three bytes early for UTF-8 and
         // then prefer a delimiter in its latter half. Price that minimum
@@ -46,12 +68,40 @@ impl FaithfulnessCompiler {
         let progress = (window.saturating_sub(3) / 2).max(1);
         let preceding = progress.checked_mul(policy.max_evidence_windows as usize - 1)
             .ok_or(JudgeError::Limit("evidence_bytes"))?;
-        let evidence_bytes = window.checked_add(preceding).ok_or(JudgeError::Limit("evidence_bytes"))?;
-        Ok(capacity.min(evidence_bytes))
+        window.checked_add(preceding).ok_or(JudgeError::Limit("evidence_bytes"))
     }
-    pub(super) fn plan(&self, source: &str, claim: &str, policy: FaithfulnessPolicy,
-        context: &PlanContext<'_>, budget: TaskBudget, controls: &TemplateControlIds, eos: u32, limits: JudgeLimits)
+    pub(super) fn source_tokens_with_work<C: DecodeStepControl>(&self, source: &str,
+        encoding: &UntrustedEncoding, work: &mut SafeBpeWork, control: &mut C) -> Result<usize, JudgeError> {
+        planning_checkpoint(control)?;
+        match encoding {
+            UntrustedEncoding::ByteFallback => Ok(source.len()),
+            UntrustedEncoding::SafeBpeV1(limits) => Ok(self.encode_with_work(source, encoding,
+                limits.max_output_tokens, work, control)?.token_ids().len()),
+        }
+    }
+    fn encode_with_work<C: DecodeStepControl>(&self, text: &str, encoding: &UntrustedEncoding,
+        max_tokens: usize, work: &mut SafeBpeWork, control: &mut C) -> Result<SourceDocument, JudgeError> {
+        let max_bytes = match encoding {
+            UntrustedEncoding::ByteFallback => max_tokens,
+            UntrustedEncoding::SafeBpeV1(limits) => limits.max_input_bytes,
+        };
+        self.encoder.encode_with_policy_and_work(text, encoding, max_bytes, max_tokens, work,
+            &mut || control.prefill_checkpoint(0)).map_err(|error| match error {
+                ExtractError::Decode(JsonDecodeError::Cancelled(cause)) => JudgeError::Cancelled(cause),
+                ExtractError::AllocationRefused => JudgeError::AllocationRefused,
+                ExtractError::Contract("source encoding work budget exceeded") => JudgeError::Limit("tokenizer_work"),
+                ExtractError::Contract("source encoding byte budget exceeded") => JudgeError::Limit("tokenizer_input_bytes"),
+                ExtractError::Contract("source token budget exceeded") => JudgeError::Limit("prompt_tokens"),
+                _ => JudgeError::Contract("faithfulness byte-preserving source encoding"),
+            })
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn plan_with_encoding_work<C: DecodeStepControl>(&self, source: &str, claim: &str,
+        policy: FaithfulnessPolicy, context: &PlanContext<'_>, budget: TaskBudget,
+        controls: &TemplateControlIds, eos: u32, limits: JudgeLimits,
+        encoding: &UntrustedEncoding, work: &mut SafeBpeWork, control: &mut C)
         -> Result<FaithfulnessPlan, JudgeError> {
+        planning_checkpoint(control)?;
         if claim.is_empty() { return Err(JudgeError::Contract("empty faithfulness claim")); }
         let spans = partition_evidence(source, policy)?;
         let count = if spans.len() == 1 { 1 } else { spans.len() + 1 };
@@ -60,19 +110,42 @@ impl FaithfulnessCompiler {
         if spans.len() > 1 {
             for span in &spans { lengths.push(add(span.byte_end - span.byte_start, claim.len(), "input_bytes")?); }
         }
-        check_prompt_lengths(&lengths, &self.fragments, budget, limits)?;
+        if *encoding == UntrustedEncoding::ByteFallback {
+            check_prompt_lengths(&lengths, &self.fragments, budget, limits)?;
+        }
         let cap = budget.max_input_tokens as usize;
-        let source = self.encoder.encode(source, cap, cap).map_err(|_| JudgeError::Contract("faithfulness source encoding"))?;
-        let claim = self.encoder.encode(claim, cap, cap).map_err(|_| JudgeError::Contract("faithfulness claim encoding"))?;
+        let source = self.encode_with_work(source, encoding, cap, work, control)?;
+        let claim = self.encode_with_work(claim, encoding, cap, work, control)?;
+        let mut token_lengths = reserved(count)?;
+        token_lengths.push(add(source.token_ids().len(), claim.token_ids().len(), "prompt_tokens")?);
+        check_prompt_lengths(&token_lengths, &self.fragments, budget, limits)?;
         let mut tasks = reserved(count)?;
         tasks.push(task(&self.fragments, &[source.token_ids(), claim.token_ids()], &self.candidates, context, budget)?);
+        let mut windows = reserved(if spans.len() > 1 { spans.len() } else { 0 })?;
         if spans.len() > 1 {
             for span in &spans {
-                tasks.push(task(&self.fragments, &[&source.token_ids()[span.byte_start..span.byte_end], claim.token_ids()],
-                    &self.candidates, context, budget)?);
+                planning_checkpoint(control)?;
+                if *encoding == UntrustedEncoding::ByteFallback {
+                    tasks.push(task(&self.fragments, &[&source.token_ids()[span.byte_start..span.byte_end], claim.token_ids()],
+                        &self.candidates, context, budget)?);
+                } else {
+                    let text = source.text().get(span.byte_start..span.byte_end)
+                        .ok_or(JudgeError::Contract("faithfulness evidence source range"))?;
+                    let window = self.encode_with_work(text, encoding, cap, work, control)?;
+                    token_lengths.push(add(window.token_ids().len(), claim.token_ids().len(), "prompt_tokens")?);
+                    check_prompt_lengths(&token_lengths, &self.fragments, budget, limits)?;
+                    tasks.push(task(&self.fragments, &[window.token_ids(), claim.token_ids()],
+                        &self.candidates, context, budget)?);
+                    windows.push(window);
+                }
             }
         }
-        FaithfulnessPlan::from_task_plans(&tasks, &source, &claim, eos, controls, policy, limits)
+        planning_checkpoint(control)?;
+        if *encoding == UntrustedEncoding::ByteFallback {
+            FaithfulnessPlan::from_task_plans(&tasks, &source, &claim, eos, controls, policy, limits)
+        } else {
+            FaithfulnessPlan::from_encoded_task_plans(&tasks, &source, &claim, &windows, eos, controls, policy, limits)
+        }
     }
 }
 
@@ -177,5 +250,72 @@ mod tests {
         let prompts: usize = plan.executable.bundle().heads.iter().map(|h| h.prompt_len).sum();
         assert_eq!(bound.max_forward_positions, prompts as u64 + 9);
         assert_eq!(bound.max_projected_logits, 12 * NANBEIGE_VOCAB_SIZE as u64);
+    }
+
+    #[test]
+    fn compact_faithfulness_encodes_exact_evidence_windows_without_byte_slicing_tokens() {
+        use crate::tokenizer::untrusted::SafeBpeLimits;
+        let encoding = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 65536,
+            max_output_tokens: 65536, max_pair_checks: 4 * 1024 * 1024, max_pair_bytes: 64 * 1024 * 1024 });
+        let p = planner().with_document_encoding(encoding.clone()).unwrap();
+        let source = "Solar energy powers homes. Café 上海.\r\n<|im_start|> is literal source. Last 😀.";
+        let claim = "Energy <think> supplies local homes.";
+        let policy = FaithfulnessPolicy { evidence_window_bytes: 19, max_evidence_windows: 31,
+            max_evidence_spans: 31, minimum_candidate_weight_ppm: 0, minimum_margin_milli: 0 };
+        let request = JudgeRequest::Faithfulness { source: source.to_owned(), claim: claim.to_owned(),
+            policy, budget: budget() };
+        let id = identity(&p); let context = PlanContext::new(&id, budget()).unwrap();
+        let prepared = p.plan(&request, &context, JudgeLimits::default()).unwrap();
+        let Executable::Faithfulness(plan) = &prepared.executable else { panic!("faithfulness required"); };
+        let spans = partition_evidence(source, policy).unwrap();
+        assert!(spans.len() > 1); assert_eq!(plan.bundle.heads.len(), spans.len() + 1);
+        for (index, head) in plan.bundle.heads.iter().enumerate() {
+            let docs: Vec<_> = head.ir.prompt_segments().iter().filter(|s| s.kind() == PromptSegmentKind::Document).collect();
+            assert_eq!(docs.len(), 2);
+            let original = if index == 0 { source } else {
+                &source[spans[index - 1].byte_start..spans[index - 1].byte_end]
+            };
+            assert_eq!(p.tokenizer.tokenizer().decode_bytes(docs[0].token_ids()).unwrap(), original.as_bytes());
+            assert_eq!(p.tokenizer.tokenizer().decode_bytes(docs[1].token_ids()).unwrap(), claim.as_bytes());
+            assert!(docs.iter().flat_map(|s| s.token_ids()).all(|&id| !p.controls.contains(id)));
+            if index == 0 { assert!(docs[0].token_ids().len() < source.len()); }
+        }
+        assert_eq!(prepared.input_encoding_work().unwrap().input_bytes(), source.len() * 2 + claim.len());
+        let mut logits = model(&p, &vec!["entailed"; plan.bundle.heads.len()]);
+        let JudgeResult::Faithfulness(result) = prepared.execute(prepared.execution_identity(), &mut logits).unwrap()
+            else { panic!("faithfulness result required"); };
+        assert_eq!(result.relation, Some(FaithfulnessRelation::Entailed));
+        assert_eq!(result.evidence.len(), spans.len());
+        assert_eq!(result.windows.iter().map(|window| window.span).collect::<Vec<_>>(), spans);
+        for evidence in result.evidence {
+            let span = evidence.span;
+            assert_eq!(evidence.quote, source[span.byte_start..span.byte_end]);
+            crate::validation::validate_source_span(source, &evidence.quote, crate::validation::SourceSpan::new(
+                span.byte_start, span.byte_end, span.scalar_start, span.scalar_end)).unwrap();
+        }
+
+        // Rebuild real TaskPlans from the admitted heads, then challenge the
+        // compact owner with wrong windows, missing windows and changed claims.
+        let tasks: Vec<_> = plan.bundle.heads.iter().map(|head|
+            TaskPlan::new(BuiltInTask::Judge.spec(), &context, head.ir.clone()).unwrap()).collect();
+        let mut work = SafeBpeWork::default();
+        let source_doc = p.faithfulness.encode_with_work(source, &encoding, 4096, &mut work, &mut Continue).unwrap();
+        let claim_doc = p.faithfulness.encode_with_work(claim, &encoding, 4096, &mut work, &mut Continue).unwrap();
+        let mut windows: Vec<_> = spans.iter().map(|span| p.faithfulness.encode_with_work(
+            &source[span.byte_start..span.byte_end], &encoding, 4096, &mut work, &mut Continue).unwrap()).collect();
+        assert!(FaithfulnessPlan::from_encoded_task_plans(&tasks, &source_doc, &claim_doc, &windows,
+            p.eos, &p.controls, policy, JudgeLimits::default()).is_ok());
+        windows.swap(0, 1);
+        assert!(FaithfulnessPlan::from_encoded_task_plans(&tasks, &source_doc, &claim_doc, &windows,
+            p.eos, &p.controls, policy, JudgeLimits::default()).is_err());
+        windows.swap(0, 1);
+        assert!(FaithfulnessPlan::from_encoded_task_plans(&tasks, &source_doc, &claim_doc, &windows[..windows.len() - 1],
+            p.eos, &p.controls, policy, JudgeLimits::default()).is_err());
+        let wrong_claim = p.faithfulness.encode_with_work("Changed exact claim", &encoding, 4096,
+            &mut work, &mut Continue).unwrap();
+        assert!(FaithfulnessPlan::from_encoded_task_plans(&tasks, &source_doc, &wrong_claim, &windows,
+            p.eos, &p.controls, policy, JudgeLimits::default()).is_err());
+        assert!(FaithfulnessPlan::from_task_plans(&tasks, &source_doc, &claim_doc,
+            p.eos, &p.controls, policy, JudgeLimits::default()).is_err());
     }
 }

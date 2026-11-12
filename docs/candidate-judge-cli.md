@@ -134,6 +134,39 @@ arguments and authenticated resume. Existing source/extraction and
 classification/sentiment routes are unchanged. Without `asupersync-runtime`,
 execution refuses before input or model IO.
 
+## Compact input on the native INT4 routes
+
+`fnlp candidate source-int4 judge` accepts `--input-encoding safe-bpe-v1`
+for all three request modes. Its model input is an explicit pinned source or an
+independently pinned INT4 snapshot. The strict-INT8 commands described above
+retain their existing encoding contract.
+
+Compact input preserves exact untrusted bytes and excludes template-control
+tokens. Evidence windows are independently encoded from original UTF-8 spans,
+so a byte offset is never used to slice compact token IDs. All actual encoding
+work in one judgment shares a single ledger, with four optional ceilings:
+
+- `--max-tokenizer-input-bytes` (default 1048576).
+- `--max-tokenizer-output-tokens` (default 1048576).
+- `--max-tokenizer-pair-checks` (default 4194304).
+- `--max-tokenizer-pair-bytes` (default 67108864).
+
+These are cumulative preparation limits. Request size, per-head native context,
+model work and result size remain separate constraints. Invalid or unused
+encoding flags refuse before private input IO. The CLI admits one transient
+encoder workspace; the host receives the already-prepared judgment and does
+not tokenize again. Snapshot saving follows that same preparation.
+
+`source-int4 score-batch --task judge` accepts the same encoding and all four
+ceiling flags for every record, including explicit head cohorts and persistent
+CPU teams. Its input-byte and output-token defaults remain the record-byte cap
+and per-head prompt capacity. Larger explicit tokenizer ceilings may therefore
+be needed for repeated preparation. Every frame reports the fixed policy.
+Generic `score-job` remains byte encoded; its factory rejects a compact planner.
+
+Compact encoding selects different prompt tokens. These candidate routes do
+not claim identical model output, qualified task accuracy or measured speed.
+
 ## Validation scope
 
 Sixteen added regression definitions cover strict parsing, policy units,

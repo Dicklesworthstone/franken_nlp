@@ -392,3 +392,48 @@ fn diagnostics_are_redacted_and_native_cancellation_keeps_its_typed_cause() {
         assert!(!text.contains(private));
     }
 }
+
+#[test]
+fn compact_native_judgments_retain_exact_work_receipts_and_control_causes() {
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    let encoding = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 65536,
+        max_output_tokens: 65536, max_pair_checks: 4 * 1024 * 1024, max_pair_bytes: 64 * 1024 * 1024 });
+    let planner = fixtures::planner().with_document_encoding(encoding.clone()).unwrap();
+    let mut id = fixtures::identity(&planner);
+    id.numerics_profile = NumericsProfile::StrictQuantized { version: 2 };
+    id.backend_semantic_version = STRICT_INT4_EXECUTION.to_owned();
+    let context = PlanContext::new(&id, fixtures::budget()).unwrap();
+    for request in [pairwise(), rubric(), faithfulness()] {
+        let mut work = SafeBpeWork::default();
+        let plan = planner.compile_int4_with_work(&request, &context, JudgeLimits::default(),
+            32, &mut Continue, &mut work).unwrap();
+        assert_eq!(plan.input_encoding(), &encoding);
+        assert_eq!(plan.input_encoding_work(), Some(work));
+        assert!(work.input_bytes() > 0); assert!(work.output_tokens() > 0);
+        let rebuilt = planner.compile_int4_with_work(&request, &context, JudgeLimits::default(),
+            32, &mut Continue, &mut work).unwrap();
+        assert_eq!(plan.execution_identity(), rebuilt.execution_identity());
+        assert_eq!(plan.planned_work(), rebuilt.planned_work());
+        assert_eq!(plan.input_encoding_work(), rebuilt.input_encoding_work());
+        assert_eq!(Some(work), plan.input_encoding_work().unwrap().checked_add(plan.input_encoding_work().unwrap()));
+        match request {
+            JudgeRequest::Faithfulness { source, .. } => {
+                let count = plan.source_token_count().unwrap();
+                assert!(count > 0 && count < source.len());
+                let first = &plan.inner.executable.bundle().heads[0];
+                assert_eq!(count, first.ir.prompt_segments()[2].token_ids().len());
+            },
+            _ => assert_eq!(plan.source_token_count(), None),
+        }
+        let result = evaluate(&plan);
+        assert_eq!(result.head_count, plan.head_count());
+        assert_eq!(result.model_work, plan.planned_work());
+    }
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        assert_eq!(Int4JudgeError::from(JudgeError::Cancelled(cause)).cancellation(), Some(cause));
+        assert_eq!(Int4JudgeError::Task(JudgeError::Cancelled(cause)).cancellation(), Some(cause));
+        assert_eq!(super::super::quantized::Int8JudgeError::from(JudgeError::Cancelled(cause)).cancellation(), Some(cause));
+    }
+}

@@ -11,7 +11,7 @@ fn team_command(flags: &[&str]) -> Int4Command {
 }
 
 #[test]
-fn judge_teams_admit_scratch_but_preserve_byte_evidence_and_refuse_unsupported_composition() {
+fn judge_teams_admit_scratch_and_refuse_unsupported_composition() {
     let command = team_command(&["--compute-threads", "2"]);
     let Int4Task::Judge(options) = command.task else { panic!("judge required"); };
     let limits = options.validate(&command.args).unwrap();
@@ -34,11 +34,12 @@ fn judge_teams_admit_scratch_but_preserve_byte_evidence_and_refuse_unsupported_c
         assert_eq!(team_command(&flags).execute(&mut NoRead, &mut output), Err(CandidateError::Arguments));
         assert!(output.is_empty());
     }
-    let mut compact = team_command(&["--compute-threads", "2"]);
-    let encoding = input_encoding::definition(clap::Command::new("encoding"))
-        .try_get_matches_from(["encoding", "--input-encoding", "safe-bpe-v1"]).unwrap();
-    compact.args.input_encoding = input_encoding::InputEncodingArgs::from_matches(&encoding).unwrap();
-    assert_eq!(compact.execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+    let compact = team_command(&["--compute-threads", "2", "--input-encoding", "safe-bpe-v1"]);
+    let Int4Task::Judge(options) = compact.task else { panic!("judge required"); };
+    let admitted = options.validate(&compact.args).unwrap();
+    assert_eq!(admitted.compute, limits.compute);
+    assert_eq!(admitted.minimum_memory_bytes,
+        limits.minimum_memory_bytes + options.encoding.workspace_bytes(&compact.args).unwrap());
 }
 
 #[test]
@@ -90,11 +91,14 @@ fn complete_judgment_publication_preserves_evidence_but_omits_private_provenance
             scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "judge", mode,
             model_id: "Nanbeige4.2-3B", source_revision: "fixture", source_root_sha256: "fixture-source",
             model_content_sha256: "fixture-model", candidate_format: "fixture-format", quant_recipe: "fixture:group=32",
-            group_width: 32, integer_kernel: "s_scalar_i32", snapshot: None };
+            group_width: 32, integer_kernel: "s_scalar_i32", snapshot: None,
+            input_encoding: None, input_encoding_work: None };
         let response = Response { provenance: &provenance, output: &output };
         let mut bytes = Vec::new(); publish(&response, 4096, &mut bytes).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["output"], output);
+        assert!(value.get("input_encoding").is_none());
+        assert!(value.get("input_encoding_work").is_none());
         assert_eq!(value["protocol"], "fnlp-candidate-int4-judge-v1");
         assert_eq!(value["mode"], mode);
         assert_eq!(value["evidence"], "non_authoritative");
@@ -117,4 +121,27 @@ fn writer_flush_failure_reports_output_failure_after_complete_staging() {
     let mut writer = FlushFailure(Vec::new());
     assert_eq!(publish(&complete, 4096, &mut writer), Err(CandidateError::Output));
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&writer.0).unwrap(), complete);
+}
+
+#[test]
+fn compact_judgment_provenance_preserves_the_complete_inner_result() {
+    let output = serde_json::json!({"fixture_only":true,"result":{"mode":"faithfulness",
+        "evidence":[{"quote":"é上海","span":{"byte_start":4,"byte_end":12}}]}});
+    let encoding = UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 4096, max_output_tokens: 2048,
+        max_pair_checks: 20000, max_pair_bytes: 200000 });
+    let work = crate::tokenizer::untrusted::SafeBpeWork::default();
+    let provenance = Provenance { protocol: "fnlp-candidate-int4-judge-v1", schema_version: 1,
+        scope: "fixture", evidence: "non_authoritative", task: "judge", mode: "faithfulness",
+        model_id: "Nanbeige4.2-3B", source_revision: "fixture", source_root_sha256: "fixture",
+        model_content_sha256: "fixture", candidate_format: "fixture", quant_recipe: "fixture",
+        group_width: 32, integer_kernel: "s_scalar_i32", snapshot: None,
+        input_encoding: Some(&encoding), input_encoding_work: Some(work) };
+    let response = Response { provenance: &provenance, output: &output };
+    let mut bytes = Vec::new();
+    publish_checked(&response, 4096, &mut bytes, &|| Ok(())).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["output"], output);
+    assert_eq!(value["input_encoding"], serde_json::to_value(encoding).unwrap());
+    assert_eq!(value["input_encoding_work"], serde_json::to_value(work).unwrap());
 }

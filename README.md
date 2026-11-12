@@ -1162,6 +1162,22 @@ judgment on the native grouped-INT4 engine. It uses the existing typed judge
 request contract and requires `asupersync-runtime`, explicit source or
 independently pinned snapshot input, and a process memory ceiling.
 
+All three modes also accept `--input-encoding safe-bpe-v1`. Untrusted source,
+claim, criterion and answer bytes remain exact and exclude template controls.
+Faithfulness evidence windows are encoded independently from their original
+UTF-8 spans; compact token IDs are never indexed by byte offsets. One tokenizer
+ledger covers every encoding operation in the complete judgment. Its explicit
+`--max-tokenizer-input-bytes`, `--max-tokenizer-output-tokens`,
+`--max-tokenizer-pair-checks` and `--max-tokenizer-pair-bytes` limits are
+separate from request bytes, per-head context and native work. One encoder
+workspace is admitted before private input IO. Compact operation supports the
+existing serial, prompt-prefill, head-cohort and persistent-team schedules,
+with their existing combination restrictions. Output reports the exact policy
+and consumed tokenizer work; byte-mode output remains unchanged. Compact input
+changes prompt tokens and does not establish output parity, task quality or a
+speedup. Source input, snapshot saving after the single preparation, and pinned
+snapshot reload use the same prepared-plan route.
+
 For example, save this pairwise request as `judge.json`:
 
 ```json
@@ -1244,15 +1260,20 @@ serial, persistent CPU-team or explicit cross-document cohort execution**. The c
 source or independently pinned snapshot input, and a process memory ceiling.
 The selected task remains fixed for the whole invocation.
 
-Classification and sentiment accept `--input-encoding safe-bpe-v1` with the
-same bounded encoder as their one-off commands. Each record gets one cumulative
-byte/token/pair-check/pair-byte budget: classification shares it across the
-document and canonical label metadata, while sentiment reuses the encoded
-document across every axis. Actual encoded prompt lengths determine context
-and native work. The byte cap therefore includes classification label metadata,
-not just the decoded document. Tokenizer ceilings apply to each complete record;
-the transport, checkpoint, deadline and native-work limits still cover the
-entire invocation. Judgment retains byte fallback for its indexed evidence.
+Classification, sentiment and judgment accept `--input-encoding safe-bpe-v1`.
+Each record gets one cumulative byte/token/pair-check/pair-byte budget.
+Classification shares it across document and label metadata; sentiment reuses
+the encoded document across axes; judgment shares it across pairwise data,
+rubric criteria and independently encoded faithfulness evidence windows.
+Actual prompt lengths determine context and native work. Explicit
+`--max-tokenizer-input-bytes` and `--max-tokenizer-output-tokens` can price
+repeated preparation separately from the transport's source-byte cap and each
+head's native context. Their defaults remain `--max-input-bytes` and the
+per-head prompt capacity. One encoder workspace is admitted beside retained
+plans, independently of record count, cohort width or worker count. Tokenizer
+limits apply to each complete record; transport, checkpoint, deadline and
+native-work limits still cover the entire invocation. The policy is fixed for
+the stream and appears on every frame, including empty-stream completion.
 
 For classification, save shared settings as `labels.json`:
 

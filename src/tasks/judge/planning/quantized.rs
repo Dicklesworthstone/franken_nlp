@@ -45,13 +45,18 @@ impl Error for Int8JudgeError {
         match self { Self::Task(e) => Some(e), Self::Scoring(e) => Some(e), Self::Native(e) => Some(e), _ => None }
     }
 }
-impl From<JudgeError> for Int8JudgeError { fn from(e: JudgeError) -> Self { Self::Task(e) } }
+impl From<JudgeError> for Int8JudgeError {
+    fn from(e: JudgeError) -> Self {
+        match e { JudgeError::Cancelled(cause) => Self::Cancelled(cause), other => Self::Task(other) }
+    }
+}
 impl From<Int8ScoringError> for Int8JudgeError { fn from(e: Int8ScoringError) -> Self { Self::Scoring(e) } }
 impl From<StrictInt8Error> for Int8JudgeError { fn from(e: StrictInt8Error) -> Self { Self::Native(e) } }
 impl Int8JudgeError {
     pub fn cancellation(&self) -> Option<DecodeCancellationKind> {
         match self {
-            Self::Cancelled(c) | Self::Native(StrictInt8Error::Cancelled(c)) => Some(*c),
+            Self::Cancelled(c) | Self::Task(JudgeError::Cancelled(c))
+                | Self::Native(StrictInt8Error::Cancelled(c)) => Some(*c),
             Self::Scoring(e) => e.cancellation(), _ => None,
         }
     }
@@ -79,14 +84,15 @@ pub struct PreparedInt8Judge {
 }
 impl JudgePlanner {
     /// Compile with the STRICT profile supplied by the caller, never by
-    /// rewriting an eager context. Legacy tokenization is checked before and
-    /// after the bounded planning operation; it is not preemptible mid-encode.
+    /// rewriting an eager context. Compact tokenization preserves the original
+    /// control while all heads share one bounded work allowance.
     pub fn plan_int8_with_control<C: DecodeStepControl>(&self, request: &JudgeRequest,
         context: &PlanContext<'_>, limits: JudgeLimits, control: &mut C)
         -> Result<PreparedInt8Judge, Int8JudgeError> {
         checkpoint(control)?;
         check_profile(context.execution_identity())?;
-        let inner = self.plan_with_profile(request, context, limits, NumericsProfile::StrictQuantized { version: 1 })?;
+        let inner = self.plan_with_profile_and_work(request, context, limits,
+            NumericsProfile::StrictQuantized { version: 1 }, control, &mut SafeBpeWork::default())?;
         checkpoint(control)?;
         let mut schedules = reserved(inner.executable.bundle().heads.len())?;
         let mut work = Int8Work::default();

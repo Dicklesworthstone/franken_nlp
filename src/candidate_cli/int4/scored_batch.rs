@@ -23,6 +23,7 @@ const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 pub(super) struct BatchArgs {
     scoring: classify::ScoringArgs,
     stream: StreamArgs,
+    encoding: judge::EncodingArgs,
 }
 impl std::fmt::Debug for BatchArgs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ScoredBatchArgs") }
@@ -54,7 +55,7 @@ struct StreamArgs {
 }
 
 pub(super) fn definition() -> clap::Command {
-    input_encoding::definition(StreamArgs::augment_args(classify::definition().name("score-batch")
+    judge::encoding_definition(StreamArgs::augment_args(classify::definition().name("score-batch")
         .about("Classify, score sentiment or judge ordered NDJSON with one resident INT4 model")
         .long_about("Run one fixed finite-scoring task over bounded ordered {id,text,task_args?} NDJSON, with exact {\"flush\":true} controls. --task selects classify, sentiment or judge. --defaults supplies shared task data without a document, budget, model or execution identity; a non-null task_args replaces the complete defaults under the same host ceiling. Source conversion and independently digest-pinned snapshot loading share one resident model. Execution is serial by default. --compute-threads N admits one persistent CPU row team for the entire stream, including all documents, heads and flushes; its run_complete is published only after every worker joins. Alternatively, --cohort-heads N groups complete documents' scoring heads in one bounded native layer-major cohort. These schedules cannot be combined. --cohort-documents caps buffered document/error records; otherwise the head ceiling and aggregate output cap determine it. Cohort producers must fill a window or send a flush; there is no timer-driven partial-window execution. Every candidate includes terminal EOS and full-vocabulary scoring; classification scores every label, sentiment retains independent axes and one fixed run policy, and judgment preserves all pairwise orders, rubric criteria or faithfulness evidence. Every admitted cohort preflights before its first native forward; a document with more heads than the ceiling is rejected without serial fallback. All five work flags bound the ENTIRE RUN and never renew per item, cohort, thread or flush; accepting more records grants no additional compute. Complete results and errors remain ordered. IDs reset only after a drained flush. Every event carries non-authoritative candidate provenance. Require run_complete AND exit 0 for whole-run success; earlier complete results survive later item failure. No generated-label shortcut, sampling, thinking, tools, durable resume, calibrated confidence or semantic-accuracy claim. Blocking IO is cooperative, not preemptible.")
         .mut_arg("cohort_heads", |arg| arg.hide(false)
@@ -68,7 +69,9 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("max_attention_pairs", |arg| arg.help("Whole-stream attention pair ceiling"))
         .mut_arg("max_dot_products", |arg| arg.help("Whole-stream actual grouped native dot-product ceiling"))
         .mut_arg("max_multiply_accumulates", |arg| arg.help("Whole-stream multiply-accumulate ceiling")))
-        .after_long_help("Classification and sentiment accept --input-encoding safe-bpe-v1. The entire document and its untrusted label metadata share one bounded tokenizer ledger per record; sentiment reuses its document across axes. Byte/token/pair ceilings never renew between segments of that record. One transient encoder workspace is admitted alongside every retained cohort plan and lookahead. The exact policy binds each prompt identity and appears on every candidate event, including flush and run_complete. Aggregate transport, native work and deadline limits still cover the whole stream; tokenizer work caps are per document, not a separate stream-global allowance. Judge remains byte-fallback because its evidence windows use byte-token indexing. Existing byte-fallback output remains unchanged."))
+        .after_long_help("Classification, sentiment and judgment accept --input-encoding safe-bpe-v1. One bounded tokenizer ledger covers every untrusted segment in a record, including both pairwise orders, all rubric criteria and separately encoded faithfulness evidence windows. --max-tokenizer-input-bytes and --max-tokenizer-output-tokens may explicitly bound this cumulative work; their defaults remain --max-input-bytes and the per-head prompt capacity. These work limits are separate from the original record size and each native context. Byte/token/pair ceilings never renew between heads or evidence windows. One transient encoder workspace is admitted alongside retained cohort plans and lookahead. The exact policy binds each prompt identity and appears on every candidate event, including flush and run_complete. Aggregate transport, native work and deadline limits still cover the whole stream; tokenizer caps are per record. Existing byte-fallback output remains unchanged. Compact input changes prompt tokens and makes no output-parity, quality or speed claim."))
+        .mut_arg("max_tokenizer_input_bytes", |arg| arg.help("Cumulative untrusted bytes encoded per record; safe-bpe-v1 only, defaults to --max-input-bytes"))
+        .mut_arg("max_tokenizer_output_tokens", |arg| arg.help("Cumulative untrusted tokens produced per record; safe-bpe-v1 only, defaults to per-head prompt capacity"))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -87,15 +90,15 @@ pub(super) struct CohortWindow { pub max_documents: usize, pub max_heads: usize 
 impl BatchArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         Ok(Self { scoring: classify::ScoringArgs::from_batch_matches(matches)?,
-            stream: StreamArgs::from_arg_matches(matches)? })
+            stream: StreamArgs::from_arg_matches(matches)?,
+            encoding: judge::EncodingArgs::from_arg_matches(matches)? })
     }
     fn kind(&self) -> Result<ScoreTask, CandidateError> {
         ScoreTask::named(&self.stream.task).ok_or(CandidateError::Arguments)
     }
     pub(super) fn validate(&self, args: &Int4Args) -> Result<BatchLimits, CandidateError> {
-        let kind = self.kind()?;
-        if args.prefill()?.is_some()
-            || (kind == ScoreTask::Judge && !args.input_encoding.is_default()) {
+        self.kind()?;
+        if args.prefill()?.is_some() {
             return Err(CandidateError::Arguments);
         }
         let stream = &self.stream;
@@ -109,9 +112,15 @@ impl BatchArgs {
         }
         // Keep hardware selection, source/snapshot exclusivity and scored-only
         // policy refusal ahead of defaults, document or model IO.
-        let mut common = self.scoring.validate_one_off_with_prefill(args)?;
-        let encoding = args.input_encoding.policy(args.max_input_bytes, common.max_prompt_tokens)?;
-        let encoding_workspace_bytes = args.input_encoding.workspace_bytes(args.max_input_bytes, common.max_prompt_tokens)?;
+        let mut native_args = args.clone();
+        native_args.input_encoding = input_encoding::InputEncodingArgs::default();
+        let mut common = self.scoring.validate_one_off_with_prefill(&native_args)?;
+        let encoding = self.input_encoding(args, common)?;
+        let encoding_workspace_bytes = match &encoding {
+            crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback => 0,
+            crate::tokenizer::untrusted::UntrustedEncoding::SafeBpeV1(limits) => limits.requirements()
+                .map_err(|_| CandidateError::Arguments)?.workspace_bytes,
+        };
         let work = self.scoring.work_ceiling();
         let native = Int4ScoredBatchLimits { max_item_work: work, max_model_work: work };
         native.validate().map_err(|_| CandidateError::Arguments)?;
@@ -162,6 +171,10 @@ impl BatchArgs {
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(BatchLimits { common, transport, native, output_bytes: stream.max_total_output_bytes,
             io_bytes, preparation_reserve_bytes, encoding_workspace_bytes, cohort })
+    }
+    fn input_encoding(&self, args: &Int4Args, common: Int4Limits)
+        -> Result<crate::tokenizer::untrusted::UntrustedEncoding, CandidateError> {
+        self.encoding.policy_with_defaults(args, args.max_input_bytes, common.max_prompt_tokens)
     }
     fn load_defaults(&self, text: Option<&str>, budget: TaskBudget, args: &Int4Args)
         -> Result<Defaults, CandidateError> {

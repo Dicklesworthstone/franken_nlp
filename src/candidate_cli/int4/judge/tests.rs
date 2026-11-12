@@ -241,3 +241,62 @@ fn all_three_modes_match_between_source_scalar_and_pinned_snapshot_simd() {
     }
     // The caller-owned snapshot is preserved on success and on failure.
 }
+
+#[test]
+fn compact_judgment_admits_one_encoder_independently_of_head_scheduling() {
+    for schedule in [&[][..], &["--prefill-rows", "4"][..],
+        &["--cohort-heads", "4"][..], &["--compute-threads", "3"][..]] {
+        let plain = command(schedule);
+        let base = options(&plain).validate(&plain.args).unwrap();
+        let mut flags = schedule.to_vec();
+        flags.extend(["--input-encoding", "safe-bpe-v1",
+            "--max-tokenizer-input-bytes", "4096", "--max-tokenizer-output-tokens", "2048",
+            "--max-tokenizer-pair-checks", "20000", "--max-tokenizer-pair-bytes", "200000"]);
+        let compact = command(&flags);
+        let selected = options(&compact);
+        let admitted = selected.validate(&compact.args).unwrap();
+        let policy = selected.encoding.policy(&compact.args).unwrap();
+        assert_eq!(policy, UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+            max_input_bytes: 4096, max_output_tokens: 2048,
+            max_pair_checks: 20000, max_pair_bytes: 200000 }));
+        let workspace = selected.encoding.workspace_bytes(&compact.args).unwrap();
+        assert!(workspace > 0);
+        assert_eq!(admitted.minimum_memory_bytes, base.minimum_memory_bytes + workspace);
+        assert_eq!(admitted.preparation_bytes, base.preparation_bytes);
+        assert_eq!(admitted.native, base.native);
+        assert_eq!(admitted.compute, base.compute);
+        assert_eq!(selected.scoring.work_ceiling(), options(&plain).scoring.work_ceiling());
+        let mut under = compact;
+        under.args.memory_mib = admitted.minimum_memory_bytes.saturating_sub(1) / MIB;
+        let mut output = Vec::new();
+        assert_eq!(under.execute(&mut NoRead, &mut output), Err(CandidateError::Arguments));
+        assert!(output.is_empty());
+    }
+}
+
+#[test]
+fn compact_judge_caps_are_validated_before_any_private_io() {
+    for flag in ["--max-tokenizer-input-bytes", "--max-tokenizer-output-tokens",
+        "--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
+        for value in ["0", "18446744073709551615"] {
+            let mut output = Vec::new();
+            assert_eq!(command(&["--input-encoding", "safe-bpe-v1", flag, value])
+                .execute(&mut NoRead, &mut output), Err(CandidateError::Arguments));
+            assert!(output.is_empty());
+        }
+    }
+    for flag in ["--max-tokenizer-input-bytes", "--max-tokenizer-output-tokens"] {
+        assert_eq!(command(&[flag, "128"]).execute(&mut NoRead, &mut Vec::new()),
+            Err(CandidateError::Arguments));
+    }
+    let byte = command(&["--input-encoding", "byte-fallback"]);
+    assert_eq!(options(&byte).encoding.workspace_bytes(&byte.args).unwrap(), 0);
+    let source = command(&["--input-encoding", "safe-bpe-v1", "--save-snapshot", "new.snapshot"]);
+    options(&source).validate(&source.args).unwrap();
+    let pin = "ab".repeat(32);
+    let reload = parsed(&["--input-encoding", "safe-bpe-v1", "--snapshot", "pinned.snapshot",
+        "--expected-model-sha256", &pin]).unwrap();
+    let selected = options(&reload);
+    assert!(selected.validate(&reload.args).unwrap().snapshot_pin.is_some());
+    assert!(matches!(selected.encoding.policy(&reload.args).unwrap(), UntrustedEncoding::SafeBpeV1(_)));
+}

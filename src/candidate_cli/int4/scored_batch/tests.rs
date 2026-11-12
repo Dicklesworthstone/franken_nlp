@@ -103,9 +103,9 @@ fn every_native_transport_and_preparation_ceiling_refuses_before_io() {
 }
 
 #[test]
-fn compact_classification_and_sentiment_admit_serial_and_cohort_streams_with_one_encoder() {
+fn compact_scored_tasks_admit_serial_and_cohort_streams_with_one_encoder() {
     use crate::tokenizer::untrusted::UntrustedEncoding;
-    for task in ["classify", "sentiment"] {
+    for task in ["classify", "sentiment", "judge"] {
         for schedule in [&[][..], &["--cohort-heads", "8", "--cohort-documents", "3"][..]] {
             let mut flags = schedule.to_vec();
             flags.extend(["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "123456",
@@ -157,20 +157,15 @@ fn compact_classification_and_sentiment_admit_serial_and_cohort_streams_with_one
 }
 
 #[test]
-fn unsupported_compact_judgment_and_invalid_encoder_policy_refuse_before_private_io() {
+fn invalid_encoder_policy_refuses_before_private_io() {
     for task in ["classify", "sentiment", "judge"] {
-        for limits in [&["--max-tokenizer-pair-checks", "0"][..], &["--max-tokenizer-pair-bytes", "0"][..]] {
+        for limits in [&["--max-tokenizer-pair-checks", "0"][..], &["--max-tokenizer-pair-bytes", "0"][..],
+            &["--max-tokenizer-input-bytes", "0"][..], &["--max-tokenizer-output-tokens", "0"][..]] {
             let mut flags = vec!["--input-encoding", "safe-bpe-v1", "--defaults", "never-open.json"];
             flags.extend_from_slice(limits);
             let (batch, args) = arguments(task, &flags);
             assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
         }
-    }
-    for schedule in [&[][..], &["--cohort-heads", "4"][..]] {
-        let mut flags = vec!["--input-encoding", "safe-bpe-v1", "--defaults", "never-open.json"];
-        flags.extend_from_slice(schedule);
-        let (batch, args) = arguments("judge", &flags);
-        assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
     }
     let (batch, args) = arguments("judge", &["--input-encoding", "byte-fallback"]);
     assert_eq!(batch.validate(&args).unwrap().encoding_workspace_bytes, 0);
@@ -178,7 +173,7 @@ fn unsupported_compact_judgment_and_invalid_encoder_policy_refuse_before_private
 
 #[test]
 fn compact_stream_policy_does_not_enable_prefill_by_injection() {
-    for task in ["classify", "sentiment"] {
+    for task in ["classify", "sentiment", "judge"] {
         let (batch, mut args) = arguments(task, &["--input-encoding", "safe-bpe-v1"]);
         args.prefill_rows = Some(2);
         assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
@@ -208,7 +203,7 @@ fn persistent_team_admission_preserves_all_stream_budgets_and_prices_worker_scra
             assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
         }
     }
-    for task in ["classify", "sentiment"] {
+    for task in ["classify", "sentiment", "judge"] {
         let (batch, args) = arguments(task, &["--compute-threads", "3", "--input-encoding", "safe-bpe-v1"]);
         let admitted = batch.validate(&args).unwrap();
         assert!(admitted.encoding_workspace_bytes > 0);
@@ -235,7 +230,7 @@ fn unsupported_team_widths_and_combined_schedules_refuse_before_private_io() {
 
 #[test]
 fn snapshot_compaction_keeps_the_same_work_transport_and_encoding_limits() {
-    for task in ["classify", "sentiment"] {
+    for task in ["classify", "sentiment", "judge"] {
         let (batch, mut args) = arguments(task, &["--input-encoding", "safe-bpe-v1"]);
         let source = batch.validate(&args).unwrap();
         args.source_dir = None; args.source_manifest = None;
@@ -473,5 +468,40 @@ fn disabled_runtime_refuses_without_opening_defaults_or_touching_streams() {
             "--cohort-heads", "8", "--cohort-documents", "2"]);
         args.memory_mib = 262_144;
         assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Unavailable));
+    }
+}
+
+#[test]
+fn explicit_record_tokenizer_caps_are_separate_from_context_and_transport() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    for task in ["classify", "sentiment", "judge"] {
+        for schedule in [&[][..], &["--cohort-heads", "4"][..], &["--compute-threads", "3"][..]] {
+            let mut flags = schedule.to_vec();
+            flags.extend(["--input-encoding", "safe-bpe-v1",
+                "--max-tokenizer-input-bytes", "1048576", "--max-tokenizer-output-tokens", "524288",
+                "--max-tokenizer-pair-checks", "20000", "--max-tokenizer-pair-bytes", "200000"]);
+            let (batch, mut args) = arguments(task, &flags);
+            args.memory_mib = 262144;
+            let limits = batch.validate(&args).unwrap();
+            let policy = batch.input_encoding(&args, limits.common).unwrap();
+            assert_eq!(policy, UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+                max_input_bytes: 1048576, max_output_tokens: 524288,
+                max_pair_checks: 20000, max_pair_bytes: 200000 }));
+            assert!(limits.common.max_prompt_tokens < 524288);
+            assert!(limits.transport.max_document_bytes < 1048576);
+            let UntrustedEncoding::SafeBpeV1(caps) = policy else { unreachable!() };
+            assert_eq!(limits.encoding_workspace_bytes, caps.requirements().unwrap().workspace_bytes);
+            let (byte, mut byte_args) = arguments(task, schedule);
+            byte_args.memory_mib = args.memory_mib;
+            let byte = byte.validate(&byte_args).unwrap();
+            assert_eq!(byte.transport, limits.transport);
+            assert_eq!(byte.native, limits.native);
+            args.memory_mib = limits.common.minimum_memory_bytes.saturating_sub(1) / MIB;
+            assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+        }
+        for flag in ["--max-tokenizer-input-bytes", "--max-tokenizer-output-tokens"] {
+            let (batch, args) = arguments(task, &[flag, "128"]);
+            assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+        }
     }
 }
