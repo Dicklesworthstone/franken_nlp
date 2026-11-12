@@ -1,10 +1,11 @@
 # Resume durable jobs from retained inputs
 
-Durable candidate jobs can explicitly retain their complete input population
-and replay it through one reusable record buffer on a later invocation. This
-removes the need to keep supplying the original population file or pipe after
-a successfully initialized retained job. The model, exact task configuration,
-job key, job ID and immutable job limits remain required.
+Durable candidate jobs can explicitly retain their complete input population,
+creating and replaying it with one record's payload in memory at a time. This
+removes the complete-population payload allocation during retained creation
+and the need to supply the original population file or pipe after successful
+initialization. The model, exact task configuration, job key, job ID and
+immutable job limits remain required.
 
 Input retention is separate from `--store-results`. Without input-retention
 flags, a job keeps its existing behavior: it reads the complete original
@@ -108,7 +109,31 @@ The same finite invocation deadline and checkpoint control cover the scan,
 verification, planning and execution phases. No extra full-file input copy is
 created solely for CLI selection.
 
-## Retained replay memory and passes
+## Streaming creation and replay
+
+Creation reads the selected file or one-shot pipe once. It validates each
+exact envelope and the current processor's typed arguments, adds the original
+bytes to one incremental manifest with whole-population duplicate detection,
+and stages a bounded frame in the protected input file. Each frame's full
+size, including its header, must fit the explicit retention cap before any
+part of that frame is written. Earlier record payloads are released.
+
+The existing v1 frame chain binds the final population commitment, so creation
+cannot seal frames until the original stream is complete. A second pass reads
+one staged record at a time, compares it against its independently frozen
+original binding, and fills only the chain fields in place. Staged bytes cannot
+substitute for the original population. The file and its directory entry are
+synced, the writable handle closes, and a read-only cursor authenticates the
+complete sealed spool before the initial journal receipt is committed. No
+second plaintext input file or per-record offset vector is created.
+
+The same exclusive lock covers staging, sealing, receipt publication and
+execution. The already admitted native state may exist during ingestion, but
+no item preparation, native work debit or inference begins until the complete
+typed population and spool have passed validation. Execution starts from the
+first authenticated record using the same cursor. Exact envelope bytes,
+population commitments and the retained v1 wire format match the existing
+borrowed-population creation API.
 
 Retained resume authenticates the complete population before repairing any
 result tail or preparing native work. It reads every exact envelope, including
@@ -134,12 +159,14 @@ job and closes before the lock is released. Read, authentication and
 cancellation failures stop the session; continuing requires an explicit
 reopen and another complete verification.
 
-This trades a second read of pending input frames for avoiding a retained
-copy of the complete input population in memory. Both metadata indexes used
-during fresh authorization remain in memory and obey the existing item
-ceiling. Job creation, including creation with `--spool-input`, and resume
-from an external population still hold the complete input population.
-Only retained replay receives the smaller input-memory quote.
+These paths trade bounded sequential file passes for avoiding a retained copy
+of the complete input population in memory. The metadata indexes used during
+fresh authorization remain in memory and obey the existing item ceiling.
+Both `--spool-input` creation and `--use-retained-input` replay receive the
+smaller input-memory quote. Ordinary creation and resume from an external
+population still hold the complete input population. The embedding API
+`JobRunner::create_with_retained_inputs` also keeps its caller-owned slice;
+use `JobRunner::create_with_retained_ndjson` for streaming creation.
 
 For embeddings, `JobInputMemory::buffer_bytes(JobLimits)` selects the common
 job-buffer floor:
@@ -167,19 +194,22 @@ shared process budget. The conservative
 `JobHostLimits::required_buffer_bytes` helper retains the complete-population
 quote; `required_buffer_bytes_for_input` selects the input mode explicitly.
 The actual host requests and CLI preloading calculations derive the mode
-from the validated input source. Selecting `--use-retained-input` therefore
-uses retained-record admission automatically, with no new memory flag and
-without changing the job's frozen limits or recipe.
+from the validated input source. Selecting `--spool-input` or
+`--use-retained-input` therefore uses retained-record admission automatically,
+with no new memory flag and without changing the job's frozen limits or recipe.
 No-model status, verification and materialization share the same record/parser
 floor while keeping their separate journal, serialization and IO reserves.
 
 ## Recovery and inspection
 
-Creation preflights the complete framed size, writes and syncs the input file
-and its directory entry, and only then commits its receipt with the initial
-job state. An interruption before that journal commit cannot make the input
-file authoritative. An error may therefore leave private retained bytes even
-if job initialization did not finish; it does not imply rollback or deletion.
+Streaming creation checks the framed cap before each append, validates the
+complete original population and final sealed file, syncs the input file and
+its directory entry, and only then commits its receipt with the initial job
+state. An interruption or invalid later record before that journal commit
+cannot make the input file authoritative. An error may leave private retained
+bytes even if job initialization did not finish; it does not imply rollback
+or deletion. A later create cannot overwrite or adopt that orphan. A lost
+acknowledgement after the header commit requires explicit authenticated resume.
 
 Retained replay holds the same exclusive job lock through stored-state
 authentication, complete frame verification, fresh typed population/recipe
@@ -241,8 +271,13 @@ population stream. Added fixtures cover reusable record storage, pending
 bookmarks that refuse committed-prefix rereads, end-of-input replay, cursor
 poisoning, unchanged population commitments, and typed-invalid committed or
 pending arguments refusing before result-tail repair and new work debits.
+Streaming-creation fixtures additionally cover exact v1 byte compatibility,
+late typed and duplicate rejection before preparation, original-reader release,
+staging tamper, framed-cap enforcement, cancellation and initialization fault
+boundaries. Shared host/CLI fixtures check one-shot source ownership and the
+same mode-specific memory admission.
 
-The current implementation checkpoint has source parsing and diff review
+The current implementation checkpoint has independent source and diff review
 only. Rust builds/tests, native execution and parity, performance/RSS
 measurements, crash campaigns and controller-selected DSR gates remain
 **UNRUN**. The smaller admission calculation is not an observed RSS reduction

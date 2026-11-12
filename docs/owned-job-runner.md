@@ -17,10 +17,25 @@ For this explicitly named `identity-json-envelope-v1` profile, each `JobInput`
 contains the original JSON `{id,text,task_args?}` envelope in BOTH `original`
 and `normalized`, with the same `id` also supplied as `JobInput.id`. Nonidentity
 normalization, duplicate JSON keys, unknown envelope fields, flush commands,
-and mismatched IDs refuse. Every envelope is validated before opening storage;
+and mismatched IDs refuse. The borrowed-population constructors validate every
+envelope before opening storage;
 whole-population size and duplicate-ID checks precede that parse pass. The exact
 ordered envelopes (including per-item arguments), execution identity, processor
 recipe/defaults, and job limits enter the existing keyed frozen manifest.
+
+For explicit input retention, `create_with_retained_ndjson` instead accepts a
+`BufRead` source, `PopulationReadLimits` and a separate `InputRetentionLimits`
+cap. It validates and binds each original record while staging one private
+frame at a time. After the complete stream passes, it verifies and seals those
+frames against the original manifest, syncs and authenticates the retained
+file, and only then publishes the initial journal receipt. No preparation or
+inference begins before complete validation. It retains one record's payload
+and the bounded keyed item index, and owns its read-only replay cursor.
+`create_with_retained_inputs` remains available for callers that already own a
+complete borrowed population. `resume_with_retained_inputs` authenticates the
+saved complete population and fresh processor contract before recovery, then
+replays only the pending suffix. See [retained inputs](retained-inputs.md) for
+consent, memory, exact-format and interruption semantics.
 
 `step` executes only the next uncommitted ordinal. `run` repeats it until all
 items commit. Planning uses the same caller-provided cancellation control.
@@ -122,6 +137,8 @@ model/mask and task-budget axes, complete default options, typed source-budget
 projection, and the concrete adapter trait boundary. These tests are fixtures,
 not native accuracy or filesystem crash qualification.
 
-The public CLI dispatcher, input spooling, external-sort populations,
-partition/corpus-global execution, live controller/DSR/Beads/bv/Agent-Mail
-qualification, and platform-native crash campaigns remain separate work.
+The [candidate owned-job CLI](candidate-owned-jobs-cli.md) and
+[retained-input paths](retained-inputs.md) now connect the runner to public
+candidate invocations. External-sort populations, partition/corpus-global
+execution, controller DSR qualification and platform-native crash campaigns
+remain separate work.

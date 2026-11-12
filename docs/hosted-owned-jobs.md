@@ -20,13 +20,17 @@ KV quantity, and a live result-memory reservation.
 
 `hosted::corpus::jobs::SourceJobRequest` names an existing protected root,
 host-protected random `JobSecret`, random `JobId`, immutable `JobLimits`, and
-`JobOpenMode::Create` or explicit `Resume(TailPolicy)`. Constructing the request
+`JobOpenMode::Create`, explicit `Resume(TailPolicy)`, or the separate
+`CreateRetainingInputs` / `ResumeRetained` input-retention selections.
+Constructing the request
 is an explicit result-storage request; the API generates no weak/default key,
 reads no secret from argv, creates no directory and never silently adopts an
 existing job. `materialize` separately requests publication after completion.
 
-`JobHostLimits` admits the entire population rather than a live batch window.
-It combines checked population/index/byte-staging floors with mandatory caller
+`JobHostLimits` admits the selected input owner and complete keyed item index.
+Ordinary create and external-input resume hold the complete payload population;
+explicit retained creation and replay hold one record's payload at a time.
+It combines the checked input/index/byte-staging floors with mandatory caller
 prices for planner/vocabulary/default/source/grammar preparation, the reader's
 retained backing buffers, fsqlite engine allocations, and serialization trees
 and allocator slack. The database file cap is not misrepresented as a database
@@ -38,11 +42,15 @@ These modeled commitments are not an RSS bound or an allocator interceptor.
 The existing hosted preflight requires the actual process runtime, the same
 resident-model resource domain, and the serial profile's single blocking
 coordinator. All claims are acquired before dispatch. In the one existing
-`spawn_blocking`/`scoped_cpu(0)` invocation, the host first ingests the complete
-population. Invalid later input therefore fails before native engine creation,
-job storage or inference. The exact typed recipe/envelopes are then frozen by
-`JobRunner` before create/resume; per-item native preparation/admission remains
-unchanged. The engine and vocabulary are reused across all pending items.
+`spawn_blocking`/`scoped_cpu(0)` invocation, ordinary original-input jobs first
+ingest the complete population. Explicit retained creation defers its one-shot
+reader to `JobRunner`, whose real processor validates and binds each exact
+envelope while staging bounded private frames. It seals and authenticates the
+complete spool before the initial journal receipt. Retained replay authenticates
+the saved population and fresh typed recipe under the same job lock before
+recovery. Admitted native state may exist during these retained scans; no
+item preparation or inference starts until complete validation. The engine
+and vocabulary are reused across all pending items.
 
 The job buffer charge is held through ingestion, journal/spool use, every
 native execution, optional materialization and cleanup. Each result's actual
@@ -62,8 +70,10 @@ acknowledgement, rather than assuming an error means no durable progress exists.
 
 ## Resume and outputs
 
-Replay requires the entire original NDJSON population and exactly the same
-key, identity, recipe and immutable job limits. Committed items are not inferred
+Ordinary replay requires the entire original NDJSON population; explicit
+retained replay uses the authenticated saved inputs without touching the
+supplied reader. Both require exactly the same key, identity, recipe and
+immutable job limits. Committed items are not inferred
 again. Failed attempts and all six work axes stay charged across invocations,
 even though a fresh native adapter starts with new process-local counters.
 The newly supplied host limits may change admission capacity but cannot change
@@ -73,12 +83,15 @@ Without `materialize`, the return is only `JobProgress`; committed private
 results remain in the protected result spool. Explicit materialization uses
 the existing verified, synced, no-replace `materialized.ndjson` transaction.
 The method touches no ambient stdin/stdout and promises nothing about arbitrary
-pipe consumers. Inputs are retained only in the admitted in-memory population;
-persistent input spooling and external-sort populations are still separate work.
+pipe consumers. Input persistence requires the separate explicit retention
+selection and finite disk cap. See [retained inputs](retained-inputs.md) for
+streaming creation, memory admission, private orphan bytes and recovery.
+External-sort populations remain separate work.
 
 Nine host-accounting/lifecycle regression-test functions are supplied, including
 resume after a failed second item, explicit publication without re-inference,
 and changed-original refusal. The existing native source-adapter and dispatch
 suites cover their own seams. None of these tests, Rust compilation, real-model
 inference, physical crash/drain campaigns, or controller DSR qualification was
-run for this checkpoint. Public `fnlp job` command dispatch remains unconnected.
+run for this checkpoint. Public candidate start/resume commands are documented
+in the [candidate owned-job CLI guide](candidate-owned-jobs-cli.md).

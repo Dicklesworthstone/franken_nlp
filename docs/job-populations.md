@@ -28,16 +28,24 @@ index accepted by `JobRunner`, and `freeze` applies the existing complete
 execution/recipe/population contract. No mutable view, Clone, Debug, or
 Deserialize path exposes a replaceable population. Any read/validation failure
 returns no usable prefix, and no inference occurs until ingestion has finished.
-This intentionally rejects populations that exceed the in-memory bounds;
-external-sort indexing and protected persistent input spooling remain separate.
+This API intentionally retains the complete payload population. For explicitly
+retained jobs, `JobRunner::create_with_retained_ndjson` uses the same bounded
+record parser and one incremental keyed manifest while staging private input
+frames. It validates the complete original stream and seals the authenticated
+spool before publishing a job or preparing native work. That route keeps one
+record's payload at a time; it still enforces all logical snapshot ceilings
+and the complete bounded duplicate-ID index. See
+[retained inputs](retained-inputs.md). External-sort indexing remains separate.
 
 Cancellation is checked at most 8192 copied transport bytes apart. This is not
 preemption of arbitrary blocking `BufRead`, JSON parsing, allocation, or hashing.
 The host must price the reader's retained buffers, record capacities, keyed
 indices, borrowed index, canonical JSON trees and preparation/allocator overhead.
 
-Eleven regression-test functions are supplied for fragmented reads, exact
+Regression-test definitions cover fragmented reads, exact
 record replay, duplicate/invalid later inputs, byte/line/item/attempt budgets,
-IO errors, and mid-record cancellation. They are source fixtures only: no Rust
+IO errors, and mid-record cancellation. Incremental-reader fixtures also cover
+exact manifest parity, lazy consumption, poisoned failed prefixes and all
+eleven cancellation kinds. They are source fixtures only: no Rust
 compilation, test execution, native inference or platform qualification was run
 for this checkpoint; repository build authority remains as stated in WIRING.md.

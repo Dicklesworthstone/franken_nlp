@@ -94,15 +94,27 @@ fn input_memory_mode_requires_valid_consent_and_removes_only_complete_population
     let spool = input_options(&["--spool-input", "--max-retained-input-mib", "7"]).unwrap();
     let retained = input_options(&["--use-retained-input", "--max-retained-input-mib", "7"]).unwrap();
     assert_eq!(external.input_memory().unwrap(), JobInputMemory::CompletePopulation);
-    assert_eq!(spool.input_memory().unwrap(), JobInputMemory::CompletePopulation);
+    assert_eq!(spool.input_memory().unwrap(), JobInputMemory::RetainedRecord);
     assert_eq!(retained.input_memory().unwrap(), JobInputMemory::RetainedRecord);
     let job = lifetime();
     let full = external.buffer_bytes(job).unwrap();
-    assert_eq!(spool.buffer_bytes(job).unwrap(), full);
+    assert_eq!(spool.buffer_bytes(job).unwrap(), full - 2 * job.max_snapshot_bytes);
     assert_eq!(retained.buffer_bytes(job).unwrap(), full - 2 * job.max_snapshot_bytes);
+    let mut larger = job; larger.max_snapshot_bytes *= 2;
+    assert_eq!(external.buffer_bytes(larger).unwrap(), full + 2 * job.max_snapshot_bytes);
+    for mode in [spool, retained] {
+        assert_eq!(mode.buffer_bytes(larger).unwrap(), mode.buffer_bytes(job).unwrap());
+        let mut more_items = job; more_items.max_items += 1;
+        assert_eq!(mode.buffer_bytes(more_items).unwrap(), mode.buffer_bytes(job).unwrap() + 1024);
+        let mut larger_record = job; larger_record.max_input_bytes_per_item += 1;
+        assert!(mode.buffer_bytes(larger_record).unwrap() > mode.buffer_bytes(job).unwrap());
+    }
     for invalid in [
+        InputRetentionArgs { spool_input: true, ..InputRetentionArgs::default() },
         InputRetentionArgs { use_retained_input: true, ..InputRetentionArgs::default() },
         InputRetentionArgs { spool_input: true, ..retained },
+        InputRetentionArgs { max_retained_input_mib: Some(7), ..InputRetentionArgs::default() },
+        InputRetentionArgs { max_retained_input_mib: Some(0), ..spool },
         InputRetentionArgs { max_retained_input_mib: Some(u64::MAX), ..retained },
     ] {
         assert_eq!(invalid.input_memory().unwrap_err().code, "job_input_retention_options");
@@ -144,10 +156,15 @@ fn retained_population_reader_never_touches_stdin_or_falls_back_to_an_external_f
         .err().unwrap();
     assert_eq!(error.code, "job_input_retention_options");
     let exact = b"{\"id\":\"x\",\"text\":\"private\"}\r\n";
-    let mut external = population_reader(RunMode::Start, InputRetentionArgs::default(), std::path::Path::new("-"),
-        io::Cursor::new(exact), 8192).unwrap();
-    external.read_to_end(&mut bytes).unwrap();
-    assert_eq!(bytes, exact);
+    let spool = input_options(&["--spool-input", "--max-retained-input-mib", "1"]).unwrap();
+    for mode in [InputRetentionArgs::default(), spool] {
+        // Retained creation still consumes the selected one-shot stream exactly;
+        // only authenticated retained replay substitutes the empty reader.
+        let mut external = population_reader(RunMode::Start, mode, std::path::Path::new("-"),
+            io::Cursor::new(exact), 8192).unwrap();
+        bytes.clear(); external.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, exact);
+    }
 }
 #[test]
 fn schema_options_never_change_the_fixed_source_task() {

@@ -17,7 +17,7 @@ pub(super) use config::{Defaults, load_defaults, native_limits, parse_limits};
 pub(super) const LIMIT_BYTES: usize = 16 * 1024;
 pub(super) const DEFAULT_BYTES: usize = 1024 * 1024;
 pub(super) const REPORT_BYTES: usize = 16 * 1024;
-pub(in crate::candidate_cli) const INPUT_RETENTION_HELP: &str = "Input retention is separate consent: start with --spool-input --max-retained-input-mib N to save exact private envelopes in the protected job. Resume with --use-retained-input --max-retained-input-mib N and omit the population positional argument; the original population file/stdin is not opened. The explicit disk cap includes framing and does not enlarge logical population limits or lifetime work. Original model, task, limits and key are still required. Retained replay authenticates the complete typed population and fresh recipe under one exclusive lock before repair or inference, then reads pending records through one reusable buffer. Admission includes strict parser workspace and the bounded keyed item index; large per-record ceilings can still require substantial memory. Missing/corrupt/uncommitted input bytes never fall back to an external source. Omit both flags to keep supplying the complete original population on every invocation.";
+pub(in crate::candidate_cli) const INPUT_RETENTION_HELP: &str = "Input retention is separate consent: start with --spool-input --max-retained-input-mib N to save exact private envelopes in the protected job. Creation stages one envelope at a time under the job lock, validates the complete typed population, then authenticates and seals the spool before publishing its journal receipt or running inference. Interrupted creation may leave private uncommitted input bytes. Resume with --use-retained-input --max-retained-input-mib N and omit the population positional argument; the original population file/stdin is not opened. The explicit disk cap includes framing and does not enlarge logical population limits or lifetime work. Original model, task, limits and key are still required. Retained replay authenticates the complete typed population and fresh recipe under one exclusive lock before repair or inference, then reads pending records through one reusable buffer. Creation and replay admission include strict parser workspace and the bounded keyed item index; large per-record ceilings can still require substantial memory. Missing/corrupt/uncommitted input bytes never fall back to an external source. Omit both flags to keep supplying the complete original population on every invocation.";
 
 #[derive(Args)]
 pub(crate) struct JobCommand {
@@ -87,11 +87,12 @@ impl RunMode {
 }
 
 /// Input retention is independent consent from result retention. The byte cap
-/// covers the framed on-disk population. Retained replay admits one original
-/// envelope at a time while keeping the full immutable descriptor inventory.
+/// covers the framed on-disk population. Retained creation and replay admit one
+/// original envelope at a time while keeping the full immutable descriptor inventory.
 #[derive(Args, Clone, Copy, Debug, Default)]
 pub(in crate::candidate_cli) struct InputRetentionArgs {
-    /// Start only: retain exact private input envelopes in the protected job.
+    /// Start only: stream exact private envelopes into the protected job, then
+    /// authenticate the complete population before inference.
     #[arg(long, conflicts_with = "use_retained_input", requires = "max_retained_input_mib")]
     pub spool_input: bool,
     /// Resume only: restore authenticated retained inputs; do not read a population file or stdin.
@@ -103,10 +104,11 @@ pub(in crate::candidate_cli) struct InputRetentionArgs {
 }
 impl InputRetentionArgs {
     /// Derive the physical input owner only after validating explicit consent
-    /// and the spool byte cap. Spooling on start still owns a full population.
+    /// and the spool byte cap. Retained creation and replay keep record-sized
+    /// raw input storage; the complete immutable descriptor index remains.
     pub(in crate::candidate_cli) fn input_memory(self) -> Result<crate::jobs::JobInputMemory, Failure> {
         self.limits()?;
-        Ok(if self.use_retained_input { crate::jobs::JobInputMemory::RetainedRecord }
+        Ok(if self.spool_input || self.use_retained_input { crate::jobs::JobInputMemory::RetainedRecord }
             else { crate::jobs::JobInputMemory::CompletePopulation })
     }
 

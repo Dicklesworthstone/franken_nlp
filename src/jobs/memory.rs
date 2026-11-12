@@ -11,8 +11,9 @@ pub(super) const INPUT_JSON_DEPTH: usize = 64;
 pub enum JobInputMemory {
     /// Original NDJSON is retained in memory for the whole invocation.
     CompletePopulation,
-    /// A fully authenticated retained spool lends one record at a time.
-    /// The complete bounded keyed manifest index remains resident.
+    /// Explicit retained creation reads and seals one original record at a
+    /// time; authenticated replay then lends one retained record at a time.
+    /// The complete bounded keyed manifest index remains resident in both.
     RetainedRecord,
 }
 impl JobInputMemory {
@@ -72,7 +73,7 @@ mod tests {
     use crate::jobs::tests::limits;
 
     #[test]
-    fn streamed_replay_removes_only_the_complete_payload_reservation() {
+    fn streamed_retained_input_removes_only_the_complete_payload_reservation() {
         let job = limits();
         let complete = JobInputMemory::CompletePopulation.buffer_bytes(job).unwrap();
         let streamed = JobInputMemory::RetainedRecord.buffer_bytes(job).unwrap();

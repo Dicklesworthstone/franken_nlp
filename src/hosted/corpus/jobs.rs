@@ -17,14 +17,16 @@ use crate::{
     tasks::source_planning::SourceTaskPlanner,
     native_engine::decode::DecodeStepControl,
 };
+use std::cell::Cell;
 
 /// Retry is an explicit new invocation; no automatic reopen or work refund.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JobOpenMode {
     Create,
     Resume(TailPolicy),
-    /// Save exact input envelopes in the protected job directory. This is a
-    /// separate explicit grant to retain private source bytes, with a disk cap.
+    /// Stream exact input envelopes into the protected job directory, then
+    /// authenticate the complete snapshot before executing its first item.
+    /// This separately grants private-source retention under its own disk cap.
     CreateRetainingInputs(InputRetentionLimits),
     /// Resume from an authenticated retained population without reading the
     /// supplied reader. The current read ceiling may tighten the original cap.
@@ -35,9 +37,8 @@ impl JobOpenMode {
     /// the memory quote, never the stored contract or lifetime work limits.
     pub fn input_memory(self) -> JobInputMemory {
         match self {
-            Self::ResumeRetained { .. } => JobInputMemory::RetainedRecord,
-            Self::Create | Self::Resume(_) | Self::CreateRetainingInputs(_) =>
-                JobInputMemory::CompletePopulation,
+            Self::CreateRetainingInputs(_) | Self::ResumeRetained { .. } => JobInputMemory::RetainedRecord,
+            Self::Create | Self::Resume(_) => JobInputMemory::CompletePopulation,
         }
     }
 }
@@ -86,9 +87,9 @@ impl JobHostLimits {
     fn reservation_bytes(self, job: JobLimits) -> Result<u64, HostedJobError> {
         self.required_buffer_bytes_for_input(job, JobInputMemory::CompletePopulation)
     }
-    /// Price the actual input owner. Retained replay keeps the keyed manifest
-    /// index and one reusable record; original input ingestion keeps the full
-    /// population. Native entrypoints derive this from `request.mode`.
+    /// Price the actual input owner. Explicit retained creation and replay
+    /// keep the keyed manifest index and one record; ordinary original-input
+    /// create/resume keep the full population. Entrypoints use `request.mode`.
     pub fn required_buffer_bytes_for_input(self, job: JobLimits, input: JobInputMemory)
         -> Result<u64, HostedJobError> {
         self.native.run.validate()?; self.transport.validate()?; job.validate()?;
@@ -133,10 +134,11 @@ impl NlpEngine {
     /// same resident model is used for every
     /// item. The caller supplies no admission implementation or native driver.
     ///
-    /// Entire-snapshot ingestion precedes engine construction and job storage.
-    /// Existing per-item identity/admission checks and all lifetime work debits
-    /// remain mandatory. No stdin/stdout globals, loader, runtime, worker team,
-    /// automatic retry, hidden input spool or inference network is introduced.
+    /// Complete input validation precedes native preparation and execution.
+    /// Explicit retained creation stages one original record at a time under
+    /// the admitted native/input owners before acknowledging the snapshot.
+    /// Per-item identity/admission checks and all lifetime work debits remain
+    /// mandatory throughout the existing process-owned invocation.
     #[allow(clippy::too_many_arguments)]
     pub fn job_int8_source<R>(&self, model: &ResidentInt8, planner: Arc<SourceTaskPlanner>,
         vocabulary: Arc<ExtractionVocabulary>, config: SourceCorpusConfig,
@@ -196,43 +198,65 @@ impl NlpEngine {
     }
 }
 
-/// Read original input only when the selected job mode requires it. Retained
-/// replay is deferred to the runner so its authenticated read, recipe check
-/// and recovery share the same exclusive job lock. No empty population or
-/// caller-supplied stream can substitute for journal-authorized input bytes.
-pub(in crate::hosted) fn read_population<R: BufRead, C: DecodeStepControl>(reader: &mut R,
+/// Original-input jobs retain the complete population. Explicit retained
+/// creation transfers a one-shot reader to the runner, where the processor's
+/// typed argument contract can validate each original record before freezing.
+/// This owner remains inside the blocking invocation and drops before the
+/// charged input that supplies its reader.
+pub(in crate::hosted) enum Population<'reader> {
+    Original(JobPopulation),
+    Retaining { reader: Cell<Option<&'reader mut dyn BufRead>>, transport: PopulationReadLimits },
+    Retained,
+}
+
+/// Retained modes defer to the runner so complete input authentication, recipe
+/// validation and storage initialization/recovery share the exclusive job lock.
+/// No supplied stream can substitute for journal-authorized replay bytes.
+pub(in crate::hosted) fn read_population<'reader, R: BufRead, C: DecodeStepControl>(reader: &'reader mut R,
     request: &SourceJobRequest, transport: PopulationReadLimits, control: &mut C)
-    -> Result<Option<JobPopulation>, JobError> {
+    -> Result<Population<'reader>, JobError> {
     match request.mode {
         JobOpenMode::ResumeRetained { retention, .. } => {
             crate::jobs::checkpoint(control)?;
             retention.validate()?;
-            return Ok(None);
+            return Ok(Population::Retained);
         }
-        JobOpenMode::CreateRetainingInputs(retention) => retention.validate()?,
+        JobOpenMode::CreateRetainingInputs(retention) => {
+            crate::jobs::checkpoint(control)?;
+            retention.validate()?; request.limits.validate()?; transport.validate()?;
+            return Ok(Population::Retaining { reader: Cell::new(Some(reader)), transport });
+        }
         JobOpenMode::Create | JobOpenMode::Resume(_) => (),
     }
     JobPopulation::read_ndjson(reader, &request.key, request.job_id, request.limits,
-        transport, control).map(Some)
+        transport, control).map(Population::Original)
 }
 
 // Shared ordered job lifecycle, not a public fake-native injection surface.
 // Production uses sealed source/extraction/scored processors + process admission.
 pub(in crate::hosted) fn run_population<P: DurableBatchProcessor, C: DecodeStepControl>(request: SourceJobRequest,
-    population: &Option<JobPopulation>, processor: P, control: &mut C) -> Result<JobProgress, JobRunError> {
+    population: &Population<'_>, processor: P, control: &mut C) -> Result<JobProgress, JobRunError> {
     let SourceJobRequest { root, key, job_id, limits, mode, materialize } = request;
-    let inputs = population.as_ref().map(JobPopulation::borrowed_inputs).transpose()?;
+    let inputs = match population {
+        Population::Original(original) => Some(original.borrowed_inputs()?),
+        Population::Retaining { .. } | Population::Retained => None,
+    };
     let supplied = || inputs.as_deref().ok_or(JobError::InvalidLimits);
-    let mut runner = match mode {
-        JobOpenMode::Create => JobRunner::create(&root, key, job_id, limits, supplied()?, processor, control)?,
-        JobOpenMode::Resume(tail) => JobRunner::resume(&root, key, job_id, limits, supplied()?, processor, tail, control)?,
-        JobOpenMode::CreateRetainingInputs(retention) => JobRunner::create_with_retained_inputs(
-            &root, key, job_id, limits, retention, supplied()?, processor, control)?,
-        JobOpenMode::ResumeRetained { tail, retention } => {
-            if inputs.is_some() { return Err(JobError::InvalidLimits.into()); }
+    let mut runner = match (mode, population) {
+        (JobOpenMode::Create, Population::Original(_)) =>
+            JobRunner::create(&root, key, job_id, limits, supplied()?, processor, control)?,
+        (JobOpenMode::Resume(tail), Population::Original(_)) =>
+            JobRunner::resume(&root, key, job_id, limits, supplied()?, processor, tail, control)?,
+        (JobOpenMode::CreateRetainingInputs(retention), Population::Retaining { reader, transport }) => {
+            let reader = reader.take().ok_or(JobError::InvalidLimits)?;
+            JobRunner::create_with_retained_ndjson(&root, key, job_id, limits, retention,
+                reader, *transport, processor, control)?
+        }
+        (JobOpenMode::ResumeRetained { tail, retention }, Population::Retained) => {
             JobRunner::resume_with_retained_inputs(&root, key, job_id, limits, retention,
                 processor, tail, control)?
         }
+        _ => return Err(JobError::InvalidLimits.into()),
     };
     let progress = runner.run(control)?;
     if materialize { runner.materialize_ordered(control) } else { Ok(progress) }

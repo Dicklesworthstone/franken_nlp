@@ -26,22 +26,23 @@ fn whole_population_is_priced_not_only_a_live_batch_window() {
     }
 }
 #[test]
-fn actual_open_mode_selects_record_memory_only_for_retained_resume() {
+fn actual_open_mode_selects_record_memory_for_retained_creation_and_resume() {
     let retention = InputRetentionLimits { max_spool_bytes: 1 << 20 };
     let cap = job_limits(); let host = host_limits();
     let complete = host.required_buffer_bytes(cap).unwrap();
-    for mode in [JobOpenMode::Create, JobOpenMode::Resume(TailPolicy::Refuse),
-        JobOpenMode::CreateRetainingInputs(retention)] {
+    for mode in [JobOpenMode::Create, JobOpenMode::Resume(TailPolicy::Refuse)] {
         assert_eq!(mode.input_memory(), JobInputMemory::CompletePopulation);
         assert_eq!(host.required_buffer_bytes_for_input(cap, mode.input_memory()).unwrap(), complete);
     }
-    let mode = JobOpenMode::ResumeRetained { tail: TailPolicy::DiscardUncommitted, retention };
-    assert_eq!(mode.input_memory(), JobInputMemory::RetainedRecord);
-    let replay = host.required_buffer_bytes_for_input(cap, mode.input_memory()).unwrap();
-    assert_eq!(complete - replay, 2 * cap.max_snapshot_bytes);
-    assert_eq!(replay, JobInputMemory::RetainedRecord.buffer_bytes(cap).unwrap()
-        + host.preparation_reserve_bytes + host.io_reserve_bytes
-        + host.journal_reserve_bytes + host.serialization_reserve_bytes);
+    for mode in [JobOpenMode::CreateRetainingInputs(retention),
+        JobOpenMode::ResumeRetained { tail: TailPolicy::DiscardUncommitted, retention }] {
+        assert_eq!(mode.input_memory(), JobInputMemory::RetainedRecord);
+        let record = host.required_buffer_bytes_for_input(cap, mode.input_memory()).unwrap();
+        assert_eq!(complete - record, 2 * cap.max_snapshot_bytes);
+        assert_eq!(record, JobInputMemory::RetainedRecord.buffer_bytes(cap).unwrap()
+            + host.preparation_reserve_bytes + host.io_reserve_bytes
+            + host.journal_reserve_bytes + host.serialization_reserve_bytes);
+    }
 }
 #[test]
 fn retained_quote_keeps_parser_and_host_reserves_when_snapshot_ceiling_is_large() {
@@ -108,10 +109,12 @@ impl Drop for Root { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
 fn request(root: &Root, mode: JobOpenMode, materialize: bool) -> SourceJobRequest {
     SourceJobRequest { root: root.0.clone(), key: key(), job_id: JobId([7;16]), limits: job_limits(), mode, materialize }
 }
-fn population(changed: bool) -> Option<JobPopulation> {
+fn source(changed: bool) -> String {
     let text = if changed { "changed" } else { "original" };
-    let source = format!("{{\"id\":\"alpha\",\"text\":\"{text}\"}}\n{{\"id\":\"beta\",\"text\":\"original\"}}\n");
-    Some(JobPopulation::read_ndjson(&mut Cursor::new(source), &key(), JobId([7;16]), job_limits(),
+    format!("{{\"id\":\"alpha\",\"text\":\"{text}\"}}\n{{\"id\":\"beta\",\"text\":\"original\"}}\n")
+}
+fn population(changed: bool) -> Population<'static> {
+    Population::Original(JobPopulation::read_ndjson(&mut Cursor::new(source(changed)), &key(), JobId([7;16]), job_limits(),
         host_limits().transport, &mut Control::default()).unwrap())
 }
 struct Fixture { identity: ExecutionIdentity, calls: Arc<Mutex<Vec<u64>>>, fail_second: bool }
@@ -190,16 +193,26 @@ fn retained_resume_owns_the_population_and_keeps_failed_attempt_debits() {
     let root = Root::new(); let calls = Arc::new(Mutex::new(Vec::new()));
     let retention = InputRetentionLimits { max_spool_bytes: 1 << 20 };
     let mut control = Control::default();
-    let original = population(false);
-    let failure = run_population(request(&root, JobOpenMode::CreateRetainingInputs(retention), true),
+    let mut reader = Cursor::new(source(false));
+    let create = request(&root, JobOpenMode::CreateRetainingInputs(retention), true);
+    let original = read_population(&mut reader, &create, host_limits().transport, &mut control).unwrap();
+    assert!(matches!(&original, Population::Retaining { .. }));
+    assert_eq!(fs::read_dir(&root.0).unwrap().count(), 0);
+    let failure = run_population(create,
         &original, Fixture::new(&calls, true), &mut control).unwrap_err();
     assert_eq!(failure, JobRunError::Processor(BatchCode::Execution.into()));
     assert!(root.0.join("inputs.spool").exists());
     assert!(!root.0.join("materialized.ndjson").exists());
+    // The deferred source is transferred once, even when execution fails.
+    // An explicit new invocation must select an authenticated resume mode.
+    assert_eq!(run_population(request(&root, JobOpenMode::CreateRetainingInputs(retention), false),
+        &original, Fixture::new(&calls, false), &mut control).unwrap_err(),
+        JobRunError::Storage(JobError::InvalidLimits));
     drop(original);
+    drop(reader);
     let progress = run_population(request(&root,
         JobOpenMode::ResumeRetained { tail: TailPolicy::Refuse, retention }, true),
-        &None, Fixture::new(&calls, false), &mut control).unwrap();
+        &Population::Retained, Fixture::new(&calls, false), &mut control).unwrap();
     assert_eq!(progress.committed, 2); assert_eq!(progress.attempts, 3);
     assert!(progress.materialized);
     assert_eq!(*calls.lock().unwrap(), vec![1, 2, 2]);
@@ -207,7 +220,7 @@ fn retained_resume_owns_the_population_and_keeps_failed_attempt_debits() {
 }
 
 #[test]
-fn retained_mode_does_not_touch_the_supplied_reader() {
+fn retained_mode_selection_defers_reader_io_until_the_runner() {
     struct Unreadable;
     impl std::io::Read for Unreadable {
         fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> { panic!("original input read") }
@@ -219,8 +232,11 @@ fn retained_mode_does_not_touch_the_supplied_reader() {
     let root = Root::new();
     let mode = JobOpenMode::ResumeRetained { tail: TailPolicy::Refuse,
         retention: InputRetentionLimits { max_spool_bytes: 1 << 20 } };
-    assert!(read_population(&mut Unreadable, &request(&root, mode, false),
-        host_limits().transport, &mut Control::default()).unwrap().is_none());
+    assert!(matches!(read_population(&mut Unreadable, &request(&root, mode, false),
+        host_limits().transport, &mut Control::default()).unwrap(), Population::Retained));
+    let create = JobOpenMode::CreateRetainingInputs(InputRetentionLimits { max_spool_bytes: 1 << 20 });
+    assert!(matches!(read_population(&mut Unreadable, &request(&root, create, false),
+        host_limits().transport, &mut Control::default()).unwrap(), Population::Retaining { .. }));
     let invalid = JobOpenMode::ResumeRetained { tail: TailPolicy::Refuse,
         retention: InputRetentionLimits { max_spool_bytes: 0 } };
     assert!(read_population(&mut Unreadable, &request(&root, invalid, false),
@@ -235,14 +251,28 @@ fn input_selection_cannot_silently_change_authority() {
     let mut control = Control::default();
     for mode in [JobOpenMode::Create, JobOpenMode::Resume(TailPolicy::Refuse),
         JobOpenMode::CreateRetainingInputs(retention)] {
-        let error = run_population(request(&root, mode, false), &None,
+        let error = run_population(request(&root, mode, false), &Population::Retained,
             Fixture::new(&calls, false), &mut control).unwrap_err();
         assert_eq!(error, JobRunError::Storage(JobError::InvalidLimits));
     }
-    let error = run_population(request(&root,
-        JobOpenMode::ResumeRetained { tail: TailPolicy::Refuse, retention }, false),
-        &population(false), Fixture::new(&calls, false), &mut control).unwrap_err();
-    assert_eq!(error, JobRunError::Storage(JobError::InvalidLimits));
+    for mode in [JobOpenMode::CreateRetainingInputs(retention),
+        JobOpenMode::ResumeRetained { tail: TailPolicy::Refuse, retention }] {
+        let error = run_population(request(&root, mode, false), &population(false),
+            Fixture::new(&calls, false), &mut control).unwrap_err();
+        assert_eq!(error, JobRunError::Storage(JobError::InvalidLimits));
+    }
+    let mut reader = Cursor::new(source(false));
+    let deferred = read_population(&mut reader,
+        &request(&root, JobOpenMode::CreateRetainingInputs(retention), false),
+        host_limits().transport, &mut control).unwrap();
+    for mode in [JobOpenMode::Create, JobOpenMode::Resume(TailPolicy::Refuse),
+        JobOpenMode::ResumeRetained { tail: TailPolicy::Refuse, retention }] {
+        let error = run_population(request(&root, mode, false), &deferred,
+            Fixture::new(&calls, false), &mut control).unwrap_err();
+        assert_eq!(error, JobRunError::Storage(JobError::InvalidLimits));
+    }
+    drop(deferred); assert_eq!(reader.position(), 0);
+    assert_eq!(fs::read_dir(&root.0).unwrap().count(), 0);
     assert!(calls.lock().unwrap().is_empty());
 }
 
@@ -255,7 +285,7 @@ fn ordinary_creation_never_authorizes_retained_replay() {
     assert!(!root.0.join("inputs.spool").exists());
     let mode = JobOpenMode::ResumeRetained { tail: TailPolicy::DiscardUncommitted,
         retention: InputRetentionLimits { max_spool_bytes: 1 << 20 } };
-    assert!(run_population(request(&root, mode, true), &None,
+    assert!(run_population(request(&root, mode, true), &Population::Retained,
         Fixture::new(&calls, false), &mut control).is_err());
     assert_eq!(*calls.lock().unwrap(), vec![1, 2]);
     assert!(!root.0.join("materialized.ndjson").exists());
