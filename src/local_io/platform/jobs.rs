@@ -59,8 +59,10 @@ impl JobFiles {
         check_parent(&self.parent)?; self.parent.sync_all().map_err(|_| JobError::Io)
     }
     /// Explicit input-retention opt-in, under this job's existing lock. The
-    /// caller must price and bound the complete framed snapshot BEFORE opening
-    /// this file. An orphan from failed initialization is never overwritten.
+    /// caller admits a finite complete-file cap BEFORE opening this file and
+    /// checks every framed append against it. Streaming creation need not know
+    /// the actual final size yet. Orphan input from failed initialization is
+    /// never overwritten.
     /// No receipt may be journaled until `sync_inputs` succeeds.
     pub fn create_inputs(&self, max: u64) -> Result<File, JobError> {
         input_limit(max)?;

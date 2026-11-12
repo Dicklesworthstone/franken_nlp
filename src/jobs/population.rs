@@ -1,8 +1,9 @@
 //! Bounded NDJSON ingestion for an immutable, complete owned-job population.
-//! This retains private input in memory only; it opens no job files and runs
-//! no planner/model. Hosts must admit the population and parser allocations
-//! before calling it. Large populations fail closed instead of using the live
-//! batch runner's weaker epoch-local duplicate window.
+//! The legacy population retains private envelopes in memory. The internal
+//! record reader also supports bounded retained-input creation without keeping
+//! earlier payloads. Neither parser opens job files or runs a model. Complete
+//! keyed uniqueness belongs to the collecting population or manifest builder,
+//! never the live batch runner's weaker epoch-local duplicate window.
 use super::{FrozenManifest, JobContract, JobError, JobId, JobInput, JobLimits, JobSecret, checkpoint};
 use crate::{batch::BatchDocument, canonjson, native_engine::decode::DecodeStepControl};
 use serde::Serialize;
@@ -33,12 +34,72 @@ pub struct PopulationStats {
     /// Original and normalized borrow ONE retained record in this profile.
     pub snapshot_bytes: u64,
 }
-struct Envelope { id: String, bytes: Vec<u8> }
+pub(super) struct PopulationRecord { id: String, bytes: Vec<u8> }
+impl PopulationRecord {
+    pub(super) fn input(&self) -> JobInput<'_> {
+        JobInput { id: &self.id, original: &self.bytes, normalized: &self.bytes }
+    }
+}
+
+/// One exact envelope at a time, with the same transport and logical snapshot
+/// ceilings as JobPopulation. The consumer must bind every returned record to
+/// one ManifestBuilder (or another complete keyed uniqueness index) before
+/// accepting the population. A prefix is never complete until next_record
+/// returns None. No plaintext record is retained inside this reader.
+pub(super) struct PopulationReader<R> {
+    reader: R,
+    limits: JobLimits,
+    transport: PopulationReadLimits,
+    stats: PopulationStats,
+    finished: bool,
+    failed: bool,
+}
+impl<R: BufRead> PopulationReader<R> {
+    pub(super) fn new<C: DecodeStepControl>(reader: R, limits: JobLimits,
+        transport: PopulationReadLimits, control: &mut C) -> Result<Self, JobError> {
+        checkpoint(control)?; limits.validate()?; transport.validate()?;
+        Ok(Self { reader, limits, transport, stats: PopulationStats::default(),
+            finished: false, failed: false })
+    }
+    pub(super) fn stats(&self) -> PopulationStats { self.stats }
+    pub(super) fn next_record<C: DecodeStepControl>(&mut self, control: &mut C)
+        -> Result<Option<PopulationRecord>, JobError> {
+        if self.failed { return Err(JobError::Poisoned); }
+        self.failed = true;
+        let result = self.read_next(control);
+        if result.is_ok() { self.failed = false; }
+        result
+    }
+    fn read_next<C: DecodeStepControl>(&mut self, control: &mut C)
+        -> Result<Option<PopulationRecord>, JobError> {
+        checkpoint(control)?;
+        if self.finished { return Ok(None); }
+        while let Some(bytes) = read_record(&mut self.reader, &mut self.stats,
+            self.limits.max_input_bytes_per_item, self.transport, control)? {
+            checkpoint(control)?;
+            if bytes.is_empty() { continue; }
+            if self.stats.items >= self.limits.max_items { return Err(JobError::Limit); }
+            let id = envelope_id(&bytes, self.limits)?;
+            let snapshot = self.stats.snapshot_bytes.checked_add(id.len() as u64)
+                .and_then(|n| n.checked_add(bytes.len() as u64))
+                .and_then(|n| n.checked_add(bytes.len() as u64))
+                .filter(|&n| n <= self.limits.max_snapshot_bytes).ok_or(JobError::Limit)?;
+            self.stats.items += 1;
+            self.stats.snapshot_bytes = snapshot;
+            return Ok(Some(PopulationRecord { id, bytes }));
+        }
+        if self.stats.items == 0 { return Err(JobError::InvalidInput); }
+        if self.stats.items > self.limits.max_attempts { return Err(JobError::InvalidLimits); }
+        checkpoint(control)?;
+        self.finished = true;
+        Ok(None)
+    }
+}
 
 /// No Debug/Clone/Deserialize or mutable content access. Task arguments remain
 /// inside the exact original envelope, not a reserialized serde Value. The
 /// complete native recipe and typed arguments are still verified by JobRunner.
-pub struct JobPopulation { items: Vec<Envelope>, stats: PopulationStats }
+pub struct JobPopulation { items: Vec<PopulationRecord>, stats: PopulationStats }
 impl JobPopulation {
     /// Consume a finite NDJSON stream before any durable execution. Only empty
     /// LF/CRLF records are ignored; whitespace-only input and flush controls
@@ -51,34 +112,21 @@ impl JobPopulation {
     pub fn read_ndjson<R: BufRead, C: DecodeStepControl>(reader: &mut R, key: &JobSecret,
         job: JobId, limits: JobLimits, transport: PopulationReadLimits, control: &mut C)
         -> Result<Self, JobError> {
-        checkpoint(control)?; limits.validate()?; transport.validate()?;
-        let mut result = Self { items: Vec::new(), stats: PopulationStats::default() };
+        let mut reader = PopulationReader::new(reader, limits, transport, control)?;
+        let mut items = Vec::new();
         let mut ids = BTreeSet::new();
-        while let Some(bytes) = read_record(reader, &mut result.stats, limits.max_input_bytes_per_item, transport, control)? {
-            checkpoint(control)?;
-            if bytes.is_empty() { continue; }
-            if result.stats.items >= limits.max_items { return Err(JobError::Limit); }
-            let id = envelope_id(&bytes, limits)?;
-            let snapshot = result.stats.snapshot_bytes.checked_add(id.len() as u64)
-                .and_then(|n| n.checked_add(bytes.len() as u64))
-                .and_then(|n| n.checked_add(bytes.len() as u64))
-                .filter(|&n| n <= limits.max_snapshot_bytes).ok_or(JobError::Limit)?;
+        while let Some(record) = reader.next_record(control)? {
             // The transient uniqueness index contains no extra plaintext IDs.
-            let commitment = key.commit(b"population-reader-id", &[&job.0, id.as_bytes()]);
+            let commitment = key.commit(b"population-reader-id", &[&job.0, record.id.as_bytes()]);
             if !ids.insert(commitment.0) { return Err(JobError::DuplicateId); }
-            result.items.try_reserve(1).map_err(|_| JobError::Allocation)?;
-            result.items.push(Envelope { id, bytes });
-            result.stats.items += 1;
-            result.stats.snapshot_bytes = snapshot;
+            items.try_reserve(1).map_err(|_| JobError::Allocation)?;
+            items.push(record);
         }
-        if result.items.is_empty() { return Err(JobError::InvalidInput); }
-        if result.stats.items > limits.max_attempts { return Err(JobError::InvalidLimits); }
-        checkpoint(control)?;
-        Ok(result)
+        Ok(Self { items, stats: reader.stats() })
     }
     pub fn stats(&self) -> PopulationStats { self.stats }
     pub fn inputs(&self) -> impl ExactSizeIterator<Item = JobInput<'_>> + '_ {
-        self.items.iter().map(|item| JobInput { id: &item.id, original: &item.bytes, normalized: &item.bytes })
+        self.items.iter().map(PopulationRecord::input)
     }
     /// Bounded borrow-only index for JobRunner. It owns no copy of input text.
     /// Keep this population alive until the runner (and its index) are dropped.

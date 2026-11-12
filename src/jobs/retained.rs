@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Seek, SeekFrom, Write};
 
 pub(super) const HEADER_BYTES: usize = 56;
-const MAGIC: &[u8; 8] = b"FNLPINP1";
+pub(super) const MAGIC: &[u8; 8] = b"FNLPINP1";
 
 /// Explicit consent and byte ceiling for private input retention. This does
 /// not change JobLimits, the native recipe, or their existing commitments.
@@ -92,15 +92,15 @@ pub(super) fn preflight<C: DecodeStepControl>(key: &JobSecret, manifest: &Frozen
     Ok(length)
 }
 
-fn start(key: &JobSecret, binding: &Binding, cap: u64) -> Commitment {
+pub(super) fn start(key: &JobSecret, binding: &Binding, cap: u64) -> Commitment {
     key.commit(b"retained-input-start-v1", &[&binding.job.0, &binding.population.0,
         &binding.execution.0, &binding.recipe.0, &binding.limits.0, &cap.to_le_bytes()])
 }
-fn next(key: &JobSecret, prior: Commitment, ordinal: u64, offset: u64, bytes: &[u8]) -> Commitment {
+pub(super) fn next(key: &JobSecret, prior: Commitment, ordinal: u64, offset: u64, bytes: &[u8]) -> Commitment {
     key.commit(b"retained-input-next-v1", &[&prior.0, &ordinal.to_le_bytes(),
         &offset.to_le_bytes(), bytes])
 }
-fn finish(key: &JobSecret, prior: Commitment, items: u64, length: u64) -> Commitment {
+pub(super) fn finish(key: &JobSecret, prior: Commitment, items: u64, length: u64) -> Commitment {
     key.commit(b"retained-input-end-v1", &[&prior.0, &items.to_le_bytes(), &length.to_le_bytes()])
 }
 

@@ -99,6 +99,16 @@ impl OwnedJob {
             checkpoint(control)?;
             Some(receipt)
         } else { None };
+        let header = Self::initialize(&journal, &files, &key, &manifest, retained_inputs, control, fail_at)?;
+        Ok(Self { journal, files, key, manifest, header, poisoned: false, #[cfg(test)] fail_at: None })
+    }
+    /// Borrow the storage owners while publishing the first authority. A
+    /// streaming initializer may also hold a verified input cursor, which must
+    /// close before these files release the exclusive lock on any failure.
+    fn initialize<C: DecodeStepControl>(journal: &Journal, files: &JobFiles,
+        key: &JobSecret, manifest: &FrozenManifest, retained_inputs: Option<InputReceipt>,
+        control: &mut C, fail_at: Option<CreateFault>) -> Result<Header, JobError> {
+        let limits = manifest.limits;
         let header = Header { schema_version: 1, binding: manifest.binding.clone(), items: manifest.item_count(),
             committed: 0, attempts: 0, used: JobWork::default(), spool_end: 0, materialized: false, retained_inputs };
         journal.transaction(|journal| {
@@ -107,13 +117,13 @@ impl OwnedJob {
                 checkpoint(control)?;
                 let row = Item { binding: binding.clone(), stage: Stage::Pending, attempts: 0,
                     used: JobWork::default(), pointer: None };
-                journal.write(Table::Item, binding.ordinal, &key, &row, true)?;
+                journal.write(Table::Item, binding.ordinal, key, &row, true)?;
             }
-            journal.write(Table::Header, 0, &key, &header, true)
+            journal.write(Table::Header, 0, key, &header, true)
         })?;
         files.check_database(limits.max_journal_bytes)?; files.sync_database()?;
         create_fault(fail_at, CreateFault::HeaderCommitted)?;
-        Ok(Self { journal, files, key, manifest, header, poisoned: false, #[cfg(test)] fail_at: None })
+        Ok(header)
     }
 
     /// Recompute `manifest` from the complete original population first. Key,
@@ -336,4 +346,5 @@ fn create_fault(fail_at: Option<CreateFault>, point: CreateFault) -> Result<(), 
 // the same exclusive session, poisoned-error policy, and cancellation control.
 mod materialize;
 mod retained_inputs;
+mod streaming_inputs;
 #[cfg(test)] mod tests;

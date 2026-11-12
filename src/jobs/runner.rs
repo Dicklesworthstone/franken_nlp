@@ -5,11 +5,11 @@
 //! No task failures are cached as successful results and no retry is implicit.
 use super::{FrozenManifest, InputRetentionLimits, JobContract, JobError, JobId, JobInput, JobLimits, JobProgress,
     JobSecret, JobWork, OwnedJob, TailPolicy, checkpoint,
-    manifest::ManifestBuilder, retained::RetainedInputCursor};
+    manifest::ManifestBuilder, population::PopulationReadLimits, retained::RetainedInputCursor};
 use crate::{batch::{BatchDocument, BatchFault, BatchItemFailure, BatchProcessor, BatchRequestContext},
     canonjson, execution_identity::ExecutionIdentity, native_engine::decode::DecodeStepControl};
 use serde::Serialize;
-use std::{error::Error, fmt, fs::File, path::Path};
+use std::{error::Error, fmt, fs::File, io::BufRead, path::Path};
 
 pub mod source;
 pub mod extract;
@@ -113,6 +113,31 @@ impl<'items, 'bytes, P: DurableBatchProcessor> JobRunner<'items, 'bytes, P> {
         let manifest = freeze(&key, job_id, limits, inputs, &processor, control)?;
         let job = OwnedJob::create_with_retained_inputs(root, key, manifest, retention, inputs, control)?;
         Ok(Self { job, processor, inputs: Inputs::Borrowed(inputs), limits, stopped: false })
+    }
+
+    /// Explicitly retain an exact NDJSON population without keeping its raw
+    /// records resident. Each original envelope is bounded, typed and frozen
+    /// before the complete retained snapshot is authenticated and acknowledged.
+    /// Preparation and execution begin only after that complete validation.
+    /// The runner owns one authenticated replay record plus the bounded keyed
+    /// manifest index; hosts must admit both before entering this constructor.
+    /// An interruption before the initial journal receipt may leave orphan
+    /// input bytes; these are never adopted or silently overwritten.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_retained_ndjson<R: BufRead, C: DecodeStepControl>(root: &Path,
+        key: JobSecret, job_id: JobId, limits: JobLimits, retention: InputRetentionLimits,
+        reader: R, transport: PopulationReadLimits, processor: P, control: &mut C)
+        -> Result<Self, JobRunError> {
+        checkpoint(control)?;
+        retention.validate()?;
+        transport.validate()?;
+        let fresh = manifest_builder(&key, job_id, limits, &processor, control)?;
+        let (job, cursor) = OwnedJob::create_with_retained_ndjson(root, key, limits, retention,
+            reader, transport, fresh, control, |input, _| -> Result<(), JobRunError> {
+                drop(parse::<P>(input, limits)?);
+                Ok(())
+            })?;
+        Ok(Self { job, processor, inputs: Inputs::Retained(cursor), limits, stopped: false })
     }
 
     /// Requires the entire original population and a newly constructed clean

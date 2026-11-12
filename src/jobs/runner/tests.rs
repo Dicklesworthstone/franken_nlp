@@ -1,4 +1,6 @@
 //! Storage/runner fixtures, not native-model accuracy or crash qualification.
+mod streaming;
+
 use super::*;
 use crate::{batch::{BatchCode, BatchWork}, jobs::{MismatchField, tests::{identity, key, limits, work, Control}},
     native_engine::decode::DecodeCancellationKind};

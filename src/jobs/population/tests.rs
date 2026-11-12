@@ -119,3 +119,100 @@ fn transport_limits_must_be_finite_and_nonzero() {
         assert_eq!(cap.validate(), Err(JobError::InvalidLimits));
     }
 }
+
+#[test]
+fn streamed_records_freeze_the_same_exact_population_without_borrowing_payloads() {
+    let bytes = stream();
+    let population = read(&bytes).unwrap();
+    let expected = population.freeze(&key(), JobContract { job_id: JobId([7;16]),
+        execution: &identity(), recipe: &"streaming-fixture", limits: limits() },
+        &mut Control::default()).unwrap();
+    for capacity in [1, 2, 7, 8192] {
+        let source = BufReader::with_capacity(capacity, Cursor::new(&bytes));
+        let mut reader = PopulationReader::new(source, limits(), transport(), &mut Control::default()).unwrap();
+        let mut builder = crate::jobs::manifest::ManifestBuilder::new(&key(), JobContract {
+            job_id: JobId([7;16]), execution: &identity(), recipe: &"streaming-fixture", limits: limits(),
+        }, &mut Control::default()).unwrap();
+        while let Some(record) = reader.next_record(&mut Control::default()).unwrap() {
+            let input = record.input();
+            assert!(std::ptr::eq(input.original.as_ptr(), input.normalized.as_ptr()));
+            builder.push(&key(), &input, &mut Control::default()).unwrap();
+            // Each owned record is dropped here; only keyed bindings survive.
+        }
+        let actual = builder.finish(&key()).unwrap();
+        assert_eq!(reader.stats(), population.stats());
+        assert_eq!(actual.binding.compare(&expected.binding), Ok(()));
+        assert_eq!(actual.item_count(), 2);
+    }
+}
+
+#[test]
+fn streaming_reader_consumes_only_one_record_and_never_reuses_a_failed_prefix() {
+    let bytes = [A, b"\n", B, b"\n{"].concat();
+    let mut reader = PopulationReader::new(Cursor::new(&bytes), limits(), transport(), &mut Control::default()).unwrap();
+    let first = reader.next_record(&mut Control::default()).unwrap().unwrap();
+    assert_eq!(first.input().original, A);
+    assert_eq!(reader.reader.position(), A.len() as u64 + 1);
+    drop(first);
+    let second = reader.next_record(&mut Control::default()).unwrap().unwrap();
+    assert_eq!(second.input().original, B);
+    assert_eq!(reader.reader.position(), (A.len() + B.len() + 2) as u64);
+    drop(second);
+    assert_eq!(error(reader.next_record(&mut Control::default())), JobError::InvalidInput);
+    let position = reader.reader.position();
+    assert_eq!(error(reader.next_record(&mut Control::default())), JobError::Poisoned);
+    assert_eq!(reader.reader.position(), position);
+}
+
+#[test]
+fn streaming_reader_caps_and_eof_validation_never_authorize_an_incomplete_population() {
+    let bytes = [B, b"\n", A].concat();
+    for axis in 0..6 {
+        let mut cap = limits(); let mut wire = transport();
+        match axis {
+            0 => cap.max_items = 1,
+            1 => cap.max_snapshot_bytes = ("beta".len() + 2 * B.len()) as u64,
+            2 => cap.max_input_bytes_per_item = B.len(),
+            3 => wire.max_stream_bytes = bytes.len() as u64 - 1,
+            4 => wire.max_lines = 1,
+            _ => cap.max_attempts = 1,
+        }
+        let mut reader = PopulationReader::new(Cursor::new(&bytes), cap, wire, &mut Control::default()).unwrap();
+        assert!(reader.next_record(&mut Control::default()).unwrap().is_some());
+        if axis == 5 { assert!(reader.next_record(&mut Control::default()).unwrap().is_some()); }
+        let expected = if axis == 5 { JobError::InvalidLimits } else { JobError::Limit };
+        assert_eq!(error(reader.next_record(&mut Control::default())), expected);
+        let position = reader.reader.position();
+        assert_eq!(error(reader.next_record(&mut Control::default())), JobError::Poisoned);
+        assert_eq!(reader.reader.position(), position);
+    }
+    let mut empty = PopulationReader::new(Cursor::new(b"\r\n\n"), limits(), transport(), &mut Control::default()).unwrap();
+    assert_eq!(error(empty.next_record(&mut Control::default())), JobError::InvalidInput);
+    assert_eq!(error(empty.next_record(&mut Control::default())), JobError::Poisoned);
+    let mut broken = PopulationReader::new(Broken, limits(), transport(), &mut Control::default()).unwrap();
+    assert_eq!(error(broken.next_record(&mut Control::default())), JobError::Io);
+    assert_eq!(error(broken.next_record(&mut Control::default())), JobError::Poisoned);
+}
+
+#[test]
+fn streaming_reader_keeps_every_original_cancellation_kind_and_stops_consuming() {
+    struct Cancel(DecodeCancellationKind);
+    impl DecodeStepControl for Cancel {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { Some(self.0) }
+    }
+    for kind in [DecodeCancellationKind::User, DecodeCancellationKind::Timeout,
+        DecodeCancellationKind::Deadline, DecodeCancellationKind::PollQuota,
+        DecodeCancellationKind::CostBudget, DecodeCancellationKind::FailFast,
+        DecodeCancellationKind::RaceLost, DecodeCancellationKind::ParentCancelled,
+        DecodeCancellationKind::ResourceUnavailable, DecodeCancellationKind::Shutdown,
+        DecodeCancellationKind::LinkedExit] {
+        let bytes = [A, b"\n", B].concat();
+        let mut reader = PopulationReader::new(Cursor::new(&bytes), limits(), transport(), &mut Control::default()).unwrap();
+        assert!(reader.next_record(&mut Control::default()).unwrap().is_some());
+        let position = reader.reader.position();
+        assert_eq!(error(reader.next_record(&mut Cancel(kind))), JobError::Cancelled(kind));
+        assert_eq!(reader.reader.position(), position);
+        assert_eq!(error(reader.next_record(&mut Control::default())), JobError::Poisoned);
+        assert_eq!(reader.reader.position(), position);
+    }
+}
