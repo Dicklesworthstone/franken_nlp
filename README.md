@@ -1130,8 +1130,27 @@ skipped and failed attempts retain their work debits. Stdout contains only
 progress metadata; explicit materialization publishes private results after
 all documents commit.
 
+Both population commands accept `--compute-threads N`. Width `1` keeps serial
+execution; widths `2..64` reuse one numerical output-row team across every
+source, claim, chunk and evidence head in the invocation. The process admits
+worker scratch once before private input IO, retains charged IO through drain,
+and publishes terminal corpus completion only after physical worker join.
+Teams cannot combine with `--cohort-chunks`, including an explicit chunk width
+of one. These commands retain their byte-based input contract.
+
+Physical worker width is excluded from durable recipes, so an explicit resume
+may change it without renewing work or attempts. The original policy, evidence
+head cap and chunk schedule remain authenticated. Optional `compute_schedule`
+metadata describes only the declared physical width; complete-source verdicts,
+evidence, coordinates and work accounting retain their existing contracts.
+
 Library callers use `Int4FaithfulnessDocumentJobPlanner` and
 `NlpEngine::job_int4_faithfulness_document`, reusing the corpus processor.
+The team variants are `batch_int4_faithfulness_documents_with_threads` and
+`job_int4_faithfulness_document_with_threads`; the process thread envelope must
+admit the selected width. Source regression definitions cover lifecycle and
+recipe invariance. Compilation, executable tests, native parity and measured
+performance remain pending controller DSR qualification.
 See the [faithfulness population guide](docs/native-faithfulness-populations-int4.md)
 for CLI and library contracts, explicit policy examples, memory boundaries
 and pending executable/native qualification gates.

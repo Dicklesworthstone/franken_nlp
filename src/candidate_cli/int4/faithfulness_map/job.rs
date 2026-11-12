@@ -1,5 +1,6 @@
 //! Retained complete-source judgments, one exact claim/source pair per attempt.
-//! Fixed policy, mapping, native schedule and lifetime authenticate every resume.
+//! Fixed policy, mapping, chunk cohorts and lifetime authenticate every resume.
+//! Physical row-team width may change without changing that authority.
 #![cfg_attr(not(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64"))), allow(dead_code))]
 
@@ -33,9 +34,9 @@ struct FaithfulnessArgs {
 
 pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
     let operation = |name: &'static str, about: &'static str| {
-        let command = FaithfulnessArgs::augment_args(StorageArgs::augment_args(super::definition()
+        let command = FaithfulnessArgs::augment_args(StorageArgs::augment_args(super::population_definition()
             .name(name).about(about)
-            .long_about("Retain and resume faithfulness judgments of COMPLETE original sources with a required fixed --policy FaithfulnessPolicy JSON file. By default, supply the COMPLETE original {id,text,task_args:{claim}} NDJSON population on every invocation; explicit retained-input replay is available. text is never a pre-split chunk; every row supplies its own nonempty claim and no policy or budget overrides. The combined exact source and claim bytes must fit the immutable stored per-item input ceiling. Every source chunk and evidence head must finish before the original document commits. Retain full-vocabulary NLI scores, contrary and uncertain evidence, original byte/scalar coordinates and the named complete-source reduction. --cohort-chunks shares native layers within a document; each actual ragged window must fit 64 heads without resizing or fallback. Repeat the exact policy, task budget, mapping and schedule on resume. Requires --store-results, protected existing --job-dir and --key-file, exact --job-id and immutable --limits. All five per-document work flags cover every chunk and evidence head. JobLimits.max_work is the sole lifetime allowance, including failed attempts; mask_node_visits must be zero. Chunks, attempts and resume never renew that allowance. Complete input, planning, native, retained-result and durable-job memory are admitted before population IO. Stdout is metadata only; --materialize publishes private results after every document commits. No partial-document success, automatic retry, generation, selected-row heads, calibrated correctness probability or full-context equivalence. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
+            .long_about("Retain and resume faithfulness judgments of COMPLETE original sources with a required fixed --policy FaithfulnessPolicy JSON file. By default, supply the COMPLETE original {id,text,task_args:{claim}} NDJSON population on every invocation; explicit retained-input replay is available. text is never a pre-split chunk; every row supplies its own nonempty claim and no policy or budget overrides. The combined exact source and claim bytes must fit the immutable stored per-item input ceiling. Every source chunk and evidence head must finish before the original document commits. Retain full-vocabulary NLI scores, contrary and uncertain evidence, original byte/scalar coordinates and the named complete-source reduction. --cohort-chunks shares native layers within a document; each actual ragged window must fit 64 heads without resizing or fallback. Repeat the exact policy, task budget, mapping and chunk schedule on resume; physical --compute-threads width may change. Requires --store-results, protected existing --job-dir and --key-file, exact --job-id and immutable --limits. All five per-document work flags cover every chunk and evidence head. JobLimits.max_work is the sole lifetime allowance, including failed attempts; mask_node_visits must be zero. Chunks, attempts and resume never renew that allowance. Complete input, planning, native, retained-result and durable-job memory are admitted before population IO. Stdout is metadata only; --materialize publishes private results after every document commits. No partial-document success, automatic retry, generation, selected-row heads, calibrated correctness probability or full-context equivalence. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
             .after_help(job_cli::INPUT_RETENTION_HELP)
             .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population with a claim per record; omit with --use-retained-input; '-' reads stdin"))
             .mut_arg("max_input_bytes", |arg| arg.help("Outer ceiling for combined source and claim bytes; immutable stored input ceiling must fit"))
@@ -143,7 +144,9 @@ impl JobCommand {
         };
         let args = JobArgs { map: MapArgs::from_matches(matches)?, storage: StorageArgs::from_arg_matches(matches)?,
             faithfulness: FaithfulnessArgs::from_arg_matches(matches)? };
-        Ok((Self { mode, args }, Int4Args::from_arg_matches(matches)?))
+        let mut common = Int4Args::from_arg_matches(matches)?;
+        common.compute = compute::Args::from_matches(matches)?;
+        Ok((Self { mode, args }, common))
     }
     pub(in crate::candidate_cli::int4) fn run_owned<R: Read + Send + 'static>(self, args: Int4Args,
         input: R, output: &mut impl Write, diagnostics: &mut impl Write) -> ExitCode {

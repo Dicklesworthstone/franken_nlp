@@ -2,7 +2,7 @@
 use super::*;
 use std::{io::{BufRead, BufReader}, time::{Duration, Instant}};
 use crate::{
-    NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
+    NlpEngine, MemoryClass,
     batch::judge::grouped_int4::Int4FaithfulnessDocumentBatchPlanner,
     candidate_cli::batch::{CandidateWriter, completed},
     hosted::{CancellationToken, HostedError, Int4HostError, NativeLimits, RunLimits,
@@ -48,12 +48,8 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: common.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().map_err(|_| CandidateError::Runtime)?;
+    let engine = NlpEngine::builder().resource_config(compute::resource_config(common))
+        .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
     // Policy parsing, IO and output staging stay charged until physical drain.
     let _preparation = lease.reserve(MemoryClass::JobBuffers, limits.cli_preparation_bytes)
@@ -114,6 +110,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         protocol: "fnlp-candidate-int4-faithfulness-corpus-v1", schema_version: 1,
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "faithfulness",
         source_mode: "complete_source", chunk_schedule: chunk_schedule(cohort_chunks), cohort_chunks,
+        compute_schedule: compute::Schedule::for_threads(common.compute.threads),
         max_evidence_heads: command.stream.max_evidence_heads,
         model_id: "Nanbeige4.2-3B", source_revision: &identity.source_revision,
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
@@ -128,8 +125,13 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
             crate::local_io::open_document(&args.input).map_err(|_| CandidateError::Input)?))
     };
     host.native.run.max_elapsed = remaining()?;
-    let summary = engine.batch_int4_faithfulness_documents(&model, planner, host, common.kernel,
-        reader, writer, cancellation).map_err(|error| host_error(error, CandidateError::Batch))?;
+    let summary = if common.compute.threads == 1 {
+        engine.batch_int4_faithfulness_documents(&model, planner, host, common.kernel,
+            reader, writer, cancellation)
+    } else {
+        engine.batch_int4_faithfulness_documents_with_threads(&model, planner, host, common.kernel,
+            common.compute.threads, reader, writer, cancellation)
+    }.map_err(|error| host_error(error, CandidateError::Batch))?;
     remaining()?;
     // The host owns the only completion footer. Rejected records retain a
     // nonzero exit status even if later records and the physical drain succeed.
@@ -163,6 +165,8 @@ struct Provenance<'a> {
     source_mode: &'static str, chunk_schedule: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     cohort_chunks: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compute_schedule: Option<compute::Schedule>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_evidence_heads: Option<usize>,
     model_id: &'static str, source_revision: &'a str, source_root_sha256: &'a str, model_content_sha256: &'a str,

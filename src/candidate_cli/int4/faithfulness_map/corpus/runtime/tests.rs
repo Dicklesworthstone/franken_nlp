@@ -56,13 +56,65 @@ fn provenance_declares_complete_source_and_physical_schedule_without_private_pol
         source_mode: "complete_source", chunk_schedule: chunk_schedule(Some(3)), cohort_chunks: Some(3),
         model_id: "Nanbeige4.2-3B", source_revision: "revision", source_root_sha256: "root",
         model_content_sha256: "content", candidate_format: "format", quant_recipe: "recipe",
-        group_width: 128, integer_kernel: "s_scalar_i32", snapshot: None, max_evidence_heads: None };
+        group_width: 128, integer_kernel: "s_scalar_i32", snapshot: None, max_evidence_heads: None,
+        compute_schedule: None };
     let value = serde_json::to_value(&provenance).unwrap();
     assert_eq!(value["source_mode"], "complete_source");
     assert_eq!(value["cohort_chunks"], 3);
-    for absent in ["source", "claim", "policy", "policy_file", "snapshot", "max_evidence_heads"] {
+    for absent in ["source", "claim", "policy", "policy_file", "snapshot", "max_evidence_heads", "compute_schedule"] {
         assert!(value.get(absent).is_none());
     }
     provenance.max_evidence_heads = Some(1);
     assert_eq!(serde_json::to_value(&provenance).unwrap()["max_evidence_heads"], 1);
+}
+
+#[test]
+fn row_team_provenance_is_optional_and_does_not_change_inner_events_or_head_policy() {
+    // A framing-only fixture exercises exact number preservation; it makes
+    // no claim about any native judgment or successful model execution.
+    let event = br#"{"event":"wire_fixture","number":12345678901234567890123456789012345678}"#;
+    let mut expected = None;
+    for threads in [1, 2, 4, 64] {
+        let provenance = Provenance { protocol: "fnlp-candidate-int4-faithfulness-corpus-v1", schema_version: 1,
+            scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "faithfulness",
+            source_mode: "complete_source", chunk_schedule: chunk_schedule(None), cohort_chunks: None,
+            model_id: "Nanbeige4.2-3B", source_revision: "revision", source_root_sha256: "root",
+            model_content_sha256: "content", candidate_format: "format", quant_recipe: "recipe",
+            group_width: 128, integer_kernel: "s_scalar_i32", snapshot: None, max_evidence_heads: Some(3),
+            compute_schedule: compute::Schedule::for_threads(threads) };
+        let mut value = serde_json::to_value(&provenance).unwrap();
+        if threads == 1 { assert!(value.get("compute_schedule").is_none()); }
+        else {
+            assert_eq!(value["compute_schedule"]["execution"], "int4-output-row-team-v1");
+            assert_eq!(value["compute_schedule"]["declared_compute_threads"], threads);
+        }
+        assert!(value.get("compute").is_none());
+        value.as_object_mut().unwrap().remove("compute_schedule");
+        if let Some(expected) = &expected { assert_eq!(&value, expected); }
+        else { expected = Some(value); }
+        let mut output = Vec::new();
+        {
+            let mut writer = CandidateWriter::new(&mut output, &provenance, 8192, 65536).unwrap();
+            writer.write_all(event).unwrap(); writer.write_all(b"\n").unwrap(); writer.flush().unwrap();
+        }
+        let mut framed = serde_json::to_vec(&provenance).unwrap(); framed.pop();
+        framed.extend_from_slice(b",\"record\":"); framed.extend_from_slice(event); framed.extend_from_slice(b"}\n");
+        assert_eq!(output, framed);
+    }
+}
+
+#[test]
+fn team_runtime_rechecks_conflicts_and_prices_the_admitted_process_width() {
+    for threads in [1, 2, 4, 64] {
+        let width = threads.to_string();
+        let (command, args) = super::super::tests::arguments(&["--compute-threads", width.as_str()]);
+        let limits = command.validate(&args).unwrap(); let config = compute::resource_config(limits.common);
+        assert_eq!(config.scoped_cpu_children_per_coordinator, threads - 1);
+        assert_eq!(config.thread_ceiling, threads + 1);
+        assert_eq!(config.memory_ceiling_bytes, limits.common.memory_bytes);
+    }
+    let (mut command, args) = super::super::tests::arguments(&["--compute-threads", "4"]);
+    let admitted = command.validate(&args).unwrap(); command.document.mapping.cohort_chunks = Some(1);
+    assert_eq!(execute(args, command, admitted, super::super::tests::NoIo, super::super::tests::NoIo),
+        Err(CandidateError::Arguments));
 }

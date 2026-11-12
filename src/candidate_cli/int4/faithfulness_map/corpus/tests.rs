@@ -20,7 +20,7 @@ pub(super) fn arguments(flags: &[&str]) -> (CorpusArgs, Int4Args) {
     let Int4Task::FaithfulnessCorpus(options) = command.task else { panic!("faithfulness corpus required"); };
     (options, command.args)
 }
-struct NoIo;
+pub(super) struct NoIo;
 impl Read for NoIo {
     fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("refused corpus read input"); }
 }
@@ -233,9 +233,69 @@ fn unsupported_prompt_sampling_and_cross_document_schedules_are_never_ignored() 
         vec!["--cohort-documents", "1"], vec!["--max-new-tokens", "128"],
         vec!["--max-output-bytes", "65536"], vec!["--min-new-tokens", "0"],
         vec!["--logprobs"], vec!["--seed", "ab"], vec!["--task", "faithfulness"],
-        vec!["--mode", "rubric"], vec!["--max-selected-rows", "128"], vec!["--defaults", "settings"]] {
+        vec!["--mode", "rubric"], vec!["--max-selected-rows", "128"], vec!["--defaults", "settings"],
+        vec!["--input-encoding", "safe-bpe-v1"]] {
         let mut all = vec!["--source-dir", "source", "--source-manifest", "manifest", "--policy", "policy"];
         all.extend_from_slice(&flags);
         assert!(parsed(&all).is_err(), "{flags:?}");
+    }
+}
+
+#[test]
+fn population_teams_price_one_workspace_and_preserve_all_evidence_and_work_limits() {
+    use crate::native_engine::strict_int4::projection::int4_team_workspace_bytes;
+    for max_heads in [None, Some(1), Some(3), Some(32)] {
+        let (mut serial, args) = arguments(&[]); serial.stream.max_evidence_heads = max_heads;
+        let baseline = serial.validate(&args).unwrap();
+        let task = serial.document.budget_with_max_heads(baseline.common, max_heads.unwrap_or(32)).unwrap();
+        for threads in [1, 2, 4, 64] {
+            let width = threads.to_string();
+            let (mut command, mut args) = arguments(&["--compute-threads", width.as_str()]);
+            command.stream.max_evidence_heads = max_heads;
+            let limits = command.validate(&args).unwrap(); let common = limits.common;
+            let scratch = if threads == 1 { 0 } else { int4_team_workspace_bytes(threads, args.group_width).unwrap() };
+            assert_eq!(common.compute.threads, threads);
+            assert_eq!(common.compute.workspace_bytes, scratch);
+            assert_eq!(limits.document.memory, baseline.document.memory);
+            let mapping = |map: MapLimits| (map.mapping.chunks, map.mapping.max_model_work,
+                map.mapping.max_retained_result_bytes, map.mapping.max_result_bytes, map.mapping.aggregation);
+            let planning = |limits: JudgeLimits| (limits.per_head.max_candidates, limits.per_head.max_total_tokens,
+                limits.per_head.max_nodes, limits.per_head.max_depth, limits.per_head.max_candidate_id_bytes,
+                limits.per_head.max_projected_logits, limits.max_total_prompt_tokens,
+                limits.max_total_candidate_tokens, limits.max_total_projected_logits, limits.max_output_bytes);
+            assert_eq!(mapping(limits.document), mapping(baseline.document));
+            assert_eq!(planning(limits.document.planning), planning(baseline.document.planning));
+            assert_eq!(limits.transport, baseline.transport);
+            assert_eq!(command.document.budget_with_max_heads(common, max_heads.unwrap_or(32)).unwrap(), task);
+            let map = limits.document;
+            let execution = map.memory.native.kv_bytes + map.memory.input_bytes
+                + map.memory.workspace_bytes + map.memory.output_reservation_bytes + scratch;
+            let loading = common.source_preparation_bytes + common.load.scratch_payload_bytes;
+            let document_peak = map.cli_preparation_bytes + common.load.weight_payload_bytes + ALLOCATOR_BYTES
+                + loading.max(execution) + CLEANUP_BYTES;
+            assert_eq!(common.minimum_memory_bytes, document_peak
+                + corpus_buffer_bytes(limits.transport, common.preparation_bytes, limits.io_bytes).unwrap()
+                + retained_metadata_bytes(map.mapping.chunks.max_chunks).unwrap() + limits.io_bytes);
+            args.memory_mib = common.minimum_memory_bytes.div_ceil(MIB);
+            command.validate(&args).unwrap();
+            args.memory_mib -= 1;
+            assert_eq!(command.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+        }
+    }
+}
+
+#[test]
+fn invalid_widths_and_every_explicit_cohort_team_mix_refuse_before_private_io() {
+    for width in ["0", "65", "18446744073709551615"] {
+        let (command, args) = arguments(&["--compute-threads", width]);
+        assert_eq!(command.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+    for chunks in ["1", "3", "64"] {
+        let (command, args) = arguments(&["--compute-threads", "2", "--cohort-chunks", chunks]);
+        assert_eq!(command.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+    let help = definition().render_long_help().to_string();
+    for required in ["--compute-threads", "--cohort-chunks", "compute_schedule", "without renewing work or attempts"] {
+        assert!(help.split_whitespace().collect::<Vec<_>>().join(" ").contains(required));
     }
 }

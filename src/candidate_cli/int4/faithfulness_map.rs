@@ -61,6 +61,13 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("max_checkpoints", |arg| arg.help("Cooperative allowance for complete planning, native chunks and evidence reduction")))
 }
 
+/// Population commands keep one physical row team across their entire
+/// invocation without changing complete-source or evidence-head authority.
+pub(super) fn population_definition() -> clap::Command {
+    compute::definition(definition()).after_long_help(
+        "--compute-threads N keeps one persistent numerical output-row team across every source, chunk and evidence head in the complete stream or retained-job invocation. Width 1 preserves serial execution; widths 2..64 admit worker scratch and process thread capacity before private IO. Multiple workers cannot combine with --cohort-chunks. The byte-only source and claim, fixed evidence policy, original coordinates, complete reduction and all native-work limits remain unchanged. Workers join before terminal run_complete or successful job progress is published. Optional compute_schedule reports only physical width. Durable recipes exclude worker width, so explicit resume may change it without renewing work or attempts. Explicit --max-evidence-heads and native chunk-cohort settings remain authenticated recipe fields.")
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct MapLimits {
     pub common: Int4Limits,
@@ -76,11 +83,16 @@ impl MapArgs {
             mapping: MappingArgs::from_arg_matches(matches)? })
     }
     pub(super) fn validate(self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
+        if args.compute.threads() != 1 { return Err(CandidateError::Arguments); }
         self.validate_with_max_heads(args, 32)
     }
     fn validate_with_max_heads(self, args: &Int4Args, max_heads: usize) -> Result<MapLimits, CandidateError> {
-        if !(1..=32).contains(&max_heads) { return Err(CandidateError::Arguments); }
-        let mut common = self.scoring.validate(args)?;
+        if !(1..=32).contains(&max_heads) || !args.input_encoding.is_default()
+            || args.prefill()?.is_some() || self.scoring.cohort_head_limit().is_some()
+            || (args.compute.threads() != 1 && self.mapping.cohort_chunks.is_some()) {
+            return Err(CandidateError::Arguments);
+        }
+        let mut common = self.scoring.validate_one_off_with_prefill(args)?;
         let m = self.mapping;
         if args.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
             || !(1..=1_000_000).contains(&m.max_tokenizer_calls)
@@ -128,7 +140,7 @@ impl MapArgs {
             else { sum(&[common.source_preparation_bytes, common.load.scratch_payload_bytes])? };
         let saving = if args.save_snapshot.is_some() { common.snapshot_need.scratch_bytes } else { 0 };
         let execution = sum(&[memory.native.kv_bytes, memory.input_bytes,
-            memory.workspace_bytes, memory.output_reservation_bytes])?;
+            memory.workspace_bytes, memory.output_reservation_bytes, common.compute.workspace_bytes])?;
         common.minimum_memory_bytes = sum(&[cli_preparation_bytes, resident,
             loading.max(saving).max(execution), CLEANUP_BYTES])?;
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }

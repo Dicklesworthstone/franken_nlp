@@ -46,6 +46,7 @@ fnlp candidate source-int4 faithfulness-corpus claims.ndjson \
   --snapshot /models/nanbeige-g128.int4snap \
   --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
   --group-width 128 --memory-mib "$MEMORY_MIB" \
+  --compute-threads 4 \
   --max-input-bytes 1048576 --max-chunks 64 \
   --max-requests 1000 \
   > results.ndjson
@@ -75,6 +76,17 @@ remain usable after later rejection or failure. Whole-run success requires
 **both `run_complete` and exit status zero**; the footer alone does not hide
 rejected records. The command returns failure if writing or flushing fails.
 
+With `--compute-threads N`, one admitted numerical output-row team spans the
+entire corpus, including every source, chunk, evidence head and flush epoch.
+The default `1` uses the existing serial route; `2` through `64` select one
+coordinator plus `N - 1` persistent children. Documents and claims keep their
+original order. The team joins before the terminal `run_complete` frame can
+be published. The optional top-level `compute_schedule` field records
+`execution: "int4-output-row-team-v1"` and `declared_compute_threads`; it is
+omitted for width one. This is physical scheduling metadata, not a fabricated
+projection count, speed measurement or new judgment score. The wrapped inner
+events and complete-source results keep their existing contracts.
+
 ## Work and scheduling
 
 The five native flags bound the **whole live corpus**:
@@ -94,6 +106,28 @@ preparation refusals can remain record-local when the engine is still clean.
 Flush, another chunk, another document or another cohort never replenishes
 these counters. The cooperative deadline and checkpoint allowance also span
 the invocation.
+
+### Numerical workers and native chunk cohorts
+
+Numerical workers parallelize output rows within the existing INT4
+projections. The planner still uses the exact complete source and claim,
+full-vocabulary NLI scores, fixed evidence policy, original evidence
+coordinates and the same complete-source reduction. All five native work
+ceilings and the original invocation deadline retain their meaning. This
+route remains byte based and does not accept `--input-encoding safe-bpe-v1`.
+
+Worker scratch is admitted once for the complete invocation before private
+policy, model or population IO. The CLI also prices one runtime thread in
+addition to the selected compute width, for a process ceiling of `N + 1`
+threads. Worker width does not multiply native work allowances, evidence-head
+capacity, result limits or population memory. The memory quote still includes
+all existing model, preparation, map, transport, output and cleanup owners.
+
+Multiple numerical workers cannot combine with **any explicit**
+`--cohort-chunks`, including `--cohort-chunks 1`. Such combinations, widths
+outside `1..=64`, prompt prefill and evidence-head cohort overrides are
+refused before private IO. Select one numerical team or the existing native
+chunk-cohort schedule for an invocation.
 
 Chunks execute serially by default. `--cohort-chunks N` explicitly shares
 native layers across up to `N` independent source chunks within a document.
@@ -156,9 +190,20 @@ scoring remains part of the NLI result contract.
 `faithfulness-document-job start|resume` retains one complete-source judgment
 per original record. It accepts the same `policy.json` and source/claim
 population shown above. Supply the **complete original population on every
-resume**, including committed records in their original order. Claims, source
+resume** by default, including committed records in their original order. Claims, source
 bytes and IDs authenticate along with the fixed policy, model and recipe.
 Durable populations require unique IDs and do not accept live flush controls.
+
+Explicit input retention is also available: start with `--spool-input
+--max-retained-input-mib N`, then resume with `--use-retained-input
+--max-retained-input-mib N` and omit the population argument. Retained creation
+stages one envelope at a time, authenticates the complete original population
+and seals its spool before inference. Retained replay authenticates the whole
+spool before repair, then lends one pending record at a time. Both modes keep
+the bounded keyed item index and strict per-record parser workspace; logical
+snapshot and lifetime limits still apply. See the
+[retained-input guide](retained-inputs.md) for consent, disk caps and interrupted
+creation behavior. Numerical teams support both external and retained inputs.
 
 The command requires `metadata-store` and `asupersync-runtime` on Linux x86-64
 or AArch64. Prepare an existing owner-only job directory, a protected file
@@ -210,6 +255,7 @@ fnlp candidate source-int4 faithfulness-document-job start claims.ndjson \
   --snapshot /models/nanbeige-g128.int4snap \
   --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
   --group-width 128 --memory-mib "$MEMORY_MIB" \
+  --compute-threads 4 \
   --context-tokens 2048 --max-chunks 64 \
   --store-results --job-dir /private/faithfulness-job \
   --job-id "$JOB_ID" --key-file /private/faithfulness-job.key \
@@ -218,10 +264,20 @@ fnlp candidate source-int4 faithfulness-document-job start claims.ndjson \
 
 Use the same invocation with `resume` in place of `start` to continue pending
 records. Repeat the exact policy, model/group identity, task and planning
-limits, map settings, schedule and immutable job limits. Committed records
+limits, map settings, native chunk schedule and immutable job limits. Committed records
 are authenticated and skipped; an unfinished source is retried from its
 beginning if the original attempt and work ceilings permit it. No partial
 source result is committed.
+
+The physical `--compute-threads` width may change on explicit resume. For
+example, use width four for the start above and width two on a later resume,
+with the same authenticated inputs and other required settings. Numerical
+width is excluded from the job recipe and execution identity; it cannot
+renew attempts or lifetime work. One team spans the complete invocation,
+including input authentication, every source/chunk/evidence head, result
+commit and optional materialization. All workers join before successful job
+progress is returned. The metadata response adds the same optional
+`compute_schedule` description as the live corpus, omitted for width one.
 
 For this durable command, the five native flags bound **each complete
 document**, and every one must fit the corresponding **lifetime** counter in
@@ -280,6 +336,14 @@ token. `int4_faithfulness_document_corpus_requirements` quotes its complete
 hosted reservation before IO. `Int4FaithfulnessDocumentArgs` contains only
 the required claim; `BatchDocument.text` is the original source.
 
+`NlpEngine::batch_int4_faithfulness_documents_with_threads` takes the same
+arguments with explicit `compute_threads` immediately after the kernel. It
+requires `2..=64`, accepts no native chunk-cohort setting, and retains one
+admitted team across the complete stream. The scalar method remains the
+width-one API. Pure document/corpus quotes retain their existing semantic
+meaning; team dispatch additionally admits one worker-scratch envelope and
+the declared process-thread capacity.
+
 Both population planner types provide `.with_max_heads(H)?` and
 `.max_heads()`. The builder validates the fixed policy and the prepared
 descriptor remains bound to the admitted ceiling. Use
@@ -300,7 +364,10 @@ chunk result enters the native path.
 
 The durable library surface is
 `jobs::runner::scored::grouped_int4::faithfulness_document::Int4FaithfulnessDocumentJobPlanner`
-with `NlpEngine::job_int4_faithfulness_document`. It reuses the corpus
+with `NlpEngine::job_int4_faithfulness_document`. Its threaded counterpart is
+`NlpEngine::job_int4_faithfulness_document_with_threads`, with explicit
+`compute_threads` immediately after the kernel and before the owned reader.
+It requires `2..=64` and rejects native chunk cohorts. Both reuse the corpus
 processor and the existing authenticated population/journal runner. Every
 complete source and its claim is one durable result. The recipe binds policy,
 map settings, actual task/planning limits, schedule and result envelope; the
@@ -315,14 +382,26 @@ Memory admission includes the complete native map, original source and claim,
 all retained chunk results, transport or authenticated original population,
 and 32 KiB per maximum chunk for frozen identities during replanning.
 Output guards remain owned through stream delivery or durable serialization,
-spool synchronization and journal acknowledgement. IO and native state stay
-inside the physical invocation until it drains. Blocking IO observes
-cancellation cooperatively.
+spool synchronization and journal acknowledgement. Document planners and
+native state finish their work inside the physical invocation and drop before
+worker join. The model and worker scratch remain charged through physical
+worker drain; corpus IO remains charged through post-join terminal delivery.
+Public return waits for that drain, including cancellation, writer errors and
+unwind. Blocking IO observes cancellation cooperatively. A terminal
+cancellation or metadata-delivery failure can follow a durable commit;
+explicit authenticated resume reconciles that state.
 
 Focused regression definitions cover strict per-record claims and policy,
 Unicode byte limits, all five lifetime counters, changed-claim authentication,
 ragged geometry, output ownership, memory coexistence, cancellation and
-restart behavior. Compilation and test execution remain **UNRUN** in this
+restart behavior. Team regression definitions additionally cover width and
+cohort refusal before IO, scratch accounting, process-thread admission,
+physical drain and terminal delivery, unchanged inner framing, all typed
+cancellation causes, and real model-bound recipe/identity invariance across
+widths one/two/four/64 for start/resume. Recipe fixtures distinguish omitted
+evidence-head caps from explicit caps, including explicit 32. These are
+source definitions; they do not establish numerical parity or throughput.
+Compilation and test execution remain **UNRUN** in this
 session under the repository's controller-owned DSR policy. Native parity,
 semantic quality, performance and release qualification require their
 separate evidence; this implementation does not assert them.

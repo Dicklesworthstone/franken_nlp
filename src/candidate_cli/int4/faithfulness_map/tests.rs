@@ -120,12 +120,25 @@ fn unsupported_generation_and_single_request_schedules_refuse() {
     for flags in [vec!["--prefill-rows", "1"], vec!["--cohort-heads", "1"],
         vec!["--max-new-tokens", "128"], vec!["--max-output-bytes", "65536"],
         vec!["--temperature-milli", "1000"], vec!["--logprobs"], vec!["--stop", "END"],
-        vec!["--focus-area", "reviews"], vec!["--prompt", "private"], vec!["--max-evidence-heads", "1"]] {
+        vec!["--focus-area", "reviews"], vec!["--prompt", "private"], vec!["--max-evidence-heads", "1"],
+        vec!["--compute-threads", "2"], vec!["--input-encoding", "safe-bpe-v1"]] {
         let mut all = vec!["--source-dir", "d", "--source-manifest", "m"];
         all.extend(flags); assert!(parsed(&all).is_err());
     }
     let mut command = command(&[]); command.args.logprobs = true;
     assert_eq!(command.execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+}
+
+#[test]
+fn population_team_admission_does_not_widen_the_one_document_route() {
+    let matches = population_definition().try_get_matches_from(["faithfulness-map", "--source-dir", "source",
+        "--source-manifest", "manifest", "--memory-mib", "131072", "--compute-threads", "4"]).unwrap();
+    let mut args = Int4Args::from_arg_matches(&matches).unwrap();
+    args.compute = compute::Args::from_matches(&matches).unwrap();
+    let document = MapArgs::from_matches(&matches).unwrap();
+    assert_eq!(args.compute.threads(), 4);
+    document.validate_with_max_heads(&args, 32).unwrap();
+    assert_eq!(document.validate(&args).unwrap_err(), CandidateError::Arguments);
 }
 
 #[test]

@@ -135,7 +135,7 @@ fn required_fixed_policy_has_no_claim_or_execution_override_route() {
         words.drain(at..at + 2); assert!(parse(words).is_err());
         for unsupported in [vec!["--claim", "fixed"], vec!["--defaults", "other"], vec!["--cohort-heads", "1"],
             vec!["--prefill-rows", "1"], vec!["--max-selected-rows", "7"], vec!["--max-new-tokens", "128"],
-            vec!["--logprobs"], vec!["--task", "faithfulness"]] {
+            vec!["--logprobs"], vec!["--task", "faithfulness"], vec!["--input-encoding", "safe-bpe-v1"]] {
             let mut words = argv(operation); words.extend(unsupported.into_iter().map(str::to_owned));
             assert!(parse(words).is_err());
         }
@@ -195,11 +195,59 @@ fn source_and_snapshot_keep_identical_task_authority_and_tail_repair_is_resume_o
 #[test]
 fn owned_root_dispatch_never_falls_through_to_a_single_document() {
     let mut words = vec!["candidate".to_owned(), "source-int4".to_owned()]; words.extend(argv("start"));
+    words.extend(["--compute-threads".to_owned(), "4".to_owned()]);
     let matches = crate::candidate_cli::definition().try_get_matches_from(words).unwrap();
     let CandidateCommand::SourceInt4(c) = CandidateCommand::from_matches(&matches).unwrap()
         else { panic!("source INT4 required") };
     assert_eq!(c.task, Int4Task::FaithfulnessDocumentJob);
+    assert_eq!(c.args.compute.threads(), 4);
     assert_eq!(c.execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+}
+
+#[test]
+fn changing_physical_width_keeps_durable_memory_owners_and_lifetime_limits() {
+    for operation in ["start", "resume"] {
+        for heads in ["1", "3", "32"] {
+            let (serial, args) = command(operation, &["--max-evidence-heads", heads]);
+            let baseline = serial.args.validate(&args).unwrap();
+            let fixed = lifetime(&args, baseline);
+            let ordinary = serial.args.lifetime_limits(&args, baseline, fixed).unwrap();
+            for threads in [1, 2, 4, 64] {
+                let width = threads.to_string();
+                let (c, args) = command(operation, &["--max-evidence-heads", heads, "--compute-threads", width.as_str()]);
+                let map = c.args.validate(&args).unwrap();
+                let limits = c.args.lifetime_limits(&args, map, fixed).unwrap();
+                assert_eq!(args.compute.threads(), threads); assert_eq!(map.common.compute.threads, threads);
+                assert_eq!(map.memory, baseline.memory);
+                assert_eq!(map.mapping.chunks, baseline.mapping.chunks);
+                assert_eq!(map.mapping.max_model_work, baseline.mapping.max_model_work);
+                assert_eq!(map.mapping.aggregation, baseline.mapping.aggregation);
+                assert_eq!(map.mapping.max_result_bytes, baseline.mapping.max_result_bytes);
+                assert_eq!(map.mapping.max_retained_result_bytes, baseline.mapping.max_retained_result_bytes);
+                assert_eq!(limits.buffer_bytes, ordinary.buffer_bytes);
+                assert_eq!(limits.map.mapping.max_model_work, fixed.max_work.int4_model_work());
+                assert_eq!(c.args.result_bytes(map).unwrap(), serial.args.result_bytes(baseline).unwrap());
+                assert_eq!(limits.map.common.minimum_memory_bytes,
+                    map.common.minimum_memory_bytes + limits.buffer_bytes
+                        + map.mapping.chunks.max_chunks as u64 * FAITHFULNESS_DOCUMENT_CHUNK_METADATA_BYTES);
+                let mut tight = map; tight.common.memory_bytes = limits.map.common.minimum_memory_bytes - 1;
+                assert_eq!(c.args.lifetime_limits(&args, tight, fixed).unwrap_err().code, "job_population_memory");
+                tight.common.memory_bytes += 1; c.args.lifetime_limits(&args, tight, fixed).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn job_team_refusals_precede_key_policy_limits_and_population_io() {
+    for operation in ["start", "resume"] {
+        for flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+            vec!["--compute-threads", "2", "--cohort-chunks", "1"],
+            vec!["--compute-threads", "4", "--cohort-chunks", "3"]] {
+            let (c, args) = command(operation, &flags);
+            assert_eq!(c.execute_owned(args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+        }
+    }
 }
 
 #[cfg(not(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
