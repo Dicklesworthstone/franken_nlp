@@ -128,3 +128,39 @@ fn typed_cancellation_and_guarded_results_cross_the_host_boundary() {
     send::<Int4FaithfulnessMapCohortRun>(); send::<HostedOutput<Int4FaithfulnessMapRun>>();
     send::<HostedOutput<Int4FaithfulnessMapCohortRun>>();
 }
+
+#[test]
+fn hosted_compact_quotes_add_one_encoder_without_changing_native_or_output_ownership() {
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    let (config, mut request, task) = fixture();
+    let limits = SafeBpeLimits { max_input_bytes: 8192, max_output_tokens: 8192,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
+    let encoding = UntrustedEncoding::SafeBpeV1(limits);
+    let workspace = limits.requirements().unwrap().workspace_bytes;
+    let serial = config.requirements(32, task).unwrap();
+    let compact = config.requirements_with_encoding(32, task, &encoding).unwrap();
+    assert_eq!(compact, serial.with_input_encoding(&encoding).unwrap());
+    assert_eq!(compact.input_bytes - serial.input_bytes, workspace);
+    assert_eq!(compact.native, serial.native);
+    assert_eq!(compact.output_reservation_bytes, serial.output_reservation_bytes);
+    assert_eq!(config.requirements_with_encoding(32, task, &UntrustedEncoding::ByteFallback).unwrap(), serial);
+    if let JudgeRequest::Faithfulness { source, claim, .. } = &mut request {
+        source.reserve(config.mapping.chunks.max_input_bytes * 2);
+        claim.reserve(config.mapping.chunks.max_input_bytes * 2);
+    }
+    assert_eq!(owned_input_bytes(&request, config, compact).unwrap()
+        - owned_input_bytes(&request, config, serial).unwrap(), workspace);
+    for chunks in [1, 2, 8] {
+        let byte = config.cohort_requirements(32, task, chunks).unwrap();
+        let compact = config.cohort_requirements_with_encoding(32, task, chunks, &encoding).unwrap();
+        assert_eq!(compact.memory, byte.memory.with_input_encoding(&encoding).unwrap());
+        assert_eq!(compact.memory.input_bytes - byte.memory.input_bytes, workspace);
+        assert_eq!(compact.task_workspace_bytes, byte.task_workspace_bytes);
+        assert_eq!(compact.max_cohort_output_bytes, byte.max_cohort_output_bytes);
+    }
+    let mut invalid = limits; invalid.max_output_tokens = 0;
+    assert!(config.requirements_with_encoding(32, task, &UntrustedEncoding::SafeBpeV1(invalid)).is_err());
+    assert!(config.cohort_requirements_with_encoding(32, task, 2, &UntrustedEncoding::SafeBpeV1(invalid)).is_err());
+    let _serial = NlpEngine::map_int4_faithfulness_with_encoding;
+    let _cohort = NlpEngine::map_int4_faithfulness_cohorts_with_encoding;
+}

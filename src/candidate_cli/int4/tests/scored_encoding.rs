@@ -80,7 +80,7 @@ fn unwired_scored_workflows_cannot_inherit_a_compact_input_contract() {
     assert!(scoring.validate(&compact.args).is_err());
     assert!(scoring.validate_batch(&compact.args).is_err());
     assert!(scoring.validate_with_prefill(&compact.args).is_err());
-    for task in ["resolve", "redact", "faithfulness-map", "faithfulness-corpus"] {
+    for task in ["resolve", "redact", "faithfulness-corpus"] {
         let error = crate::candidate_cli::definition().try_get_matches_from([
             "candidate", "source-int4", task, "--source-dir", "private-source",
             "--source-manifest", "private-manifest", "--memory-mib", "8192",

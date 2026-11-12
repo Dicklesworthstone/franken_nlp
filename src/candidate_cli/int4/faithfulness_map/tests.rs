@@ -90,7 +90,7 @@ fn wire_rejects_other_tasks_duplicate_keys_and_caller_execution_authority() {
     let text = request_json();
     let baseline: serde_json::Value = serde_json::from_str(&text).unwrap();
     for field in ["budget", "token_ids", "work", "model", "backend", "prompt", "eos_token_id",
-        "aggregation", "cohort_chunks", "probability_space"] {
+        "aggregation", "cohort_chunks", "probability_space", "input_encoding", "tokenizer_work"] {
         let mut value = baseline.clone(); value[field] = serde_json::json!(1);
         assert_eq!(parse_request(&value.to_string(), task, 4096).err(), Some(CandidateError::Input), "{field}");
     }
@@ -121,7 +121,7 @@ fn unsupported_generation_and_single_request_schedules_refuse() {
         vec!["--max-new-tokens", "128"], vec!["--max-output-bytes", "65536"],
         vec!["--temperature-milli", "1000"], vec!["--logprobs"], vec!["--stop", "END"],
         vec!["--focus-area", "reviews"], vec!["--prompt", "private"], vec!["--max-evidence-heads", "1"],
-        vec!["--compute-threads", "2"], vec!["--input-encoding", "safe-bpe-v1"]] {
+        vec!["--compute-threads", "2"]] {
         let mut all = vec!["--source-dir", "d", "--source-manifest", "m"];
         all.extend(flags); assert!(parsed(&all).is_err());
     }
@@ -217,4 +217,83 @@ fn help_exposes_complete_evidence_semantics_and_only_supported_schedules() {
 #[test]
 fn unavailable_runtime_refuses_before_input_or_model_access() {
     assert_eq!(command(&[]).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Unavailable));
+}
+
+
+#[test]
+fn compact_source_and_snapshot_quotes_use_one_complete_document_encoder() {
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    let expected = UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 8192, max_output_tokens: 4096,
+        max_pair_checks: 100_000, max_pair_bytes: 1_000_000 });
+    let compact_flags = ["--input-encoding", "safe-bpe-v1",
+        "--max-tokenizer-input-bytes", "8192", "--max-tokenizer-output-tokens", "4096",
+        "--max-tokenizer-pair-checks", "100000", "--max-tokenizer-pair-bytes", "1000000"];
+    let hash = "ab".repeat(32);
+    for schedule in [vec![], vec!["--cohort-chunks", "1"], vec!["--cohort-chunks", "3"],
+        vec!["--cohort-chunks", "64", "--max-result-bytes", "524288"]] {
+        let byte = command(&schedule);
+        let byte_options = selected(&byte);
+        let baseline = byte_options.validate(&byte.args).unwrap();
+        assert_eq!(byte_options.input_encoding(&byte.args).unwrap(), UntrustedEncoding::ByteFallback);
+        let mut flags = schedule.clone(); flags.extend(compact_flags);
+        let compact = command(&flags); let options = selected(&compact);
+        assert_eq!(options.input_encoding(&compact.args).unwrap(), expected);
+        let limits = options.validate(&compact.args).unwrap();
+        assert_eq!(limits.mapping.chunks, baseline.mapping.chunks);
+        assert_eq!(limits.mapping.max_model_work, baseline.mapping.max_model_work);
+        assert_eq!(limits.mapping.aggregation, baseline.mapping.aggregation);
+        assert_eq!(options.budget(limits.common).unwrap(), byte_options.budget(baseline.common).unwrap());
+        assert_eq!(limits.memory, baseline.memory.with_input_encoding(&expected).unwrap());
+        assert_eq!(limits.envelope_bytes, baseline.envelope_bytes);
+        let mut snapshot_flags = vec!["--snapshot", "explicit.snapshot", "--expected-model-sha256", &hash];
+        snapshot_flags.extend(flags);
+        let snapshot = parsed(&snapshot_flags).unwrap(); let restored_options = selected(&snapshot);
+        assert_eq!(restored_options.input_encoding(&snapshot.args).unwrap(), expected);
+        let restored = restored_options.validate(&snapshot.args).unwrap();
+        assert_eq!(restored.memory, limits.memory);
+        assert_eq!(restored.mapping.chunks, limits.mapping.chunks);
+    }
+    let compact = command(&["--input-encoding", "safe-bpe-v1"]);
+    let options = selected(&compact); let limits = options.validate(&compact.args).unwrap();
+    let UntrustedEncoding::SafeBpeV1(encoding) = options.input_encoding(&compact.args).unwrap()
+        else { panic!("compact policy required"); };
+    assert_eq!(encoding.max_input_bytes, SafeBpeLimits::MAX_INPUT_BYTES);
+    assert_eq!(encoding.max_output_tokens, SafeBpeLimits::MAX_OUTPUT_TOKENS);
+    assert!(encoding.max_output_tokens > limits.common.max_prompt_tokens,
+        "cumulative complete-document work is independent of a per-head context");
+}
+
+#[test]
+fn invalid_or_unused_tokenizer_limits_and_compact_snapshot_saving_refuse_before_io() {
+    for flag in ["--max-tokenizer-input-bytes", "--max-tokenizer-output-tokens",
+        "--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
+        let source = ["--source-dir", "d", "--source-manifest", "m", flag, "1"];
+        if let Ok(command) = parsed(&source) {
+            assert_eq!(command.execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+        }
+        for value in ["0", "18446744073709551615"] {
+            let flags = ["--source-dir", "d", "--source-manifest", "m",
+                "--input-encoding", "safe-bpe-v1", flag, value];
+            if let Ok(command) = parsed(&flags) {
+                assert_eq!(command.execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+            }
+        }
+    }
+    let compact = command(&["--input-encoding", "safe-bpe-v1", "--save-snapshot", "must-not-be-created"]);
+    assert_eq!(compact.execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+    assert!(selected(&command(&["--save-snapshot", "byte.snapshot"]))
+        .validate(&command(&["--save-snapshot", "byte.snapshot"]).args).is_ok());
+}
+
+#[test]
+fn compact_map_help_explains_actual_tokens_and_the_complete_work_allowance() {
+    let help = one_off_definition().render_long_help().to_string();
+    let words = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    for required in ["--input-encoding", "--max-tokenizer-input-bytes", "--max-tokenizer-output-tokens",
+        "--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes", "actual compact token counts",
+        "accepted or rejected source-token probe", "All four tokenizer limits are cumulative",
+        "One encoder workspace", "--save-snapshot is refused in compact mode"] {
+        assert!(words.contains(required), "missing {required}");
+    }
 }

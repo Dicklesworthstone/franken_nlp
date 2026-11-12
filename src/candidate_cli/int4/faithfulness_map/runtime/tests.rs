@@ -104,7 +104,7 @@ fn provenance() -> Provenance<'static> {
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "faithfulness-map",
         model_id: "Nanbeige4.2-3B", source_revision: "fixture", source_root_sha256: "fixture-source",
         model_content_sha256: "fixture-model", candidate_format: "fixture-format", quant_recipe: "fixture:group=128",
-        group_width: 128, integer_kernel: "s_scalar_i32", snapshot: None }
+        group_width: 128, integer_kernel: "s_scalar_i32", snapshot: None, input_encoding: None }
 }
 
 #[test]
@@ -122,7 +122,7 @@ fn publication_preserves_evidence_without_leaking_source_claim_or_local_paths() 
     assert_eq!(value["output"], semantic);
     assert_eq!(value["task"], "faithfulness-map"); assert_eq!(value["evidence"], "non_authoritative");
     assert_eq!(value["protocol"], "fnlp-candidate-int4-faithfulness-map-v1");
-    for absent in ["source", "claim", "prompt", "prompt_digest", "source_dir", "snapshot_path", "snapshot", "cohort"] {
+    for absent in ["source", "claim", "prompt", "prompt_digest", "source_dir", "snapshot_path", "snapshot", "cohort", "input_encoding"] {
         assert!(value.get(absent).is_none());
     }
     let mut exact = Vec::new();
@@ -211,4 +211,68 @@ fn generic_one_off_dispatch_cannot_skip_document_admission() {
     let limits = options.validate(&command.args).unwrap();
     assert_eq!(super::super::super::runtime::execute_task(command.task, command.args, limits.common,
         &mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+}
+
+
+#[test]
+fn compact_host_and_cli_admit_the_same_encoder_for_serial_and_chunk_cohorts() {
+    for schedule in [vec![], vec!["--cohort-chunks", "1"], vec!["--cohort-chunks", "3"]] {
+        for width in [3, 128] {
+            let mut flags = schedule.clone();
+            flags.extend(["--input-encoding", "safe-bpe-v1",
+                "--max-tokenizer-input-bytes", "8192", "--max-tokenizer-output-tokens", "4096",
+                "--max-tokenizer-pair-checks", "100000", "--max-tokenizer-pair-bytes", "1000000"]);
+            let mut command = command(&flags);
+            command.args.group_width = width; command.args.max_load_mib = 65536;
+            let Int4Task::FaithfulnessMap(options) = command.task else { panic!("wrong task"); };
+            let encoding = options.input_encoding(&command.args).unwrap();
+            let limits = options.validate(&command.args).unwrap();
+            let config = Int4FaithfulnessMapHostConfig {
+                native: NativeLimits { context_tokens: command.args.context_tokens,
+                    allocator_reserve_bytes: ALLOCATOR_BYTES,
+                    run: RunLimits { max_elapsed: Duration::from_secs(command.args.timeout_seconds),
+                        max_checkpoints: command.args.max_checkpoints, cleanup_reserve_bytes: CLEANUP_BYTES } },
+                planning: limits.planning, mapping: limits.mapping,
+                preparation_reserve_bytes: limits.common.preparation_bytes,
+            };
+            let task = options.budget(limits.common).unwrap();
+            let quote = if let Some(chunks) = options.mapping.cohort_chunks {
+                config.cohort_requirements_with_encoding(width, task, chunks, &encoding).unwrap().memory
+            } else {
+                config.requirements_with_encoding(width, task, &encoding).unwrap()
+            };
+            assert_eq!(quote, limits.memory);
+            let byte = if let Some(chunks) = options.mapping.cohort_chunks {
+                config.cohort_requirements(width, task, chunks).unwrap().memory
+            } else {
+                config.requirements(width, task).unwrap()
+            };
+            assert_eq!(quote, byte.with_input_encoding(&encoding).unwrap());
+        }
+    }
+}
+
+#[test]
+fn compact_publication_reports_the_exact_policy_beside_original_evidence() {
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 8192, max_output_tokens: 4096,
+        max_pair_checks: 100_000, max_pair_bytes: 1_000_000 });
+    let mut provenance = provenance(); provenance.input_encoding = Some(policy.clone());
+    let semantic = serde_json::json!({"single_context_equivalence":false,
+        "aggregate":{"evidence":[{"chunk_id":1,"quote":"é\r\n上海",
+            "byte_start":17,"byte_end":27,"scalar_start":12,"scalar_end":17}]}});
+    let response = Response { provenance: &provenance, output: &semantic, cohort: None };
+    let mut output = Vec::new();
+    publish_complete(&response, 4096, &mut output, &available).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["input_encoding"], serde_json::to_value(&policy).unwrap());
+    assert_eq!(value["output"], semantic);
+    assert_eq!(value["task"], "faithfulness-map");
+    for absent in ["source", "claim", "prompt", "source_dir", "snapshot_path"] {
+        assert!(value.get(absent).is_none());
+    }
+    let mut refused = Vec::new();
+    assert_eq!(publish_complete(&response, output.len() - 1, &mut refused, &available), Err(CandidateError::Output));
+    assert!(refused.is_empty());
 }

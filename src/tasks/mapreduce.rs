@@ -144,6 +144,26 @@ impl<'a> ChunkPlan<'a> {
     pub fn build_with_checkpoints<F, C>(
         source: &'a str,
         limits: ChunkLimits,
+        count: F,
+        checkpoint: C,
+    ) -> Result<Self, MapReduceError>
+    where
+        F: FnMut(&str) -> Result<usize, MapReduceError>,
+        C: FnMut() -> Result<(), MapReduceError>,
+    {
+        Self::build_with_checkpoints_and_byte_cap(source, limits, limits.max_chunk_bytes, count, checkpoint)
+    }
+
+    /// A task may independently constrain source bytes, even below the
+    /// ordinary four-byte chunk geometry. Honor that cap before tokenization;
+    /// an indivisible scalar or CRLF that cannot fit refuses the whole plan.
+    /// Successful counts remain actual encoder results, never a synthetic
+    /// token penalty used to simulate a byte limit. Public limits retain
+    /// their existing validation and are only tightened by this task cap.
+    pub(crate) fn build_with_checkpoints_and_byte_cap<F, C>(
+        source: &'a str,
+        limits: ChunkLimits,
+        byte_cap: usize,
         mut count: F,
         mut checkpoint: C,
     ) -> Result<Self, MapReduceError>
@@ -152,14 +172,16 @@ impl<'a> ChunkPlan<'a> {
         C: FnMut() -> Result<(), MapReduceError>,
     {
         let token_limit = limits.effective_token_limit()?;
+        if byte_cap == 0 || byte_cap > limits.max_chunk_bytes { return Err(MapReduceError::InvalidLimits); }
         if source.len() > limits.max_input_bytes { return Err(MapReduceError::InputBudget); }
         checkpoint()?;
         let mut chunks = Vec::new();
         let (mut start, mut scalar, mut calls) = (0, 0, 0);
         while start < source.len() {
             if chunks.len() == limits.max_chunks { return Err(MapReduceError::ChunkBudget); }
-            let ceiling = start + limits.max_chunk_bytes.min(source.len() - start);
+            let ceiling = start + byte_cap.min(source.len() - start);
             let mut end = preferred_end(source, start, aligned_end(source, ceiling));
+            if end <= start { return Err(MapReduceError::TokenBudget); }
             let tokens = loop {
                 checkpoint()?;
                 if calls == limits.max_tokenizer_calls { return Err(MapReduceError::TokenizerBudget); }
@@ -289,6 +311,43 @@ mod tests {
         let options = ChunkLimits { max_chunk_tokens: 1, ..limits() };
         for text in ["😀", "\r\n"] {
             assert!(matches!(ChunkPlan::build(text, options, |_| Ok(2)), Err(MapReduceError::TokenBudget)));
+        }
+    }
+
+    #[test]
+    fn independent_byte_caps_support_tiny_ascii_without_artificial_token_counts() {
+        let options = ChunkLimits { max_chunk_bytes: 8, max_chunk_tokens: 128, ..limits() };
+        for cap in [1, 2, 3] {
+            let mut counted = Vec::new();
+            let plan = ChunkPlan::build_with_checkpoints_and_byte_cap("abcdefgh", options, cap,
+                |text| { counted.push(text.to_owned()); Ok(1) }, || Ok(())).unwrap();
+            assert_eq!(plan.chunks().iter().map(SourceChunk::text).collect::<String>(), "abcdefgh");
+            assert!(plan.chunks().iter().all(|chunk| chunk.text().len() <= cap && chunk.tokens() == 1));
+            assert_eq!(plan.tokenizer_calls(), counted.len());
+            assert_eq!(plan.limits(), options);
+            assert_eq!(counted, plan.chunks().iter().map(|chunk| chunk.text().to_owned()).collect::<Vec<_>>());
+        }
+        for cap in [0, 9] {
+            assert!(matches!(ChunkPlan::build_with_checkpoints_and_byte_cap("a", options, cap,
+                |_| panic!("invalid byte cap reached encoder"), || Ok(())), Err(MapReduceError::InvalidLimits)));
+        }
+    }
+
+    #[test]
+    fn independent_byte_caps_preserve_scalar_and_crlf_boundaries_or_refuse_before_counting() {
+        let options = ChunkLimits { max_chunk_tokens: 128, ..limits() };
+        for (text, cap) in [("é", 1), ("𐐀", 3), ("\r\n", 1)] {
+            assert!(matches!(ChunkPlan::build_with_checkpoints_and_byte_cap(text, options, cap,
+                |_| panic!("indivisible source unit reached encoder"), || Ok(())), Err(MapReduceError::TokenBudget)));
+        }
+        let source = "éA\r\né";
+        let plan = ChunkPlan::build_with_checkpoints_and_byte_cap(source, options, 2, count, || Ok(())).unwrap();
+        assert_eq!(plan.chunks().iter().map(SourceChunk::text).collect::<String>(), source);
+        assert_eq!(plan.chunks().iter().map(SourceChunk::text).collect::<Vec<_>>(), ["é", "A", "\r\n", "é"]);
+        for chunk in plan.chunks() {
+            assert!(chunk.text().len() <= 2);
+            assert_eq!(chunk.span().scalar_start, source[..chunk.span().byte_start].chars().count());
+            assert_eq!(chunk.span().scalar_end, source[..chunk.span().byte_end].chars().count());
         }
     }
 

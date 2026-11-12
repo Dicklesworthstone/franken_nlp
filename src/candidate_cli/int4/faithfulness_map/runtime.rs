@@ -54,6 +54,7 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
     let started = Instant::now();
     let limits = options.validate(&args)?;
+    let encoding = options.input_encoding(&args)?;
     let common = limits.common;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
@@ -97,7 +98,7 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         let _preflight = lease.reserve(MemoryClass::JobBuffers, preflight_bytes)
             .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
         let planner = Int4JudgePlanner::for_model(model.model_identity(), budget, config.planning)
-            .map_err(judge_error)?;
+            .map_err(judge_error)?.with_document_encoding(encoding.clone()).map_err(judge_error)?;
         let mut control = DeadlineControl { started, deadline };
         let prepared = planner.plan_faithfulness_document_with_control(&request, config.mapping,
             &mut control).map_err(planning_error)?;
@@ -121,7 +122,7 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
             }
         }
         if let Some(chunks) = options.mapping.cohort_chunks {
-            let quoted = config.cohort_requirements(model.model_identity().group_width(), budget, chunks)
+            let quoted = config.cohort_requirements_with_encoding(model.model_identity().group_width(), budget, chunks, &encoding)
                 .map_err(|error| host_error(error, CandidateError::Planning))?;
             if quoted.memory != limits.memory { return Err(CandidateError::Identity); }
             prepared.preflight_cohorts_with_control(&admitted, model.model_identity(), chunks,
@@ -157,9 +158,11 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         model_id: "Nanbeige4.2-3B", source_revision: model_identity.revision(),
         source_root_sha256: model_identity.source_root_sha256(), model_content_sha256: &content,
         candidate_format: INT4_SOURCE_FORMAT, quant_recipe: &recipe,
-        group_width: model_identity.group_width(), integer_kernel: common.kernel.kind().id(), snapshot };
+        group_width: model_identity.group_width(), integer_kernel: common.kernel.kind().id(), snapshot,
+        input_encoding: match &encoding { UntrustedEncoding::ByteFallback => None,
+            UntrustedEncoding::SafeBpeV1(_) => Some(encoding.clone()) } };
     if let Some(chunks) = options.mapping.cohort_chunks {
-        let result = engine.map_int4_faithfulness_cohorts(&model, request, config, chunks,
+        let result = engine.map_int4_faithfulness_cohorts_with_encoding(&model, request, encoding, config, chunks,
             common.kernel, cancellation).map_err(|error| host_error(error, CandidateError::Execution))?;
         if let Some(expected) = expected {
             expected.verify_completed_cohorts_with_control(result.result(), chunks,
@@ -171,7 +174,7 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         publish_complete(&Response { provenance: &provenance, output: &result.result().output, cohort: Some(cohort) },
             limits.envelope_bytes, output, &remaining)
     } else {
-        let result = engine.map_int4_faithfulness(&model, request, config, common.kernel, cancellation)
+        let result = engine.map_int4_faithfulness_with_encoding(&model, request, encoding, config, common.kernel, cancellation)
             .map_err(|error| host_error(error, CandidateError::Execution))?;
         if let Some(expected) = expected {
             expected.verify_completed_with_control(result.result(),
@@ -213,6 +216,8 @@ struct Provenance<'a> {
     candidate_format: &'a str, quant_recipe: &'a str, group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<SnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<UntrustedEncoding>,
 }
 #[derive(Serialize)]
 struct Cohort<'a> {

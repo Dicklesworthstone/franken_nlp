@@ -1105,6 +1105,20 @@ serial/cohort equivalence with standalone maps and work exhaustion across
 flush. Compilation, native parity and task quality remain subject to their
 separate controller validation gates.
 
+## Implemented candidate compact faithfulness maps
+
+`fnlp candidate source-int4 faithfulness-map` accepts
+`--input-encoding safe-bpe-v1` for sources larger than one native context.
+It uses actual compact token counts for source chunks, while retaining exact
+UTF-8 source bytes and original byte/scalar evidence coordinates. Claim-capacity
+preparation, rejected size probes, final chunks and evidence windows share
+one tokenizer allowance. All four ceilings and consumed work are bound to the
+completed map. One encoder workspace is admitted beside retained plans, in
+serial or native chunk-cohort execution. Compact maps accept pinned sources or
+snapshot reload and refuse `--save-snapshot`, which would introduce a second
+preparation. Byte fallback retains its existing behavior. See the
+[complete-source faithfulness guide](docs/native-faithfulness-map-int4.md).
+
 ## Implemented candidate complete-source faithfulness corpora
 
 `fnlp candidate source-int4 faithfulness-corpus` checks ordered

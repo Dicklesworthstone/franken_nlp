@@ -3,6 +3,7 @@ use super::*;
 pub(super) mod corpus;
 pub(super) mod job;
 use serde::Deserialize;
+use crate::tokenizer::untrusted::UntrustedEncoding;
 use crate::{native_engine::strict_int4::cohort::MAX_INT4_SEQUENCES,
     tasks::{ir::TaskBudget, mapreduce::ChunkLimits,
         judge::{FaithfulnessAggregationPolicy, FaithfulnessPolicy, JudgeLimits, JudgeRequest,
@@ -18,6 +19,7 @@ mod tests;
 pub(super) struct MapArgs {
     scoring: classify::ScoringArgs,
     mapping: MappingArgs,
+    encoding: judge::EncodingArgs,
 }
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
 struct MappingArgs {
@@ -61,11 +63,18 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("max_checkpoints", |arg| arg.help("Cooperative allowance for complete planning, native chunks and evidence reduction")))
 }
 
+/// Compact input is explicit on the standalone route. Population definitions
+/// add the same encoder only when their own prepared/replayed work is wired.
+pub(super) fn one_off_definition() -> clap::Command {
+    judge::encoding_definition(definition()).after_long_help(
+        "--input-encoding safe-bpe-v1 preserves source and claim bytes while choosing source chunks by actual compact token counts. A separate byte cap keeps every evidence window complete, including tiny ASCII policies; an indivisible Unicode scalar or CRLF that cannot fit refuses the whole document. One tokenizer allowance covers claim-capacity work, every accepted or rejected source-token probe and all independently encoded evidence windows. All four tokenizer limits are cumulative and separate from native work, source size and context. One encoder workspace is admitted before private IO, independently of chunk/cohort count. Compact source input and independently pinned snapshot reload are supported; --save-snapshot is refused in compact mode because its extra preflight would repeat planning. Byte fallback remains the default with unchanged output. Compact prompts make no model-quality, output-parity or speed claim.")
+}
+
 /// Population commands keep one physical row team across their entire
 /// invocation without changing complete-source or evidence-head authority.
 pub(super) fn population_definition() -> clap::Command {
     compute::definition(definition()).after_long_help(
-        "--compute-threads N keeps one persistent numerical output-row team across every source, chunk and evidence head in the complete stream or retained-job invocation. Width 1 preserves serial execution; widths 2..64 admit worker scratch and process thread capacity before private IO. Multiple workers cannot combine with --cohort-chunks. The byte-only source and claim, fixed evidence policy, original coordinates, complete reduction and all native-work limits remain unchanged. Workers join before terminal run_complete or successful job progress is published. Optional compute_schedule reports only physical width. Durable recipes exclude worker width, so explicit resume may change it without renewing work or attempts. Explicit --max-evidence-heads and native chunk-cohort settings remain authenticated recipe fields.")
+        "--compute-threads N keeps one persistent numerical output-row team across every source, chunk and evidence head in the complete stream or retained-job invocation. Width 1 preserves serial execution; widths 2..64 admit worker scratch and process thread capacity before private IO. Multiple workers cannot combine with --cohort-chunks. The selected source and claim encoding, fixed evidence policy, original coordinates, complete reduction and all native-work limits remain unchanged. Workers join before terminal run_complete or successful job progress is published. Optional compute_schedule reports only physical width. Durable recipes exclude worker width, so explicit resume may change it without renewing work or attempts. Explicit --max-evidence-heads and native chunk-cohort settings remain authenticated recipe fields.")
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -80,19 +89,31 @@ pub(super) struct MapLimits {
 impl MapArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         Ok(Self { scoring: classify::ScoringArgs::from_matches(matches)?,
-            mapping: MappingArgs::from_arg_matches(matches)? })
+            mapping: MappingArgs::from_arg_matches(matches)?,
+            encoding: if matches.try_contains_id("input_encoding").is_ok() {
+                judge::EncodingArgs::from_arg_matches(matches)?
+            } else { judge::EncodingArgs::default() } })
+    }
+    pub(super) fn input_encoding(self, args: &Int4Args) -> Result<UntrustedEncoding, CandidateError> {
+        self.encoding.policy(args)
     }
     pub(super) fn validate(self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
         if args.compute.threads() != 1 { return Err(CandidateError::Arguments); }
         self.validate_with_max_heads(args, 32)
     }
     fn validate_with_max_heads(self, args: &Int4Args, max_heads: usize) -> Result<MapLimits, CandidateError> {
-        if !(1..=32).contains(&max_heads) || !args.input_encoding.is_default()
+        if !(1..=32).contains(&max_heads)
+            || (!args.input_encoding.is_default() && args.save_snapshot.is_some())
             || args.prefill()?.is_some() || self.scoring.cohort_head_limit().is_some()
             || (args.compute.threads() != 1 && self.mapping.cohort_chunks.is_some()) {
             return Err(CandidateError::Arguments);
         }
-        let mut common = self.scoring.validate_one_off_with_prefill(args)?;
+        let encoding = self.input_encoding(args)?;
+        // The generic scoring quote retains its byte defaults. This route
+        // adds its separately bounded encoder to the complete map ownership.
+        let mut native_args = args.clone();
+        native_args.input_encoding = input_encoding::InputEncodingArgs::default();
+        let mut common = self.scoring.validate_one_off_with_prefill(&native_args)?;
         let m = self.mapping;
         if args.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
             || !(1..=1_000_000).contains(&m.max_tokenizer_calls)
@@ -130,7 +151,7 @@ impl MapArgs {
         } else {
             memory_limits.requirements_with_max_heads(args.group_width, budget, planning, mapping, max_heads)
                 .map_err(|_| CandidateError::Arguments)?
-        };
+        }.with_input_encoding(&encoding).map_err(|_| CandidateError::Arguments)?;
         let envelope_bytes = memory.max_output_bytes.checked_add(4096)
             .and_then(|bytes| usize::try_from(bytes).ok()).ok_or(CandidateError::Arguments)?;
         let cli_preparation_bytes = sum(&[common.preparation_bytes,

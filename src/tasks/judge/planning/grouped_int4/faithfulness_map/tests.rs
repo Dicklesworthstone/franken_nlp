@@ -10,6 +10,7 @@ use crate::{native_engine::{lmhead::scoring::{CandidateLogits, ProjectionRows},
 use fixtures::Continue;
 
 mod binding;
+mod encoding;
 
 fn fixture() -> (&'static JudgePlanner, &'static ExecutionIdentity) {
     static FIXTURE: OnceLock<(JudgePlanner, ExecutionIdentity)> = OnceLock::new();

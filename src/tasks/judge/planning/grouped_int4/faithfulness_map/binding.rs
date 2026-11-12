@@ -3,8 +3,10 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn request<C: DecodeStepControl>(request: &JudgeRequest,
     limits: Int4FaithfulnessMapLimits, authority: (TaskBudget, JudgeLimits),
+    encoding: &UntrustedEncoding, work: SafeBpeWork,
     chunks: &ChunkPlan<'_>, plans: &[PreparedInt4Judge], control: &mut C)
     -> Result<[u8; 32], Int4FaithfulnessMapError> {
     checkpoint(control)?;
@@ -15,6 +17,9 @@ pub(super) fn request<C: DecodeStepControl>(request: &JudgeRequest,
     writer.value(request)?;
     writer.value(&(limits.chunks, limits.max_model_work, limits.max_retained_result_bytes,
         limits.max_result_bytes, limits.aggregation))?;
+    // Preserve the previous byte-mode private binding as well as its public
+    // output. Compact policy and all consumed work receive explicit framing.
+    if !matches!(encoding, UntrustedEncoding::ByteFallback) { writer.value(&(encoding, work))?; }
     let (ceiling, planning) = authority;
     let head = planning.per_head;
     writer.value(&(ceiling, planning.max_total_prompt_tokens, planning.max_total_candidate_tokens,

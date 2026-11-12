@@ -57,11 +57,44 @@ unknown or duplicate keys, empty source or claim, invalid evidence policies,
 and caller-supplied execution authority are refused. JSON cannot provide
 tokens, prompts, model identities, budgets, score-space controls or scores.
 
-An optional `--save-snapshot NEW_FILE` first compiles the complete document
+In byte mode, an optional `--save-snapshot NEW_FILE` first compiles the complete document
 against the loaded model and admits every future cohort window. The snapshot
 uses the existing create-new policy; it can remain if subsequent inference or
 publication fails. This explicit candidate snapshot does not activate a model
 or authenticate a publisher.
+
+## Compact source and claim encoding
+
+Add `--input-encoding safe-bpe-v1` to select compact untrusted input explicitly.
+Source, claim and evidence quotes preserve their original UTF-8 bytes, and
+template-control IDs remain excluded. Chunk sizing uses actual compact token
+counts. Every evidence window is independently encoded from its original text;
+source byte offsets never index compact token vectors.
+
+The four tokenizer ceilings are cumulative planning-work limits:
+
+- `--max-tokenizer-input-bytes` and `--max-tokenizer-output-tokens` default to 1048576.
+- `--max-tokenizer-pair-checks` defaults to 4194304.
+- `--max-tokenizer-pair-bytes` defaults to 67108864.
+
+One ledger includes claim-capacity preparation, every source sizing probe
+(including rejected probes), final chunk judgments and their evidence windows.
+A failure does not refund consumed work. Context, original input bytes, native
+work, retained output and tokenizer calls keep their separate ceilings.
+The compact completion's `input_encoding` record contains the exact policy
+and work for that planning pass, and completion verification binds both.
+
+Serial and native chunk-cohort execution admit one transient encoder workspace
+beside retained plans. Evidence byte limits can constrain a chunk even when its
+compact tokens fit; Unicode scalars and CRLF pairs remain indivisible, and a
+span that cannot fit is refused without truncation or fabricated token counts.
+Pinned source input and pinned snapshot reload are supported. Compact
+`--save-snapshot` refuses before IO because its preliminary planning pass would
+otherwise duplicate preparation. Byte fallback preserves the existing default
+identity and output shape.
+
+Compact input changes prompt tokens. It carries no model-output parity,
+task-quality or performance claim.
 
 ## Source partition and native judgment
 

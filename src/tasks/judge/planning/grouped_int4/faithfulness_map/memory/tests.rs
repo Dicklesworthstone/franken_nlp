@@ -128,3 +128,35 @@ fn small_declared_evidence_sets_enable_cohorts_with_their_own_task_kv_ceiling() 
     let many = memory.cohort_requirements(32, task, planning, mapping, 3, 64).unwrap();
     assert_eq!(many.memory.native.kv_bytes, 64 * row);
 }
+
+#[test]
+fn compact_encoder_workspace_is_single_and_independent_of_heads_or_cohorts() {
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    let (memory, task, planning, mapping) = fixture();
+    let limits = SafeBpeLimits { max_input_bytes: 8192, max_output_tokens: 8192,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
+    let encoding = UntrustedEncoding::SafeBpeV1(limits);
+    let workspace = limits.requirements().unwrap().workspace_bytes;
+    for heads in [1, 3, 32] {
+        let serial = memory.requirements_with_max_heads(32, task, planning, mapping, heads).unwrap();
+        assert_eq!(serial.with_input_encoding(&UntrustedEncoding::ByteFallback).unwrap(), serial);
+        let compact = serial.with_input_encoding(&encoding).unwrap();
+        assert_eq!(compact.input_bytes - serial.input_bytes, workspace);
+        assert_eq!(compact.native, serial.native);
+        assert_eq!(compact.workspace_bytes, serial.workspace_bytes);
+        assert_eq!(compact.output_reservation_bytes, serial.output_reservation_bytes);
+        for chunks in [1, 2, 8] {
+            let cohort = memory.cohort_requirements(32, task, planning, mapping, heads, chunks).unwrap();
+            let compact = cohort.memory.with_input_encoding(&encoding).unwrap();
+            assert_eq!(compact.input_bytes - cohort.memory.input_bytes, workspace);
+            assert_eq!(compact.native, cohort.memory.native);
+            assert_eq!(compact.output_reservation_bytes, cohort.memory.output_reservation_bytes);
+        }
+    }
+    let serial = memory.requirements(32, task, planning, mapping).unwrap();
+    let mut invalid = limits; invalid.max_input_bytes = 0;
+    assert!(matches!(serial.with_input_encoding(&UntrustedEncoding::SafeBpeV1(invalid)),
+        Err(Int4FaithfulnessMapError::Limits)));
+    let mut overflow = serial; overflow.input_bytes = u64::MAX;
+    assert!(matches!(overflow.with_input_encoding(&encoding), Err(Int4FaithfulnessMapError::Limits)));
+}

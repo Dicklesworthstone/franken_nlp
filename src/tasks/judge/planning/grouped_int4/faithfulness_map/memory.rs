@@ -5,7 +5,7 @@ use super::{Int4FaithfulnessMapError, Int4FaithfulnessMapLimits, MAX_FAITHFULNES
     cohort::COHORT_WRAPPER_BYTES};
 use crate::{native_engine::strict_int4::{Int4MemoryRequirement,
         cohort::MAX_INT4_SEQUENCES, scoring::cohort::required_task_workspace_bytes},
-    tasks::{judge::JudgeLimits, ir::TaskBudget}};
+    tasks::{judge::JudgeLimits, ir::TaskBudget}, tokenizer::untrusted::UntrustedEncoding};
 
 pub const MIN_FAITHFULNESS_MAP_PREPARATION_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -22,6 +22,21 @@ pub struct Int4FaithfulnessMapMemoryRequirement {
     pub input_bytes: u64,
     pub output_reservation_bytes: u64,
     pub max_output_bytes: u64,
+}
+impl Int4FaithfulnessMapMemoryRequirement {
+    /// Add one transient encoder workspace while retaining all document and
+    /// evidence plans. Probes, heads and cohorts reuse this same workspace.
+    pub fn with_input_encoding(mut self, encoding: &UntrustedEncoding)
+        -> Result<Self, Int4FaithfulnessMapError> {
+        let workspace = match encoding {
+            UntrustedEncoding::ByteFallback => 0,
+            UntrustedEncoding::SafeBpeV1(limits) => limits.requirements()
+                .map_err(|_| Int4FaithfulnessMapError::Limits)?.workspace_bytes,
+        };
+        self.input_bytes = sum(&[self.input_bytes, workspace])?;
+        sum(&[self.native.kv_bytes, self.workspace_bytes, self.input_bytes, self.output_reservation_bytes])?;
+        Ok(self)
+    }
 }
 /// `memory.input_bytes` already includes `task_workspace_bytes`; callers do
 /// not add the serial quote or task workspace again.

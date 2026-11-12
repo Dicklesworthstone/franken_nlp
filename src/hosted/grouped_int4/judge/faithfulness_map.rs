@@ -6,6 +6,7 @@ pub use corpus::{int4_faithfulness_document_corpus_requirements,
 #[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod job;
 use crate::{native_engine::lmhead::NANBEIGE_VOCAB_SIZE,
+    tokenizer::untrusted::UntrustedEncoding,
     tasks::judge::{JudgeLimits, JudgeRequest,
     grouped_int4::{Int4JudgePlanner,
         faithfulness_map::{Int4FaithfulnessMapError, Int4FaithfulnessMapLimits,
@@ -40,6 +41,20 @@ impl Int4FaithfulnessMapHostConfig {
         self.memory_limits().cohort_requirements(width, task, self.planning, self.mapping,
             32, cohort_chunks).map_err(map_error)
     }
+    /// Add one bounded compact encoder workspace to the complete serial quote.
+    pub fn requirements_with_encoding(self, width: usize, task: TaskBudget, encoding: &UntrustedEncoding)
+        -> Result<Int4FaithfulnessMapMemoryRequirement, HostedError> {
+        self.requirements(width, task)?.with_input_encoding(encoding).map_err(map_error)
+    }
+    /// Cohort width changes native ownership, while all probes and evidence
+    /// heads reuse the same transient source encoder workspace.
+    pub fn cohort_requirements_with_encoding(self, width: usize, task: TaskBudget,
+        cohort_chunks: usize, encoding: &UntrustedEncoding)
+        -> Result<Int4FaithfulnessMapCohortMemoryRequirement, HostedError> {
+        let mut required = self.cohort_requirements(width, task, cohort_chunks)?;
+        required.memory = required.memory.with_input_encoding(encoding).map_err(map_error)?;
+        Ok(required)
+    }
     fn memory_limits(self) -> Int4FaithfulnessMapMemoryLimits {
         Int4FaithfulnessMapMemoryLimits { context_tokens: self.native.context_tokens,
             preparation_reserve_bytes: self.preparation_reserve_bytes,
@@ -56,10 +71,20 @@ impl NlpEngine {
     pub fn map_int4_faithfulness(&self, model: &ResidentInt4, request: JudgeRequest,
         config: Int4FaithfulnessMapHostConfig, kernel: PackedInt4Kernel, cancellation: CancellationToken)
         -> Result<HostedOutput<Int4FaithfulnessMapRun>, HostedError> {
+        self.map_int4_faithfulness_with_encoding(model, request, UntrustedEncoding::ByteFallback,
+            config, kernel, cancellation)
+    }
+
+    /// Select one fixed byte-preserving input policy for claim-capacity work,
+    /// every chunk probe and all complete evidence plans in this invocation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_int4_faithfulness_with_encoding(&self, model: &ResidentInt4, request: JudgeRequest,
+        encoding: UntrustedEncoding, config: Int4FaithfulnessMapHostConfig, kernel: PackedInt4Kernel,
+        cancellation: CancellationToken) -> Result<HostedOutput<Int4FaithfulnessMapRun>, HostedError> {
         dispatch::preflight(self, config.native.run)?;
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
         let task = validate_request(&request, config)?;
-        let required = config.requirements(model.model_identity().group_width(), task)?;
+        let required = config.requirements_with_encoding(model.model_identity().group_width(), task, &encoding)?;
         let input_bytes = owned_input_bytes(&request, config, required)?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, input_bytes)?,
@@ -72,7 +97,7 @@ impl NlpEngine {
             let input = input;
             checkpoint(control)?;
             let planner = Int4JudgePlanner::for_model(model.model_identity(), task, config.planning)
-                .map_err(judge_error)?;
+                .map_err(judge_error)?.with_document_encoding(encoding).map_err(judge_error)?;
             let (prepared, admitted) = prepare(&planner, &model, &input.value, control)?;
             let expected = prepared.preflight_metadata();
             let mut engine = allocate_native(kv, scratch, || {
@@ -102,10 +127,22 @@ impl NlpEngine {
     pub fn map_int4_faithfulness_cohorts(&self, model: &ResidentInt4, request: JudgeRequest,
         config: Int4FaithfulnessMapHostConfig, cohort_chunks: usize, kernel: PackedInt4Kernel,
         cancellation: CancellationToken) -> Result<HostedOutput<Int4FaithfulnessMapCohortRun>, HostedError> {
+        self.map_int4_faithfulness_cohorts_with_encoding(model, request, UntrustedEncoding::ByteFallback,
+            config, cohort_chunks, kernel, cancellation)
+    }
+
+    /// Preserve the selected source encoder across every independent chunk
+    /// and evidence head; a cohort never renews tokenizer or native work.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_int4_faithfulness_cohorts_with_encoding(&self, model: &ResidentInt4, request: JudgeRequest,
+        encoding: UntrustedEncoding, config: Int4FaithfulnessMapHostConfig, cohort_chunks: usize,
+        kernel: PackedInt4Kernel, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int4FaithfulnessMapCohortRun>, HostedError> {
         dispatch::preflight(self, config.native.run)?;
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
         let task = validate_request(&request, config)?;
-        let required = config.cohort_requirements(model.model_identity().group_width(), task, cohort_chunks)?;
+        let required = config.cohort_requirements_with_encoding(model.model_identity().group_width(), task,
+            cohort_chunks, &encoding)?;
         let memory = required.memory;
         let input_bytes = owned_input_bytes(&request, config, memory)?;
         let lease = self.resources().acquire_lease();
@@ -119,7 +156,7 @@ impl NlpEngine {
             let input = input;
             checkpoint(control)?;
             let planner = Int4JudgePlanner::for_model(model.model_identity(), task, config.planning)
-                .map_err(judge_error)?;
+                .map_err(judge_error)?.with_document_encoding(encoding).map_err(judge_error)?;
             let (prepared, admitted) = prepare(&planner, &model, &input.value, control)?;
             prepared.validate_cohort_chunks(cohort_chunks).map_err(map_error)?;
             let expected = prepared.preflight_metadata();

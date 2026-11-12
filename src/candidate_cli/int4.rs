@@ -215,7 +215,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(sentiment_map::corpus::definition())
         .subcommand(sentiment_map::job::definition())
         .subcommand(compute::definition(judge::definition()))
-        .subcommand(faithfulness_map::definition())
+        .subcommand(faithfulness_map::one_off_definition())
         .subcommand(faithfulness_map::corpus::definition())
         .subcommand(faithfulness_map::job::definition())
         .subcommand(compute::definition(scored_batch::definition()))
@@ -380,7 +380,7 @@ impl Int4Command {
             _ => return Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source-int4 task refused")),
         };
         let mut args = Int4Args::from_arg_matches(matches)?;
-        if matches!(name, "generate" | "chat" | "classify" | "classify-map" | "classify-corpus" | "sentiment" | "sentiment-map" | "sentiment-corpus" | "judge" | "extract" | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch"
+        if matches!(name, "generate" | "chat" | "classify" | "classify-map" | "classify-corpus" | "sentiment" | "sentiment-map" | "sentiment-corpus" | "judge" | "faithfulness-map" | "extract" | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch"
             | "extract-batch" | "ner-batch" | "keyphrases-batch" | "summarize-batch" | "answer-batch"
             | "ner-map" | "keyphrases-map" | "summarize-map" | "answer-map"
             | "ner-corpus" | "keyphrases-corpus" | "summarize-corpus" | "answer-corpus") {

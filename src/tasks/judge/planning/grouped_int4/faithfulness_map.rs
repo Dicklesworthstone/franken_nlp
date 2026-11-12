@@ -2,9 +2,12 @@
 //! E/C/U judge heads. Every chunk is planned before any native forward. The
 //! document reducer names its separate evidence semantics explicitly.
 use super::*;
+use std::cell::RefCell;
+use sha2::{Digest, Sha256};
 use crate::{tasks::{judge::{FaithfulnessAggregate, FaithfulnessAggregationPolicy,
         FaithfulnessAggregationError, aggregation::{FaithfulnessChunkView, aggregate_with_control}},
     mapreduce::{CHUNK_PROFILE, ChunkLimits, ChunkPlan, MapReduceError}},
+    tokenizer::untrusted::{SafeBpeLimits, SafeBpeWork, UntrustedEncoding},
     validation::grounded_fields::VerifiedSourceSpan};
 
 pub mod memory;
@@ -102,10 +105,19 @@ impl Int4FaithfulnessMapError {
 pub struct Int4FaithfulnessMapChunk {
     pub chunk_id: usize,
     pub source_span: VerifiedSourceSpan,
+    /// Exact encoded source length, excluding the unchanged claim and trusted
+    /// scaffold. Byte fallback retains one token per original source byte.
     pub source_tokens: usize,
     /// The original exact result keeps chunk-local evidence coordinates.
     /// Aggregate witnesses separately carry original-source coordinates.
     pub run: Int4JudgeRun,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct Int4FaithfulnessMapEncoding {
+    pub policy: UntrustedEncoding,
+    /// Includes claim-capacity preparation, every source sizing probe, and
+    /// every complete chunk and evidence-head plan in this planning pass.
+    pub work: SafeBpeWork,
 }
 #[derive(Clone, PartialEq, Serialize)]
 pub struct Int4FaithfulnessMapRun {
@@ -114,6 +126,9 @@ pub struct Int4FaithfulnessMapRun {
     pub source_span: VerifiedSourceSpan, pub chunk_limits: ChunkLimits, pub tokenizer_checks: usize,
     pub planned_model_work: Int4Work, pub model_work: Int4Work, pub retained_result_bytes: u64,
     pub chunks: Vec<Int4FaithfulnessMapChunk>, pub aggregate: FaithfulnessAggregate,
+    /// Absent for the unchanged byte-fallback output contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_encoding: Option<Int4FaithfulnessMapEncoding>,
     #[serde(skip)]
     request_binding: [u8; 32],
     #[serde(skip)]
@@ -129,7 +144,8 @@ impl fmt::Debug for Int4FaithfulnessMapRun {
             .field("source_span", &self.source_span).field("chunk_limits", &self.chunk_limits)
             .field("tokenizer_checks", &self.tokenizer_checks).field("planned_model_work", &self.planned_model_work)
             .field("model_work", &self.model_work).field("retained_result_bytes", &self.retained_result_bytes)
-            .field("chunks", &self.chunks).field("aggregate", &self.aggregate).finish()
+            .field("chunks", &self.chunks).field("aggregate", &self.aggregate)
+            .field("input_encoding", &self.input_encoding).finish()
     }
 }
 
@@ -141,6 +157,7 @@ pub struct Int4FaithfulnessMapPreflight {
     policy: FaithfulnessPolicy, group_width: usize, work: Int4Work,
     retained_bytes: u64, result_bytes: u64, aggregation: FaithfulnessAggregationPolicy,
     chunk_limits: ChunkLimits, tokenizer_checks: usize,
+    source_geometry: [u8; 32], encoding: Option<SafeBpeLimits>, encoding_work: SafeBpeWork,
     request_binding: [u8; 32],
 }
 impl fmt::Debug for Int4FaithfulnessMapPreflight {
@@ -151,7 +168,8 @@ impl fmt::Debug for Int4FaithfulnessMapPreflight {
             .field("policy", &self.policy).field("group_width", &self.group_width).field("work", &self.work)
             .field("retained_bytes", &self.retained_bytes).field("result_bytes", &self.result_bytes)
             .field("aggregation", &self.aggregation).field("chunk_limits", &self.chunk_limits)
-            .field("tokenizer_checks", &self.tokenizer_checks).finish()
+            .field("tokenizer_checks", &self.tokenizer_checks).field("encoding", &self.encoding)
+            .field("encoding_work", &self.encoding_work).finish()
     }
 }
 impl Int4FaithfulnessMapPreflight {
@@ -160,6 +178,10 @@ impl Int4FaithfulnessMapPreflight {
     pub fn max_head_count(&self) -> usize { self.max_heads }
     pub fn planned_work(&self) -> Int4Work { self.work }
     pub fn source_span(&self) -> VerifiedSourceSpan { self.source }
+    fn encoding_record(&self) -> Option<Int4FaithfulnessMapEncoding> {
+        self.encoding.map(|limits| Int4FaithfulnessMapEncoding {
+            policy: UntrustedEncoding::SafeBpeV1(limits), work: self.encoding_work })
+    }
     pub fn verify_completed_cohorts(&self, run: &Int4FaithfulnessMapCohortRun, cohort_chunks: usize)
         -> Result<(), Int4FaithfulnessMapError> {
         self.verify_completed_cohorts_with_control(run, cohort_chunks, &mut Continue)
@@ -209,7 +231,9 @@ impl Int4FaithfulnessMapPreflight {
             || run.source_span != self.source || run.chunks.len() != self.chunks
             || run.chunk_limits != self.chunk_limits || run.tokenizer_checks != self.tokenizer_checks
             || run.planned_model_work != self.work || run.model_work != self.work
-            || run.retained_result_bytes > self.retained_bytes {
+            || run.retained_result_bytes > self.retained_bytes
+            || run.input_encoding != self.encoding_record()
+            || geometry(run.chunks.iter().map(|chunk| (chunk.chunk_id, chunk.source_span, chunk.source_tokens))) != self.source_geometry {
             return Err(Int4FaithfulnessMapError::Admission);
         }
         run.aggregate.verify_metadata(self.aggregation, self.policy, self.chunks,
@@ -222,7 +246,9 @@ impl Int4FaithfulnessMapPreflight {
             let JudgeResult::Faithfulness(result) = &chunk.run.result else { return Err(Int4FaithfulnessMapError::Admission); };
             if chunk.chunk_id != index || span.byte_start != byte || span.scalar_start != scalar
                 || span.byte_end <= byte || span.scalar_end <= scalar
-                || chunk.source_tokens != span.byte_end - byte || chunk.run.schema_version != 1
+                || chunk.source_tokens == 0
+                || (self.encoding.is_none() && chunk.source_tokens != span.byte_end - byte)
+                || chunk.run.schema_version != 1
                 || chunk.run.execution != INT4_JUDGE_EXECUTION || chunk.run.numerics_profile != STRICT_INT4_PROFILE
                 || chunk.run.group_width != self.group_width || result.policy != self.policy
                 || chunk.run.head_count == 0 || chunk.run.head_count > MAX_FAITHFULNESS_MAP_HEADS
@@ -254,11 +280,28 @@ impl Int4JudgePlanner {
     pub fn plan_faithfulness_document_with_control<'a, C: DecodeStepControl>(&self, request: &'a JudgeRequest,
         limits: Int4FaithfulnessMapLimits, control: &mut C)
         -> Result<PreparedInt4FaithfulnessMap<'a>, Int4FaithfulnessMapError> {
+        self.plan_faithfulness_document_with_encoding_work(request, limits, control, &mut SafeBpeWork::default())
+    }
+    /// A population attempt carries the same bounded allowance from initial
+    /// preparation into exact execution reconstruction. Each plan seals its
+    /// deterministic work delta without renewing any consumed counter.
+    pub(crate) fn plan_faithfulness_document_with_encoding_work<'a, C: DecodeStepControl>(&self,
+        request: &'a JudgeRequest, limits: Int4FaithfulnessMapLimits, control: &mut C,
+        work: &mut SafeBpeWork) -> Result<PreparedInt4FaithfulnessMap<'a>, Int4FaithfulnessMapError> {
         checkpoint(control)?;
-        let capacity = self.max_faithfulness_source_bytes(request, limits.chunks.context_tokens)?;
-        PreparedInt4FaithfulnessMap::compile_bound(request, limits, capacity, self.group_width(),
-            self.semantic_configuration(), control,
-            |request, control| self.plan_with_control(request, control))
+        limits.validate(request.budget())?;
+        let before = *work;
+        let capacity = self.faithfulness_source_token_capacity_with_work(request,
+            limits.chunks.context_tokens, work, control)?;
+        let byte_capacity = match self.document_encoding() {
+            UntrustedEncoding::ByteFallback => limits.chunks.max_chunk_bytes,
+            UntrustedEncoding::SafeBpeV1(_) => self.faithfulness_source_byte_limit(request)?,
+        };
+        PreparedInt4FaithfulnessMap::compile_encoded_with_work(request, limits, capacity,
+            byte_capacity, self.group_width(), self.semantic_configuration(), self.document_encoding(),
+            work, before, control,
+            |source, control, work| self.source_tokens_with_work(source, work, control),
+            |request, control, work| self.plan_with_encoding_work(request, control, work))
     }
 }
 impl<'a> PreparedInt4FaithfulnessMap<'a> {
@@ -270,43 +313,74 @@ impl<'a> PreparedInt4FaithfulnessMap<'a> {
         Self::compile_bound(request, limits, capacity, width, (request.budget(), JudgeLimits::default()),
             control, |request, control| prepare(request, control))
     }
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn compile_bound<C: DecodeStepControl, F>(request: &'a JudgeRequest, limits: Int4FaithfulnessMapLimits,
         capacity: usize, width: usize, authority: (TaskBudget, JudgeLimits), control: &mut C, mut prepare: F)
         -> Result<Self, Int4FaithfulnessMapError>
     where F: FnMut(&JudgeRequest, &mut C) -> Result<PreparedInt4Judge, Int4JudgeError> {
+        Self::compile_encoded_with_work(request, limits, capacity, limits.chunks.max_chunk_bytes,
+            width, authority, &UntrustedEncoding::ByteFallback, &mut SafeBpeWork::default(),
+            SafeBpeWork::default(), control, |text, _, _| Ok(text.len()),
+            |request, control, _| prepare(request, control))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn compile_encoded_with_work<C: DecodeStepControl, Count, Prepare>(request: &'a JudgeRequest,
+        limits: Int4FaithfulnessMapLimits, capacity: usize, byte_capacity: usize, width: usize,
+        authority: (TaskBudget, JudgeLimits), encoding: &UntrustedEncoding, work: &mut SafeBpeWork,
+        before: SafeBpeWork, control: &mut C, mut count: Count, mut prepare: Prepare)
+        -> Result<Self, Int4FaithfulnessMapError>
+    where Count: FnMut(&str, &mut C, &mut SafeBpeWork) -> Result<usize, Int4JudgeError>,
+        Prepare: FnMut(&JudgeRequest, &mut C, &mut SafeBpeWork) -> Result<PreparedInt4Judge, Int4JudgeError> {
         checkpoint(control)?;
+        encoding.validate().map_err(|_| Int4FaithfulnessMapError::Limits)?;
         let JudgeRequest::Faithfulness { source, claim, policy, budget } = request else {
             return Err(Int4FaithfulnessMapError::Limits);
         };
         limits.validate(*budget)?; policy.validate()?;
         if source.is_empty() || claim.is_empty() { return Err(Int4FaithfulnessMapError::EmptySource); }
-        if capacity == 0 || source.len().checked_add(claim.len()).is_none_or(|n| n > limits.chunks.max_input_bytes) {
+        if capacity == 0 || byte_capacity == 0
+            || source.len().checked_add(claim.len()).is_none_or(|n| n > limits.chunks.max_input_bytes) {
             return Err(Int4FaithfulnessMapError::Limits);
         }
         let reserved_tokens = limits.chunks.context_tokens.checked_sub(capacity).ok_or(Int4FaithfulnessMapError::Limits)?;
         let chunk_limits = ChunkLimits { max_chunk_tokens: limits.chunks.max_chunk_tokens.min(capacity),
+            max_chunk_bytes: limits.chunks.max_chunk_bytes.min(byte_capacity.max(4)),
             reserved_tokens: limits.chunks.reserved_tokens.max(reserved_tokens), ..limits.chunks };
-        let mut stopped = None;
-        let chunks = ChunkPlan::build_with_checkpoints(source, chunk_limits, |text| Ok(text.len()),
-            || match control.prefill_checkpoint(0) { None => Ok(()), Some(cause) => {
-                stopped = Some(cause); Err(MapReduceError::Cancelled) } });
-        if let Some(cause) = stopped { return Err(Int4JudgeError::Cancelled(cause).into()); }
+        let error = RefCell::new(None);
+        let chunks = {
+            let control = RefCell::new(&mut *control);
+            ChunkPlan::build_with_checkpoints_and_byte_cap(source, chunk_limits,
+                byte_capacity.min(chunk_limits.max_chunk_bytes),
+                |text| count(text, &mut **control.borrow_mut(), work).map_err(|cause| {
+                    *error.borrow_mut() = Some(cause); MapReduceError::Tokenizer
+                }),
+                || match control.borrow_mut().prefill_checkpoint(0) { None => Ok(()), Some(cause) => {
+                    *error.borrow_mut() = Some(Int4JudgeError::Cancelled(cause));
+                    Err(MapReduceError::Cancelled)
+                } })
+        };
+        if let Some(error) = error.into_inner() { return Err(error.into()); }
         let chunks = chunks.map_err(Int4FaithfulnessMapError::Chunk)?;
         let last = chunks.chunks().last().ok_or(Int4FaithfulnessMapError::EmptySource)?.span();
         let mut expected = Int4FaithfulnessMapPreflight {
             source: VerifiedSourceSpan { byte_start: 0, byte_end: last.byte_end, scalar_start: 0, scalar_end: last.scalar_end },
             chunks: chunks.chunks().len(), heads: 0, max_heads: 0, policy: *policy, group_width: width,
             work: Int4Work::default(), retained_bytes: limits.max_retained_result_bytes, result_bytes: limits.max_result_bytes,
-            aggregation: limits.aggregation, chunk_limits, tokenizer_checks: chunks.tokenizer_calls(), request_binding: [0; 32] };
+            aggregation: limits.aggregation, chunk_limits, tokenizer_checks: chunks.tokenizer_calls(),
+            source_geometry: geometry(chunks.chunks().iter().map(|chunk| (chunk.id(), chunk.span(), chunk.tokens()))),
+            encoding: match encoding { UntrustedEncoding::ByteFallback => None,
+                UntrustedEncoding::SafeBpeV1(limits) => Some(*limits) }, encoding_work: SafeBpeWork::default(),
+            request_binding: [0; 32] };
         let mut plans = reserved(expected.chunks)?;
         for chunk in chunks.chunks() {
             checkpoint(control)?;
             let row = JudgeRequest::Faithfulness { source: copy_text(chunk.text())?, claim: copy_text(claim)?,
                 policy: *policy, budget: *budget };
-            let prepared = prepare(&row, control)?;
+            let prepared = prepare(&row, control, work)?;
             if prepared.group_width() != width || prepared.head_count() == 0
                 || prepared.head_count() > MAX_FAITHFULNESS_MAP_HEADS || prepared.task_budget() != *budget
+                || prepared.source_token_count() != Some(chunk.tokens())
                 || prepared.required_context() > chunk_limits.context_tokens {
                 return Err(Int4FaithfulnessMapError::Admission);
             }
@@ -316,7 +390,9 @@ impl<'a> PreparedInt4FaithfulnessMap<'a> {
             expected.max_heads = expected.max_heads.max(prepared.head_count());
             plans.push(prepared);
         }
-        expected.request_binding = binding::request(request, limits, authority, &chunks, &plans, control)?;
+        expected.encoding_work = work.checked_sub(before).ok_or(Int4FaithfulnessMapError::Admission)?;
+        expected.request_binding = binding::request(request, limits, authority, encoding,
+            expected.encoding_work, &chunks, &plans, control)?;
         checkpoint(control)?;
         Ok(Self { source, chunks, plans, limits, expected, task: *budget })
     }
@@ -398,11 +474,22 @@ impl<'a> PreparedInt4FaithfulnessMap<'a> {
             chunk_profile: CHUNK_PROFILE.to_owned(), semantics: SEMANTICS.to_owned(), single_context_equivalence: false,
             source_span: self.expected.source, chunk_limits: self.chunks.limits(), tokenizer_checks: self.chunks.tokenizer_calls(),
             planned_model_work: self.planned_work(), model_work: work, retained_result_bytes: bytes, chunks, aggregate,
+            input_encoding: self.expected.encoding_record(),
             request_binding: self.expected.request_binding, result_binding: [0; 32] };
         run.result_binding = binding::result_with_control(&run, self.limits.max_result_bytes, control)?;
         value_bytes(&run, self.limits.max_result_bytes)?;
         checkpoint(control)?; Ok(run)
     }
+}
+fn geometry(rows: impl Iterator<Item = (usize, VerifiedSourceSpan, usize)>) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"faithfulness-map-source-token-geometry-v1");
+    for (id, span, tokens) in rows {
+        for value in [id, span.byte_start, span.byte_end, span.scalar_start, span.scalar_end, tokens] {
+            hash.update((value as u64).to_le_bytes());
+        }
+    }
+    hash.finalize().into()
 }
 fn copy_text(text: &str) -> Result<String, Int4FaithfulnessMapError> {
     let mut copy = String::new(); copy.try_reserve_exact(text.len()).map_err(|_| Int4FaithfulnessMapError::Allocation)?;
