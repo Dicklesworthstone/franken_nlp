@@ -5,6 +5,8 @@ use crate::{canonjson, native_engine::{decode::DecodeCancellationKind,
     lmhead::NANBEIGE_VOCAB_SIZE, portable_int8::ProjectionWork},
     tasks::{mapreduce::ChunkLimits, judge::FaithfulnessAggregationPolicy}};
 
+mod encoding;
+
 fn task() -> TaskBudget {
     TaskBudget { max_input_tokens: 768, max_output_tokens: 16, max_output_bytes: 65_536,
         max_grammar_states: 4096,
@@ -163,6 +165,7 @@ fn all_cancellation_causes_survive_nested_native_or_aggregation_errors() {
     for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost, ParentCancelled,
         ResourceUnavailable, Shutdown, LinkedExit] {
         for error in [Int4FaithfulnessMapError::Judge(Int4JudgeError::Native(StrictInt4Error::Cancelled(cause))),
+            Int4FaithfulnessMapError::Judge(Int4JudgeError::Task(JudgeError::Cancelled(cause))),
             Int4FaithfulnessMapError::Aggregation(FaithfulnessAggregationError::Cancelled(cause))] {
             let mut run = RunState::new(work(2)); run.enter().unwrap();
             run.charge(work(1), BatchRequestContext { request_seq: 1, epoch: 1, input_line: 1, byte_offset: 0 }).unwrap();

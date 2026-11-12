@@ -261,3 +261,48 @@ fn failed_result_encoding_releases_ownership_without_a_committed_prefix_or_refun
     assert_eq!(complete.reserved_work, JobWork::from_int4(work(3), 0));
     assert_eq!((events.values_dropped.get(), events.releases.get()), (3, 3));
 }
+
+
+#[test]
+fn retained_source_claim_replay_authenticates_every_compact_ceiling_before_reexecution() {
+    let root = Root::new(); let inputs = inputs(); let events = Rc::new(Events::default());
+    let retention = crate::jobs::InputRetentionLimits { max_spool_bytes: 65_536 };
+    let make = || {
+        let mut processor = Processor::new(mapping(), limits(), Rc::clone(&events));
+        processor.recipe.input_encoding = Some(compact_policy());
+        processor
+    };
+    let mut job = JobRunner::create_with_retained_inputs(&root.0, key(), JobId([9; 16]), limits(),
+        retention, &inputs, make(), &mut Continue).unwrap();
+    assert_eq!(job.step(&mut Continue).unwrap().unwrap().committed, 1);
+    let first = job.read_committed(0, &mut Continue).unwrap();
+    drop(job);
+    let spool = fs::read(root.0.join("results.spool")).unwrap();
+    for axis in 0..5 {
+        let mut changed = make();
+        if axis == 4 { changed.recipe.input_encoding = None; }
+        else {
+            let Some(UntrustedEncoding::SafeBpeV1(policy)) = &mut changed.recipe.input_encoding else {
+                panic!("compact recipe required");
+            };
+            match axis { 0 => policy.max_input_bytes -= 1, 1 => policy.max_output_tokens -= 1,
+                2 => policy.max_pair_checks -= 1, _ => policy.max_pair_bytes -= 1 }
+        }
+        assert_eq!(error(JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([9; 16]),
+            limits(), retention, changed, TailPolicy::DiscardUncommitted, &mut Continue)),
+            JobRunError::Storage(JobError::Mismatch(MismatchField::Recipe)), "axis {axis}");
+        assert_eq!((events.preparations.get(), events.executions.get()), (1, 1));
+        assert_eq!(fs::read(root.0.join("results.spool")).unwrap(), spool);
+    }
+    let mut restored = JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([9; 16]),
+        limits(), retention, make(), TailPolicy::Refuse, &mut Continue).unwrap();
+    let complete = restored.run(&mut Continue).unwrap();
+    assert_eq!((complete.committed, complete.attempts), (2, 2));
+    assert_eq!(complete.reserved_work, JobWork::from_int4(work(2), 0));
+    assert_eq!((events.preparations.get(), events.executions.get()), (2, 2));
+    assert_eq!(restored.read_committed(0, &mut Continue).unwrap(), first);
+    let second: serde_json::Value = serde_json::from_slice(&restored.read_committed(1, &mut Continue).unwrap()).unwrap();
+    assert_eq!(second[1], "Second complete 上海 source");
+    assert_eq!(second[2], "a different é claim");
+    restored.verify(&mut Continue).unwrap();
+}

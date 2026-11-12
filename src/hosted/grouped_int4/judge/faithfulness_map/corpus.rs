@@ -126,7 +126,8 @@ impl NlpEngine {
         check_team_schedule(compute_threads, cohort_chunks)?;
         let required = int4_faithfulness_document_corpus_requirements_with_max_heads(
             planner.group_width(), planner.task_budget(), planner.planning_limits(), mapping,
-            limits, planner.max_heads(), cohort_chunks)?;
+            limits, planner.max_heads(), cohort_chunks)?
+            .with_input_encoding(planner.document_encoding()).map_err(map_error)?;
         let team_scratch = compute_threads.map(|width|
             int4_task_team_workspace_bytes(width, planner.group_width())).transpose()?.unwrap_or(0);
         sum(&[required.input_bytes, required.native.kv_bytes, required.workspace_bytes,

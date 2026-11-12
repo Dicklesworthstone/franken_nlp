@@ -8,6 +8,7 @@ use crate::{
         BatchRequestContext, BatchWork, output::GuardedOutput,
         int4_document::{RunState, fits, nonzero, subtract}},
     execution_identity::ExecutionIdentity,
+    tokenizer::untrusted::{SafeBpeWork, UntrustedEncoding},
     native_engine::{constrained_int4, decode::DecodeStepControl, int4::PackedInt4Kernel,
         lmhead::scoring::ScoringError,
         strict_int4::{Int4MemoryRequirement, Int4ModelWeights, Int4RunBudget, Int4Work,
@@ -84,6 +85,9 @@ impl Int4FaithfulnessDocumentBatchPlanner {
     pub fn planning_limits(&self) -> JudgeLimits { self.compiler.semantic_configuration().1 }
     pub fn mapping_limits(&self) -> Int4FaithfulnessMapLimits { self.mapping }
     pub fn group_width(&self) -> usize { self.compiler.group_width() }
+    /// Every document and its execution reconstruction use one immutable
+    /// encoding policy and a shared per-attempt tokenizer allowance.
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.compiler.document_encoding() }
     pub fn policy(&self) -> FaithfulnessPolicy { self.policy }
     pub fn max_run_work(&self) -> Int4Work { self.max_run_work }
     pub fn max_heads(&self) -> usize { self.max_heads }
@@ -105,6 +109,7 @@ pub struct PreparedInt4FaithfulnessDocument {
     expected: Int4FaithfulnessMapPreflight,
     identities: Vec<ExecutionIdentity>,
     required_context: usize,
+    encoding_work: SafeBpeWork,
     seal: Arc<()>,
 }
 impl PreparedInt4FaithfulnessDocument {
@@ -114,6 +119,9 @@ impl PreparedInt4FaithfulnessDocument {
     /// Total native heads across every source chunk, not the physical peak.
     pub fn head_count(&self) -> usize { self.expected.head_count() }
     pub fn max_head_count(&self) -> usize { self.expected.max_head_count() }
+    /// Preparation consumption is carried into execution reconstruction;
+    /// possession of a prepared document never renews tokenizer ceilings.
+    pub fn encoding_work(&self) -> SafeBpeWork { self.encoding_work }
 }
 
 /// Preserve the standalone complete-source map wire values verbatim.
@@ -182,8 +190,9 @@ impl<A: Int4FaithfulnessDocumentBatchAdmission> BatchProcessor for NativeInt4Fai
             checkpoint(control)?;
             let request = self.compiler.request(document)?;
             self.backend.check(&self.compiler)?;
-            let plan = self.compiler.compiler.plan_faithfulness_document_with_control(&request,
-                self.compiler.mapping, control).map_err(|error| map_failure(error, false))?;
+            let mut encoding_work = SafeBpeWork::default();
+            let plan = self.compiler.compiler.plan_faithfulness_document_with_encoding_work(&request,
+                self.compiler.mapping, control, &mut encoding_work).map_err(|error| map_failure(error, false))?;
             validate_plan(&plan, &self.compiler)?;
             subtract(self.run.remaining(), plan.planned_work())?;
             let identities = plan.identities().map_err(|error| map_failure(error, false))?;
@@ -191,7 +200,7 @@ impl<A: Int4FaithfulnessDocumentBatchAdmission> BatchProcessor for NativeInt4Fai
             let expected = plan.preflight_metadata(); let required_context = plan.required_context();
             drop(plan); checkpoint(control)?;
             Ok(PreparedInt4FaithfulnessDocument { request, expected, identities, required_context,
-                seal: Arc::clone(&self.compiler.seal) })
+                encoding_work, seal: Arc::clone(&self.compiler.seal) })
         })();
         self.run.finish_preparation(result, self.backend.clean())
     }
@@ -202,7 +211,7 @@ impl<A: Int4FaithfulnessDocumentBatchAdmission> BatchProcessor for NativeInt4Fai
     fn execute<C: DecodeStepControl>(&mut self, _: Self::Prepared, _: &mut C) -> Result<Self::Output, BatchItemFailure> {
         self.run.fail(); Err(BatchItemFailure::fatal(BatchCode::InvalidExecution))
     }
-    fn execute_with_context<C: DecodeStepControl>(&mut self, prepared: Self::Prepared,
+    fn execute_with_context<C: DecodeStepControl>(&mut self, mut prepared: Self::Prepared,
         context: BatchRequestContext, control: &mut C) -> Result<Self::Output, BatchItemFailure> {
         self.run.enter()?;
         let result = (|| {
@@ -214,8 +223,8 @@ impl<A: Int4FaithfulnessDocumentBatchAdmission> BatchProcessor for NativeInt4Fai
             self.run.charge(prepared.planned_work(), context)?;
             checkpoint(control)?;
             let kv = self.backend.check(&self.compiler)?;
-            let plan = self.compiler.compiler.plan_faithfulness_document_with_control(&prepared.request,
-                self.compiler.mapping, control).map_err(|error| map_failure(error, true))?;
+            let plan = self.compiler.compiler.plan_faithfulness_document_with_encoding_work(&prepared.request,
+                self.compiler.mapping, control, &mut prepared.encoding_work).map_err(|error| map_failure(error, true))?;
             validate_plan(&plan, &self.compiler)?;
             let actual = plan.identities().map_err(|error| map_failure(error, true))?;
             if plan.preflight_metadata() != prepared.expected || actual != prepared.identities

@@ -18,6 +18,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
     let started = Instant::now();
     job.storage.input_retention.validate(mode, &args.input)?;
     let map = job.validate(&args)?;
+    let encoding = job.map.input_encoding(&args)?;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
@@ -48,6 +49,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         remaining()?, cancellation.clone(), model_failure)?;
     remaining()?;
     let compiler = Int4JudgePlanner::for_model(model.model_identity(), budget, map.planning)
+        .and_then(|planner| planner.with_document_encoding(encoding.clone()))
         .map_err(|_| CandidateError::Planning)?;
     let planner = Int4FaithfulnessDocumentJobPlanner::new(compiler, policy, map.mapping, lifetime)
         .map_err(|_| CandidateError::Planning)?;
@@ -59,7 +61,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         planner.with_chunk_cohorts(chunks).map_err(|_| CandidateError::Planning)?
     } else { planner };
     planner.check_job_limits(lifetime).map_err(|_| CandidateError::Planning)?;
-    if planner.max_result_bytes() != job.result_bytes(map)? {
+    if planner.max_result_bytes() != job.result_bytes(map)? || planner.document_encoding() != &encoding {
         return Err(Failure::usage("faithfulness_document_job_result_quote"));
     }
     let identity = planner.execution_identity().clone();
@@ -96,7 +98,8 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         quant_recipe: &identity.quant_recipe, group_width: model.model_identity().group_width(),
         integer_kernel: common.kernel.kind().id(), snapshot, cohort_chunks,
         compute_schedule: compute::Schedule::for_threads(common.compute.threads),
-        max_evidence_heads: job.faithfulness.max_evidence_heads, output: &report };
+        max_evidence_heads: job.faithfulness.max_evidence_heads,
+        input_encoding: input_encoding::reported_policy(&encoding), output: &report };
     // Failure can follow durable commits; stdout contains only metadata.
     publish_report(&response, output, &remaining)
 }
@@ -168,6 +171,8 @@ struct Response<'a, T: Serialize> {
     compute_schedule: Option<compute::Schedule>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_evidence_heads: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<&'a crate::tokenizer::untrusted::UntrustedEncoding>,
     output: &'a T,
 }
 

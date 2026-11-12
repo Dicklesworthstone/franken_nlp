@@ -233,8 +233,7 @@ fn unsupported_prompt_sampling_and_cross_document_schedules_are_never_ignored() 
         vec!["--cohort-documents", "1"], vec!["--max-new-tokens", "128"],
         vec!["--max-output-bytes", "65536"], vec!["--min-new-tokens", "0"],
         vec!["--logprobs"], vec!["--seed", "ab"], vec!["--task", "faithfulness"],
-        vec!["--mode", "rubric"], vec!["--max-selected-rows", "128"], vec!["--defaults", "settings"],
-        vec!["--input-encoding", "safe-bpe-v1"]] {
+        vec!["--mode", "rubric"], vec!["--max-selected-rows", "128"], vec!["--defaults", "settings"]] {
         let mut all = vec!["--source-dir", "source", "--source-manifest", "manifest", "--policy", "policy"];
         all.extend_from_slice(&flags);
         assert!(parsed(&all).is_err(), "{flags:?}");
@@ -298,4 +297,62 @@ fn invalid_widths_and_every_explicit_cohort_team_mix_refuse_before_private_io() 
     for required in ["--compute-threads", "--cohort-chunks", "compute_schedule", "without renewing work or attempts"] {
         assert!(help.split_whitespace().collect::<Vec<_>>().join(" ").contains(required));
     }
+}
+
+
+#[test]
+fn compact_corpus_flags_reach_the_complete_document_policy_and_quote_one_workspace() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    for schedule in [vec![], vec!["--cohort-chunks", "3", "--max-evidence-heads", "3"],
+        vec!["--compute-threads", "2"]] {
+        let (byte, byte_args) = arguments(&schedule);
+        let baseline = byte.validate(&byte_args).unwrap();
+        let mut flags = schedule;
+        flags.extend(["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "65536",
+            "--max-tokenizer-output-tokens", "32768", "--max-tokenizer-pair-checks", "1048576",
+            "--max-tokenizer-pair-bytes", "16777216"]);
+        let (compact, mut args) = arguments(&flags);
+        let selected = compact.document.input_encoding(&args).unwrap();
+        let policy = SafeBpeLimits { max_input_bytes: 65536, max_output_tokens: 32768,
+            max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
+        assert_eq!(selected, UntrustedEncoding::SafeBpeV1(policy));
+        let limits = compact.validate(&args).unwrap();
+        assert_eq!(limits.document.memory.input_bytes - baseline.document.memory.input_bytes,
+            policy.requirements().unwrap().workspace_bytes);
+        assert_eq!(limits.document.memory.native, baseline.document.memory.native);
+        assert_eq!(limits.document.mapping.chunks, baseline.document.mapping.chunks);
+        assert_eq!(limits.document.mapping.max_model_work, baseline.document.mapping.max_model_work);
+        assert_eq!(limits.transport, baseline.transport);
+        assert_eq!(limits.cli_preparation_bytes, baseline.cli_preparation_bytes);
+        assert!(limits.common.minimum_memory_bytes >= baseline.common.minimum_memory_bytes);
+        args.memory_mib = limits.common.minimum_memory_bytes.div_ceil(MIB);
+        compact.validate(&args).unwrap();
+        args.memory_mib -= 1;
+        assert_eq!(compact.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
+fn compact_corpus_refuses_invalid_work_policy_and_snapshot_saving_before_private_io() {
+    for flags in [
+        vec!["--max-tokenizer-input-bytes", "65536"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "0"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "1048577"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-output-tokens", "0"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "0"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-bytes", "0"],
+        vec!["--input-encoding", "safe-bpe-v1", "--save-snapshot", "must-not-be-created"],
+    ] {
+        let (command, args) = arguments(&flags);
+        assert_eq!(command.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments), "{flags:?}");
+    }
+    let (command, args) = arguments(&["--input-encoding", "safe-bpe-v1"]);
+    let source = command.validate(&args).unwrap();
+    let pin = "ab".repeat(32);
+    let loaded = parsed(&["--snapshot", "private.snapshot", "--expected-model-sha256", &pin,
+        "--policy", "private-policy.json", "--input-encoding", "safe-bpe-v1"]).unwrap();
+    let Int4Task::FaithfulnessCorpus(restored) = loaded.task else { panic!("faithfulness corpus required"); };
+    let snapshot = restored.validate(&loaded.args).unwrap();
+    assert_eq!(source.document.memory, snapshot.document.memory);
+    assert_eq!(command.document.input_encoding(&args).unwrap(), restored.document.input_encoding(&loaded.args).unwrap());
 }

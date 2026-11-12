@@ -1150,7 +1150,18 @@ source, claim, chunk and evidence head in the invocation. The process admits
 worker scratch once before private input IO, retains charged IO through drain,
 and publishes terminal corpus completion only after physical worker join.
 Teams cannot combine with `--cohort-chunks`, including an explicit chunk width
-of one. These commands retain their byte-based input contract.
+of one. Byte fallback remains the default input encoding.
+
+Both commands also accept `--input-encoding safe-bpe-v1` with all four explicit
+tokenizer work ceilings. Each document attempt carries one allowance through
+preparation and execution reconstruction, including all chunk probes, exact
+claim encodings and independent evidence windows. One transient encoder
+workspace is admitted for the invocation. Source bytes, claim bytes and
+evidence coordinates remain exact; compact prompts can change judgments.
+The full policy authenticates durable resume and appears in output provenance.
+Byte-mode recipes and output keep their prior encoding, and compact snapshot
+saving is refused before private IO. See the population guide for the distinct
+tokenizer, native-work and lifetime limits.
 
 Physical worker width is excluded from durable recipes, so an explicit resume
 may change it without renewing work or attempts. The original policy, evidence

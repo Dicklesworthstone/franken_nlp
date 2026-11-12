@@ -16,8 +16,10 @@ impl<'e, 'w> Backend<'e, 'w> {
         let chunks = compiler.cohort_chunks.ok_or(BatchCode::InvalidLimits)?;
         validate_cohort_chunks(chunks, compiler.mapping)?;
         constrained_int4::check_model(compiler.execution_identity(), weights.identity()).map_err(|_| BatchCode::Admission)?;
-        let required = memory.cohort_requirements(compiler.group_width(), compiler.task_budget(),
+        let mut required = memory.cohort_requirements(compiler.group_width(), compiler.task_budget(),
             compiler.planning_limits(), compiler.mapping, compiler.max_heads, chunks)
+            .map_err(|error| map_failure(error, false).fault)?;
+        required.memory = required.memory.with_input_encoding(compiler.document_encoding())
             .map_err(|error| map_failure(error, false).fault)?;
         Ok(Self::Cohorts { weights, kernel, chunks, context: memory.context_tokens,
             max_heads: compiler.max_heads, required })

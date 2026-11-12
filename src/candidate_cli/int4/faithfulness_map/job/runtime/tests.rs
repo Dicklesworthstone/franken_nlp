@@ -58,14 +58,14 @@ fn completion_reports_only_public_model_and_durable_progress_metadata() {
         source_revision: "public-revision", source_root_sha256: "public-source", model_content_sha256: "public-model",
         candidate_format: "candidate-int4", quant_recipe: "strict-int4", group_width: args.group_width,
         integer_kernel: map.common.kernel.kind().id(), snapshot: None, cohort_chunks: Some(3),
-        max_evidence_heads: None, compute_schedule: None, output: &report };
+        max_evidence_heads: None, compute_schedule: None, input_encoding: None, output: &report };
     let mut bytes = Vec::new(); publish_report(&response, &mut bytes, &available).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["durable_unit"], "complete_original_document"); assert_eq!(value["cohort_chunks"], 3);
     assert_eq!(value["task"], "faithfulness"); assert_eq!(value["output"]["committed"], 2);
     assert_eq!(value["output"]["attempts"], 3);
     assert_eq!(value["output"]["reserved_work"], serde_json::to_value(fixed.max_work).unwrap());
-    for forbidden in ["text", "source", "claim", "scores", "citations", "policy", "recipe", "key", "job_dir", "documents", "aggregate", "max_evidence_heads", "compute_schedule"] {
+    for forbidden in ["text", "source", "claim", "scores", "citations", "policy", "recipe", "key", "job_dir", "documents", "aggregate", "max_evidence_heads", "compute_schedule", "input_encoding"] {
         assert!(value.get(forbidden).is_none()); assert!(value["output"].get(forbidden).is_none());
     }
     assert!(bytes.ends_with(b"\n"));
@@ -178,7 +178,8 @@ fn team_progress_metadata_changes_only_the_optional_physical_schedule() {
             source_revision: "public-revision", source_root_sha256: "public-source", model_content_sha256: "public-model",
             candidate_format: "candidate-int4", quant_recipe: "strict-int4", group_width: args.group_width,
             integer_kernel: map.common.kernel.kind().id(), snapshot: None, cohort_chunks: None,
-            max_evidence_heads: Some(3), compute_schedule: compute::Schedule::for_threads(threads), output: &report };
+            max_evidence_heads: Some(3), compute_schedule: compute::Schedule::for_threads(threads),
+            input_encoding: None, output: &report };
         let mut bytes = Vec::new(); publish_report(&response, &mut bytes, &available).unwrap();
         let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         if threads == 1 { assert!(value.get("compute_schedule").is_none()); }
@@ -198,4 +199,60 @@ fn runtime_rechecks_team_cohort_conflicts_before_private_job_io() {
     let (mut c, args) = command("resume", &["--compute-threads", "4"]);
     let map = c.args.validate(&args).unwrap(); c.args.map.mapping.cohort_chunks = Some(1);
     assert_eq!(execute(c.mode, args, c.args, map, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+}
+
+
+#[test]
+fn compact_job_cli_policy_reaches_the_real_recipe_and_public_progress_metadata() {
+    use crate::native_engine::strict_int4::weights::projection_fixture;
+    let (weights, _) = projection_fixture(128);
+    let mut expected_recipe = None;
+    for threads in ["1", "2"] {
+        let (c, args) = command("resume", &["--input-encoding", "safe-bpe-v1",
+            "--max-tokenizer-input-bytes", "65536", "--max-tokenizer-output-tokens", "32768",
+            "--compute-threads", threads]);
+        let map = c.args.validate(&args).unwrap();
+        let fixed = lifetime(&args, map);
+        let selected = c.args.map.input_encoding(&args).unwrap();
+        let budget = c.args.map.budget(map.common).unwrap();
+        let compiler = Int4JudgePlanner::for_model(weights.identity(), budget, map.planning).unwrap()
+            .with_document_encoding(selected.clone()).unwrap();
+        let policy = FaithfulnessPolicy { minimum_candidate_weight_ppm: 700_000, minimum_margin_milli: 100,
+            evidence_window_bytes: 256, max_evidence_windows: 31, max_evidence_spans: 31 };
+        let planner = Int4FaithfulnessDocumentJobPlanner::new(compiler, policy, map.mapping, fixed).unwrap();
+        assert_eq!(planner.document_encoding(), &selected);
+        let recipe = crate::canonjson::canonical_bytes(planner.job_recipe()).unwrap();
+        let recipe_json: serde_json::Value = serde_json::from_slice(&recipe).unwrap();
+        assert_eq!(recipe_json["input_encoding"], serde_json::to_value(&selected).unwrap());
+        if let Some(expected) = &expected_recipe { assert_eq!(&recipe, expected); }
+        else { expected_recipe = Some(recipe); }
+        let id = JobId([0x12; 16]);
+        let progress = JobProgress { job_id: id, items: 2, committed: 2, attempts: 2,
+            reserved_work: fixed.max_work, spool_bytes: 1024, materialized: false };
+        let report = progress_report(progress, id, fixed, false, c.mode, "faithfulness").unwrap();
+        let response = Response { protocol: "fnlp-candidate-int4-faithfulness-document-job-v1", schema_version: 1,
+            scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "faithfulness",
+            durable_unit: "complete_original_document", model_id: "Nanbeige4.2-3B",
+            source_revision: "fixture-public-revision", source_root_sha256: "fixture-public-source",
+            model_content_sha256: "fixture-public-model", candidate_format: "candidate-int4",
+            quant_recipe: "strict-int4", group_width: args.group_width,
+            integer_kernel: map.common.kernel.kind().id(), snapshot: None, cohort_chunks: None,
+            compute_schedule: compute::Schedule::for_threads(map.common.compute.threads),
+            max_evidence_heads: None, input_encoding: input_encoding::reported_policy(&selected), output: &report };
+        let mut output = Vec::new(); publish_report(&response, &mut output, &available).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["input_encoding"], serde_json::to_value(&selected).unwrap());
+        assert_eq!(value["output"]["committed"], 2);
+        for private in ["text", "source", "claim", "policy", "recipe", "key", "documents"] {
+            assert!(value.get(private).is_none());
+        }
+    }
+}
+
+#[test]
+fn compact_job_runtime_rechecks_snapshot_refusal_before_configuration_or_input_io() {
+    let (c, mut args) = command("resume", &["--input-encoding", "safe-bpe-v1"]);
+    let admitted = c.args.validate(&args).unwrap();
+    args.save_snapshot = Some(PathBuf::from("must-not-be-created"));
+    assert_eq!(execute(c.mode, args, c.args, admitted, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
 }

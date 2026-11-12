@@ -10,6 +10,12 @@ use crate::{artifact::converter::PINNED_REVISION, canonjson,
 
 mod storage;
 
+fn compact_policy() -> UntrustedEncoding {
+    UntrustedEncoding::SafeBpeV1(crate::tokenizer::untrusted::SafeBpeLimits {
+        max_input_bytes: 1 << 18, max_output_tokens: 1 << 17,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 })
+}
+
 const WIDTH: usize = 32;
 struct Continue;
 impl DecodeStepControl for Continue {
@@ -173,6 +179,7 @@ fn omitted_head_cap_preserves_the_exact_legacy_private_recipe() {
         "cohort_chunks": null,
     });
     assert!(actual.max_heads.is_none());
+    assert!(actual.input_encoding.is_none());
     assert_eq!(canonjson::canonical_bytes(&actual).unwrap(), canonjson::canonical_bytes(&legacy).unwrap());
 }
 
@@ -230,4 +237,53 @@ fn source_claim_output_and_each_work_axis_must_fit_stored_authority() {
     let judge = Int4ScoredJobRecipe::judge(WIDTH, budget(), JudgeLimits::default(), None,
         Int4ScoredBatchLimits { max_item_work: mapping().max_model_work, max_model_work: work(6) }).unwrap();
     assert!(Int4FaithfulnessDocumentJobRecipe::new(judge, policy, mapping()).is_err());
+}
+
+
+#[test]
+fn compact_tokenizer_policy_is_complete_resume_authority_without_changing_native_limits() {
+    let make = || recipe(mapping(), policy(), budget(), JudgeLimits::default(), limits());
+    let legacy = make();
+    let mut original = make(); original.input_encoding = Some(compact_policy());
+    let original_binding = freeze(&original).binding;
+    assert_eq!(original_binding.compare(&freeze(&legacy).binding),
+        Err(JobError::Mismatch(MismatchField::Recipe)));
+    for axis in 0..4 {
+        let mut changed = make();
+        let UntrustedEncoding::SafeBpeV1(mut encoding) = compact_policy() else { panic!("compact policy required"); };
+        match axis { 0 => encoding.max_input_bytes -= 1, 1 => encoding.max_output_tokens -= 1,
+            2 => encoding.max_pair_checks -= 1, _ => encoding.max_pair_bytes -= 1 }
+        changed.input_encoding = Some(UntrustedEncoding::SafeBpeV1(encoding));
+        assert_eq!(original_binding.compare(&freeze(&changed).binding),
+            Err(JobError::Mismatch(MismatchField::Recipe)), "axis {axis}");
+        assert_eq!(canonjson::canonical_bytes(&changed.judge).unwrap(),
+            canonjson::canonical_bytes(&legacy.judge).unwrap());
+        assert_eq!(changed.chunks, legacy.chunks);
+        assert_eq!(changed.per_document_model_work, legacy.per_document_model_work);
+    }
+    let mut same = make(); same.input_encoding = Some(compact_policy());
+    assert_eq!(original_binding.compare(&freeze(&same).binding), Ok(()));
+    let wire = serde_json::to_value(&original).unwrap();
+    assert_eq!(wire["input_encoding"], serde_json::to_value(compact_policy()).unwrap());
+    let private = String::from_utf8(canonjson::canonical_bytes(&original_binding).unwrap()).unwrap();
+    for field in ["input_encoding", "max_pair_checks", "max_pair_bytes"] { assert!(!private.contains(field)); }
+}
+
+#[test]
+fn actual_model_bound_factory_projects_compact_policy_and_leaves_default_recipe_unchanged() {
+    let (weights, _) = crate::native_engine::strict_int4::weights::projection_fixture(WIDTH);
+    for encoding in [UntrustedEncoding::ByteFallback, compact_policy()] {
+        let planner = Int4JudgePlanner::for_model(weights.identity(), budget(), JudgeLimits::default()).unwrap()
+            .with_document_encoding(encoding.clone()).unwrap();
+        let planner = Int4FaithfulnessDocumentJobPlanner::new(planner, policy(), mapping(), limits()).unwrap();
+        assert_eq!(planner.document_encoding(), &encoding);
+        match encoding {
+            UntrustedEncoding::ByteFallback => {
+                assert!(planner.job_recipe().input_encoding.is_none());
+                assert_eq!(canonjson::canonical_bytes(planner.job_recipe()).unwrap(),
+                    canonjson::canonical_bytes(&recipe(mapping(), policy(), budget(), JudgeLimits::default(), limits())).unwrap());
+            }
+            selected => assert_eq!(planner.job_recipe().input_encoding.as_ref(), Some(&selected)),
+        }
+    }
 }

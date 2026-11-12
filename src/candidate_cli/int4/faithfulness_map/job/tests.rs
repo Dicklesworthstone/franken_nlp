@@ -135,7 +135,7 @@ fn required_fixed_policy_has_no_claim_or_execution_override_route() {
         words.drain(at..at + 2); assert!(parse(words).is_err());
         for unsupported in [vec!["--claim", "fixed"], vec!["--defaults", "other"], vec!["--cohort-heads", "1"],
             vec!["--prefill-rows", "1"], vec!["--max-selected-rows", "7"], vec!["--max-new-tokens", "128"],
-            vec!["--logprobs"], vec!["--task", "faithfulness"], vec!["--input-encoding", "safe-bpe-v1"]] {
+            vec!["--logprobs"], vec!["--task", "faithfulness"]] {
             let mut words = argv(operation); words.extend(unsupported.into_iter().map(str::to_owned));
             assert!(parse(words).is_err());
         }
@@ -257,4 +257,62 @@ fn unsupported_owned_profile_refuses_before_private_input_or_configuration() {
     let (c, args) = command("resume", &[]);
     assert_eq!(c.execute_owned(args, NoIo, &mut NoIo).unwrap_err().code,
         "owned_faithfulness_document_job_profile_unavailable");
+}
+
+
+#[test]
+fn compact_job_start_and_resume_keep_one_workspace_and_the_same_lifetime_authority() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    for operation in ["start", "resume"] {
+        for schedule in [vec![], vec!["--cohort-chunks", "3", "--max-evidence-heads", "3"],
+            vec!["--compute-threads", "2"]] {
+            let (byte, byte_args) = command(operation, &schedule);
+            let baseline = byte.args.validate(&byte_args).unwrap();
+            let fixed = lifetime(&byte_args, baseline);
+            let mut flags = schedule;
+            flags.extend(["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "65536",
+                "--max-tokenizer-output-tokens", "32768", "--max-tokenizer-pair-checks", "1048576",
+                "--max-tokenizer-pair-bytes", "16777216"]);
+            let (compact, args) = command(operation, &flags);
+            let policy = SafeBpeLimits { max_input_bytes: 65536, max_output_tokens: 32768,
+                max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
+            assert_eq!(compact.args.map.input_encoding(&args).unwrap(), UntrustedEncoding::SafeBpeV1(policy));
+            let map = compact.args.validate(&args).unwrap();
+            let admitted = compact.args.lifetime_limits(&args, map, fixed).unwrap();
+            let old = byte.args.lifetime_limits(&byte_args, baseline, fixed).unwrap();
+            assert_eq!(map.memory.input_bytes - baseline.memory.input_bytes,
+                policy.requirements().unwrap().workspace_bytes);
+            assert_eq!(map.memory.native, baseline.memory.native);
+            assert_eq!(map.mapping.chunks, baseline.mapping.chunks);
+            assert_eq!(map.mapping.max_model_work, fixed.max_work.int4_model_work());
+            assert_eq!(admitted.buffer_bytes, old.buffer_bytes);
+            assert_eq!(admitted.map.mapping.max_model_work, old.map.mapping.max_model_work);
+        }
+    }
+}
+
+#[test]
+fn compact_job_refuses_invalid_policy_before_config_or_population_io_and_reports_it_on_failure() {
+    for operation in ["start", "resume"] {
+        for flags in [
+            vec!["--max-tokenizer-input-bytes", "65536"],
+            vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "0"],
+            vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-output-tokens", "0"],
+            vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "0"],
+            vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-bytes", "0"],
+            vec!["--input-encoding", "safe-bpe-v1", "--save-snapshot", "must-not-be-created"],
+        ] {
+            let (command, args) = command(operation, &flags);
+            assert_eq!(command.execute_owned(args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+        }
+        let (mut command, args) = command(operation, &["--input-encoding", "safe-bpe-v1"]);
+        let selected = command.args.map.input_encoding(&args).unwrap();
+        command.args.storage.store_results = false;
+        let mut diagnostics = Vec::new();
+        assert_eq!(command.run_owned(args, NoIo, &mut NoIo, &mut diagnostics), ErrorCode::Usage.as_process_exit());
+        let error: serde_json::Value = serde_json::from_slice(&diagnostics).unwrap();
+        assert_eq!(error["input_encoding"], serde_json::to_value(selected).unwrap());
+        assert_eq!(error["code"], "explicit_faithfulness_document_job_storage");
+        for private in ["source", "claim", "policy", "job_dir", "key"] { assert!(error.get(private).is_none()); }
+    }
 }

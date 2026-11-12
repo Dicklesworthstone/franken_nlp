@@ -155,3 +155,32 @@ fn owned_reader_and_private_recipe_share_the_existing_job_boundary() {
     fn send<T: Send + 'static>() {}
     send::<JobInput<std::io::Cursor<Vec<u8>>>>();
 }
+
+
+#[test]
+fn durable_populations_add_one_encoder_without_multiplying_by_items_attempts_or_heads() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    let policy = SafeBpeLimits { max_input_bytes: 65536, max_output_tokens: 32768,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
+    let encoding = UntrustedEncoding::SafeBpeV1(policy);
+    let encoder = policy.requirements().unwrap().workspace_bytes;
+    let (task, planning, mapping, job, host) = fixture();
+    for heads in [1, 3, 32] {
+        for chunks in [None, Some(3), Some(64)] {
+            for items in [3, 30] {
+                let mut job = job; job.max_items = items; job.max_attempts = 100;
+                let base = requirements(32, task, planning, mapping, job, host,
+                    heads, chunks, JobInputMemory::CompletePopulation).unwrap();
+                let compact = base.with_input_encoding(&encoding).unwrap();
+                assert_eq!(compact.input_bytes, base.input_bytes + encoder);
+                assert_eq!(compact.native, base.native);
+                assert_eq!(compact.workspace_bytes, base.workspace_bytes);
+                assert_eq!(compact.max_output_bytes, base.max_output_bytes);
+                assert_eq!(compact.output_reservation_bytes, base.output_reservation_bytes);
+                assert_eq!(base.with_input_encoding(&UntrustedEncoding::ByteFallback).unwrap(), base);
+                let mut invalid = policy; invalid.max_output_tokens = 0;
+                assert!(base.with_input_encoding(&UntrustedEncoding::SafeBpeV1(invalid)).is_err());
+            }
+        }
+    }
+}

@@ -53,7 +53,7 @@ fnlp candidate source-int4 faithfulness-corpus claims.ndjson \
 ```
 
 The source-directory route uses `--source-dir` and `--source-manifest` instead
-of the snapshot flags. Optional `--save-snapshot NEW_FILE` follows fixed
+of the snapshot flags. In byte mode, optional `--save-snapshot NEW_FILE` follows fixed
 model/policy/envelope admission. The snapshot may remain if a later record is
 rejected. Acquisition is explicit; this command does not download a model.
 
@@ -87,6 +87,57 @@ omitted for width one. This is physical scheduling metadata, not a fabricated
 projection count, speed measurement or new judgment score. The wrapped inner
 events and complete-source results keep their existing contracts.
 
+## Bounded compact source and claim encoding
+
+Both population commands accept `--input-encoding safe-bpe-v1`. Repeat the
+same selection and all four work limits on `faithfulness-document-job resume`:
+
+| Flag | Bounded work within one document attempt |
+| --- | --- |
+| `--max-tokenizer-input-bytes` | Total UTF-8 bytes consumed across every encoding call |
+| `--max-tokenizer-output-tokens` | Total tokens produced across every encoding call |
+| `--max-tokenizer-pair-checks` | Total BPE pair inspections |
+| `--max-tokenizer-merge-bytes` | Total bytes processed by BPE merges |
+
+The shared allowance covers **both preparation and execution reconstruction**.
+Each pass includes claim-capacity preparation, accepted and rejected source
+sizing probes, and every complete chunk judgment with its independently
+encoded evidence windows. It does not renew for another chunk, evidence head
+or native cohort. A document whose preparation fits can still be refused
+during reconstruction if the remaining allowance is insufficient. The native
+attempt debit has already been charged at that point and is not refunded.
+
+These tokenizer ceilings apply per document attempt. They are separate from
+the live corpus's five whole-run native ceilings and the durable job's
+persisted native lifetime and attempt limits. A complete map's encoding work
+receipt describes its own planning pass so preparation and reconstruction can
+compare the same sealed result; the in-memory attempt ledger carries the
+cumulative consumption across both passes. It is not a new persisted lifetime
+tokenizer counter. `--max-tokenizer-calls` separately bounds chunk-sizing
+probes. Original source/claim bytes still obey `--max-input-bytes`, and each
+actual prompt must fit the native context.
+
+Compact token counts choose chunk boundaries without altering the original
+UTF-8 source or exact claim. Evidence windows are encoded from their original
+byte spans, independently of the enclosing chunk's token sequence. Evidence
+byte/scalar coordinates and counterevidence remain complete. Tiny ASCII
+evidence windows are supported; an indivisible scalar or CRLF that cannot fit
+the declared evidence byte cap refuses the document.
+
+One bounded encoder workspace is admitted alongside map, transport and
+retained-plan ownership before private IO. Its size is not multiplied by the
+number of documents, chunks, evidence heads, cohorts or numerical workers.
+The selected full policy appears on every live event and on durable progress
+and error metadata. It also binds execution identity and the immutable job
+recipe: changed limits or a changed encoding refuse authenticated resume.
+Physical worker width may still change under the existing scheduling rules.
+
+Byte fallback remains the default. Omitting compact input preserves the old
+byte-mode recipe and omits optional encoding provenance. Compact input is
+supported with independently pinned snapshot loading; `--save-snapshot` is
+refused before private IO in compact mode. Compact prompts can change model
+output; this feature makes no judgment-parity, quality or speed claim.
+
 ## Work and scheduling
 
 The five native flags bound the **whole live corpus**:
@@ -113,8 +164,8 @@ Numerical workers parallelize output rows within the existing INT4
 projections. The planner still uses the exact complete source and claim,
 full-vocabulary NLI scores, fixed evidence policy, original evidence
 coordinates and the same complete-source reduction. All five native work
-ceilings and the original invocation deadline retain their meaning. This
-route remains byte based and does not accept `--input-encoding safe-bpe-v1`.
+ceilings and the original invocation deadline retain their meaning. Both byte
+fallback and explicit bounded compact input use the same scheduling rules.
 
 Worker scratch is admitted once for the complete invocation before private
 policy, model or population IO. The CLI also prices one runtime thread in
@@ -264,7 +315,7 @@ fnlp candidate source-int4 faithfulness-document-job start claims.ndjson \
 
 Use the same invocation with `resume` in place of `start` to continue pending
 records. Repeat the exact policy, model/group identity, task and planning
-limits, map settings, native chunk schedule and immutable job limits. Committed records
+limits, map settings, exact input-encoding policy, native chunk schedule and immutable job limits. Committed records
 are authenticated and skipped; an unfinished source is retried from its
 beginning if the original attempt and work ceilings permit it. No partial
 source result is committed.
@@ -329,6 +380,13 @@ let planner = Int4FaithfulnessDocumentBatchPlanner::new(
 // Optional explicit schedule:
 let planner = planner.with_chunk_cohorts(3)?;
 ```
+
+To choose compact input, call `.with_document_encoding(encoding)?` on the
+`Int4JudgePlanner` before constructing either population planner. Both expose
+`.document_encoding()` for the exact immutable policy. When quoting memory
+outside the hosted route, call `.with_input_encoding(planner.document_encoding())?`
+exactly once on the returned `Int4FaithfulnessMapMemoryRequirement`.
+The hosted routes apply that addition themselves.
 
 `NlpEngine::batch_int4_faithfulness_documents` takes the planner, resident
 model, `CorpusLimits`, explicit kernel, owned reader/writer and cancellation
@@ -399,7 +457,10 @@ cohort refusal before IO, scratch accounting, process-thread admission,
 physical drain and terminal delivery, unchanged inner framing, all typed
 cancellation causes, and real model-bound recipe/identity invariance across
 widths one/two/four/64 for start/resume. Recipe fixtures distinguish omitted
-evidence-head caps from explicit caps, including explicit 32. These are
+evidence-head caps from explicit caps, including explicit 32. Compact-input
+regression definitions cover cumulative preparation/reconstruction budgets,
+changed-policy resume authentication, retained replay, pre-IO memory admission,
+exact policy provenance and byte-mode compatibility. These are
 source definitions; they do not establish numerical parity or throughput.
 Compilation and test execution remain **UNRUN** in this
 session under the repository's controller-owned DSR policy. Native parity,

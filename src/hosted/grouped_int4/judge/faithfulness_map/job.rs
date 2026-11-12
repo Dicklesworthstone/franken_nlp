@@ -83,7 +83,8 @@ impl NlpEngine {
         let cohort_chunks = planner.cohort_chunks();
         check_team_schedule(compute_threads, cohort_chunks)?;
         let required = requirements(planner.group_width(), planner.task_budget(), planner.planning_limits(),
-            mapping, request.limits, limits, planner.max_heads(), cohort_chunks, request.mode.input_memory())?;
+            mapping, request.limits, limits, planner.max_heads(), cohort_chunks, request.mode.input_memory())?
+            .with_input_encoding(planner.document_encoding()).map_err(map_error)?;
         let team_scratch = compute_threads.map(|width|
             int4_task_team_workspace_bytes(width, planner.group_width())).transpose()?.unwrap_or(0);
         sum(&[required.input_bytes, required.native.kv_bytes, required.workspace_bytes,

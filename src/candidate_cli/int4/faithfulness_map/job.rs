@@ -34,9 +34,9 @@ struct FaithfulnessArgs {
 
 pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
     let operation = |name: &'static str, about: &'static str| {
-        let command = FaithfulnessArgs::augment_args(StorageArgs::augment_args(super::population_definition()
+        let command = FaithfulnessArgs::augment_args(StorageArgs::augment_args(judge::encoding_definition(super::population_definition())
             .name(name).about(about)
-            .long_about("Retain and resume faithfulness judgments of COMPLETE original sources with a required fixed --policy FaithfulnessPolicy JSON file. By default, supply the COMPLETE original {id,text,task_args:{claim}} NDJSON population on every invocation; explicit retained-input replay is available. text is never a pre-split chunk; every row supplies its own nonempty claim and no policy or budget overrides. The combined exact source and claim bytes must fit the immutable stored per-item input ceiling. Every source chunk and evidence head must finish before the original document commits. Retain full-vocabulary NLI scores, contrary and uncertain evidence, original byte/scalar coordinates and the named complete-source reduction. --cohort-chunks shares native layers within a document; each actual ragged window must fit 64 heads without resizing or fallback. Repeat the exact policy, task budget, mapping and chunk schedule on resume; physical --compute-threads width may change. Requires --store-results, protected existing --job-dir and --key-file, exact --job-id and immutable --limits. All five per-document work flags cover every chunk and evidence head. JobLimits.max_work is the sole lifetime allowance, including failed attempts; mask_node_visits must be zero. Chunks, attempts and resume never renew that allowance. Complete input, planning, native, retained-result and durable-job memory are admitted before population IO. Stdout is metadata only; --materialize publishes private results after every document commits. No partial-document success, automatic retry, generation, selected-row heads, calibrated correctness probability or full-context equivalence. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
+            .long_about("Retain and resume faithfulness judgments of COMPLETE original sources with a required fixed --policy FaithfulnessPolicy JSON file. By default, supply the COMPLETE original {id,text,task_args:{claim}} NDJSON population on every invocation; explicit retained-input replay is available. text is never a pre-split chunk; every row supplies its own nonempty claim and no policy or budget overrides. The combined exact source and claim bytes must fit the immutable stored per-item input ceiling. Every source chunk and evidence head must finish before the original document commits. Retain full-vocabulary NLI scores, contrary and uncertain evidence, original byte/scalar coordinates and the named complete-source reduction. --cohort-chunks shares native layers within a document; each actual ragged window must fit 64 heads without resizing or fallback. Repeat the exact policy, task budget, mapping and chunk schedule on resume; physical --compute-threads width may change. Requires --store-results, protected existing --job-dir and --key-file, exact --job-id and immutable --limits. All five per-document work flags cover every chunk and evidence head. JobLimits.max_work is the sole lifetime allowance, including failed attempts; mask_node_visits must be zero. Chunks, attempts and resume never renew that allowance. Complete input, planning, native, retained-result and durable-job memory are admitted before population IO. Stdout is metadata only; --materialize publishes private results after every document commits. No partial-document success, automatic retry, generation, selected-row heads, calibrated correctness probability or full-context equivalence. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64. Safe-bpe-v1 keeps every original source and claim byte, partition probe and evidence head. Its four cumulative work ceilings cover document preparation plus execution reconstruction and are authenticated in the durable recipe. Repeat the exact encoding policy on resume, including retained-input replay. Every attempted document receives one bounded encoder allowance; native lifetime work never renews. Encoder workspace is admitted before population IO. Progress and error reports expose the selected compact policy; byte fallback preserves legacy recipe and report bytes. Compact snapshot saving is refused.")
             .after_help(job_cli::INPUT_RETENTION_HELP)
             .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population with a claim per record; omit with --use-retained-input; '-' reads stdin"))
             .mut_arg("max_input_bytes", |arg| arg.help("Outer ceiling for combined source and claim bytes; immutable stored input ceiling must fit"))
@@ -146,17 +146,20 @@ impl JobCommand {
             faithfulness: FaithfulnessArgs::from_arg_matches(matches)? };
         let mut common = Int4Args::from_arg_matches(matches)?;
         common.compute = compute::Args::from_matches(matches)?;
+        common.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
         Ok((Self { mode, args }, common))
     }
     pub(in crate::candidate_cli::int4) fn run_owned<R: Read + Send + 'static>(self, args: Int4Args,
         input: R, output: &mut impl Write, diagnostics: &mut impl Write) -> ExitCode {
         let operation = self.mode.name();
+        let input_encoding = self.args.map.input_encoding(&args).ok()
+            .filter(|encoding| !matches!(encoding, crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback));
         match self.execute_owned(args, input, output) {
             Ok(()) => ExitCode::SUCCESS,
             Err(failure) => {
                 let report = ErrorReport { schema_version: 1, operation, status: "error", code: failure.code,
                     exit_code: failure.exit, durable_progress_may_exist: true,
-                    recovery: "authenticate stored job status or explicitly resume; do not assume rollback" };
+                    recovery: "authenticate stored job status or explicitly resume; do not assume rollback", input_encoding };
                 if publish(&report, job_cli::REPORT_BYTES, diagnostics).is_err() { return ErrorCode::Generic.as_process_exit(); }
                 failure.exit.as_process_exit()
             }
@@ -181,4 +184,6 @@ fn product(value: u64, count: u64) -> Result<u64, Failure> {
 struct ErrorReport {
     schema_version: u32, operation: &'static str, status: &'static str,
     code: &'static str, exit_code: ErrorCode, durable_progress_may_exist: bool, recovery: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<crate::tokenizer::untrusted::UntrustedEncoding>,
 }

@@ -57,11 +57,11 @@ fn provenance_declares_complete_source_and_physical_schedule_without_private_pol
         model_id: "Nanbeige4.2-3B", source_revision: "revision", source_root_sha256: "root",
         model_content_sha256: "content", candidate_format: "format", quant_recipe: "recipe",
         group_width: 128, integer_kernel: "s_scalar_i32", snapshot: None, max_evidence_heads: None,
-        compute_schedule: None };
+        compute_schedule: None, input_encoding: None };
     let value = serde_json::to_value(&provenance).unwrap();
     assert_eq!(value["source_mode"], "complete_source");
     assert_eq!(value["cohort_chunks"], 3);
-    for absent in ["source", "claim", "policy", "policy_file", "snapshot", "max_evidence_heads", "compute_schedule"] {
+    for absent in ["source", "claim", "policy", "policy_file", "snapshot", "max_evidence_heads", "compute_schedule", "input_encoding"] {
         assert!(value.get(absent).is_none());
     }
     provenance.max_evidence_heads = Some(1);
@@ -81,7 +81,7 @@ fn row_team_provenance_is_optional_and_does_not_change_inner_events_or_head_poli
             model_id: "Nanbeige4.2-3B", source_revision: "revision", source_root_sha256: "root",
             model_content_sha256: "content", candidate_format: "format", quant_recipe: "recipe",
             group_width: 128, integer_kernel: "s_scalar_i32", snapshot: None, max_evidence_heads: Some(3),
-            compute_schedule: compute::Schedule::for_threads(threads) };
+            compute_schedule: compute::Schedule::for_threads(threads), input_encoding: None };
         let mut value = serde_json::to_value(&provenance).unwrap();
         if threads == 1 { assert!(value.get("compute_schedule").is_none()); }
         else {
@@ -115,6 +115,64 @@ fn team_runtime_rechecks_conflicts_and_prices_the_admitted_process_width() {
     }
     let (mut command, args) = super::super::tests::arguments(&["--compute-threads", "4"]);
     let admitted = command.validate(&args).unwrap(); command.document.mapping.cohort_chunks = Some(1);
+    assert_eq!(execute(args, command, admitted, super::super::tests::NoIo, super::super::tests::NoIo),
+        Err(CandidateError::Arguments));
+}
+
+
+#[test]
+fn selected_compact_policy_matches_host_memory_and_is_present_on_every_stream_record() {
+    for chunks in [None, Some(3)] {
+        let (mut command, args) = super::super::tests::arguments(&[
+            "--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "65536",
+            "--max-tokenizer-output-tokens", "32768", "--max-result-bytes", "65536"]);
+        command.document.mapping.cohort_chunks = chunks;
+        command.stream.max_evidence_heads = Some(3);
+        let selected = command.document.input_encoding(&args).unwrap();
+        let limits = command.validate(&args).unwrap();
+        let budget = command.document.budget_with_max_heads(limits.common, 3).unwrap();
+        let host = host_limits(&args, limits, Duration::from_secs(1));
+        let base = crate::hosted::int4_faithfulness_document_corpus_requirements_with_max_heads(
+            args.group_width, budget, limits.document.planning, limits.document.mapping, host, 3, chunks).unwrap();
+        let quote = base.with_input_encoding(&selected).unwrap();
+        assert_eq!(quote.input_bytes, limits.document.memory.input_bytes
+            + corpus_buffer_bytes(limits.transport, limits.common.preparation_bytes, limits.io_bytes).unwrap()
+            + retained_metadata_bytes(limits.document.mapping.chunks.max_chunks).unwrap());
+        assert_eq!(quote.native, limits.document.memory.native);
+        assert_eq!(quote.workspace_bytes, limits.document.memory.workspace_bytes);
+        let provenance = Provenance { protocol: "fnlp-candidate-int4-faithfulness-corpus-v1", schema_version: 1,
+            scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "faithfulness",
+            source_mode: "complete_source", chunk_schedule: chunk_schedule(chunks), cohort_chunks: chunks,
+            model_id: "Nanbeige4.2-3B", source_revision: "revision", source_root_sha256: "root",
+            model_content_sha256: "content", candidate_format: "format", quant_recipe: "recipe",
+            group_width: args.group_width, integer_kernel: "s_scalar_i32", snapshot: None,
+            max_evidence_heads: Some(3), compute_schedule: None,
+            input_encoding: input_encoding::reported_policy(&selected) };
+        let mut output = Vec::new();
+        {
+            let mut writer = CandidateWriter::new(&mut output, &provenance, 8192, 65536).unwrap();
+            for event in ["doc_result", "doc_error", "flush", "run_complete"] {
+                // Transport-only frames, never fabricated native evidence.
+                let frame = format!("{{\"event\":\"{event}\",\"fixture\":true}}\n");
+                writer.write_all(frame.as_bytes()).unwrap();
+                writer.flush().unwrap();
+            }
+        }
+        for (index, line) in output.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()).enumerate() {
+            let value: serde_json::Value = serde_json::from_slice(line).unwrap();
+            assert_eq!(value["input_encoding"], serde_json::to_value(&selected).unwrap());
+            assert_eq!(value["record"]["event"], ["doc_result", "doc_error", "flush", "run_complete"][index]);
+            assert_eq!(value["record"]["fixture"], true);
+            for private in ["source", "claim", "policy", "policy_file"] { assert!(value.get(private).is_none()); }
+        }
+    }
+}
+
+#[test]
+fn compact_corpus_runtime_revalidates_snapshot_refusal_before_any_private_io() {
+    let (command, mut args) = super::super::tests::arguments(&["--input-encoding", "safe-bpe-v1"]);
+    let admitted = command.validate(&args).unwrap();
+    args.save_snapshot = Some(PathBuf::from("must-not-be-created"));
     assert_eq!(execute(args, command, admitted, super::super::tests::NoIo, super::super::tests::NoIo),
         Err(CandidateError::Arguments));
 }

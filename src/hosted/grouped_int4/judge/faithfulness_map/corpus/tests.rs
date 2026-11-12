@@ -214,3 +214,31 @@ fn owned_stream_and_quote_are_available_on_the_existing_host_surface() {
     fn send<T: Send + 'static>() {}
     send::<StreamInput<std::io::Cursor<Vec<u8>>, Vec<u8>>>();
 }
+
+
+#[test]
+fn compact_population_quote_has_one_encoder_owner_across_all_chunk_and_head_bounds() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    let policy = SafeBpeLimits { max_input_bytes: 65536, max_output_tokens: 32768,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
+    let encoding = UntrustedEncoding::SafeBpeV1(policy);
+    let encoder = policy.requirements().unwrap().workspace_bytes;
+    let (task, planning, mapping, limits) = fixture();
+    for heads in [1, 3, 32] {
+        for chunks in [None, Some(1), Some(3), Some(64)] {
+            let base = int4_faithfulness_document_corpus_requirements_with_max_heads(
+                32, task, planning, mapping, limits, heads, chunks).unwrap();
+            assert_eq!(base.with_input_encoding(&UntrustedEncoding::ByteFallback).unwrap(), base);
+            let compact = base.with_input_encoding(&encoding).unwrap();
+            assert_eq!(compact.input_bytes, base.input_bytes + encoder);
+            assert_eq!(compact.native, base.native);
+            assert_eq!(compact.workspace_bytes, base.workspace_bytes);
+            assert_eq!(compact.output_reservation_bytes, base.output_reservation_bytes);
+            assert_eq!(compact.max_output_bytes, base.max_output_bytes);
+            let mut invalid = policy; invalid.max_pair_checks = 0;
+            assert!(base.with_input_encoding(&UntrustedEncoding::SafeBpeV1(invalid)).is_err());
+            let mut full = base; full.input_bytes = u64::MAX - encoder + 1;
+            assert!(full.with_input_encoding(&encoding).is_err());
+        }
+    }
+}

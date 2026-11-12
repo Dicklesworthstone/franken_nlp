@@ -8,6 +8,7 @@ use crate::{
         Int4FaithfulnessDocumentBatchPlanner, Int4FaithfulnessDocumentRun,
         NativeInt4FaithfulnessDocumentBatch, PreparedInt4FaithfulnessDocument},
     jobs::manifest::bounded_json,
+    tokenizer::untrusted::UntrustedEncoding,
     native_engine::{int4::PackedInt4Kernel, strict_int4::{Int4ModelWeights, Int4Work}},
     tasks::{mapreduce::{CHUNK_PROFILE, ChunkLimits}, judge::{FaithfulnessPolicy,
         FaithfulnessAggregationPolicy, FAITHFULNESS_AGGREGATION_PROFILE, JudgeLimits,
@@ -42,6 +43,10 @@ pub struct Int4FaithfulnessDocumentJobRecipe {
     /// Absence preserves the original recipe bytes and 32-head declaration.
     #[serde(skip_serializing_if = "Option::is_none")]
     max_heads: Option<usize>,
+    /// The complete compact policy is resume authority. Absence preserves
+    /// byte-mode recipe bytes for previously created source/claim jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<UntrustedEncoding>,
 }
 impl Int4FaithfulnessDocumentJobRecipe {
     fn new(judge: Int4ScoredJobRecipe, policy: FaithfulnessPolicy, mapping: Int4FaithfulnessMapLimits)
@@ -57,7 +62,7 @@ impl Int4FaithfulnessDocumentJobRecipe {
             reservation_policy: "exact-all-chunk-five-axis-work-before-durable-attempt-v1",
             judge, policy, chunks, per_document_model_work: max_model_work,
             max_retained_result_bytes, max_result_bytes, max_stored_result_bytes: max_result_bytes,
-            aggregation, cohort_chunks: None, max_heads: None };
+            aggregation, cohort_chunks: None, max_heads: None, input_encoding: None };
         bounded_json(&recipe, RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
         Ok(recipe)
     }
@@ -78,7 +83,11 @@ impl Int4FaithfulnessDocumentJobPlanner {
         let native = Int4ScoredBatchLimits { max_item_work: mapping.max_model_work,
             max_model_work: limits.max_work.int4_model_work() };
         let judge = Int4ScoredJobRecipe::judge(planner.group_width(), task, planning, None, native)?;
-        let recipe = Int4FaithfulnessDocumentJobRecipe::new(judge, policy, mapping)?;
+        let mut recipe = Int4FaithfulnessDocumentJobRecipe::new(judge, policy, mapping)?;
+        if planner.document_encoding() != &UntrustedEncoding::ByteFallback {
+            recipe.input_encoding = Some(planner.document_encoding().clone());
+            bounded_json(&recipe, RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
+        }
         let compiler = Int4FaithfulnessDocumentBatchPlanner::new(planner, policy, mapping, native.max_model_work)?;
         Ok(Self { compiler, identity, recipe, limits })
     }
@@ -108,6 +117,7 @@ impl Int4FaithfulnessDocumentJobPlanner {
     pub fn document_limits(&self) -> Int4FaithfulnessMapLimits { self.compiler.mapping_limits() }
     pub fn job_limits(&self) -> JobLimits { self.limits }
     pub fn group_width(&self) -> usize { self.compiler.group_width() }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.compiler.document_encoding() }
     pub fn policy(&self) -> FaithfulnessPolicy { self.compiler.policy() }
     pub fn max_heads(&self) -> usize { self.compiler.max_heads() }
     pub fn cohort_chunks(&self) -> Option<usize> { self.compiler.cohort_chunks() }
