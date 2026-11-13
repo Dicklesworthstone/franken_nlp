@@ -2,7 +2,7 @@
 use super::*;
 use std::{sync::Arc, time::{Duration, Instant}};
 use crate::{
-    NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
+    NlpEngine, MemoryClass,
     execution_identity::{ExecutionIdentity, NumericsProfile, Sha256Digest, ThinkingMode, ToolMode},
     corpus::{resolve::{ResolutionPlan, ResolveError, RESOLVE_VERSION},
         native_resolve::{ResolutionPlanner, grouped_int4::{Int4ResolveError, Int4ResolutionRun, INT4_RESOLUTION_EXECUTION}}},
@@ -151,12 +151,8 @@ pub(super) fn execute(args: Int4Args, command: ResolveArgs, _admitted: Int4Limit
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: limits.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().map_err(|_| CandidateError::Runtime)?;
+    let engine = NlpEngine::builder().resource_config(compute::resource_config(limits))
+        .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
     let _preparation = lease.reserve(MemoryClass::JobBuffers, limits.preparation_bytes)
         .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
@@ -223,6 +219,14 @@ pub(super) fn execute(args: Int4Args, command: ResolveArgs, _admitted: Int4Limit
         check_result(&result.result().output, expected)?;
         remaining()?;
         publish_complete(&Response { provenance: &provenance, output: result.result() }, cap, output, &remaining)
+    } else if limits.compute.threads > 1 {
+        let result = engine.resolve_int4_with_threads(&model, population.documents, Arc::new(planner), config,
+            limits.kernel, limits.compute.threads, cancellation).map_err(execution_error)?;
+        check_result(result.result(), expected)?;
+        remaining()?;
+        let response = Response { provenance: &provenance, output: result.result() };
+        publish_complete(&compute::Response { response: &response, compute: Some(result.compute()) },
+            cap, output, &remaining)
     } else {
         let result = engine.resolve_int4(&model, population.documents, Arc::new(planner), config,
             limits.kernel, cancellation).map_err(execution_error)?;

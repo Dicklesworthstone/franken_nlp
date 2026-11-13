@@ -71,7 +71,7 @@ fn fixed_policy_rejects_duplicate_keys_omissions_and_authority_overrides() {
     assert_eq!(parsed.ner.max_entities, 8);
     assert_eq!(parsed.options.blocking, crate::corpus::resolve::BlockingPolicy::ExactSurface);
     for field in ["documents", "budget", "work", "model", "execution_identity", "seed", "thinking", "tools",
-        "cohort_pairs", "cohort_chunks", "schedule"] {
+        "cohort_pairs", "cohort_chunks", "schedule", "compute_threads", "compute"] {
         let mut value = policy(); value[field] = json!({});
         assert!(Policy::parse(&value.to_string()).is_err());
     }
@@ -202,4 +202,38 @@ fn malformed_limits_and_borrowed_dispatch_refuse_before_any_private_io() {
 fn unavailable_runtime_does_not_open_policy_model_input_or_output() {
     let (command, args) = args(&[]);
     assert_eq!(command.execute_owned(args, NoIo, NoIo).unwrap_err().code, "entity_corpus_profile_unavailable");
+}
+
+#[test]
+fn corpus_row_team_is_fixed_for_the_stream_without_renewing_any_semantic_budget() {
+    for threads in ["1", "2", "3", "64"] {
+        let (mut command, mut args) = args(&["--chunked", "--compute-threads", threads]);
+        args.memory_mib = 131072;
+        let limits = command.validate(&args).unwrap();
+        assert_eq!(limits.common.compute.threads, threads.parse::<usize>().unwrap());
+        let config = command.configuration(&args, limits.common, Policy::parse(&policy().to_string()).unwrap()).unwrap();
+        command.stream.max_snapshots = 1;
+        let once = command.validate(&args).unwrap();
+        let after = command.configuration(&args, once.common, Policy::parse(&policy().to_string()).unwrap()).unwrap();
+        assert_eq!(limits.common.compute, once.common.compute);
+        assert_eq!(limits.common.minimum_memory_bytes, once.common.minimum_memory_bytes);
+        assert_eq!(config.max_model_work, after.max_model_work);
+        assert_eq!(config.masks.max_visits_per_run, after.masks.max_visits_per_run);
+        assert_eq!(config.verification, after.verification);
+        assert_eq!(config.scoring.planning.per_head.max_kv_bytes, limits.common.native.kv_bytes);
+        assert_eq!(config.ner_budget.max_kv_bytes, limits.common.native.kv_bytes);
+    }
+}
+
+#[test]
+fn invalid_corpus_teams_and_cohort_combinations_refuse_before_policy_model_and_stream_io() {
+    for flags in [
+        vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+        vec!["--compute-threads", "2", "--cohort-chunks", "2"],
+        vec!["--compute-threads", "3", "--cohort-pairs", "1"],
+        vec!["--chunked", "--compute-threads", "3", "--cohort-chunks", "1", "--cohort-pairs", "1"],
+    ] {
+        let (command, args) = args(&flags);
+        assert_eq!(command.execute_owned(args, NoIo, NoIo).err().unwrap().exit, ErrorCode::Usage);
+    }
 }

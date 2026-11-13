@@ -2,7 +2,7 @@
 use super::*;
 use std::{io::{BufRead, BufReader}, sync::Arc, time::{Duration, Instant}};
 use crate::{
-    NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
+    NlpEngine, MemoryClass,
     corpus::{entities_int4::{Int4EntityError, prepare_int4_entities},
         entity_stream::EntityStreamError, native_resolve::grouped_int4::Int4ResolveError, resolve::ResolveError},
     hosted::{CancellationToken, HostedError, Int4HostError, NativeLimits, RunLimits,
@@ -34,7 +34,7 @@ pub(super) fn memory_floor(args: &Int4Args, command: &CorpusArgs, common: Int4Li
     // Resident model allocation and the caller's policy/planner preparation
     // coexist with every host-owned parser, graph, output and native claim.
     sum(&[common.load.weight_payload_bytes, ALLOCATOR_BYTES, common.preparation_bytes,
-        requirement.total_bytes().map_err(host_failure)?]).map_err(candidate_failure)
+        requirement.total_bytes().map_err(host_failure)?, common.compute.workspace_bytes]).map_err(candidate_failure)
 }
 
 pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
@@ -46,12 +46,8 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or_else(|| cancelled(DecodeCancellationKind::Deadline));
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: common.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().map_err(|_| candidate_failure(CandidateError::Runtime))?;
+    let engine = NlpEngine::builder().resource_config(compute::resource_config(common))
+        .build().map_err(|_| candidate_failure(CandidateError::Runtime))?;
     let lease = engine.resources().acquire_lease();
     let _preparation = lease.reserve(MemoryClass::JobBuffers, common.preparation_bytes)
         .map_err(|_| candidate_failure(CandidateError::Memory))?.commit()
@@ -108,8 +104,13 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         io_reserve_bytes: limits.io_bytes,
         schedule: command.resolution.cohorts.enabled().then(|| command.resolution.cohorts.schedule()),
     };
-    let completed = engine.execute_int4_entity_corpus(&model, source, resolver, vocabulary, config,
-        common.kernel, reader, output, cancellation).map_err(corpus_failure)?;
+    let completed = if common.compute.threads > 1 {
+        engine.execute_int4_entity_corpus_with_threads(&model, source, resolver, vocabulary, config,
+            common.kernel, common.compute.threads, reader, output, cancellation)
+    } else {
+        engine.execute_int4_entity_corpus(&model, source, resolver, vocabulary, config,
+            common.kernel, reader, output, cancellation)
+    }.map_err(corpus_failure)?;
     // No frame here can certify a task that is still physically running. The
     // completion retains writer guards, and its sole footer write is fallible.
     remaining()?;

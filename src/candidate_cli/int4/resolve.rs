@@ -85,7 +85,8 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("max_dot_products", |arg| arg.default_value("100000000000000"))
         .mut_arg("max_result_bytes", |arg| arg.help("Complete native resolution result; candidate provenance is additional"))
         .mut_arg("max_forward_positions", |arg| arg.help("Whole-snapshot native forward ceiling, shared by all discovery chunks, pairs and both presentation orders")));
-    CohortArgs::augment_args(discovery::DiscoveryArgs::augment_args(command))
+    compute::definition(CohortArgs::augment_args(discovery::DiscoveryArgs::augment_args(command)))
+        .mut_arg("compute_threads", |arg| arg.help("Coordinator plus persistent INT4 row workers, 1..=64; 1 is serial. One team covers every NER chunk, candidate pair and both presentation orders; resolve-corpus reuses it across all flush epochs. Cannot combine with --cohort-pairs or --cohort-chunks. Worker scratch is admitted before IO"))
         .after_long_help("Native cohorts are explicit and independently selected. --cohort-pairs N executes both presentation orders of up to N complete pairs together (1..=32 pairs, at most 64 heads). --cohort-chunks N executes up to N independent NER discovery chunks together (1..=64); it requires --discover-entities and also applies to unchunked documents. All original sources and the complete pair graph retain their existing semantics. Every window drains before a dependent phase starts. The requested schedule admits its complete native phase peak and simultaneous preparation without enlarging any task's context or replenishing native, mask or grounding budgets. Physical cohort counters are separate from the semantic result. No measured speedup or model parity is implied.")
 }
 impl ResolveArgs {
@@ -100,7 +101,14 @@ impl ResolveArgs {
     }
     pub(super) fn validate(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
         self.cohorts.validate(self.discovery.discover_entities)?;
-        let mut limits = self.scoring.validate(args)?;
+        // Numerical row teams retain serial prompt/task order. They do not
+        // enable prefill or compose with independent native cohort schedules.
+        if args.prefill()?.is_some() || self.scoring.cohort_head_limit().is_some()
+            || !args.input_encoding.is_default()
+            || (args.compute.threads() != 1 && self.cohorts.enabled()) {
+            return Err(CandidateError::Arguments);
+        }
+        let mut limits = self.scoring.validate_one_off_with_prefill(args)?;
         let g = self.graph;
         if self.scoring.budget(limits).max_output_tokens != 2
             || !(1..=4096).contains(&g.max_documents) || !(1..=16_384).contains(&g.max_mentions)

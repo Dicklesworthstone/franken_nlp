@@ -1,4 +1,4 @@
-# Native INT4 entity discovery and resolution cohorts
+# Native INT4 entity discovery and resolution schedules
 
 `fnlp candidate source-int4 resolve` and `resolve-corpus` can group independent
 NER discovery tasks and complete candidate pairs on the existing native
@@ -6,7 +6,103 @@ grouped-INT4 cohort engines. The two schedules are explicit and independent.
 They retain the same original-source verification, both-order finite scoring
 language, and complete-link clustering as serial entity resolution.
 
-## Select the phases
+Both commands also support a persistent numerical worker team through
+`--compute-threads`. Native cohorts and numerical teams have separate execution
+paths; a width greater than one cannot combine with either cohort option.
+
+## Persistent numerical workers
+
+`--compute-threads N` accepts 1 through 64, including the coordinator. Omit
+it or select one for the existing serial path. Runtime threads are additional.
+Larger widths reuse one fixed INT4 row team across the whole invocation:
+all supplied-mention comparisons, every NER discovery chunk, both orders of
+every candidate pair, and every corpus epoch. Flush does not create a new team.
+
+For supplied mentions:
+
+```sh
+fnlp candidate source-int4 resolve anchored-snapshot.json \
+  --compute-threads 4 \
+  --snapshot /models/nanbeige.group128.snapshot \
+  --expected-model-sha256 "$TRUSTED_MODEL_CONTENT_SHA256" \
+  --group-width 128 --memory-mib 32768 --context-tokens 2048
+```
+
+For raw documents, add `--discover-entities` and, when needed, `--chunked`
+to the existing `resolve documents.json` invocation. A resident corpus uses
+the same explicit worker width:
+
+```sh
+fnlp candidate source-int4 resolve-corpus documents.ndjson \
+  --discover-entities --chunked --policy entity-policy.json \
+  --compute-threads 4 \
+  --snapshot /models/nanbeige.group128.snapshot \
+  --expected-model-sha256 "$TRUSTED_MODEL_CONTENT_SHA256" \
+  --group-width 128 --memory-mib 32768 --context-tokens 2048 \
+  --max-input-bytes 1048576 --graph-reserve-mib 128 \
+  --max-documents 256 --max-records 1000 --max-snapshots 1000 \
+  > resolved-epochs.ndjson
+```
+
+The source-conversion route accepts the same option. Worker scratch and the
+process thread envelope are admitted alongside the original input, planning,
+graph, native state and guarded output. Serial task order, original source
+coordinates, both-order scores, complete-link clustering, and all native,
+mask and grounding limits retain their existing contract. Larger numerical
+teams reject either `--cohort-pairs` or `--cohort-chunks` before private IO.
+Prompt-prefill and unrelated cohort-head controls remain refused.
+
+A successful one-off response keeps its original semantic `output` and adds
+a sibling `compute` object. Corpus epoch frames keep their original shape;
+the terminal `run_complete` summary alone carries `summary.compute`.
+Each actual receipt contains:
+
+| Field | Meaning |
+| --- | --- |
+| `schedule` | `int4-output-row-team-v1` |
+| `compute_threads` | Coordinator plus persistent workers |
+| `completed_projections` | Completed numerical projection operations |
+| `completed_rows` | Completed output rows across the team |
+| `completed_worker_rows` | Completed rows executed by child workers |
+
+These counters come from the shared projection executor. Empty pair graphs or
+streams may report zero operations while still authenticating the model and
+joining the requested team. Counters do not change semantic work ceilings or
+claim task quality or a speedup. Width one omits the new receipt and preserves
+the existing serial representation.
+
+All workers join before a one-off result is returned or a corpus completion
+is available. A corpus completion retains its writer and output guard until
+`finish()` writes and flushes its sole terminal footer. Cancellation observed
+during that final flush still fails the call; consumers require both the
+footer and a successful return or exit status. Previously acknowledged epochs
+remain valid within their original scope after a later failure.
+
+Library callers choose the corresponding explicit route:
+
+| Population | Hosted API |
+| --- | --- |
+| Original documents with anchored mentions | `NlpEngine::resolve_int4_with_threads` |
+| Prepared original-source NER plus resolution | `NlpEngine::execute_int4_entities_with_threads` |
+| Owned raw-document NDJSON and writer | `NlpEngine::execute_int4_entity_corpus_with_threads` |
+
+Each threaded API requires 2 through 64 workers that fit the already installed
+process envelope. The corpus configuration must have no native cohort
+schedule. One-off APIs return a guarded semantic result plus its compute
+receipt; the corpus API returns `HostedInt4EntityCorpus` with its optional
+summary receipt and explicit fallible completion delivery.
+
+Regression definitions cover argument and memory boundaries, unsupported
+schedule combinations, physical receipt serialization, cancellation, terminal
+flush and ownership. A controller-only pinned-model fixture compares all
+three APIs at widths 2 and 4 with the scalar path using one shared resource
+host. It requires nonempty scored pairs and multiple discovery chunks, checks
+repeated epochs against standalone results and cumulative physical counters,
+and exercises empty input, pre-cancellation and late malformed input. These
+fixtures are **UNRUN**; their presence is not native parity or performance
+evidence.
+
+## Select native cohort phases
 
 | Option | Allowed width | Scope |
 | --- | --- | --- |
@@ -19,9 +115,9 @@ uses only its actual heads. Discovery follows canonical document/chunk order
 and can put chunks from different original documents in the same window.
 Without `--chunked`, each admitted complete document supplies one source task.
 
-Omit either option to keep that phase serial. Omit both for the existing serial
-route and result shape. Width one explicitly selects a cohort route; it is not
-an alias for omitting the option. Zero and oversized widths reject before model
+Omit either cohort option to keep that phase serial. With `--compute-threads 1`,
+omit both for the existing serial route and result shape. Cohort width one
+explicitly selects a cohort route; it is not an alias for omitting the option. Zero and oversized widths reject before model
 or document IO. These commands continue to reject `--cohort-heads`, prompt
 prefill overrides, generation controls, and caller-supplied scheduling metadata
 in source records.

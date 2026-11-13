@@ -188,3 +188,27 @@ fn flush_failure_remains_output_failure_after_complete_staging() {
     assert_eq!(publish(&value, 4096, &mut writer), Err(CandidateError::Output));
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&writer.0).unwrap(), value);
 }
+
+#[test]
+fn row_team_receipt_is_physical_and_keeps_the_unchanged_complete_resolution_output() {
+    let (result, expected) = no_neural_result();
+    check_result(&result, expected).unwrap();
+    let provenance = Provenance { protocol: "fnlp-candidate-int4-resolve-v1", schema_version: 1,
+        scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "resolve",
+        model_id: "Nanbeige4.2-3B", source_revision: "fixture", source_root_sha256: "source-root",
+        model_content_sha256: "model-content", candidate_format: "candidate-format", quant_recipe: "group=32",
+        group_width: 32, integer_kernel: "s_scalar_i32", snapshot: None,
+        cohort_pairs: None, cohort_chunks: None };
+    let response = Response { provenance: &provenance, output: &result };
+    let scalar = serde_json::to_value(&response).unwrap();
+    // Zero-work receipt is a wire fixture; it makes no neural-execution claim.
+    let compute = crate::hosted::Int4ComputeReceipt { schedule: "int4-output-row-team-v1",
+        compute_threads: 3, completed_projections: 0, completed_rows: 0, completed_worker_rows: 0 };
+    let mut bytes = Vec::new();
+    publish_complete(&compute::Response { response: &response, compute: Some(&compute) },
+        4096, &mut bytes, &|| Ok(Duration::from_secs(1))).unwrap();
+    let mut actual: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(actual.as_object_mut().unwrap().remove("compute"), Some(serde_json::to_value(compute).unwrap()));
+    assert_eq!(actual, scalar);
+    assert_eq!(serde_json::to_value(compute::Response { response: &response, compute: None }).unwrap(), scalar);
+}

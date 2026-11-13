@@ -90,12 +90,8 @@ pub(super) fn execute(args: Int4Args, command: ResolveArgs,
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: limits.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().map_err(|_| CandidateError::Runtime)?;
+    let engine = NlpEngine::builder().resource_config(compute::resource_config(limits))
+        .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
     let _preparation = lease.reserve(MemoryClass::JobBuffers, limits.preparation_bytes)
         .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
@@ -157,6 +153,15 @@ pub(super) fn execute(args: Int4Args, command: ResolveArgs,
         check_result(&result.result().output, expected)?;
         remaining()?;
         publish_complete(&Response { provenance: &provenance, output: result.result() }, cap, output, &remaining)
+    } else if limits.compute.threads > 1 {
+        let result = engine.execute_int4_entities_with_threads(&model, prepared, Arc::new(vocabulary), native,
+            limits.preparation_bytes, command.graph_bytes()?, limits.kernel, limits.compute.threads,
+            cancellation).map_err(execution_error)?;
+        check_result(result.result(), expected)?;
+        remaining()?;
+        let response = Response { provenance: &provenance, output: result.result() };
+        publish_complete(&compute::Response { response: &response, compute: Some(result.compute()) },
+            cap, output, &remaining)
     } else {
         let result = engine.execute_int4_entities(&model, prepared, Arc::new(vocabulary), native,
             limits.preparation_bytes, command.graph_bytes()?, limits.kernel, cancellation).map_err(execution_error)?;

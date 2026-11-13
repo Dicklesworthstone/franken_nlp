@@ -2073,12 +2073,40 @@ no measured speedup or actual-model parity is claimed by this implementation.
 See [native INT4 entity cohorts](docs/native-entity-cohorts-int4.md) for commands,
 output shapes and the shared library admission APIs.
 
+### Persistent numerical workers for entity resolution
+
+Both `resolve` and `resolve-corpus` accept `--compute-threads N` from 1
+through 64, including the coordinator. One preserves serial execution.
+Larger widths keep one numerical row team across supplied-mention scoring,
+raw-document discovery, every pair's two presentation orders, and all corpus
+epochs. This works with unchunked and chunked discovery. Worker scratch and
+the process envelope are admitted with the complete existing memory quote.
+Numerical teams cannot combine with `--cohort-pairs` or `--cohort-chunks`.
+
+The selected width preserves the original model identity, semantic result,
+source coordinates and whole-invocation budgets. One-off output adds an actual
+`compute` receipt beside its unchanged `output`; corpus epochs retain their
+original shape and the terminal summary adds `compute` once. Its counters
+report completed projections, all output rows and child-worker rows. Serial
+output omits these fields. Empty graphs authenticate the model and can report
+zero projections.
+
+Every worker joins before a result or corpus completion returns. The corpus
+writer remains guarded through its explicit terminal write and flush; a
+cancellation during that flush still fails completion. Consumers require
+`run_complete` and exit 0. Library callers use `resolve_int4_with_threads`,
+`execute_int4_entities_with_threads` or
+`execute_int4_entity_corpus_with_threads`. See
+[persistent entity workers](docs/native-entity-cohorts-int4.md#persistent-numerical-workers)
+for commands, receipt fields and the unrun actual-model fixture.
+
 ## Implemented candidate INT4 entity-resolution corpora
 
 `fnlp candidate source-int4 resolve-corpus` discovers and resolves entities from
 bounded raw-document NDJSON while keeping **one model resident across document
-groups**. The default schedule also retains one serial engine; explicit native
-cohorts allocate only their required windows and drain them between phases.
+groups**. The default schedule also retains one serial engine; an explicit
+numerical team reuses that engine across all epochs. Native cohorts allocate
+only their required windows and drain them between phases.
 It requires `asupersync-runtime`, explicit
 source or snapshot selection, `--discover-entities`, and a fixed `--policy FILE`.
 Add `--chunked` to discover mentions across every admitted source chunk before
@@ -2160,7 +2188,8 @@ failed inference, partial writes or failed flushes stop the stream without
 retrying output or emitting a success footer. Earlier completely delivered
 epochs remain valid within their own scope. Content-free errors go to stderr.
 
-Embedders can call `NlpEngine::execute_int4_entity_corpus` and consume
+Embedders can call `NlpEngine::execute_int4_entity_corpus`, or select a fixed
+numerical team with `execute_int4_entity_corpus_with_threads`, and consume
 `HostedInt4EntityCorpus::finish()` after examining its summary. The host prices
 parser/input storage, source witnesses, graph/output staging, complete native
 KV/scratch and cleanup before execution, and retains writer guards through

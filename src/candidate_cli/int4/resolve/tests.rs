@@ -79,7 +79,8 @@ fn exact_original_utf8_and_explicit_policy_survive_wire_parsing() {
 fn duplicate_unknown_and_execution_authority_fields_are_rejected() {
     let command = command(&[]); let options = options(&command); let cap = command.args.max_input_bytes;
     for field in ["budget", "model", "work", "execution_identity", "group_width", "numerics_profile",
-        "seed", "prompt", "tools", "thinking", "scores", "clusters", "cohort_pairs", "cohort_chunks", "schedule"] {
+        "seed", "prompt", "tools", "thinking", "scores", "clusters", "cohort_pairs", "cohort_chunks", "schedule",
+        "compute_threads", "compute"] {
         let mut value = fixture(); value[field] = json!({});
         assert!(matches!(options.parse(&value.to_string(), cap), Err(CandidateError::Input)));
     }
@@ -243,7 +244,8 @@ fn pair_cohort_cli_uses_shared_host_quote_and_enforces_the_complete_memory_floor
     let required = runtime::cohort_memory_floor(selected, &grouped.args, limits).unwrap();
     assert!(limits.minimum_memory_bytes >= required);
     grouped.args.memory_mib = (limits.minimum_memory_bytes - 1) / MIB;
-    assert_eq!(grouped.execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+    assert_eq!(selected.execute(grouped.args.clone(), &mut NoRead, &mut Vec::new()),
+        Err(CandidateError::Arguments));
     grouped.args.memory_mib = limits.minimum_memory_bytes.div_ceil(MIB);
     assert!(selected.validate(&grouped.args).is_ok());
 }
@@ -299,4 +301,76 @@ fn source_scalar_and_independently_pinned_snapshot_simd_resolve_the_same_snapsho
         }
     }
     // The caller-owned snapshot is deliberately preserved, including on failure.
+}
+
+#[test]
+fn row_teams_keep_the_same_pair_language_work_and_complete_memory_admission() {
+    let serial = command(&[]);
+    let selected = options(&serial);
+    let baseline = selected.validate(&serial.args).unwrap();
+    let explicit = command(&["--compute-threads", "1"]);
+    assert_eq!(options(&explicit).validate(&explicit.args).unwrap().compute, baseline.compute);
+    assert_eq!(baseline.compute.workspace_bytes, 0);
+    for width in [3, 32, 128] {
+        for threads in ["2", "3", "64"] {
+            let mut threaded = command(&["--compute-threads", threads]);
+            threaded.args.group_width = width;
+            threaded.args.memory_mib = 131072;
+            threaded.args.max_load_mib = 131072;
+            let options = options(&threaded);
+            let limits = options.validate(&threaded.args).unwrap();
+            assert_eq!(limits.compute.threads, threads.parse::<usize>().unwrap());
+            assert_eq!(limits.compute.workspace_bytes,
+                crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(
+                    limits.compute.threads, width).unwrap());
+            let base = options.scoring.validate_one_off_with_prefill(&threaded.args).unwrap();
+            assert_eq!(limits.minimum_memory_bytes, base.minimum_memory_bytes + base.preparation_bytes
+                + options.graph_bytes().unwrap() + options.host_input_bytes(&threaded.args).unwrap());
+            assert_eq!(options.scoring.work_ceiling(), selected.scoring.work_ceiling());
+            assert_eq!(options.scoring_limits(&threaded.args, limits).planning.per_head.max_output_tokens, 2);
+            assert_eq!(limits.native.kv_bytes,
+                Int4MemoryRequirement::for_context(threaded.args.context_tokens, width).unwrap().kv_bytes);
+            #[cfg(feature = "asupersync-runtime")]
+            {
+                let host = compute::resource_config(limits);
+                assert_eq!(host.scoped_cpu_children_per_coordinator, limits.compute.threads - 1);
+                assert_eq!(host.thread_ceiling, limits.compute.threads + 1);
+                assert_eq!(host.max_blocking_coordinators, 1);
+            }
+            threaded.args.memory_mib = (limits.minimum_memory_bytes - 1) / MIB;
+            assert_eq!(options.execute(threaded.args.clone(), &mut NoRead, &mut Vec::new()),
+                Err(CandidateError::Arguments));
+            threaded.args.memory_mib = limits.minimum_memory_bytes.div_ceil(MIB);
+            assert!(options.validate(&threaded.args).is_ok());
+        }
+    }
+    let pin = "ab".repeat(32);
+    let snapshot = parsed(&["--snapshot", "explicit.snapshot", "--expected-model-sha256", &pin,
+        "--compute-threads", "3"]).unwrap();
+    assert_eq!(options(&snapshot).validate(&snapshot.args).unwrap().compute.threads, 3);
+}
+
+#[test]
+fn unsupported_row_teams_and_native_cohort_combinations_refuse_before_any_io() {
+    for flags in [
+        vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+        vec!["--compute-threads", "2", "--cohort-pairs", "1"],
+        vec!["--discover-entities", "--compute-threads", "3", "--cohort-chunks", "2"],
+        vec!["--discover-entities", "--chunked", "--compute-threads", "3", "--cohort-pairs", "2"],
+        vec!["--discover-entities", "--compute-threads", "2", "--cohort-chunks", "1", "--cohort-pairs", "1"],
+    ] {
+        let mut output = Vec::new();
+        assert_eq!(command(&flags).execute(&mut NoRead, &mut output), Err(CandidateError::Arguments));
+        assert!(output.is_empty());
+    }
+    for flags in [
+        vec!["--compute-threads", "2", "--prefill-rows", "1"],
+        vec!["--compute-threads", "2", "--cohort-heads", "1"],
+    ] {
+        let mut input = vec!["--source-dir", "d", "--source-manifest", "m"];
+        input.extend(flags);
+        assert!(parsed(&input).is_err());
+    }
+    let raw = command(&["--discover-entities", "--chunked", "--compute-threads", "3"]);
+    assert_eq!(options(&raw).validate(&raw.args).unwrap().compute.threads, 3);
 }
