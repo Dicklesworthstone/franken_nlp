@@ -252,3 +252,62 @@ fn mode_path_conflicts_are_rejected_without_touching_staging() {
     request.output = request.manifest.clone();
     assert!(validate_request(&request).is_err());
 }
+
+#[test]
+fn multiwindow_digest_failure_preserves_the_original_absolute_prefix() {
+    let manifest = manifest();
+    let part = &manifest.parts[2];
+    let (path, mut file) = stage(b"abcDEFGh");
+    let prefix = authenticate_prefix(&mut file, &manifest, 8,
+        &mut [0_u8; 2], &mut |_| Ok(())).unwrap();
+    let mut downloaded = 0;
+    let mut hasher = prefix.partial_hasher.clone();
+    file.write_all(b"XX").unwrap(); hasher.update(b"XX");
+    charge_body_bytes(&mut downloaded, 2).unwrap();
+    assert_eq!(finish_artifact_attempt(2, 0, part, 7, 1, 2,
+        &mut file, &hasher, Ok(2)).unwrap(), 2);
+    file.sync_all().unwrap();
+    file.write_all(b"kl").unwrap(); hasher.update(b"kl");
+    charge_body_bytes(&mut downloaded, 2).unwrap();
+    assert!(matches!(finish_artifact_attempt(2, 1, part, 7, 3, 4,
+        &mut file, &hasher, Ok(2)), Err(NetworkPullError::Digest { part: 2, .. })));
+    restore_window_prefix(2, &mut file, 7, 1).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"abcDEFGh");
+    assert_eq!(file.stream_position().unwrap(), 8);
+    assert_eq!(downloaded, 4);
+    let mut recovered = prefix.partial_hasher;
+    file.write_all(b"ijkl").unwrap(); recovered.update(b"ijkl");
+    charge_body_bytes(&mut downloaded, 4).unwrap();
+    assert_eq!(finish_artifact_attempt(2, 1, part, 7, 1, 4,
+        &mut file, &recovered, Ok(4)).unwrap(), 4);
+    assert_eq!(fs::read(path).unwrap(), b"abcDEFGhijkl");
+    assert_eq!(downloaded, 8, "recovery never refunds untrusted window bytes");
+}
+
+#[test]
+fn later_window_timeout_retains_synced_artifact_progress_and_absolute_budget() {
+    let manifest = manifest();
+    let part = &manifest.parts[2];
+    let (path, mut file) = stage(b"abcDEFGh");
+    let prefix = authenticate_prefix(&mut file, &manifest, 8,
+        &mut [0_u8; 2], &mut |_| Ok(())).unwrap();
+    let mut downloaded = 0;
+    let mut hasher = prefix.partial_hasher.clone();
+    file.write_all(b"ij").unwrap(); hasher.update(b"ij");
+    charge_body_bytes(&mut downloaded, 2).unwrap();
+    assert_eq!(finish_artifact_attempt(2, 0, part, 7, 1, 2,
+        &mut file, &hasher, Ok(2)).unwrap(), 2);
+    file.sync_all().unwrap();
+    let mut failed = hasher;
+    file.write_all(b"k").unwrap(); failed.update(b"k");
+    charge_body_bytes(&mut downloaded, 1).unwrap();
+    assert!(matches!(finish_artifact_attempt(2, 0, part, 7, 3, 4,
+        &mut file, &failed, Err(NetworkPullError::RequestTimeout { part: 2, mirror: 0 })),
+        Err(NetworkPullError::RequestTimeout { .. })));
+    assert_eq!(fs::read(path).unwrap(), b"abcDEFGhij");
+    assert_eq!(file.stream_position().unwrap(), 10);
+    assert!(matches!(artifact_range_end(2, 7, 3, part.bytes, 12, Some(3), downloaded),
+        Err(NetworkPullError::DownloadBudgetExceeded {
+            limit: 3, downloaded_bytes: 3, retained_bytes: 10, total_bytes: 12, part: 2,
+        })));
+}

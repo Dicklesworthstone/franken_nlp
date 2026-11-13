@@ -47,6 +47,9 @@ use crate::artifact::{
 const USER_AGENT: &str = "franken_nlp-agent (+https://github.com/Dicklesworthstone/franken_nlp)";
 const STAGING_SUFFIX: &str = ".partial";
 const COPY_BUFFER_BYTES: usize = 1024 * 1024;
+// A release part is almost 2 GB. Bound each separately timed request so a
+// healthy slower link can commit progress without finishing that whole part.
+const MAX_RANGE_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_REDIRECTS: u32 = 5;
 const CANCELLATION_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 // Signed asset URLs can be longer than the manifest's immutable mirror URLs.
@@ -73,12 +76,14 @@ pub struct NetworkPartsOptions {
     pub resume: bool,
     /// Allowance for requested part-body bytes across ALL mirror attempts.
     /// Received bytes remain charged when an attempt fails or rolls back. A
-    /// successful partial range is retained and returns DownloadBudgetExceeded.
+    /// range that exhausts the allowance before completion is retained and
+    /// returns DownloadBudgetExceeded; ordinary bounded windows continue.
     /// This is not a wire-byte cap: HTTP/TLS overhead and unsolicited bytes
     /// from a server that violates its requested range cannot be prevented.
     pub max_new_bytes: Option<u64>,
-    /// Total timeout for one mirror attempt, including redirects, response
-    /// headers and the complete streaming body, meet-composed with Cx.
+    /// Total timeout for one bounded range attempt on a mirror, including
+    /// redirects, response headers and the complete streaming body. Each new
+    /// range gets this timeout, always meet-composed with the same parent Cx.
     pub request_timeout: Duration,
     /// Maximum explicit HTTPS redirect hops for one mirror.
     pub max_redirects: u32,
@@ -108,6 +113,7 @@ pub struct NetworkPartReport {
     pub bytes: u64,
     pub sha256: String,
     pub state: NetworkPartState,
+    /// Mirror that completed the part; earlier windows may use prior mirrors.
     pub mirror_index: Option<usize>,
     pub resumed_bytes: u64,
     /// Body bytes received for this part, including discarded mirror attempts.
@@ -225,7 +231,7 @@ pub async fn download_release_parts(
     checkpoint(cx, None)?;
 
     let max_part = manifest.parts.iter().map(|part| part.bytes).max().unwrap_or(1);
-    let max_body = usize::try_from(max_part)
+    let max_body = usize::try_from(max_part.min(MAX_RANGE_BYTES))
         .map_err(|_| NetworkPullError::InvalidOptions("part length does not fit host usize"))?;
     let client = HttpClient::builder()
         .no_redirects()
@@ -284,56 +290,73 @@ pub async fn download_release_parts(
             continue;
         }
 
-        let base_len = start;
         let downloaded_before_part = downloaded_total;
+        let mut retained = start;
+        let mut retained_hasher = prefix_hasher.clone();
         let mut success = None;
         let mut last_error = None;
         if part.mirrors.is_empty() { return Err(NetworkPullError::NoMirrors { part: index }); }
 
         for (mirror_index, mirror) in part.mirrors.iter().enumerate() {
-            checkpoint(cx, Some(index))?;
-            // A failed attempt spends the enclosing budget even though its
-            // bytes are discarded. Recompute the next Range before contacting
-            // each mirror; never reuse the first mirror's larger allowance.
-            let request_end = next_range_end(index, start, part.bytes,
-                manifest.artifact.bytes, options.max_new_bytes, downloaded_total)?;
-            let mut hasher = prefix_hasher.clone();
-            let result = drive_attempt(cx, index, mirror_index, options.request_timeout,
-                fetch_range(cx, &client, index, mirror_index, mirror, start, request_end, part.bytes,
-                    &mut staging, &mut hasher, &mut downloaded_total, options)).await;
-            // Digest validation belongs to the attempt, before short-circuiting
-            // mirror fallback. Failure restores both length and cursor to the
-            // pre-attempt prefix; a corrupt complete suffix cannot poison resume.
-            match finish_attempt(index, mirror_index, part, base_len, request_end,
-                &mut staging, &hasher, result) {
-                Ok(received) => {
-                    success = Some((mirror_index, received));
-                    break;
+            // A later mirror may inherit complete, but unauthenticated, windows
+            // from an interrupted earlier mirror. It gets at most one fresh
+            // suffix attempt if those inherited bytes fail the final digest.
+            let mut inherited_windows = retained > start;
+            loop {
+                checkpoint(cx, Some(index))?;
+                // Failed traffic is never refunded. Recompute the allowance
+                // before every window and every mirror, before contacting it.
+                let request_end = next_range_end(index, retained, part.bytes,
+                    manifest.artifact.bytes, options.max_new_bytes, downloaded_total)?;
+                let mut hasher = retained_hasher.clone();
+                let result = drive_attempt(cx, index, mirror_index, options.request_timeout,
+                    fetch_range(cx, &client, index, mirror_index, mirror, retained, request_end, part.bytes,
+                        &mut staging, &mut hasher, &mut downloaded_total, options)).await;
+                match finish_attempt(index, mirror_index, part, retained, request_end,
+                    &mut staging, &hasher, result) {
+                    Ok(received) => {
+                        staging.flush().map_err(|error| staging_error(index, "flush-window", error))?;
+                        staging.sync_all().map_err(|error| staging_error(index, "sync-window", error))?;
+                        retained = retained.checked_add(received)
+                            .ok_or(NetworkPullError::InvalidOptions("part length arithmetic overflow"))?;
+                        retained_hasher = hasher;
+                        if retained == part.bytes {
+                            success = Some(mirror_index);
+                            break;
+                        }
+                    }
+                    // Cancellation and local storage errors are terminal. The
+                    // completed earlier windows remain synced and resumable.
+                    Err(error @ (NetworkPullError::Cancelled { .. } | NetworkPullError::Staging { .. })) => return Err(error),
+                    Err(error @ NetworkPullError::Digest { .. }) => {
+                        // Only the complete part has a trusted digest. Do not
+                        // let a corrupt earlier window poison all later mirrors.
+                        // Preserve exactly the prefix supplied by the caller.
+                        restore_window_prefix(index, &mut staging, 0, start)?;
+                        retained = start;
+                        retained_hasher = prefix_hasher.clone();
+                        last_error = Some(error);
+                        if inherited_windows {
+                            inherited_windows = false;
+                            continue;
+                        }
+                        break;
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                        break;
+                    }
                 }
-                // Retrying cannot repair cancellation or a local storage
-                // failure. In particular, rollback failure must stop here.
-                Err(error @ (NetworkPullError::Cancelled { .. } | NetworkPullError::Staging { .. })) => return Err(error),
-                Err(error) => last_error = Some(error),
             }
+            if success.is_some() { break; }
         }
-        let Some((mirror_index, segment_len)) = success else {
+        let Some(mirror_index) = success else {
             // Give exhausted enclosing work its typed budget outcome even if
             // the last available mirror consumed the final allowance.
-            next_range_end(index, start, part.bytes, manifest.artifact.bytes,
+            next_range_end(index, retained, part.bytes, manifest.artifact.bytes,
                 options.max_new_bytes, downloaded_total)?;
             return Err(exhausted_mirrors(index, part.mirrors.len(), last_error));
         };
-        staging.flush().map_err(|error| staging_error(index, "flush", error))?;
-        staging.sync_all().map_err(|error| staging_error(index, "sync", error))?;
-        let new_len = base_len.checked_add(segment_len)
-            .ok_or(NetworkPullError::InvalidOptions("part length arithmetic overflow"))?;
-        if new_len < part.bytes {
-            return Err(NetworkPullError::DownloadBudgetExceeded {
-                limit: options.max_new_bytes.unwrap_or(downloaded_total),
-                downloaded_bytes: downloaded_total, retained_bytes: new_len,
-                total_bytes: manifest.artifact.bytes, part: index,
-            });
-        }
         publish_part(index, &staging_path, &final_path)?;
         verify_final(index, part, &final_path, || checkpoint(cx, Some(index)))?;
         reports.push(NetworkPartReport {
@@ -422,7 +445,8 @@ fn next_range_end(
 ) -> Result<u64, NetworkPullError> {
     let remaining = part_bytes.checked_sub(start).filter(|&bytes| bytes != 0)
         .ok_or(NetworkPullError::InvalidOptions("invalid incomplete part range"))?;
-    let length = limit.map_or(remaining, |limit| remaining.min(limit.saturating_sub(downloaded_bytes)));
+    let window = remaining.min(MAX_RANGE_BYTES);
+    let length = limit.map_or(window, |limit| window.min(limit.saturating_sub(downloaded_bytes)));
     if length == 0 {
         return Err(NetworkPullError::DownloadBudgetExceeded {
             limit: limit.unwrap_or(0), downloaded_bytes, retained_bytes: start,
@@ -456,6 +480,20 @@ fn finish_attempt(
         file.sync_all().map_err(|error| staging_error(index, "sync-rollback", error))?;
     }
     checked
+}
+
+/// Forget only windows appended during this invocation after a whole-part
+/// digest failure. An earlier complete artifact part and the caller's retained
+/// incomplete prefix are never rewritten. The network charge is unchanged.
+fn restore_window_prefix(
+    part: usize, file: &mut File, artifact_offset: u64, start: u64,
+) -> Result<(), NetworkPullError> {
+    let length = artifact_offset.checked_add(start)
+        .ok_or(NetworkPullError::InvalidOptions("window rollback offset overflow"))?;
+    file.set_len(length).map_err(|error| staging_error(part, "rollback-part-windows", error))?;
+    file.seek(SeekFrom::Start(length)).map_err(|error| staging_error(part, "seek-part-windows", error))?;
+    file.sync_all().map_err(|error| staging_error(part, "sync-part-windows", error))?;
+    Ok(())
 }
 
 fn charge_body_bytes(downloaded: &mut u64, bytes: usize) -> Result<(), NetworkPullError> {
@@ -1127,6 +1165,123 @@ mod tests {
         let mut downloaded = u64::MAX;
         assert!(charge_body_bytes(&mut downloaded, 1).is_err());
         assert_eq!(downloaded, u64::MAX);
+    }
+
+    #[test]
+    fn large_release_parts_use_bounded_contiguous_windows_without_gaps() {
+        let total = 1_957_046_720_u64;
+        let mut start = 0;
+        let mut windows = 0;
+        while start < total {
+            let end = next_range_end(0, start, total, total, None, start).unwrap();
+            assert!(end >= start && end < total);
+            assert!(end - start + 1 <= 8 * 1024 * 1024);
+            start = end + 1;
+            windows += 1;
+        }
+        assert_eq!(start, total);
+        assert_eq!(windows, 234);
+        assert_eq!(next_range_end(0, 0, total, total, Some(3), 0).unwrap(), 2);
+        assert!(matches!(next_range_end(0, MAX_RANGE_BYTES, total, total,
+            Some(MAX_RANGE_BYTES), MAX_RANGE_BYTES),
+            Err(NetworkPullError::DownloadBudgetExceeded {
+                downloaded_bytes: MAX_RANGE_BYTES, retained_bytes: MAX_RANGE_BYTES, ..
+            })));
+    }
+
+    #[test]
+    fn separate_windows_can_complete_after_more_than_one_request_timeout() {
+        let (runtime, clock) = virtual_attempt_runtime();
+        let (mut file, part, mut prefix) = attempt_fixture(b"ab", b"abcdefgh");
+        let mut downloaded = 0;
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            assert_eq!(cx.now(), asupersync::types::Time::from_secs(17));
+            for (index, bytes) in [b"cd", b"ef", b"gh"].into_iter().enumerate() {
+                let start = 2 + index as u64 * 2;
+                let mut hasher = prefix.clone();
+                let result = drive_attempt(&cx, 0, 0, Duration::from_secs(1), async {
+                    // Each bounded response is healthy, even though the complete
+                    // transfer lasts longer than the per-request timeout.
+                    clock.advance(750_000_000);
+                    file.write_all(bytes).unwrap();
+                    hasher.update(bytes);
+                    charge_body_bytes(&mut downloaded, bytes.len()).unwrap();
+                    Ok(2)
+                }).await;
+                assert_eq!(finish_attempt(0, 0, &part, start, start + 1,
+                    &mut file, &hasher, result).unwrap(), 2);
+                file.sync_all().unwrap();
+                prefix = hasher;
+            }
+            assert!(cx.now() > asupersync::types::Time::from_secs(19));
+        });
+        assert_eq!(downloaded, 6);
+        assert_eq!(hex_lower(&prefix.finalize()), part.sha256);
+        file.rewind().unwrap();
+        let mut bytes = Vec::new(); file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"abcdefgh");
+    }
+
+    #[test]
+    fn window_transport_failure_retains_completed_progress_and_spent_bytes() {
+        let (mut file, part, mut prefix) = attempt_fixture(b"ab", b"abcdefgh");
+        let mut downloaded = 0;
+        file.write_all(b"cd").unwrap(); prefix.update(b"cd");
+        charge_body_bytes(&mut downloaded, 2).unwrap();
+        assert_eq!(finish_attempt(0, 0, &part, 2, 3,
+            &mut file, &prefix, Ok(2)).unwrap(), 2);
+        file.sync_all().unwrap();
+        let mut failed = prefix.clone();
+        file.write_all(b"e").unwrap(); failed.update(b"e");
+        charge_body_bytes(&mut downloaded, 1).unwrap();
+        assert!(matches!(finish_attempt(0, 0, &part, 4, 7, &mut file, &failed,
+            Err(NetworkPullError::RequestTimeout { part: 0, mirror: 0 })),
+            Err(NetworkPullError::RequestTimeout { .. })));
+        assert_eq!(file.metadata().unwrap().len(), 4);
+        assert_eq!(file.stream_position().unwrap(), 4);
+        assert_eq!(downloaded, 3);
+        let end = next_range_end(0, 4, part.bytes, part.bytes, Some(7), downloaded).unwrap();
+        let mut next = prefix;
+        file.write_all(b"efgh").unwrap(); next.update(b"efgh");
+        charge_body_bytes(&mut downloaded, 4).unwrap();
+        assert_eq!(finish_attempt(0, 1, &part, 4, end,
+            &mut file, &next, Ok(4)).unwrap(), 4);
+        assert_eq!(downloaded, 7, "fallback includes the discarded timeout bytes");
+        file.rewind().unwrap();
+        let mut bytes = Vec::new(); file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"abcdefgh");
+    }
+
+    #[test]
+    fn final_digest_failure_discards_all_new_windows_before_mirror_recovery() {
+        let (mut file, part, prefix) = attempt_fixture(b"ab", b"abcdefgh");
+        let mut hasher = prefix.clone();
+        let mut downloaded = 0;
+        for (start, bytes) in [(2, b"XX"), (4, b"ef")] {
+            file.write_all(bytes).unwrap(); hasher.update(bytes);
+            charge_body_bytes(&mut downloaded, 2).unwrap();
+            assert_eq!(finish_attempt(0, 0, &part, start, start + 1,
+                &mut file, &hasher, Ok(2)).unwrap(), 2);
+            file.sync_all().unwrap();
+        }
+        file.write_all(b"gh").unwrap(); hasher.update(b"gh");
+        charge_body_bytes(&mut downloaded, 2).unwrap();
+        assert!(matches!(finish_attempt(0, 1, &part, 6, 7,
+            &mut file, &hasher, Ok(2)), Err(NetworkPullError::Digest { .. })));
+        restore_window_prefix(0, &mut file, 0, 2).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 2);
+        assert_eq!(file.stream_position().unwrap(), 2);
+        assert_eq!(downloaded, 6);
+        let mut repaired = prefix;
+        file.write_all(b"cdefgh").unwrap(); repaired.update(b"cdefgh");
+        charge_body_bytes(&mut downloaded, 6).unwrap();
+        assert_eq!(finish_attempt(0, 1, &part, 2, 7,
+            &mut file, &repaired, Ok(6)).unwrap(), 6);
+        assert_eq!(downloaded, 12, "corrupt windows never refund their network cost");
+        file.rewind().unwrap();
+        let mut bytes = Vec::new(); file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"abcdefgh");
     }
 
     #[test]

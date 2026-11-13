@@ -22,9 +22,9 @@ use asupersync::{CancelKind, cx::Cx, http::HttpClient};
 use sha2::{Digest, Sha256};
 
 use super::{
-    COPY_BUFFER_BYTES, NetworkPartsOptions, NetworkPullError, USER_AGENT,
+    COPY_BUFFER_BYTES, MAX_RANGE_BYTES, NetworkPartsOptions, NetworkPullError, USER_AGENT,
     checkpoint, drive_attempt, exhausted_mirrors, fetch_range, hex_lower,
-    next_range_end, staging_error, validate_options,
+    next_range_end, restore_window_prefix, staging_error, validate_options,
 };
 use super::super::{
     LocalReconstructPhase, LocalReconstructProgress, PullError,
@@ -138,7 +138,7 @@ pub async fn acquire_release_artifact(
     let mut downloaded_bytes = 0_u64;
     if prefix.complete_parts < manifest.parts.len() {
         let max_part = manifest.parts.iter().map(|part| part.bytes).max().unwrap_or(1);
-        let max_body = usize::try_from(max_part)
+        let max_body = usize::try_from(max_part.min(MAX_RANGE_BYTES))
             .map_err(|_| NetworkPullError::InvalidOptions("part length does not fit host usize"))?;
         let client = HttpClient::builder()
             .no_redirects().no_retries().no_cookie_store().user_agent(USER_AGENT)
@@ -155,48 +155,66 @@ pub async fn acquire_release_artifact(
             if part.mirrors.is_empty() {
                 return Err(NetworkPullError::NoMirrors { part: index });
             }
-            let mut success = None;
+            let mut retained = start;
+            let mut retained_hasher = prefix_hasher.clone();
+            let mut success = false;
             let mut last_error = None;
             for (mirror_index, mirror) in part.mirrors.iter().enumerate() {
-                checkpoint(cx, Some(index))?;
-                let end = artifact_range_end(index, artifact_offset, start, part.bytes,
-                    manifest.artifact.bytes, options.max_new_bytes, downloaded_bytes)?;
-                let base_len = artifact_offset.checked_add(start)
-                    .ok_or(NetworkPullError::InvalidOptions("artifact offset overflow"))?;
-                check_staging_path(&staging, &request.staging_output, base_len)?;
-                staging.seek(SeekFrom::Start(base_len))
-                    .map_err(|error| staging_error(index, "seek-artifact-append", error))?;
-                let mut hasher = prefix_hasher.clone();
-                let result = drive_attempt(cx, index, mirror_index, options.request_timeout,
-                    fetch_range(cx, &client, index, mirror_index, mirror, start, end, part.bytes,
-                        &mut staging, &mut hasher, &mut downloaded_bytes, options)).await;
-                match finish_artifact_attempt(index, mirror_index, part, artifact_offset,
-                    start, end, &mut staging, &hasher, result) {
-                    Ok(received) => {
-                        success = Some(received);
-                        break;
+                let mut inherited_windows = retained > start;
+                loop {
+                    checkpoint(cx, Some(index))?;
+                    let end = artifact_range_end(index, artifact_offset, retained, part.bytes,
+                        manifest.artifact.bytes, options.max_new_bytes, downloaded_bytes)?;
+                    let base_len = artifact_offset.checked_add(retained)
+                        .ok_or(NetworkPullError::InvalidOptions("artifact offset overflow"))?;
+                    check_staging_path(&staging, &request.staging_output, base_len)?;
+                    staging.seek(SeekFrom::Start(base_len))
+                        .map_err(|error| staging_error(index, "seek-artifact-append", error))?;
+                    let mut hasher = retained_hasher.clone();
+                    let result = drive_attempt(cx, index, mirror_index, options.request_timeout,
+                        fetch_range(cx, &client, index, mirror_index, mirror, retained, end, part.bytes,
+                            &mut staging, &mut hasher, &mut downloaded_bytes, options)).await;
+                    match finish_artifact_attempt(index, mirror_index, part, artifact_offset,
+                        retained, end, &mut staging, &hasher, result) {
+                        Ok(received) => {
+                            staging.flush().map_err(|error| staging_error(index, "flush-artifact-window", error))?;
+                            staging.sync_all().map_err(|error| staging_error(index, "sync-artifact-window", error))?;
+                            retained = retained.checked_add(received)
+                                .ok_or(NetworkPullError::InvalidOptions("retained part length overflow"))?;
+                            retained_hasher = hasher;
+                            if retained == part.bytes {
+                                success = true;
+                                break;
+                            }
+                        }
+                        Err(error @ (NetworkPullError::Cancelled { .. }
+                            | NetworkPullError::Staging { .. })) => return Err(error),
+                        Err(error @ NetworkPullError::Digest { .. }) => {
+                            // A window has no independent manifest digest.
+                            // Restart this invocation's suffix without touching
+                            // the caller's prefix or earlier authenticated parts.
+                            restore_window_prefix(index, &mut staging, artifact_offset, start)?;
+                            retained = start;
+                            retained_hasher = prefix_hasher.clone();
+                            last_error = Some(error);
+                            if inherited_windows {
+                                inherited_windows = false;
+                                continue;
+                            }
+                            break;
+                        }
+                        Err(error) => {
+                            last_error = Some(error);
+                            break;
+                        }
                     }
-                    Err(error @ (NetworkPullError::Cancelled { .. }
-                        | NetworkPullError::Staging { .. })) => return Err(error),
-                    Err(error) => last_error = Some(error),
                 }
+                if success { break; }
             }
-            let Some(received) = success else {
-                artifact_range_end(index, artifact_offset, start, part.bytes,
+            if !success {
+                artifact_range_end(index, artifact_offset, retained, part.bytes,
                     manifest.artifact.bytes, options.max_new_bytes, downloaded_bytes)?;
                 return Err(exhausted_mirrors(index, part.mirrors.len(), last_error));
-            };
-            staging.flush().map_err(|error| staging_error(index, "flush-artifact-part", error))?;
-            staging.sync_all().map_err(|error| staging_error(index, "sync-artifact-part", error))?;
-            let retained_part_bytes = start.checked_add(received)
-                .ok_or(NetworkPullError::InvalidOptions("retained part length overflow"))?;
-            if retained_part_bytes < part.bytes {
-                return Err(NetworkPullError::DownloadBudgetExceeded {
-                    limit: options.max_new_bytes.unwrap_or(downloaded_bytes),
-                    downloaded_bytes,
-                    retained_bytes: artifact_offset + retained_part_bytes,
-                    total_bytes: manifest.artifact.bytes, part: index,
-                });
             }
             artifact_offset = artifact_offset.checked_add(part.bytes)
                 .ok_or(NetworkPullError::InvalidOptions("artifact offset overflow"))?;

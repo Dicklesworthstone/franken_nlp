@@ -41,7 +41,9 @@ Every request is an explicit byte range and sends:
 
 The pinned asupersync client is configured with no automatic redirects, no
 automatic retries, no cookies, a finite request timeout and a body cap no larger
-than the largest declared release part. Redirects are followed explicitly so
+than **8 MiB** (or the largest declared part, when smaller). Each release part is
+downloaded in contiguous requests of at most 8 MiB. The immutable release-part
+size and all manifest digests are unchanged. Redirects are followed explicitly so
 that every hop is checked **before** the next request is constructed. Every
 target must be an absolute HTTPS URL with a plain ASCII hostname, no userinfo,
 no explicit port (including `:443`), and no whitespace, controls, backslashes or
@@ -72,11 +74,20 @@ they can exceed the immutable manifest URL's 2 KiB cap without becoming
 unbounded. Mirror URLs are attempted sequentially in manifest order; a refused
 redirect follows the existing rollback and fallback path.
 
-One timeout covers the **complete mirror attempt**: all redirect hops, the
-response headers, and the streaming body. The effective deadline is the earlier
-of that attempt's timeout and the caller's `Cx` deadline. Neither a redirect nor
-a received body frame renews it. This explicit outer timer is necessary because
-the pinned client's streaming request timeout ends at the response head.
+One timeout covers each **complete range attempt on a mirror**: all redirect
+hops, the response headers, and the streaming body. The effective deadline is
+the earlier of that range's timeout and the caller's `Cx` deadline. Neither a
+redirect nor a received body frame renews it. The next completed-window request
+gets a new per-request timeout, always bounded by the same parent deadline.
+This explicit outer timer is necessary because the pinned client's streaming
+request timeout ends at the response head.
+
+A complete release part may therefore take longer than one request timeout.
+The previous implementation requested the entire remaining part in one attempt;
+the new windows allow a slower healthy connection to retain progress without
+finishing an almost 2 GB part within the default 300 seconds. This is a bounded
+transfer policy, not a throughput guarantee. A response that cannot complete
+its own 8 MiB window within its deadline still fails.
 
 While a transfer is pending, an owned runtime timer also checks the caller's
 `Cx` cancellation every 100 ms. The same transfer stays alive between checks;
@@ -104,10 +115,12 @@ The final part name is never overwritten. An existing final part is reused only
 after its length and complete SHA-256 pass again.
 
 Incomplete work is stored at `<part-name>.partial`. With resume enabled, the
-entire retained prefix is re-hashed before the next request. A failed mirror is
-rolled back to the exact pre-attempt length before the next mirror is tried.
-The same rollback applies to a stalled body's timeout, after the body future
-has been dropped. Received bytes from failed attempts remain charged against
+entire retained prefix is re-hashed before the next request. Each successful
+window is flushed and synced before requesting the next window from the same
+mirror. An interrupted or malformed range is rolled back to its exact
+pre-attempt length, retaining earlier completed windows before trying the next
+mirror. The same rollback applies to a stalled body's timeout, after the body
+future has been dropped. Received bytes from failed attempts remain charged against
 the invocation's download allowance. Exhausting mirrors on a timeout preserves
 the typed timeout and CLI exit category 5; a caller's cancellation retains its
 original cause.
@@ -115,6 +128,18 @@ original cause.
 The release manifest contains whole-part digests rather than per-range digests,
 so an incomplete prefix is deliberately **not** described as verified release
 content. It becomes trusted only after the final complete part hash passes.
+If that final digest fails, all windows appended to this part during the current
+invocation are discarded, and the original caller-supplied prefix and hash
+state are restored. Earlier complete parts remain untouched. A mirror that
+inherited windows from an interrupted earlier mirror gets at most one fresh
+suffix attempt from that original prefix, so corrupt inherited windows do not
+prevent a later good mirror from completing. Other digest failures advance to
+the next mirror. A corrupt prefix supplied by the caller remains an error; it
+is never silently repaired.
+
+The part report's `mirror_index` identifies the mirror that completed and
+authenticated the part. Earlier windows may have come from previous mirrors;
+`downloaded_bytes` includes all of their received bytes, including retries.
 
 `max_new_bytes` bounds newly received bytes across one invocation. When that
 allowance ends inside a part, the successfully received range remains in the
@@ -227,9 +252,12 @@ promise free disk space.
 download/copy limits remain. The direct mode uses `--max-download-bytes` for
 newly received body bytes across every part and mirror attempt. Discarded
 failed-mirror bytes still spend that allowance. A successful partial range
-retains its bytes, returns exit category **5**, and can be resumed by repeating
-the command. Rollback after a failed mirror preserves the exact pre-attempt
-prefix, including all earlier complete parts.
+retains its bytes when the enclosing allowance is exhausted, returns exit
+category **5**, and can be resumed by repeating the command. Ordinary complete
+8 MiB windows continue automatically in the same invocation. A failed range
+preserves the exact pre-attempt prefix, including earlier completed windows
+and complete parts; a whole-part digest failure uses the original-prefix
+recovery described above.
 
 An existing regular staging file is resumed by default. Before any request,
 the command rehashes every retained complete part and compares it with the
@@ -278,8 +306,9 @@ identity-encoding checks apply to both acquisition modes.
 
 Source regressions cover multipart resume boundaries, corrupt prefixes and
 tails, absolute-offset rollback, failed-mirror byte accounting, deterministic
-timeout/cancellation, and the real current-format container's zero-network
-completion/cache paths. Their execution remains pending the repository's
+timeout/cancellation, bounded window coverage of the fixed release-part size,
+per-window deadlines across longer transfers, multiwindow digest recovery, and
+the real current-format container's zero-network completion/cache paths. Their execution remains pending the repository's
 controller-selected DSR checkpoint; this candidate is not release evidence.
 
 ## What this does not claim
