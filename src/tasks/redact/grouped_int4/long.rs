@@ -161,6 +161,7 @@ impl<'p> Int4DocumentRedactor<'p> {
     // Private model-free fixtures cannot bypass public actual-model binding.
     fn from_bound_parts(planner: &'p SourceTaskPlanner, identity: ExecutionIdentity,
         config: Int4LongRedactionConfig, group_width: usize) -> Result<Self, Int4LongRedactionError> {
+        planner.map_document_encoding_workspace_bytes().map_err(Int4SourceError::Planning)?;
         config.ner.validate().map_err(|_| RedactError::InvalidOptions)?;
         config.per_chunk.validate().map_err(|_| RedactError::InvalidOptions)?;
         config.mapping.chunks.effective_token_limit().map_err(Int4SourceMapError::Chunk)?;

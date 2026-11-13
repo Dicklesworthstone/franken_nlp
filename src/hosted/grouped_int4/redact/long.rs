@@ -27,7 +27,7 @@ impl NlpEngine {
         let required = document_requirements(&config, source.len(), width,
             planner.tokenizer_digest(), *planner.template_digest())?;
         let captured = input_bytes(&source, &config, pseudonyms.as_ref())?;
-        let temporary_bytes = document_temporary_bytes(&config)?;
+        let temporary_bytes = sum(&[document_temporary_bytes(&config)?, document_encoding_workspace(&planner)?])?;
         let run = config.native.run;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, captured)?,
@@ -134,6 +134,10 @@ fn document_requirements(config: &RedactConfig<Int4LongRedactionConfig>, source_
     Ok(required)
 }
 
+fn document_encoding_workspace(planner: &SourceTaskPlanner) -> Result<u64, HostedError> {
+    planner.map_document_encoding_workspace_bytes()
+        .map_err(|_| HostedError::Limits("INT4 redaction document encoding admission"))
+}
 fn document_temporary_bytes(config: &RedactConfig<Int4LongRedactionConfig>) -> Result<u64, HostedError> {
     document_workspace_bytes(&config.detector, config.edit_reserve_bytes)
 }

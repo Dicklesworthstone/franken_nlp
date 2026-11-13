@@ -36,6 +36,40 @@ fn corpus_schedule_metadata_is_explicit_and_omitted_for_existing_serial_output()
 }
 
 #[test]
+fn compact_corpus_provenance_reports_per_document_policy_without_factory_work_receipts() {
+    let (command, args) = arguments(&["--input-encoding", "safe-bpe-v1",
+        "--max-total-tokenizer-input-bytes", "123456",
+        "--max-total-tokenizer-output-tokens", "654321"]);
+    let limits = command.validate(&args).unwrap().document.encoding.unwrap();
+    let plain = serde_json::to_value(provenance()).unwrap();
+    assert_eq!(serde_json::to_value(encoding::population(provenance(), None)).unwrap(), plain);
+    let metadata = encoding::population(provenance(), Some(limits));
+    let mut output = Vec::new();
+    let events = [serde_json::json!({"event":"flush","epoch":1}),
+        serde_json::json!({"event":"run_complete","succeeded":0,"failed":0})];
+    {
+        let mut writer = CandidateWriter::new(&mut output, &metadata, 8192, 65536).unwrap();
+        for event in &events {
+            let mut bytes = crate::canonjson::canonical_bytes(event).unwrap(); bytes.push(b'\n');
+            writer.write_all(&bytes).unwrap(); writer.flush().unwrap();
+        }
+    }
+    let rows: Vec<serde_json::Value> = std::str::from_utf8(&output).unwrap().lines()
+        .map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(rows.len(), events.len());
+    for (mut row, event) in rows.into_iter().zip(events) {
+        let encoding = row.as_object_mut().unwrap().remove("input_encoding").unwrap();
+        assert_eq!(encoding["policy"], serde_json::to_value(limits.policy()).unwrap());
+        assert_eq!(encoding["complete_document_limits"], serde_json::to_value(limits.complete).unwrap());
+        assert_eq!(encoding["budget_scope"],
+            "original_preflight_execution_and_edited_verification_per_document_attempt");
+        assert!(encoding.get("work_used").is_none(), "an unused population factory cannot report measured work");
+        assert_eq!(row.as_object_mut().unwrap().remove("record").unwrap(), event);
+        assert_eq!(row, plain);
+    }
+}
+
+#[test]
 fn stale_stream_admission_cannot_bypass_revalidation_before_any_owned_io() {
     let (mut command, args) = arguments(&[]);
     let quote = command.validate(&args).unwrap();

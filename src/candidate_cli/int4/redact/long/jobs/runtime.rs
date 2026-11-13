@@ -46,6 +46,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     drop(options);
     drop(detectors::detect("", &request.rules, request.rule_budget).map_err(|_| CandidateError::Planning)?);
     let (planner, vocabulary) = source::planner()?;
+    let planner = encoding::configure(planner, limits.document.encoding)?;
     remaining()?;
     let cancellation = CancellationToken::default();
     let model = super::super::super::super::runtime::load_model(
@@ -108,7 +109,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     };
     // Metadata only. Delivery failure may follow durable progress and never
     // authorizes automatic replay, tail repair or an unrequested rollback.
-    publish_report(&response, output, &remaining)
+    publish_report(&encoding::population(response, limits.document.encoding), output, &remaining)
 }
 fn publish_report<T: Serialize>(response: &T, output: &mut impl Write,
     remaining: &impl Fn() -> Result<Duration, CandidateError>) -> Result<(), Failure> {

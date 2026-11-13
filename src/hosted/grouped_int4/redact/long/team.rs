@@ -21,7 +21,7 @@ impl NlpEngine {
             planner.tokenizer_digest(), *planner.template_digest())?;
         team_requirements(&config, width, compute_threads)?;
         let captured = input_bytes(&source, &config, pseudonyms.as_ref())?;
-        let temporary_bytes = document_temporary_bytes(&config)?;
+        let temporary_bytes = sum(&[document_temporary_bytes(&config)?, document_encoding_workspace(&planner)?])?;
         let run = config.native.run;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, captured)?,

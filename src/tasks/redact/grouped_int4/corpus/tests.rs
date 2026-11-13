@@ -547,7 +547,7 @@ fn cohort_admission_refuses_every_underpriced_axis_and_widened_row_authority() {
 fn prepared_documents_are_sealed_to_the_exact_policy_key_and_schedule_owner() {
     let owner = Arc::new(()); let other = Arc::new(());
     let prepared = PreparedInt4DocumentRedaction { source: "alpha beta".to_owned(),
-        preflight: receipt(&config(), None).original.preflight, owner: Arc::clone(&owner) };
+        preflight: receipt(&config(), None).original.preflight, owner: Arc::clone(&owner), operation: None };
     check_owner(&owner, &prepared).unwrap();
     let refused = check_owner(&other, &prepared).unwrap_err();
     assert_eq!(refused.fault.code, BatchCode::Admission); assert!(refused.stop);

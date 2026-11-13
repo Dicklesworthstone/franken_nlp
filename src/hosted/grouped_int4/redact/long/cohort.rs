@@ -28,7 +28,8 @@ impl NlpEngine {
         // The native quote already includes transient decoder/cursor/result
         // storage. Keep the complete map, grounding and edit frontier separate;
         // the actual edited source can need a larger window than the original.
-        let temporary_bytes = sum(&[document_temporary_bytes(&config)?, required.workspace_bytes])?;
+        let temporary_bytes = sum(&[document_temporary_bytes(&config)?,
+            document_encoding_workspace(&planner)?, required.workspace_bytes])?;
         let output_bytes = sum(&[config.detector.max_result_bytes, INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES])?;
         let run = config.native.run;
         let lease = self.resources().acquire_lease();

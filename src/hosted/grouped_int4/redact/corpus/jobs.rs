@@ -110,7 +110,7 @@ impl NlpEngine {
         } else {
             job_requirements(&config, request.limits, limits, width, pseudonyms.as_ref(),
                 request.mode.input_memory())?
-        };
+        }.with_document_encoding(&planner)?;
         check_team_workspace(compute_threads, width, required.input_bytes,
             required.native.kv_bytes, required.workspace_bytes)?;
         let lease = self.resources().acquire_lease();
@@ -209,6 +209,15 @@ struct JobRequirements {
     workspace_bytes: u64,
     input_bytes: u64,
     cohort: Option<Int4SourceMapCohortRequirement>,
+}
+impl JobRequirements {
+    fn with_document_encoding(mut self, planner: &SourceTaskPlanner) -> Result<Self, HostedError> {
+        let encoding = planner.map_document_encoding_workspace_bytes()
+            .map_err(|_| HostedError::Limits("INT4 redaction job document encoding admission"))?;
+        self.input_bytes = sum(&[self.input_bytes, encoding])?;
+        sum(&[self.input_bytes, self.native.kv_bytes, self.workspace_bytes])?;
+        Ok(self)
+    }
 }
 fn job_requirements(config: &RedactionCorpusConfig<Int4RedactionJobConfig>,
     job: JobLimits, limits: JobHostLimits, width: usize, secret: Option<&RedactionPseudonyms>,

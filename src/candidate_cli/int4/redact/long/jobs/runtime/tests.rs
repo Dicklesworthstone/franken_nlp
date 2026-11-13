@@ -219,6 +219,35 @@ fn metadata_only_report_has_public_provenance_and_keeps_sensitive_results_in_the
 }
 
 #[test]
+fn compact_job_publication_preserves_lifetime_progress_and_reports_invocation_local_policy() {
+    let (job, args) = command("resume", &["--input-encoding", "safe-bpe-v1",
+        "--max-total-tokenizer-input-bytes", "123456",
+        "--max-total-tokenizer-output-tokens", "654321"]);
+    let document = job.args.validate(&args).unwrap();
+    let encoding = document.encoding.unwrap();
+    let stored = lifetime(&args, document); let id = JobId([0x12; 16]);
+    let progress = progress_report(completed(id, stored), id, stored, true,
+        RunMode::Resume { discard_uncommitted: false }, "redact").unwrap();
+    let response = serde_json::json!({"protocol":"fnlp-candidate-int4-redact-job-v1",
+        "redaction_mode":"complete_document", "output":progress});
+    assert_eq!(serde_json::to_value(encoding::population(&response, None)).unwrap(), response);
+    let mut bytes = Vec::new();
+    publish_report(&encoding::population(&response, Some(encoding)), &mut bytes,
+        &|| Ok(Duration::from_secs(1))).unwrap();
+    let mut report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(report["output"]["reserved_work"], serde_json::to_value(stored.max_work).unwrap());
+    assert_eq!(report["output"]["attempts"], 3);
+    let policy = report.as_object_mut().unwrap().remove("input_encoding").unwrap();
+    assert_eq!(policy["policy"], serde_json::to_value(encoding.policy()).unwrap());
+    assert_eq!(policy["complete_document_limits"], serde_json::to_value(encoding.complete).unwrap());
+    assert_eq!(policy["budget_scope"],
+        "original_preflight_execution_and_edited_verification_per_document_attempt");
+    assert!(policy.get("work_used").is_none());
+    assert_eq!(report, response, "tokenizer metadata cannot rewrite authenticated lifetime progress");
+    assert_eq!(bytes.iter().filter(|&&byte| byte == b'\n').count(), 1);
+}
+
+#[test]
 fn report_delivery_or_flush_failure_cannot_erase_or_retry_durable_completion() {
     struct Broken { bytes: Vec<u8>, fail_write: bool }
     impl Write for Broken {

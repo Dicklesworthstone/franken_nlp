@@ -58,6 +58,102 @@ fn complete_dispatch_requires_owned_input_and_supports_both_model_routes_and_mod
 }
 
 #[test]
+fn compact_job_options_survive_start_resume_and_pinned_snapshot_dispatch() {
+    let flags = ["--input-encoding", "safe-bpe-v1", "--max-input-bytes", "4096",
+        "--max-result-bytes", "65536", "--max-ner-chunk-bytes", "128",
+        "--max-tokenizer-pair-checks", "1000", "--max-tokenizer-pair-bytes", "8192",
+        "--max-total-tokenizer-input-bytes", "200000", "--max-total-tokenizer-output-tokens", "100000",
+        "--max-total-tokenizer-pair-checks", "3000", "--max-total-tokenizer-pair-bytes", "32768"];
+    for operation in ["start", "resume"] {
+        let (job, args) = command(operation, &flags);
+        let document = job.args.validate(&args).unwrap();
+        let selected = document.encoding.unwrap();
+        assert_eq!(selected.call.max_input_bytes, 128);
+        assert_eq!(selected.call.max_output_tokens, 128);
+        assert_eq!(selected.call.max_pair_checks, 1000);
+        assert_eq!(selected.call.max_pair_bytes, 8192);
+        assert_eq!(selected.complete.max_input_bytes, 200000);
+        assert_eq!(selected.complete.max_output_tokens, 100000);
+        assert_eq!(selected.complete.max_pair_checks, 3000);
+        assert_eq!(selected.complete.max_pair_bytes, 32768);
+        let mut words = argv(operation);
+        let at = words.iter().position(|s| s == "--source-dir").unwrap(); words.drain(at..at + 4);
+        words.extend(["--snapshot", "pinned.int4", "--expected-model-sha256"].into_iter().map(str::to_owned));
+        words.push("ab".repeat(32)); words.extend(flags.iter().map(|s| (*s).to_owned()));
+        let (snapshot, args) = parse(words).unwrap();
+        let reload = snapshot.args.validate(&args).unwrap();
+        assert_eq!(reload.encoding, Some(selected));
+        assert!(reload.common.snapshot_pin.is_some());
+        let mut root = vec!["candidate".to_owned(), "source-int4".to_owned()];
+        root.extend(argv(operation)); root.extend(flags.iter().map(|s| (*s).to_owned()));
+        let matches = crate::candidate_cli::definition().try_get_matches_from(root).unwrap();
+        let CandidateCommand::SourceInt4(command) = CandidateCommand::from_matches(&matches).unwrap()
+            else { panic!("wrong compact job dispatcher"); };
+        assert_eq!(command.args.input_encoding, args.input_encoding);
+        assert!(matches!(command.task, Int4Task::RedactJob));
+    }
+}
+
+#[test]
+fn compact_job_tokenizer_allowances_do_not_multiply_lifetime_native_or_attempt_authority() {
+    for operation in ["start", "resume"] {
+        let (plain, args) = command(operation, &[]);
+        let baseline = plain.args.validate(&args).unwrap();
+        assert!(baseline.encoding.is_none());
+        let stored = lifetime(&args, baseline);
+        let original = plain.args.lifetime_limits(&args, baseline, stored).unwrap();
+        let (job, args) = command(operation, &["--input-encoding", "safe-bpe-v1"]);
+        let document = job.args.validate(&args).unwrap();
+        let compact = document.encoding.unwrap();
+        assert_eq!(compact.complete.max_input_bytes,
+            8 * (args.max_input_bytes as u64 + document.common.result_bytes as u64));
+        assert_eq!(compact.complete.max_output_tokens, compact.complete.max_input_bytes);
+        let limits = job.args.lifetime_limits(&args, document, stored).unwrap();
+        assert_eq!(limits.document.encoding, Some(compact));
+        assert_eq!(limits.model_work, original.model_work);
+        assert_eq!(limits.masks, original.masks);
+        assert_eq!(limits.common.native, original.common.native);
+        let mut population = stored; population.max_items = 999; population.max_attempts = 9999;
+        let expanded = job.args.lifetime_limits(&args, document, population).unwrap();
+        assert_eq!(expanded.document.encoding, Some(compact));
+        assert_eq!(expanded.model_work, limits.model_work);
+        assert_eq!(expanded.masks, limits.masks);
+        for schedule in [vec!["--cohort-chunks", "3"], vec!["--compute-threads", "3"]] {
+            let mut flags = vec!["--input-encoding", "safe-bpe-v1"]; flags.extend(schedule);
+            let (scheduled, args) = command(operation, &flags);
+            assert_eq!(scheduled.args.validate(&args).unwrap().encoding, Some(compact));
+        }
+    }
+    let (retained, args) = command("resume", &["--use-retained-input", "--max-retained-input-mib", "16",
+        "--input-encoding", "safe-bpe-v1"]);
+    assert!(retained.args.validate(&args).unwrap().encoding.is_some());
+}
+
+#[test]
+fn invalid_compact_job_limits_refuse_before_job_keys_limits_or_population_io() {
+    for operation in ["start", "resume"] {
+        for flag in ["--max-total-tokenizer-input-bytes", "--max-total-tokenizer-output-tokens",
+            "--max-total-tokenizer-pair-checks", "--max-total-tokenizer-pair-bytes"] {
+            let (without_policy, args) = command(operation, &[flag, "1"]);
+            assert_eq!(without_policy.execute_owned(args, NoIo, &mut NoIo).unwrap_err().code,
+                "invalid_job_options");
+            for invalid in ["0", "18446744073709551615"] {
+                let (compact, args) = command(operation, &["--input-encoding", "safe-bpe-v1", flag, invalid]);
+                assert_eq!(compact.execute_owned(args, NoIo, &mut NoIo).unwrap_err().code,
+                    "invalid_job_options");
+            }
+        }
+        let (compact, args) = command(operation, &["--input-encoding", "safe-bpe-v1",
+            "--max-ner-chunks", "1", "--max-ner-chunk-bytes", "1048576", "--preparation-mib", "512"]);
+        assert_eq!(compact.execute_owned(args, NoIo, &mut NoIo).unwrap_err().code, "invalid_job_options");
+        for flag in ["--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
+            let mut words = argv(operation); words.extend([flag, "1"].into_iter().map(str::to_owned));
+            assert!(parse(words).is_err());
+        }
+    }
+}
+
+#[test]
 fn repair_is_resume_only_and_retention_paths_and_immutable_limits_are_explicit() {
     assert!(matches!(command("resume", &[]).0.mode, RunMode::Resume { discard_uncommitted: false }));
     assert!(matches!(command("resume", &["--discard-uncommitted-tail"]).0.mode,

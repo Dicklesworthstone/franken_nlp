@@ -29,6 +29,7 @@ pub use crate::batch::extract::grouped_int4::{
 };
 pub use super::super::batch::RedactionBatchArgs;
 mod backend;
+mod encoding;
 use backend::Backend;
 
 /// The detector's allowances cover both stages of one complete document.
@@ -55,10 +56,11 @@ impl Int4DocumentRedactionBatchConfig {
 /// The private owner binds preparation to the exact policy, key and schedule.
 pub struct PreparedInt4DocumentRedaction {
     source: String, preflight: Int4LongRedactionPreflight, owner: Arc<()>,
+    operation: Option<SourceTaskPlanner>,
 }
 
 pub struct NativeInt4DocumentRedactionBatch<'p, 'e, 'w, 'v, 's, 'k, A: Int4RedactionBatchAdmission> {
-    redactor: Int4DocumentRedactor<'p>, config: Int4DocumentRedactionBatchConfig,
+    planner: &'p SourceTaskPlanner, group_width: usize, config: Int4DocumentRedactionBatchConfig,
     backend: Backend<'e, 'w>, vocabulary: &'v ExtractionVocabulary,
     pseudonyms: Option<&'s Pseudonyms<'k>>, admission: A, ledger: Ledger,
     owner: Arc<()>,
@@ -91,15 +93,18 @@ impl<'p, 'e, 'w, 'v, 's, 'k, A: Int4RedactionBatchAdmission>
         config.request.actions.check_key(pseudonyms).map_err(|_| BatchCode::Admission)?;
         let redactor = Int4DocumentRedactor::new(planner, config.ner_identity.clone(),
             config.detector.clone(), backend.model_identity()).map_err(|_| BatchCode::Admission)?;
-        backend.capacity(&config, redactor.group_width()).map_err(|e| e.fault)?;
-        Ok(Self { redactor, config, backend, vocabulary, pseudonyms, admission,
+        let group_width = redactor.group_width();
+        backend.capacity(&config, group_width).map_err(|e| e.fault)?;
+        Ok(Self { planner, group_width, config, backend, vocabulary, pseudonyms, admission,
             ledger: Ledger::default(), owner: Arc::new(()) })
     }
     pub fn reserved_model_work(&self) -> Int4Work { self.ledger.reserved }
     pub fn reserved_mask_visits(&self) -> u64 { self.ledger.masks }
     pub fn is_poisoned(&self) -> bool { self.ledger.failed || !self.backend.clean() }
     pub(crate) fn check_prepared(&self, prepared: &PreparedInt4DocumentRedaction) -> Result<(), BatchItemFailure> {
-        check_owner(&self.owner, prepared)
+        check_owner(&self.owner, prepared)?;
+        encoding::retained(self.planner, prepared.operation.as_ref())?;
+        Ok(())
     }
 }
 impl<A: Int4RedactionBatchAdmission> BatchProcessor
@@ -115,13 +120,22 @@ impl<A: Int4RedactionBatchAdmission> BatchProcessor
         self.ledger.ready()?; self.ledger.failed = true;
         let result = (|| {
             checkpoint(control)?;
-            self.backend.capacity(&self.config, self.redactor.group_width())?;
+            self.backend.capacity(&self.config, self.group_width)?;
             check_source(&document.text, &self.config)?;
             // All original chunk plans are checked under the outer preparation
             // reservation; only the actual edited source can plan verification.
-            let preflight = self.backend.preflight(&self.redactor, &document.text, control).map_err(failure)?;
+            // Fork exactly once here, never during reconstruction or redetection.
+            let operation = encoding::operation(self.planner)?;
+            let preflight = {
+                let planner = encoding::retained(self.planner, operation.as_ref())?;
+                let redactor = Int4DocumentRedactor::new(planner, self.config.ner_identity.clone(),
+                    self.config.detector.clone(), self.backend.model_identity())
+                    .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
+                self.backend.preflight(&redactor, &document.text, control).map_err(failure)?
+            };
             checkpoint(control)?;
-            Ok(PreparedInt4DocumentRedaction { source: document.text, preflight, owner: Arc::clone(&self.owner) })
+            Ok(PreparedInt4DocumentRedaction { source: document.text, preflight,
+                owner: Arc::clone(&self.owner), operation })
         })();
         self.ledger.finish(&result); result
     }
@@ -134,18 +148,23 @@ impl<A: Int4RedactionBatchAdmission> BatchProcessor
     }
     fn execute_with_context<C: DecodeStepControl>(&mut self, prepared: Self::Prepared,
         context: BatchRequestContext, control: &mut C) -> Result<Self::Output, BatchItemFailure> {
-        let group_width = self.redactor.group_width();
+        let group_width = self.group_width;
         let kv = match self.check_prepared(&prepared)
             .and_then(|()| self.backend.capacity(&self.config, group_width)) {
             Ok(kv) => kv, Err(error) => { self.ledger.failed = true; return Err(error); }
         };
+        let planner = prepared.operation.as_ref().unwrap_or(self.planner);
+        let redactor = match Int4DocumentRedactor::new(planner, self.config.ner_identity.clone(),
+            self.config.detector.clone(), self.backend.model_identity()) {
+            Ok(redactor) => redactor,
+            Err(_) => { self.ledger.failed = true; return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
+        };
         let backend = &mut self.backend;
         let config = &self.config;
-        let redactor = &self.redactor;
         let vocabulary = self.vocabulary;
         let pseudonyms = self.pseudonyms;
         execute_reserved(&mut self.ledger, config, context, kv, &mut self.admission, control, |control| {
-            let result = backend.redact(redactor, &prepared.source, config, pseudonyms, vocabulary, control)
+            let result = backend.redact(&redactor, &prepared.source, config, pseudonyms, vocabulary, control)
                 .and_then(|out| {
                     prepared.preflight.verify_completed_with_control(&out, &config.request,
                         pseudonyms.map(Pseudonyms::identity), control)?;
@@ -161,6 +180,7 @@ impl<A: Int4RedactionBatchAdmission> BatchProcessor
 pub(crate) fn check_configuration(planner: &SourceTaskPlanner, config: &Int4DocumentRedactionBatchConfig,
     model: &Int4ModelIdentity) -> Result<(), BatchFault> {
     check_limits(config)?;
+    planner.map_document_encoding_workspace_bytes().map_err(|_| BatchCode::InvalidLimits)?;
     Int4DocumentRedactor::new(planner, config.ner_identity.clone(), config.detector.clone(), model)
         .map_err(|_| BatchCode::Admission)?;
     super::super::detectors::detect("", &config.request.rules, config.request.rule_budget)

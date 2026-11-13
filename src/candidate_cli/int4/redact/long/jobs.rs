@@ -46,7 +46,7 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
             .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoints for this invocation; persisted work and attempts never renew")))
             .mut_arg("store_results", |arg| arg.help("Required consent to retain sensitive edited text and optional maps in the owner-only result spool"))
             .mut_arg("key_file", |arg| arg.help("Independent protected job-authentication key: exactly 32 raw bytes; never the pseudonym key")))
-            .after_long_help(format!("--compute-threads N reuses one persistent INT4 output-row team for the entire retained invocation, including every original document and fresh edited-source verification map. Width 1 preserves serial execution; widths 2..64 admit one worker workspace and process capacity before private IO. Multiple workers cannot combine with --cohort-chunks. Physical worker count is excluded from the authenticated recipe: an explicit resume may select a different width without renewing lifetime native/mask work, attempts, changing policy or replacing either key scope. The same full256 pseudonym commitment authenticates every item and resume. Workers join before success metadata is published; optional compute_schedule reports the declared physical width only. Retained-input replay, source conversion, pinned snapshot reload and materialization keep their existing contracts. Width-one recipes, semantic results and progress bytes remain unchanged.\n\n{}", job_cli::INPUT_RETENTION_HELP))
+            .after_long_help(format!("--compute-threads N reuses one persistent INT4 output-row team for the entire retained invocation, including every original document and fresh edited-source verification map. Width 1 preserves serial execution; widths 2..64 admit one worker workspace and process capacity before private IO. Multiple workers cannot combine with --cohort-chunks. Physical worker count is excluded from the authenticated recipe: an explicit resume may select a different width without renewing lifetime native/mask work, attempts, changing policy or replacing either key scope. The same full256 pseudonym commitment authenticates every item and resume. Workers join before success metadata is published; optional compute_schedule reports the declared physical width only. Retained-input replay, source conversion, pinned snapshot reload and materialization keep their existing contracts. Width-one recipes, semantic results and progress bytes remain unchanged.\n\n{}\n\n{}", job_cli::INPUT_RETENTION_HELP, encoding::HELP))
     };
     let start = operation("start", "Create a new retained complete-document INT4 redaction job");
     let resume = operation("resume", "Authenticate the original population and redact pending INT4 job items")
@@ -153,6 +153,7 @@ impl JobCommand {
         let job = JobArgs { document: DocumentArgs::from_matches(matches)?,
             storage: StorageArgs::from_arg_matches(matches)? };
         let mut args = Int4Args::from_arg_matches(matches)?;
+        args.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
         args.compute = compute::Args::from_matches(matches)?;
         Ok((Self { mode, args: job }, args))
     }

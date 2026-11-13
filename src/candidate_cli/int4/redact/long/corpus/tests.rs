@@ -66,6 +66,87 @@ fn fixed_document_policy_survives_the_stream_envelope_and_records_cannot_overrid
 }
 
 #[test]
+fn compact_corpus_policy_keeps_per_call_and_complete_document_limits_distinct() {
+    let (plain, args) = arguments(&[]);
+    assert!(plain.validate(&args).unwrap().document.encoding.is_none());
+    let flags = ["--input-encoding", "safe-bpe-v1", "--max-input-bytes", "4096",
+        "--max-result-bytes", "65536", "--max-ner-chunk-bytes", "128",
+        "--max-tokenizer-pair-checks", "1000", "--max-tokenizer-pair-bytes", "8192",
+        "--max-total-tokenizer-input-bytes", "200000", "--max-total-tokenizer-output-tokens", "100000",
+        "--max-total-tokenizer-pair-checks", "3000", "--max-total-tokenizer-pair-bytes", "32768"];
+    let (options, mut args) = arguments(&flags); args.memory_mib = 65536;
+    let limits = options.validate(&args).unwrap();
+    let encoding = limits.document.encoding.unwrap();
+    assert_eq!(encoding.call.max_input_bytes, 128);
+    assert_eq!(encoding.call.max_output_tokens, 128);
+    assert_eq!(encoding.call.max_pair_checks, 1000);
+    assert_eq!(encoding.call.max_pair_bytes, 8192);
+    assert_eq!(encoding.complete.max_input_bytes, 200000);
+    assert_eq!(encoding.complete.max_output_tokens, 100000);
+    assert_eq!(encoding.complete.max_pair_checks, 3000);
+    assert_eq!(encoding.complete.max_pair_bytes, 32768);
+    assert_eq!(limits.transport.max_document_bytes, 4096);
+    assert_eq!(limits.common.result_bytes, 65536);
+    for extra in [vec!["--max-requests", "3"], vec!["--cohort-chunks", "3"],
+        vec!["--compute-threads", "3"], vec!["--no-verify"]] {
+        let mut selected = flags.to_vec(); selected.extend(extra);
+        let (selected, mut args) = arguments(&selected); args.memory_mib = 65536;
+        assert_eq!(selected.validate(&args).unwrap().document.encoding, Some(encoding),
+            "population size, physical schedule and verification do not multiply tokenizer ceilings");
+    }
+    for text in [r#"{"input_encoding":"safe_bpe_v1"}"#,
+        r#"{"max_total_tokenizer_pair_checks":999999}"#] {
+        assert!(serde_json::from_str::<RedactionBatchArgs>(text).is_err());
+    }
+}
+
+#[test]
+fn compact_corpus_defaults_cover_original_and_edited_envelopes_without_population_scaling() {
+    let (options, args) = arguments(&["--input-encoding", "safe-bpe-v1",
+        "--max-input-bytes", "4096", "--max-result-bytes", "65536", "--max-requests", "2"]);
+    let limits = options.validate(&args).unwrap();
+    let encoding = limits.document.encoding.unwrap();
+    assert_eq!(encoding.complete.max_input_bytes, 8 * (4096 + 65536));
+    assert_eq!(encoding.complete.max_output_tokens, encoding.complete.max_input_bytes);
+    assert_eq!(encoding.complete.max_pair_checks, 268_435_456);
+    assert_eq!(encoding.complete.max_pair_bytes, 4_294_967_296);
+    assert_eq!(encoding.call.max_input_bytes, args.context_tokens.min(65536));
+    assert_eq!(encoding.call.max_output_tokens, encoding.call.max_input_bytes);
+    let mut more = options.clone(); more.stream.max_requests = 4;
+    let expanded = more.validate(&args).unwrap();
+    assert_eq!(expanded.document.encoding, limits.document.encoding);
+    assert_eq!(expanded.model_work.forward_positions, limits.model_work.forward_positions * 2);
+}
+
+#[test]
+fn compact_corpus_workspace_and_invalid_ceilings_refuse_before_private_io() {
+    let (plain, mut args) = arguments(&["--max-ner-chunks", "1",
+        "--max-ner-chunk-bytes", "1048576", "--preparation-mib", "512"]);
+    args.memory_mib = 65536;
+    assert!(plain.validate(&args).is_ok());
+    let (compact, mut args) = arguments(&["--input-encoding", "safe-bpe-v1",
+        "--max-ner-chunks", "1", "--max-ner-chunk-bytes", "1048576", "--preparation-mib", "512"]);
+    args.memory_mib = 65536;
+    assert_eq!(compact.clone().execute_owned(args.clone(), NoIo, NoIo), Err(CandidateError::Arguments));
+    args.preparation_mib = 1024;
+    assert!(compact.validate(&args).is_ok());
+    for flag in ["--max-total-tokenizer-input-bytes", "--max-total-tokenizer-output-tokens",
+        "--max-total-tokenizer-pair-checks", "--max-total-tokenizer-pair-bytes"] {
+        let (without_policy, args) = arguments(&[flag, "1"]);
+        assert_eq!(without_policy.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+        for invalid in ["0", "18446744073709551615"] {
+            let (compact, args) = arguments(&["--input-encoding", "safe-bpe-v1", flag, invalid]);
+            assert_eq!(compact.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+        }
+    }
+    for flag in ["--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
+        assert!(parsed(&["--source-dir", "s", "--source-manifest", "m", flag, "1"]).is_err());
+        let (compact, args) = arguments(&["--input-encoding", "safe-bpe-v1", flag, "0"]);
+        assert_eq!(compact.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
 fn all_five_work_axes_and_masks_are_scaled_from_one_complete_item_and_can_only_tighten() {
     let (options, args) = arguments(&["--max-requests", "3"]);
     let limits = options.validate(&args).unwrap();

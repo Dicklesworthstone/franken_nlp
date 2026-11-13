@@ -74,6 +74,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     drop(options);
     drop(detectors::detect("", &request.rules, request.rule_budget).map_err(|_| CandidateError::Planning)?);
     let (planner, vocabulary) = source::planner()?;
+    let planner = encoding::configure(planner, limits.document.encoding)?;
     remaining()?;
     let cancellation = CancellationToken::default();
     let model = super::super::super::super::runtime::load_model(
@@ -110,6 +111,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         chunk_schedule: command.document.cohort_chunks.map(ChunkSchedule::new),
         compute_schedule: compute::Schedule::for_threads(common.compute.threads),
     };
+    let provenance = encoding::population(provenance, limits.document.encoding);
     let writer = CandidateWriter::new(output, &provenance, limits.transport.max_output_line_bytes, limits.output_bytes)?;
     let reader: Box<dyn BufRead + Send> = if args.input.as_os_str() == "-" {
         Box::new(BufReader::with_capacity(IO_BUFFER_BYTES, input))

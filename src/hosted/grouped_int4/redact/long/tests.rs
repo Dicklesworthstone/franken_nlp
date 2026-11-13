@@ -170,6 +170,34 @@ fn one_complete_map_and_both_coordinate_representations_are_reserved_at_peak() {
 }
 
 #[test]
+fn compact_document_encoder_workspace_is_admitted_once_for_both_detection_stages() {
+    use crate::tokenizer::{embedded::EmbeddedTokenizer, pinned_controls,
+        untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding}};
+    let planner = || {
+        let tokenizer = EmbeddedTokenizer::pinned().unwrap();
+        let controls = pinned_controls::pinned().unwrap();
+        SourceTaskPlanner::pinned(controls.template_controls(), tokenizer.eos_token_id().unwrap()).unwrap()
+    };
+    assert_eq!(document_encoding_workspace(&planner()).unwrap(), 0);
+    let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 8192, max_output_tokens: 8192,
+        max_pair_checks: 1_000_000, max_pair_bytes: 32_000_000,
+    });
+    let one_call = planner().with_document_encoding(policy.clone()).unwrap();
+    assert!(document_encoding_workspace(&one_call).is_err());
+    let complete = planner().with_map_document_encoding(policy,
+        SafeBpeWorkLimits { max_input_bytes: 1_000_000, max_output_tokens: 1_000_000,
+            max_pair_checks: 10_000_000, max_pair_bytes: 1 << 30 }).unwrap();
+    let encoding = document_encoding_workspace(&complete).unwrap();
+    assert_eq!(encoding, complete.map_document_encoding_workspace_bytes().unwrap());
+    assert!(encoding > 0);
+    let c = config(127);
+    let base = document_temporary_bytes(&c).unwrap();
+    assert_eq!(sum(&[base, encoding]).unwrap(), base + encoding);
+    assert!(sum(&[u64::MAX, encoding]).is_err());
+}
+
+#[test]
 fn captured_source_and_secret_capacity_remain_separate_from_map_workspace() {
     let c = config(127);
     let mut source = String::with_capacity(8192); source.push_str("Alice");

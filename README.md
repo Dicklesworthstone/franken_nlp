@@ -2195,6 +2195,21 @@ each context is independently reset. Rule scans retain their explicit
 resident model, full KV, native scratch, both preparation owners, captured
 source, explicit `--edit-reserve-mib` workspace and bounded final serialization.
 
+Add `--input-encoding safe-bpe-v1` to compact ordinary source text while
+preserving every UTF-8 byte and excluding template-control tokens. For this
+single-context command, `--max-tokenizer-pair-checks` (default 4194304) and
+`--max-tokenizer-pair-bytes` (default 67108864) bound **all** original preflight,
+original execution planning and fresh edited-text verification together.
+The total byte/token allowances are the declared per-pass peak times three,
+or times two with `--no-verify`; the byte peak includes the larger of the
+original input and edited-result ceilings. Both prompts still have to fit the
+context independently. Encoder workspace is admitted before private IO, and
+exhaustion returns no result without renewing the allowance or falling back.
+Compact output reports `input_encoding` and `tokenizer_work_limits`; the exact
+policy also enters the redaction policy digest. Byte fallback remains the
+default. Compact tokens change the prompt, so output parity, detector quality
+and speed remain unqualified pending actual-model gates.
+
 Both source conversion and independently pinned snapshots bind the actual
 model and group width. `--save-snapshot NEW_FILE` on the source route starts
 only after original-source planning and the complete-operation work bound
@@ -2286,6 +2301,36 @@ bounds one complete intermediate map; live and cumulative reduction bounds
 are twice and four times that value. Final output retains its own
 `--max-result-bytes` limit. Nothing is silently truncated.
 
+Complete-document compact input uses `--input-encoding safe-bpe-v1` with the
+same byte preservation and control-token exclusion as single-context
+redaction. For example, append these options to the command above:
+
+```bash
+--input-encoding safe-bpe-v1 \
+  --max-total-tokenizer-input-bytes 16777216 \
+  --max-total-tokenizer-output-tokens 16777216 \
+  --max-total-tokenizer-pair-checks 268435456 \
+  --max-total-tokenizer-pair-bytes 4294967296
+```
+
+These four ceilings cover **one complete original-plus-edited operation**:
+initial preflight, every accepted or rejected chunk-sizing probe, execution
+replanning and fresh verification all spend one nonrenewable ledger. The
+input-byte and output-token defaults are eight times the sum of
+`--max-input-bytes` and `--max-result-bytes`; total pair defaults are those in
+the example. Here `--max-tokenizer-pair-checks` and
+`--max-tokenizer-pair-bytes` additionally constrain each encoding call, with
+defaults 4194304 and 67108864. The per-call byte/token envelope follows
+`--max-ner-chunk-bytes` (or `--context-tokens` when omitted), capped by the
+larger original/edited byte envelope. Each accepted prompt must still fit the
+actual context. Admission reserves the encoder workspace beside retained
+plans before private IO. Exhaustion refuses the document without fallback or
+partial output. Serial, chunk-cohort and threaded schedules use the same
+tokenizer policy. Successful compact responses report `input_encoding` with
+the policy, complete-operation limits and actual cumulative `work_used`.
+Byte fallback remains the default; compact input makes no model-output,
+quality or speed claim.
+
 The default input ceiling is 1 MiB and the preparation reserve is 1024 MiB.
 Admission prices every possible chunk grammar, full resident KV, both
 preparation lifetimes, captured source/key metadata, one complete live map
@@ -2343,6 +2388,15 @@ Fresh transformed-text NER and whole-source rule verification remain the
 default. Full256 pseudonymization reads one binary key from inherited stdin
 with a separate corpus file, and checks its expected commitment before
 opening or reading the corpus. Flush controls never replace that key scope.
+
+The compact-input options from `redact-document` also apply to `redact-corpus`.
+Each original document attempt receives one admitted tokenizer ledger that
+survives its preflight, chunk probes, execution replanning and edited-text
+verification. Chunk and flush boundaries never renew it; the next document
+gets its own allowance. These per-document tokenizer ceilings do not replace
+whole-corpus input, native-work or mask ceilings. Compact events include
+`input_encoding` policy, limits and explicit per-document scope; they do not
+report work from the unexecuted population planner as measured usage.
 
 Add `--cohort-chunks N` to share native decoder layers across independent NER
 chunks within each document. N must be 1 through 64 and no greater than
@@ -2510,6 +2564,19 @@ separately admitted result envelope and is freshly partitioned for verification.
 The same `--ner-options`, rule, action, map, chunk, native-work and grounding
 flags as `redact-document` select one immutable per-document policy.
 `--no-verify` remains an explicit opt-out.
+
+`--input-encoding safe-bpe-v1` and the complete-document tokenizer limits are
+also available on both `redact-job start` and `resume`, including explicitly
+retained-input replay. The selected policy and every ceiling authenticate in
+the immutable recipe, so repeat them on resume. Each original document
+attempt keeps one ledger through preflight, execution replanning and fresh
+edited-text verification; chunk or stage boundaries cannot reset it.
+Tokenizer work is **invocation-local**, not a persisted lifetime debit:
+explicit resume may receive a new ledger under those same authenticated
+ceilings. Existing native-work, mask and attempt debits retain their lifetime
+accounting. Compact completion reports include policy and per-document scope,
+without inventing cumulative usage from the population planner. Model-present
+compact execution and quality qualification remain pending.
 
 For pseudonymization, add `--action pseudonymize --key-stdin`, a nonsecret
 `--key-id`, a `--namespace`, and optionally the independently retained

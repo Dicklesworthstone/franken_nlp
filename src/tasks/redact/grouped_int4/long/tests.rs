@@ -177,6 +177,31 @@ fn native_profile_actual_group_and_pinned_assets_cannot_be_substituted() {
     assert!(Int4DocumentRedactor::from_bound_parts(&p, identity(&p, 127), config(), 32).is_err());
 }
 #[test]
+fn compact_complete_documents_require_and_retain_their_whole_operation_allowance() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding};
+    let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 8192, max_output_tokens: 8192,
+        max_pair_checks: 1_000_000, max_pair_bytes: 32_000_000,
+    });
+    let one_call = planner().with_document_encoding(policy.clone()).unwrap();
+    assert!(Int4DocumentRedactor::from_bound_parts(&one_call, identity(&one_call, 127), config(), 127).is_err());
+    let total = SafeBpeWorkLimits { max_input_bytes: 1_000_000, max_output_tokens: 1_000_000,
+        max_pair_checks: 10_000_000, max_pair_bytes: 1 << 30 };
+    let probe = planner().with_map_document_encoding(policy.clone(), total).unwrap();
+    redactor(&probe, 127).preflight("alpha", &mut Continue).unwrap();
+    let required = probe.map_document_encoding_work().unwrap().unwrap().input_bytes() as u64;
+    assert!(required >= 5);
+    let bounded = planner().with_map_document_encoding(policy,
+        SafeBpeWorkLimits { max_input_bytes: required, ..total }).unwrap();
+    let recipe = redactor(&bounded, 127);
+    recipe.preflight("alpha", &mut Continue).unwrap();
+    let used = bounded.map_document_encoding_work().unwrap();
+    assert_eq!(used.unwrap().input_bytes() as u64, required);
+    assert!(recipe.preflight("alpha", &mut Continue).is_err(),
+        "execution reconstruction and edited-source detection must retain the spent allowance");
+    assert_eq!(bounded.map_document_encoding_work().unwrap(), used);
+}
+#[test]
 fn pinned_preflight_covers_the_complete_source_and_preserves_partial_group_geometry() {
     let p = planner(); let source = "éAéAéAéA"; let mut work = Vec::new();
     for width in [32, 127] {

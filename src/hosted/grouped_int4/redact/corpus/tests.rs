@@ -386,3 +386,30 @@ fn complete_team_reservation_checks_exact_total_overflow_and_invalid_geometry() 
         assert!(check_team_workspace(Some(2), 128, input, kv, scratch).is_err());
     }
 }
+
+#[test]
+fn compact_corpora_reserve_one_complete_encoder_workspace_before_stream_io() {
+    use crate::tokenizer::{embedded::EmbeddedTokenizer, pinned_controls,
+        untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding}};
+    let tokenizer = EmbeddedTokenizer::pinned().unwrap();
+    let controls = pinned_controls::pinned().unwrap();
+    let planner = SourceTaskPlanner::pinned(controls.template_controls(), tokenizer.eos_token_id().unwrap()).unwrap();
+    let c = config(127);
+    let original = corpus_requirements(&c, limits(), 127, None, false).unwrap();
+    let byte = corpus_requirements(&c, limits(), 127, None, false).unwrap().with_document_encoding(&planner).unwrap();
+    assert_eq!(byte.input_bytes, original.input_bytes);
+    let call = SafeBpeLimits { max_input_bytes: 8192, max_output_tokens: 8192,
+        max_pair_checks: 1_000_000, max_pair_bytes: 32_000_000 };
+    let planner = planner.with_document_encoding(UntrustedEncoding::SafeBpeV1(call)).unwrap();
+    assert!(corpus_requirements(&c, limits(), 127, None, false).unwrap().with_document_encoding(&planner).is_err());
+    let planner = planner.with_map_document_encoding(UntrustedEncoding::SafeBpeV1(call), SafeBpeWorkLimits {
+        max_input_bytes: 1_000_000, max_output_tokens: 1_000_000,
+        max_pair_checks: 10_000_000, max_pair_bytes: 1 << 30 }).unwrap();
+    let compact = corpus_requirements(&c, limits(), 127, None, false).unwrap().with_document_encoding(&planner).unwrap();
+    assert_eq!(compact.input_bytes - original.input_bytes, planner.map_document_encoding_workspace_bytes().unwrap());
+    assert_eq!(compact.native, original.native);
+    assert_eq!(compact.workspace_bytes, original.workspace_bytes);
+    let mut overflow = corpus_requirements(&c, limits(), 127, None, false).unwrap();
+    overflow.input_bytes = u64::MAX;
+    assert!(overflow.with_document_encoding(&planner).is_err());
+}

@@ -174,6 +174,7 @@ pub(super) fn execute(args: Int4Args, command: DocumentArgs, _admitted: Document
     drop(detectors::detect(&text, &request.rules, request.rule_budget).map_err(|_| CandidateError::Planning)?);
     remaining()?;
     let (planner, vocabulary) = source::planner()?;
+    let planner = Arc::new(encoding::configure(planner, limits.encoding)?);
     let cancellation = CancellationToken::default();
     let model = super::super::super::runtime::load_model(&engine, &args, common, remaining()?, cancellation.clone())?;
     remaining()?;
@@ -223,7 +224,7 @@ pub(super) fn execute(args: Int4Args, command: DocumentArgs, _admitted: Document
     // Both output ownership and CLI preparation survive staging/write/flush.
     // No chunk NER transcript, provisional edit or failed verification escapes.
     if limits.cohort.is_some() {
-        let result = engine.redact_int4_document_cohorts(&model, text, Arc::new(planner), Arc::new(vocabulary),
+        let result = engine.redact_int4_document_cohorts(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
             config, secret, common.kernel, cancellation).map_err(execution_error)?;
         check_completed_with_control(expected, &result.result().output, &request, &detector,
             expected_pseudonyms.as_ref(), &mut DeadlineControl { started, deadline })?;
@@ -234,22 +235,23 @@ pub(super) fn execute(args: Int4Args, command: DocumentArgs, _admitted: Document
             .map_err(|error| error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution))?;
         let cap = common.result_bytes.checked_add(INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES as usize)
             .and_then(|bytes| bytes.checked_add(4096)).ok_or(CandidateError::Arguments)?;
-        publish_complete(&Response { provenance: &provenance, output: result.result() }, cap, output, &remaining)
+        let response = encoding::completed(Response { provenance: &provenance, output: result.result() }, &planner)?;
+        publish_complete(&response, cap, output, &remaining)
     } else {
         let result = if common.compute.threads == 1 {
             compute::Completion::serial(engine.redact_int4_document(&model, text,
-                Arc::new(planner), Arc::new(vocabulary), config, secret, common.kernel, cancellation)
+                Arc::clone(&planner), Arc::new(vocabulary), config, secret, common.kernel, cancellation)
                 .map_err(execution_error)?)
         } else {
             compute::Completion::Team(engine.redact_int4_document_with_threads(&model, text,
-                Arc::new(planner), Arc::new(vocabulary), config, secret, common.kernel,
+                Arc::clone(&planner), Arc::new(vocabulary), config, secret, common.kernel,
                 common.compute.threads, cancellation).map_err(execution_error)?)
         };
         check_completed_with_control(expected, result.result(), &request, &detector,
             expected_pseudonyms.as_ref(), &mut DeadlineControl { started, deadline })?;
         let response = Response { provenance: &provenance, output: result.result() };
-        publish_complete(&compute::Response { response: &response, compute: result.compute() },
-            common.result_bytes + 4096, output, &remaining)
+        let response = encoding::completed(compute::Response { response: &response, compute: result.compute() }, &planner)?;
+        publish_complete(&response, common.result_bytes + 4096, output, &remaining)
     }
 }
 

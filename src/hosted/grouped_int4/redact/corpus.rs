@@ -111,7 +111,8 @@ impl NlpEngine {
                 .map_err(HostedError::BatchSetup)?;
         }
         let width = model.model_identity().group_width();
-        let required = corpus_requirements(&config, limits, width, pseudonyms.as_ref(), cohorts)?;
+        let required = corpus_requirements(&config, limits, width, pseudonyms.as_ref(), cohorts)?
+            .with_document_encoding(&planner)?;
         check_team_workspace(compute_threads, width, required.input_bytes,
             required.native.kv_bytes, required.workspace_bytes)?;
         let lease = self.resources().acquire_lease();
@@ -240,6 +241,18 @@ struct CorpusRequirements {
     workspace_bytes: u64,
     input_bytes: u64,
     cohort: Option<Int4SourceMapCohortRequirement>,
+}
+impl CorpusRequirements {
+    fn with_document_encoding(mut self, planner: &SourceTaskPlanner) -> Result<Self, HostedError> {
+        // Prepared records retain their exact operation through both scans.
+        // Encoding is sequential, so one bounded workspace serves all probes
+        // and documents without becoming a population-wide work allowance.
+        let encoding = planner.map_document_encoding_workspace_bytes()
+            .map_err(|_| HostedError::Limits("INT4 redaction document encoding admission"))?;
+        self.input_bytes = sum(&[self.input_bytes, encoding])?;
+        sum(&[self.input_bytes, self.native.kv_bytes, self.workspace_bytes])?;
+        Ok(self)
+    }
 }
 fn corpus_requirements(config: &RedactionCorpusConfig<Int4DocumentRedactionBatchConfig>,
     limits: CorpusLimits, width: usize, secret: Option<&RedactionPseudonyms>, cohorts: bool)

@@ -332,6 +332,55 @@ fn recipe_versions_bind_the_complete_document_and_both_grounding_pools() {
         serde_json::to_value(c.batch.request.grounding_budget).unwrap());
 }
 #[test]
+fn byte_encoding_preserves_the_complete_existing_private_recipe() {
+    let c = config();
+    let original = recipe(&c);
+    let unchanged = recipe(&c).with_document_encoding(&planner()).unwrap();
+    assert_eq!(canonjson::canonical_bytes(&original).unwrap(), canonjson::canonical_bytes(&unchanged).unwrap());
+    assert!(serde_json::to_value(&unchanged).unwrap().get("input_encoding").is_none());
+    assert_eq!(freeze(&c, &original).binding.compare(&freeze(&c, &unchanged).binding), Ok(()));
+}
+#[test]
+fn compact_recipe_authenticates_every_tokenizer_ceiling_and_whole_document_ownership() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding};
+    let call = SafeBpeLimits { max_input_bytes: 8192, max_output_tokens: 8192,
+        max_pair_checks: 1_000_000, max_pair_bytes: 32_000_000 };
+    let total = SafeBpeWorkLimits { max_input_bytes: 1_000_000, max_output_tokens: 1_000_000,
+        max_pair_checks: 10_000_000, max_pair_bytes: 1 << 30 };
+    let configured = |call, total| planner().with_map_document_encoding(UntrustedEncoding::SafeBpeV1(call), total).unwrap();
+    let c = config();
+    let baseline = recipe(&c).with_document_encoding(&configured(call, total)).unwrap();
+    let encoded = serde_json::to_value(&baseline).unwrap();
+    assert_eq!(encoded["input_encoding"]["ownership"], "one-original-document-prepare-execute-and-redetect-v1");
+    assert_eq!(encoded["input_encoding"]["accounting"], "invocation-local-tokenizer-work-not-journal-debits-v1");
+    assert_eq!(encoded["input_encoding"]["policy"], serde_json::to_value(UntrustedEncoding::SafeBpeV1(call)).unwrap());
+    assert_eq!(encoded["input_encoding"]["complete_work_limits"], serde_json::to_value(total).unwrap());
+    assert_eq!(baseline.check_work(batch_work(item(&c)), false).unwrap(), item(&c));
+    let frozen = freeze(&c, &baseline);
+    for axis in 0..8 {
+        let mut changed_call = call; let mut changed_total = total;
+        match axis {
+            0 => changed_call.max_input_bytes += 1,
+            1 => changed_call.max_output_tokens += 1,
+            2 => changed_call.max_pair_checks += 1,
+            3 => changed_call.max_pair_bytes += 1,
+            4 => changed_total.max_input_bytes += 1,
+            5 => changed_total.max_output_tokens += 1,
+            6 => changed_total.max_pair_checks += 1,
+            _ => changed_total.max_pair_bytes += 1,
+        }
+        // Keep ExecutionIdentity constant here to isolate the independently
+        // authenticated recipe; the public constructor checks both bindings.
+        let changed = recipe(&c).with_document_encoding(&configured(changed_call, changed_total)).unwrap();
+        assert_eq!(frozen.binding.compare(&freeze(&c, &changed).binding),
+            Err(JobError::Mismatch(MismatchField::Recipe)), "axis {axis}");
+    }
+    assert_eq!(frozen.binding.compare(&freeze(&c, &recipe(&c)).binding),
+        Err(JobError::Mismatch(MismatchField::Recipe)));
+    let one_call = planner().with_document_encoding(UntrustedEncoding::SafeBpeV1(call)).unwrap();
+    assert_eq!(fault(recipe(&c).with_document_encoding(&one_call)).code, BatchCode::InvalidLimits);
+}
+#[test]
 fn explicit_chunk_cohorts_preserve_serial_recipe_bytes_and_complete_attempt_debits() {
     let mut c = config(); c.batch.detector.mapping.reduction.map_batch_chunks = 3;
     let serial = recipe(&c);

@@ -413,3 +413,36 @@ fn physical_team_admission_cannot_widen_persisted_work_or_the_complete_result_gu
         assert!(check_team_schedule(Some(threads), false, 3).is_err());
     }
 }
+
+#[test]
+fn compact_jobs_charge_the_encoder_for_both_population_memory_modes() {
+    use crate::tokenizer::{embedded::EmbeddedTokenizer, pinned_controls,
+        untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding}};
+    let tokenizer = EmbeddedTokenizer::pinned().unwrap();
+    let controls = pinned_controls::pinned().unwrap();
+    let planner = SourceTaskPlanner::pinned(controls.template_controls(), tokenizer.eos_token_id().unwrap()).unwrap();
+    let c = config(); let (job, host) = limits(&c);
+    let byte = job_requirements(&c, job, host, 127, None, JobInputMemory::RetainedRecord).unwrap()
+        .with_document_encoding(&planner).unwrap();
+    assert_eq!(byte.input_bytes,
+        job_requirements(&c, job, host, 127, None, JobInputMemory::RetainedRecord).unwrap().input_bytes);
+    let call = SafeBpeLimits { max_input_bytes: 8192, max_output_tokens: 8192,
+        max_pair_checks: 1_000_000, max_pair_bytes: 32_000_000 };
+    let planner = planner.with_document_encoding(UntrustedEncoding::SafeBpeV1(call)).unwrap();
+    assert!(job_requirements(&c, job, host, 127, None, JobInputMemory::RetainedRecord).unwrap()
+        .with_document_encoding(&planner).is_err());
+    let planner = planner.with_map_document_encoding(UntrustedEncoding::SafeBpeV1(call), SafeBpeWorkLimits {
+        max_input_bytes: 1_000_000, max_output_tokens: 1_000_000,
+        max_pair_checks: 10_000_000, max_pair_bytes: 1 << 30 }).unwrap();
+    for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
+        let base = job_requirements(&c, job, host, 127, None, input).unwrap();
+        let encoded = job_requirements(&c, job, host, 127, None, input).unwrap()
+            .with_document_encoding(&planner).unwrap();
+        assert_eq!(encoded.input_bytes - base.input_bytes, planner.map_document_encoding_workspace_bytes().unwrap());
+        assert_eq!(encoded.native, base.native);
+        assert_eq!(encoded.workspace_bytes, base.workspace_bytes);
+        let mut overflow = job_requirements(&c, job, host, 127, None, input).unwrap();
+        overflow.input_bytes = u64::MAX;
+        assert!(overflow.with_document_encoding(&planner).is_err());
+    }
+}

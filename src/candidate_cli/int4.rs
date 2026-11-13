@@ -381,7 +381,7 @@ impl Int4Command {
         };
         let mut args = Int4Args::from_arg_matches(matches)?;
         if matches!(name, "generate" | "chat" | "classify" | "classify-map" | "classify-corpus" | "sentiment" | "sentiment-map" | "sentiment-corpus" | "judge" | "faithfulness-map" | "faithfulness-corpus" | "extract" | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch"
-            | "redact"
+            | "redact" | "redact-document" | "redact-corpus"
             | "extract-batch" | "ner-batch" | "keyphrases-batch" | "summarize-batch" | "answer-batch"
             | "ner-map" | "keyphrases-map" | "summarize-map" | "answer-map"
             | "ner-corpus" | "keyphrases-corpus" | "summarize-corpus" | "answer-corpus") {

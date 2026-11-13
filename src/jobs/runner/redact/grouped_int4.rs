@@ -110,7 +110,8 @@ impl<'p, 'e, 'w, 'v, 's, 'k, A: Int4RedactionBatchAdmission>
         pseudonyms: Option<&'s Pseudonyms<'k>>, admission: A) -> Result<Self, BatchFault> {
         check_static_limits(&config)?;
         document_batch::check_configuration(planner, &config.batch, engine.model_identity())?;
-        let recipe = Int4RedactionJobRecipe::new(&config, engine.model_identity().group_width(), pseudonyms)?;
+        let recipe = Int4RedactionJobRecipe::new(&config, engine.model_identity().group_width(), pseudonyms)?
+            .with_document_encoding(planner)?;
         let identity = config.batch.ner_identity.clone();
         let native = NativeInt4DocumentRedactionBatch::new(planner, config.batch,
             engine, vocabulary, pseudonyms, admission)?;
@@ -128,7 +129,8 @@ impl<'p, 'e, 'w, 'v, 's, 'k, A: Int4RedactionBatchAdmission>
         document_batch::check_cohort_configuration(planner, &config.batch,
             weights.identity(), budget.context_limit)?;
         let recipe = Int4RedactionJobRecipe::new_cohorts(&config,
-            weights.group_width(), budget.context_limit, pseudonyms)?;
+            weights.group_width(), budget.context_limit, pseudonyms)?
+            .with_document_encoding(planner)?;
         let identity = config.batch.ner_identity.clone();
         let native = NativeInt4DocumentRedactionBatch::new_cohorts(planner, config.batch,
             weights, vocabulary, pseudonyms, budget, kernel, admission)?;

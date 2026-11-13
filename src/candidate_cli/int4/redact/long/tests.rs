@@ -40,6 +40,7 @@ fn default_whole_document_route_preserves_shared_policy_and_both_model_inputs() 
     assert_eq!(limits.mapping.reduction.max_result_bytes, 16 * 1024 * 1024);
     assert_eq!(limits.mapping.reduction.map_batch_chunks, 1);
     assert!(selected.cohort_chunks.is_none() && limits.cohort.is_none());
+    assert!(limits.encoding.is_none());
     assert_eq!(request.actions.default_action, RedactionAction::Mask);
     assert!(request.verify); assert!(!request.actions.include_map);
     assert_eq!(request.grounding_budget, limits.mapping.verification);
@@ -53,6 +54,54 @@ fn default_whole_document_route_preserves_shared_policy_and_both_model_inputs() 
         vec!["--snapshot", "s", "--expected-model-sha256", &pin, "--save-snapshot", "s2"]] {
         assert!(parsed(&invalid).is_err());
     }
+}
+
+#[test]
+fn compact_document_input_admits_each_call_and_one_original_plus_edited_operation() {
+    let byte = command(&[]);
+    let ordinary = options(&byte).validate(&byte.args).unwrap();
+    for schedule in [vec![], vec!["--cohort-chunks", "2"], vec!["--compute-threads", "2"]] {
+        let mut flags = vec!["--input-encoding", "safe-bpe-v1", "--max-ner-chunk-bytes", "16384",
+            "--max-tokenizer-pair-checks", "7777", "--max-tokenizer-pair-bytes", "65536",
+            "--max-total-tokenizer-input-bytes", "40000000", "--max-total-tokenizer-output-tokens", "30000000",
+            "--max-total-tokenizer-pair-checks", "8888888", "--max-total-tokenizer-pair-bytes", "99999999"];
+        flags.extend_from_slice(&schedule);
+        let compact = command(&flags);
+        let limits = options(&compact).validate(&compact.args).unwrap();
+        let encoding = limits.encoding.unwrap();
+        assert_eq!(encoding.call.max_input_bytes, 16384);
+        assert_eq!(encoding.call.max_output_tokens, 16384);
+        assert_eq!(encoding.call.max_pair_checks, 7777);
+        assert_eq!(encoding.call.max_pair_bytes, 65536);
+        assert_eq!(encoding.complete, crate::tokenizer::untrusted::SafeBpeWorkLimits {
+            max_input_bytes: 40000000, max_output_tokens: 30000000,
+            max_pair_checks: 8888888, max_pair_bytes: 99999999 });
+        assert!(encoding.workspace_bytes().unwrap() > 0);
+        assert_eq!(limits.mapping.max_model_work, ordinary.mapping.max_model_work);
+        assert_eq!(limits.mapping.max_mask_visits, ordinary.mapping.max_mask_visits);
+    }
+    let compact = command(&["--input-encoding", "safe-bpe-v1"]);
+    let limits = options(&compact).validate(&compact.args).unwrap();
+    let complete = limits.encoding.unwrap().complete;
+    assert_eq!(complete.max_input_bytes,
+        8 * (compact.args.max_input_bytes as u64 + limits.common.result_bytes as u64));
+    assert_eq!(complete.max_output_tokens, complete.max_input_bytes);
+}
+
+#[test]
+fn compact_document_caps_fail_before_private_io_and_do_not_enable_other_schedules() {
+    for flag in ["--max-total-tokenizer-input-bytes", "--max-total-tokenizer-output-tokens",
+        "--max-total-tokenizer-pair-checks", "--max-total-tokenizer-pair-bytes"] {
+        assert_eq!(command(&[flag, "1"]).execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+        for invalid in ["0", "18446744073709551615"] {
+            assert_eq!(command(&["--input-encoding", "safe-bpe-v1", flag, invalid])
+                .execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+        }
+    }
+    assert_eq!(command(&["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "0"])
+        .execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+    assert_eq!(command(&["--input-encoding", "safe-bpe-v1", "--cohort-chunks", "2", "--compute-threads", "2"])
+        .execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
 }
 
 #[test]

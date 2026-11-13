@@ -41,6 +41,17 @@ pub struct Int4RedactionJobRecipe {
     /// Omission preserves the exact existing serial replay commitment.
     #[serde(skip_serializing_if = "Option::is_none")]
     chunk_cohorts: Option<ChunkCohortRecipe>,
+    /// Compact preparation is a different, explicitly bounded prompt recipe.
+    /// Byte mode omits the field to preserve its existing replay commitment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<EncodingRecipe>,
+}
+#[derive(Serialize)]
+struct EncodingRecipe {
+    ownership: &'static str,
+    accounting: &'static str,
+    policy: crate::tokenizer::untrusted::UntrustedEncoding,
+    complete_work_limits: crate::tokenizer::untrusted::SafeBpeWorkLimits,
 }
 #[derive(Serialize)]
 struct ChunkCohortRecipe {
@@ -121,7 +132,7 @@ impl Int4RedactionJobRecipe {
             request: request.clone(), max_model_work: *max_model_work, max_mask_visits: *max_mask_visits,
             pseudonyms: context.map(|p| p.identity().clone()),
             item_work: JobWork::from_int4(batch.item_model_work(), mapping.max_mask_visits),
-            max_result_bytes: *max_result_bytes, chunk_cohorts: None };
+            max_result_bytes: *max_result_bytes, chunk_cohorts: None, input_encoding: None };
         bounded(&recipe)?;
         Ok(recipe)
     }
@@ -136,6 +147,20 @@ impl Int4RedactionJobRecipe {
         });
         bounded(&recipe)?;
         Ok(recipe)
+    }
+    /// One original document's private operation survives initial planning,
+    /// execution reconstruction and fresh detection of the edited source.
+    /// A resumed invocation admits a new bounded operation; tokenizer work is
+    /// not represented as the journal's lifetime native-work debit.
+    pub(super) fn with_document_encoding(mut self, planner: &SourceTaskPlanner) -> Result<Self, BatchFault> {
+        planner.map_document_encoding_workspace_bytes().map_err(|_| BatchCode::InvalidLimits)?;
+        self.input_encoding = planner.map_document_encoding_limits().map(|complete_work_limits| EncodingRecipe {
+            ownership: "one-original-document-prepare-execute-and-redetect-v1",
+            accounting: "invocation-local-tokenizer-work-not-journal-debits-v1",
+            policy: planner.document_encoding().clone(), complete_work_limits,
+        });
+        bounded(&self)?;
+        Ok(self)
     }
     pub(super) fn max_source_bytes(&self) -> usize { self.max_source_bytes }
     pub(super) fn max_result_bytes(&self) -> u64 { self.max_result_bytes }
