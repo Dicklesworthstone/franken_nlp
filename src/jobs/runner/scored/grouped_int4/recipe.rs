@@ -40,6 +40,8 @@ pub struct Int4ScoredJobRecipe {
     task_ceiling: TaskBudget,
     native: NativeRecipe,
     settings: Settings,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<UntrustedEncoding>,
 }
 #[derive(Serialize)]
 struct NativeRecipe { max_item_work: Int4Work, max_model_work: Int4Work }
@@ -77,11 +79,19 @@ impl Int4ScoredJobRecipe {
         let recipe = Self { version: 1, dependency_scope: "item-local",
             input_policy: "typed-scored-records-fixed-task-full-resident-kv-v1",
             execution, prompt_version, task_spec, group_width, task_ceiling,
-            native: NativeRecipe { max_item_work, max_model_work }, settings };
+            native: NativeRecipe { max_item_work, max_model_work }, settings, input_encoding: None };
         // Leave room for JobRunner's protocol and input-profile wrapper.
         // Defaults are still single-owned here; clone only after this bound.
         bounded_json(&recipe, RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
         Ok(recipe)
+    }
+    /// Only the sealed actual compiler supplies this policy. Omitting byte
+    /// fallback preserves existing authenticated recipe bytes exactly.
+    pub(super) fn with_document_encoding(mut self, encoding: &UntrustedEncoding) -> Result<Self, BatchFault> {
+        crate::batch::scored_int4::memory::encoding_workspace_bytes(encoding)?;
+        self.input_encoding = (encoding != &UntrustedEncoding::ByteFallback).then(|| encoding.clone());
+        bounded_json(&self, RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
+        Ok(self)
     }
     pub(super) fn task_ceiling(&self) -> TaskBudget { self.task_ceiling }
     pub(super) fn check_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> {

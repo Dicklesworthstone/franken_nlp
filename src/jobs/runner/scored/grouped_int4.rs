@@ -12,6 +12,7 @@ use crate::{
     jobs::{JobLimits, JobWork, runner::DurableBatchProcessor},
     native_engine::{decode::DecodeStepControl, strict_int4::StrictInt4Engine},
     tasks::ir::TaskBudget,
+    tokenizer::untrusted::UntrustedEncoding,
 };
 
 mod recipe;
@@ -37,15 +38,31 @@ pub struct Int4ScoredJobPlanner<P: Int4ScoredJobTask> {
     recipe: Int4ScoredJobRecipe,
 }
 impl<P: Int4ScoredJobTask> Int4ScoredJobPlanner<P> {
+    /// Preserve the existing byte-fallback constructor. Compact durable input
+    /// requires the explicit constructor whose private recipe binds its caps.
     pub fn new(planner: P, defaults: Option<P::Args>, native: Int4ScoredBatchLimits)
+        -> Result<Self, BatchFault> {
+        if planner.document_encoding() != &UntrustedEncoding::ByteFallback {
+            return Err(BatchCode::InvalidLimits.into());
+        }
+        Self::new_with_document_encoding(planner, defaults, native)
+    }
+    /// Freeze the actual compiler's complete input policy before any job state
+    /// is opened. Every record has one bounded segment ledger, while native
+    /// work and attempts remain governed by the immutable lifetime job limits.
+    pub fn new_with_document_encoding(planner: P, defaults: Option<P::Args>, native: Int4ScoredBatchLimits)
         -> Result<Self, BatchFault> {
         native.validate()?;
         let identity = planner.base_identity().clone();
         let (recipe, defaults) = planner.freeze_recipe(defaults, native)?;
-        let compiler = Int4ScoredBatchPlanner::new(planner, defaults, native)?;
+        let recipe = recipe.with_document_encoding(planner.document_encoding())?;
+        let compiler = Int4ScoredBatchPlanner::new_with_document_encoding(planner, defaults, native)?;
         Ok(Self { compiler, identity, recipe })
     }
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.compiler.document_encoding() }
+    /// One transient encoder workspace beside retained plans and job buffers.
+    pub fn encoding_workspace_bytes(&self) -> u64 { self.compiler.encoding_workspace_bytes() }
     pub fn task_ceiling(&self) -> TaskBudget { self.recipe.task_ceiling() }
     pub fn native_limits(&self) -> Int4ScoredBatchLimits { self.compiler.limits() }
     pub fn check_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> {

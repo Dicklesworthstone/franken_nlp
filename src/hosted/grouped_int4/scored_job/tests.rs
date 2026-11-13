@@ -151,3 +151,38 @@ fn all_three_real_task_factories_cross_the_existing_owned_host_boundary() {
     binding::<Int4SentimentPlanner>();
     binding::<Int4JudgePlanner>();
 }
+
+
+#[test]
+fn compact_encoder_workspace_is_charged_once_for_each_input_ownership_mode() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 8192, max_output_tokens: 4096,
+        max_pair_checks: 4 * 1024 * 1024, max_pair_bytes: 64 * 1024 * 1024,
+    });
+    let workspace = crate::batch::scored_int4::memory::encoding_workspace_bytes(&policy).unwrap();
+    assert!(workspace > 0);
+    for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
+        let (task, work, mut job, host) = fixture(128);
+        let base = requirements(128, task, work, job, host, input).unwrap();
+        assert_eq!(base.with_encoding_workspace(0).unwrap(), base);
+        let compact = base.with_encoding_workspace(workspace).unwrap();
+        assert_eq!(compact.input_bytes - base.input_bytes, workspace);
+        assert_eq!(compact.native, base.native);
+        assert_eq!(compact.workspace_bytes, base.workspace_bytes);
+        job.max_items = 100; job.max_attempts = 1000;
+        let larger = requirements(128, task, work, job, host, input).unwrap();
+        assert_eq!(larger.with_encoding_workspace(workspace).unwrap().input_bytes - larger.input_bytes, workspace);
+    }
+}
+
+#[test]
+fn encoder_and_native_aggregate_overflow_refuse_before_owned_input_is_read() {
+    let (task, work, job, host) = fixture(128);
+    let base = requirements(128, task, work, job, host, JobInputMemory::RetainedRecord).unwrap();
+    assert!(base.with_encoding_workspace(u64::MAX).is_err());
+    let remaining = u64::MAX - base.input_bytes;
+    // Even an individually representable input claim must leave space for
+    // the simultaneously retained native context and activation scratch.
+    assert!(base.with_encoding_workspace(remaining).is_err());
+}

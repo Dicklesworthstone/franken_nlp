@@ -38,6 +38,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         job_cli::LIMIT_BYTES, &remaining)?)?;
     let limits = job.lifetime_limits(&args, common, lifetime)?;
     let common = limits.common;
+    let encoding = job.input_encoding(&args, common)?;
     check_host_quote(host_limits(&args, limits, remaining()?), lifetime, limits.buffer_bytes, input_memory)?;
     let key = JobSecret::read(&job.storage.key_file).map_err(job_failure)?;
     remaining()?;
@@ -54,24 +55,27 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     match defaults {
         Defaults::Classify(defaults) => {
             let planner = Int4ClassificationPlanner::for_model(model.model_identity(), budget,
-                job.scoring.classification_limits(&args)).map_err(|_| CandidateError::Planning)?;
-            let planner = Int4ScoredJobPlanner::new(planner, defaults, limits.native)
+                job.scoring.classification_limits(&args))
+                .and_then(|planner| planner.with_document_encoding(encoding.clone())).map_err(|_| CandidateError::Planning)?;
+            let planner = Int4ScoredJobPlanner::new_with_document_encoding(planner, defaults, limits.native)
                 .map_err(|_| CandidateError::Planning)?;
             run(&engine, &model, planner, "classify", mode, &args, job, limits, lifetime,
                 key, reader, output, started, deadline, cancellation)
         }
         Defaults::Sentiment { args: defaults, policy } => {
             let planner = Int4SentimentPlanner::for_model(model.model_identity(), sentiment_options(policy)?, budget,
-                job.scoring.sentiment_limits(&args)).map_err(|_| CandidateError::Planning)?;
-            let planner = Int4ScoredJobPlanner::new(planner, Some(defaults), limits.native)
+                job.scoring.sentiment_limits(&args))
+                .and_then(|planner| planner.with_document_encoding(encoding.clone())).map_err(|_| CandidateError::Planning)?;
+            let planner = Int4ScoredJobPlanner::new_with_document_encoding(planner, Some(defaults), limits.native)
                 .map_err(|_| CandidateError::Planning)?;
             run(&engine, &model, planner, "sentiment", mode, &args, job, limits, lifetime,
                 key, reader, output, started, deadline, cancellation)
         }
         Defaults::Judge(defaults) => {
             let planner = Int4JudgePlanner::for_model(model.model_identity(), budget,
-                job.scoring.judge_limits(budget)).map_err(|_| CandidateError::Planning)?;
-            let planner = Int4ScoredJobPlanner::new(planner, defaults, limits.native)
+                job.scoring.judge_limits(budget))
+                .and_then(|planner| planner.with_document_encoding(encoding.clone())).map_err(|_| CandidateError::Planning)?;
+            let planner = Int4ScoredJobPlanner::new_with_document_encoding(planner, defaults, limits.native)
                 .map_err(|_| CandidateError::Planning)?;
             run(&engine, &model, planner, "judge", mode, &args, job, limits, lifetime,
                 key, reader, output, started, deadline, cancellation)
@@ -87,6 +91,8 @@ fn run<P: Int4ScoredJobTask>(engine: &NlpEngine, model: &ResidentInt4, planner: 
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
     planner.check_job_limits(lifetime).map_err(|_| CandidateError::Planning)?;
+    let encoding = job.input_encoding(args, limits.common)?;
+    check_planner_quote(&planner, &encoding, limits.encoding_workspace_bytes)?;
     let identity = planner.execution_identity().clone();
     remaining()?;
     let common = limits.common;
@@ -117,7 +123,8 @@ fn run<P: Int4ScoredJobTask>(engine: &NlpEngine, model: &ResidentInt4, planner: 
         source_root_sha256: model.model_identity().source_root_sha256(),
         model_content_sha256: &content, candidate_format: &identity.artifact_format,
         quant_recipe: &identity.quant_recipe, group_width: model.model_identity().group_width(),
-        integer_kernel: common.kernel.kind().id(), snapshot, output: &report,
+        integer_kernel: common.kernel.kind().id(), snapshot,
+        input_encoding: input_encoding::reported_policy(&encoding), output: &report,
     };
     // A report-write error can follow durable commits. No private scores,
     // labels, documents, paths or keys are included, and rollback is not implied.
@@ -148,6 +155,13 @@ fn check_host_quote(host: JobHostLimits, job: JobLimits, expected: u64, input: J
     }
     Ok(())
 }
+fn check_planner_quote<P: Int4ScoredJobTask>(planner: &Int4ScoredJobPlanner<P>,
+    encoding: &crate::tokenizer::untrusted::UntrustedEncoding, workspace: u64) -> Result<(), CandidateError> {
+    if planner.document_encoding() != encoding || planner.encoding_workspace_bytes() != workspace {
+        return Err(CandidateError::Planning);
+    }
+    Ok(())
+}
 #[derive(Serialize)]
 struct SnapshotRecord { operation: &'static str, format: &'static str, file_bytes: u64 }
 impl SnapshotRecord {
@@ -162,6 +176,8 @@ struct Response<'a, T: Serialize> {
     candidate_format: &'a str, quant_recipe: &'a str, group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<SnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<&'a crate::tokenizer::untrusted::UntrustedEncoding>,
     output: &'a T,
 }
 

@@ -87,7 +87,7 @@ fn completion_metadata_is_task_and_candidate_bound_without_private_scores_or_rec
             source_root_sha256: &source, model_content_sha256: &content,
             candidate_format: "fixture-candidate-format", quant_recipe: "fixture-grouped-int4",
             group_width: args.group_width, integer_kernel: common.kernel.kind().id(),
-            snapshot: Some(SnapshotRecord::new("loaded", common.snapshot_need)), output: &report,
+            snapshot: Some(SnapshotRecord::new("loaded", common.snapshot_need)), input_encoding: None, output: &report,
         };
         let mut bytes = Vec::new(); publish(&response, job_cli::REPORT_BYTES, &mut bytes).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -102,5 +102,45 @@ fn completion_metadata_is_task_and_candidate_bound_without_private_scores_or_rec
         }
         assert!(bytes.ends_with(b"\n"));
         assert_eq!(publish(&response, 1, &mut NoIo), Err(CandidateError::Output));
+        assert!(value.get("input_encoding").is_none());
+        let encoding = crate::tokenizer::untrusted::UntrustedEncoding::SafeBpeV1(
+            crate::tokenizer::untrusted::SafeBpeLimits {
+                max_input_bytes: 8192, max_output_tokens: 4096,
+                max_pair_checks: 123456, max_pair_bytes: 2345678,
+            });
+        let mut compact = response;
+        compact.input_encoding = Some(&encoding);
+        let mut compact_value = serde_json::to_value(&compact).unwrap();
+        assert_eq!(compact_value.as_object_mut().unwrap().remove("input_encoding"),
+            Some(serde_json::to_value(&encoding).unwrap()));
+        assert_eq!(compact_value, value);
     }
+}
+
+
+#[test]
+fn immutable_compiler_policy_and_workspace_must_match_the_cli_before_snapshot_or_job_io() {
+    use crate::native_engine::strict_int4::weights::projection_fixture;
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    let (c, args) = parts(); let common = c.args.validate(&args).unwrap();
+    let fixed = lifetime(&c.args, &args, common);
+    let limits = c.args.lifetime_limits(&args, common, fixed).unwrap();
+    let (model, _) = projection_fixture(args.group_width);
+    let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 8192, max_output_tokens: 4096,
+        max_pair_checks: 4 * 1024 * 1024, max_pair_bytes: 64 * 1024 * 1024,
+    });
+    let planner = Int4ClassificationPlanner::for_model(model.identity(), c.args.scoring.budget(common),
+        c.args.scoring.classification_limits(&args)).unwrap().with_document_encoding(policy.clone()).unwrap();
+    let planner = Int4ScoredJobPlanner::new_with_document_encoding(planner, None, limits.native).unwrap();
+    let workspace = planner.encoding_workspace_bytes();
+    check_planner_quote(&planner, &policy, workspace).unwrap();
+    assert_eq!(check_planner_quote(&planner, &UntrustedEncoding::ByteFallback, workspace), Err(CandidateError::Planning));
+    assert_eq!(check_planner_quote(&planner, &policy, workspace - 1), Err(CandidateError::Planning));
+    assert_eq!(check_planner_quote(&planner, &policy, workspace + 1), Err(CandidateError::Planning));
+    let UntrustedEncoding::SafeBpeV1(mut changed) = policy else { unreachable!() };
+    changed.max_pair_checks += 1;
+    assert_eq!(check_planner_quote(&planner, &UntrustedEncoding::SafeBpeV1(changed), workspace),
+        Err(CandidateError::Planning));
+    planner.check_job_limits(fixed).unwrap();
 }

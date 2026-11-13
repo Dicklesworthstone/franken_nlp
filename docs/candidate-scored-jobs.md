@@ -204,3 +204,69 @@ committed diffs. No Rust compilation, Cargo tests, repository execution scripts,
 model runs, numerical qualification or performance gates were run; executable
 validation remains with the designated controller. No passing-build, fault-recovery
 execution, task-quality, calibration or throughput result is claimed here.
+
+## Compact input for grouped INT4 jobs
+
+The grouped INT4 route is
+`fnlp candidate source-int4 score-job start|resume --task classify|sentiment|judge`.
+It uses the same authenticated storage protocol, with an explicit local source
+closure or a digest-pinned INT4 snapshot. Its three tasks accept
+`--input-encoding safe-bpe-v1`; this does not enable compact input on the INT8
+commands documented above.
+
+For example, with an existing protected job directory and key and immutable
+limits as described above:
+
+```sh
+fnlp candidate source-int4 score-job start corpus.ndjson \
+  --task classify --defaults labels.json \
+  --snapshot ./model.int4.snapshot \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --memory-mib 16384 --group-width 128 \
+  --input-encoding safe-bpe-v1 \
+  --max-tokenizer-input-bytes 65536 \
+  --max-tokenizer-output-tokens 8192 \
+  --max-tokenizer-pair-checks 4194304 \
+  --max-tokenizer-pair-bytes 67108864 \
+  --store-results --job-dir ./protected-job \
+  --job-id "$JOB_ID" --key-file ./protected.key \
+  --limits ./job-limits.json --materialize
+```
+
+These tokenizer limits are per complete record and separate from its NDJSON
+byte ceiling, native context capacity and lifetime job work. One cumulative
+ledger covers the source and metadata, every pairwise order, every rubric
+criterion, and independently encoded faithfulness evidence windows. Original
+source bytes and UTF-8 byte/scalar evidence coordinates remain exact. Oversized
+or exhausted requests fail without silently switching encoding or returning a
+partial scored bundle.
+
+Omitting the byte and token flags uses `--max-input-bytes` and per-head prompt
+capacity respectively. The pair-work defaults are 4,194,304 checks and 67,108,864
+examined bytes. Each configured ceiling is bounded by the existing safe-BPE
+validator. The planner's modeled encoder workspace is admitted exactly once
+alongside the retained population, prepared heads, native KV and guarded output.
+
+Use the same policy and all four caps for `resume`. They are committed in the
+immutable private recipe even when two configurations happen to produce the
+same prompt tokens. Recipe mismatches refuse before uncommitted-tail repair.
+The same binding applies to `--spool-input` and `--use-retained-input`.
+Tokenizer work is bounded for each preparation, including a preparation on an
+explicit resume; native work and attempts remain persisted lifetime charges.
+
+Library callers first configure the actual `Int4ClassificationPlanner`,
+`Int4SentimentPlanner` or `Int4JudgePlanner` with
+`with_document_encoding(policy)`, then construct
+`Int4ScoredJobPlanner::new_with_document_encoding` and pass it to
+`NlpEngine::job_int4_scored`. The factory exposes its immutable
+`document_encoding()` and `encoding_workspace_bytes()` for host admission.
+The existing `Int4ScoredJobPlanner::new` remains byte-only and refuses compact
+planners. Byte mode omits the new recipe and metadata field, preserving existing
+authenticated job bytes.
+
+Compact prompt tokenization is an explicit input profile. Byte preservation
+and control-token exclusion do not establish semantic injection resistance,
+native-output equivalence, task quality or a measured speedup. Regression
+definitions cover recipe mutations across all five record shapes, admission,
+metadata compatibility and authenticated recovery; execution and model
+qualification remain pending the controller-selected DSR checkpoint.

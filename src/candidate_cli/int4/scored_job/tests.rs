@@ -233,3 +233,73 @@ fn unavailable_profile_refuses_before_key_defaults_model_population_or_job_io() 
         assert_eq!(c.execute_owned(args, NoIo, &mut NoIo).unwrap_err().code, "owned_score_job_profile_unavailable");
     }
 }
+
+
+#[test]
+fn compact_scored_jobs_keep_per_record_caps_separate_from_native_and_lifetime_limits() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    for task in ["classify", "sentiment", "judge"] {
+        for operation in ["start", "resume"] {
+            let (byte, byte_args) = command(operation, task, &[]);
+            let byte_common = byte.args.validate(&byte_args).unwrap();
+            let fixed = lifetime(&byte.args, &byte_args, byte_common);
+            let byte_limits = byte.args.lifetime_limits(&byte_args, byte_common, fixed).unwrap();
+            let (compact, compact_args) = command(operation, task, &[
+                "--input-encoding", "safe-bpe-v1",
+                "--max-tokenizer-input-bytes", "8192", "--max-tokenizer-output-tokens", "4096",
+                "--max-tokenizer-pair-checks", "123456", "--max-tokenizer-pair-bytes", "2345678",
+            ]);
+            let common = compact.args.validate(&compact_args).unwrap();
+            let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+                max_input_bytes: 8192, max_output_tokens: 4096,
+                max_pair_checks: 123456, max_pair_bytes: 2345678,
+            });
+            assert_eq!(compact.args.input_encoding(&compact_args, common).unwrap(), policy);
+            let workspace = crate::batch::scored_int4::memory::encoding_workspace_bytes(&policy).unwrap();
+            let limits = compact.args.lifetime_limits(&compact_args, common, fixed).unwrap();
+            assert_eq!(limits.encoding_workspace_bytes, workspace);
+            assert_eq!(byte_limits.encoding_workspace_bytes, 0);
+            assert_eq!(limits.common.minimum_memory_bytes - byte_limits.common.minimum_memory_bytes, workspace);
+            assert_eq!(limits.buffer_bytes, byte_limits.buffer_bytes);
+            assert_eq!(limits.native, byte_limits.native);
+            assert_eq!(limits.common.native, byte_limits.common.native);
+            assert_eq!(compact.args.scoring.budget(common), byte.args.scoring.budget(byte_common));
+        }
+    }
+}
+
+#[test]
+fn compact_caps_and_mode_are_validated_before_any_private_job_io() {
+    for task in ["classify", "sentiment", "judge"] {
+        for flag in ["--max-tokenizer-input-bytes", "--max-tokenizer-output-tokens",
+            "--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
+            let mut words = argv("start", task);
+            words.extend([flag, "100"].into_iter().map(str::to_owned));
+            if let Ok((c, args)) = parse(words) {
+                assert!(c.execute_owned(args, NoIo, &mut NoIo).is_err());
+            }
+            let (c, args) = command("resume", task, &["--input-encoding", "safe-bpe-v1", flag, "0"]);
+            assert!(c.execute_owned(args, NoIo, &mut NoIo).is_err());
+        }
+    }
+}
+
+#[test]
+fn retained_input_selection_does_not_change_compact_policy_or_work_authority() {
+    for task in ["classify", "sentiment", "judge"] {
+        let (start, start_args) = command("start", task, &["--input-encoding", "safe-bpe-v1",
+            "--spool-input", "--max-retained-input-mib", "16"]);
+        let (resume, resume_args) = command("resume", task, &["--input-encoding", "safe-bpe-v1",
+            "--use-retained-input", "--max-retained-input-mib", "16"]);
+        let start_common = start.args.validate(&start_args).unwrap();
+        let resume_common = resume.args.validate(&resume_args).unwrap();
+        assert_eq!(start.args.input_encoding(&start_args, start_common).unwrap(),
+            resume.args.input_encoding(&resume_args, resume_common).unwrap());
+        let fixed = lifetime(&start.args, &start_args, start_common);
+        let first = start.args.lifetime_limits(&start_args, start_common, fixed).unwrap();
+        let restored = resume.args.lifetime_limits(&resume_args, resume_common, fixed).unwrap();
+        assert_eq!(first.native, restored.native);
+        assert_eq!(first.encoding_workspace_bytes, restored.encoding_workspace_bytes);
+        assert_eq!(first.buffer_bytes, restored.buffer_bytes);
+    }
+}

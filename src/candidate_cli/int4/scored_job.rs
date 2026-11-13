@@ -24,6 +24,7 @@ pub(super) struct JobArgs {
     scoring: classify::ScoringArgs,
     score: ScoreArgs,
     storage: StorageArgs,
+    encoding: judge::EncodingArgs,
 }
 #[derive(Args)]
 struct ScoreArgs {
@@ -37,7 +38,7 @@ struct ScoreArgs {
 
 pub(super) fn definition() -> clap::Command {
     let operation = |name: &'static str, about: &'static str| {
-        StorageArgs::augment_args(ScoreArgs::augment_args(classify::definition().name(name).about(about)
+        let command = StorageArgs::augment_args(ScoreArgs::augment_args(classify::definition().name(name).about(about)
             .long_about("Retain and resume complete classification, sentiment or judgment results with one resident source-converted or independently pinned snapshot INT4 model. Requires --store-results, an existing protected --job-dir, original --job-id and --key-file, and immutable --limits. By default, supply the COMPLETE original NDJSON {id,text,task_args?} population on every invocation; explicit retained-input replay is available. --task is fixed; --defaults has the same typed settings as score-batch. Supplied task_args replaces the complete shared arguments. Sentiment scoring mode, EOS and policy stay fixed for the run. Every native head preflights before execution. Resume authenticates original input bytes, defaults, planner limits and model/group identity before any repair or native forward. Five scoring flags bound EACH ITEM; JobLimits.max_work is the sole lifetime authority, including failed attempts, and its mask_node_visits must be zero. Neither population size nor resume renews that work. Flush controls are refused. Stdout is metadata only; private scores remain in the explicitly retained spool. --materialize publishes only after all items commit. Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. No automatic retry, key/directory creation, release activation or semantic-accuracy claim.")
             .after_help(job_cli::INPUT_RETENTION_HELP)
             .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population; omit with --use-retained-input; '-' reads stdin"))
@@ -50,7 +51,11 @@ pub(super) fn definition() -> clap::Command {
             .mut_arg("max_dot_products", |arg| arg.help("Per-item actual grouped dot-product ceiling; lifetime ceiling comes from --limits"))
             .mut_arg("max_multiply_accumulates", |arg| arg.help("Per-item multiply-accumulate ceiling; lifetime ceiling comes from --limits"))))
             .mut_arg("store_results", |arg| arg.help("Required consent to retain private scored results in the owner-only spool"))
-            .mut_arg("limits_file", |arg| arg.help("Exact immutable JobLimits JSON; lifetime five-axis native work and zero mask work"))
+            .mut_arg("limits_file", |arg| arg.help("Exact immutable JobLimits JSON; lifetime five-axis native work and zero mask work"));
+        judge::encoding_definition(command)
+            .mut_arg("max_tokenizer_input_bytes", |arg| arg.help("Cumulative untrusted bytes encoded per complete scored record; safe-bpe-v1 only, default --max-input-bytes"))
+            .mut_arg("max_tokenizer_output_tokens", |arg| arg.help("Cumulative untrusted tokens produced per complete scored record; safe-bpe-v1 only, default per-head prompt capacity"))
+            .after_long_help("All three tasks accept --input-encoding safe-bpe-v1 with explicit byte, token, pair-check and pair-byte ceilings. One tokenizer ledger covers every untrusted segment in a record, including label metadata, both pairwise orders, rubric criteria and independently encoded faithfulness evidence windows. These per-record planning ceilings are authenticated in the immutable job recipe and cannot change on resume, including --use-retained-input. One transient encoder workspace is admitted beside the population and prepared heads. Native work and attempts remain nonrenewable lifetime debits; tokenizer work is bounded per preparation, including a new preparation on explicit resume. Original source bytes and evidence coordinates remain unchanged. Byte fallback remains the default. Compact prompts are a distinct input profile with no output-parity, task-quality or speed claim.")
     };
     let start = operation("start", "Create an explicitly retained INT4 scoring job");
     let resume = operation("resume", "Authenticate the original population and run pending INT4 scoring items")
@@ -72,6 +77,7 @@ pub(super) struct JobExecutionLimits {
     io_reserve_bytes: u64,
     journal_reserve_bytes: u64,
     serialization_reserve_bytes: u64,
+    encoding_workspace_bytes: u64,
 }
 impl JobArgs {
     fn kind(&self) -> Result<ScoreTask, CandidateError> {
@@ -89,13 +95,24 @@ impl JobArgs {
             || s.journal_memory_mib == 0 || s.serialization_memory_mib == 0 {
             return Err(Failure::usage("explicit_scored_job_storage"));
         }
-        let common = self.scoring.validate(args)?;
+        let mut native_args = args.clone();
+        native_args.input_encoding = input_encoding::InputEncodingArgs::default();
+        let mut common = self.scoring.validate(&native_args)?;
+        let encoding = self.input_encoding(args, common)?;
+        let workspace = crate::batch::scored_int4::memory::encoding_workspace_bytes(&encoding)
+            .map_err(|_| CandidateError::Arguments)?;
+        common.minimum_memory_bytes = sum(&[common.minimum_memory_bytes, workspace])?;
+        if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments.into()); }
         for mib in [s.journal_memory_mib, s.serialization_memory_mib] {
             if mib.checked_mul(MIB).is_none_or(|bytes| bytes > common.memory_bytes) {
                 return Err(Failure::usage("score_job_memory"));
             }
         }
         Ok(common)
+    }
+    fn input_encoding(&self, args: &Int4Args, common: Int4Limits)
+        -> Result<crate::tokenizer::untrusted::UntrustedEncoding, CandidateError> {
+        self.encoding.policy_with_defaults(args, args.max_input_bytes, common.max_prompt_tokens)
     }
     fn load_defaults(&self, text: Option<&str>, budget: TaskBudget, args: &Int4Args)
         -> Result<Defaults, CandidateError> {
@@ -119,6 +136,8 @@ impl JobArgs {
         let transport = PopulationReadLimits { max_stream_bytes: product(self.storage.max_stream_mib, MIB)?,
             max_lines: self.storage.max_input_lines };
         transport.validate().map_err(|_| Failure::usage("job_transport"))?;
+        let encoding_workspace_bytes = crate::batch::scored_int4::memory::encoding_workspace_bytes(
+            &self.input_encoding(args, common)?).map_err(|_| CandidateError::Arguments)?;
         let preparation_reserve_bytes = common.preparation_bytes;
         let io_reserve_bytes = product(IO_BUFFER_BYTES as u64, 2)?;
         let journal_reserve_bytes = product(self.storage.journal_memory_mib, MIB)?;
@@ -136,7 +155,7 @@ impl JobArgs {
             return Err(Failure { exit: ErrorCode::AdmissionOrResourceLimit, code: "job_population_memory" });
         }
         Ok(JobExecutionLimits { common, transport, native, buffer_bytes, preparation_reserve_bytes,
-            io_reserve_bytes, journal_reserve_bytes, serialization_reserve_bytes })
+            io_reserve_bytes, journal_reserve_bytes, serialization_reserve_bytes, encoding_workspace_bytes })
     }
 }
 impl JobCommand {
@@ -149,8 +168,11 @@ impl JobCommand {
             _ => return Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "score-job operation refused")),
         };
         let args = JobArgs { scoring: classify::ScoringArgs::from_matches(matches)?,
-            score: ScoreArgs::from_arg_matches(matches)?, storage: StorageArgs::from_arg_matches(matches)? };
-        Ok((Self { mode, args }, Int4Args::from_arg_matches(matches)?))
+            score: ScoreArgs::from_arg_matches(matches)?, storage: StorageArgs::from_arg_matches(matches)?,
+            encoding: judge::EncodingArgs::from_arg_matches(matches)? };
+        let mut native = Int4Args::from_arg_matches(matches)?;
+        native.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+        Ok((Self { mode, args }, native))
     }
     pub(super) fn run_owned<R: Read + Send + 'static>(self, args: Int4Args, input: R,
         output: &mut impl Write, diagnostics: &mut impl Write) -> ExitCode {

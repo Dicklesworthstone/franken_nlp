@@ -22,6 +22,13 @@ struct JobInput<P: Int4ScoredJobTask, R> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Requirements { native: Int4MemoryRequirement, workspace_bytes: u64, input_bytes: u64 }
+impl Requirements {
+    fn with_encoding_workspace(mut self, workspace: u64) -> Result<Self, HostedError> {
+        self.input_bytes = sum(&[self.input_bytes, workspace])?;
+        sum(&[self.input_bytes, self.native.kv_bytes, self.workspace_bytes])?;
+        Ok(self)
+    }
+}
 
 impl NlpEngine {
     /// Start or resume one fixed scoring task over the complete original
@@ -54,7 +61,8 @@ impl NlpEngine {
         planner.check_job_limits(request.limits).map_err(HostedError::BatchSetup)?;
         let work = planner.native_limits();
         let required = requirements(model.model_identity().group_width(), planner.task_ceiling(),
-            work, request.limits, limits, request.mode.input_memory())?;
+            work, request.limits, limits, request.mode.input_memory())?
+            .with_encoding_workspace(planner.encoding_workspace_bytes())?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(JobInput { preparation: Some((planner, request)), reader }))?;

@@ -1718,6 +1718,32 @@ three native planners. This route uses the existing job format and serial
 native execution. Fixtures are authored; compilation, model-present execution,
 crash qualification, task quality and performance remain pending their gates.
 
+### Compact input for retained scoring jobs
+
+All three `source-int4 score-job` tasks accept
+`--input-encoding safe-bpe-v1`. This uses the existing byte-preserving,
+control-excluding encoder for complete classification, sentiment and judgment
+records, including pairwise, rubric and faithfulness modes. One cumulative
+tokenizer budget covers every untrusted segment in each record; repeated heads
+do not receive fresh per-segment allowances.
+
+`--max-tokenizer-input-bytes`, `--max-tokenizer-output-tokens`,
+`--max-tokenizer-pair-checks` and `--max-tokenizer-pair-bytes` set explicit
+ceilings. Their defaults are the record byte ceiling, per-head prompt capacity,
+4,194,304 pair checks and 67,108,864 examined pair bytes. Choose them before
+starting: the exact encoding policy and every cap are authenticated in the
+private job recipe, including retained-input replay. Changing any of them
+refuses resume before storage repair. Native work and attempts remain
+nonrenewable lifetime debits.
+
+The host admits one extra encoder workspace beside retained population and
+plan storage. Compact mode preserves the original source and evidence
+coordinates while changing prompt tokenization; it carries no model-output,
+quality or speed equivalence claim. Byte fallback remains the default and its
+existing recipe and metadata bytes are preserved. See
+[the compact INT4 scoring contract](docs/candidate-scored-jobs.md#compact-input-for-grouped-int4-jobs)
+for a complete invocation and embedding APIs.
+
 ## Implemented candidate INT4 classification document jobs
 
 `fnlp candidate source-int4 classify-document-job start|resume` retains

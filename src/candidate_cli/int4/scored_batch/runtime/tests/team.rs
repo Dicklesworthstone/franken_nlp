@@ -21,7 +21,7 @@ fn command(task: &str, threads: usize, encoding: &str, snapshot: &str, pin: &str
 fn execute_stream(engine: &NlpEngine, model: &ResidentInt4, batch: &BatchArgs, args: &Int4Args,
     limits: BatchLimits, task: &'static str, input: Vec<u8>, output: CapturedStream) {
     let budget = batch.scoring.budget(limits.common);
-    let encoding = args.input_encoding.policy(args.max_input_bytes, limits.common.max_prompt_tokens).unwrap();
+    let encoding = batch.input_encoding(args, limits.common).unwrap();
     let reader: Box<dyn BufRead + Send> = Box::new(std::io::Cursor::new(input));
     let cancellation = CancellationToken::default();
     let started = Instant::now(); let deadline = Duration::from_secs(args.timeout_seconds);
@@ -29,21 +29,21 @@ fn execute_stream(engine: &NlpEngine, model: &ResidentInt4, batch: &BatchArgs, a
         Defaults::Classify(defaults) => {
             let planner = Int4ClassificationPlanner::for_model(model.model_identity(), budget,
                 batch.scoring.classification_limits(args)).unwrap()
-                .with_document_encoding(encoding).unwrap();
+                .with_document_encoding(encoding.clone()).unwrap();
             let planner = Int4ScoredBatchPlanner::new_with_document_encoding(planner, defaults, limits.native).unwrap();
-            stream(engine, model, planner, task, args, limits, started, deadline, reader, output, cancellation).unwrap();
+            stream(engine, model, planner, task, args, limits, encoding, started, deadline, reader, output, cancellation).unwrap();
         }
         Defaults::Sentiment { args: defaults, policy } => {
             let planner = Int4SentimentPlanner::for_model(model.model_identity(), sentiment_options(policy).unwrap(), budget,
-                batch.scoring.sentiment_limits(args)).unwrap().with_document_encoding(encoding).unwrap();
+                batch.scoring.sentiment_limits(args)).unwrap().with_document_encoding(encoding.clone()).unwrap();
             let planner = Int4ScoredBatchPlanner::new_with_document_encoding(planner, Some(defaults), limits.native).unwrap();
-            stream(engine, model, planner, task, args, limits, started, deadline, reader, output, cancellation).unwrap();
+            stream(engine, model, planner, task, args, limits, encoding, started, deadline, reader, output, cancellation).unwrap();
         }
         Defaults::Judge(defaults) => {
             let planner = Int4JudgePlanner::for_model(model.model_identity(), budget,
-                batch.scoring.judge_limits(budget)).unwrap();
-            let planner = Int4ScoredBatchPlanner::new(planner, defaults, limits.native).unwrap();
-            stream(engine, model, planner, task, args, limits, started, deadline, reader, output, cancellation).unwrap();
+                batch.scoring.judge_limits(budget)).unwrap().with_document_encoding(encoding.clone()).unwrap();
+            let planner = Int4ScoredBatchPlanner::new_with_document_encoding(planner, defaults, limits.native).unwrap();
+            stream(engine, model, planner, task, args, limits, encoding, started, deadline, reader, output, cancellation).unwrap();
         }
     }
 }
@@ -58,7 +58,8 @@ fn snapshot_score_stream_teams_match_every_semantic_record_work_and_flush_and_re
     let kernel: Int8KernelKind = std::env::var("FNLP_INT4_TEST_KERNEL").expect("explicit kernel required").parse().unwrap();
     PackedInt4Kernel::detect(kernel).unwrap();
     let cases = [("classify", "byte-fallback"), ("classify", "safe-bpe-v1"),
-        ("sentiment", "byte-fallback"), ("sentiment", "safe-bpe-v1"), ("judge", "byte-fallback")];
+        ("sentiment", "byte-fallback"), ("sentiment", "safe-bpe-v1"),
+        ("judge", "byte-fallback"), ("judge", "safe-bpe-v1")];
     let preparation_bytes = cases.iter().map(|&(task, encoding)|
         command(task, 4, encoding, &snapshot, &pin, memory, kernel).2.common.preparation_bytes).max().unwrap();
     let (_, base_args, base_limits) = command("classify", 4, "safe-bpe-v1", &snapshot, &pin, memory, kernel);

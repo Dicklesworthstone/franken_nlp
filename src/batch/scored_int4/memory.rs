@@ -85,7 +85,7 @@ impl Int4ScoredCohortMemoryLimits {
     }
 }
 
-pub(super) fn encoding_workspace_bytes(encoding: &UntrustedEncoding) -> Result<u64, BatchFault> {
+pub(crate) fn encoding_workspace_bytes(encoding: &UntrustedEncoding) -> Result<u64, BatchFault> {
     encoding.validate().map_err(|_| BatchCode::InvalidLimits)?;
     match encoding {
         UntrustedEncoding::ByteFallback => Ok(0),

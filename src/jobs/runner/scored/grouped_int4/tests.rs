@@ -362,3 +362,126 @@ fn post_sync_cancellation_releases_guard_and_authenticates_recipe_before_tail_re
     let done = resumed.run(&mut Continue).unwrap(); assert_eq!((done.committed, done.attempts), (2, 3));
     assert_eq!(done.reserved_work, JobWork::from_int4(work(3), 0));
 }
+
+
+fn compact_policy() -> UntrustedEncoding {
+    UntrustedEncoding::SafeBpeV1(crate::tokenizer::untrusted::SafeBpeLimits {
+        max_input_bytes: 8192, max_output_tokens: 8192,
+        max_pair_checks: 4 * 1024 * 1024, max_pair_bytes: 64 * 1024 * 1024,
+    })
+}
+
+#[test]
+fn every_compact_cap_is_authenticated_for_all_five_scored_record_shapes() {
+    for task in 0..5 {
+        let original = recipe(task, native()).with_document_encoding(&compact_policy()).unwrap();
+        assert!(serde_json::to_value(&original).unwrap().get("input_encoding").is_some());
+        assert_eq!(original.task_ceiling(), budget());
+        original.check_job_limits(limits(native())).unwrap();
+        for axis in 0..4 {
+            let UntrustedEncoding::SafeBpeV1(mut changed) = compact_policy() else { unreachable!() };
+            match axis { 0 => changed.max_input_bytes += 1, 1 => changed.max_output_tokens += 1,
+                2 => changed.max_pair_checks += 1, _ => changed.max_pair_bytes += 1 }
+            let changed = recipe(task, native())
+                .with_document_encoding(&UntrustedEncoding::SafeBpeV1(changed)).unwrap();
+            assert_eq!(freeze(task, &original).binding.compare(&freeze(task, &changed).binding),
+                Err(JobError::Mismatch(MismatchField::Recipe)), "task {task}, axis {axis}");
+        }
+        assert_eq!(freeze(task, &original).binding.compare(&freeze(task, &recipe(task, native())).binding),
+            Err(JobError::Mismatch(MismatchField::Recipe)));
+    }
+}
+
+#[test]
+fn byte_recipes_keep_exact_bytes_and_invalid_compact_limits_refuse() {
+    for task in 0..5 {
+        let expected = bytes(&recipe(task, native()));
+        let selected = recipe(task, native()).with_document_encoding(&UntrustedEncoding::ByteFallback).unwrap();
+        assert_eq!(bytes(&selected), expected);
+        assert!(serde_json::to_value(&selected).unwrap().get("input_encoding").is_none());
+        for axis in 0..4 {
+            let UntrustedEncoding::SafeBpeV1(mut invalid) = compact_policy() else { unreachable!() };
+            match axis { 0 => invalid.max_input_bytes = 0, 1 => invalid.max_output_tokens = 0,
+                2 => invalid.max_pair_checks = 0, _ => invalid.max_pair_bytes = 0 }
+            assert!(recipe(task, native()).with_document_encoding(&UntrustedEncoding::SafeBpeV1(invalid)).is_err());
+        }
+    }
+}
+
+#[test]
+fn actual_factories_bind_only_the_explicit_compact_constructor_and_quote_one_workspace() {
+    use crate::native_engine::strict_int4::weights::projection_fixture;
+    use crate::tasks::sentiment::{SentimentOptions, SentimentPolicy};
+    use crate::native_engine::lmhead::scoring::ScoringMode;
+    fn check<P: Int4ScoredJobTask>(make: impl Fn(UntrustedEncoding) -> P, defaults: P::Args) {
+        let byte = Int4ScoredJobPlanner::new(make(UntrustedEncoding::ByteFallback),
+            Some(defaults.clone()), native()).unwrap();
+        let explicit = Int4ScoredJobPlanner::new_with_document_encoding(make(UntrustedEncoding::ByteFallback),
+            Some(defaults.clone()), native()).unwrap();
+        assert_eq!(bytes(&byte.recipe), bytes(&explicit.recipe));
+        assert_eq!(byte.encoding_workspace_bytes(), 0);
+        assert!(Int4ScoredJobPlanner::new(make(compact_policy()), Some(defaults.clone()), native()).is_err());
+        let compact = Int4ScoredJobPlanner::new_with_document_encoding(make(compact_policy()),
+            Some(defaults), native()).unwrap();
+        assert_eq!(compact.document_encoding(), &compact_policy());
+        assert_eq!(compact.encoding_workspace_bytes(),
+            crate::batch::scored_int4::memory::encoding_workspace_bytes(&compact_policy()).unwrap());
+        assert_ne!(bytes(&byte.recipe), bytes(&compact.recipe));
+        assert_eq!(byte.native_limits(), compact.native_limits());
+        assert_eq!(byte.task_ceiling(), compact.task_ceiling());
+        compact.check_job_limits(limits(native())).unwrap();
+    }
+    let (model, _) = projection_fixture(WIDTH);
+    check(|encoding| Int4ClassificationPlanner::for_model(model.identity(), budget(), planning()).unwrap()
+        .with_document_encoding(encoding).unwrap(), labels());
+    let registry = crate::tokenizer::pinned_controls::pinned().unwrap();
+    let eos = registry.template_controls().entries().iter()
+        .find(|entry| entry.special && entry.surface == crate::template::IM_END).unwrap().id;
+    check(|encoding| Int4SentimentPlanner::for_model(model.identity(), SentimentOptions {
+        mode: ScoringMode::FullVocabulary, eos_token_id: eos, policy: SentimentPolicy {
+            minimum_peak_weight_ppm: 0, maximum_normalized_entropy_ppm: 1_000_000 },
+    }, budget(), SentimentLimits::default()).unwrap().with_document_encoding(encoding).unwrap(), sentiment());
+    for mode in 0..3 {
+        check(|encoding| Int4JudgePlanner::for_model(model.identity(), budget(), JudgeLimits::default()).unwrap()
+            .with_document_encoding(encoding).unwrap(), judgment(mode));
+    }
+}
+
+#[test]
+fn compact_policy_authenticates_before_tail_repair_and_failed_work_is_not_refunded() {
+    let root = Root::new(); let input = inputs(); let cap = native();
+    let events = Rc::new(Events::default());
+    let make = || {
+        let mut p = Processor::<JudgeBatchArgs>::new(2, cap, Rc::clone(&events));
+        p.recipe = p.recipe.with_document_encoding(&compact_policy()).unwrap();
+        p
+    };
+    let mut stop = CancelAfterSync(Rc::clone(&events));
+    let mut run = JobRunner::create(&root.0, key(), JobId([9; 16]), limits(cap), &input,
+        make(), &mut stop).unwrap();
+    assert_eq!(error(run.step(&mut stop)),
+        JobRunError::Storage(JobError::Cancelled(DecodeCancellationKind::PollQuota)));
+    assert_eq!(run.progress().reserved_work, JobWork::from_int4(work(1), 0));
+    assert_eq!(run.progress().attempts, 1);
+    assert!(!events.held.get()); drop(run);
+    for axis in 0..5 {
+        let policy = if axis == 4 { UntrustedEncoding::ByteFallback } else {
+            let UntrustedEncoding::SafeBpeV1(mut changed) = compact_policy() else { unreachable!() };
+            match axis { 0 => changed.max_input_bytes += 1, 1 => changed.max_output_tokens += 1,
+                2 => changed.max_pair_checks += 1, _ => changed.max_pair_bytes += 1 }
+            UntrustedEncoding::SafeBpeV1(changed)
+        };
+        let mut wrong = make();
+        wrong.recipe = wrong.recipe.with_document_encoding(&policy).unwrap();
+        assert_eq!(error(JobRunner::resume(&root.0, key(), JobId([9; 16]), limits(cap), &input,
+            wrong, TailPolicy::DiscardUncommitted, &mut Continue)),
+            JobRunError::Storage(JobError::Mismatch(MismatchField::Recipe)));
+        assert_eq!(error(JobRunner::resume(&root.0, key(), JobId([9; 16]), limits(cap), &input,
+            make(), TailPolicy::Refuse, &mut Continue)), JobRunError::Storage(JobError::UncommittedTail));
+    }
+    let mut resumed = JobRunner::resume(&root.0, key(), JobId([9; 16]), limits(cap), &input,
+        make(), TailPolicy::DiscardUncommitted, &mut Continue).unwrap();
+    let done = resumed.run(&mut Continue).unwrap();
+    assert_eq!((done.committed, done.attempts), (2, 3));
+    assert_eq!(done.reserved_work, JobWork::from_int4(work(3), 0));
+}
