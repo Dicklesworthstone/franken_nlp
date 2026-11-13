@@ -146,7 +146,12 @@ impl<A: Int4RedactionBatchAdmission> BatchProcessor
         let pseudonyms = self.pseudonyms;
         execute_reserved(&mut self.ledger, config, context, kv, &mut self.admission, control, |control| {
             let result = backend.redact(redactor, &prepared.source, config, pseudonyms, vocabulary, control)
-                .and_then(|out| { validate_result(&out, prepared.preflight, config, group_width, pseudonyms)?; Ok(out) });
+                .and_then(|out| {
+                    prepared.preflight.verify_completed_with_control(&out, &config.request,
+                        pseudonyms.map(Pseudonyms::identity), control)?;
+                    validate_result(&out, prepared.preflight, config, group_width, pseudonyms)?;
+                    Ok(out)
+                });
             (result, backend.clean())
         })
     }

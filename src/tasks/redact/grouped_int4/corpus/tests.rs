@@ -360,18 +360,21 @@ fn receipt(c: &Int4DocumentRedactionBatchConfig, pseudonyms: Option<&Pseudonyms<
     let used = SourceMapVerification { fields: 2, matches: 3, scan_steps: 7 };
     let stage = || Int4LongRedactionStage { preflight: Int4LongRedactionPreflight {
         source_bytes: source.len(), source_scalars: source.chars().count(), chunks: 2, group_width: WIDTH,
-        planned_model_work: two, reserved_mask_node_visits: 2000 }, model_work: two, mask_node_visit_charge: 4,
+        planned_model_work: two, reserved_mask_node_visits: 2000,
+        source_binding: [1; 32], max_result_bytes: c.detector.max_result_bytes }, model_work: two, mask_node_visit_charge: 4,
         map_verification_used: used, detection_verification_used: used };
     let work = if c.request.verify { two.checked_add(two).unwrap() } else { two };
     let total = if c.request.verify { add_verification(used, used).unwrap() } else { used };
-    Int4LongRedactionRun { schema_version: 1, execution: INT4_LONG_REDACTION_EXECUTION,
+    let mut run = Int4LongRedactionRun { schema_version: 1, execution: INT4_LONG_REDACTION_EXECUTION,
         numerics_profile: STRICT_INT4_PROFILE, group_width: WIDTH, detector_scope: "whole-source-rules-independent-ner-chunks-v1",
         result, original: stage(), verification: c.request.verify.then(stage), reserved_model_work: work, model_work: work,
         reserved_mask_node_visits: if c.request.verify { 4000 } else { 2000 },
         mask_node_visit_charge: if c.request.verify { 8 } else { 4 },
         map_verification_used: total, detection_verification_used: total, verification_scan_steps: total.scan_steps,
         warnings: ["ner_chunk_boundaries_may_split_entities", "detector_recall_not_established",
-            "clean_scan_and_pseudonyms_are_not_anonymization"] }
+            "clean_scan_and_pseudonyms_are_not_anonymization"], request_binding: [0; 32], result_binding: [0; 32] };
+    super::super::long::seal_fixture(&mut run, &c.request, pseudonyms.map(Pseudonyms::identity));
+    run
 }
 #[test]
 fn completed_receipt_reconciles_geometry_policy_group_and_every_counter() {
@@ -561,9 +564,11 @@ fn cohort_receipt(c: &Int4DocumentRedactionBatchConfig)
             projection_groups: (stage.model_work.projected_logits / NANBEIGE_VOCAB_SIZE as u64).div_ceil(rows),
             planned_work: stage.preflight.planned_model_work, model_work: stage.model_work }
     };
-    Int4LongRedactionCohortRun { schema_version: 1, execution: INT4_LONG_REDACTION_COHORT_EXECUTION,
+    let mut run = Int4LongRedactionCohortRun { schema_version: 1, execution: INT4_LONG_REDACTION_COHORT_EXECUTION,
         cohort_chunks: width, original_cohorts: stats(&output.original),
-        verification_cohorts: output.verification.as_ref().map(stats), output }
+        verification_cohorts: output.verification.as_ref().map(stats), output, completion_binding: [0; 32] };
+    run.seal_fixture();
+    run
 }
 #[test]
 fn physical_receipts_are_validated_before_preserving_the_exact_semantic_wire() {

@@ -23,11 +23,26 @@ pub struct Int4LongRedactionCohortRun {
     /// Same edited text, policy/key scope, evidence and semantic stage receipts
     /// as the serial schedule. No native transcript or private source escapes.
     pub output: Int4LongRedactionRun,
+    #[serde(skip)]
+    pub(crate) completion_binding: [u8; 32],
 }
 impl Int4LongRedactionCohortRun {
     /// Check physical counters against the complete semantic stage receipts.
-    /// This is a consistency check, not authentication of external results.
+    /// The private seal binds the actual declared width and both native stages.
+    /// This remains process-local association, not external receipt authority.
     pub fn validate_schedule(&self) -> Result<(), Int4LongRedactionError> {
+        self.validate_schedule_with_control(&mut binding::Continue)
+    }
+    pub fn validate_schedule_with_control<C: DecodeStepControl>(&self, control: &mut C)
+        -> Result<(), Int4LongRedactionError> {
+        let mut check = || poll(control);
+        check()?;
+        let cap = self.output.original.preflight.max_result_bytes.checked_add(INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES)
+            .ok_or(Int4SourceMapError::WorkLimit)?;
+        if self.output.result_binding != binding::result(&self.output, self.output.original.preflight.max_result_bytes, &mut check)?
+            || self.completion_binding != binding::cohort(self, cap, &mut check)? {
+            return Err(Int4RedactionError::InvalidResult.into());
+        }
         if self.schema_version != 1 || self.execution != INT4_LONG_REDACTION_COHORT_EXECUTION
             || !(1..=64).contains(&self.cohort_chunks) {
             return Err(Int4RedactionError::InvalidResult.into());
@@ -38,7 +53,13 @@ impl Int4LongRedactionCohortRun {
             (None, None) => {},
             _ => return Err(Int4RedactionError::InvalidResult.into()),
         }
-        Ok(())
+        check()
+    }
+    #[cfg(test)]
+    pub(crate) fn seal_fixture(&mut self) {
+        let cap = self.output.original.preflight.max_result_bytes
+            .checked_add(INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES).unwrap();
+        self.completion_binding = binding::cohort(self, cap, &mut || Ok(())).unwrap();
     }
 }
 
@@ -79,7 +100,7 @@ impl Int4DocumentRedactor<'_> {
         let prepared = self.prepare(source, self.config.mapping, control)?;
         check_budget(prepared.cohort_requirements(budget.context_limit)?, budget)?;
         poll(control)?;
-        Ok(metadata(prepared.preflight_metadata()))
+        self.metadata(source, prepared.preflight_metadata(), control)
     }
 
     /// Execute both NER maps through real source-map cohorts. Each stage
@@ -100,17 +121,18 @@ impl Int4DocumentRedactor<'_> {
             stages: [None, None], completed: 0 };
         let output = self.run_pipeline(source, request, pseudonyms, &mut driver)?;
         let original_cohorts = driver.stages[0].ok_or(Int4RedactionError::InvalidResult)?;
-        let run = Int4LongRedactionCohortRun { schema_version: 1,
+        let mut run = Int4LongRedactionCohortRun { schema_version: 1,
             execution: INT4_LONG_REDACTION_COHORT_EXECUTION,
             cohort_chunks: self.config.mapping.reduction.map_batch_chunks,
-            original_cohorts, verification_cohorts: driver.stages[1], output };
+            original_cohorts, verification_cohorts: driver.stages[1], output, completion_binding: [0; 32] };
         if driver.completed != 1 + usize::from(request.verify) {
             return Err(Int4RedactionError::InvalidResult.into());
         }
-        run.validate_schedule()?;
         let cap = self.config.max_result_bytes.checked_add(INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES)
             .ok_or(Int4SourceMapError::WorkLimit)?;
         crate::tasks::extract::quantized::check_size(&run, cap).map_err(Int4SourceError::from)?;
+        run.completion_binding = binding::cohort(&run, cap, &mut || poll(driver.control))?;
+        run.validate_schedule_with_control(driver.control)?;
         poll(driver.control)?;
         Ok(run)
     }

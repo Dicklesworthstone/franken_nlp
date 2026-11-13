@@ -2,6 +2,7 @@
 //! Native stage receipts are private scripted fixtures, not inference evidence.
 use super::*;
 mod cohort;
+mod binding;
 use crate::{
     artifact::converter::PINNED_REVISION,
     execution_identity::{NumericsProfile, ThinkingMode, ToolMode},
@@ -117,7 +118,7 @@ impl DetectionDriver for FixtureDetection {
         -> Result<(DetectedDocument<'s>, Int4LongRedactionStage), Int4LongRedactionError> {
         let mapping = accounting.begin(recipe.config.mapping)?;
         let prepared = recipe.prepare(source, mapping, &mut Continue)?;
-        let preflight = metadata(prepared.preflight_metadata());
+        let preflight = recipe.metadata(source, prepared.preflight_metadata(), &mut Continue)?;
         accounting.reserve(preflight, recipe.config.mapping)?;
         let chunks = exact_chunks(recipe, source, mapping);
         assert_eq!(preflight.chunks, chunks.chunks().len());
@@ -153,7 +154,7 @@ fn synthetic_stage(preflight: Int4LongRedactionPreflight) -> Int4LongRedactionSt
 }
 fn one_stage(work: Int4Work) -> Int4LongRedactionPreflight {
     Int4LongRedactionPreflight { source_bytes: 5, source_scalars: 5, chunks: 1, group_width: 127,
-        planned_model_work: work, reserved_mask_node_visits: 1000 }
+        planned_model_work: work, reserved_mask_node_visits: 1000, source_binding: [0; 32], max_result_bytes: u64::MAX }
 }
 
 #[test]

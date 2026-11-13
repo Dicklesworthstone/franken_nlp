@@ -22,7 +22,8 @@ fn fixture(verify: bool, include_map: bool)
     let map_used = SourceMapVerification { fields: 1, matches: 1, scan_steps: 11 };
     let detection_used = SourceMapVerification { fields: 1, matches: 1, scan_steps: 13 };
     let expected = Int4LongRedactionPreflight { source_bytes: source.len(), source_scalars: source.chars().count(),
-        chunks: 2, group_width: 128, planned_model_work: work, reserved_mask_node_visits: masks };
+        chunks: 2, group_width: 128, planned_model_work: work, reserved_mask_node_visits: masks,
+        source_binding: [1; 32], max_result_bytes: detector.max_result_bytes };
     let original = Int4LongRedactionStage { preflight: expected, model_work: work, mask_node_visit_charge: masks,
         map_verification_used: map_used, detection_verification_used: detection_used };
     let verification = verify.then(|| Int4LongRedactionStage {
@@ -33,7 +34,7 @@ fn fixture(verify: bool, include_map: bool)
     });
     let stages = 1 + u64::from(verify);
     let total_work = if verify { work.checked_add(work).unwrap() } else { work };
-    let run = Int4LongRedactionRun { schema_version: 1, execution: INT4_LONG_REDACTION_EXECUTION,
+    let mut run = Int4LongRedactionRun { schema_version: 1, execution: INT4_LONG_REDACTION_EXECUTION,
         numerics_profile: STRICT_INT4_PROFILE, group_width: 128,
         detector_scope: "whole-source-rules-independent-ner-chunks-v1", result, original, verification,
         reserved_model_work: total_work, model_work: total_work,
@@ -42,7 +43,8 @@ fn fixture(verify: bool, include_map: bool)
         detection_verification_used: SourceMapVerification { fields: stages as usize, matches: stages as usize, scan_steps: 13 * stages },
         verification_scan_steps: 13 * stages,
         warnings: ["ner_chunk_boundaries_may_split_entities", "detector_recall_not_established",
-            "clean_scan_and_pseudonyms_are_not_anonymization"] };
+            "clean_scan_and_pseudonyms_are_not_anonymization"], request_binding: [0; 32], result_binding: [0; 32] };
+    crate::tasks::redact::grouped_int4::long::seal_fixture(&mut run, &request, None);
     (expected, run, request, detector)
 }
 
@@ -61,6 +63,28 @@ fn complete_receipt_requires_selected_verification_and_actual_transformed_geomet
         let mut changed = request.clone(); changed.verify = !verify;
         assert_eq!(check_completed(expected, &run, &changed, &detector), Err(CandidateError::Execution));
     }
+}
+
+#[test]
+fn publication_checks_the_private_completion_and_preserves_late_deadlines() {
+    struct Control { calls: usize, stop: usize }
+    impl DecodeStepControl for Control {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.calls += 1; (self.calls == self.stop).then_some(DecodeCancellationKind::Deadline)
+        }
+    }
+    let (expected, mut run, request, detector) = fixture(true, false);
+    assert!(check_completed_with_control(expected, &run, &request, &detector, None,
+        &mut Control { calls: 0, stop: usize::MAX }).is_ok());
+    for stop in [1, 3, 5, 6] {
+        assert_eq!(check_completed_with_control(expected, &run, &request, &detector, None,
+            &mut Control { calls: 0, stop }), Err(CandidateError::Timeout));
+    }
+    run.result.text = run.result.text.replace('é', "à");
+    // All existing geometry/counter checks still pass for this same-width edit.
+    assert!(check_completed(expected, &run, &request, &detector).is_ok());
+    assert_eq!(check_completed_with_control(expected, &run, &request, &detector, None,
+        &mut Control { calls: 0, stop: usize::MAX }), Err(CandidateError::Execution));
 }
 
 #[test]

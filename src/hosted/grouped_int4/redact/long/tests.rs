@@ -193,7 +193,8 @@ fn completed(c: &RedactConfig<Int4LongRedactionConfig>, source: &str) -> Int4Lon
         let work = if chunks == 2 { one.checked_add(one).unwrap() } else { one };
         Int4LongRedactionStage {
             preflight: Int4LongRedactionPreflight { source_bytes: text.len(), source_scalars: text.chars().count(),
-                chunks, group_width: width, planned_model_work: work, reserved_mask_node_visits: chunks as u64 * 1000 },
+                chunks, group_width: width, planned_model_work: work, reserved_mask_node_visits: chunks as u64 * 1000,
+                source_binding: [1; 32], max_result_bytes: c.detector.max_result_bytes },
             model_work: work, mask_node_visit_charge: chunks as u64 * 500,
             map_verification_used: SourceMapVerification { fields: 1, matches: 1, scan_steps: 10 },
             detection_verification_used: SourceMapVerification { fields: 1, matches: 1, scan_steps: 11 },
@@ -218,6 +219,7 @@ fn completed(c: &RedactConfig<Int4LongRedactionConfig>, source: &str) -> Int4Lon
         verification_scan_steps: detection.scan_steps,
         warnings: ["ner_chunk_boundaries_may_split_entities", "detector_recall_not_established",
             "clean_scan_and_pseudonyms_are_not_anonymization"],
+        request_binding: [0; 32], result_binding: [0; 32],
     }
 }
 

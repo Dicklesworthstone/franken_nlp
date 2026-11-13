@@ -57,11 +57,13 @@ impl NlpEngine {
             let result = allocate(output, || {
                 let result = redactor.redact_cohorts(&input.value.source, &config.request, pseudonyms.as_ref(),
                     &model.inner.loaded.value, &input.value.vocabulary, budget, kernel, control).map_err(document_error)?;
+                redactor.verify_completed_with_control(&input.value.source, &config.request,
+                    pseudonyms.as_ref().map(Pseudonyms::identity), &result.output, control).map_err(document_error)?;
                 validate_completed(&result.output, config, &input.value.source, width)?;
                 if result.cohort_chunks != config.detector.mapping.reduction.map_batch_chunks {
                     return Err(invalid_result());
                 }
-                result.validate_schedule().map_err(document_error)?;
+                result.validate_schedule_with_control(control).map_err(document_error)?;
                 checkpoint(control)?;
                 Ok(result)
             })?;

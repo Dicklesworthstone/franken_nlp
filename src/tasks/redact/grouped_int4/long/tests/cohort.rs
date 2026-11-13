@@ -119,7 +119,9 @@ fn physical_schedule_never_changes_edit_key_scope_or_fresh_verification_semantic
             let mut wrapped = Int4LongRedactionCohortRun { schema_version: 1,
                 execution: INT4_LONG_REDACTION_COHORT_EXECUTION, cohort_chunks: 3,
                 original_cohorts: stats(&output.original, 3),
-                verification_cohorts: output.verification.as_ref().map(|stage| stats(stage, 3)), output };
+                verification_cohorts: output.verification.as_ref().map(|stage| stats(stage, 3)), output,
+                completion_binding: [0; 32] };
+            wrapped.seal_fixture();
             wrapped.validate_schedule().unwrap();
             wrapped.original_cohorts.chunks += 1;
             assert!(wrapped.validate_schedule().is_err());
@@ -128,4 +130,27 @@ fn physical_schedule_never_changes_edit_key_scope_or_fresh_verification_semantic
             assert!(wrapped.validate_schedule().is_err());
         }
     }
+}
+
+#[test]
+fn plausible_equal_count_width_changes_and_identical_wire_owner_substitution_are_refused() {
+    let p = planner();
+    let request = RedactionRequest { verify: false, ..RedactionRequest::default() };
+    let mut limits = config(); limits.mapping.reduction.map_batch_chunks = 3;
+    let recipe = Int4DocumentRedactor::from_bound_parts(&p, identity(&p, 127), limits.clone(), 127).unwrap();
+    let output = recipe.run_pipeline("Alice", &request, None, &mut FixtureDetection::new()).unwrap();
+    let mut run = Int4LongRedactionCohortRun { schema_version: 1,
+        execution: INT4_LONG_REDACTION_COHORT_EXECUTION, cohort_chunks: 3,
+        original_cohorts: stats(&output.original, 3), verification_cohorts: None, output, completion_binding: [0; 32] };
+    run.seal_fixture(); run.validate_schedule().unwrap();
+    // A single original chunk has the same plausible counters at widths 3/4.
+    run.cohort_chunks = 4;
+    assert!(run.validate_schedule().is_err());
+    run.cohort_chunks = 3; run.validate_schedule().unwrap();
+    limits.max_result_bytes += 1;
+    let other_recipe = Int4DocumentRedactor::from_bound_parts(&p, identity(&p, 127), limits, 127).unwrap();
+    let other = other_recipe.run_pipeline("Alice", &request, None, &mut FixtureDetection::new()).unwrap();
+    assert_eq!(canonjson::canonical_bytes(&run.output).unwrap(), canonjson::canonical_bytes(&other).unwrap());
+    run.output = other;
+    assert!(run.validate_schedule().is_err());
 }

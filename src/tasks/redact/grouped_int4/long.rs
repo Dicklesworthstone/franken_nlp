@@ -15,7 +15,7 @@ use crate::{
 };
 use super::{Int4RedactionError, check_engine, check_model};
 use super::super::{RedactError, RedactionRequest, actions::{self, RedactionResult, VerificationStatus},
-    long::detection, pipeline::LeakReport, pseudonym::Pseudonyms, union::{DetectedDocument, NerProfile}};
+    long::detection, pipeline::LeakReport, pseudonym::{PseudonymIdentity, Pseudonyms}, union::{DetectedDocument, NerProfile}};
 
 pub const INT4_LONG_REDACTION_EXECUTION: &str = "grouped-int4-whole-rules-chunk-ner-redetect-v1";
 const DETECTOR_SCOPE: &str = "whole-source-rules-independent-ner-chunks-v1";
@@ -24,6 +24,9 @@ const WARNINGS: [&str; 3] = ["ner_chunk_boundaries_may_split_entities", "detecto
 const ZERO_VERIFICATION: SourceMapVerification = SourceMapVerification { fields: 0, matches: 0, scan_steps: 0 };
 
 mod cohort;
+mod binding;
+#[cfg(test)]
+pub(crate) use binding::seal_fixture;
 pub use cohort::{Int4LongRedactionCohortRun, INT4_LONG_REDACTION_COHORT_EXECUTION,
     INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES};
 
@@ -65,7 +68,7 @@ impl Int4LongRedactionError {
 
 /// Exact original-stage plans, not execution proof or a promise that the
 /// unknown transformed source will fit the remaining complete-operation cap.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Eq, PartialEq, Serialize)]
 pub struct Int4LongRedactionPreflight {
     pub source_bytes: usize,
     pub source_scalars: usize,
@@ -73,6 +76,40 @@ pub struct Int4LongRedactionPreflight {
     pub group_width: usize,
     pub planned_model_work: Int4Work,
     pub reserved_mask_node_visits: u64,
+    #[serde(skip)]
+    pub(crate) source_binding: [u8; 32],
+    #[serde(skip)]
+    pub(crate) max_result_bytes: u64,
+}
+impl fmt::Debug for Int4LongRedactionPreflight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Int4LongRedactionPreflight")
+            .field("source_bytes", &self.source_bytes).field("source_scalars", &self.source_scalars)
+            .field("chunks", &self.chunks).field("group_width", &self.group_width)
+            .field("planned_model_work", &self.planned_model_work)
+            .field("reserved_mask_node_visits", &self.reserved_mask_node_visits).finish_non_exhaustive()
+    }
+}
+impl Int4LongRedactionPreflight {
+    /// Verify a completion against this exact prepared source/model/detector,
+    /// the requested edit policy and the expected key/namespace commitment.
+    /// Private associations never enter the public result or its byte ceiling.
+    pub fn verify_completed(&self, run: &Int4LongRedactionRun, request: &RedactionRequest,
+        expected_pseudonyms: Option<&PseudonymIdentity>) -> Result<(), Int4LongRedactionError> {
+        self.verify_completed_with_control(run, request, expected_pseudonyms, &mut binding::Continue)
+    }
+    pub fn verify_completed_with_control<C: DecodeStepControl>(&self, run: &Int4LongRedactionRun,
+        request: &RedactionRequest, expected_pseudonyms: Option<&PseudonymIdentity>, control: &mut C)
+        -> Result<(), Int4LongRedactionError> {
+        let mut check = || poll(control);
+        check()?;
+        if run.original.preflight != *self
+            || run.request_binding != binding::request(self.source_binding, request, expected_pseudonyms, &mut check)?
+            || run.result_binding != binding::result(run, self.max_result_bytes, &mut check)? {
+            return Err(Int4RedactionError::InvalidResult.into());
+        }
+        check()
+    }
 }
 #[derive(Serialize)]
 pub struct Int4LongRedactionStage {
@@ -101,6 +138,10 @@ pub struct Int4LongRedactionRun {
     /// Destructive-offset rescans only; map verification is charged separately.
     pub verification_scan_steps: u64,
     pub warnings: [&'static str; 3],
+    #[serde(skip)]
+    pub(crate) request_binding: [u8; 32],
+    #[serde(skip)]
+    pub(crate) result_binding: [u8; 32],
 }
 
 /// Public construction seals the actual resident model and group partition.
@@ -140,7 +181,29 @@ impl<'p> Int4DocumentRedactor<'p> {
     pub fn group_width(&self) -> usize { self.group_width }
     pub fn preflight<C: DecodeStepControl>(&self, source: &str, control: &mut C)
         -> Result<Int4LongRedactionPreflight, Int4LongRedactionError> {
-        Ok(metadata(self.prepare(source, self.config.mapping, control)?.preflight_metadata()))
+        let proof = self.prepare(source, self.config.mapping, control)?.preflight_metadata();
+        self.metadata(source, proof, control)
+    }
+    /// Recheck the complete publication using the same recipe and source,
+    /// without re-tokenizing or executing any additional model work.
+    pub fn verify_completed_with_control<C: DecodeStepControl>(&self, source: &str,
+        request: &RedactionRequest, expected_pseudonyms: Option<&PseudonymIdentity>,
+        run: &Int4LongRedactionRun, control: &mut C) -> Result<(), Int4LongRedactionError> {
+        let expected = binding::source(self, source, &mut || poll(control))?;
+        if run.original.preflight.source_binding != expected
+            || run.original.preflight.max_result_bytes != self.config.max_result_bytes {
+            return Err(Int4RedactionError::InvalidResult.into());
+        }
+        run.original.preflight.verify_completed_with_control(run, request, expected_pseudonyms, control)
+    }
+    fn metadata<C: DecodeStepControl>(&self, source: &str, proof: Int4SourceMapPreflight, control: &mut C)
+        -> Result<Int4LongRedactionPreflight, Int4LongRedactionError> {
+        let span = proof.source_span();
+        Ok(Int4LongRedactionPreflight { source_bytes: span.byte_end, source_scalars: span.scalar_end,
+            chunks: proof.chunk_count(), group_width: proof.group_width(), planned_model_work: proof.planned_work(),
+            reserved_mask_node_visits: proof.reserved_mask_visits(),
+            source_binding: binding::source(self, source, &mut || poll(control))?,
+            max_result_bytes: self.config.max_result_bytes })
     }
     fn prepare<'s, C: DecodeStepControl>(&self, source: &'s str, mapping: Int4SourceMapLimits, control: &mut C)
         -> Result<PreparedInt4SourceMap<'s>, Int4LongRedactionError> {
@@ -168,6 +231,9 @@ impl<'p> Int4DocumentRedactor<'p> {
             || request.edit_budget.max_output_bytes as u64 > self.config.max_result_bytes {
             return Err(RedactError::InputBudget.into());
         }
+        let source_binding = binding::source(self, source, &mut || driver.checkpoint())?;
+        let request_binding = binding::request(source_binding, request, pseudonyms.map(Pseudonyms::identity),
+            &mut || driver.checkpoint())?;
         let mut accounting = Accounting::default();
         let mut grounding = request.grounding_budget;
         let (document, original) = driver.detect(self, source, request, &mut accounting, &mut grounding)?;
@@ -184,7 +250,8 @@ impl<'p> Int4DocumentRedactor<'p> {
             Some(stage)
         } else { None };
         driver.checkpoint()?;
-        if accounting.failed || accounting.current.is_some() || accounting.completed != 1 + usize::from(request.verify) {
+        if accounting.failed || accounting.current.is_some() || accounting.completed != 1 + usize::from(request.verify)
+            || original.preflight.source_binding != source_binding {
             return Err(Int4RedactionError::InvalidResult.into());
         }
         let detection_used = verification_used(request.grounding_budget, grounding)?;
@@ -195,16 +262,26 @@ impl<'p> Int4DocumentRedactor<'p> {
             INT4_LONG_REDACTION_EXECUTION, CHUNK_PROFILE, result.policy_digest, request,
             &self.config.ner, self.config.per_chunk, self.config.mapping.chunks, self.group_width,
         )).map_err(|_| RedactError::Serialization)?);
+        // Preserve established byte-mode policy bytes. An explicitly compact
+        // planner is a separate prompt policy, including its finite work limits.
+        if self.planner.document_encoding() != &crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback {
+            result.policy_digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&(
+                "int4-document-redaction-input-policy-v1", result.policy_digest,
+                self.planner.document_encoding(), self.planner.map_document_encoding_limits(),
+            )).map_err(|_| RedactError::Serialization)?);
+        }
         result.check_size(request.edit_budget.max_output_bytes)?;
-        let output = Int4LongRedactionRun {
+        let mut output = Int4LongRedactionRun {
             schema_version: 1, execution: INT4_LONG_REDACTION_EXECUTION, numerics_profile: STRICT_INT4_PROFILE,
             group_width: self.group_width, detector_scope: DETECTOR_SCOPE, result, original, verification,
             reserved_model_work: accounting.reserved, model_work: accounting.actual,
             reserved_mask_node_visits: accounting.masks_reserved, mask_node_visit_charge: accounting.masks_actual,
             map_verification_used: accounting.map_used, detection_verification_used: detection_used,
             verification_scan_steps: detection_used.scan_steps, warnings: WARNINGS,
+            request_binding, result_binding: [0; 32],
         };
         crate::tasks::extract::quantized::check_size(&output, self.config.max_result_bytes).map_err(Int4SourceError::from)?;
+        output.result_binding = binding::result(&output, self.config.max_result_bytes, &mut || driver.checkpoint())?;
         driver.checkpoint()?;
         Ok(output)
     }
@@ -235,7 +312,7 @@ impl<'p> Int4DocumentRedactor<'p> {
         let before = *grounding;
         let prepared = self.prepare(source, mapping, control)?;
         let proof = prepared.preflight_metadata();
-        let preflight = metadata(proof);
+        let preflight = self.metadata(source, proof, control)?;
         accounting.reserve(preflight, self.config.mapping)?;
         let mut admitted = Vec::new();
         admitted.try_reserve_exact(prepared.chunk_count()).map_err(|_| RedactError::AllocationRefused)?;
@@ -243,7 +320,7 @@ impl<'p> Int4DocumentRedactor<'p> {
         let mapped = execute(prepared, &admitted, control)?;
         // The sealed map proof checks complete source coverage, every actual
         // group/work receipt, native result counts and independent map evidence.
-        proof.verify_completed(&mapped)?;
+        proof.verify_completed_with_control(&mapped, control)?;
         for chunk in mapped.mapped.root().value().chunks() {
             poll(control)?;
             let SourceTaskResult::Ner(result) = &chunk.native.result else { return Err(RedactError::InvalidNerEvidence.into()); };
@@ -281,12 +358,6 @@ impl<C: DecodeStepControl> DetectionDriver for NativeDetection<'_, '_, C> {
         -> Result<(DetectedDocument<'s>, Int4LongRedactionStage), Int4LongRedactionError> {
         recipe.detect(source, request, self.engine, self.vocabulary, accounting, grounding, self.control)
     }
-}
-fn metadata(proof: Int4SourceMapPreflight) -> Int4LongRedactionPreflight {
-    let source = proof.source_span();
-    Int4LongRedactionPreflight { source_bytes: source.byte_end, source_scalars: source.scalar_end,
-        chunks: proof.chunk_count(), group_width: proof.group_width(), planned_model_work: proof.planned_work(),
-        reserved_mask_node_visits: proof.reserved_mask_visits() }
 }
 fn require_clean(document: DetectedDocument<'_>, cap: u64) -> Result<(), Int4LongRedactionError> {
     if document.regions.is_empty() { return Ok(()); }

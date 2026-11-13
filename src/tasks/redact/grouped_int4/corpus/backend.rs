@@ -51,7 +51,7 @@ impl Backend<'_, '_> {
             Self::Cohorts { weights, budget, kernel } => {
                 let run = redactor.redact_cohorts(source, &config.request, pseudonyms,
                     weights, vocabulary, *budget, *kernel, control)?;
-                completed(run, config.detector.mapping.reduction.map_batch_chunks)
+                completed_with_control(run, config.detector.mapping.reduction.map_batch_chunks, control)
             }
         }
     }
@@ -79,9 +79,18 @@ pub(super) fn cohort_budget(config: &Int4DocumentRedactionBatchConfig, width: us
     }
     Ok(required)
 }
+#[cfg(test)]
 pub(super) fn completed(run: Int4LongRedactionCohortRun, width: usize)
     -> Result<Int4LongRedactionRun, Int4LongRedactionError> {
+    struct Continue;
+    impl DecodeStepControl for Continue {
+        fn checkpoint(&mut self, _: usize) -> Option<crate::native_engine::decode::DecodeCancellationKind> { None }
+    }
+    completed_with_control(run, width, &mut Continue)
+}
+fn completed_with_control<C: DecodeStepControl>(run: Int4LongRedactionCohortRun, width: usize, control: &mut C)
+    -> Result<Int4LongRedactionRun, Int4LongRedactionError> {
     if run.cohort_chunks != width { return Err(Int4RedactionError::InvalidResult.into()); }
-    run.validate_schedule()?;
+    run.validate_schedule_with_control(control)?;
     Ok(run.output)
 }

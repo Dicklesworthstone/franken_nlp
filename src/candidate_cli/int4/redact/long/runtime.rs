@@ -7,7 +7,7 @@ use crate::{
         RedactConfig, RedactionPseudonyms},
     native_engine::{decode::{DecodeCancellationKind, DecodeStepControl},
         strict_int4::{Int4MemoryBudget, STRICT_INT4_PROFILE, weights::snapshot::INT4_SNAPSHOT_VERSION}},
-    tasks::{BuiltInTask, redact::{actions::VerificationStatus, detectors, pseudonym::Pseudonyms,
+    tasks::{BuiltInTask, redact::{actions::VerificationStatus, detectors, pseudonym::{PseudonymIdentity, Pseudonyms},
         grouped_int4::{Int4RedactionError, long::{Int4DocumentRedactor, Int4LongRedactionError,
             Int4LongRedactionPreflight, Int4LongRedactionRun, Int4LongRedactionStage,
             INT4_LONG_REDACTION_EXECUTION}}},
@@ -125,6 +125,13 @@ fn check_completed(expected: Int4LongRedactionPreflight, run: &Int4LongRedaction
     }
     Ok(())
 }
+fn check_completed_with_control<C: DecodeStepControl>(expected: Int4LongRedactionPreflight,
+    run: &Int4LongRedactionRun, request: &RedactionRequest, detector: &Int4LongRedactionConfig,
+    expected_pseudonyms: Option<&PseudonymIdentity>, control: &mut C) -> Result<(), CandidateError> {
+    expected.verify_completed_with_control(run, request, expected_pseudonyms, control)
+        .map_err(|error| error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution))?;
+    check_completed(expected, run, request, detector)
+}
 
 pub(super) fn execute(args: Int4Args, command: DocumentArgs, _admitted: DocumentLimits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
@@ -144,11 +151,12 @@ pub(super) fn execute(args: Int4Args, command: DocumentArgs, _admitted: Document
     // same full256 scope for both stages; no per-chunk key or policy override.
     let secret = command.redaction.key(input)?.map(|(key, namespace)| RedactionPseudonyms { key: Arc::new(key), namespace });
     let request = command.request(&args, limits);
-    {
+    let expected_pseudonyms = {
         let context = secret.as_ref().map(|s| Pseudonyms::full256(&s.key, &s.namespace,
             request.actions.expected_key_commitment.as_deref())).transpose().map_err(|_| CandidateError::Identity)?;
         request.actions.check_key(context.as_ref()).map_err(|_| CandidateError::Arguments)?;
-    }
+        context.as_ref().map(|context| context.identity().clone())
+    };
     remaining()?;
     let text = if args.input.as_os_str() == "-" { read_input(input, args.max_input_bytes)? }
         else { read_input(&mut crate::local_io::open_document(&args.input)
@@ -217,11 +225,13 @@ pub(super) fn execute(args: Int4Args, command: DocumentArgs, _admitted: Document
     if limits.cohort.is_some() {
         let result = engine.redact_int4_document_cohorts(&model, text, Arc::new(planner), Arc::new(vocabulary),
             config, secret, common.kernel, cancellation).map_err(execution_error)?;
-        check_completed(expected, &result.result().output, &request, &detector)?;
+        check_completed_with_control(expected, &result.result().output, &request, &detector,
+            expected_pseudonyms.as_ref(), &mut DeadlineControl { started, deadline })?;
         if Some(result.result().cohort_chunks) != command.cohort_chunks {
             return Err(CandidateError::Execution);
         }
-        result.result().validate_schedule().map_err(|_| CandidateError::Execution)?;
+        result.result().validate_schedule_with_control(&mut DeadlineControl { started, deadline })
+            .map_err(|error| error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution))?;
         let cap = common.result_bytes.checked_add(INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES as usize)
             .and_then(|bytes| bytes.checked_add(4096)).ok_or(CandidateError::Arguments)?;
         publish_complete(&Response { provenance: &provenance, output: result.result() }, cap, output, &remaining)
@@ -235,7 +245,8 @@ pub(super) fn execute(args: Int4Args, command: DocumentArgs, _admitted: Document
                 Arc::new(planner), Arc::new(vocabulary), config, secret, common.kernel,
                 common.compute.threads, cancellation).map_err(execution_error)?)
         };
-        check_completed(expected, result.result(), &request, &detector)?;
+        check_completed_with_control(expected, result.result(), &request, &detector,
+            expected_pseudonyms.as_ref(), &mut DeadlineControl { started, deadline })?;
         let response = Response { provenance: &provenance, output: result.result() };
         publish_complete(&compute::Response { response: &response, compute: result.compute() },
             common.result_bytes + 4096, output, &remaining)

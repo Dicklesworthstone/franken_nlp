@@ -55,6 +55,8 @@ impl NlpEngine {
             let result = allocate(output, || {
                 let result = redactor.redact(&input.value.source, &config.request, pseudonyms.as_ref(),
                     &mut engine.value, &input.value.vocabulary, control).map_err(document_error)?;
+                redactor.verify_completed_with_control(&input.value.source, &config.request,
+                    pseudonyms.as_ref().map(Pseudonyms::identity), &result, control).map_err(document_error)?;
                 validate_completed(&result, config, &input.value.source, width)?;
                 if engine.value.is_poisoned() || !engine.value.kv_cache().all_slots_have_len(0) {
                     return Err(invalid_result());
