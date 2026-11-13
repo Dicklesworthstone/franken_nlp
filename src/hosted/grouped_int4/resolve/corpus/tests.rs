@@ -510,3 +510,80 @@ fn serial_footer_omits_schedule_and_empty_cohort_footer_retains_the_selected_pha
     send::<Int4EntityCorpusCohortSummary>();
     send::<Int4EntityCorpusHostRequirements>();
 }
+
+#[test]
+fn row_team_is_distinct_from_every_native_cohort_schedule() {
+    check_team_schedule(None).unwrap();
+    for schedule in [
+        Int4EntitySchedule::default(),
+        Int4EntitySchedule { ner_cohort_chunks: Some(1), pair_cohort_pairs: None },
+        Int4EntitySchedule { ner_cohort_chunks: None, pair_cohort_pairs: Some(1) },
+        cohort_schedule(),
+    ] {
+        assert!(matches!(check_team_schedule(Some(schedule)), Err(HostedError::Limits(_))));
+    }
+}
+
+#[test]
+fn row_team_footer_has_one_physical_total_without_changing_semantic_work() {
+    let mut ledger = Ledger::new(&task());
+    ledger.begin().unwrap();
+    ledger.complete(charge()).unwrap();
+    ledger.acknowledge().unwrap();
+    let semantic = ledger.summary;
+    let receipt = Int4ComputeReceipt { schedule: "int4-output-row-team-v1", compute_threads: 3,
+        completed_projections: 12, completed_rows: 60, completed_worker_rows: 40 };
+    ledger.summary.compute = Some(receipt);
+    let frame = events(&footer_bytes(&provenance(), &ledger.summary, FOOTER_BYTES).unwrap()).remove(0);
+    assert_eq!(frame["summary"]["compute"], serde_json::to_value(receipt).unwrap());
+    assert_eq!(frame["summary"]["model_work"], serde_json::to_value(semantic.model_work).unwrap());
+    assert!(frame["summary"].get("cohort").is_none());
+    let before = ledger.remaining;
+    ledger.begin().unwrap();
+    ledger.complete(zero_charge()).unwrap();
+    ledger.acknowledge().unwrap();
+    assert_eq!(ledger.remaining, before);
+    assert_eq!(ledger.summary.compute, Some(receipt));
+
+    let serial = events(&footer_bytes(&provenance(), &semantic, FOOTER_BYTES).unwrap()).remove(0);
+    assert!(serial["summary"].get("compute").is_none());
+    let empty = Int4EntityCorpusSummary {
+        compute: Some(Int4ComputeReceipt { completed_projections: 0, completed_rows: 0,
+            completed_worker_rows: 0, ..receipt }), ..Default::default()
+    };
+    let frame = events(&footer_bytes(&provenance(), &empty, FOOTER_BYTES).unwrap()).remove(0);
+    assert_eq!(frame["summary"]["compute"]["completed_projections"], 0);
+    assert_eq!(frame["summary"]["model_work"], serde_json::to_value(Int4Work::default()).unwrap());
+}
+
+#[test]
+fn terminal_cancellation_during_flush_cannot_return_success_or_retry_the_writer() {
+    struct CancelOnFlush {
+        token: CancellationToken, bytes: Vec<u8>, flushes: usize,
+    }
+    impl Write for CancelOnFlush {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(bytes); Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            self.token.cancel(DecodeCancellationKind::User);
+            Ok(())
+        }
+    }
+    let token = CancellationToken::default();
+    let mut completed = Completed {
+        writer: CancelOnFlush { token: token.clone(), bytes: Vec::new(), flushes: 0 },
+        summary: Int4EntityCorpusSummary::default(), provenance: provenance(),
+        max_output_bytes: FOOTER_BYTES, deadline: Instant::now() + Duration::from_secs(60),
+        cancellation: token,
+    };
+    let error = finish_completed(&mut completed).unwrap_err();
+    assert_eq!(error.cancellation(), Some(DecodeCancellationKind::User));
+    assert_eq!(completed.writer.flushes, 1);
+    assert_eq!(events(&completed.writer.bytes)[0]["event"], "run_complete");
+    let bytes = completed.writer.bytes.clone();
+    assert_eq!(finish_completed(&mut completed).unwrap_err().cancellation(), Some(DecodeCancellationKind::User));
+    assert_eq!(completed.writer.bytes, bytes);
+    assert_eq!(completed.writer.flushes, 1);
+}

@@ -14,7 +14,8 @@ use crate::{
         entity_stream::{self, EntitySnapshotProcessor, EntityStreamError, EntityStreamLimits,
             EntityStreamSummary, ENTITY_STREAM_PROTOCOL},
     },
-    native_engine::{decode::DecodeCancellationKind, portable_int8::ProjectionWork},
+    native_engine::{decode::DecodeCancellationKind, portable_int8::ProjectionWork,
+        strict_int4::projection::Int4ProjectionExecutor},
     tasks::source_planning::SourceTaskPlanner,
     validation::grounded_fields::GroundingBudget,
 };
@@ -134,6 +135,9 @@ pub struct Int4EntityCorpusSummary {
     pub verification_used: EntityVerificationWork,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cohort: Option<Int4EntityCorpusCohortSummary>,
+    /// Physical row-team totals, captured after every native epoch drains.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compute: Option<Int4ComputeReceipt>,
 }
 
 
@@ -284,14 +288,17 @@ impl<W: Write> HostedInt4EntityCorpus<W> {
     /// this footer acknowledges the finite run, never a cross-epoch graph.
     /// Failure consumes the writer and cannot trigger retry or another record.
     pub fn finish(mut self) -> Result<Int4EntityCorpusSummary, Int4EntityCorpusError> {
-        let completed = &mut self.completed.value;
-        terminal_checkpoint(completed.deadline, &completed.cancellation)?;
-        let bytes = footer_bytes(&completed.provenance, &completed.summary, completed.max_output_bytes)?;
-        terminal_checkpoint(completed.deadline, &completed.cancellation)?;
-        completed.writer.write_all(&bytes).and_then(|_| completed.writer.flush())
-            .map_err(|_| Int4EntityCorpusError::OutputIo)?;
-        Ok(completed.summary)
+        finish_completed(&mut self.completed.value)
     }
+}
+fn finish_completed<W: Write>(completed: &mut Completed<W>) -> Result<Int4EntityCorpusSummary, Int4EntityCorpusError> {
+    terminal_checkpoint(completed.deadline, &completed.cancellation)?;
+    let bytes = footer_bytes(&completed.provenance, &completed.summary, completed.max_output_bytes)?;
+    terminal_checkpoint(completed.deadline, &completed.cancellation)?;
+    completed.writer.write_all(&bytes).and_then(|_| completed.writer.flush())
+        .map_err(|_| Int4EntityCorpusError::OutputIo)?;
+    terminal_checkpoint(completed.deadline, &completed.cancellation)?;
+    Ok(completed.summary)
 }
 fn terminal_checkpoint(deadline: Instant, cancellation: &CancellationToken) -> Result<(), Int4EntityCorpusError> {
     let cause = cancellation.cause().or_else(|| (Instant::now() >= deadline).then_some(DecodeCancellationKind::Deadline));
@@ -385,7 +392,7 @@ impl NlpEngine {
             drop(empty);
             let output = Arc::new(output.commit()?);
             let provenance = Provenance::new(model.model_identity(), &config.resolution_identity, kernel);
-            let mut processor = Processor { model: &model.inner.loaded.value, engine: None, cohort_native: None,
+            let mut processor = Processor { model: &model.inner.loaded.value, engine: None, projection: None, cohort_native: None,
                 source: input.value.source.clone(), resolver: input.value.resolver.clone(),
                 vocabulary: input.value.vocabulary.clone(), config, required, kernel,
                 kv: Some(kv), scratch: Some(scratch), output: Arc::clone(&output),
@@ -421,6 +428,91 @@ impl NlpEngine {
         })?;
         completed.map_err(Int4EntityCorpusError::Transport)
     }
+
+    /// Keep one persistent numerical row team across the entire raw-document
+    /// stream, including discovery, both comparison orders and every flush
+    /// epoch. Cohort schedules are a separate physical execution and refuse
+    /// before input is read. The original work/deadline ledger is never reset.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_int4_entity_corpus_with_threads<R, W>(&self, model: &ResidentInt4,
+        source: Arc<SourceTaskPlanner>, resolver: Arc<ResolutionPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: Int4EntityCorpusHostConfig, kernel: PackedInt4Kernel, compute_threads: usize,
+        reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<HostedInt4EntityCorpus<W>, Int4EntityCorpusError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        dispatch::preflight_int4_team(self, config.native.run, compute_threads)?;
+        check_team_schedule(config.schedule)?;
+        if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain.into()); }
+        constrained_int4::check_model(&config.source_identity, model.model_identity())
+            .map_err(|_| HostedError::ModelIdentity)?;
+        constrained_int4::check_model(&config.resolution_identity, model.model_identity())
+            .map_err(|_| HostedError::ModelIdentity)?;
+        let width = model.model_identity().group_width();
+        let required = config.requirements(width)?;
+        sum(&[required.total_bytes()?, int4_task_team_workspace_bytes(compute_threads, width)?])?;
+        let run = config.native.run;
+        let deadline = Instant::now().checked_add(run.max_elapsed).ok_or(HostedError::Limits("deadline arithmetic"))?;
+        let terminal_cancellation = cancellation.clone();
+        let lease = self.resources().acquire_lease();
+        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.retained_bytes)?,
+            || Ok(Input { reader: Some(reader), writer: Some(writer), source, resolver, vocabulary, config }))?;
+        let temporary = Pending::reserve(&lease, MemoryClass::JobBuffers, required.temporary_bytes)?;
+        let output = Pending::reserve(&lease, MemoryClass::JobBuffers, required.output_bytes)?;
+        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
+        let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.scratch_bytes)?;
+        let completed = dispatch::run_int4_team(self, run, cancellation, model.clone(), compute_threads,
+            kernel, move |weights, control, team| {
+                let mut input = input;
+                let config = &input.value.config;
+                let empty = prepare_int4_entities(Vec::new(), input.value.source.clone(), config.source_identity.clone(),
+                    input.value.resolver.clone(), config.resolution_identity.clone(), config.task.clone(),
+                    weights.identity(), control).map_err(entities::execution_error)?;
+                drop(empty);
+                let output = Arc::new(output.commit()?);
+                let provenance = Provenance::new(weights.identity(), &config.resolution_identity, kernel);
+                let mut processor = Processor { model: weights, engine: None, projection: Some(team), cohort_native: None,
+                    source: input.value.source.clone(), resolver: input.value.resolver.clone(),
+                    vocabulary: input.value.vocabulary.clone(), config, required, kernel,
+                    kv: Some(kv), scratch: Some(scratch), output: Arc::clone(&output),
+                    provenance: provenance.clone(), ledger: Ledger::with_schedule(&config.task, None) };
+                let mut transport = config.transport;
+                transport.max_output_bytes -= FOOTER_BYTES;
+                let result = entity_stream::run_ndjson(
+                    input.value.reader.as_mut().ok_or(HostedError::CompletionMissing)?,
+                    input.value.writer.as_mut().ok_or(HostedError::CompletionMissing)?,
+                    &mut processor, transport, control);
+                let mut summary = processor.ledger.summary;
+                // Release the engine's exclusive executor borrow before
+                // observing physical totals. Workers are joined by dispatch
+                // before any completion object or terminal footer can escape.
+                drop(processor);
+                summary.compute = Some(team.stats().into());
+                drop(temporary);
+                match result {
+                    Err(EntityStreamError::Handler(error)) => Err(error),
+                    Err(EntityStreamError::Resolution(crate::corpus::resolve::ResolveError::Cancelled(cause))) =>
+                        Err(entities::execution_error(Int4EntityError::Graph(crate::corpus::resolve::ResolveError::Cancelled(cause)))),
+                    Err(error) => Ok(Err(error)),
+                    Ok(transport) => {
+                        let completed = Completed { writer: input.value.writer.take().ok_or(HostedError::CompletionMissing)?,
+                            summary: Int4EntityCorpusSummary { transport, ..summary }, provenance,
+                            max_output_bytes: input.value.config.transport.max_output_bytes, deadline,
+                            cancellation: terminal_cancellation };
+                        drop(input.value);
+                        drop(lease);
+                        Ok(Ok(HostedInt4EntityCorpus { completed: Charged { value: completed, _memory: input._memory }, _output: output }))
+                    }
+                }
+            })?;
+        completed.map_err(Int4EntityCorpusError::Transport)
+    }
+}
+
+fn check_team_schedule(schedule: Option<Int4EntitySchedule>) -> Result<(), HostedError> {
+    if schedule.is_some() {
+        return Err(HostedError::Limits("INT4 entity corpus row team cannot combine with native cohorts"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -474,7 +566,7 @@ impl Ledger {
             (Some(total), Some(next)) => Some(total.checked_add(next)?),
             _ => return Err(Int4EntityError::Accounting),
         };
-        let summary = Int4EntityCorpusSummary { transport: previous.transport, cohort,
+        let summary = Int4EntityCorpusSummary { transport: previous.transport, cohort, compute: previous.compute,
             reserved_model_work: previous.reserved_model_work.checked_add(charge.reserved)?,
             model_work: previous.model_work.checked_add(charge.actual)?,
             reserved_mask_node_visits: add(previous.reserved_mask_node_visits, charge.masks_reserved)?,
@@ -509,6 +601,9 @@ fn subtract_work(a: Int4Work, b: Int4Work) -> Result<Int4Work, Int4EntityError> 
 struct Processor<'p, 'm> {
     model: &'m Int4ModelWeights,
     engine: Option<ChargedNative<StrictInt4Engine<'m>>>,
+    // Moved into the first nonempty epoch's engine and reused for all later
+    // epochs. Empty streams retain no native engine but still join the team.
+    projection: Option<&'m mut (dyn Int4ProjectionExecutor + 'm)>,
     // Drop the core phase engines before these committed peak reservations.
     // Keeping them on the processor spans all epochs, writes and final drain.
     cohort_native: Option<(CommittedMemory, CommittedMemory)>,
@@ -557,11 +652,16 @@ impl EntitySnapshotProcessor for Processor<'_, '_> {
                 let kv = self.kv.take().ok_or(HostedError::CompletionMissing)?;
                 let scratch = self.scratch.take().ok_or(HostedError::CompletionMissing)?;
                 let required = self.required.native;
+                let projection = self.projection.take();
                 self.engine = Some(allocate_native(kv, scratch, || {
-                    StrictInt4Engine::new(self.model, self.config.native.context_tokens, Int4MemoryBudget {
+                    let engine = StrictInt4Engine::new(self.model, self.config.native.context_tokens, Int4MemoryBudget {
                         max_kv_bytes: required.kv_bytes, max_rope_bytes: required.rope_bytes,
                         max_scratch_payload_bytes: required.scratch_payload_bound,
-                    }).map(|engine| engine.with_kernel(self.kernel)).map_err(native_error)
+                    }).map_err(native_error)?.with_kernel(self.kernel);
+                    match projection {
+                        Some(team) => engine.with_projection_executor(team).map_err(native_error),
+                        None => Ok(engine),
+                    }
                 })?);
             }
             let engine = self.engine.as_mut().ok_or(HostedError::CompletionMissing)?;

@@ -178,6 +178,98 @@ impl NlpEngine {
             Ok(GuardedOutput::new(result.value, result._memory))
         })
     }
+    /// Keep one fixed numerical row team across both orders of every pair
+    /// and the complete snapshot finalizer. The ordinary sealed plans, graph,
+    /// five-axis work allowance and output owner remain unchanged. An empty
+    /// graph authenticates the model and reports zero completed projections.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_int4_with_threads(&self, model: &ResidentInt4, documents: Vec<ResolutionDocument>,
+        planner: Arc<ResolutionPlanner>, config: Int4ResolveConfig, kernel: PackedInt4Kernel,
+        compute_threads: usize, cancellation: CancellationToken)
+        -> Result<HostedInt4TeamResult<Int4ResolutionRun>, HostedError> {
+        dispatch::preflight_int4_team(self, config.native.run, compute_threads)?;
+        if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
+        constrained_int4::check_model(&config.identity, model.model_identity())
+            .map_err(|_| HostedError::ModelIdentity)?;
+        let width = model.model_identity().group_width();
+        let (required, scratch_bytes) = requirements(&config, width,
+            planner.tokenizer_digest(), planner.template_digest())?;
+        sum(&[scratch_bytes, int4_task_team_workspace_bytes(compute_threads, width)?])?;
+        let input_bytes = sum(&[super::super::resolve::input_payload(&documents, config.graph)?,
+            config.preparation_reserve_bytes])?;
+        let run = config.native.run;
+        let lease = self.resources().acquire_lease();
+        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, input_bytes)?,
+            || Ok(ResolveInput { documents, planner, config }))?;
+        dispatch::run_int4_team(self, run, cancellation, model.clone(), compute_threads,
+            kernel, move |weights, control, team| {
+                // Keep source/planner storage charged through native cleanup
+                // and clustering. The dispatcher owns workers until join.
+                let input = input;
+                let config = &input.value.config;
+                let graph_charge = Pending::reserve(&lease, MemoryClass::JobBuffers, config.graph_reserve_bytes)?;
+                let plan = ResolutionPlan::prepare(&input.value.documents, config.options, config.graph, control)
+                    .map_err(|error| resolution_error(error.into()))?;
+                let prepared = input.value.planner.prepare_int4(&plan, &config.identity,
+                    config.scoring, weights.identity(), control).map_err(resolution_error)?;
+                let pairs = prepared.pair_count();
+                let heads = prepared.head_count();
+                let work = prepared.planned_work();
+                check_work(work, config.scoring.max_model_work)?;
+                let output = output_claim(&lease, prepared.max_result_bytes(), 0)?;
+                let result = if pairs == 0 {
+                    allocate(output, || {
+                        let result = prepared.finalize_without_model(control).map_err(resolution_error)?;
+                        check_result(&result, width, heads, work)?;
+                        checkpoint(control)?;
+                        Ok(result)
+                    })?
+                } else {
+                    if prepared.required_context_tokens() > config.native.context_tokens {
+                        return Err(HostedError::Limits("INT4 resolution complete context"));
+                    }
+                    let mut admitted = Vec::new();
+                    admitted.try_reserve_exact(pairs)
+                        .map_err(|_| resolution_error(Int4ResolveError::WorkBudget))?;
+                    for identity in prepared.execution_identities() {
+                        checkpoint(control)?;
+                        constrained_int4::check_model(identity, weights.identity())
+                            .map_err(|_| HostedError::ModelIdentity)?;
+                        admitted.push(identity.clone());
+                    }
+                    let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
+                    let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch_bytes)?;
+                    let mut engine = allocate_native(kv, scratch, || {
+                        StrictInt4Engine::new(weights, config.native.context_tokens, Int4MemoryBudget {
+                            max_kv_bytes: required.kv_bytes, max_rope_bytes: required.rope_bytes,
+                            max_scratch_payload_bytes: required.scratch_payload_bound,
+                        }).map_err(native_error)?.with_kernel(kernel)
+                            .with_projection_executor(team).map_err(native_error)
+                    })?;
+                    let result = allocate(output, || {
+                        let result = prepared.execute_with_control(&admitted, &mut engine.value,
+                            Int4ScoringBudget { native: Int4RunBudget::exact(work), max_kv_bytes: required.kv_bytes }, control)
+                            .map_err(resolution_error)?;
+                        check_result(&result, width, heads, work)?;
+                        if engine.value.is_poisoned() || !engine.value.kv_cache().all_slots_have_len(0) {
+                            return Err(resolution_error(Int4ResolveError::Accounting));
+                        }
+                        checkpoint(control)?;
+                        Ok(result)
+                    })?;
+                    drop(engine);
+                    drop(admitted);
+                    result
+                };
+                drop(plan);
+                drop(graph_charge);
+                drop(input);
+                let compute = team.stats().into();
+                drop(lease);
+                Ok(HostedInt4TeamResult::new(GuardedOutput::new(result.value, result._memory), compute))
+            })
+    }
+
     /// Score independently bounded windows of pairs, keeping both presentation
     /// orders together. Every window shares the original complete-snapshot work
     /// allowance and failure leaves no partial clustering result.

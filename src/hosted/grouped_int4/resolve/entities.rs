@@ -134,6 +134,80 @@ impl NlpEngine {
             Ok(GuardedOutput::new(result.value, result._memory))
         })
     }
+    /// Use one persistent numerical team for every original NER chunk and
+    /// both orders of every required entity comparison. No worker is created
+    /// per document, chunk or pair; all workers join before this returns.
+    /// Independent native cohorts remain a separately selected execution.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_int4_entities_with_threads(&self, model: &ResidentInt4, prepared: PreparedInt4EntityCorpus,
+        vocabulary: Arc<ExtractionVocabulary>, native: NativeLimits, preparation_reserve_bytes: u64,
+        graph_reserve_bytes: u64, kernel: PackedInt4Kernel, compute_threads: usize,
+        cancellation: CancellationToken) -> Result<HostedInt4TeamResult<Int4EntityRun>, HostedError> {
+        dispatch::preflight_int4_team(self, native.run, compute_threads)?;
+        if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
+        constrained_int4::check_model(prepared.source_identity(), model.model_identity())
+            .map_err(|_| HostedError::ModelIdentity)?;
+        constrained_int4::check_model(prepared.resolution_identity(), model.model_identity())
+            .map_err(|_| HostedError::ModelIdentity)?;
+        let width = model.model_identity().group_width();
+        if prepared.group_width() != width { return Err(HostedError::ModelIdentity); }
+        let (required, scratch_bytes) = requirements(prepared.config(), prepared.required_ner_context_tokens(),
+            native, preparation_reserve_bytes, graph_reserve_bytes, width)?;
+        sum(&[scratch_bytes, int4_task_team_workspace_bytes(compute_threads, width)?])?;
+        let input_bytes = sum(&[prepared.retained_input_bytes().map_err(execution_error)?, preparation_reserve_bytes])?;
+        let temporary_bytes = temporary_bytes(prepared.config(), graph_reserve_bytes)?;
+        let output_bytes = prepared.config().max_result_bytes as u64;
+        let expected = Expected { width, documents: prepared.document_count(), chunks: prepared.chunk_count(),
+            ner_work: prepared.ner_reserved_work(), masks: prepared.reserved_mask_visits(),
+            max_model_work: prepared.config().max_model_work, chunked: prepared.config().chunks.is_some() };
+        let lease = self.resources().acquire_lease();
+        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, input_bytes)?,
+            || Ok(Input { prepared: Some(prepared), vocabulary }))?;
+        dispatch::run_int4_team(self, native.run, cancellation, model.clone(), compute_threads,
+            kernel, move |weights, control, team| {
+                let mut input = input;
+                let temporary = Pending::reserve(&lease, MemoryClass::JobBuffers, temporary_bytes)?;
+                let output = output_claim(&lease, output_bytes, 0)?;
+                let result = if expected.documents == 0 {
+                    let prepared = input.value.prepared.take().ok_or(HostedError::CompletionMissing)?;
+                    allocate(output, || {
+                        let result = prepared.finalize_without_model(control).map_err(execution_error)?;
+                        check_result(&result, expected)?;
+                        checkpoint(control)?;
+                        Ok(result)
+                    })?
+                } else {
+                    let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
+                    let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch_bytes)?;
+                    let mut engine = allocate_native(kv, scratch, || {
+                        StrictInt4Engine::new(weights, native.context_tokens, Int4MemoryBudget {
+                            max_kv_bytes: required.kv_bytes, max_rope_bytes: required.rope_bytes,
+                            max_scratch_payload_bytes: required.scratch_payload_bound,
+                        }).map_err(native_error)?.with_kernel(kernel)
+                            .with_projection_executor(team).map_err(native_error)
+                    })?;
+                    let prepared = input.value.prepared.take().ok_or(HostedError::CompletionMissing)?;
+                    let result = allocate(output, || {
+                        let result = prepared.execute_with_control(&mut engine.value, &input.value.vocabulary, control)
+                            .map_err(execution_error)?;
+                        check_result(&result, expected)?;
+                        if engine.value.is_poisoned() || !engine.value.kv_cache().all_slots_have_len(0) {
+                            return Err(execution_error(Int4EntityError::Accounting));
+                        }
+                        checkpoint(control)?;
+                        Ok(result)
+                    })?;
+                    drop(engine);
+                    result
+                };
+                drop(temporary);
+                drop(input);
+                let compute = team.stats().into();
+                drop(lease);
+                Ok(HostedInt4TeamResult::new(GuardedOutput::new(result.value, result._memory), compute))
+            })
+    }
+
     /// Run independently selected discovery and pair-scoring windows against
     /// one consumed source corpus. The complete declared phase peak is reserved
     /// before execution, and each core phase owns only the native engine it uses.

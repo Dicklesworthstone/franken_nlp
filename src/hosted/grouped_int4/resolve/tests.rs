@@ -269,3 +269,81 @@ fn pair_cohort_results_and_owned_host_api_cross_the_physical_boundary() {
     send::<HostedOutput<Int4ResolutionCohortRun>>();
     let _method = NlpEngine::resolve_int4_cohorts;
 }
+
+#[test]
+#[ignore = "requires controller-admitted real runtime; zero-pair synthetic model fixture, not numerical parity"]
+fn zero_pair_team_joins_and_retains_output_without_inventing_native_work() {
+    use crate::{LeakResponsePolicy, ResourceHostConfig, RuntimePreset,
+        native_engine::strict_int4::weights::projection_fixture};
+    let host = NlpEngine::builder().resource_config(ResourceHostConfig {
+        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
+        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 2,
+        helper_threads: 0, thread_ceiling: 4, memory_ceiling_bytes: 512 << 20,
+        leak_response_policy: LeakResponsePolicy::PanicInLabOrCi,
+    }).build().unwrap();
+    let (weights, _) = projection_fixture(4);
+    let lease = host.resources().acquire_lease();
+    let loaded = allocate(Pending::reserve(&lease, MemoryClass::Weights, 1 << 20).unwrap(),
+        || Ok(weights)).unwrap();
+    let model = ResidentInt4 { inner: Arc::new(ResidentModel { loaded, lease }) };
+    let baseline = host.resources().memory_snapshot();
+    let controls = crate::tokenizer::pinned_controls::pinned().unwrap();
+    let eos = controls.template_controls().entries().iter()
+        .find(|entry| entry.special && entry.surface == crate::template::IM_END).unwrap().id;
+    let planner = Arc::new(ResolutionPlanner::pinned(controls.template_controls(), eos).unwrap());
+    let make_config = || {
+        let mut c = config(4);
+        c.identity = bind_candidate_model(c.identity, model.model_identity()).unwrap();
+        c.identity.tokenizer_digest = planner.tokenizer_digest();
+        c.identity.template_digest = planner.template_digest();
+        c
+    };
+    let scalar = host.resolve_int4(&model, documents(), Arc::clone(&planner), make_config(),
+        PackedInt4Kernel::scalar(), CancellationToken::default()).unwrap();
+    let expected = crate::canonjson::canonical_bytes(scalar.result()).unwrap();
+    drop(scalar);
+    assert_eq!(host.resources().memory_snapshot(), baseline);
+
+    let team = host.resolve_int4_with_threads(&model, documents(), Arc::clone(&planner), make_config(),
+        PackedInt4Kernel::scalar(), 3, CancellationToken::default()).unwrap();
+    assert_eq!(crate::canonjson::canonical_bytes(team.result()).unwrap(), expected);
+    assert_eq!(team.compute().compute_threads, 3);
+    assert_eq!(team.compute().completed_projections, 0);
+    assert_eq!(team.compute().completed_rows, 0);
+    assert_eq!(team.compute().completed_worker_rows, 0);
+    assert!(!team.result().model_evaluated);
+    assert_eq!(host.resources().outstanding_closure_snapshot().active_closures, 0);
+    let held = host.resources().memory_snapshot();
+    assert!(held.committed_bytes > baseline.committed_bytes);
+    assert_eq!(held.reserved_bytes, 0);
+    drop(team);
+    assert_eq!(host.resources().memory_snapshot(), baseline);
+
+    for threads in [0, 1, 4, 65] {
+        assert!(host.resolve_int4_with_threads(&model, documents(), Arc::clone(&planner), make_config(),
+            PackedInt4Kernel::scalar(), threads, CancellationToken::default()).is_err());
+        assert_eq!(host.resources().memory_snapshot(), baseline);
+    }
+    let mut wrong = make_config();
+    wrong.identity.logical_model_digest = Sha256Digest::of_bytes(b"wrong-model");
+    assert!(host.resolve_int4_with_threads(&model, documents(), Arc::clone(&planner), wrong,
+        PackedInt4Kernel::scalar(), 3, CancellationToken::default()).is_err());
+    assert_eq!(host.resources().memory_snapshot(), baseline);
+
+    let cancellation = CancellationToken::default();
+    cancellation.cancel(DecodeCancellationKind::ParentCancelled);
+    let error = host.resolve_int4_with_threads(&model, documents(), Arc::clone(&planner), make_config(),
+        PackedInt4Kernel::scalar(), 3, cancellation).err().expect("cancelled team must refuse");
+    assert!(matches!(error, HostedError::Stopped {
+        stop: RunStop { kind: DecodeCancellationKind::ParentCancelled, .. }, ..
+    }));
+    assert_eq!(host.resources().outstanding_closure_snapshot().active_closures, 0);
+    assert_eq!(host.resources().memory_snapshot(), baseline);
+}
+
+#[test]
+fn resolution_team_result_and_api_retain_the_complete_host_owner() {
+    fn send<T: Send + 'static>() {}
+    send::<HostedInt4TeamResult<Int4ResolutionRun>>();
+    let _method = NlpEngine::resolve_int4_with_threads;
+}

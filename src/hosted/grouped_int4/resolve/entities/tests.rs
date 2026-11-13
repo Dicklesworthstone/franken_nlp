@@ -396,3 +396,10 @@ fn entity_cohort_native_and_result_ownership_crosses_the_owned_host_boundary() {
     send::<HostedOutput<Int4EntityCohortRun>>();
     let _method = NlpEngine::execute_int4_entities_cohorts;
 }
+
+#[test]
+fn complete_discovery_team_api_keeps_the_consumed_plan_and_guarded_result() {
+    fn send<T: Send + 'static>() {}
+    send::<HostedInt4TeamResult<Int4EntityRun>>();
+    let _method = NlpEngine::execute_int4_entities_with_threads;
+}
