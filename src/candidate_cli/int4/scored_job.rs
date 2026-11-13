@@ -52,10 +52,10 @@ pub(super) fn definition() -> clap::Command {
             .mut_arg("max_multiply_accumulates", |arg| arg.help("Per-item multiply-accumulate ceiling; lifetime ceiling comes from --limits"))))
             .mut_arg("store_results", |arg| arg.help("Required consent to retain private scored results in the owner-only spool"))
             .mut_arg("limits_file", |arg| arg.help("Exact immutable JobLimits JSON; lifetime five-axis native work and zero mask work"));
-        judge::encoding_definition(command)
+        compute::definition(judge::encoding_definition(command))
             .mut_arg("max_tokenizer_input_bytes", |arg| arg.help("Cumulative untrusted bytes encoded per complete scored record; safe-bpe-v1 only, default --max-input-bytes"))
             .mut_arg("max_tokenizer_output_tokens", |arg| arg.help("Cumulative untrusted tokens produced per complete scored record; safe-bpe-v1 only, default per-head prompt capacity"))
-            .after_long_help("All three tasks accept --input-encoding safe-bpe-v1 with explicit byte, token, pair-check and pair-byte ceilings. One tokenizer ledger covers every untrusted segment in a record, including label metadata, both pairwise orders, rubric criteria and independently encoded faithfulness evidence windows. These per-record planning ceilings are authenticated in the immutable job recipe and cannot change on resume, including --use-retained-input. One transient encoder workspace is admitted beside the population and prepared heads. Native work and attempts remain nonrenewable lifetime debits; tokenizer work is bounded per preparation, including a new preparation on explicit resume. Original source bytes and evidence coordinates remain unchanged. Byte fallback remains the default. Compact prompts are a distinct input profile with no output-parity, task-quality or speed claim.")
+            .after_long_help("All three tasks accept --input-encoding safe-bpe-v1 with explicit byte, token, pair-check and pair-byte ceilings. One tokenizer ledger covers every untrusted segment in a record, including label metadata, both pairwise orders, rubric criteria and independently encoded faithfulness evidence windows. These per-record planning ceilings are authenticated in the immutable job recipe and cannot change on resume, including --use-retained-input. One transient encoder workspace is admitted beside the population and prepared heads. Native work and attempts remain nonrenewable lifetime debits; tokenizer work is bounded per preparation, including a new preparation on explicit resume. Original source bytes and evidence coordinates remain unchanged. Byte fallback remains the default. Compact prompts are a distinct input profile with no output-parity, task-quality or speed claim. --compute-threads 1..=64 selects one persistent numerical team for the complete authenticated invocation; one is the existing serial path. All records, scoring heads, durable attempts and optional materialization share that team. Worker scratch and process thread capacity are admitted before private IO. Width is physical metadata and may change on explicit resume without changing recipes or refunding work. Native cohorts and prompt-prefill schedules remain refused. Metadata is published only after every worker joins.")
     };
     let start = operation("start", "Create an explicitly retained INT4 scoring job");
     let resume = operation("resume", "Authenticate the original population and run pending INT4 scoring items")
@@ -95,9 +95,12 @@ impl JobArgs {
             || s.journal_memory_mib == 0 || s.serialization_memory_mib == 0 {
             return Err(Failure::usage("explicit_scored_job_storage"));
         }
+        if args.prefill()?.is_some() || self.scoring.cohort_head_limit().is_some() {
+            return Err(CandidateError::Arguments.into());
+        }
         let mut native_args = args.clone();
         native_args.input_encoding = input_encoding::InputEncodingArgs::default();
-        let mut common = self.scoring.validate(&native_args)?;
+        let mut common = self.scoring.validate_one_off_with_prefill(&native_args)?;
         let encoding = self.input_encoding(args, common)?;
         let workspace = crate::batch::scored_int4::memory::encoding_workspace_bytes(&encoding)
             .map_err(|_| CandidateError::Arguments)?;
@@ -172,6 +175,7 @@ impl JobCommand {
             encoding: judge::EncodingArgs::from_arg_matches(matches)? };
         let mut native = Int4Args::from_arg_matches(matches)?;
         native.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+        native.compute = compute::Args::from_matches(matches)?;
         Ok((Self { mode, args }, native))
     }
     pub(super) fn run_owned<R: Read + Send + 'static>(self, args: Int4Args, input: R,

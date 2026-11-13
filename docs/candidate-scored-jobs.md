@@ -270,3 +270,80 @@ native-output equivalence, task quality or a measured speedup. Regression
 definitions cover recipe mutations across all five record shapes, admission,
 metadata compatibility and authenticated recovery; execution and model
 qualification remain pending the controller-selected DSR checkpoint.
+
+## Persistent workers for grouped INT4 jobs
+
+The grouped INT4 `score-job start` and `resume` commands also accept
+`--compute-threads N`. Widths 1 through 64 include the coordinator; one is the
+existing serial route. Runtime threads are additional. This option applies
+to classification, sentiment and all three judgment modes, with either byte
+fallback or explicit `safe-bpe-v1` input.
+
+For example, add the physical width to the protected-job invocation above:
+
+```sh
+fnlp candidate source-int4 score-job start corpus.ndjson \
+  --task classify --defaults labels.json \
+  --snapshot ./model.int4.snapshot \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --memory-mib 16384 --group-width 128 --compute-threads 4 \
+  --input-encoding safe-bpe-v1 \
+  --max-tokenizer-input-bytes 65536 \
+  --max-tokenizer-output-tokens 8192 \
+  --max-tokenizer-pair-checks 4194304 \
+  --max-tokenizer-pair-bytes 67108864 \
+  --store-results --job-dir ./protected-job \
+  --job-id "$JOB_ID" --key-file ./protected.key \
+  --limits ./job-limits.json --materialize
+```
+
+One fixed team spans population authentication, every pending scored record,
+all of its heads, durable attempts and commits, and optional materialization.
+The existing strict INT4 projection executor divides numerical output rows
+among workers. Input order, scored-language semantics, both pairwise orders,
+result validation and journal acknowledgement keep their existing authority.
+This command does not expose a native cohort or prompt-prefill schedule.
+
+The process envelope admits the selected children and their modeled scratch
+before execution. The host retains the input, private recipe and key owner,
+native KV and scratch, and guarded result staging through physical completion.
+The original cancellation cause and checkpoint/deadline allowance propagate
+through the team. Every worker joins before the public API can return progress.
+The CLI stages bounded metadata only after that return, then checks its original
+deadline before and after delivery. Durable progress can precede a later
+cancellation, output error or deadline failure; failure never implies rollback.
+
+The width is excluded from authenticated semantic identity. To resume, change
+`start` to `resume` and keep the original complete input or explicitly select
+retained-input replay. The width may change, including between serial and team
+execution; defaults, task policies, encoding caps and lifetime limits must not.
+Already committed records remain skipped. Interrupted attempts and all five
+native work axes remain charged.
+
+Serial metadata keeps its previous shape. Nondefault widths add only:
+
+```json
+{
+  "compute_schedule": {
+    "execution": "int4-output-row-team-v1",
+    "declared_compute_threads": 4
+  }
+}
+```
+
+This is selected physical configuration, not a projection counter or measured
+speedup. Library callers use
+`NlpEngine::job_int4_scored_with_threads(model, planner, request, limits, kernel, compute_threads, reader, cancellation)`.
+The explicit threaded API accepts widths 2 through 64 that fit the installed
+process envelope. Use `job_int4_scored` for serial execution; the same immutable
+planner and owned storage request work in either route.
+
+Six additional regression definitions cover width and memory admission,
+original cancellation causes, charged input lifetime, bounded metadata and
+delivery deadlines, plus controller-only lifecycle and pinned-model fixtures.
+The actual-model fixture compares complete stored classification, sentiment,
+pairwise, rubric and faithfulness results at widths 1, 2 and 4 separately for
+byte and compact input, then replays authenticated retained input at another
+width without new attempts or work. All executable checks remain **UNRUN**
+pending the designated controller. No native parity, crash qualification,
+task-quality or throughput result is asserted by this source change.

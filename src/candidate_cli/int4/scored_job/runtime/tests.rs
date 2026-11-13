@@ -87,7 +87,8 @@ fn completion_metadata_is_task_and_candidate_bound_without_private_scores_or_rec
             source_root_sha256: &source, model_content_sha256: &content,
             candidate_format: "fixture-candidate-format", quant_recipe: "fixture-grouped-int4",
             group_width: args.group_width, integer_kernel: common.kernel.kind().id(),
-            snapshot: Some(SnapshotRecord::new("loaded", common.snapshot_need)), input_encoding: None, output: &report,
+            snapshot: Some(SnapshotRecord::new("loaded", common.snapshot_need)), input_encoding: None,
+            compute_schedule: None, output: &report,
         };
         let mut bytes = Vec::new(); publish(&response, job_cli::REPORT_BYTES, &mut bytes).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -114,6 +115,13 @@ fn completion_metadata_is_task_and_candidate_bound_without_private_scores_or_rec
         assert_eq!(compact_value.as_object_mut().unwrap().remove("input_encoding"),
             Some(serde_json::to_value(&encoding).unwrap()));
         assert_eq!(compact_value, value);
+        assert!(value.get("compute_schedule").is_none());
+        compact.compute_schedule = compute::Schedule::for_threads(4);
+        let mut threaded = serde_json::to_value(&compact).unwrap();
+        assert_eq!(threaded.as_object_mut().unwrap().remove("compute_schedule"),
+            compute::Schedule::for_threads(4).map(serde_json::to_value).transpose().unwrap());
+        threaded.as_object_mut().unwrap().remove("input_encoding");
+        assert_eq!(threaded, value);
     }
 }
 
@@ -143,4 +151,49 @@ fn immutable_compiler_policy_and_workspace_must_match_the_cli_before_snapshot_or
     assert_eq!(check_planner_quote(&planner, &UntrustedEncoding::SafeBpeV1(changed), workspace),
         Err(CandidateError::Planning));
     planner.check_job_limits(fixed).unwrap();
+}
+
+
+#[test]
+fn original_native_cancellation_causes_keep_the_durable_policy_boundary() {
+    use crate::native_engine::decode::DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let expected = job_failure(JobError::Cancelled(cause));
+        let actual = execution_failure(HostedJobError::Host(
+            HostedError::Int4(Int4HostError::Native(StrictInt4Error::Cancelled(cause)))));
+        assert_eq!(actual.exit, expected.exit);
+        assert_eq!(actual.code, expected.code);
+    }
+}
+
+#[test]
+fn scored_metadata_must_still_fit_and_have_time_before_and_after_delivery() {
+    let available = || Ok(Duration::from_secs(1));
+    let oversized = "x".repeat(job_cli::REPORT_BYTES);
+    assert!(publish_report(&oversized, &mut NoIo, &available).is_err());
+    let checks = std::cell::Cell::new(0);
+    let expired_before_write = || {
+        checks.set(checks.get() + 1);
+        if checks.get() == 1 { available() } else { Err(CandidateError::Timeout) }
+    };
+    assert_eq!(publish_report(&true, &mut NoIo, &expired_before_write).unwrap_err().exit,
+        ErrorCode::BudgetOrTimeout);
+    let checks = std::cell::Cell::new(0);
+    let expired_after_flush = || {
+        checks.set(checks.get() + 1);
+        if checks.get() < 3 { available() } else { Err(CandidateError::Timeout) }
+    };
+    let mut delivered = Vec::new();
+    assert_eq!(publish_report(&true, &mut delivered, &expired_after_flush).unwrap_err().exit,
+        ErrorCode::BudgetOrTimeout);
+    assert_eq!(delivered, b"true\n");
+    struct BrokenFlush(Vec<u8>);
+    impl Write for BrokenFlush {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> { self.0.extend_from_slice(bytes); Ok(bytes.len()) }
+        fn flush(&mut self) -> io::Result<()> { Err(io::Error::other("fixture flush")) }
+    }
+    let mut broken = BrokenFlush(Vec::new());
+    assert!(publish_report(&true, &mut broken, &available).is_err());
+    assert_eq!(broken.0, b"true\n");
 }

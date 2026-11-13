@@ -9,7 +9,7 @@ use crate::{
     jobs::{JobInputMemory, JobLimits, JobProgress,
         runner::{JobRunError, scored::grouped_int4::{Int4ScoredJobPlanner,
             Int4ScoredJobProcessor, Int4ScoredJobTask}}},
-    native_engine::constrained_int4,
+    native_engine::{constrained_int4, strict_int4::projection::Int4ProjectionExecutor},
     tasks::ir::TaskBudget,
 };
 use super::scored_batch::ScoredAdmission;
@@ -30,6 +30,11 @@ impl Requirements {
     }
 }
 
+struct ScoredJobExecution<P: Int4ScoredJobTask, R> {
+    input: Charged<JobInput<P, R>>, kv: Pending, scratch: Pending,
+    limits: JobHostLimits, required: Requirements, lease: EngineLease,
+}
+
 impl NlpEngine {
     /// Start or resume one fixed scoring task over the complete original
     /// population. P is sealed to the real model-bound classification,
@@ -41,15 +46,43 @@ impl NlpEngine {
     /// resumes. Every stored item contains its complete multihead task result.
     ///
     /// Supplying SourceJobRequest explicitly authorizes result retention in
-    /// the existing owner-only job protocol. No input spool, key generation,
-    /// automatic retry or result publication to stdout is introduced here.
+    /// the existing owner-only job protocol. Its explicit input-retention mode
+    /// controls the input spool; ordinary create/resume keeps external input.
+    /// This method never generates keys, retries automatically or emits results
+    /// to stdout.
     #[allow(clippy::too_many_arguments)]
     pub fn job_int4_scored<P, R>(&self, model: &ResidentInt4,
         planner: Int4ScoredJobPlanner<P>, request: SourceJobRequest,
         limits: JobHostLimits, kernel: PackedInt4Kernel, reader: R,
         cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
     where P: Int4ScoredJobTask, R: BufRead + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
+        self.run_int4_scored_job(model, planner, request, limits, kernel, None, reader, cancellation)
+    }
+
+    /// Keep one fixed numerical team across authenticated population loading,
+    /// every scored head and durable attempt, commit and optional materialization.
+    /// Worker width is physical metadata, so explicit resume may change it
+    /// without changing recipes or refunding any work. Widths 2..=64 require
+    /// admitted worker scratch and the installed process thread envelope.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int4_scored_with_threads<P, R>(&self, model: &ResidentInt4,
+        planner: Int4ScoredJobPlanner<P>, request: SourceJobRequest,
+        limits: JobHostLimits, kernel: PackedInt4Kernel, compute_threads: usize, reader: R,
+        cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where P: Int4ScoredJobTask, R: BufRead + Send + 'static {
+        self.run_int4_scored_job(model, planner, request, limits, kernel, Some(compute_threads), reader, cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_int4_scored_job<P, R>(&self, model: &ResidentInt4,
+        planner: Int4ScoredJobPlanner<P>, request: SourceJobRequest,
+        limits: JobHostLimits, kernel: PackedInt4Kernel, compute_threads: Option<usize>, reader: R,
+        cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where P: Int4ScoredJobTask, R: BufRead + Send + 'static {
+        match compute_threads {
+            Some(width) => dispatch::preflight_int4_team(self, limits.native.run, width)?,
+            None => dispatch::preflight(self, limits.native.run)?,
+        }
         if !Arc::ptr_eq(self.resources(), model.resources()) {
             return Err(HostedError::ResourceDomain.into());
         }
@@ -63,52 +96,73 @@ impl NlpEngine {
         let required = requirements(model.model_identity().group_width(), planner.task_ceiling(),
             work, request.limits, limits, request.mode.input_memory())?
             .with_encoding_workspace(planner.encoding_workspace_bytes())?;
+        let team_scratch = compute_threads.map(|width|
+            int4_task_team_workspace_bytes(width, model.model_identity().group_width())).transpose()?.unwrap_or(0);
+        sum(&[required.input_bytes, required.native.kv_bytes, required.workspace_bytes, team_scratch])?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(JobInput { preparation: Some((planner, request)), reader }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes)?;
+        let execution = ScoredJobExecution { input, kv, scratch, limits, required, lease };
         let model = model.clone();
-        let completed = dispatch::run(self, limits.native.run, cancellation, move |control| {
-            // Capture the entire owner: queued cancellation must drop owned
-            // inputs, private settings and key before their buffer charge.
-            let mut input = input;
-            checkpoint(control)?;
-            let (planner, request) = input.value.preparation.take()
-                .ok_or(HostedError::CompletionMissing)?;
-            let population = match read_population(&mut input.value.reader,
-                &request, limits.transport, control) {
-                Ok(population) => population,
-                Err(error) => return Ok(Err(JobRunError::Storage(error))),
-            };
-            checkpoint(control)?;
-            let mut engine = allocate_native(kv, scratch, || {
-                StrictInt4Engine::new(&model.inner.loaded.value, limits.native.context_tokens,
-                    Int4MemoryBudget { max_kv_bytes: required.native.kv_bytes,
-                        max_rope_bytes: required.native.rope_bytes,
-                        max_scratch_payload_bytes: required.native.scratch_payload_bound })
-                    .map(|engine| engine.with_kernel(kernel)).map_err(native_error)
-            })?;
-            let admission = ScoredAdmission::for_job(&lease, model.model_identity(),
-                limits.native.context_tokens, required.native.kv_bytes,
-                work.max_item_work, P::TASK, request.limits.max_result_bytes as u64);
-            let result = (|| {
-                let processor = Int4ScoredJobProcessor::new(planner, &mut engine.value, admission)
-                    .map_err(JobRunError::Processor)?;
-                // The runner validates the immutable recipe before storage
-                // opens, syncs work before execution, and holds each output
-                // guard through spool sync and journal acknowledgement.
-                run_population(request, &population, processor, control)
-            })();
-            drop(engine);
-            drop(population);
-            drop(input);
-            drop(lease);
-            Ok(result)
-        })?;
+        let completed = match compute_threads {
+            None => dispatch::run(self, limits.native.run, cancellation, move |control|
+                execution.run(&model.inner.loaded.value, kernel, None, control)),
+            Some(width) => dispatch::run_int4_team(self, limits.native.run, cancellation,
+                model, width, kernel, move |weights, control, team|
+                    execution.run(weights, kernel, Some(team), control)),
+        }?;
         // Physical drain/cancellation failure takes precedence over a job
         // result. Durable progress is reconciled by authenticated resume.
         completed.map_err(HostedJobError::Job)
+    }
+}
+
+impl<P: Int4ScoredJobTask, R: BufRead> ScoredJobExecution<P, R> {
+    fn run<'weights>(self, weights: &'weights Int4ModelWeights, kernel: PackedInt4Kernel,
+        projection: Option<&'weights mut (dyn Int4ProjectionExecutor + 'weights)>,
+        control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
+        // Keep the transferred aggregate whole: its reader, private settings
+        // and key drop before their charge, including queued cancellation.
+        let Self { mut input, kv, scratch, limits, required, lease } = self;
+        checkpoint(control)?;
+        let (planner, request) = input.value.preparation.take()
+            .ok_or(HostedError::CompletionMissing)?;
+        let work = planner.native_limits();
+        let population = match read_population(&mut input.value.reader,
+            &request, limits.transport, control) {
+            Ok(population) => population,
+            Err(error) => return Ok(Err(JobRunError::Storage(error))),
+        };
+        checkpoint(control)?;
+        let mut engine = allocate_native(kv, scratch, || {
+            let engine = StrictInt4Engine::new(weights, limits.native.context_tokens,
+                Int4MemoryBudget { max_kv_bytes: required.native.kv_bytes,
+                    max_rope_bytes: required.native.rope_bytes,
+                    max_scratch_payload_bytes: required.native.scratch_payload_bound })
+                .map_err(native_error)?.with_kernel(kernel);
+            match projection {
+                Some(team) => engine.with_projection_executor(team).map_err(native_error),
+                None => Ok(engine),
+            }
+        })?;
+        let admission = ScoredAdmission::for_job(&lease, weights.identity(),
+            limits.native.context_tokens, required.native.kv_bytes,
+            work.max_item_work, P::TASK, request.limits.max_result_bytes as u64);
+        let result = (|| {
+            let processor = Int4ScoredJobProcessor::new(planner, &mut engine.value, admission)
+                .map_err(JobRunError::Processor)?;
+            // The runner authenticates the frozen recipe before recovery,
+            // persists work before execution and holds each output guard
+            // through spool sync and journal acknowledgement.
+            run_population(request, &population, processor, control)
+        })();
+        drop(engine);
+        drop(population);
+        drop(input);
+        drop(lease);
+        Ok(result)
     }
 }
 

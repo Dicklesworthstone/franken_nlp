@@ -1714,9 +1714,10 @@ Library callers construct `Int4ScoredJobPlanner` from an actual
 `Int4ClassificationPlanner`, `Int4SentimentPlanner` or `Int4JudgePlanner`, typed
 defaults and `Int4ScoredBatchLimits`, then call `NlpEngine::job_int4_scored` with
 `SourceJobRequest` and `JobHostLimits`. The durable trait is sealed to those
-three native planners. This route uses the existing job format and serial
-native execution. Fixtures are authored; compilation, model-present execution,
-crash qualification, task quality and performance remain pending their gates.
+three native planners. This route uses the existing job format with serial
+native execution by default and an explicit persistent worker team as described
+below. Fixtures are authored; compilation, model-present execution, crash
+qualification, task quality and performance remain pending their gates.
 
 ### Compact input for retained scoring jobs
 
@@ -1743,6 +1744,32 @@ quality or speed equivalence claim. Byte fallback remains the default and its
 existing recipe and metadata bytes are preserved. See
 [the compact INT4 scoring contract](docs/candidate-scored-jobs.md#compact-input-for-grouped-int4-jobs)
 for a complete invocation and embedding APIs.
+
+### Persistent workers for retained scoring jobs
+
+Add `--compute-threads N` to `source-int4 score-job start` or `resume`.
+The accepted range is 1 through 64, including the coordinator; one preserves
+the serial route. Larger widths keep one admitted numerical row team across
+the complete authenticated invocation, every record and scoring head, durable
+attempts and commits, and optional materialization. The team works with both
+byte fallback and explicit safe-BPE input. Native cohort and prompt-prefill
+options remain refused on this job route.
+
+Worker scratch and the process thread envelope are priced alongside the
+existing population, model, native state and guarded storage. Threads join
+before progress can return or completion metadata can be written, including
+on cancellation or failure. The original deadline also covers metadata write
+and flush. A failed invocation can still have durable progress; it must resume
+through the authenticated journal.
+
+Worker width is physical configuration, excluded from the private recipe.
+An explicit resume may change it while keeping every task, encoding, input
+and lifetime-work setting fixed. Nondefault widths add `compute_schedule`
+metadata; the serial metadata shape is unchanged. This field records the
+selected schedule and width, without inventing per-projection measurements.
+Embedders use `NlpEngine::job_int4_scored_with_threads` for widths 2 through 64.
+See [persistent INT4 scoring workers](docs/candidate-scored-jobs.md#persistent-workers-for-grouped-int4-jobs)
+for the invocation and validation scope.
 
 ## Implemented candidate INT4 classification document jobs
 

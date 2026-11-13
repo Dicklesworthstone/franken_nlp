@@ -303,3 +303,57 @@ fn retained_input_selection_does_not_change_compact_policy_or_work_authority() {
         assert_eq!(first.buffer_bytes, restored.buffer_bytes);
     }
 }
+
+
+#[test]
+fn complete_job_team_width_keeps_semantic_limits_and_compact_policy_unchanged() {
+    for task in ["classify", "sentiment", "judge"] {
+        for encoding in ["byte-fallback", "safe-bpe-v1"] {
+            let mut baseline = None;
+            for width in [1, 2, 4, 64] {
+                let width_text = width.to_string();
+                let (c, args) = command("resume", task, &["--input-encoding", encoding,
+                    "--compute-threads", &width_text]);
+                let common = c.args.validate(&args).unwrap();
+                assert_eq!(common.compute.threads, width);
+                assert_eq!(common.compute, args.compute.admit(args.group_width).unwrap());
+                assert_eq!(common.compute.workspace_bytes == 0, width == 1);
+                let fixed = lifetime(&c.args, &args, common);
+                let limits = c.args.lifetime_limits(&args, common, fixed).unwrap();
+                let semantics = (c.args.scoring.budget(common), limits.native, limits.buffer_bytes,
+                    limits.encoding_workspace_bytes, c.args.input_encoding(&args, common).unwrap());
+                if let Some(expected) = &baseline { assert_eq!(expected, &semantics); }
+                else { baseline = Some(semantics); }
+                assert_eq!(limits.common.native, common.native);
+                #[cfg(feature = "asupersync-runtime")]
+                {
+                    let host = compute::resource_config(limits.common);
+                    assert_eq!(host.scoped_cpu_children_per_coordinator, width - 1);
+                    assert_eq!(host.thread_ceiling, width + 1);
+                    assert_eq!(host.max_blocking_coordinators, 1);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_worker_widths_and_incompatible_native_schedules_refuse_before_job_io() {
+    for task in ["classify", "sentiment", "judge"] {
+        for width in ["0", "65", "18446744073709551615"] {
+            let mut words = argv("start", task);
+            words.extend(["--compute-threads", width].into_iter().map(str::to_owned));
+            if let Ok((c, args)) = parse(words) {
+                assert!(c.execute_owned(args, NoIo, &mut NoIo).is_err());
+            }
+        }
+        for schedule in ["--cohort-heads", "--prefill-rows"] {
+            let mut words = argv("start", task);
+            words.extend(["--compute-threads", "4", schedule, "1"].into_iter().map(str::to_owned));
+            assert!(parse(words).is_err());
+        }
+        let (c, mut args) = command("resume", task, &["--compute-threads", "4"]);
+        args.memory_mib = 1;
+        assert!(c.execute_owned(args, NoIo, &mut NoIo).is_err());
+    }
+}
