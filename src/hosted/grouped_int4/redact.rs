@@ -34,6 +34,7 @@ impl NlpEngine {
         let width = model.model_identity().group_width();
         let required = requirements(&config, source.len(), width,
             planner.tokenizer_digest(), *planner.template_digest())?;
+        check_encoding_preparation(&planner, config.preparation_reserve_bytes)?;
         let input_bytes = input_bytes(&source, &config, pseudonyms.as_ref())?;
         let temporary_bytes = temporary_bytes(&config)?;
         let run = config.native.run;
@@ -85,6 +86,14 @@ impl NlpEngine {
     }
 }
 fn redaction_error(error: Int4RedactionError) -> HostedError { HostedError::Int4(Int4HostError::Redaction(error)) }
+fn check_encoding_preparation(planner: &SourceTaskPlanner, preparation_bytes: u64) -> Result<(), HostedError> {
+    let workspace = planner.map_document_encoding_workspace_bytes()
+        .map_err(|_| HostedError::Limits("INT4 redaction cumulative encoding admission"))?;
+    if preparation_bytes < workspace {
+        return Err(HostedError::Limits("INT4 redaction encoding workspace"));
+    }
+    Ok(())
+}
 fn detector_error(error: RedactError) -> HostedError { redaction_error(error.into()) }
 fn execution_error(error: Int4RedactionError) -> HostedError {
     // A borrowed core caller may retain a bounded residual report. Hosted

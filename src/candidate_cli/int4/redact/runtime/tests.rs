@@ -113,7 +113,8 @@ fn complete_publication_preserves_only_edited_text_explicit_maps_and_public_poli
             scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "redact",
             model_id: "Nanbeige4.2-3B", source_revision: "fixture", source_root_sha256: "fixture-source",
             model_content_sha256: "fixture-model", candidate_format: "fixture-format", quant_recipe: "fixture:group=128",
-            group_width: 128, integer_kernel: "s_scalar_i32", snapshot: None };
+            group_width: 128, integer_kernel: "s_scalar_i32", snapshot: None,
+            input_encoding: None, tokenizer_work_limits: None };
         let response = Response { provenance: &provenance, output: &output };
         let mut bytes = Vec::new(); publish(&response, 8192, &mut bytes).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -121,6 +122,8 @@ fn complete_publication_preserves_only_edited_text_explicit_maps_and_public_poli
         assert_eq!(value["output"]["result"]["text"], result.text());
         assert_eq!(value["output"]["result"]["edits"][0]["original"]["span"]["byte_start"], 3);
         assert_eq!(value["protocol"], "fnlp-candidate-int4-redact-v1");
+        assert!(value.get("input_encoding").is_none());
+        assert!(value.get("tokenizer_work_limits").is_none());
         if action == "pseudonymize" {
             assert_eq!(value["output"]["result"]["pseudonym_identity"]["encoding"], "full256");
         } else { assert!(value["output"]["result"]["pseudonym_identity"].is_null()); }

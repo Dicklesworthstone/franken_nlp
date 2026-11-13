@@ -4,6 +4,7 @@ pub(super) mod long;
 use crate::{
     candidate_cli::redact::{self as shared, Action, Rule},
     tasks::redact::{RedactionRequest, actions::RedactionAction, pseudonym::PseudonymKey},
+    tokenizer::untrusted::{SafeBpeWorkLimits, UntrustedEncoding},
 };
 
 #[cfg(feature = "asupersync-runtime")]
@@ -57,7 +58,8 @@ pub(super) fn definition() -> clap::Command {
         .long_about("Redact one exact bounded UTF-8 document with the selected NER types plus deterministic rules. The complete original source must fit the declared context. By default the actual edited text is replanned and rerun through the same model AND rules; residual findings fail without publishing the rejected text. --no-verify explicitly skips that second pass. Actions are mask, placeholder or full-256-bit HMAC pseudonymize. Raw key bytes are accepted only through inherited stdin with a separate document file; an expected key commitment is checked before document input. No raw key argv option, chunked/corpus mode, retained job, automatic download or backend fallback. Source conversion and independently pinned snapshots share the same path. Both passes share native work, mask, memory and deadline admission. The result contains only final edited text and explicitly requested coordinate maps, never NER transcripts. Verification covers the declared detector union; omissions can remain and pseudonyms are not anonymization. Blocking IO observes the deadline cooperatively.")
         .mut_arg("input", |arg| arg.help("Exact bounded UTF-8 document; '-' reads stdin unless stdin supplies the private key"))
         .mut_arg("options", |arg| arg.long("ner-options").help("Complete bounded NerOptions JSON file; omitted selects person, organization, location"))
-        .mut_arg("max_result_bytes", |arg| arg.help("Complete final redaction and per-pass NER result byte ceiling")))
+        .mut_arg("max_result_bytes", |arg| arg.help("Complete final redaction and per-pass NER result byte ceiling"))
+        .after_long_help("The standalone redact command accepts --input-encoding safe-bpe-v1 for lossless compact document tokens with template controls excluded. One nonrenewable tokenizer allowance spans original-source preflight, original execution planning and fresh edited-source verification. Pair-work flags constrain their total; byte and token totals are bounded by the declared per-pass peak times the admitted passes. Edited text must independently fit the same context and result envelope. Workspace is priced before key, document or model IO. Exhaustion returns no redacted result, without a reset or byte fallback. The exact encoding and cumulative limits are reported only when compact input is selected and enter the semantic policy digest. This changes prompt tokenization and does not claim unchanged model output, established detector recall or measured performance.")))
 }
 impl RedactArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
@@ -65,7 +67,49 @@ impl RedactArgs {
             flags: RedactionFlags::from_arg_matches(matches)? })
     }
     pub(super) fn validate(&self, args: &Int4Args) -> Result<RedactLimits, CandidateError> {
-        self.validate_input(args, args.input.as_os_str() == "-")
+        if args.input_encoding.is_default() {
+            return self.validate_input(args, args.input.as_os_str() == "-");
+        }
+        if args.prefill()?.is_some() || args.compute.threads() != 1 {
+            return Err(CandidateError::Arguments);
+        }
+        // The edited source can be larger than the original. Price that
+        // declared peak before reading either private input or model bytes;
+        // the original read still obeys args.max_input_bytes independently.
+        let original = self.source.validate_batch_with_prefill(args)?;
+        let mut admission = args.clone();
+        admission.max_input_bytes = args.max_input_bytes.max(original.result_bytes);
+        let common = self.source.validate_batch_with_prefill(&admission)?;
+        let limits = self.validate_redaction_input(args, args.input.as_os_str() == "-", common)?;
+        let _ = self.encoding_policy(args, limits)?;
+        Ok(limits)
+    }
+    fn encoding_policy(&self, args: &Int4Args, limits: RedactLimits)
+        -> Result<(UntrustedEncoding, Option<SafeBpeWorkLimits>), CandidateError> {
+        let policy = args.input_encoding.policy(args.max_input_bytes.max(limits.common.result_bytes),
+            limits.common.max_prompt_tokens)?;
+        let complete = match &policy {
+            UntrustedEncoding::ByteFallback => None,
+            UntrustedEncoding::SafeBpeV1(call) => {
+                // One original preflight, one original execution compilation,
+                // and, when selected, one fresh edited-source compilation.
+                // Pair-work flags constrain their SUM, not each pass anew.
+                let passes = 2 + u64::from(!self.flags.no_verify);
+                let complete = SafeBpeWorkLimits {
+                    max_input_bytes: (call.max_input_bytes as u64).checked_mul(passes)
+                        .ok_or(CandidateError::Arguments)?,
+                    max_output_tokens: (call.max_output_tokens as u64).checked_mul(passes)
+                        .ok_or(CandidateError::Arguments)?,
+                    max_pair_checks: call.max_pair_checks, max_pair_bytes: call.max_pair_bytes,
+                };
+                complete.validate().map_err(|_| CandidateError::Arguments)?;
+                let workspace = call.requirements().map_err(|_| CandidateError::Arguments)?.workspace_bytes
+                    .checked_add(512).ok_or(CandidateError::Arguments)?;
+                if limits.common.preparation_bytes < workspace { return Err(CandidateError::Arguments); }
+                Some(complete)
+            }
+        };
+        Ok((policy, complete))
     }
     fn validate_input(&self, args: &Int4Args, population_stdin: bool) -> Result<RedactLimits, CandidateError> {
         let common = self.source.validate(args)?;

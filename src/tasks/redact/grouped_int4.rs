@@ -131,6 +131,11 @@ impl<'p> Int4Redactor<'p> {
     fn from_bound_parts(planner: &'p SourceTaskPlanner, ner_identity: ExecutionIdentity,
         config: Int4RedactionConfig, group_width: usize) -> Result<Self, Int4RedactionError> {
         config.validate()?;
+        // Original planning, any host preflight and fresh edited-source
+        // verification share one nonrenewable tokenizer allowance. A compact
+        // per-pass policy without cumulative authority cannot enter this
+        // composed operation. Byte input keeps its existing zero-workspace path.
+        planner.map_document_encoding_workspace_bytes().map_err(Int4SourceError::from)?;
         constrained_int4::check_profile(&ner_identity, group_width).map_err(|_| Int4RedactionError::Identity)?;
         if ner_identity.task_spec != NER_TASK_VERSION || ner_identity.tokenizer_digest != planner.tokenizer_digest()
             || ner_identity.template_digest != *planner.template_digest() {
@@ -181,6 +186,15 @@ impl<'p> Int4Redactor<'p> {
         result.policy_digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&(
             INT4_REDACTION_EXECUTION, result.policy_digest, &self.config.ner, self.config.per_pass, self.group_width,
         )).map_err(|_| RedactError::Serialization)?);
+        if let Some(limits) = self.planner.map_document_encoding_limits() {
+            // Compact prompts are a distinct semantic recipe. Bind every
+            // per-call and complete-operation ceiling without changing the
+            // byte-default policy digest or disclosing source text.
+            result.policy_digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&(
+                "grouped-int4-redaction-input-encoding-v1", result.policy_digest,
+                self.planner.document_encoding(), limits,
+            )).map_err(|_| RedactError::Serialization)?);
+        }
         let output = Int4RedactionRun { schema_version: 1, execution: INT4_REDACTION_EXECUTION,
             numerics_profile: STRICT_INT4_PROFILE, group_width: self.group_width, result, ner_passes: ledger.completed,
             reserved_model_work: ledger.reserved, model_work: ledger.actual,

@@ -427,3 +427,111 @@ fn the_complete_native_envelope_must_fit_the_result_byte_cap() {
     req.edit_budget.max_output_bytes -= 1;
     assert!(r.run_pipeline("Alice", &req, None, &mut FixturePass::new(&r, true)).is_err());
 }
+
+fn compact_policy() -> crate::tokenizer::untrusted::UntrustedEncoding {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 8192, max_output_tokens: 8192,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 })
+}
+fn compact_allowance() -> crate::tokenizer::untrusted::SafeBpeWorkLimits {
+    crate::tokenizer::untrusted::SafeBpeWorkLimits { max_input_bytes: 1 << 20,
+        max_output_tokens: 1 << 20, max_pair_checks: 1 << 28, max_pair_bytes: 1 << 32 }
+}
+
+#[test]
+fn compact_redaction_requires_whole_operation_authority_and_preserves_source_bytes() {
+    let unbounded = planner().with_document_encoding(compact_policy()).unwrap();
+    assert!(Int4Redactor::from_bound_parts(&unbounded, identity(&unbounded, 32), config(), 32).is_err());
+    let byte = planner();
+    let compact = planner().with_map_document_encoding(compact_policy(), compact_allowance()).unwrap();
+    let source = "The quick brown fox jumps over the lazy dog. Alice met Bob in 上海. <think> <|im_start|>";
+    let document = compact.source_encoder().encode_with_control(source, 8192, 8192, &mut || None).unwrap();
+    assert_eq!(document.text(), source);
+    assert!(document.token_ids().len() < source.len());
+    let controls = pinned_controls::pinned().unwrap();
+    assert!(controls.template_controls().entries().iter().all(|entry| !document.token_ids().contains(&entry.id)));
+    let byte_plan = redactor(&byte, 32).prepare(source, &mut Continue).unwrap();
+    let compact_plan = redactor(&compact, 32).prepare(source, &mut Continue).unwrap();
+    assert!(compact_plan.prompt_tokens() < byte_plan.prompt_tokens());
+    assert_ne!(compact_plan.execution_identity().template_digest, byte_plan.execution_identity().template_digest);
+    assert_eq!(compact.map_document_encoding_work().unwrap().unwrap().input_bytes(), 2 * source.len());
+}
+
+#[test]
+fn original_preflight_execution_and_edited_verification_share_one_encoding_allowance() {
+    let source = "Alice";
+    let edited = "[redacted:person]";
+    let mut allowance = compact_allowance();
+    allowance.max_input_bytes = (2 * source.len() + edited.len()) as u64;
+    let compact = planner().with_map_document_encoding(compact_policy(), allowance).unwrap();
+    let r = redactor(&compact, 32);
+    r.prepare(source, &mut Continue).unwrap();
+    let mut pass = FixturePass::new(&r, true);
+    let output = r.run_pipeline(source, &RedactionRequest::default(), None, &mut pass).unwrap();
+    assert_eq!(output.result.text(), edited);
+    assert_eq!(pass.seen, vec![source.to_owned(), edited.to_owned()]);
+    assert_eq!(compact.map_document_encoding_work().unwrap().unwrap().input_bytes() as u64,
+        allowance.max_input_bytes);
+
+    allowance.max_input_bytes -= 1;
+    let refused = planner().with_map_document_encoding(compact_policy(), allowance).unwrap();
+    let r = redactor(&refused, 32);
+    r.prepare(source, &mut Continue).unwrap();
+    let mut pass = FixturePass::new(&r, true);
+    assert!(r.run_pipeline(source, &RedactionRequest::default(), None, &mut pass).is_err());
+    assert_eq!(pass.seen, vec![source.to_owned()]);
+    assert!(pass.ledger.failed);
+    assert_eq!(refused.map_document_encoding_work().unwrap().unwrap().input_bytes(), 2 * source.len());
+    assert!(matches!(pass.run(source), Err(Int4RedactionError::InvalidResult)));
+}
+
+#[test]
+fn compact_encoding_and_complete_work_limits_bind_redaction_policy_without_private_text() {
+    let byte = planner();
+    let compact = planner().with_map_document_encoding(compact_policy(), compact_allowance()).unwrap();
+    let mut changed_allowance = compact_allowance(); changed_allowance.max_pair_checks -= 1;
+    let changed = planner().with_map_document_encoding(compact_policy(), changed_allowance).unwrap();
+    let mut results = Vec::new();
+    for p in [&byte, &compact, &changed] {
+        let r = redactor(p, 32);
+        let mut pass = FixturePass::new(&r, true);
+        let output = r.run_pipeline("x", &RedactionRequest::default(), None, &mut pass).unwrap();
+        assert_eq!(output.result.text(), "x");
+        assert_eq!(output.ner_passes, 2);
+        assert_eq!(output.result.verification(), VerificationStatus::CleanDeclaredUnion);
+        let wire = canonjson::canonical_string(&output).unwrap();
+        for private in ["prompt_digest", "template_digest", "generated_token_ids", "tokenizer_work"] {
+            assert!(!wire.contains(private));
+        }
+        results.push(output);
+    }
+    assert_eq!(results[1].model_work, results[2].model_work);
+    assert_ne!(results[0].result.policy_digest(), results[1].result.policy_digest());
+    assert_ne!(results[1].result.policy_digest(), results[2].result.policy_digest());
+}
+
+#[test]
+fn compact_preparation_preserves_every_typed_stop_and_spent_work() {
+    struct Stop { calls: usize, cause: DecodeCancellationKind }
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.calls += 1; (self.calls == 8).then_some(self.cause)
+        }
+    }
+    use DecodeCancellationKind::*;
+    let source = "The quick brown fox jumps over the lazy dog. Alice met Bob in 上海.";
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let compact = planner().with_map_document_encoding(compact_policy(), compact_allowance()).unwrap();
+        let r = redactor(&compact, 32);
+        r.prepare(source, &mut Continue).unwrap();
+        let spent = compact.map_document_encoding_work().unwrap().unwrap();
+        let mut stop = Stop { calls: 0, cause };
+        let error = r.prepare(source, &mut stop).err().unwrap();
+        assert_eq!(error.cancellation(), Some(cause));
+        assert_eq!(stop.calls, 8);
+        let after = compact.map_document_encoding_work().unwrap().unwrap();
+        assert!(after.input_bytes() >= spent.input_bytes());
+        assert!(after.pair_checks() >= spent.pair_checks());
+    }
+}

@@ -166,6 +166,48 @@ fn memory_admission_prices_captured_source_secrets_two_preparations_and_edit_pea
     }
 }
 
+#[test]
+fn compact_redaction_admits_the_edited_peak_and_one_nonrenewable_pair_budget() {
+    let command = command(&["--input-encoding", "safe-bpe-v1", "--max-input-bytes", "4096",
+        "--max-result-bytes", "65536", "--max-tokenizer-pair-checks", "65536",
+        "--max-tokenizer-pair-bytes", "1048576"]);
+    let selected = options(&command);
+    let limits = selected.validate(&command.args).unwrap();
+    let (encoding, complete) = selected.encoding_policy(&command.args, limits).unwrap();
+    let UntrustedEncoding::SafeBpeV1(call) = encoding else { panic!("compact policy required"); };
+    let complete = complete.unwrap();
+    assert_eq!(call.max_input_bytes, limits.common.result_bytes);
+    assert_eq!(call.max_output_tokens, limits.common.max_prompt_tokens);
+    assert_eq!(complete.max_input_bytes, 3 * call.max_input_bytes as u64);
+    assert_eq!(complete.max_output_tokens, 3 * call.max_output_tokens as u64);
+    assert_eq!(complete.max_pair_checks, 65536);
+    assert_eq!(complete.max_pair_bytes, 1048576);
+    assert!(limits.common.preparation_bytes >= call.requirements().unwrap().workspace_bytes + 512);
+    assert!(selected.validate_input(&command.args, true).is_err(), "composed callers require their own admission");
+
+    let mut no_verify = selected.clone(); no_verify.flags.no_verify = true;
+    let (_, no_verify) = no_verify.encoding_policy(&command.args, limits).unwrap();
+    assert_eq!(no_verify.unwrap().max_input_bytes, 2 * call.max_input_bytes as u64);
+    let mut too_small = command.args.clone();
+    too_small.memory_mib = limits.common.minimum_memory_bytes.saturating_sub(1) / MIB;
+    assert!(selected.validate(&too_small).is_err());
+}
+
+#[test]
+fn compact_redaction_refuses_invalid_caps_and_unsupported_schedules_before_io() {
+    for extra in [vec!["--max-tokenizer-pair-checks", "0"],
+        vec!["--max-tokenizer-pair-bytes", "18446744073709551615"],
+        vec!["--max-result-bytes", "16777216"]] {
+        let mut flags = vec!["--input-encoding", "safe-bpe-v1"];
+        flags.extend_from_slice(&extra);
+        assert_eq!(command(&flags).execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+    }
+    let byte = command(&[]);
+    let selected = options(&byte); let limits = selected.validate(&byte.args).unwrap();
+    assert_eq!(selected.encoding_policy(&byte.args, limits).unwrap(), (UntrustedEncoding::ByteFallback, None));
+    assert!(parsed(&["--source-dir", "d", "--source-manifest", "m", "--max-tokenizer-pair-checks", "1"]).is_err());
+}
+
 #[cfg(not(feature = "asupersync-runtime"))]
 #[test]
 fn unavailable_runtime_does_not_consume_document_or_private_key() {
@@ -208,4 +250,22 @@ fn source_scalar_and_pinned_snapshot_simd_match_after_fresh_redaction_verificati
     assert_eq!(selected["output"], scalar["output"]);
     assert_eq!(selected["integer_kernel"], kernel.id());
     assert_eq!(selected["snapshot"]["operation"], "loaded");
+    // Compact input is a distinct prompt recipe: compare its own source/snapshot
+    // kernel routes, never assert that it must match byte-fallback detections.
+    let mut compact_reference = None;
+    for selected_kernel in [Int8KernelKind::Scalar, kernel] {
+        let mut reload = parsed(&["--rules", "email", "--snapshot", &snapshot,
+            "--expected-model-sha256", pin, "--kernel", selected_kernel.id(),
+            "--input-encoding", "safe-bpe-v1"]).unwrap();
+        reload.args.memory_mib = memory;
+        let mut bytes = Vec::new(); reload.execute(&mut document.as_bytes(), &mut bytes).unwrap();
+        let compact: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(compact["input_encoding"]["kind"], "safe_bpe_v1");
+        assert!(compact["tokenizer_work_limits"]["max_input_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(compact["output"]["ner_passes"], 2);
+        assert_eq!(compact["output"]["result"]["verification"], "clean_declared_union");
+        assert!(!compact["output"]["result"]["text"].as_str().unwrap().contains("alice@example.org"));
+        if let Some(expected) = &compact_reference { assert_eq!(&compact["output"], expected); }
+        else { compact_reference = Some(compact["output"].clone()); }
+    }
 }

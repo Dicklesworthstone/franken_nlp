@@ -182,3 +182,28 @@ fn typed_cancellation_and_secret_owners_cross_the_completion_boundary() {
     assert_ne!(VerificationStatus::CleanDeclaredUnion, VerificationStatus::NotRequested);
     let _host = NlpEngine::redact_int4;
 }
+
+#[test]
+fn compact_redaction_requires_cumulative_authority_and_exact_workspace_admission() {
+    use crate::tokenizer::{embedded::EmbeddedTokenizer, pinned_controls,
+        untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding}};
+    let make = || SourceTaskPlanner::pinned(pinned_controls::pinned().unwrap().template_controls(),
+        EmbeddedTokenizer::pinned().unwrap().eos_token_id().unwrap()).unwrap();
+    let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 8192,
+        max_output_tokens: 8192, max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 });
+    let limits = SafeBpeWorkLimits { max_input_bytes: 1 << 20, max_output_tokens: 1 << 20,
+        max_pair_checks: 1 << 28, max_pair_bytes: 1 << 32 };
+    assert!(check_encoding_preparation(&make(), 0).is_ok());
+    let unbounded = make().with_document_encoding(policy.clone()).unwrap();
+    assert!(check_encoding_preparation(&unbounded, u64::MAX).is_err());
+    let compact = make().with_map_document_encoding(policy, limits).unwrap();
+    let needed = compact.map_document_encoding_workspace_bytes().unwrap();
+    assert!(needed > 0);
+    assert!(check_encoding_preparation(&compact, needed - 1).is_err());
+    assert!(check_encoding_preparation(&compact, needed).is_ok());
+    compact.source_encoder().encode_with_control("Alice", 8192, 8192, &mut || None).unwrap();
+    let spent = compact.map_document_encoding_work().unwrap();
+    assert!(check_encoding_preparation(&compact, needed).is_ok());
+    assert_eq!(compact.map_document_encoding_work().unwrap(), spent,
+        "admission cannot renew original preflight work");
+}

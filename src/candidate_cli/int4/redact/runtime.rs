@@ -90,6 +90,7 @@ pub(super) fn execute(args: Int4Args, command: RedactArgs, _admitted: RedactLimi
     let started = Instant::now();
     let limits = command.validate(&args)?;
     let common = limits.common;
+    let (encoding, encoding_work) = command.encoding_policy(&args, limits)?;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
@@ -128,6 +129,11 @@ pub(super) fn execute(args: Int4Args, command: RedactArgs, _admitted: RedactLimi
     drop(detectors::detect(&text, &request.rules, request.rule_budget).map_err(|_| CandidateError::Planning)?);
     remaining()?;
     let (planner, vocabulary) = source::planner()?;
+    let planner = match encoding_work {
+        Some(work) => planner.with_map_document_encoding(encoding.clone(), work)
+            .map_err(|_| CandidateError::Planning)?,
+        None => planner,
+    };
     remaining()?;
     let cancellation = CancellationToken::default();
     let model = super::super::runtime::load_model(&engine, &args, common, remaining()?, cancellation.clone())?;
@@ -176,6 +182,7 @@ pub(super) fn execute(args: Int4Args, command: RedactArgs, _admitted: RedactLimi
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(), snapshot,
+        input_encoding: input_encoding::reported_policy(&encoding), tokenizer_work_limits: encoding_work,
     };
     // Both guards survive staging, writing AND flushing. A rejected native,
     // editing or verification result never reaches the writer.
@@ -197,6 +204,10 @@ struct Provenance<'a> {
     candidate_format: &'a str, quant_recipe: &'a str, group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<SnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<&'a UntrustedEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokenizer_work_limits: Option<SafeBpeWorkLimits>,
 }
 #[derive(Serialize)]
 struct Response<'a, 'b, T: Serialize> {
