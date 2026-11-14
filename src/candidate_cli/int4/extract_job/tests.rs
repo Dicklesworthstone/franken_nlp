@@ -62,6 +62,80 @@ fn start_and_resume_keep_explicit_model_schema_and_storage_identity() {
     assert!(c.args.validate(&args).unwrap().snapshot_pin.is_some());
 }
 
+
+#[test]
+fn persistent_width_is_explicit_and_never_replenishes_retained_native_or_mask_work() {
+    for operation in ["start", "resume"] {
+        for width in ["1", "2", "4", "64"] {
+            let (c, args) = command(operation, &["--compute-threads", width]);
+            let common = c.args.validate(&args).unwrap();
+            assert_eq!(common.compute.threads, width.parse::<usize>().unwrap());
+            let job = lifetime(&c.args, &args, common);
+            let limits = c.args.lifetime_limits(&args, common, job).unwrap();
+            assert_eq!(limits.native.max_model_work, job.max_work.int4_model_work());
+            assert_eq!(limits.native.masks.max_visits_per_run, job.max_work.mask_node_visits);
+            assert_eq!(limits.native.masks.max_visits_per_item, c.args.extraction.mask_visits());
+            assert_eq!(limits.common.native, common.native);
+            if width == "1" { assert_eq!(common.compute.workspace_bytes, 0); }
+            else { assert!(common.compute.workspace_bytes > 0); }
+        }
+    }
+    let (serial, serial_args) = command("start", &[]);
+    let serial = serial.args.validate(&serial_args).unwrap();
+    let (threaded, threaded_args) = command("resume", &["--compute-threads", "4"]);
+    let threaded = threaded.args.validate(&threaded_args).unwrap();
+    assert_eq!(serial.max_prompt_tokens, threaded.max_prompt_tokens);
+    assert_eq!(serial.native, threaded.native);
+    assert_eq!(serial.result_bytes, threaded.result_bytes);
+}
+
+#[test]
+fn invalid_worker_widths_and_unsupported_schedules_refuse_before_private_io() {
+    for width in ["0", "65", "18446744073709551615"] {
+        let mut words = argv("start");
+        words.extend(["--compute-threads".to_owned(), width.to_owned()]);
+        if let Ok((c, args)) = parse(words) {
+            assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().exit, ErrorCode::Usage);
+        }
+    }
+    for extra in [
+        vec!["--compute-threads", "2", "--prefill-rows", "2"],
+        vec!["--compute-threads", "2", "--cohort-documents", "2"],
+        vec!["--compute-threads", "2", "--max-selected-rows", "8"],
+        vec!["--compute-threads", "2", "--input-encoding", "safe-bpe-v1"],
+    ] {
+        let mut words = argv("resume");
+        words.extend(extra.into_iter().map(str::to_owned));
+        assert!(parse(words).is_err());
+    }
+}
+
+#[test]
+fn snapshot_execution_prices_worker_scratch_before_admitting_job_population() {
+    let (serial, mut serial_args) = command("start", &[]);
+    let (parallel, mut parallel_args) = command("start", &["--compute-threads", "4"]);
+    for args in [&mut serial_args, &mut parallel_args] {
+        args.source_dir = None;
+        args.source_manifest = None;
+        args.snapshot = Some(PathBuf::from("model.int4"));
+        args.expected_model_sha256 = Some("a".repeat(64));
+    }
+    let serial_common = serial.args.validate(&serial_args).unwrap();
+    let parallel_common = parallel.args.validate(&parallel_args).unwrap();
+    assert_eq!(parallel_common.minimum_memory_bytes - serial_common.minimum_memory_bytes,
+        parallel_common.compute.workspace_bytes);
+    let fixed = lifetime(&serial.args, &serial_args, serial_common);
+    let serial_job = serial.args.lifetime_limits(&serial_args, serial_common, fixed).unwrap();
+    let parallel_job = parallel.args.lifetime_limits(&parallel_args, parallel_common, fixed).unwrap();
+    assert_eq!(serial_job.buffer_bytes, parallel_job.buffer_bytes);
+    assert_eq!(parallel_job.common.minimum_memory_bytes - serial_job.common.minimum_memory_bytes,
+        parallel_common.compute.workspace_bytes);
+    let mut insufficient = parallel_common;
+    insufficient.memory_bytes = parallel_job.common.minimum_memory_bytes - 1;
+    assert_eq!(parallel.args.lifetime_limits(&parallel_args, insufficient, fixed).unwrap_err().code,
+        "job_population_memory");
+}
+
 #[test]
 fn repair_is_resume_only_and_requires_an_explicit_flag() {
     assert!(matches!(command("resume", &[]).0.mode, RunMode::Resume { discard_uncommitted: false }));

@@ -62,12 +62,12 @@ pub(super) struct StorageArgs {
 
 pub(super) fn definition() -> clap::Command {
     let operation = |name: &'static str, about: &'static str| {
-        StorageArgs::augment_args(extract::definition().name(name).about(about)
-            .long_about("Retain and resume schema/source extraction with one resident source-converted or independently pinned snapshot INT4 model. Requires --store-results, an existing protected --job-dir, original --job-id and --key-file, immutable --limits, and one exact shared --schema. By default, supply the COMPLETE original NDJSON population on every invocation; explicit retained-input replay is available. Non-null task_args and flush controls are refused. Resume authenticates exact input bytes, schema, model/group identity and recipe before replay or tail repair. Lifetime native work includes every INT4 group dot and does not renew on resume; failed attempts remain debited. Stdout is metadata only; retained private results are read through explicit job verification/materialization. --materialize publishes only after all items commit. Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. No automatic retry, key/directory creation, release activation or semantic-accuracy claim.")
+        compute::definition(StorageArgs::augment_args(extract::definition().name(name).about(about)
+            .long_about("Retain and resume schema/source extraction with one resident source-converted or independently pinned snapshot INT4 model. Requires --store-results, an existing protected --job-dir, original --job-id and --key-file, immutable --limits, and one exact shared --schema. By default, supply the COMPLETE original NDJSON population on every invocation; explicit retained-input replay is available. Non-null task_args and flush controls are refused. Resume authenticates exact input bytes, schema, model/group identity and recipe before replay or tail repair. Lifetime native work includes every INT4 group dot and does not renew on resume; failed attempts remain debited. Stdout is metadata only; retained private results are read through explicit job verification/materialization. --materialize publishes only after all items commit. Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. Serial execution remains the default. --compute-threads 2..=64 reuses one admitted numerical row team across the invocation; physical width may change on authenticated resume without changing the recipe or replenishing any lifetime work. Worker scratch and the installed thread envelope are priced before private IO. No prefill, cohorts, selected-row override, compact-input override, automatic retry, key/directory creation, release activation or semantic-accuracy claim.")
             .after_help(job_cli::INPUT_RETENTION_HELP)
             .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population; omit with --use-retained-input; '-' reads stdin"))
             .mut_arg("max_input_bytes", |arg| arg.help("Outer cap on each complete NDJSON record; immutable JobLimits.max_input_bytes_per_item must fit"))
-            .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoints for this complete invocation; persisted work and attempt ceilings do not renew")))
+            .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoints for this complete invocation; persisted work and attempt ceilings do not renew"))))
     };
     let start = operation("start", "Create a new explicitly retained INT4 extraction job");
     let resume = operation("resume", "Authenticate the original population and run pending INT4 extraction items")
@@ -105,7 +105,13 @@ impl JobArgs {
             || s.journal_memory_mib == 0 || s.serialization_memory_mib == 0 {
             return Err(Failure::usage("explicit_storage_or_job_options"));
         }
-        let common = self.extraction.validate(args).map_err(Failure::from)?;
+        // This route owns a physical worker schedule but retains the existing
+        // byte-input, full-head, sequential-prompt recipe. Never silently
+        // discard a programmatic policy that is not authenticated by the job.
+        if args.prefill()?.is_some() || !args.input_encoding.is_default() {
+            return Err(CandidateError::Arguments.into());
+        }
+        let common = self.extraction.validate_batch_with_prefill(args).map_err(Failure::from)?;
         for mib in [s.journal_memory_mib, s.serialization_memory_mib] {
             if mib.checked_mul(MIB).is_none_or(|bytes| bytes > common.memory_bytes) {
                 return Err(Failure::usage("job_memory_options"));
@@ -169,7 +175,9 @@ impl JobCommand {
         };
         let args = JobArgs { extraction: extract::ExtractionArgs::from_matches(matches)?,
             storage: StorageArgs::from_arg_matches(matches)? };
-        Ok((Self { mode, args }, Int4Args::from_arg_matches(matches)?))
+        let mut native = Int4Args::from_arg_matches(matches)?;
+        native.compute = compute::Args::from_matches(matches)?;
+        Ok((Self { mode, args }, native))
     }
 
     pub(super) fn run_owned<R: Read + Send + 'static>(self, args: Int4Args, input: R,

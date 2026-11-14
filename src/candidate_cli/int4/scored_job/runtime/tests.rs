@@ -207,7 +207,8 @@ fn scored_metadata_preserves_every_original_cancellation_before_staging() {
         let cancellation = CancellationToken::default();
         cancellation.cancel(cause);
         let expected = job_failure(JobError::Cancelled(cause));
-        let failure = publish_report(&true, &mut NoIo, &|| Ok(Duration::from_secs(1)),
+        // The recorded cause also wins when the absolute deadline has expired.
+        let failure = publish_report(&true, &mut NoIo, &|| Err(CandidateError::Timeout),
             &cancellation).unwrap_err();
         assert_eq!(failure.exit, expected.exit);
         assert_eq!(failure.code, expected.code);

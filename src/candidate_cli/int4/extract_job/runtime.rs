@@ -3,13 +3,13 @@ use super::*;
 use crate::jobs::JobInputMemory;
 use std::{sync::Arc, time::{Duration, Instant}};
 use crate::{
-    NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
+    NlpEngine, MemoryClass,
     candidate_cli::{extract::SCHEMA_BYTES, runtime::owned_jobs::{
         host_failure, job_failure, open_mode, progress_report}},
-    hosted::{CancellationToken, NativeLimits, RunLimits,
-        corpus::jobs::{JobHostLimits, SourceJobRequest}},
-    jobs::{JobSecret, runner::extract::grouped_int4::Int4ExtractionJobPlanner},
-    native_engine::strict_int4::weights::snapshot::INT4_SNAPSHOT_VERSION,
+    hosted::{CancellationToken, HostedError, Int4HostError, NativeLimits, RunLimits,
+        corpus::jobs::{HostedJobError, JobHostLimits, SourceJobRequest}},
+    jobs::{JobError, JobSecret, runner::extract::grouped_int4::Int4ExtractionJobPlanner},
+    native_engine::strict_int4::{StrictInt4Error, weights::snapshot::INT4_SNAPSHOT_VERSION},
     tasks::extract::ExtractionVocabulary,
 };
 
@@ -23,12 +23,8 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: common.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().map_err(|_| CandidateError::Runtime)?;
+    let engine = NlpEngine::builder().resource_config(compute::resource_config(common))
+        .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
     // Config/key/schema/planner/IO and final report allocations drop BEFORE
     // their preparation charge, including errors after a durable job commit.
@@ -76,8 +72,16 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         mode: open_mode(mode, job.storage.input_retention)?, materialize };
     // Only the real host opens the protected job, authenticates the exact
     // population/recipe, skips committed ordinals and admits pending forwards.
-    let progress = engine.job_int4_extract(&model, planner, vocabulary, request, host,
-        common.kernel, reader, cancellation).map_err(host_failure)?;
+    let progress = if common.compute.threads == 1 {
+        engine.job_int4_extract(&model, planner, vocabulary, request, host,
+            common.kernel, reader, cancellation.clone())
+    } else {
+        engine.job_int4_extract_with_threads(&model, planner, vocabulary, request, host,
+            common.kernel, common.compute.threads, reader, cancellation.clone())
+    }.map_err(execution_failure)?;
+    if let Some(cause) = cancellation.cause() {
+        return Err(job_failure(JobError::Cancelled(cause)));
+    }
     remaining()?;
     let report = progress_report(progress, job_id, lifetime, materialize, mode, "extract")?;
     let content = identity.logical_model_digest.to_hex();
@@ -88,11 +92,38 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         source_root_sha256: model.model_identity().source_root_sha256(),
         model_content_sha256: &content, candidate_format: &identity.artifact_format,
         quant_recipe: &identity.quant_recipe, group_width: model.model_identity().group_width(),
-        integer_kernel: common.kernel.kind().id(), snapshot, output: &report,
+        integer_kernel: common.kernel.kind().id(), snapshot,
+        compute_schedule: compute::Schedule::for_threads(common.compute.threads), output: &report,
     };
     // Metadata only: result bytes remain in the explicit owner-only spool.
     // Delivery failure can follow a durable commit and never implies rollback.
-    publish(&response, job_cli::REPORT_BYTES, output).map_err(Failure::from)
+    publish_report(&response, output, &remaining, &cancellation)
+}
+
+fn execution_failure(error: HostedJobError) -> Failure {
+    match error {
+        HostedJobError::Host(HostedError::Join { physical_error: Some(error), .. }
+            | HostedError::Scope { physical_error: Some(error), .. }) =>
+                execution_failure(HostedJobError::Host(*error)),
+        HostedJobError::Host(HostedError::Int4(Int4HostError::Native(StrictInt4Error::Cancelled(cause)))) =>
+            job_failure(JobError::Cancelled(cause)),
+        other => host_failure(other),
+    }
+}
+
+/// Completion metadata has the same original cancellation/deadline authority
+/// as native execution. A late failure may follow durable commits; it never
+/// permits an automatic replay or implies those commits were rolled back.
+fn publish_report<T: Serialize>(response: &T, output: &mut impl Write,
+    remaining: &impl Fn() -> Result<Duration, CandidateError>,
+    cancellation: &CancellationToken) -> Result<(), Failure> {
+    publish_checked(response, job_cli::REPORT_BYTES, output, &|| {
+        if cancellation.cause().is_some() { return Err(CandidateError::Execution); }
+        remaining().map(|_| ())
+    }).map_err(|error| match (error, cancellation.cause()) {
+        (CandidateError::Execution, Some(cause)) => job_failure(JobError::Cancelled(cause)),
+        (error, _) => Failure::from(error),
+    })
 }
 
 fn read_config(path: &std::path::Path, cap: usize,
@@ -143,6 +174,8 @@ struct Response<'a, T: Serialize> {
     integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<SnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compute_schedule: Option<compute::Schedule>,
     output: &'a T,
 }
 

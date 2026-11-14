@@ -98,7 +98,8 @@ fn completion_envelope_contains_candidate_identity_and_authenticated_progress_on
         source_root_sha256: &source, model_content_sha256: &content,
         candidate_format: "fixture-candidate-format", quant_recipe: "fixture-grouped-int4",
         group_width: args.group_width, integer_kernel: common.kernel.kind().id(),
-        snapshot: Some(SnapshotRecord::new("loaded", common.snapshot_need)), output: &report,
+        snapshot: Some(SnapshotRecord::new("loaded", common.snapshot_need)),
+        compute_schedule: None, output: &report,
     };
     let mut bytes = Vec::new();
     publish(&response, job_cli::REPORT_BYTES, &mut bytes).unwrap();
@@ -117,5 +118,113 @@ fn completion_envelope_contains_candidate_identity_and_authenticated_progress_on
         assert!(value["output"].get(forbidden).is_none());
     }
     assert!(bytes.ends_with(b"\n"));
-    assert_eq!(publish(&response, 1, &mut NoWrite), Err(CandidateError::Output));
+    assert!(value.get("compute_schedule").is_none());
+    let mut threaded = response;
+    threaded.compute_schedule = compute::Schedule::for_threads(4);
+    let mut threaded_value = serde_json::to_value(&threaded).unwrap();
+    assert_eq!(threaded_value.as_object_mut().unwrap().remove("compute_schedule"),
+        compute::Schedule::for_threads(4).map(serde_json::to_value).transpose().unwrap());
+    assert_eq!(threaded_value, value);
+    assert_eq!(publish(&threaded, 1, &mut NoWrite), Err(CandidateError::Output));
+}
+
+
+#[test]
+fn worker_admission_installs_the_same_process_envelope_used_by_the_host() {
+    let (command, mut args) = parts();
+    for width in [1, 2, 4, 64] {
+        let matches = compute::definition(clap::Command::new("fixture"))
+            .try_get_matches_from(["fixture", "--compute-threads", &width.to_string()]).unwrap();
+        args.compute = compute::Args::from_matches(&matches).unwrap();
+        let common = command.args.validate(&args).unwrap();
+        let config = compute::resource_config(common);
+        assert_eq!(config.runtime_workers, 1);
+        assert_eq!(config.max_blocking_coordinators, 1);
+        assert_eq!(config.scoped_cpu_children_per_coordinator, width - 1);
+        assert_eq!(config.thread_ceiling, width + 1);
+        assert_eq!(config.memory_ceiling_bytes, common.memory_bytes);
+        config.thread_inventory().unwrap();
+    }
+}
+
+#[test]
+fn original_native_and_metadata_cancellation_keep_the_durable_policy_boundary() {
+    use crate::native_engine::decode::DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let expected = job_failure(JobError::Cancelled(cause));
+        let native = execution_failure(HostedJobError::Host(
+            HostedError::Int4(Int4HostError::Native(StrictInt4Error::Cancelled(cause)))));
+        assert_eq!(native.exit, expected.exit);
+        assert_eq!(native.code, expected.code);
+        let stop = CancellationToken::default();
+        stop.cancel(cause);
+        // Original cancellation wins even if the wall clock is also expired.
+        let metadata = publish_report(&true, &mut NoWrite,
+            &|| Err(CandidateError::Timeout), &stop).unwrap_err();
+        assert_eq!(metadata.exit, expected.exit);
+        assert_eq!(metadata.code, expected.code);
+    }
+}
+
+#[test]
+fn cancelled_serialization_emits_no_metadata_and_cancelled_flush_cannot_report_success() {
+    use crate::native_engine::decode::DecodeCancellationKind::{Deadline, Shutdown};
+    struct CancelWhileSerializing(CancellationToken);
+    impl Serialize for CancelWhileSerializing {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.0.cancel(Deadline);
+            serializer.serialize_bool(true)
+        }
+    }
+    let remaining = || Ok(Duration::from_secs(1));
+    let stop = CancellationToken::default();
+    let response = CancelWhileSerializing(stop.clone());
+    let failure = publish_report(&response, &mut NoWrite, &remaining, &stop).unwrap_err();
+    assert_eq!(failure.code, job_failure(JobError::Cancelled(Deadline)).code);
+    assert_eq!(failure.exit, ErrorCode::BudgetOrTimeout);
+
+    struct CancelOnFlush { bytes: Vec<u8>, stop: CancellationToken }
+    impl Write for CancelOnFlush {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes); Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> { self.stop.cancel(Shutdown); Ok(()) }
+    }
+    let stop = CancellationToken::default();
+    let mut writer = CancelOnFlush { bytes: Vec::new(), stop: stop.clone() };
+    let failure = publish_report(&true, &mut writer, &remaining, &stop).unwrap_err();
+    assert_eq!(failure.code, job_failure(JobError::Cancelled(Shutdown)).code);
+    assert_eq!(writer.bytes, b"true\n");
+}
+
+#[test]
+fn report_budget_and_original_deadline_cover_staging_and_complete_delivery() {
+    let stop = CancellationToken::default();
+    let available = || Ok(Duration::from_secs(1));
+    assert!(publish_report(&"x".repeat(job_cli::REPORT_BYTES), &mut NoWrite, &available, &stop).is_err());
+    let checks = std::cell::Cell::new(0);
+    let before_write = || {
+        checks.set(checks.get() + 1);
+        if checks.get() == 1 { available() } else { Err(CandidateError::Timeout) }
+    };
+    assert_eq!(publish_report(&true, &mut NoWrite, &before_write, &stop).unwrap_err().exit,
+        ErrorCode::BudgetOrTimeout);
+    let checks = std::cell::Cell::new(0);
+    let after_flush = || {
+        checks.set(checks.get() + 1);
+        if checks.get() < 3 { available() } else { Err(CandidateError::Timeout) }
+    };
+    let mut delivered = Vec::new();
+    assert_eq!(publish_report(&true, &mut delivered, &after_flush, &stop).unwrap_err().exit,
+        ErrorCode::BudgetOrTimeout);
+    assert_eq!(delivered, b"true\n");
+    struct BrokenFlush(Vec<u8>);
+    impl Write for BrokenFlush {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> { self.0.extend_from_slice(bytes); Ok(bytes.len()) }
+        fn flush(&mut self) -> io::Result<()> { Err(io::Error::other("fixture flush failure")) }
+    }
+    let mut broken = BrokenFlush(Vec::new());
+    assert!(publish_report(&true, &mut broken, &available, &stop).is_err());
+    assert_eq!(broken.0, b"true\n");
 }

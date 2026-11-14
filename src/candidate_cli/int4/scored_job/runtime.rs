@@ -113,6 +113,9 @@ fn run<P: Int4ScoredJobTask>(engine: &NlpEngine, model: &ResidentInt4, planner: 
         engine.job_int4_scored_with_threads(model, planner, request, host, common.kernel,
             common.compute.threads, reader, cancellation.clone())
     }.map_err(execution_failure)?;
+    if let Some(cause) = cancellation.cause() {
+        return Err(job_failure(JobError::Cancelled(cause)));
+    }
     remaining()?;
     let report = progress_report(progress, job_id, lifetime, materialize, mode, task)?;
     let content = identity.logical_model_digest.to_hex();

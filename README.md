@@ -895,6 +895,23 @@ items commit. Existing stored-job status, verification and materialization
 remain available independently of model loading. A failed acknowledgement
 does not imply rollback; inspect the protected job or resume explicitly.
 
+Add `--compute-threads N` to extraction-job `start` or `resume` for a
+persistent numerical row team. The accepted range is 1 through 64, including
+the coordinator; one keeps the serial path. The admitted team spans the
+complete invocation, pending items, durable commits and optional
+materialization. Worker scratch and the process thread envelope are included
+in admission before private IO, and all workers join before progress returns.
+This route retains its byte-input, full-projection, sequential-prompt contract.
+
+Worker width is physical scheduling metadata. An authenticated resume may
+change it without changing the private recipe or renewing native work, mask
+visits or attempts. Nonserial completion adds only `compute_schedule`; the
+serial response shape is unchanged. Cancellation and the original deadline
+remain authoritative through metadata staging and final write/flush.
+
+Library callers select `NlpEngine::job_int4_extract_with_threads` for widths
+2 through 64, or keep the existing serial entry point.
+
 The library entry point is `NlpEngine::job_int4_extract`, with a sealed
 `Int4ExtractionJobPlanner`, charged resident model, caller-owned input,
 explicit `SourceJobRequest`, and `JobHostLimits`. It uses one physical
