@@ -335,7 +335,8 @@ fn provenance() -> Provenance {
     Provenance { scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "resolve-corpus",
         model_id: "fixture-only", source_revision: "fixture-only", source_root_sha256: "00".repeat(32),
         model_content_sha256: "01".repeat(32), candidate_format: "fixture-only".to_owned(),
-        quant_recipe: "fixture-only".to_owned(), group_width: 32, integer_kernel: "fixture-only", cluster_scope: "epoch_local" }
+        quant_recipe: "fixture-only".to_owned(), group_width: 32, integer_kernel: "fixture-only", cluster_scope: "epoch_local",
+        input_encoding: None }
 }
 #[test]
 fn footer_has_final_record_sequence_and_never_claims_a_global_snapshot() {
@@ -586,4 +587,89 @@ fn terminal_cancellation_during_flush_cannot_return_success_or_retry_the_writer(
     assert_eq!(finish_completed(&mut completed).unwrap_err().cancellation(), Some(DecodeCancellationKind::User));
     assert_eq!(completed.writer.bytes, bytes);
     assert_eq!(completed.writer.flushes, 1);
+}
+
+fn encoding_planners(compact: bool, total_input: u64) -> (Arc<SourceTaskPlanner>, ResolutionPlanner) {
+    use crate::tokenizer::{pinned_controls, untrusted::SafeBpeLimits};
+    let registry = pinned_controls::pinned().unwrap();
+    let eos = registry.template_controls().entries().iter()
+        .find(|entry| entry.special && entry.surface == crate::template::IM_END).unwrap().id;
+    let source = SourceTaskPlanner::pinned(registry.template_controls(), eos).unwrap();
+    let resolver = ResolutionPlanner::pinned(registry.template_controls(), eos).unwrap();
+    if !compact { return (Arc::new(source), resolver); }
+    let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 8192, max_output_tokens: 8192,
+        max_pair_checks: 1 << 26, max_pair_bytes: 1 << 29 });
+    let complete = SafeBpeWorkLimits { max_input_bytes: total_input, max_output_tokens: 1 << 20,
+        max_pair_checks: 1 << 30, max_pair_bytes: 1 << 33 };
+    (Arc::new(source.with_map_document_encoding(policy.clone(), complete).unwrap()),
+        resolver.with_document_encoding(policy, complete).unwrap())
+}
+
+#[test]
+fn compact_corpus_workspace_is_additional_to_the_unchanged_native_and_transport_quote() {
+    let quote = quote(&task(), transport()).unwrap();
+    let (byte, byte_resolver) = encoding_planners(false, 1 << 20);
+    assert_eq!(encoding_requirements(quote, &byte, &byte_resolver).unwrap(), quote);
+    let (compact, resolver) = encoding_planners(true, 1 << 20);
+    let extra = compact.map_document_encoding_workspace_bytes().unwrap()
+        + resolver.document_encoding_workspace_bytes().unwrap();
+    let admitted = encoding_requirements(quote, &compact, &resolver).unwrap();
+    assert_eq!(admitted.retained_bytes, quote.retained_bytes + extra);
+    assert_eq!(admitted.total_bytes().unwrap(), quote.total_bytes().unwrap() + extra);
+    assert_eq!(admitted.native, quote.native);
+    assert_eq!(admitted.input_payload_bytes, quote.input_payload_bytes);
+    let mut overflow = quote; overflow.retained_bytes = u64::MAX;
+    assert!(encoding_requirements(overflow, &compact, &resolver).is_err());
+}
+
+#[test]
+fn compact_epochs_get_fresh_counters_but_chunk_reconstruction_cannot_renew_them() {
+    let (base, _) = encoding_planners(true, 5);
+    let first = source_snapshot(&base).unwrap();
+    let second = source_snapshot(&base).unwrap();
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert_eq!(first.template_digest(), second.template_digest());
+    first.source_encoder().encode_with_control("Smith", 8192, 8192, &mut || None).unwrap();
+    assert_eq!(first.map_document_encoding_work().unwrap().unwrap().input_bytes(), 5);
+    assert!(first.source_encoder().encode_with_control("Smith", 8192, 8192, &mut || None).is_err());
+    assert_eq!(base.map_document_encoding_work().unwrap().unwrap().input_bytes(), 0);
+    assert_eq!(second.map_document_encoding_work().unwrap().unwrap().input_bytes(), 0);
+    second.source_encoder().encode_with_control("Smith", 8192, 8192, &mut || None).unwrap();
+    let (byte, _) = encoding_planners(false, 5);
+    assert!(Arc::ptr_eq(&byte, &source_snapshot(&byte).unwrap()));
+}
+
+#[test]
+fn compact_epoch_and_terminal_provenance_name_both_independent_phase_allowances() {
+    let (source, resolver) = encoding_planners(true, 1 << 20);
+    let configured = provenance().with_encoding(&source, &resolver);
+    let value = serde_json::to_value(&configured).unwrap();
+    let encoding = &value["input_encoding"];
+    assert_eq!(encoding["scope"], "separate_ner_snapshot_and_resolution_graph_allowances_per_epoch");
+    assert_eq!(encoding["ner"]["policy"], serde_json::to_value(source.document_encoding()).unwrap());
+    assert_eq!(encoding["resolution"]["policy"], serde_json::to_value(resolver.document_encoding()).unwrap());
+    assert_eq!(encoding["ner"]["complete_work_limits"],
+        serde_json::to_value(source.map_document_encoding_limits().unwrap()).unwrap());
+    assert_eq!(encoding["resolution"]["complete_work_limits"],
+        serde_json::to_value(resolver.document_encoding_limits().unwrap()).unwrap());
+    let footer = footer_bytes(&configured, &Int4EntityCorpusSummary::default(), FOOTER_BYTES).unwrap();
+    assert_eq!(events(&footer)[0]["provenance"]["input_encoding"], *encoding);
+    let (byte, resolver) = encoding_planners(false, 1 << 20);
+    let bytes = serde_json::to_value(provenance().with_encoding(&byte, &resolver)).unwrap();
+    assert!(bytes.get("input_encoding").is_none());
+}
+
+#[test]
+fn compact_resolver_epochs_share_tables_without_sharing_work_counters() {
+    let (_, resolver) = encoding_planners(true, 1 << 20);
+    let resolver = Arc::new(resolver);
+    let first = resolution_snapshot(&resolver).unwrap();
+    let second = resolution_snapshot(&resolver).unwrap();
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert_eq!(first.template_digest(), second.template_digest());
+    assert_eq!(first.document_encoding_work().unwrap(), Some(crate::tokenizer::untrusted::SafeBpeWork::default()));
+    assert_eq!(second.document_encoding_work().unwrap(), Some(crate::tokenizer::untrusted::SafeBpeWork::default()));
+    let (_, byte) = encoding_planners(false, 1 << 20);
+    let byte = Arc::new(byte);
+    assert!(Arc::ptr_eq(&byte, &resolution_snapshot(&byte).unwrap()));
 }

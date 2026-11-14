@@ -7,7 +7,7 @@
 //! before pair scoring receives the remainder of the same corpus allowance.
 //! Intermediate mentions or partial clusters are never successful output.
 
-use std::{error::Error, fmt, mem::size_of, sync::Arc};
+use std::{cell::RefCell, error::Error, fmt, mem::size_of, sync::Arc};
 use serde::Serialize;
 use crate::{
     batch::source::SourceMaskBudget,
@@ -148,6 +148,7 @@ pub fn prepare_int4_entities<C: DecodeStepControl>(documents: Vec<EntityDocument
     -> Result<PreparedInt4EntityCorpus, Int4EntityError> {
     resolve::checkpoint(control)?;
     validate(&config, &source, &source_identity, &resolution_identity, model)?;
+    encoding_workspace_bytes(&source, &resolver)?;
     // Validate the complete fixed graph/scorer policy even for an empty corpus.
     let empty = ResolutionPlan::prepare(&[], config.resolution, config.graph, control)?;
     resolver.prepare_int4(&empty, &resolution_identity, config.scoring, model, control)?;
@@ -216,6 +217,12 @@ impl PreparedInt4EntityCorpus {
     pub fn resolution_identity(&self) -> &ExecutionIdentity { &self.resolution_identity }
     pub fn config(&self) -> &Int4EntityConfig { &self.config }
     pub fn group_width(&self) -> usize { self.model.group_width() }
+    /// Temporary tokenizer storage additional to retained source/graph plans.
+    /// The NER snapshot and its derived pair graph have separate explicit
+    /// cumulative work allowances; neither is renewed for a chunk or pair.
+    pub fn input_encoding_workspace_bytes(&self) -> Result<u64, Int4EntityError> {
+        encoding_workspace_bytes(&self.source, &self.resolver)
+    }
     /// Actual retained Vec/String capacities. Planners/configuration, temporary
     /// grammars, expanded mentions and the graph are separate host reservations.
     pub fn retained_input_bytes(&self) -> Result<u64, Int4EntityError> {
@@ -583,16 +590,32 @@ fn chunk_text(source: &str, span: VerifiedSourceSpan, byte_start: usize, scalar_
 fn partition<'s, C: DecodeStepControl>(text: &'s str, source: &SourceTaskPlanner, limits: ChunkLimits, control: &mut C)
     -> Result<ChunkPlan<'s>, Int4EntityError> {
     let mut cancelled = None;
-    let result = ChunkPlan::build_with_checkpoints(text, limits, |part| {
-        source.source_encoder().encode(part, limits.max_chunk_bytes, limits.max_chunk_bytes)
-            .map(|document| document.total_token_count()).map_err(|_| MapReduceError::Tokenizer)
-    }, || {
-        if let Some(cause) = control.prefill_checkpoint(0) {
-            cancelled = Some(cause); Err(MapReduceError::Cancelled)
-        } else { Ok(()) }
-    });
+    let mut encoding_error = None;
+    let result = {
+        let control = RefCell::new(&mut *control);
+        ChunkPlan::build_with_checkpoints(text, limits, |part| {
+            source.source_encoder().encode_with_control(part, limits.max_chunk_bytes, limits.max_chunk_bytes,
+                &mut || control.borrow_mut().prefill_checkpoint(0))
+                .map(|document| document.total_token_count()).map_err(|error| {
+                    encoding_error = Some(error); MapReduceError::Tokenizer
+                })
+        }, || {
+            if let Some(cause) = control.borrow_mut().prefill_checkpoint(0) {
+                cancelled = Some(cause); Err(MapReduceError::Cancelled)
+            } else { Ok(()) }
+        })
+    };
     if let Some(cause) = cancelled { return Err(ResolveError::Cancelled(cause).into()); }
+    if let Some(error) = encoding_error { return Err(Int4SourceError::from(error).into()); }
     result.map_err(partition_error)
+}
+/// Shared by direct snapshots and resident epoch hosts before source access.
+/// The quote is deliberately additive even though the two phases are serial.
+pub(crate) fn encoding_workspace_bytes(source: &SourceTaskPlanner, resolver: &ResolutionPlanner)
+    -> Result<u64, Int4EntityError> {
+    let source = source.map_document_encoding_workspace_bytes().map_err(Int4SourceError::from)?;
+    let resolution = resolver.document_encoding_workspace_bytes().map_err(Int4ResolveError::from)?;
+    source.checked_add(resolution).ok_or(Int4EntityError::WorkBudget)
 }
 fn partition_error(error: MapReduceError) -> Int4EntityError {
     match error {

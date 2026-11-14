@@ -17,6 +17,7 @@ use crate::{
     native_engine::{decode::DecodeCancellationKind, portable_int8::ProjectionWork,
         strict_int4::projection::Int4ProjectionExecutor},
     tasks::source_planning::SourceTaskPlanner,
+    tokenizer::untrusted::{SafeBpeWorkLimits, UntrustedEncoding},
     validation::grounded_fields::GroundingBudget,
 };
 
@@ -239,6 +240,19 @@ struct Provenance {
     group_width: usize,
     integer_kernel: &'static str,
     cluster_scope: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<EncodingProvenance>,
+}
+#[derive(Clone, Serialize)]
+struct EncodingPhase {
+    policy: UntrustedEncoding,
+    complete_work_limits: Option<SafeBpeWorkLimits>,
+}
+#[derive(Clone, Serialize)]
+struct EncodingProvenance {
+    scope: &'static str,
+    ner: EncodingPhase,
+    resolution: EncodingPhase,
 }
 impl Provenance {
     fn new(model: &Int4ModelIdentity, identity: &ExecutionIdentity, kernel: PackedInt4Kernel) -> Self {
@@ -247,7 +261,21 @@ impl Provenance {
             source_root_sha256: model.source_root_sha256().to_owned(),
             model_content_sha256: identity.logical_model_digest.to_hex(),
             candidate_format: identity.artifact_format.clone(), quant_recipe: identity.quant_recipe.clone(),
-            group_width: model.group_width(), integer_kernel: kernel.kind().id(), cluster_scope: "epoch_local" }
+            group_width: model.group_width(), integer_kernel: kernel.kind().id(), cluster_scope: "epoch_local",
+            input_encoding: None }
+    }
+    fn with_encoding(mut self, source: &SourceTaskPlanner, resolver: &ResolutionPlanner) -> Self {
+        if source.document_encoding() != &UntrustedEncoding::ByteFallback
+            || resolver.document_encoding() != &UntrustedEncoding::ByteFallback {
+            self.input_encoding = Some(EncodingProvenance {
+                scope: "separate_ner_snapshot_and_resolution_graph_allowances_per_epoch",
+                ner: EncodingPhase { policy: source.document_encoding().clone(),
+                    complete_work_limits: source.map_document_encoding_limits() },
+                resolution: EncodingPhase { policy: resolver.document_encoding().clone(),
+                    complete_work_limits: resolver.document_encoding_limits() },
+            });
+        }
+        self
     }
 }
 #[derive(Serialize)]
@@ -367,7 +395,8 @@ impl NlpEngine {
             .map_err(|_| HostedError::ModelIdentity)?;
         constrained_int4::check_model(&config.resolution_identity, model.model_identity())
             .map_err(|_| HostedError::ModelIdentity)?;
-        let required = config.requirements(model.model_identity().group_width())?;
+        let required = encoding_requirements(config.requirements(model.model_identity().group_width())?,
+            &source, &resolver)?;
         let run = config.native.run;
         let deadline = Instant::now().checked_add(run.max_elapsed).ok_or(HostedError::Limits("deadline arithmetic"))?;
         let terminal_cancellation = cancellation.clone();
@@ -391,7 +420,8 @@ impl NlpEngine {
                 model.model_identity(), control).map_err(entities::execution_error)?;
             drop(empty);
             let output = Arc::new(output.commit()?);
-            let provenance = Provenance::new(model.model_identity(), &config.resolution_identity, kernel);
+            let provenance = Provenance::new(model.model_identity(), &config.resolution_identity, kernel)
+                .with_encoding(&input.value.source, &input.value.resolver);
             let mut processor = Processor { model: &model.inner.loaded.value, engine: None, projection: None, cohort_native: None,
                 source: input.value.source.clone(), resolver: input.value.resolver.clone(),
                 vocabulary: input.value.vocabulary.clone(), config, required, kernel,
@@ -448,7 +478,7 @@ impl NlpEngine {
         constrained_int4::check_model(&config.resolution_identity, model.model_identity())
             .map_err(|_| HostedError::ModelIdentity)?;
         let width = model.model_identity().group_width();
-        let required = config.requirements(width)?;
+        let required = encoding_requirements(config.requirements(width)?, &source, &resolver)?;
         sum(&[required.total_bytes()?, int4_task_team_workspace_bytes(compute_threads, width)?])?;
         let run = config.native.run;
         let deadline = Instant::now().checked_add(run.max_elapsed).ok_or(HostedError::Limits("deadline arithmetic"))?;
@@ -469,7 +499,8 @@ impl NlpEngine {
                     weights.identity(), control).map_err(entities::execution_error)?;
                 drop(empty);
                 let output = Arc::new(output.commit()?);
-                let provenance = Provenance::new(weights.identity(), &config.resolution_identity, kernel);
+                let provenance = Provenance::new(weights.identity(), &config.resolution_identity, kernel)
+                    .with_encoding(&input.value.source, &input.value.resolver);
                 let mut processor = Processor { model: weights, engine: None, projection: Some(team), cohort_native: None,
                     source: input.value.source.clone(), resolver: input.value.resolver.clone(),
                     vocabulary: input.value.vocabulary.clone(), config, required, kernel,
@@ -506,6 +537,35 @@ impl NlpEngine {
             })?;
         completed.map_err(Int4EntityCorpusError::Transport)
     }
+}
+
+fn encoding_requirements(mut required: Int4EntityCorpusHostRequirements,
+    source: &SourceTaskPlanner, resolver: &ResolutionPlanner)
+    -> Result<Int4EntityCorpusHostRequirements, HostedError> {
+    required.retained_bytes = sum(&[required.retained_bytes,
+        crate::corpus::entities_int4::encoding_workspace_bytes(source, resolver)
+            .map_err(entities::execution_error)?])?;
+    required.total_bytes()?;
+    Ok(required)
+}
+
+/// A new accepted epoch owns one explicitly admitted source-encoding ledger.
+/// The consumed prepared snapshot retains it through every chunk rebuild;
+/// the stream never forks again for an individual chunk or execution retry.
+fn source_snapshot(source: &Arc<SourceTaskPlanner>) -> Result<Arc<SourceTaskPlanner>, HostedError> {
+    if source.document_encoding() == &UntrustedEncoding::ByteFallback {
+        return Ok(Arc::clone(source));
+    }
+    source.fork_map_document_operation().map(Arc::new).map_err(|error|
+        entities::execution_error(Int4EntityError::Source(error.into())))
+}
+
+fn resolution_snapshot(resolver: &Arc<ResolutionPlanner>) -> Result<Arc<ResolutionPlanner>, HostedError> {
+    if resolver.document_encoding() == &UntrustedEncoding::ByteFallback {
+        return Ok(Arc::clone(resolver));
+    }
+    resolver.fork_document_operation().map(Arc::new)
+        .map_err(|error| super::resolution_error(error.into()))
 }
 
 fn check_team_schedule(schedule: Option<Int4EntitySchedule>) -> Result<(), HostedError> {
@@ -622,8 +682,8 @@ impl EntitySnapshotProcessor for Processor<'_, '_> {
         let remaining = self.ledger.begin().map_err(entities::execution_error)?;
         let empty = documents.is_empty();
         let task = narrowed_task(&self.config.task, remaining, empty).map_err(entities::execution_error)?;
-        let prepared = prepare_int4_entities(documents, self.source.clone(), self.config.source_identity.clone(),
-            self.resolver.clone(), self.config.resolution_identity.clone(), task, self.model.identity(), control)
+        let prepared = prepare_int4_entities(documents, source_snapshot(&self.source)?, self.config.source_identity.clone(),
+            resolution_snapshot(&self.resolver)?, self.config.resolution_identity.clone(), task, self.model.identity(), control)
             .map_err(entities::execution_error)?;
         let expected = entities::Expected { width: self.model.identity().group_width(), documents: prepared.document_count(),
             chunks: prepared.chunk_count(), ner_work: prepared.ner_reserved_work(), masks: prepared.reserved_mask_visits(),

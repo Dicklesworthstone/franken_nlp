@@ -81,7 +81,8 @@ impl NlpEngine {
         if prepared.group_width() != width { return Err(HostedError::ModelIdentity); }
         let (required, scratch_bytes) = requirements(prepared.config(), prepared.required_ner_context_tokens(),
             native, preparation_reserve_bytes, graph_reserve_bytes, width)?;
-        let input_bytes = sum(&[prepared.retained_input_bytes().map_err(execution_error)?, preparation_reserve_bytes])?;
+        let input_bytes = sum(&[prepared.retained_input_bytes().map_err(execution_error)?, preparation_reserve_bytes,
+            prepared.input_encoding_workspace_bytes().map_err(execution_error)?])?;
         let temporary_bytes = temporary_bytes(prepared.config(), graph_reserve_bytes)?;
         let output_bytes = prepared.config().max_result_bytes as u64;
         let expected = Expected { width, documents: prepared.document_count(), chunks: prepared.chunk_count(),
@@ -154,7 +155,8 @@ impl NlpEngine {
         let (required, scratch_bytes) = requirements(prepared.config(), prepared.required_ner_context_tokens(),
             native, preparation_reserve_bytes, graph_reserve_bytes, width)?;
         sum(&[scratch_bytes, int4_task_team_workspace_bytes(compute_threads, width)?])?;
-        let input_bytes = sum(&[prepared.retained_input_bytes().map_err(execution_error)?, preparation_reserve_bytes])?;
+        let input_bytes = sum(&[prepared.retained_input_bytes().map_err(execution_error)?, preparation_reserve_bytes,
+            prepared.input_encoding_workspace_bytes().map_err(execution_error)?])?;
         let temporary_bytes = temporary_bytes(prepared.config(), graph_reserve_bytes)?;
         let output_bytes = prepared.config().max_result_bytes as u64;
         let expected = Expected { width, documents: prepared.document_count(), chunks: prepared.chunk_count(),
@@ -228,7 +230,8 @@ impl NlpEngine {
             preparation_reserve_bytes, graph_reserve_bytes, width)?;
         let required = Int4EntityCohortHostRequirements::for_config(prepared.config(), native,
             preparation_reserve_bytes, graph_reserve_bytes, schedule, width)?;
-        let input_bytes = sum(&[prepared.retained_input_bytes().map_err(execution_error)?, required.preparation_bytes])?;
+        let input_bytes = sum(&[prepared.retained_input_bytes().map_err(execution_error)?, required.preparation_bytes,
+            prepared.input_encoding_workspace_bytes().map_err(execution_error)?])?;
         let expected = Expected { width, documents: prepared.document_count(), chunks: prepared.chunk_count(),
             ner_work: prepared.ner_reserved_work(), masks: prepared.reserved_mask_visits(),
             max_model_work: prepared.config().max_model_work, chunked: prepared.config().chunks.is_some() };

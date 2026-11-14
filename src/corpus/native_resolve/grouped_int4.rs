@@ -164,6 +164,7 @@ impl ResolutionPlanner {
 }
 
 impl PreparedInt4Resolution<'_, '_, '_> {
+    pub fn input_encoding_work(&self) -> Option<SafeBpeWork> { self.inner.input_encoding_work() }
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn execution_identities(&self) -> impl ExactSizeIterator<Item = &ExecutionIdentity> {
         self.inner.pairs.iter().map(|pair| &pair.identity)

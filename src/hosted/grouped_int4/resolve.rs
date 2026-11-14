@@ -106,7 +106,8 @@ impl NlpEngine {
         let (required, scratch_bytes) = requirements(&config, width,
             planner.tokenizer_digest(), planner.template_digest())?;
         let input_bytes = sum(&[super::super::resolve::input_payload(&documents, config.graph)?,
-            config.preparation_reserve_bytes])?;
+            config.preparation_reserve_bytes, planner.document_encoding_workspace_bytes()
+                .map_err(|error| resolution_error(error.into()))?])?;
         let run = config.native.run;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, input_bytes)?,
@@ -196,7 +197,8 @@ impl NlpEngine {
             planner.tokenizer_digest(), planner.template_digest())?;
         sum(&[scratch_bytes, int4_task_team_workspace_bytes(compute_threads, width)?])?;
         let input_bytes = sum(&[super::super::resolve::input_payload(&documents, config.graph)?,
-            config.preparation_reserve_bytes])?;
+            config.preparation_reserve_bytes, planner.document_encoding_workspace_bytes()
+                .map_err(|error| resolution_error(error.into()))?])?;
         let run = config.native.run;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, input_bytes)?,
@@ -287,7 +289,8 @@ impl NlpEngine {
         let required = Int4ResolveCohortHostRequirements::for_config(config.scoring, config.native,
             config.preparation_reserve_bytes, config.graph_reserve_bytes, cohort_pairs, width)?;
         let input_bytes = sum(&[super::super::resolve::input_payload(&documents, config.graph)?,
-            required.preparation_bytes])?;
+            required.preparation_bytes, planner.document_encoding_workspace_bytes()
+                .map_err(|error| resolution_error(error.into()))?])?;
         let run = config.native.run;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, input_bytes)?,

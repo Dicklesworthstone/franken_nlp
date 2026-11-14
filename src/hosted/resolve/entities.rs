@@ -27,7 +27,8 @@ impl NlpEngine {
             preparation_reserve_bytes, graph_reserve_bytes, required.kv_bytes)?;
         let scratch_bytes = crate::hosted::scored::scoring_scratch(sum(&[required.rope_bytes,
             required.scratch_payload_bound, native.allocator_reserve_bytes])?, prepared.prefill_limits())?;
-        let bytes = sum(&[prepared.retained_input_bytes().map_err(execution_error)?, preparation_reserve_bytes])?;
+        let bytes = sum(&[prepared.retained_input_bytes().map_err(execution_error)?, preparation_reserve_bytes,
+            prepared.resolution_encoding_workspace_bytes().map_err(execution_error)?])?;
         let temporary_bytes = temporary_bytes(prepared.config(), graph_reserve_bytes)?;
         let output_bytes = prepared.config().max_result_bytes as u64;
         let empty = prepared.document_count() == 0;

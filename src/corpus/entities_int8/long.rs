@@ -131,6 +131,10 @@ impl PreparedInt8DocumentEntityCorpus {
     pub fn required_ner_context_tokens(&self) -> usize { self.maximum_positions }
     pub fn source_identity(&self) -> &ExecutionIdentity { &self.source_identity }
     pub fn resolution_identity(&self) -> &ExecutionIdentity { &self.resolution_identity }
+    /// Additional temporary storage when the shared pair compiler uses compact input.
+    pub fn resolution_encoding_workspace_bytes(&self) -> Result<u64, Int8EntityError> {
+        Ok(self.resolver.document_encoding_workspace_bytes().map_err(Int8ResolveError::from)?)
+    }
     pub fn config(&self) -> &Int8DocumentEntityConfig { &self.config }
     /// Actual retained input/witness capacities only. Planners, compiler scratch,
     /// expanded mentions, graph plans and allocator overhead are host commitments.

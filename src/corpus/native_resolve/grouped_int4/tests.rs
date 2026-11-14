@@ -464,3 +464,37 @@ fn public_result_keeps_uncalibrated_warnings_without_private_model_keys() {
         assert!(!public.contains(absent));
     }
 }
+
+#[test]
+fn compact_records_keep_complete_two_order_native_schedules_for_each_group_geometry() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding};
+    let controls = pinned_controls::pinned().unwrap();
+    let eos = controls.template_controls().entries().iter()
+        .find(|entry| entry.special && entry.surface == IM_END).unwrap().id;
+    let planner = ResolutionPlanner::pinned(controls.template_controls(), eos).unwrap()
+        .with_document_encoding(UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+            max_input_bytes: 8192, max_output_tokens: 8192, max_pair_checks: 1 << 26, max_pair_bytes: 1 << 29,
+        }), SafeBpeWorkLimits { max_input_bytes: 1 << 20, max_output_tokens: 1 << 20,
+            max_pair_checks: 1 << 30, max_pair_bytes: 1 << 33 }).unwrap();
+    let documents = docs(); let graph = graph(&documents);
+    let mut id = identity(); id.template_digest = planner.template_digest();
+    for width in [16, 32] {
+        let compact = planner.compile_int4(&graph, &id, limits(), width, &mut Continue).unwrap();
+        let byte = prepared(&graph, width);
+        assert_eq!(compact.head_count(), byte.head_count());
+        assert!(compact.planned_work().forward_positions < byte.planned_work().forward_positions);
+        assert_eq!(compact.planned_work().projected_logits, byte.planned_work().projected_logits);
+        assert!(compact.input_encoding_work().unwrap().input_bytes() > 0);
+        let expected = compact.planned_work();
+        let ids = admitted(&compact);
+        let mut visits = 0;
+        let run = compact.execute_heads(&ids, &mut Continue, |_, _, _, schedule, _| {
+            visits += 1;
+            Ok(synthetic(schedule, width, PairDecision::Same))
+        }).unwrap();
+        assert_eq!(visits, 2 * graph.candidate_count());
+        assert_eq!(run.model_work, expected);
+        assert_eq!(run.rewound_positions, visits as u64 * 2);
+        assert_eq!(run.result.clusters.len(), 1);
+    }
+}

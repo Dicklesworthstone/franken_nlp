@@ -61,7 +61,8 @@ impl NlpEngine {
         // Check geometry now, reserve lazily only if the graph needs scoring.
         let scratch_bytes = super::scored::scoring_scratch(sum(&[required.rope_bytes,
             required.scratch_payload_bound, config.native.allocator_reserve_bytes])?, prefill)?;
-        let bytes = sum(&[input_payload(&documents, config.graph)?, config.preparation_reserve_bytes])?;
+        let bytes = sum(&[input_payload(&documents, config.graph)?, config.preparation_reserve_bytes,
+            planner.document_encoding_workspace_bytes().map_err(|error| HostedError::Resolution(error.into()))?])?;
         let run = config.native.run;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,

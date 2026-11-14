@@ -25,7 +25,8 @@ impl NlpEngine {
             preparation_reserve_bytes, graph_reserve_bytes, required.kv_bytes)?;
         let scratch_bytes = crate::hosted::scored::scoring_scratch(sum(&[required.rope_bytes,
             required.scratch_payload_bound, native.allocator_reserve_bytes])?, prepared.prefill_limits())?;
-        let bytes = sum(&[prepared.retained_input_bytes().map_err(execution_error)?, preparation_reserve_bytes])?;
+        let bytes = sum(&[prepared.retained_input_bytes().map_err(execution_error)?, preparation_reserve_bytes,
+            prepared.resolution_encoding_workspace_bytes().map_err(execution_error)?])?;
         // Same peak as one short NER task, plus the complete expanded graph.
         // No retained array of chunk grammars, native transcripts or map values.
         let temporary_bytes = temporary_bytes(config, graph_reserve_bytes)?;

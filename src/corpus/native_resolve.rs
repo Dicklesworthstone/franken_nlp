@@ -3,7 +3,7 @@
 //! Reuses CandidateScorer and one EagerPrefixSession/KV branch at a time.
 //! There is no model loader, alternate numerics implementation or new runtime.
 
-use std::{error::Error, fmt, mem::size_of};
+use std::{error::Error, fmt, mem::size_of, sync::{Arc, Mutex}};
 use serde::Serialize;
 use crate::{
     canonjson,
@@ -13,12 +13,13 @@ use crate::{
         candidate_scoring::{EagerPrefixSession, PrefixBudget, PrefixScoringError, PrefixWork, PREFIX_EXECUTION_VERSION}},
         kv::KV_BYTES_PER_TOKEN, lmhead::{NANBEIGE_VOCAB_SIZE,
             scoring::{CandidateScorer, CandidateScores, ScoringError, ScoringLimits, ScoringMode}}},
-    tasks::{BuiltInTask, extract::SourceDocumentEncoder, ir::{Candidate, DecodeStrategy, DependencyScope,
+    tasks::{BuiltInTask, extract::{ExtractError, SourceDocument, SourceDocumentEncoder}, ir::{Candidate, DecodeStrategy, DependencyScope,
         FinitePostcondition, GrammarReference, PlanContext, PromptSegment, PromptSegmentKind,
         ScoreSpace, TaskBudget, TaskIR, TaskPlan, TokenSequence}},
     template::{Conversation, Message, MessageRole, RenderOptions, TemplateBuilder, ToolFormat,
         IM_START, IM_END, THINK_START, THINK_END},
-    tokenizer::{bpe::EncodeOptions, specials::TemplateControlIds, embedded::{EmbeddedTokenizer,
+    tokenizer::{bpe::EncodeOptions, specials::TemplateControlIds,
+        untrusted::{SafeBpeWork, SafeBpeWorkLimits, UntrustedEncoding}, embedded::{EmbeddedTokenizer,
         PINNED_TOKENIZER_MODEL_BYTES, PINNED_ADDED_TOKENS_BYTES, PINNED_TOKENIZER_CONFIG_BYTES, PINNED_SPECIAL_TOKENS_MAP_BYTES}},
 };
 use super::resolve::{self, AnchoredMention, BidirectionalScores, PairLogProbabilities,
@@ -99,11 +100,15 @@ impl From<PrefixScoringError> for NativeResolveError { fn from(e: PrefixScoringE
 
 pub struct ResolutionPlanner {
     encoder: SourceDocumentEncoder,
-    fragments: Vec<Vec<u32>>,
-    candidates: Vec<Candidate>,
-    scorer: CandidateScorer,
+    fragments: Arc<Vec<Vec<u32>>>,
+    candidates: Arc<Vec<Candidate>>,
+    scorer: Arc<CandidateScorer>,
     eos: u32,
     template_digest: Sha256Digest,
+    byte_template_digest: Sha256Digest,
+    document_encoding: UntrustedEncoding,
+    encoding_limits: Option<SafeBpeWorkLimits>,
+    encoding_work: Option<Mutex<SafeBpeWork>>,
 }
 impl ResolutionPlanner {
     pub fn pinned(controls: &TemplateControlIds, eos: u32) -> Result<Self, NativeResolveError> {
@@ -136,7 +141,63 @@ impl ResolutionPlanner {
             PINNED_TOKENIZER_CONFIG_BYTES, PINNED_SPECIAL_TOKENS_MAP_BYTES].map(Sha256Digest::of_bytes);
         let template_digest = digest(&(RESOLVE_PROMPT_VERSION, &fragments, &candidates, census, eos, assets))?;
         let encoder = SourceDocumentEncoder::pinned(controls).map_err(|_| NativeResolveError::Contract)?;
-        Ok(Self { encoder, fragments, candidates, scorer, eos, template_digest })
+        Ok(Self { encoder, fragments: Arc::new(fragments), candidates: Arc::new(candidates),
+            scorer: Arc::new(scorer), eos, template_digest,
+            byte_template_digest: template_digest, document_encoding: UntrustedEncoding::ByteFallback,
+            encoding_limits: None, encoding_work: None })
+    }
+    /// Admit compact, control-free mention records for one complete pair graph.
+    /// Per-record limits bound temporary tokenizer storage; the complete ledger
+    /// spans every pair, preliminary admission and hosted reconstruction using
+    /// this planner. Reversed presentations reuse the same encoded records.
+    /// Policy and both limit envelopes bind the template identity before planning.
+    /// A different snapshot requires its own explicitly admitted operation.
+    pub fn with_document_encoding(mut self, policy: UntrustedEncoding, complete: SafeBpeWorkLimits)
+        -> Result<Self, NativeResolveError> {
+        if !matches!(policy, UntrustedEncoding::SafeBpeV1(_)) {
+            return Err(NativeResolveError::Contract);
+        }
+        policy.validate().and_then(|()| complete.validate()).map_err(|_| NativeResolveError::Contract)?;
+        self.template_digest = digest(&("resolve-untrusted-encoding-v1",
+            self.byte_template_digest, &policy, complete))?;
+        self.document_encoding = policy;
+        self.encoding_limits = Some(complete);
+        self.encoding_work = Some(Mutex::new(SafeBpeWork::default()));
+        Ok(self)
+    }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { &self.document_encoding }
+    pub fn document_encoding_limits(&self) -> Option<SafeBpeWorkLimits> { self.encoding_limits }
+    pub fn document_encoding_work(&self) -> Result<Option<SafeBpeWork>, NativeResolveError> {
+        self.encoding_work.as_ref().map(|work| work.try_lock().map(|work| *work)
+            .map_err(|_| NativeResolveError::Contract)).transpose()
+    }
+    /// Fresh epoch authority shares only immutable tokenizer/prompt tables.
+    /// Reconstruction must keep the original planner instead of forking again.
+    pub(crate) fn fork_document_operation(&self) -> Result<Self, NativeResolveError> {
+        self.document_encoding_workspace_bytes()?;
+        Ok(Self {
+            encoder: self.encoder.fork_map_document_operation().map_err(|_| NativeResolveError::Contract)?,
+            fragments: Arc::clone(&self.fragments), candidates: Arc::clone(&self.candidates),
+            scorer: Arc::clone(&self.scorer), eos: self.eos, template_digest: self.template_digest,
+            byte_template_digest: self.byte_template_digest, document_encoding: self.document_encoding.clone(),
+            encoding_limits: self.encoding_limits,
+            encoding_work: self.encoding_limits.map(|_| Mutex::new(SafeBpeWork::default())),
+        })
+    }
+    /// Additional workspace, independent of retained graph/prompt reservations.
+    /// A new snapshot owns new counters; immutable tokenizer tables are shared.
+    pub fn document_encoding_workspace_bytes(&self) -> Result<u64, NativeResolveError> {
+        match (&self.document_encoding, self.encoding_limits, self.encoding_work.as_ref()) {
+            (UntrustedEncoding::ByteFallback, None, None) => Ok(0),
+            (UntrustedEncoding::SafeBpeV1(call), Some(complete), Some(_)) => {
+                complete.validate().map_err(|_| NativeResolveError::Contract)?;
+                if size_of::<Self>() + 2 * size_of::<usize>() > 512 {
+                    return Err(NativeResolveError::Contract);
+                }
+                call.requirements().map(|quote| quote.workspace_bytes + 512).map_err(|_| NativeResolveError::Contract)
+            },
+            _ => Err(NativeResolveError::Contract),
+        }
     }
     pub fn template_digest(&self) -> Sha256Digest { self.template_digest }
     pub fn tokenizer_digest(&self) -> Sha256Digest { Sha256Digest::of_bytes(PINNED_TOKENIZER_MODEL_BYTES) }
@@ -154,6 +215,7 @@ impl ResolutionPlanner {
         identity: &ExecutionIdentity, limits: NativeResolveLimits, control: &mut C, profile: NumericsProfile)
         -> Result<PreparedNativeResolution<'a, 'p, 's>, NativeResolveError> {
         limits.validate()?; resolve::checkpoint(control)?;
+        self.document_encoding_workspace_bytes()?;
         identity.validate().map_err(|_| NativeResolveError::Contract)?;
         if identity.task_spec != RESOLVE_VERSION || identity.template_digest != self.template_digest
             || identity.tokenizer_digest != self.tokenizer_digest() || identity.numerics_profile != profile
@@ -166,13 +228,23 @@ impl ResolutionPlanner {
         let mut pairs = resolve::reserved(plan.candidate_count())?;
         let (mut total_tokens, mut maximum_context) = (0_usize, 0_usize);
         let mut work = BatchWork::default();
+        // Serialize the whole preparation without waiting. A re-entrant or
+        // overlapping caller cannot borrow or renew this snapshot's allowance.
+        let mut retained = self.encoding_work.as_ref().map(|work| work.try_lock()
+            .map_err(|_| NativeResolveError::Contract)).transpose()?;
+        let mut byte_work = SafeBpeWork::default();
+        let encoding_work = match retained.as_mut() {
+            Some(work) => &mut **work,
+            None => &mut byte_work,
+        };
+        let before = *encoding_work;
         for ticket in plan.pairs() {
             resolve::checkpoint(control)?;
             let first = mention_record(ticket.left(), plan.options().context_scalars)?;
             let second = mention_record(ticket.right(), plan.options().context_scalars)?;
             let cap = limits.per_head.max_input_tokens as usize;
-            let a = self.encoder.encode(&first, cap, cap).map_err(|_| NativeResolveError::WorkBudget)?;
-            let b = self.encoder.encode(&second, cap, cap).map_err(|_| NativeResolveError::WorkBudget)?;
+            let a = self.encode_record(&first, cap, encoding_work, control)?;
+            let b = self.encode_record(&second, cap, encoding_work, control)?;
             let forward = self.task(a.token_ids(), b.token_ids(), &context, limits)?;
             let reverse = self.task(b.token_ids(), a.token_ids(), &context, limits)?;
             let prompts = [flatten(forward.ir())?, flatten(reverse.ir())?];
@@ -193,7 +265,36 @@ impl ResolutionPlanner {
             pairs.push(NativePair { ticket, prompts, identity: bound, head_work });
         }
         resolve::checkpoint(control)?;
-        Ok(PreparedNativeResolution { planner: self, plan, pairs, limits, work, maximum_context })
+        let encoding_work = encoding_work.checked_sub(before).ok_or(NativeResolveError::Accounting)?;
+        Ok(PreparedNativeResolution { planner: self, plan, pairs, limits, work, maximum_context, encoding_work })
+    }
+    fn encode_record<C: DecodeStepControl>(&self, text: &str, token_cap: usize,
+        used: &mut SafeBpeWork, control: &mut C) -> Result<SourceDocument, NativeResolveError> {
+        resolve::checkpoint(control)?;
+        let policy = match (&self.document_encoding, self.encoding_limits) {
+            (UntrustedEncoding::ByteFallback, None) => UntrustedEncoding::ByteFallback,
+            (UntrustedEncoding::SafeBpeV1(call), Some(complete)) =>
+                UntrustedEncoding::SafeBpeV1(complete.remaining_call(*used, *call)
+                    .map_err(|_| NativeResolveError::WorkBudget)?),
+            _ => return Err(NativeResolveError::Contract),
+        };
+        let byte_cap = match &policy {
+            UntrustedEncoding::ByteFallback => token_cap,
+            UntrustedEncoding::SafeBpeV1(call) => call.max_input_bytes,
+        };
+        let mut work = SafeBpeWork::default();
+        let result = self.encoder.encode_with_policy_and_work(text, &policy, byte_cap, token_cap,
+            &mut work, &mut || control.prefill_checkpoint(0));
+        // Charge even an unsuccessful call. Neither another pair nor the
+        // reverse presentation may restart this graph's tokenizer allowance.
+        *used = used.checked_add(work).ok_or(NativeResolveError::WorkBudget)?;
+        let result = result.map_err(|error| match error {
+            ExtractError::Decode(crate::native_engine::constrained::JsonDecodeError::Cancelled(cause)) =>
+                NativeResolveError::Resolution(ResolveError::Cancelled(cause)),
+            _ => NativeResolveError::WorkBudget,
+        })?;
+        resolve::checkpoint(control)?;
+        Ok(result)
     }
     fn task(&self, a: &[u32], b: &[u32], context: &PlanContext<'_>, limits: NativeResolveLimits)
         -> Result<TaskPlan, NativeResolveError> {
@@ -207,7 +308,7 @@ impl ResolutionPlanner {
             PromptSegment::new(PromptSegmentKind::TaskInstruction, self.fragments[2].clone()),
             PromptSegment::new(PromptSegmentKind::Document, b.to_vec()),
             PromptSegment::new(PromptSegmentKind::AnswerScaffold, self.fragments[3].clone())];
-        let ir = TaskIR::new(segments, DecodeStrategy::PrefillOnly { candidates: self.candidates.clone() }, GrammarReference::none(),
+        let ir = TaskIR::new(segments, DecodeStrategy::PrefillOnly { candidates: self.candidates.as_ref().clone() }, GrammarReference::none(),
             None, vec![FinitePostcondition::CandidateSetComplete, FinitePostcondition::OutputWithinBudget],
             limits.per_head, DependencyScope::ItemLocal).map_err(|_| NativeResolveError::Contract)?;
         TaskPlan::new(BuiltInTask::Resolve.spec(), context, ir).map_err(|_| NativeResolveError::Contract)
@@ -262,7 +363,7 @@ struct NativePair<'p, 's> {
 }
 pub struct PreparedNativeResolution<'a, 'p, 's> {
     planner: &'a ResolutionPlanner, plan: &'p ResolutionPlan<'s>, pairs: Vec<NativePair<'p, 's>>,
-    limits: NativeResolveLimits, work: BatchWork, maximum_context: usize,
+    limits: NativeResolveLimits, work: BatchWork, maximum_context: usize, encoding_work: SafeBpeWork,
 }
 #[derive(Serialize)]
 pub struct NativeResolutionResult {
@@ -271,6 +372,9 @@ pub struct NativeResolutionResult {
     pub result: ResolutionResult,
 }
 impl PreparedNativeResolution<'_, '_, '_> {
+    pub fn input_encoding_work(&self) -> Option<SafeBpeWork> {
+        matches!(self.planner.document_encoding, UntrustedEncoding::SafeBpeV1(_)).then_some(self.encoding_work)
+    }
     pub fn planned_work(&self) -> BatchWork { self.work }
     pub fn pair_count(&self) -> usize { self.pairs.len() }
     pub fn required_context_tokens(&self) -> usize { self.maximum_context }

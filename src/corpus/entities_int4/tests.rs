@@ -522,3 +522,109 @@ fn mask_and_grounding_configuration_axes_are_bounded_even_without_input() {
 }
 
 mod cohorts;
+
+fn compact_source(total_input: u64) -> SourceTaskPlanner {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding};
+    let registry = pinned_controls::pinned().unwrap();
+    let eos = registry.template_controls().entries().iter()
+        .find(|entry| entry.special && entry.surface == crate::template::IM_END).unwrap().id;
+    SourceTaskPlanner::pinned(registry.template_controls(), eos).unwrap()
+        .with_map_document_encoding(UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+            max_input_bytes: 8192, max_output_tokens: 8192,
+            max_pair_checks: 1 << 26, max_pair_bytes: 1 << 29,
+        }), SafeBpeWorkLimits { max_input_bytes: total_input, max_output_tokens: 1 << 20,
+            max_pair_checks: 1 << 32, max_pair_bytes: 1 << 35 }).unwrap()
+}
+fn compact_identity(planner: &SourceTaskPlanner) -> ExecutionIdentity {
+    let mut id = identity(32); id.template_digest = *planner.template_digest(); id
+}
+
+#[test]
+fn compact_entity_partition_prices_actual_tokens_and_preserves_original_coordinates() {
+    let text = "é Alice Smith met the London research team.\r\n".repeat(8);
+    let mut c = config();
+    c.chunks = Some(ChunkLimits { max_input_bytes: 8192, max_chunk_bytes: 1024, max_chunk_tokens: 64,
+        context_tokens: 8192, reserved_tokens: 64, max_chunks: 256, max_tokenizer_calls: 4096 });
+    let byte = prepared(&[("original", &text)], &c, 32);
+    let source = compact_source(1 << 20); let id = compact_identity(&source);
+    let compact = compile_inputs(documents(&[("original", &text)]), &source, &id, &c, 32, &mut Continue).unwrap();
+    assert!(compact.chunks < byte.chunks);
+    let after_preparation = source.map_document_encoding_work().unwrap().unwrap();
+    assert!(after_preparation.input_bytes() > text.len());
+    let mut byte_cursor = 0; let mut scalar_cursor = 0;
+    for chunk in &compact.inputs[0].chunks {
+        let part = chunk_text(&text, chunk.span, byte_cursor, scalar_cursor).unwrap();
+        let rebuilt = source_plan(part, &source, &id, &c, 32, &mut Continue).unwrap();
+        check_rebuilt(chunk, &rebuilt).unwrap();
+        byte_cursor = chunk.span.byte_end; scalar_cursor = chunk.span.scalar_end;
+    }
+    assert_eq!(byte_cursor, text.len());
+    assert_eq!(scalar_cursor, text.chars().count());
+    let after_reconstruction = source.map_document_encoding_work().unwrap().unwrap();
+    assert_eq!(after_reconstruction.input_bytes() - after_preparation.input_bytes(), text.len());
+    let mapped = maps(compact, &c, 32, Some("Smith"));
+    for document in &mapped.documents {
+        assert_eq!(document.text, text);
+        for mention in &document.mentions {
+            assert_eq!(document.text.get(mention.span.byte_start..mention.span.byte_end),
+                Some(mention.surface.as_str()));
+        }
+    }
+}
+
+#[test]
+fn compact_entity_work_is_shared_by_every_document_and_reconstruction() {
+    let source = compact_source(5); let id = compact_identity(&source); let c = config();
+    let compiled = compile_inputs(documents(&[("a", "Smith")]), &source, &id, &c, 32, &mut Continue).unwrap();
+    assert_eq!(source.map_document_encoding_work().unwrap().unwrap().input_bytes(), 5);
+    // Reconstruction belongs to the original snapshot allowance, so it cannot
+    // restart merely because the first model-free preparation succeeded.
+    assert!(source_plan("Smith", &source, &id, &c, 32, &mut Continue).is_err());
+    assert_eq!(compiled.inputs[0].document.text, "Smith");
+    let source = compact_source(5); let id = compact_identity(&source);
+    assert!(compile_inputs(documents(&[("a", "Smith"), ("b", "Smith")]),
+        &source, &id, &c, 32, &mut Continue).is_err());
+    assert_eq!(source.map_document_encoding_work().unwrap().unwrap().input_bytes(), 5);
+}
+
+#[test]
+fn compact_entity_planning_requires_explicit_composed_work_authority() {
+    let registry = pinned_controls::pinned().unwrap();
+    let eos = registry.template_controls().entries().iter()
+        .find(|entry| entry.special && entry.surface == crate::template::IM_END).unwrap().id;
+    let compact = compact_source(1 << 20);
+    let one_request = SourceTaskPlanner::pinned(registry.template_controls(), eos).unwrap()
+        .with_document_encoding(compact.document_encoding().clone()).unwrap();
+    assert!(compile_inputs(documents(&[("a", "Smith")]), &one_request,
+        &compact_identity(&one_request), &chunked(), 32, &mut Continue).is_err());
+}
+
+#[test]
+fn compact_entity_partition_preserves_cancellation_from_inside_tokenization() {
+    struct Stop { calls: usize }
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.calls += 1; (self.calls >= 12).then_some(DecodeCancellationKind::CostBudget)
+        }
+    }
+    let source = compact_source(1 << 20);
+    let limits = ChunkLimits { max_input_bytes: 8192, max_chunk_bytes: 1024, max_chunk_tokens: 128,
+        context_tokens: 8192, reserved_tokens: 64, max_chunks: 256, max_tokenizer_calls: 4096 };
+    let error = partition(&"Smith and the ordinary research team ".repeat(32), &source, limits,
+        &mut Stop { calls: 0 }).err().unwrap();
+    assert_eq!(error.cancellation(), Some(DecodeCancellationKind::CostBudget));
+}
+
+#[test]
+fn entity_encoding_workspace_charges_both_phase_policies() {
+    let registry = pinned_controls::pinned().unwrap();
+    let eos = registry.template_controls().entries().iter()
+        .find(|entry| entry.special && entry.surface == crate::template::IM_END).unwrap().id;
+    let resolver = ResolutionPlanner::pinned(registry.template_controls(), eos).unwrap();
+    assert_eq!(encoding_workspace_bytes(source(), &resolver).unwrap(), 0);
+    let source = compact_source(1 << 20);
+    let resolver = resolver.with_document_encoding(source.document_encoding().clone(),
+        source.map_document_encoding_limits().unwrap()).unwrap();
+    assert_eq!(encoding_workspace_bytes(&source, &resolver).unwrap(),
+        source.map_document_encoding_workspace_bytes().unwrap() + resolver.document_encoding_workspace_bytes().unwrap());
+}
