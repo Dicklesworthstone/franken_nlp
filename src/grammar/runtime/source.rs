@@ -19,7 +19,7 @@ pub struct SourceRuntimeLimits {
 #[derive(Clone, Debug)]
 pub(super) struct SourceBinding {
     pub(super) language: SourceLanguage,
-    limits: SourceRuntimeLimits,
+    pub(super) limits: SourceRuntimeLimits,
 }
 
 impl JsonProgram {

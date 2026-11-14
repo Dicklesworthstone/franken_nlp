@@ -33,12 +33,12 @@ pub(super) fn validate(p: &GenerationOptions, limits: GenerationLimits) -> Resul
 /// Counts + compact legal IDs/logits + the largest pinned Nucleus allocation.
 /// Stack top-k arrays have an additional conservative allowance. This is a
 /// payload bound, not allocator/RSS measurement or a no-hot-allocation claim.
-pub(super) fn workspace_bytes() -> Result<u64, GenerationError> {
+pub(in crate::native_engine) fn workspace_bytes() -> Result<u64, GenerationError> {
     let per_row = 2 * size_of::<u32>() + size_of::<f32>() + size_of::<NucleusToken>();
     (NANBEIGE_VOCAB_SIZE as u64).checked_mul(per_row as u64)
         .and_then(|n| n.checked_add(4096)).ok_or(GenerationError::Limit("sampler accounting"))
 }
-pub(super) struct Workspace { counts: Vec<u32>, ids: Vec<u32>, logits: Vec<f32> }
+pub(in crate::native_engine) struct Workspace { counts: Vec<u32>, ids: Vec<u32>, logits: Vec<f32> }
 impl Workspace {
     pub fn new(prompt: &[u32]) -> Result<Self, GenerationError> {
         let mut counts = reserved(NANBEIGE_VOCAB_SIZE)?; counts.resize(NANBEIGE_VOCAB_SIZE, 0_u32);
@@ -53,6 +53,25 @@ impl Workspace {
     pub fn select(&mut self, raw: &[f32], p: &GenerationOptions, key: StableRequestKey,
         sample_index: u64, step: u64) -> Result<u32, GenerationError> {
         check_logits(raw)?;
+        self.select_processed(raw, p, key, sample_index, step, |_| true)
+    }
+    /// Exact external legality intersects the existing ordered processor
+    /// stack before temperature, top-k and nucleus selection. The native
+    /// owner checks its full vocabulary; a smaller finite width is admitted
+    /// only for the closed decoder's synthetic differential fixtures.
+    pub(in crate::native_engine) fn select_legal<F: Fn(u32) -> bool>(
+        &mut self, raw: &[f32], p: &GenerationOptions, key: StableRequestKey,
+        sample_index: u64, step: u64, legal: F,
+    ) -> Result<u32, GenerationError> {
+        if raw.is_empty() || raw.len() > self.counts.len() || raw.iter().any(|value| !value.is_finite()) {
+            return Err(GenerationError::InvalidLogits);
+        }
+        self.select_processed(raw, p, key, sample_index, step, legal)
+    }
+    fn select_processed<F: Fn(u32) -> bool>(
+        &mut self, raw: &[f32], p: &GenerationOptions, key: StableRequestKey,
+        sample_index: u64, step: u64, legal: F,
+    ) -> Result<u32, GenerationError> {
         self.ids.clear(); self.logits.clear();
         let repetition = f64::from(p.repetition_penalty_milli) / 1000.0;
         let temperature = match &p.sampling { GenerationSampling::Greedy => 1.0,
@@ -61,7 +80,7 @@ impl Workspace {
             let id = index as u32;
             // Static bans cannot be overridden by bias. EOS is additionally
             // absent until the required non-EOS output count has committed.
-            if p.banned_token_ids.binary_search(&id).is_ok()
+            if !legal(id) || p.banned_token_ids.binary_search(&id).is_ok()
                 || (step < p.min_new_tokens as u64 && p.eos_token_ids.binary_search(&id).is_ok()) { continue; }
             let count = self.counts[index];
             let mut value = f64::from(raw_logit);
@@ -143,5 +162,28 @@ mod tests {
         let mut p = GenerationOptions::greedy(1, 100, 0); p.banned_token_ids = vec![1];
         let mut logits = vec![0.0; NANBEIGE_VOCAB_SIZE]; logits[1] = f32::NAN;
         assert!(Workspace::new(&[0]).unwrap().select(&logits, &p, StableRequestKey::from_canonical_digest([0; 32]), 0, 0).is_err());
+    }
+    #[test]
+    fn universal_external_legality_preserves_the_existing_processor_stack() {
+        let mut p = GenerationOptions::greedy(4, 100, 0);
+        p.banned_token_ids = vec![1]; p.min_new_tokens = 1;
+        p.repetition_penalty_milli = 1500; p.presence_penalty_milli = 200;
+        p.frequency_penalty_milli = 100; p.logit_bias_milli.insert(3, 750);
+        let mut logits = vec![-100.0; NANBEIGE_VOCAB_SIZE];
+        logits[..5].copy_from_slice(&[4.0, 100.0, 3.0, 2.0, 1.0]);
+        let key = StableRequestKey::from_canonical_digest([7; 32]);
+        for sampling in [GenerationSampling::Greedy, GenerationSampling::Seeded {
+            effective_seed: [11; 32], temperature_milli: 700, top_k: Some(3), top_p_ppm: 900_000,
+        }, GenerationSampling::Seeded {
+            effective_seed: [11; 32], temperature_milli: 1200, top_k: None, top_p_ppm: 800_000,
+        }] {
+            p.sampling = sampling;
+            for step in 0..3 {
+                let mut ordinary = Workspace::new(&[2, 2]).unwrap();
+                let mut masked = Workspace::new(&[2, 2]).unwrap();
+                assert_eq!(ordinary.select(&logits, &p, key, 8, step).unwrap(),
+                    masked.select_legal(&logits, &p, key, 8, step, |_| true).unwrap());
+            }
+        }
     }
 }

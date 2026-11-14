@@ -28,6 +28,10 @@ pub const INT4_JSON_EXECUTION: &str = "grouped-int4-constrained-json-final-prefi
 pub mod cohort;
 pub mod sparse;
 mod prefill;
+mod sampled;
+pub use sampled::{JsonSamplingOptions, INT4_JSON_SAMPLED_EXECUTION, JSON_SAMPLER_VERSION,
+    decode_json_int4_sampled, json_sampling_workspace_bytes};
+pub(crate) use sampled::decode_json_int4_sampled_with;
 
 /// Group dots, MACs and attention pairs are additional to JSON/mask work.
 /// The KV ceiling prices the engine's complete resident capacity.
@@ -285,11 +289,34 @@ fn select(logits: &[f32], mask: &DenseTokenMask, accepting: bool, options: &Json
     best.map(|(id, _)| id).ok_or_else(|| JsonDecodeError::NoLegalToken.into())
 }
 
+/// Static token selection is the only difference between the existing greedy
+/// path and the explicitly seeded full-head path. Both retain one grammar,
+/// one causal driver, scored EOS and the same independent final validation.
+trait Selection {
+    fn select(&mut self, logits: &[f32], mask: &DenseTokenMask, accepting: bool,
+        options: &JsonDecodeOptions, step: usize) -> Result<u32, Int4JsonError>;
+    fn execution(&self) -> &'static str;
+}
+struct Greedy;
+impl Selection for Greedy {
+    fn select(&mut self, logits: &[f32], mask: &DenseTokenMask, accepting: bool,
+        options: &JsonDecodeOptions, _: usize) -> Result<u32, Int4JsonError> {
+        select(logits, mask, accepting, options)
+    }
+    fn execution(&self) -> &'static str { INT4_JSON_EXECUTION }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drive<V, D, T, E, F>(group_width: usize, prompt: &[u32], program: &JsonProgram, vocabulary: &V,
     options: &JsonDecodeOptions, budget: Int4JsonBudget, driver: &mut D, finalize: F) -> Result<T, E>
 where V: Vocabulary, D: Driver, E: From<Int4JsonError>, F: FnOnce(Int4JsonRun) -> Result<T, E> {
-    let result = run(group_width, prompt, program, vocabulary, options, budget, driver).map_err(E::from).and_then(|run| {
+    drive_selected(group_width, prompt, program, vocabulary, options, budget, driver, &mut Greedy, finalize)
+}
+#[allow(clippy::too_many_arguments)]
+fn drive_selected<V, D, S, T, E, F>(group_width: usize, prompt: &[u32], program: &JsonProgram, vocabulary: &V,
+    options: &JsonDecodeOptions, budget: Int4JsonBudget, driver: &mut D, selection: &mut S, finalize: F) -> Result<T, E>
+where V: Vocabulary, D: Driver, S: Selection, E: From<Int4JsonError>, F: FnOnce(Int4JsonRun) -> Result<T, E> {
+    let result = run(group_width, prompt, program, vocabulary, options, budget, driver, selection).map_err(E::from).and_then(|run| {
         let next_token = run.output.token_ids.len();
         let output = finalize(run)?;
         if let Some(cause) = driver.control().checkpoint(next_token) {
@@ -300,8 +327,9 @@ where V: Vocabulary, D: Driver, E: From<Int4JsonError>, F: FnOnce(Int4JsonRun) -
     if result.is_err() { driver.abort(); }
     result
 }
-fn run<V: Vocabulary, D: Driver>(group_width: usize, prompt: &[u32], program: &JsonProgram, vocabulary: &V,
-    options: &JsonDecodeOptions, budget: Int4JsonBudget, driver: &mut D) -> Result<Int4JsonRun, Int4JsonError> {
+#[allow(clippy::too_many_arguments)]
+fn run<V: Vocabulary, D: Driver, S: Selection>(group_width: usize, prompt: &[u32], program: &JsonProgram, vocabulary: &V,
+    options: &JsonDecodeOptions, budget: Int4JsonBudget, driver: &mut D, selection: &mut S) -> Result<Int4JsonRun, Int4JsonError> {
     preflight(group_width, prompt, vocabulary, options, budget)?;
     let mut tokens = Vec::new();
     tokens.try_reserve_exact(options.max_new_tokens).map_err(|_| JsonDecodeError::AllocationRefused)?;
@@ -320,7 +348,7 @@ fn run<V: Vocabulary, D: Driver>(group_width: usize, prompt: &[u32], program: &J
             .filter(|&count| count <= budget.json.max_total_mask_node_visits)
             .ok_or(JsonDecodeError::BudgetExceeded("mask work"))?;
         let mask = vocabulary.mask(&state, budget.json.mask_limits, driver.control(), step)?;
-        let selected = select(&logits, &mask, state.is_accepting(), options)?;
+        let selected = selection.select(&logits, &mask, state.is_accepting(), options, step)?;
         if let Some(cause) = driver.control().checkpoint(step) { return Err(JsonDecodeError::Cancelled(cause).into()); }
         tokens.push(selected);
         if selected == options.eos_token_id {
@@ -331,7 +359,7 @@ fn run<V: Vocabulary, D: Driver>(group_width: usize, prompt: &[u32], program: &J
                 return Err(Int4JsonError::WorkMismatch);
             }
             if let Some(cause) = driver.control().checkpoint(step) { return Err(JsonDecodeError::Cancelled(cause).into()); }
-            return Ok(Int4JsonRun { schema_version: 1, execution: INT4_JSON_EXECUTION.to_owned(), group_width, model_work,
+            return Ok(Int4JsonRun { schema_version: 1, execution: selection.execution().to_owned(), group_width, model_work,
                 output: JsonDecodeOutput { schema_version: 1, numerics_profile: STRICT_INT4_PROFILE.to_owned(),
                     token_ids: tokens, json, forward_positions: positions, projected_logits: projected,
                     mask_node_visit_charge: charged } });

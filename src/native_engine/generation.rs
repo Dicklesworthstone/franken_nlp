@@ -25,7 +25,7 @@ pub mod grouped_int4;
 pub mod quantized;
 mod config;
 mod cursor;
-mod policy;
+pub(super) mod policy;
 #[cfg(test)] mod tests;
 
 pub const GENERATION_VERSION: &str = "eager-addressed-generation-v1";

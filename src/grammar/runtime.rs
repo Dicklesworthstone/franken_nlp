@@ -137,6 +137,89 @@ impl JsonProgram {
     #[must_use]
     pub fn node_count(&self) -> usize { self.nodes.len() }
 
+    /// Private addressed-sampling authority over the ACTUAL compiled program,
+    /// including Unicode rules, source bytes and independent verification
+    /// limits. This never accepts a caller's declared schema digest in place
+    /// of executable authority, allocates, or exposes a content fingerprint.
+    pub(crate) fn sampling_digest(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        fn number(hash: &mut Sha256, value: usize) { hash.update((value as u64).to_be_bytes()); }
+        fn bytes(hash: &mut Sha256, value: &[u8]) { number(hash, value.len()); hash.update(value); }
+        fn lengths(hash: &mut Sha256, rules: &LengthRules) {
+            hash.update([u8::from(rules.max_chars.is_some())]);
+            number(hash, rules.max_chars.unwrap_or(0));
+            number(hash, rules.properties.len());
+            for (key, child) in &rules.properties { bytes(hash, key.as_bytes()); lengths(hash, child); }
+            hash.update([u8::from(rules.items.is_some())]);
+            if let Some(items) = &rules.items { lengths(hash, items); }
+        }
+        // Node literals below bind exact scalar values without allocating
+        // decimal/string renderings. Retain declaration distinctions and
+        // source annotations that affect independent final validation too.
+        fn declaration(hash: &mut Sha256, schema: &SchemaNode) {
+            match schema {
+                SchemaNode::Object { properties, required } => {
+                    hash.update([0]); number(hash, properties.len()); number(hash, required.len());
+                    for (key, child) in properties {
+                        bytes(hash, key.as_bytes()); hash.update([u8::from(required.contains(key))]);
+                        declaration(hash, child);
+                    }
+                }
+                SchemaNode::Array { items, max_items } => {
+                    hash.update([1]); number(hash, *max_items); declaration(hash, items);
+                }
+                SchemaNode::String { max_bytes, allowed, source } => {
+                    hash.update([2, u8::from(allowed.is_some()), u8::from(*source == SourceAnnotation::Verbatim)]);
+                    number(hash, *max_bytes);
+                }
+                SchemaNode::Number { integer, allowed } => hash.update([3, u8::from(*integer), u8::from(allowed.is_some())]),
+                SchemaNode::Boolean { allowed } => hash.update([4, u8::from(allowed.is_some())]),
+                SchemaNode::Null { allowed } => hash.update([5, u8::from(allowed.is_some())]),
+            }
+        }
+        let mut hash = Sha256::new();
+        bytes(&mut hash, b"fnlp-compiled-json-sampling-authority-v1");
+        bytes(&mut hash, JSON_RUNTIME_VERSION.as_bytes());
+        bytes(&mut hash, self.version().as_bytes());
+        number(&mut hash, self.root); number(&mut hash, self.max_output_bytes);
+        declaration(&mut hash, self.schema.root()); lengths(&mut hash, &self.lengths);
+        number(&mut hash, self.nodes.len());
+        for node in &self.nodes {
+            number(&mut hash, node.minimum);
+            match &node.kind {
+                Kind::Object(properties) => {
+                    hash.update([0]); number(&mut hash, properties.len());
+                    for property in properties {
+                        bytes(&mut hash, &property.key); number(&mut hash, property.child);
+                        hash.update([u8::from(property.required)]);
+                    }
+                }
+                Kind::Array { child, maximum } => {
+                    hash.update([1]); number(&mut hash, *child); number(&mut hash, *maximum);
+                }
+                Kind::String { max_bytes, max_chars, verbatim } => {
+                    hash.update([2, u8::from(*verbatim)]); number(&mut hash, *max_bytes); number(&mut hash, *max_chars);
+                }
+                Kind::Number { integer } => hash.update([3, u8::from(*integer)]),
+                Kind::Literals(literals) => {
+                    hash.update([4]); number(&mut hash, literals.len());
+                    for literal in literals { bytes(&mut hash, literal); }
+                }
+            }
+        }
+        hash.update([u8::from(self.source.is_some())]);
+        if let Some(source) = &self.source {
+            bytes(&mut hash, super::source_index::SOURCE_LANGUAGE_VERSION.as_bytes());
+            bytes(&mut hash, source.language.source().as_bytes());
+            let limits = source.limits;
+            number(&mut hash, limits.index.max_source_bytes); number(&mut hash, limits.index.max_index_bytes);
+            hash.update(limits.index.max_build_steps.to_be_bytes()); number(&mut hash, limits.index.max_matches);
+            number(&mut hash, limits.verification.max_fields); number(&mut hash, limits.verification.max_matches);
+            hash.update(limits.verification.max_scan_steps.to_be_bytes());
+        }
+        hash.finalize().into()
+    }
+
     /// Independent whole-value verification, never acceptance by parser state.
     /// The existing validator receives schema data, not transitions or masks.
     pub fn validate_json(&self, text: &str) -> Result<(), SchemaError> {
