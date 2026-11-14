@@ -163,6 +163,7 @@ impl SourceDocumentEncoder {
             token_count: document.ids().len(), input_bytes: document.bytes().len(),
             document, context_documents: Vec::new(), control_digest: self.control_digest,
             encoding: policy.clone(),
+            encoding_work: matches!(policy, UntrustedEncoding::SafeBpeV1(_)).then_some(*work),
         };
         Ok((bind(schema), bind(source)))
     }
@@ -185,7 +186,8 @@ impl SourceDocumentEncoder {
         if document.ids().len() > max_tokens { return Err(ExtractError::Contract("source token budget exceeded")); }
         encoding_checkpoint(checkpoint)?;
         Ok(SourceDocument { token_count: document.ids().len(), input_bytes: document.bytes().len(),
-            document, context_documents: Vec::new(), control_digest: self.control_digest, encoding: policy.clone() })
+            document, context_documents: Vec::new(), control_digest: self.control_digest, encoding: policy.clone(),
+            encoding_work: matches!(policy, UntrustedEncoding::SafeBpeV1(_)).then_some(*work) })
     }
 
     fn encode_part<F: FnMut() -> Option<DecodeCancellationKind>>(&self, part: &str,
@@ -251,10 +253,13 @@ impl SourceDocumentEncoder {
             _ => return Err(ExtractError::Contract("source encoding ledger policy mismatch")),
         };
         let mut work = SafeBpeWork::default();
-        let result = self.encode_with_context_budget(text, contexts, max_bytes, max_tokens,
+        let mut result = self.encode_with_context_budget(text, contexts, max_bytes, max_tokens,
             &policy, &mut work, checkpoint);
         if let Some(used) = &mut retained {
             **used = (**used).checked_add(work).ok_or(ExtractError::AllocationRefused)?;
+            if let Ok(document) = &mut result {
+                document.encoding_work = Some(**used);
+            }
         }
         result
     }
@@ -289,7 +294,8 @@ impl SourceDocumentEncoder {
         if token_count > max_tokens { return Err(ExtractError::Contract("source token budget exceeded")); }
         encoding_checkpoint(checkpoint)?;
         Ok(SourceDocument { document, context_documents, token_count, input_bytes: total,
-            control_digest: self.control_digest, encoding: self.encoding.clone() })
+            control_digest: self.control_digest, encoding: self.encoding.clone(),
+            encoding_work: matches!(policy, UntrustedEncoding::SafeBpeV1(_)).then_some(*work) })
     }
 }
 
@@ -308,6 +314,9 @@ pub struct SourceDocument {
     input_bytes: usize,
     control_digest: Sha256Digest,
     encoding: UntrustedEncoding,
+    /// Immutable work observed only after successful encoding and its final
+    /// cancellation checkpoint. A caller cannot supply or replace this receipt.
+    encoding_work: Option<SafeBpeWork>,
 }
 impl SourceDocument {
     /// Evidence text only; questions and metadata are deliberately excluded.
@@ -322,6 +331,11 @@ impl SourceDocument {
     /// Exact aggregate source and auxiliary-context bytes, before tokenization.
     pub fn total_input_bytes(&self) -> usize { self.input_bytes }
     pub fn document_encoding(&self) -> &UntrustedEncoding { &self.encoding }
+    /// Exact compact-tokenizer work for the admitted operation through this
+    /// document: all schema/context/source segments and any retained probes.
+    /// Byte-fallback has no compact work receipt. This is a copied snapshot,
+    /// never a renewable budget or a caller-authored accounting assertion.
+    pub fn input_encoding_work(&self) -> Option<SafeBpeWork> { self.encoding_work }
     pub(super) fn verify_task(&self, ir: &TaskIR, controls: &TemplateControlIds) -> Result<(), ExtractError> {
         let mut docs = ir.prompt_segments().iter().filter(|s| s.kind() == PromptSegmentKind::Document);
         for expected in self.context_token_ids().chain(std::iter::once(self.token_ids())) {
