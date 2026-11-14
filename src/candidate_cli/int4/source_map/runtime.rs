@@ -451,8 +451,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         }
         Prepared::SummarySynthesis(mut config, expected) => {
             config.native.run.max_elapsed = remaining()?;
+            let planner = Arc::new(planner);
             if common.compute.threads > 1 {
-                let planner = Arc::new(planner);
                 let result = engine.synthesize_int4_source_summary_with_threads(&model, text,
                     Arc::clone(&planner), Arc::new(vocabulary), config, common.kernel,
                     common.compute.threads, cancellation).map_err(execution_error)?;
@@ -463,27 +463,28 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
                     limits.max_result_bytes + 4096, output, &publication)
             } else if let Some(chunks) = limits.cohort_chunks {
                 let result = engine.synthesize_int4_source_summary_cohorts(&model, text,
-                    Arc::new(planner), Arc::new(vocabulary), config, common.kernel, cancellation)
+                    Arc::clone(&planner), Arc::new(vocabulary), config, common.kernel, cancellation)
                     .map_err(execution_error)?;
                 expected.verify_completed_with_control(&result.result().document, &mut DeadlineControl { started, deadline })
                     .map_err(verification_error)?;
                 remaining()?;
                 publish_discovery_cohort(&provenance, &result.result().document,
-                    &result.result().discovery_cohorts, chunks, limits.max_result_bytes + 4096, output, &publication)
+                    &result.result().discovery_cohorts, chunks, encoding::report(&planner)?.as_ref(),
+                    limits.max_result_bytes + 4096, output, &publication)
             } else {
-                let result = engine.synthesize_int4_source_summary(&model, text, Arc::new(planner), Arc::new(vocabulary),
+                let result = engine.synthesize_int4_source_summary(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
                     config, common.kernel, cancellation).map_err(execution_error)?;
                 expected.verify_completed_with_control(result.result(), &mut DeadlineControl { started, deadline })
                     .map_err(verification_error)?;
                 remaining()?;
-                publish_checked(&Response { provenance: &provenance, output: result.result() },
+                publish_map(&provenance, result.result(), None, &planner,
                     limits.max_result_bytes + 4096, output, &publication)
             }
         }
         Prepared::QuestionSynthesis(mut config, expected) => {
             config.native.run.max_elapsed = remaining()?;
+            let planner = Arc::new(planner);
             if common.compute.threads > 1 {
-                let planner = Arc::new(planner);
                 let result = engine.synthesize_int4_document_answer_with_threads(&model, text,
                     Arc::clone(&planner), Arc::new(vocabulary), config, common.kernel,
                     common.compute.threads, cancellation).map_err(execution_error)?;
@@ -494,27 +495,28 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
                     limits.max_result_bytes + 4096, output, &publication)
             } else if let Some(chunks) = limits.cohort_chunks {
                 let result = engine.synthesize_int4_document_answer_cohorts(&model, text,
-                    Arc::new(planner), Arc::new(vocabulary), config, common.kernel, cancellation)
+                    Arc::clone(&planner), Arc::new(vocabulary), config, common.kernel, cancellation)
                     .map_err(execution_error)?;
                 expected.verify_completed_with_control(&result.result().document, &mut DeadlineControl { started, deadline })
                     .map_err(verification_error)?;
                 remaining()?;
                 publish_discovery_cohort(&provenance, &result.result().document,
-                    &result.result().discovery_cohorts, chunks, limits.max_result_bytes + 4096, output, &publication)
+                    &result.result().discovery_cohorts, chunks, encoding::report(&planner)?.as_ref(),
+                    limits.max_result_bytes + 4096, output, &publication)
             } else {
-                let result = engine.synthesize_int4_document_answer(&model, text, Arc::new(planner), Arc::new(vocabulary),
+                let result = engine.synthesize_int4_document_answer(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
                     config, common.kernel, cancellation).map_err(execution_error)?;
                 expected.verify_completed_with_control(result.result(), &mut DeadlineControl { started, deadline })
                     .map_err(verification_error)?;
                 remaining()?;
-                publish_checked(&Response { provenance: &provenance, output: result.result() },
+                publish_map(&provenance, result.result(), None, &planner,
                     limits.max_result_bytes + 4096, output, &publication)
             }
         }
         Prepared::QuestionHierarchy(mut config, expected) => {
             config.native.run.max_elapsed = remaining()?;
+            let planner = Arc::new(planner);
             if common.compute.threads > 1 {
-                let planner = Arc::new(planner);
                 let result = engine.synthesize_int4_document_answer_hierarchy_with_threads(&model, text,
                     Arc::clone(&planner), Arc::new(vocabulary), config, expected.limits(), common.kernel,
                     common.compute.threads, cancellation).map_err(execution_error)?;
@@ -525,38 +527,40 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
                     limits.max_result_bytes + 4096, output, &publication)
             } else if let Some(schedule) = limits.hierarchy_cohorts {
                 let result = engine.synthesize_int4_document_answer_hierarchy_grouped(&model, text,
-                    Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), schedule, common.kernel, cancellation)
+                    Arc::clone(&planner), Arc::new(vocabulary), config, expected.limits(), schedule, common.kernel, cancellation)
                     .map_err(execution_error)?;
                 expected.verify_completed_with_control(&result.result().document, &mut DeadlineControl { started, deadline })
                     .map_err(verification_error)?;
                 remaining()?;
                 publish_hierarchy_cohorts(&provenance, &result.result().document,
                     result.result().discovery_cohorts.as_ref(), &result.result().hierarchy_cohorts,
-                    limits.cohort_chunks, schedule, limits.max_result_bytes + 4096, output, &publication)
+                    limits.cohort_chunks, schedule, encoding::report(&planner)?.as_ref(),
+                    limits.max_result_bytes + 4096, output, &publication)
             } else if let Some(chunks) = limits.cohort_chunks {
                 let result = engine.synthesize_int4_document_answer_hierarchy_cohorts(&model, text,
-                    Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), common.kernel, cancellation)
+                    Arc::clone(&planner), Arc::new(vocabulary), config, expected.limits(), common.kernel, cancellation)
                     .map_err(execution_error)?;
                 expected.verify_completed_with_control(&result.result().document, &mut DeadlineControl { started, deadline })
                     .map_err(verification_error)?;
                 remaining()?;
                 publish_discovery_cohort(&provenance, &result.result().document,
-                    &result.result().discovery_cohorts, chunks, limits.max_result_bytes + 4096, output, &publication)
+                    &result.result().discovery_cohorts, chunks, encoding::report(&planner)?.as_ref(),
+                    limits.max_result_bytes + 4096, output, &publication)
             } else {
                 let result = engine.synthesize_int4_document_answer_hierarchy(&model, text,
-                    Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), common.kernel, cancellation)
+                    Arc::clone(&planner), Arc::new(vocabulary), config, expected.limits(), common.kernel, cancellation)
                     .map_err(execution_error)?;
                 expected.verify_completed_with_control(result.result(), &mut DeadlineControl { started, deadline })
                     .map_err(verification_error)?;
                 remaining()?;
-                publish_checked(&Response { provenance: &provenance, output: result.result() },
+                publish_map(&provenance, result.result(), None, &planner,
                     limits.max_result_bytes + 4096, output, &publication)
             }
         }
         Prepared::SummaryHierarchy(mut config, expected) => {
             config.native.run.max_elapsed = remaining()?;
+            let planner = Arc::new(planner);
             if common.compute.threads > 1 {
-                let planner = Arc::new(planner);
                 let result = engine.synthesize_int4_source_summary_hierarchy_with_threads(&model, text,
                     Arc::clone(&planner), Arc::new(vocabulary), config, expected.limits(), common.kernel,
                     common.compute.threads, cancellation).map_err(execution_error)?;
@@ -567,31 +571,33 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
                     limits.max_result_bytes + 4096, output, &publication)
             } else if let Some(schedule) = limits.hierarchy_cohorts {
                 let result = engine.synthesize_int4_source_summary_hierarchy_grouped(&model, text,
-                    Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), schedule, common.kernel, cancellation)
+                    Arc::clone(&planner), Arc::new(vocabulary), config, expected.limits(), schedule, common.kernel, cancellation)
                     .map_err(execution_error)?;
                 expected.verify_completed_with_control(&result.result().document, &mut DeadlineControl { started, deadline })
                     .map_err(verification_error)?;
                 remaining()?;
                 publish_hierarchy_cohorts(&provenance, &result.result().document,
                     result.result().discovery_cohorts.as_ref(), &result.result().hierarchy_cohorts,
-                    limits.cohort_chunks, schedule, limits.max_result_bytes + 4096, output, &publication)
+                    limits.cohort_chunks, schedule, encoding::report(&planner)?.as_ref(),
+                    limits.max_result_bytes + 4096, output, &publication)
             } else if let Some(chunks) = limits.cohort_chunks {
                 let result = engine.synthesize_int4_source_summary_hierarchy_cohorts(&model, text,
-                    Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), common.kernel, cancellation)
+                    Arc::clone(&planner), Arc::new(vocabulary), config, expected.limits(), common.kernel, cancellation)
                     .map_err(execution_error)?;
                 expected.verify_completed_with_control(&result.result().document, &mut DeadlineControl { started, deadline })
                     .map_err(verification_error)?;
                 remaining()?;
                 publish_discovery_cohort(&provenance, &result.result().document,
-                    &result.result().discovery_cohorts, chunks, limits.max_result_bytes + 4096, output, &publication)
+                    &result.result().discovery_cohorts, chunks, encoding::report(&planner)?.as_ref(),
+                    limits.max_result_bytes + 4096, output, &publication)
             } else {
                 let result = engine.synthesize_int4_source_summary_hierarchy(&model, text,
-                    Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), common.kernel, cancellation)
+                    Arc::clone(&planner), Arc::new(vocabulary), config, expected.limits(), common.kernel, cancellation)
                     .map_err(execution_error)?;
                 expected.verify_completed_with_control(result.result(), &mut DeadlineControl { started, deadline })
                     .map_err(verification_error)?;
                 remaining()?;
-                publish_checked(&Response { provenance: &provenance, output: result.result() },
+                publish_map(&provenance, result.result(), None, &planner,
                     limits.max_result_bytes + 4096, output, &publication)
             }
         }
@@ -668,15 +674,19 @@ fn publish_team_map<T: Serialize>(provenance: &Provenance<'_>, document: &T,
     publish_checked(&compute::Response { response: &response, compute: Some(compute) },
         max_bytes, output, check)
 }
+#[allow(clippy::too_many_arguments)]
 fn publish_discovery_cohort<T: Serialize>(provenance: &Provenance<'_>, document: &T,
-    physical: &Int4SourceMapCohortStats, chunks: usize, max_bytes: usize, output: &mut impl Write,
+    physical: &Int4SourceMapCohortStats, chunks: usize, input_encoding: Option<&encoding::EncodingReport>,
+    max_bytes: usize, output: &mut impl Write,
     check: &impl Fn() -> Result<(), CandidateError>)
     -> Result<(), CandidateError> {
     // The semantic receipt retains every dependent pass. This separate ledger
     // covers discovery only; it cannot claim hierarchy groups ran in parallel.
-    publish_checked(&CohortResponse { response: Response { provenance, output: document },
-        cohort_schedule: CohortSchedule { execution: "cross_chunk_constrained_discovery_cohorts",
-            declared_max_chunks: chunks, physical } }, max_bytes, output, check)
+    publish_checked(&encoding::EncodedResponse {
+        response: CohortResponse { response: Response { provenance, output: document },
+            cohort_schedule: CohortSchedule { execution: "cross_chunk_constrained_discovery_cohorts",
+                declared_max_chunks: chunks, physical } }, input_encoding,
+    }, max_bytes, output, check)
 }
 #[derive(Serialize)]
 struct HierarchySchedule<'a> {
@@ -695,7 +705,8 @@ struct HierarchyResponse<'a, 'b, T: Serialize> {
 #[allow(clippy::too_many_arguments)]
 fn publish_hierarchy_cohorts<T: Serialize>(provenance: &Provenance<'_>, document: &T,
     discovery: Option<&Int4SourceMapCohortStats>, hierarchy: &Int4HierarchyCohortStats,
-    chunks: Option<usize>, schedule: Int4HierarchyCohortSchedule, max_bytes: usize, output: &mut impl Write,
+    chunks: Option<usize>, schedule: Int4HierarchyCohortSchedule,
+    input_encoding: Option<&encoding::EncodingReport>, max_bytes: usize, output: &mut impl Write,
     check: &impl Fn() -> Result<(), CandidateError>)
     -> Result<(), CandidateError> {
     if schedule.discovery_cohorts != chunks.is_some() || discovery.is_some() != chunks.is_some() {
@@ -703,9 +714,11 @@ fn publish_hierarchy_cohorts<T: Serialize>(provenance: &Provenance<'_>, document
     }
     let cohort_schedule = discovery.zip(chunks).map(|(physical, declared_max_chunks)| CohortSchedule {
         execution: "cross_chunk_constrained_discovery_cohorts", declared_max_chunks, physical });
-    publish_checked(&HierarchyResponse { response: Response { provenance, output: document }, cohort_schedule,
-        hierarchy_cohort_schedule: HierarchySchedule { execution: "within_level_constrained_hierarchy_cohorts",
-            declared_max_groups: schedule.max_groups, physical: hierarchy } }, max_bytes, output, check)
+    publish_checked(&encoding::EncodedResponse {
+        response: HierarchyResponse { response: Response { provenance, output: document }, cohort_schedule,
+            hierarchy_cohort_schedule: HierarchySchedule { execution: "within_level_constrained_hierarchy_cohorts",
+                declared_max_groups: schedule.max_groups, physical: hierarchy } }, input_encoding,
+    }, max_bytes, output, check)
 }
 
 #[cfg(test)]

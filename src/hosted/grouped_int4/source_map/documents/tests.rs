@@ -228,7 +228,7 @@ fn compact_factory_workspace_fits_once_inside_live_preparation_with_exact_bounda
         max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 };
     let compiler = compiler.with_map_document_encoding(UntrustedEncoding::SafeBpeV1(call), complete).unwrap();
     let bytes = compiler.encoding_workspace_bytes().unwrap();
-    assert_eq!(bytes, call.requirements().unwrap().workspace_bytes + 512);
+    assert_eq!(bytes, call.requirements().unwrap().workspace_bytes + 1024);
     assert_eq!(compiler.map_document_encoding_limits(), Some(complete));
     assert_ne!(compiler.execution_identity().template_digest, byte_identity.template_digest);
     host.preparation_reserve_bytes = bytes;

@@ -179,10 +179,9 @@ fn neural_source_teams_reserve_one_workspace_across_discovery_and_all_evidence_p
 }
 
 #[test]
-fn neural_source_teams_refuse_cohort_mixtures_and_compact_synthesis_before_io() {
+fn neural_source_teams_refuse_cohort_mixtures_before_io() {
     for (kind, mode) in SYNTHESIS_MODES {
-        let mut incompatible = vec![vec!["--cohort-chunks", "1"], vec!["--cohort-chunks", "2"],
-            vec!["--input-encoding", "safe-bpe-v1"]];
+        let mut incompatible = vec![vec!["--cohort-chunks", "1"], vec!["--cohort-chunks", "2"]];
         if mode.contains(&"--hierarchical-summary") || mode.contains(&"--hierarchical-answer") {
             incompatible.push(vec!["--cohort-hierarchy-groups", "1"]);
             incompatible.push(vec!["--cohort-hierarchy-groups", "2"]);
@@ -280,12 +279,70 @@ fn compact_maps_require_one_complete_tokenizer_budget_and_admit_workspace() {
 }
 
 #[test]
+fn compact_neural_documents_admit_the_full_evidence_envelope_before_io() {
+    for (kind, mode) in SYNTHESIS_MODES {
+        let (plain, mut plain_args) = arguments(kind, mode);
+        plain_args.memory_mib = 262_144;
+        let original = plain.validate(&plain_args).unwrap();
+        for schedule in [&[][..], &["--cohort-chunks", "2"][..], &["--compute-threads", "2"][..]] {
+            let mut flags = mode.to_vec();
+            flags.extend_from_slice(&["--input-encoding", "safe-bpe-v1", "--max-chunk-bytes", "2048"]);
+            flags.extend_from_slice(schedule);
+            let (map, mut args) = arguments(kind, &flags);
+            args.memory_mib = 262_144;
+            let limits = map.validate(&args).unwrap();
+            let encoding = limits.encoding.unwrap();
+            assert_eq!(limits.mapping.chunks.max_chunk_bytes, 2048);
+            assert_eq!(encoding.call.max_input_bytes,
+                args.max_input_bytes.min(crate::tokenizer::untrusted::SafeBpeLimits::MAX_INPUT_BYTES));
+            assert_eq!(encoding.call.max_output_tokens, encoding.call.max_input_bytes);
+            assert!(encoding.call.max_input_bytes > limits.mapping.chunks.max_chunk_bytes);
+            assert_eq!(encoding.complete.max_input_bytes, 8 * args.max_input_bytes as u64);
+            assert_eq!(encoding.complete.max_output_tokens, 8 * args.max_input_bytes as u64);
+            assert_eq!(encoding.workspace_bytes().unwrap(),
+                encoding.call.requirements().unwrap().workspace_bytes + 1024);
+            assert_eq!(limits.mapping.max_model_work, original.mapping.max_model_work);
+            assert_eq!(limits.mapping.max_mask_visits, original.mapping.max_mask_visits);
+            assert_eq!(limits.synthesis, original.synthesis);
+            assert_eq!(limits.question_synthesis, original.question_synthesis);
+            assert_eq!(limits.hierarchy, original.hierarchy);
+            assert_eq!(limits.question_hierarchy, original.question_hierarchy);
+            if args.compute.threads() == 1 {
+                assert_eq!(map.validate_corpus(&args).unwrap().encoding, Some(encoding));
+                assert_eq!(map.validate_document_job(&args, false).unwrap().encoding, Some(encoding));
+            }
+            args.preparation_mib = 1;
+            assert_eq!(map.execute(args, &mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+        }
+    }
+}
+
+#[test]
+fn compact_neural_hierarchy_groups_share_the_whole_document_encoding_limits() {
+    for (kind, mode) in SYNTHESIS_MODES.into_iter().filter(|(_, mode)|
+        mode.contains(&"--hierarchical-summary") || mode.contains(&"--hierarchical-answer")) {
+        let mut flags = mode.to_vec();
+        flags.extend_from_slice(&["--input-encoding", "safe-bpe-v1", "--cohort-chunks", "2",
+            "--cohort-hierarchy-groups", "2", "--max-total-tokenizer-input-bytes", "123456",
+            "--max-total-tokenizer-output-tokens", "234567", "--max-total-tokenizer-pair-checks", "345678",
+            "--max-total-tokenizer-pair-bytes", "456789"]);
+        let (map, mut args) = arguments(kind, &flags);
+        args.memory_mib = 262_144;
+        let limits = map.validate(&args).unwrap();
+        let encoding = limits.encoding.unwrap();
+        assert_eq!((encoding.complete.max_input_bytes, encoding.complete.max_output_tokens,
+            encoding.complete.max_pair_checks, encoding.complete.max_pair_bytes), (123456, 234567, 345678, 456789));
+        assert_eq!(limits.hierarchy_cohorts.unwrap().max_groups, 2);
+        assert_eq!(map.validate_corpus(&args).unwrap().encoding, Some(encoding));
+        assert_eq!(map.validate_document_job(&args, false).unwrap().encoding, Some(encoding));
+    }
+}
+
+#[test]
 fn unsupported_compact_modes_and_invalid_total_ceilings_refuse_before_io() {
     for mode in [vec!["--max-total-tokenizer-pair-checks", "1"],
         vec!["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-pair-checks", "0"],
-        vec!["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-pair-bytes", "18446744073709551615"],
-        vec!["--input-encoding", "safe-bpe-v1", "--synthesize-summary"],
-        vec!["--input-encoding", "safe-bpe-v1", "--synthesize-summary", "--hierarchical-summary"]] {
+        vec!["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-pair-bytes", "18446744073709551615"]] {
         let (map, args) = arguments(Kind::Summarize, &mode);
         assert_eq!(map.execute(args, &mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
     }

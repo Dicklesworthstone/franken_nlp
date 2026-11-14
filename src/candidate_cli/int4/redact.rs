@@ -104,7 +104,7 @@ impl RedactArgs {
                 };
                 complete.validate().map_err(|_| CandidateError::Arguments)?;
                 let workspace = call.requirements().map_err(|_| CandidateError::Arguments)?.workspace_bytes
-                    .checked_add(512).ok_or(CandidateError::Arguments)?;
+                    .checked_add(1024).ok_or(CandidateError::Arguments)?;
                 if limits.common.preparation_bytes < workspace { return Err(CandidateError::Arguments); }
                 Some(complete)
             }

@@ -230,7 +230,7 @@ fn per_record_compact_qa_workspace_is_reserved_once_for_serial_and_chunk_cohorts
         let original = int4_question_document_corpus_requirements(32, config, host, 1 << 20, chunks, None).unwrap();
         let compiler = compiler.with_map_document_encoding(UntrustedEncoding::SafeBpeV1(call), complete).unwrap();
         let bytes = compiler.encoding_workspace_bytes().unwrap();
-        assert_eq!(bytes, call.requirements().unwrap().workspace_bytes + 512);
+        assert_eq!(bytes, call.requirements().unwrap().workspace_bytes + 1024);
         assert_eq!(compiler.map_document_encoding_limits(), Some(complete));
         host.preparation_reserve_bytes = bytes;
         check_encoding_preparation(bytes, host.preparation_reserve_bytes).unwrap();

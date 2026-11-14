@@ -236,7 +236,7 @@ fn compact_question_job_preparation_is_charged_once_for_both_population_owners()
         max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 };
     let planner = planner.with_map_document_encoding(UntrustedEncoding::SafeBpeV1(call), complete).unwrap();
     let bytes = planner.encoding_workspace_bytes().unwrap();
-    assert_eq!(bytes, call.requirements().unwrap().workspace_bytes + 512);
+    assert_eq!(bytes, call.requirements().unwrap().workspace_bytes + 1024);
     assert_eq!(planner.map_document_encoding_limits(), Some(complete));
     for ownership in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
         let original = int4_question_document_job_requirements(WIDTH, config, job, host,

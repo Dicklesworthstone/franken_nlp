@@ -419,7 +419,7 @@ fn complete_publication_keeps_provenance_and_original_coordinates_and_refuses_ov
         &mut refused, &check), Err(CandidateError::Timeout));
     assert!(refused.is_empty());
     expired.set(false);
-    assert_eq!(publish_discovery_cohort(&provenance, &Expires(&expired), &physical, 4, 4096,
+    assert_eq!(publish_discovery_cohort(&provenance, &Expires(&expired), &physical, 4, None, 4096,
         &mut refused, &check), Err(CandidateError::Timeout));
     assert!(refused.is_empty());
 }
@@ -881,7 +881,7 @@ fn discovery_cohort_publication_preserves_all_synthesis_protocols_and_semantic_r
         publish(&Response { provenance: &provenance, output: &output }, 4096, &mut serial_bytes).unwrap();
         let serial: serde_json::Value = serde_json::from_slice(&serial_bytes).unwrap();
         let mut bytes = Vec::new();
-        publish_discovery_cohort(&provenance, &output, &physical, 4, 4096, &mut bytes, &|| Ok(())).unwrap();
+        publish_discovery_cohort(&provenance, &output, &physical, 4, None, 4096, &mut bytes, &|| Ok(())).unwrap();
         let mut grouped: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let schedule = grouped.as_object_mut().unwrap().remove("cohort_schedule").unwrap();
         assert_eq!(schedule["execution"], "cross_chunk_constrained_discovery_cohorts");
@@ -890,7 +890,7 @@ fn discovery_cohort_publication_preserves_all_synthesis_protocols_and_semantic_r
         assert_eq!(schedule["physical"]["cohorts"], 1);
         assert_eq!(grouped, serial, "discovery scheduling cannot rewrite the semantic receipt or private inputs");
         let mut refused = Vec::new();
-        assert_eq!(publish_discovery_cohort(&provenance, &output, &physical, 4, 1, &mut refused, &|| Ok(())),
+        assert_eq!(publish_discovery_cohort(&provenance, &output, &physical, 4, None, 1, &mut refused, &|| Ok(())),
             Err(CandidateError::Output));
         assert!(refused.is_empty());
     }

@@ -100,7 +100,7 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
         .mut_arg("max_dot_products", |arg| arg.help("Whole-stream native grouped dot-product ceiling"))
         .mut_arg("max_multiply_accumulates", |arg| arg.help("Whole-stream multiply-accumulate ceiling"));
     let details = command.get_after_long_help().map(|help| help.to_string()).unwrap_or_default();
-    command.after_long_help(format!("{details}\n\n--compute-threads N selects one persistent output-row team for the entire question stream. Width 1 is serial; widths 2..64 preserve each record's exact question, complete source, independent context and all existing semantic results. One worker workspace and the full process thread envelope are admitted before IO. The same team serves discovery, optional synthesis and every hierarchy level. run_complete is published after every worker joins under the original deadline. Teams cannot combine with chunk/hierarchy cohorts or --prefill-rows. Compact safe-bpe-v1 remains available for independent question maps; neural continuations retain their byte-only contract."))
+    command.after_long_help(format!("{details}\n\n--compute-threads N selects one persistent output-row team for the entire question stream. Width 1 is serial; widths 2..64 preserve each record's exact question, complete source, independent context and all existing semantic results. One worker workspace and the full process thread envelope are admitted before IO. The same team serves discovery, optional synthesis and every hierarchy level. run_complete is published after every worker joins under the original deadline. Teams cannot combine with chunk/hierarchy cohorts or --prefill-rows. Compact safe-bpe-v1 shares one admitted encoding allowance across each record's discovery, evidence synthesis, hierarchy probes and reconstruction."))
 }
 
 #[derive(Clone, Copy)]
@@ -130,7 +130,7 @@ impl CorpusArgs {
     }
     fn validate_options(&self, args: &Int4Args, options: AnswerOptions) -> Result<CorpusLimits, CandidateError> {
         let encoding = self.mapping.encoding.limits(args, &self.mapping,
-            !self.synthesis.flat.synthesize_answer, true)?;
+            self.synthesis.flat.synthesize_answer, true)?;
         let mut storage = args.clone();
         storage.input_encoding = input_encoding::InputEncodingArgs::default();
         let s = self.stream;

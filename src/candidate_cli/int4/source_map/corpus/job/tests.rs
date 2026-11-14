@@ -240,8 +240,13 @@ fn retained_question_resume_selects_no_external_population_or_fallback() {
 #[test]
 fn compact_question_jobs_keep_per_attempt_policy_separate_from_durable_lifetime() {
     for mode in ["start", "resume"] {
-        for cohorts in [&[][..], &["--cohort-chunks", "2"][..]] {
-            let mut flags = cohorts.to_vec();
+        for selection in [&[][..], &["--cohort-chunks", "2"][..],
+            &["--synthesize-answer"][..], &["--synthesize-answer", "--cohort-chunks", "2"][..],
+            &["--synthesize-answer", "--hierarchical-answer"][..],
+            &["--synthesize-answer", "--hierarchical-answer", "--cohort-hierarchy-groups", "2"][..],
+            &["--synthesize-answer", "--hierarchical-answer", "--cohort-chunks", "2", "--cohort-hierarchy-groups", "2"][..],
+            &["--synthesize-answer", "--hierarchical-answer", "--compute-threads", "3"][..]] {
+            let mut flags = selection.to_vec();
             flags.extend_from_slice(&["--input-encoding", "safe-bpe-v1",
                 "--max-total-tokenizer-input-bytes", "123456",
                 "--max-total-tokenizer-pair-checks", "234567"]);
@@ -252,6 +257,9 @@ fn compact_question_jobs_keep_per_attempt_policy_separate_from_durable_lifetime(
             let encoding = admitted.encoding.unwrap();
             assert_eq!(encoding.complete.max_input_bytes, 123456);
             assert_eq!(encoding.complete.max_pair_checks, 234567);
+            assert_eq!(encoding.call.max_input_bytes, args.max_input_bytes);
+            assert_eq!(admitted.config.synthesis.is_some(), selection.contains(&"--synthesize-answer"));
+            assert_eq!(admitted.config.hierarchy.is_some(), selection.contains(&"--hierarchical-answer"));
             assert!(encoding.workspace_bytes().unwrap() < common.preparation_bytes);
             assert_eq!(admitted.config.max_model_work, job.max_work.int4_model_work());
             assert_eq!(admitted.config.max_mask_visits, job.max_work.mask_node_visits);
@@ -264,14 +272,18 @@ fn compact_question_jobs_keep_per_attempt_policy_separate_from_durable_lifetime(
 }
 
 #[test]
-fn compact_question_jobs_refuse_unimplemented_synthesis_and_unbounded_encoding_options() {
-    for flags in [
-        &["--input-encoding", "safe-bpe-v1", "--synthesize-answer"][..],
-        &["--input-encoding", "safe-bpe-v1", "--synthesize-answer", "--hierarchical-answer"][..],
-        &["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-input-bytes", "0"][..],
-        &["--max-total-tokenizer-output-tokens", "1"][..],
-    ] {
-        let (command, args) = parsed("start", flags);
-        assert!(command.args.validate(&args).is_err());
+fn compact_question_jobs_refuse_unbounded_encoding_options_in_every_mode() {
+    for operation in ["start", "resume"] {
+        for mode in [&[][..], &["--synthesize-answer"][..],
+            &["--synthesize-answer", "--hierarchical-answer"][..]] {
+            for invalid in [
+                &["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-input-bytes", "0"][..],
+                &["--max-total-tokenizer-output-tokens", "1"][..],
+            ] {
+                let mut flags = mode.to_vec(); flags.extend_from_slice(invalid);
+                let (command, args) = parsed(operation, &flags);
+                assert!(command.args.validate(&args).is_err());
+            }
+        }
     }
 }

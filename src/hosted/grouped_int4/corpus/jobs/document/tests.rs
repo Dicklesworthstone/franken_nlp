@@ -573,7 +573,7 @@ fn compact_source_job_funds_one_encoder_within_its_authenticated_input_owner() {
         max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 };
     let planner = planner.with_map_document_encoding(UntrustedEncoding::SafeBpeV1(call), complete).unwrap();
     let bytes = planner.encoding_workspace_bytes().unwrap();
-    assert_eq!(bytes, call.requirements().unwrap().workspace_bytes + 512);
+    assert_eq!(bytes, call.requirements().unwrap().workspace_bytes + 1024);
     assert_eq!(planner.map_document_encoding_limits(), Some(complete));
     let frontier = planner.workspace_bytes(host.native, 65_536).unwrap();
     for ownership in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {

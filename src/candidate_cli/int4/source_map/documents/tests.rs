@@ -260,9 +260,16 @@ fn compact_source_populations_preserve_whole_run_limits_and_per_document_workspa
         ("ner-corpus", &[][..]), ("keyphrases-corpus", &[][..]),
         ("keyphrases-corpus", &["--reduce-keyphrases"][..]),
         ("summarize-corpus", &[][..]), ("answer", &[][..]),
+        ("summarize-corpus", &["--synthesize-summary"][..]),
+        ("summarize-corpus", &["--synthesize-summary", "--hierarchical-summary"][..]),
+        ("answer", &["--synthesize-answer"][..]),
+        ("answer", &["--synthesize-answer", "--hierarchical-answer"][..]),
     ] {
-        for cohorts in [&[][..], &["--cohort-chunks", "2"][..]] {
-            let mut ordinary = mode.to_vec(); ordinary.extend_from_slice(cohorts);
+        for schedule in [&[][..], &["--cohort-chunks", "2"][..], &["--compute-threads", "3"][..],
+            &["--cohort-chunks", "2", "--cohort-hierarchy-groups", "2"][..]] {
+            if schedule.contains(&"--cohort-hierarchy-groups")
+                && !mode.contains(&"--hierarchical-summary") && !mode.contains(&"--hierarchical-answer") { continue; }
+            let mut ordinary = mode.to_vec(); ordinary.extend_from_slice(schedule);
             let (baseline, args) = arguments(name, &ordinary);
             let byte = baseline.validate(&args).unwrap();
             let mut flags = ordinary;
@@ -274,6 +281,10 @@ fn compact_source_populations_preserve_whole_run_limits_and_per_document_workspa
             let encoding = admitted.document.encoding.unwrap();
             assert_eq!(encoding.complete.max_input_bytes, 123456);
             assert_eq!(encoding.complete.max_output_tokens, 234567);
+            if name == "answer" || mode.contains(&"--synthesize-summary") {
+                assert_eq!(encoding.call.max_input_bytes,
+                    args.max_input_bytes.min(crate::tokenizer::untrusted::SafeBpeLimits::MAX_INPUT_BYTES));
+            }
             assert!(encoding.workspace_bytes().unwrap() < admitted.common.preparation_bytes);
             assert_eq!(admitted.transport, byte.transport);
             assert_eq!(admitted.run.max_model_work, byte.run.max_model_work);
@@ -283,31 +294,31 @@ fn compact_source_populations_preserve_whole_run_limits_and_per_document_workspa
             assert_eq!(admitted.document.mapping.reduction, byte.document.mapping.reduction);
             assert_eq!(admitted.document.workspace_bytes, byte.document.workspace_bytes);
             assert_eq!(admitted.document.cohort, byte.document.cohort);
+            assert_eq!(admitted.document.hierarchy_cohorts, byte.document.hierarchy_cohorts);
+            assert_eq!(admitted.common.compute, byte.common.compute);
             assert_eq!(admitted.common.minimum_memory_bytes, byte.common.minimum_memory_bytes);
             args.preparation_mib = 1;
-            assert!(compact.validate(&args).is_err());
+            assert_eq!(compact.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
         }
     }
 }
 
 #[test]
-fn compact_source_populations_refuse_neural_modes_and_invalid_work_before_private_io() {
+fn compact_source_populations_refuse_invalid_work_before_private_io() {
     for (name, mode) in [
+        ("ner-corpus", &[][..]), ("keyphrases-corpus", &[][..]),
+        ("summarize-corpus", &[][..]), ("answer", &[][..]),
         ("summarize-corpus", &["--synthesize-summary"][..]),
         ("summarize-corpus", &["--synthesize-summary", "--hierarchical-summary"][..]),
         ("answer", &["--synthesize-answer"][..]),
         ("answer", &["--synthesize-answer", "--hierarchical-answer"][..]),
     ] {
-        let mut flags = mode.to_vec(); flags.extend_from_slice(&["--input-encoding", "safe-bpe-v1"]);
-        let (options, args) = arguments(name, &flags);
-        assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
-    }
-    for name in ["ner-corpus", "keyphrases-corpus", "summarize-corpus", "answer"] {
         for extra in [
             &["--max-total-tokenizer-input-bytes", "1"][..],
             &["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-pair-checks", "0"][..],
         ] {
-            let (options, args) = arguments(name, extra);
+            let mut flags = mode.to_vec(); flags.extend_from_slice(extra);
+            let (options, args) = arguments(name, &flags);
             assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
         }
     }

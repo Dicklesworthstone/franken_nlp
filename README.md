@@ -3682,6 +3682,77 @@ See [native hierarchy cohorts](docs/int4-structured-cohorts.md#native-hierarchy-
 for the complete interface and an answer example. The new execution paths and
 regression sources remain unrun; they establish no parity or performance claim.
 
+### Compact input through complete summary and answer synthesis
+
+The complete-document source commands accept `--input-encoding safe-bpe-v1`,
+including `summarize-map --synthesize-summary`, `answer-map --synthesize-answer`
+and their explicit hierarchy modes. Actual compact tokens determine context
+fit while original UTF-8 bytes and byte/scalar citation coordinates remain
+unchanged. Final summaries and answers still use only independently verified
+source quotations; generated intermediate statements do not become evidence.
+
+For example, select compact input for a bounded summary hierarchy:
+
+```bash
+fnlp candidate source-int4 summarize-map report.txt \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --memory-mib 32768 --preparation-mib 2048 \
+  --synthesize-summary --hierarchical-summary \
+  --input-encoding safe-bpe-v1 \
+  --max-total-tokenizer-input-bytes 16777216 \
+  --max-total-tokenizer-output-tokens 16777216 \
+  --max-total-tokenizer-pair-checks 268435456 \
+  --max-total-tokenizer-pair-bytes 4294967296
+```
+
+For QA, use `answer-map --question question.txt --synthesize-answer` and add
+`--hierarchical-answer` when bounded recursive evidence selection is wanted.
+Each question, canonical passage manifest and joined evidence input shares
+the same tokenizer allowance.
+
+One cumulative ledger covers initial preflight, accepted and rejected chunk
+and hierarchy probes, discovery preparation, final synthesis, every hierarchy
+level, and execution reconstruction. Prepared continuations retain that
+original ledger; replacing a planner with an equivalent unused one does not
+renew it. Encoding exhaustion or cancellation refuses the complete document.
+The input-byte and output-token totals default to eight times
+`--max-input-bytes`; the pair-check and pair-byte defaults are shown above.
+Per-call `--max-tokenizer-pair-checks` and `--max-tokenizer-pair-bytes`
+remain separate ceilings.
+
+Neural summaries admit collected evidence larger than a single discovery
+chunk. Their compact per-call envelope, like QA's full question/evidence
+envelope, is bounded by `--max-input-bytes` and the encoder's one-MiB limit.
+Admission prices its complete workspace before private IO.
+`--max-chunk-bytes` still limits original discovery chunks, and every actual
+prompt plus reserved output must fit context. Raising the complete allowance
+does not increase the original source, evidence, hierarchy, native-work or
+mask limits.
+
+Serial execution, persistent output-row teams, discovery cohorts and native
+hierarchy-group cohorts keep their existing scheduling restrictions.
+Successful standalone responses report `input_encoding` with the policy,
+complete-operation limits and actual cumulative `work_used`, alongside any
+physical schedule metadata. Default byte-mode response fields are unchanged.
+
+The same option is available in `source-corpus`, `answer-corpus`,
+`document-job start|resume` and `answer-document-job start|resume`, including
+neural and hierarchy modes. Each complete document attempt receives its own
+ledger, shared through preparation and execution reconstruction. Chunk and
+flush boundaries do not renew it. Durable resume authenticates the policy and
+all ceilings; tokenizer use remains an invocation-local allowance, while
+native work and attempts retain their existing durable lifetime accounting.
+Population metadata reports the policy and scope, rather than unused factory
+counters as measured work.
+
+Library callers opt in with `with_map_document_encoding` and complete
+`SafeBpeWorkLimits`; a per-call compact policy alone cannot authorize
+dependent synthesis. Source regressions cover exhaustion of all four work
+axes, retained ownership, cancellation, real pinned tokenization, original
+citations and output metadata. Compilation, executable regression runs,
+model quality and performance qualification remain pending.
+
 ### Complete-document limits and delivery
 
 The default original-source byte ceiling is 1 MiB, the chunk ceiling is 64,
@@ -4002,8 +4073,9 @@ map, exact reducer and permitted neural synthesis/hierarchy pass. The same
 option is available on `answer-document-job` for per-record questions. Team
 execution refuses chunk and hierarchy-group cohorts before private IO and
 reserves its worker scratch once alongside the complete job envelope.
-Width `1` uses the existing serial path. Compact input remains available on
-its supported map/reducer modes; synthesis and hierarchies remain byte-input.
+Width `1` uses the existing serial path. Compact input also covers neural
+summary/answer synthesis and every hierarchy level under one complete-document
+allowance; see [compact document synthesis](#compact-input-through-complete-summary-and-answer-synthesis).
 
 Compute width is physical scheduling and stays outside the authenticated
 semantic recipe. Explicit resume may choose a different compatible width

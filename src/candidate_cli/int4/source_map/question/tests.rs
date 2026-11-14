@@ -211,10 +211,8 @@ fn whole_document_byte_cap_does_not_expand_one_qa_encoder_past_its_hard_limit() 
 }
 
 #[test]
-fn compact_qa_unsupported_synthesis_and_invalid_work_refuse_before_private_io() {
+fn compact_qa_invalid_work_refuses_before_private_io() {
     for flags in [
-        vec!["--input-encoding", "safe-bpe-v1", "--synthesize-answer"],
-        vec!["--input-encoding", "safe-bpe-v1", "--synthesize-answer", "--hierarchical-answer"],
         vec!["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-input-bytes", "0"],
         vec!["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-output-tokens", "0"],
         vec!["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-pair-checks", "0"],

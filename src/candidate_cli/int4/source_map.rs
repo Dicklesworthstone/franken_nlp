@@ -106,7 +106,7 @@ pub(super) fn definitions() -> Vec<clap::Command> {
         let details = command.get_after_long_help().map(|help| help.to_string()).unwrap_or_default();
         compute::definition(command)
             .mut_arg("compute_threads", |arg| arg.help("Coordinator plus persistent INT4 row workers, 1..=64; one team spans every source chunk and the complete reducer. Extra worker scratch is admitted before IO. Cannot combine with chunk or hierarchy-group cohorts; runtime threads are additional"))
-            .after_long_help(format!("{details}\n\n--compute-threads N forms one persistent output-row team across the complete NER, keyphrase, cited-summary or question-answering document. The default width of 1 keeps serial execution. Widths 2..64 retain each chunk's independent causal context, original-source evidence, and the complete-document native, mask and verification budgets. Byte-fallback and safe-bpe-v1 share the same team path and complete invocation encoding ledger. Exact summary and keyphrase reducers run after every chunk completes; independent QA preserves every answer, abstention and whitespace span. Explicit neural summary/answer synthesis and hierarchies retain the same team across discovery and every dependent evidence pass, with one admitted scratch allocation and the original complete-document ceilings. Neural synthesis remains byte-only. Actual projection counts appear only in the optional compute receipt; worker count does not change semantic identity. Chunk cohorts, hierarchy-group cohorts, corpora and durable jobs retain their separate schedules."))
+            .after_long_help(format!("{details}\n\n--compute-threads N forms one persistent output-row team across the complete NER, keyphrase, cited-summary or question-answering document. The default width of 1 keeps serial execution. Widths 2..64 retain each chunk's independent causal context, original-source evidence, and the complete-document native, mask and verification budgets. Byte-fallback and safe-bpe-v1 share the same team path and complete invocation encoding ledger. Exact summary and keyphrase reducers run after every chunk completes; independent QA preserves every answer, abstention and whitespace span. Explicit neural summary/answer synthesis and hierarchies retain the same team across discovery and every dependent evidence pass, with one admitted scratch allocation and the original complete-document ceilings. Neural synthesis and every hierarchy level share that same nonrenewable tokenizer ledger. Actual projection counts appear only in the optional compute receipt; worker count does not change semantic identity. Chunk cohorts, hierarchy-group cohorts, corpora and durable jobs retain their separate schedules."))
     }).collect()
 }
 pub(super) fn document_job_definitions() -> Vec<clap::Command> {
@@ -207,9 +207,9 @@ impl MapArgs {
         if threaded && (self.cohort_chunks.is_some() || self.cohort_hierarchy_groups.is_some()) {
             return Err(CandidateError::Arguments);
         }
-        let encoding = m.encoding.limits(args, &m,
-            self.summary.is_none_or(|summary| !summary.synthesis.synthesize_summary),
-            self.kind == Kind::Answer)?;
+        // QA always admits its full question/manifest/source envelope below.
+        let neural_synthesis = self.summary.is_some_and(|summary| summary.synthesis.synthesize_summary);
+        let encoding = m.encoding.limits(args, &m, neural_synthesis, self.kind == Kind::Answer)?;
         // Single-source storage validation prices the original input envelope.
         // Compact map probes instead use the separately quoted per-chunk
         // workspace and the complete-invocation ledger below.
@@ -237,9 +237,6 @@ impl MapArgs {
             Some(question) => question.synthesis_limits(self.planning(args))?,
             None => None,
         };
-        if encoding.is_some() && question_synthesis.is_some() {
-            return Err(CandidateError::Arguments);
-        }
         let hierarchy = match self.summary {
             Some(summary) => summary.synthesis.hierarchy()?,
             None => None,

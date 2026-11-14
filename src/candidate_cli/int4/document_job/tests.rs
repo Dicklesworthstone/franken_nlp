@@ -430,7 +430,6 @@ fn unavailable_profile_refuses_before_keys_questions_options_model_or_population
 #[test]
 fn compact_document_jobs_authenticate_selected_policy_without_changing_lifetime_envelopes() {
     for &(task, mode, expected_mode) in MODES {
-        if mode.contains(&"--synthesize-summary") || mode.contains(&"--synthesize-answer") { continue; }
         for operation in ["start", "resume"] {
             for cohorts in [&[][..], &["--cohort-chunks", "2"][..]] {
                 let mut flags = mode.to_vec(); flags.extend_from_slice(cohorts);
@@ -444,6 +443,10 @@ fn compact_document_jobs_authenticate_selected_policy_without_changing_lifetime_
                 let encoding = admitted.encoding.unwrap();
                 assert_eq!(encoding.complete.max_pair_checks, 123456);
                 assert_eq!(encoding.complete.max_pair_bytes, 234567);
+                if task == "answer" || mode.contains(&"--synthesize-summary") {
+                    assert_eq!(encoding.call.max_input_bytes,
+                        args.max_input_bytes.min(crate::tokenizer::untrusted::SafeBpeLimits::MAX_INPUT_BYTES));
+                }
                 assert!(encoding.workspace_bytes().unwrap() < admitted.common.preparation_bytes);
                 assert_eq!(compact.args.mode_name(admitted), expected_mode);
                 assert_eq!(admitted.mapping.chunks, baseline.mapping.chunks);
@@ -463,18 +466,15 @@ fn compact_document_jobs_authenticate_selected_policy_without_changing_lifetime_
 }
 
 #[test]
-fn compact_document_jobs_refuse_neural_modes_and_incomplete_tokenizer_authority() {
+fn compact_document_jobs_refuse_incomplete_tokenizer_authority_in_every_mode() {
     for &(task, mode, _) in MODES {
-        if !mode.contains(&"--synthesize-summary") && !mode.contains(&"--synthesize-answer") { continue; }
-        let mut flags = mode.to_vec(); flags.extend_from_slice(&["--input-encoding", "safe-bpe-v1"]);
-        let (job, args) = command("start", task, &flags);
-        assert!(job.args.validate(&args).is_err());
-    }
-    for flags in [
-        &["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-pair-bytes", "0"][..],
-        &["--max-total-tokenizer-input-bytes", "1"][..],
-    ] {
-        let (job, args) = command("resume", "ner", flags);
-        assert!(job.args.validate(&args).is_err());
+        for invalid in [
+            &["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-pair-bytes", "0"][..],
+            &["--max-total-tokenizer-input-bytes", "1"][..],
+        ] {
+            let mut flags = mode.to_vec(); flags.extend_from_slice(invalid);
+            let (job, args) = command("resume", task, &flags);
+            assert!(job.args.validate(&args).is_err());
+        }
     }
 }
