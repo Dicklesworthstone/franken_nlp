@@ -28,6 +28,191 @@ finish() {
 }
 trap finish EXIT
 
+run_disk_cases() {
+    # Exercise the production functions with a deterministic disk/transport
+    # model. No sockets, source-model assets or production test hooks are used.
+    sed '/^while \[ "\$#" -gt 0 \]; do/,$d' "$FETCH" > "$WORK/disk-functions.sh"
+    cat > "$WORK/disk-tests.sh" <<'EOF'
+#!/bin/sh
+set -u
+. "$1/disk-functions.sh"
+DISK_WORK=$1
+DISK_FIXTURE="$DISK_WORK/disk-fixture"
+mkdir -p "$DISK_FIXTURE"
+printf 'alpha fixture bytes\n' > "$DISK_FIXTURE/alpha.bin"
+printf 'beta fixture bytes are slightly longer\n' > "$DISK_FIXTURE/beta.bin"
+DISK_ALPHA=$(bytes "$DISK_FIXTURE/alpha.bin")
+DISK_BETA=$(bytes "$DISK_FIXTURE/beta.bin")
+DISK_ALPHA_SHA=$(sha256 "$DISK_FIXTURE/alpha.bin")
+DISK_BETA_SHA=$(sha256 "$DISK_FIXTURE/beta.bin")
+CATALOG="$DISK_WORK/disk-catalog.txt"
+printf 'alpha.bin|%s|%s\nbeta.bin|%s|%s\n' "$DISK_ALPHA" "$DISK_ALPHA_SHA" "$DISK_BETA" "$DISK_BETA_SHA" > "$CATALOG"
+TEST_BASE=https://fixture.invalid/source
+catalog_stats
+
+available_bytes() {
+    printf 'probe\n' >> "$DEST/space-probes"
+    printf '%s\n' "$DISK_FREE"
+}
+download_with_progress() {
+    printf 'transfer\n' >> "$DEST/transfers"
+    [ "$DISK_REFUSE_RANGE" -eq 0 ] || return 33
+    disk_transfer_start=$(bytes "$2")
+    disk_source=${2##*/}
+    disk_source=${disk_source%.partial}
+    tail -c "+$((disk_transfer_start + 1))" "$DISK_FIXTURE/$disk_source" >> "$2" || return 92
+    DISK_FREE=$((DISK_FREE - $3 + disk_transfer_start))
+}
+disk_setup() {
+    DEST="$DISK_WORK/disk-$1"
+    VERIFIED_NAMES=' '
+    LOCK_DIR=
+    LOCK_OWNED=0
+    DISK_REFUSE_RANGE=0
+    ensure_destination
+}
+disk_journal() {
+    journal_text "$TEST_BASE/$1" "$1" "$2" "$3" > "$JOURNAL_DIR/$1.journal"
+}
+disk_check() {
+    "$@" || { printf 'DISK_TEST RESULT=FAIL assertion=%s\n' "$*" >&2; exit 1; }
+}
+disk_pass() { printf 'DISK_TEST case=%s RESULT=PASS\n' "$1"; }
+
+disk_setup cached
+cp "$DISK_FIXTURE/alpha.bin" "$DEST/alpha.bin"
+cp "$DISK_FIXTURE/beta.bin" "$DEST/beta.bin"
+DISK_FREE=0
+verify_existing_closure
+download_one alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA"
+download_one beta.bin "$DISK_BETA" "$DISK_BETA_SHA"
+disk_check test ! -e "$DEST/space-probes"
+disk_check test ! -e "$DEST/transfers"
+disk_pass cached-closure-without-free-space-or-network
+
+disk_setup fresh
+DISK_FREE=$((CATALOG_TOTAL + MARGIN_BYTES))
+verify_existing_closure
+disk_check test "$(remaining_download_bytes)" -eq "$CATALOG_TOTAL"
+download_one alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA"
+disk_check test "$(remaining_download_bytes)" -eq "$DISK_BETA"
+download_one beta.bin "$DISK_BETA" "$DISK_BETA_SHA"
+disk_check test "$DISK_FREE" -eq "$MARGIN_BYTES"
+disk_check test "$(remaining_download_bytes)" -eq 0
+disk_check cmp "$DISK_FIXTURE/alpha.bin" "$DEST/alpha.bin"
+disk_check cmp "$DISK_FIXTURE/beta.bin" "$DEST/beta.bin"
+disk_pass exact-capacity-survives-sequential-progress
+
+disk_setup later-hit
+cp "$DISK_FIXTURE/beta.bin" "$DEST/beta.bin"
+DISK_FREE=$((DISK_ALPHA + MARGIN_BYTES))
+verify_existing_closure
+disk_check test "$(remaining_download_bytes)" -eq "$DISK_ALPHA"
+download_one alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA"
+download_one beta.bin "$DISK_BETA" "$DISK_BETA_SHA"
+disk_check test "$DISK_FREE" -eq "$MARGIN_BYTES"
+disk_pass later-verified-source-is-not-reserved-again
+
+disk_setup bound-resume
+head -c 5 "$DISK_FIXTURE/alpha.bin" > "$DEST/alpha.bin.partial"
+head -c 7 "$DISK_FIXTURE/beta.bin" > "$DEST/beta.bin.partial"
+disk_journal alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA"
+disk_journal beta.bin "$DISK_BETA" "$DISK_BETA_SHA"
+DISK_FREE=$((CATALOG_TOTAL - 12 + MARGIN_BYTES))
+verify_existing_closure
+disk_check test "$(remaining_download_bytes)" -eq "$((CATALOG_TOTAL - 12))"
+download_one alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA"
+download_one beta.bin "$DISK_BETA" "$DISK_BETA_SHA"
+disk_check test "$DISK_FREE" -eq "$MARGIN_BYTES"
+disk_check cmp "$DISK_FIXTURE/alpha.bin" "$DEST/alpha.bin"
+disk_check cmp "$DISK_FIXTURE/beta.bin" "$DEST/beta.bin"
+disk_pass all-journal-bound-prefixes-earn-storage-credit
+
+disk_setup unbound-resume
+head -c 5 "$DISK_FIXTURE/alpha.bin" > "$DEST/alpha.bin.partial"
+head -c 7 "$DISK_FIXTURE/beta.bin" > "$DEST/beta.bin.partial"
+disk_journal beta.bin "$DISK_BETA" "$(printf '%064d' 0)"
+disk_check test "$(remaining_download_bytes)" -eq "$CATALOG_TOTAL"
+DISK_FREE=$((CATALOG_TOTAL + MARGIN_BYTES))
+download_one alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA"
+download_one beta.bin "$DISK_BETA" "$DISK_BETA_SHA"
+disk_check test -s "$DEST/quarantine/quarantine.log"
+disk_check test "$DISK_FREE" -eq "$MARGIN_BYTES"
+disk_pass unbound-prefixes-stay-charged-and-quarantined
+
+disk_setup corrupt-final
+cp "$DISK_FIXTURE/alpha.bin" "$DEST/alpha.bin"
+printf X | dd of="$DEST/alpha.bin" bs=1 count=1 conv=notrunc 2>/dev/null
+cp "$DISK_FIXTURE/beta.bin" "$DEST/beta.bin"
+verify_existing_closure
+disk_check test "$(remaining_download_bytes)" -eq "$DISK_ALPHA"
+DISK_FREE=$((DISK_ALPHA + MARGIN_BYTES))
+download_one alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA"
+disk_check test -s "$DEST/quarantine/quarantine.log"
+disk_check cmp "$DISK_FIXTURE/alpha.bin" "$DEST/alpha.bin"
+disk_pass same-length-corruption-never-earns-cache-credit
+
+disk_setup insufficient
+DISK_FREE=$((CATALOG_TOTAL + MARGIN_BYTES - 1))
+(download_one alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA")
+disk_check test "$?" -eq 4
+disk_check test ! -e "$DEST/transfers"
+disk_check test ! -s "$DEST/alpha.bin.partial"
+disk_pass one-byte-short-refuses-before-transport
+
+disk_setup range-restart
+cp "$DISK_FIXTURE/beta.bin" "$DEST/beta.bin"
+head -c 5 "$DISK_FIXTURE/alpha.bin" > "$DEST/alpha.bin.partial"
+disk_journal alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA"
+verify_existing_closure
+DISK_FREE=$((DISK_ALPHA - 5 + MARGIN_BYTES))
+DISK_REFUSE_RANGE=1
+(download_one alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA")
+disk_check test "$?" -eq 4
+disk_check test "$(wc -l < "$DEST/transfers" | tr -d '[:space:]')" -eq 1
+disk_check test ! -s "$DEST/alpha.bin.partial"
+disk_check test -s "$DEST/quarantine/quarantine.log"
+disk_pass range-restart-requires-new-space-before-second-transfer
+
+disk_setup nonregular-prefix
+ln -s "$DISK_FIXTURE/alpha.bin" "$DEST/alpha.bin.partial"
+disk_journal alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA"
+disk_check test "$(remaining_download_bytes)" -eq "$CATALOG_TOTAL"
+disk_pass symlink-prefix-earns-no-storage-credit
+
+disk_setup oversized-prefix
+cat "$DISK_FIXTURE/alpha.bin" "$DISK_FIXTURE/alpha.bin" > "$DEST/alpha.bin.partial"
+disk_journal alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA"
+disk_check test "$(remaining_download_bytes)" -eq "$CATALOG_TOTAL"
+disk_pass oversized-prefix-earns-no-storage-credit
+
+for invalid in 01 08 -1 9223372036854775808 999999999999999999999999999; do
+    if valid_byte_count "$invalid"; then exit 1; fi
+done
+disk_check valid_byte_count 0
+disk_check valid_byte_count 9223372036854775807
+CATALOG="$DISK_WORK/overflow-catalog.txt"
+printf 'alpha.bin|9223372036854775807|%s\n' "$DISK_ALPHA_SHA" > "$CATALOG"
+(catalog_stats)
+disk_check test "$?" -eq 2
+disk_pass byte-count-and-margin-overflow-refuse
+EOF
+    CASES=$((CASES + 1))
+    if sh "$WORK/disk-tests.sh" "$WORK" > "$WORK/disk-tests.out" 2> "$WORK/disk-tests.err"; then
+        cat "$WORK/disk-tests.out"
+        pass_case disk-admission cached-and-resumable-remaining-space
+    else
+        cat "$WORK/disk-tests.out"
+        cat "$WORK/disk-tests.err" >&2
+        fail_case disk-admission cached-and-resumable-remaining-space
+    fi
+}
+
+if [ "${1:-}" = --disk-only ]; then
+    run_disk_cases
+    exit
+fi
+
 command -v python3 >/dev/null 2>&1 || { log "FETCH_MODEL_TESTS RESULT=FAIL cases=0 failed=missing-python3 retained_work=$WORK"; exit 1; }
 command -v openssl >/dev/null 2>&1 || { log "FETCH_MODEL_TESTS RESULT=FAIL cases=0 failed=missing-openssl retained_work=$WORK"; exit 1; }
 command -v curl >/dev/null 2>&1 || { log "FETCH_MODEL_TESTS RESULT=FAIL cases=0 failed=missing-curl retained_work=$WORK"; exit 1; }
@@ -329,3 +514,5 @@ if [ "$lock_status" -eq 4 ] && [ -f "$DEST19/.fnlp-fetch-lock-$REV/owner.txt" ] 
     [ "$(cat "$DEST19/.fnlp-fetch-lock-$REV/owner.txt")" = 'another invocation owns this lock' ] &&
     ! grep -q 'LOCK_RELEASE_DEFERRED' "$WORK/case19.err"; then pass_case 19 nonempty-contended-lock-untouched
 else fail_case 19 nonempty-contended-lock-untouched; fi
+
+run_disk_cases

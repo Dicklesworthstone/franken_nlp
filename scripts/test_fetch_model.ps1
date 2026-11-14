@@ -1,7 +1,7 @@
 # Local-fixture tests for fetch_model.ps1. The retained work directory is
 # printed on completion for audit; this harness deliberately never deletes it.
 [CmdletBinding()]
-param()
+param([switch]$DiskOnly)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -285,7 +285,124 @@ function Write-Journal([string]$Dest, [string]$Name, [int64]$Length, [string]$Di
     Set-Content -LiteralPath (Join-Path $journalDir ($Name + '.journal')) -NoNewline -Encoding utf8 -Value "url=$Url`nrevision=$Revision`nname=$Name`nbytes=$Length`nsha256=$Digest`n"
 }
 
+function Test-DiskAdmission {
+    $script:Cases++
+    # Load real functions only, never the source script's main or a transport.
+    $tokens = $null; $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($Fetch, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count -ne 0) { throw 'fetcher has PowerShell parse errors' }
+    foreach ($definition in $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+        . ([scriptblock]::Create($definition.Extent.Text))
+    }
+    function Exit-Fetch([int]$Code, [string]$Message = '') { throw "disk-test-exit:$Code $Message" }
+    function Get-FreeBytes { $script:SpaceProbes++; return $script:TestFreeBytes }
+    function Download-Partial([string]$Url, [string]$Partial, [string]$Journal, $Entry) {
+        $script:TestTransfers++
+        $retained = Get-Length $Partial
+        $payload = [IO.File]::ReadAllBytes((Join-Path $diskFixture $Entry.Name))
+        $stream = [IO.File]::Open($Partial, [IO.FileMode]::Append, [IO.FileAccess]::Write)
+        try { $stream.Write($payload, [int]$retained, $payload.Length - [int]$retained) }
+        finally { $stream.Dispose() }
+        $script:TestFreeBytes -= $Entry.Length - $retained
+    }
+    function Assert-Disk([bool]$Condition, [string]$Label) {
+        if (-not $Condition) { throw "disk admission assertion failed: $Label" }
+    }
+    function New-DiskCase([string]$Name) {
+        $path = Join-Path $Work ('disk-' + $Name)
+        New-Item -ItemType Directory -Path $path | Out-Null
+        $script:JournalDir = Join-Path $path '.fnlp-fetch-journals'
+        New-Item -ItemType Directory -Path $script:JournalDir | Out-Null
+        $script:VerifiedNames = @{}
+        $script:SpaceProbes = 0
+        $script:TestTransfers = 0
+        return $path
+    }
+    $MarginBytes = [int64]67108864
+    $TestBaseUrl = 'https://fixture.invalid/source'
+    $DefaultBase = 'https://huggingface.co/Nanbeige/Nanbeige4.2-3B/resolve'
+    $diskFixture = Join-Path $Work 'disk-fixture'
+    New-Item -ItemType Directory -Path $diskFixture | Out-Null
+    [IO.File]::WriteAllText((Join-Path $diskFixture 'alpha.bin'), "alpha fixture bytes`n", [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $diskFixture 'beta.bin'), "beta fixture bytes are slightly longer`n", [Text.UTF8Encoding]::new($false))
+    $entries = @(foreach ($name in @('alpha.bin', 'beta.bin')) {
+        $path = Join-Path $diskFixture $name
+        [PSCustomObject]@{ Name = $name; Length = (Get-Length $path); Sha256 = (Get-Sha256 $path) }
+    })
+    $total = $entries[0].Length + $entries[1].Length
+
+    $Dest = New-DiskCase cached
+    foreach ($entry in $entries) { [IO.File]::Copy((Join-Path $diskFixture $entry.Name), (Join-Path $Dest $entry.Name)) }
+    $script:TestFreeBytes = [int64]0
+    Initialize-VerifiedFiles $entries
+    foreach ($entry in $entries) { Download-One $entry $entries }
+    Assert-Disk ($script:SpaceProbes -eq 0 -and $script:TestTransfers -eq 0) 'cached closure needs no new disk or network'
+
+    $Dest = New-DiskCase fresh
+    $script:TestFreeBytes = $total + $MarginBytes
+    Initialize-VerifiedFiles $entries
+    Download-One $entries[0] $entries
+    Assert-Disk ((Get-RemainingDownloadBytes $entries) -eq $entries[1].Length) 'completed first file not reserved again'
+    Download-One $entries[1] $entries
+    Assert-Disk ($script:TestFreeBytes -eq $MarginBytes -and (Get-RemainingDownloadBytes $entries) -eq 0) 'exact closure capacity completes'
+
+    $Dest = New-DiskCase later-hit
+    [IO.File]::Copy((Join-Path $diskFixture 'beta.bin'), (Join-Path $Dest 'beta.bin'))
+    Initialize-VerifiedFiles $entries
+    Assert-Disk ((Get-RemainingDownloadBytes $entries) -eq $entries[0].Length) 'later cache hit excluded before first transfer'
+
+    $Dest = New-DiskCase bound-prefixes
+    foreach ($entry in $entries) {
+        $payload = [IO.File]::ReadAllBytes((Join-Path $diskFixture $entry.Name))
+        [IO.File]::WriteAllBytes((Join-Path $Dest ($entry.Name + '.partial')), $payload[0..4])
+        Write-NewUtf8File (Join-Path $script:JournalDir ($entry.Name + '.journal')) (Get-JournalText "$TestBaseUrl/$($entry.Name)" $entry)
+    }
+    Assert-Disk ((Get-RemainingDownloadBytes $entries) -eq ($total - 10)) 'all bound partials receive storage credit'
+    $script:TestFreeBytes = $total - 10 + $MarginBytes
+    foreach ($entry in $entries) { Download-One $entry $entries }
+    Assert-Disk ($script:TestFreeBytes -eq $MarginBytes) 'resume retains exact remaining admission'
+
+    $Dest = New-DiskCase unbound-prefixes
+    foreach ($entry in $entries) {
+        $payload = [IO.File]::ReadAllBytes((Join-Path $diskFixture $entry.Name))
+        [IO.File]::WriteAllBytes((Join-Path $Dest ($entry.Name + '.partial')), $payload[0..4])
+    }
+    Assert-Disk ((Get-RemainingDownloadBytes $entries) -eq $total) 'unbound partials get no credit'
+
+    $Dest = New-DiskCase corrupt-final
+    [IO.File]::WriteAllText((Join-Path $Dest 'alpha.bin'), ('X' * $entries[0].Length))
+    [IO.File]::Copy((Join-Path $diskFixture 'beta.bin'), (Join-Path $Dest 'beta.bin'))
+    Initialize-VerifiedFiles $entries
+    Assert-Disk ((Get-RemainingDownloadBytes $entries) -eq $entries[0].Length) 'same-length corrupt source remains charged'
+
+    $Dest = New-DiskCase insufficient
+    $script:TestFreeBytes = $total + $MarginBytes - 1
+    $refused = $false
+    try { Download-One $entries[0] $entries }
+    catch { $refused = $_.Exception.Message -match '^disk-test-exit:4 ' }
+    Assert-Disk ($refused -and $script:TestTransfers -eq 0) 'one-byte short refuses before transport'
+
+    $Dest = New-DiskCase overflow
+    $overflow = @([PSCustomObject]@{ Name = 'large.bin'; Length = [int64]::MaxValue; Sha256 = ('0' * 64) })
+    $refused = $false
+    try { Get-RemainingDownloadBytes $overflow | Out-Null }
+    catch { $refused = $_.Exception.Message -match '^disk-test-exit:4 ' }
+    Assert-Disk $refused 'remaining plus margin overflow refuses'
+    $Catalog = Join-Path $Work 'overflow-catalog.txt'
+    [IO.File]::WriteAllText($Catalog, ('large.bin|9223372036854775807|' + ('0' * 64) + "`n"))
+    $refused = $false
+    try { Get-Catalog | Out-Null }
+    catch { $refused = $_.Exception.Message -match '^disk-test-exit:2 ' }
+    Assert-Disk $refused 'catalog plus margin overflow refuses'
+    Pass 'disk-admission' 'eight cached-resume-capacity-and-overflow scenarios without network'
+}
+
 try {
+    if ($DiskOnly) {
+        New-Item -ItemType Directory -Path $Work | Out-Null
+        Test-DiskAdmission
+        return
+    }
     if (-not (Get-Command python3 -ErrorAction SilentlyContinue)) { throw 'python3 is required for the local fixture server' }
     if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) { throw 'openssl is required for the local TLS redirect server' }
     $script:PwshPath = (Get-Command pwsh -ErrorAction Stop).Source
@@ -476,6 +593,7 @@ try {
     $status = Invoke-Fetch $d19 @('-CheckOnly') 2> (Join-Path $Work 'case19.err')
     if ($status -eq 4 -and [IO.File]::ReadAllText($ownerMarker) -eq 'another invocation owns this lock' -and (Get-Content (Join-Path $Work 'case19.err') -Raw) -notmatch 'LOCK_RELEASE_DEFERRED') { Pass '19' 'nonempty-contended-lock-untouched' }
     else { Fail '19' "nonempty-contended-lock-untouched exit=$status" }
+    Test-DiskAdmission
 } catch {
     Fail 'harness' $_.Exception.Message
 } finally {

@@ -20,6 +20,7 @@ $MarginBytes = [int64]67108864
 $script:LockDir = $null
 $script:LockOwned = $false
 $script:JournalDir = $null
+$script:VerifiedNames = @{}
 $UserAgent = 'franken_nlp-agent (+https://github.com/Dicklesworthstone/franken_nlp)'
 
 function Write-Log([string]$Message) {
@@ -77,18 +78,24 @@ function Get-Catalog {
         $lines = Get-Content -LiteralPath $Catalog
     } else { $lines = Get-DefaultCatalog }
     $seen = @{}
+    $total = [int64]0
     $entries = foreach ($line in $lines) {
         if (-not $line.Trim()) { continue }
         $parts = $line -split '\|', 3
         if ($parts.Count -ne 3 -or $parts[0] -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$' -or $parts[0] -match '\.\.' -or $parts[1] -notmatch '^\d+$' -or $parts[2] -notmatch '^[a-f0-9]{64}$' -or $seen.ContainsKey($parts[0])) {
             Exit-Fetch 2 "malformed catalog entry: $line"
         }
+        $length = [int64]0
+        if ($parts[1] -notmatch '^(0|[1-9][0-9]*)$' -or -not [int64]::TryParse($parts[1], [ref]$length) -or
+            $total -gt ([int64]::MaxValue - $MarginBytes - $length)) {
+            Exit-Fetch 2 'catalog byte total exceeds supported disk arithmetic'
+        }
+        $total += $length
         $seen[$parts[0]] = $true
-        [PSCustomObject]@{ Name = $parts[0]; Length = [int64]$parts[1]; Sha256 = $parts[2] }
+        [PSCustomObject]@{ Name = $parts[0]; Length = $length; Sha256 = $parts[2] }
     }
     if (-not $entries -or @($entries).Count -eq 0) { Exit-Fetch 2 'catalog has no entries' }
     if (-not $Catalog) {
-        $total = (@($entries) | Measure-Object -Property Length -Sum).Sum
         if (@($entries).Count -ne 10 -or $total -ne 8360887509) { Exit-Fetch 1 'embedded catalog invariant failed' }
     }
     return @($entries)
@@ -223,13 +230,56 @@ function Ensure-PartialAndJournal([string]$Partial, [string]$Journal, [string]$U
     if (-not (Test-SecureRegularFile $Partial) -or -not (Test-Journal $Journal $Url $Entry)) { Exit-Fetch 1 "partial/journal binding rejected name=$($Entry.Name)" }
 }
 
+function Initialize-VerifiedFiles($Entries) {
+    # Called once under the revision lock. A pathname or matching length alone
+    # never earns the cache or disk credit used by this invocation.
+    foreach ($entry in $Entries) {
+        $path = Join-Path $Dest $entry.Name
+        if ((Test-Path -LiteralPath $path) -and (Test-VerifiedFile $path $entry.Length $entry.Sha256)) {
+            $script:VerifiedNames[$entry.Name] = $true
+        }
+    }
+}
+
+function Get-RemainingDownloadBytes($Entries) {
+    $remaining = [int64]0
+    foreach ($entry in $Entries) {
+        if ($script:VerifiedNames.ContainsKey($entry.Name)) { continue }
+        $partial = Join-Path $Dest ($entry.Name + '.partial')
+        $journal = Join-Path $script:JournalDir ($entry.Name + '.journal')
+        $url = if ($TestBaseUrl) { $TestBaseUrl.TrimEnd('/') + '/' + $entry.Name } else { "$DefaultBase/$Revision/$($entry.Name)" }
+        $retained = [int64]0
+        if ((Test-SecureRegularFile $partial) -and (Test-Journal $journal $url $entry)) {
+            $retained = Get-Length $partial
+            if ($retained -lt 0 -or $retained -gt $entry.Length) { $retained = 0 }
+        }
+        # A journal-bound prefix earns storage credit only. The whole-file
+        # length and SHA-256 checks still decide whether it becomes a final.
+        $additional = $entry.Length - $retained
+        if ($remaining -gt ([int64]::MaxValue - $MarginBytes - $additional)) {
+            Exit-Fetch 4 'remaining source bytes exceed supported disk arithmetic'
+        }
+        $remaining += $additional
+    }
+    return $remaining
+}
+
+function Get-FreeBytes {
+    $free = (Get-Item -LiteralPath $Dest).PSDrive.Free
+    if ($null -eq $free -or $free -lt 0 -or $free -gt [int64]::MaxValue) {
+        Exit-Fetch 4 "cannot determine free space for $Dest"
+    }
+    return [int64]$free
+}
+
 function Assert-Preflight($Entries) {
-    $total = [int64](($Entries | Measure-Object -Property Length -Sum).Sum)
-    $largest = [int64](($Entries | Measure-Object -Property Length -Maximum).Maximum)
-    $free = [int64](Get-Item -LiteralPath $Dest).PSDrive.Free
-    $needed = $total + $largest + $MarginBytes
-    if ($free -lt $needed) { Exit-Fetch 4 "insufficient disk available=$free needed=$needed closure=$total staging=$largest margin=$MarginBytes" }
-    Write-Log "PREFLIGHT RESULT=PASS available=$free needed=$needed closure=$total staging=$largest margin=$MarginBytes"
+    $remaining = Get-RemainingDownloadBytes $Entries
+    $free = Get-FreeBytes
+    $needed = $remaining + $MarginBytes
+    # Same-directory rename adds no second payload. Existing quarantines
+    # already reduce the filesystem's reported free bytes.
+    if ($free -lt $needed) { Exit-Fetch 4 "insufficient disk available=$free needed=$needed remaining=$remaining additional_staging=0 margin=$MarginBytes" }
+    Write-Log "PREFLIGHT RESULT=PASS available=$free needed=$needed remaining=$remaining additional_staging=0 margin=$MarginBytes"
 }
 
 function Test-EffectiveHost([Uri]$Uri) {
@@ -334,14 +384,17 @@ function Download-Partial([string]$Url, [string]$Partial, [string]$Journal, $Ent
 }
 
 function Download-One($Entry, $Entries) {
-    Assert-Preflight $Entries
     $url = if ($TestBaseUrl) { $TestBaseUrl.TrimEnd('/') + '/' + $Entry.Name } else { "$DefaultBase/$Revision/$($Entry.Name)" }
     $final = Join-Path $Dest $Entry.Name
     $partial = "$final.partial"
     $journal = Join-Path $script:JournalDir ($Entry.Name + '.journal')
     Write-Log "START file=$($Entry.Name) expected_bytes=$($Entry.Length) url=$url"
+    if ($script:VerifiedNames.ContainsKey($Entry.Name)) { Write-Log "DECISION=HIT file=$($Entry.Name)"; return }
     if (Test-Path -LiteralPath $final) {
-        if (Test-VerifiedFile $final $Entry.Length $Entry.Sha256) { Write-Log "DECISION=HIT file=$($Entry.Name)"; return }
+        if (Test-VerifiedFile $final $Entry.Length $Entry.Sha256) {
+            $script:VerifiedNames[$Entry.Name] = $true
+            Write-Log "DECISION=HIT file=$($Entry.Name)"; return
+        }
         Quarantine $final 'existing-file-verification-failed'
     }
     Ensure-PartialAndJournal $partial $journal $url $Entry
@@ -352,10 +405,12 @@ function Download-One($Entry, $Entries) {
         Ensure-PartialAndJournal $partial $journal $url $Entry
         $start = 0
     }
+    Assert-Preflight $Entries
     Write-Log ("DECISION={0} file={1} existing_bytes={2} expected_bytes={3}" -f $(if ($start -gt 0) {'RESUME'} else {'MISS'}), $Entry.Name, $start, $Entry.Length)
     Download-Partial $url $partial $journal $Entry
     if (-not (Test-VerifiedFile $partial $Entry.Length $Entry.Sha256)) { Exit-Fetch 1 "digest/length verification failure file=$($Entry.Name) expected_bytes=$($Entry.Length) expected_sha256=$($Entry.Sha256)" }
     [IO.File]::Move($partial, $final)
+    $script:VerifiedNames[$Entry.Name] = $true
     Write-Log "COMPLETE file=$($Entry.Name) observed_bytes=$($Entry.Length) sha256=$($Entry.Sha256)"
 }
 
@@ -385,6 +440,7 @@ try { New-Item -ItemType Directory -Path $script:LockDir -ErrorAction Stop | Out
 catch { Exit-Fetch 4 "revision lock busy or stale path=$script:LockDir; do not bypass concurrent access" }
 $script:LockOwned = $true
 Write-Log "LOCK RESULT=PASS path=$script:LockDir"
+if (-not $CheckOnly) { Initialize-VerifiedFiles $entries }
 
 $failed = $false
 foreach ($entry in $entries) {

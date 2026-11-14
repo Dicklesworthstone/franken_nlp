@@ -12,6 +12,7 @@ DEFAULT_BASE="https://huggingface.co/Nanbeige/Nanbeige4.2-3B/resolve"
 TOTAL_DEFAULT=8360887509
 LARGEST_DEFAULT=4973547960
 MARGIN_BYTES=67108864
+MAX_BYTES=9223372036854775807
 
 DEST=$DEFAULT_DEST
 DEST_WAS_SET=0
@@ -23,6 +24,7 @@ TEST_BASE=
 LOCK_DIR=
 LOCK_OWNED=0
 JOURNAL_DIR=
+VERIFIED_NAMES=' '
 USER_AGENT='franken_nlp-agent (+https://github.com/Dicklesworthstone/franken_nlp)'
 
 log() {
@@ -95,6 +97,11 @@ catalog_lines() {
     fi
 }
 
+valid_byte_count() {
+    case "$1" in ''|*[!0-9]*|0[0-9]*) return 1;; esac
+    [ "${#1}" -le 19 ] && [ "$1" -le "$MAX_BYTES" ] 2>/dev/null
+}
+
 sha256() {
     if command -v sha256sum >/dev/null 2>&1; then
         sha256sum "$1" | awk '{print $1}'
@@ -161,11 +168,12 @@ catalog_stats() {
         case "$file" in
             *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-]*|.*|*"/"*|*".."*) fail 2 "malformed catalog filename=$file";;
         esac
-        case "$length" in ''|*[!0-9]*) fail 2 "malformed catalog length file=$file";; esac
+        valid_byte_count "$length" || fail 2 "malformed catalog length file=$file"
         case "$digest" in *[!0123456789abcdef]*) fail 2 "malformed catalog digest file=$file";; esac
         [ "${#digest}" -eq 64 ] || fail 2 "malformed catalog digest file=$file"
         case "$CATALOG_NAMES" in *" $file "*) fail 2 "duplicate catalog name=$file";; esac
         CATALOG_NAMES="$CATALOG_NAMES$file "
+        [ "$CATALOG_TOTAL" -le "$((MAX_BYTES - MARGIN_BYTES - length))" ] || fail 2 "catalog byte total exceeds supported disk arithmetic"
         CATALOG_TOTAL=$((CATALOG_TOTAL + length))
         [ "$length" -le "$CATALOG_LARGEST" ] || CATALOG_LARGEST=$length
         CATALOG_COUNT=$((CATALOG_COUNT + 1))
@@ -179,17 +187,62 @@ EOF
 }
 
 available_bytes() {
-    df -Pk "$DEST" | awk 'NR == 2 { print $4 * 1024 }'
+    df -Pk "$DEST" | awk 'NR == 2 { printf "%.0f\n", $4 * 1024 }'
+}
+
+verify_existing_closure() {
+    # Authenticate once under this invocation's revision lock. Only these
+    # exact catalog names may be excluded from subsequent disk admission.
+    while IFS='|' read -r inventory_name inventory_length inventory_digest; do
+        [ -n "$inventory_name" ] || continue
+        if { [ -e "$DEST/$inventory_name" ] || [ -L "$DEST/$inventory_name" ]; } &&
+            verify_file "$DEST/$inventory_name" "$inventory_length" "$inventory_digest"; then
+            VERIFIED_NAMES="$VERIFIED_NAMES$inventory_name "
+        fi
+    done <<EOF
+$(catalog_lines)
+EOF
+}
+
+remaining_download_bytes() {
+    # Called in a command substitution so journal helpers cannot change the
+    # active download's shell variables. A bound partial receives disk credit,
+    # never content authority: the complete SHA-256 gate still follows download.
+    remaining=0
+    while IFS='|' read -r space_name space_length space_digest; do
+        [ -n "$space_name" ] || continue
+        case "$VERIFIED_NAMES" in *" $space_name "*) continue;; esac
+        space_partial="$DEST/$space_name.partial"
+        space_journal="$JOURNAL_DIR/$space_name.journal"
+        if [ -n "$TEST_BASE" ]; then space_url="${TEST_BASE%/}/$space_name"
+        else space_url="$DEFAULT_BASE/$REVISION/$space_name"; fi
+        retained=0
+        if is_secure_regular "$space_partial" &&
+            journal_matches "$space_journal" "$space_url" "$space_name" "$space_length" "$space_digest"; then
+            retained=$(bytes "$space_partial") || return 1
+            valid_byte_count "$retained" || return 1
+            [ "$retained" -le "$space_length" ] || retained=0
+        fi
+        additional=$((space_length - retained))
+        [ "$remaining" -le "$((MAX_BYTES - MARGIN_BYTES - additional))" ] || return 1
+        remaining=$((remaining + additional))
+    done <<EOF
+$(catalog_lines)
+EOF
+    printf '%s\n' "$remaining"
 }
 
 preflight_space() {
+    remaining=$(remaining_download_bytes) || fail 4 "cannot determine remaining source bytes"
     available=$(available_bytes)
-    required=$((CATALOG_TOTAL + CATALOG_LARGEST + MARGIN_BYTES))
-    case "$available" in ''|*[!0-9]*) fail 4 "cannot determine free space for $DEST";; esac
+    valid_byte_count "$available" || fail 4 "cannot determine free space for $DEST"
+    required=$((remaining + MARGIN_BYTES))
+    # Partials become finals by same-directory rename: they are not a second
+    # payload copy. Existing quarantines already reduce measured free bytes.
     if [ "$available" -lt "$required" ]; then
-        fail 4 "insufficient disk available=$available needed=$required (closure=$CATALOG_TOTAL staging=$CATALOG_LARGEST margin=$MARGIN_BYTES)"
+        fail 4 "insufficient disk available=$available needed=$required (remaining=$remaining additional_staging=0 margin=$MARGIN_BYTES)"
     fi
-    log "PREFLIGHT RESULT=PASS available=$available needed=$required closure=$CATALOG_TOTAL staging=$CATALOG_LARGEST margin=$MARGIN_BYTES"
+    log "PREFLIGHT RESULT=PASS available=$available needed=$required remaining=$remaining additional_staging=0 margin=$MARGIN_BYTES"
 }
 
 acquire_lock() {
@@ -402,7 +455,6 @@ download_one() {
     name=$1
     length=$2
     digest=$3
-    preflight_space
     if [ -n "$TEST_BASE" ]; then
         url="${TEST_BASE%/}/$name"
     else
@@ -412,8 +464,10 @@ download_one() {
     partial="$DEST/$name.partial"
     journal="$JOURNAL_DIR/$name.journal"
     log "START file=$name expected_bytes=$length url=$url"
+    case "$VERIFIED_NAMES" in *" $name "*) log "DECISION=HIT file=$name"; return 0;; esac
     if [ -e "$final" ] || [ -L "$final" ]; then
         if verify_file "$final" "$length" "$digest"; then
+            VERIFIED_NAMES="$VERIFIED_NAMES$name "
             log "DECISION=HIT file=$name"
             return 0
         fi
@@ -427,6 +481,7 @@ download_one() {
         ensure_partial_and_journal "$partial" "$journal" "$url" "$name" "$length" "$digest"
         start=0
     fi
+    preflight_space
     log "DECISION=$([ "$start" -gt 0 ] && printf RESUME || printf MISS) file=$name existing_bytes=$start expected_bytes=$length"
     download_with_progress "$url" "$partial" "$length"
     curl_status=$?
@@ -435,6 +490,7 @@ download_one() {
         quarantine "$partial" "server-refused-range-resume"
         quarantine "$journal" "server-refused-range-resume"
         ensure_partial_and_journal "$partial" "$journal" "$url" "$name" "$length" "$digest"
+        preflight_space
         download_with_progress "$url" "$partial" "$length"
         curl_status=$?
     fi
@@ -447,6 +503,7 @@ download_one() {
     sync "$partial" 2>/dev/null || sync
     mv "$partial" "$final" || fail 1 "same-directory activation rename failed file=$name"
     sync "$final" 2>/dev/null || sync
+    VERIFIED_NAMES="$VERIFIED_NAMES$name "
     log "COMPLETE file=$name observed_bytes=$length sha256=$digest"
 }
 
@@ -485,6 +542,7 @@ fi
 ensure_destination
 catalog_stats
 acquire_lock
+if [ "$CHECK_ONLY" -eq 0 ]; then verify_existing_closure; fi
 
 status=0
 while IFS='|' read -r file length digest; do
