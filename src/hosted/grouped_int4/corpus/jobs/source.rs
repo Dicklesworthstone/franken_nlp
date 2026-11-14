@@ -92,8 +92,10 @@ impl NlpEngine {
         // The factory prices its complete planning context into task_ceiling.
         // Equality binds that context to the actual resident KV before any
         // population bytes are read or a private job directory is opened.
-        let required = job_requirements(model.model_identity().group_width(), planner.task_ceiling(),
-            request.limits, limits, request.mode.input_memory())?;
+        let required = with_encoding_workspace(
+            job_requirements(model.model_identity().group_width(), planner.task_ceiling(),
+                request.limits, limits, request.mode.input_memory())?,
+            planner.encoding_workspace_bytes())?;
         let team_scratch = compute_threads.map(|width|
             int4_task_team_workspace_bytes(width, model.model_identity().group_width()))
             .transpose()?.unwrap_or(0);
@@ -174,6 +176,16 @@ impl<R: BufRead> SourceJobExecution<R> {
             result, input, native: NativeJobCharges::Committed { _kv, _scratch }, lease,
         })
     }
+}
+
+// One transient encoder workspace coexists with the charged population and
+// native state. The original planner Arc keeps its cumulative ledger; this
+// host neither forks it per record nor refunds preparation/reconstruction.
+fn with_encoding_workspace(mut required: Requirements, workspace: u64)
+    -> Result<Requirements, HostedError> {
+    required.input_bytes = sum(&[required.input_bytes, workspace])?;
+    sum(&[required.input_bytes, required.native.kv_bytes, required.workspace_bytes])?;
+    Ok(required)
 }
 
 struct SourceJobAdmission<'a> { inner: CorpusAdmission<'a>, task_spec: &'a str }

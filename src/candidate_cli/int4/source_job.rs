@@ -8,6 +8,7 @@ use crate::{
     batch::source::{SourceMaskBudget, grouped_int4::Int4SourceBatchLimits},
     candidate_cli::{batch::IO_BUFFER_BYTES, jobs::{self as job_cli, Failure, RunMode}, source::Kind},
     jobs::{JobLimits, population::PopulationReadLimits},
+    tokenizer::untrusted::SafeBpeWorkLimits,
 };
 use super::extract_job::StorageArgs;
 
@@ -23,7 +24,51 @@ pub(super) struct JobArgs {
     source: source::SourceArgs,
     defaults: DefaultsArgs,
     storage: StorageArgs,
+    encoding: EncodingArgs,
 }
+
+/// One invocation allowance spans all records and every preparation pass.
+#[derive(Args, Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct EncodingArgs {
+    /// Total untrusted bytes encoded in this invocation; safe-bpe-v1 only, default 67108864.
+    #[arg(long)]
+    max_total_tokenizer_input_bytes: Option<u64>,
+    /// Total untrusted tokens encoded in this invocation; safe-bpe-v1 only, default 4194304.
+    #[arg(long)]
+    max_total_tokenizer_output_tokens: Option<u64>,
+    /// Total BPE pair checks in this invocation; safe-bpe-v1 only, default 268435456.
+    #[arg(long)]
+    max_total_tokenizer_pair_checks: Option<u64>,
+    /// Total examined pair bytes in this invocation; safe-bpe-v1 only, default 4294967296.
+    #[arg(long)]
+    max_total_tokenizer_pair_bytes: Option<u64>,
+}
+impl EncodingArgs {
+    fn limits(self, args: &Int4Args) -> Result<Option<SafeBpeWorkLimits>, Failure> {
+        if args.input_encoding.is_default() {
+            return if self == Self::default() { Ok(None) }
+                else { Err(Failure::usage("source_job_input_encoding")) };
+        }
+        let limits = SafeBpeWorkLimits {
+            max_input_bytes: self.max_total_tokenizer_input_bytes.unwrap_or(64 * MIB),
+            max_output_tokens: self.max_total_tokenizer_output_tokens.unwrap_or(4 * MIB),
+            max_pair_checks: self.max_total_tokenizer_pair_checks.unwrap_or(256 * MIB),
+            max_pair_bytes: self.max_total_tokenizer_pair_bytes.unwrap_or(4096 * MIB),
+        };
+        limits.validate().map_err(|_| Failure::usage("source_job_tokenizer_work"))?;
+        Ok(Some(limits))
+    }
+    fn workspace_bytes(self, args: &Int4Args, max_prompt_tokens: usize) -> Result<u64, Failure> {
+        let workspace = args.input_encoding.workspace_bytes(args.max_input_bytes, max_prompt_tokens)?;
+        // Match the composed source encoder's 1024-byte owner/counter allowance.
+        // The actual factory quote is checked again before snapshot/job IO.
+        match self.limits(args)? {
+            None => Ok(0),
+            Some(_) => sum(&[workspace, 1024]).map_err(Failure::from),
+        }
+    }
+}
+
 #[derive(Args)]
 struct DefaultsArgs {
     /// Complete SourceBatchArgs JSON, including task, options, budget and any QA passages.
@@ -46,8 +91,8 @@ pub(super) fn definition(kind: Kind) -> clap::Command {
             .mut_arg("max_input_bytes", |arg| arg.help("Outer cap for each complete NDJSON record and decoded source input; immutable stored input ceiling must fit"))
             .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoints for this invocation; persisted work and attempts never renew"))))
             .mut_arg("store_results", |arg| arg.help("Required consent to retain private source-task results in the owner-only spool"));
-        compute::definition(command)
-            .after_long_help("--compute-threads 1..=64 selects one persistent numerical team for the complete authenticated invocation; one retains serial execution. All pending records, constrained tokens, durable commits and optional materialization share that team. Worker scratch and process thread capacity are admitted before private IO. Width is physical metadata and may change on explicit resume without changing recipes or refunding native/mask work or attempts. Native cohorts, prompt-prefill schedules and compact input remain refused. Metadata is published only after every worker joins and while the original deadline and cancellation remain valid.")
+        input_encoding::definition(EncodingArgs::augment_args(compute::definition(command)))
+            .after_long_help("--compute-threads 1..=64 selects one persistent numerical team for the complete authenticated invocation; one retains serial execution. All pending records, constrained tokens, durable commits and optional materialization share that team. Worker scratch and process thread capacity are admitted before private IO. Width is physical metadata and may change on explicit resume without changing recipes or refunding native/mask work or attempts. Explicit --input-encoding safe-bpe-v1 compacts untrusted source input while preserving every original byte and excluding template controls. QA question, passage manifest and joined evidence share the same per-record tokenizer allowance. One cumulative --max-total-tokenizer-* invocation ledger spans every record, failed preparation and reconstruction; record boundaries and host transfer never reset it. The exact policy and all per-record and total caps bind the authenticated recipe. Resume admits the same declared bounded tokenizer allowance while persisted native/mask work and attempts remain spent. Encoder workspace is admitted before private IO. Compact tokens may change model output and imply no parity, quality or speed claim. Native cohorts and prompt-prefill schedules remain refused. Metadata is published only after every worker joins and while the original deadline and cancellation remain valid.")
     };
     let start = operation("start", "Create a new explicitly retained source-task INT4 job");
     let resume = operation("resume", "Authenticate the complete original population and execute pending INT4 source tasks")
@@ -68,6 +113,7 @@ pub(super) struct JobExecutionLimits {
     pub io_reserve_bytes: u64,
     pub journal_reserve_bytes: u64,
     pub serialization_reserve_bytes: u64,
+    pub encoding_workspace_bytes: u64,
 }
 impl JobArgs {
     /// Pure admission, before reading private files or constructing the host.
@@ -85,12 +131,10 @@ impl JobArgs {
             || self.defaults.defaults.as_deref().is_some_and(|path| !local(path)) {
             return Err(Failure::usage("source_job_defaults"));
         }
-        // This workflow binds a complete resident KV and full projection.
-        // Only worker width is configurable; prefill/cohort and compact-input
-        // policies require their own authenticated planning contracts.
-        if args.prefill()?.is_some() || !args.input_encoding.is_default() {
-            return Err(CandidateError::Arguments.into());
-        }
+        // Complete resident KV and full projection remain invariant. Compact
+        // input uses the factory's independently authenticated invocation ledger.
+        if args.prefill()?.is_some() { return Err(CandidateError::Arguments.into()); }
+        self.encoding.limits(args)?;
         let common = self.source.validate_batch_with_prefill(args).map_err(Failure::from)?;
         for mib in [s.journal_memory_mib, s.serialization_memory_mib] {
             if mib.checked_mul(MIB).is_none_or(|bytes| bytes > common.memory_bytes) {
@@ -131,13 +175,14 @@ impl JobArgs {
             self.storage.input_retention.buffer_bytes(job)?,
             preparation_reserve_bytes, io_reserve_bytes, journal_reserve_bytes, serialization_reserve_bytes,
         ]).map_err(|_| Failure::usage("job_memory_arithmetic"))?;
-        common.minimum_memory_bytes = common.minimum_memory_bytes.checked_add(buffer_bytes)
-            .ok_or_else(|| Failure::usage("job_memory_arithmetic"))?;
+        let encoding_workspace_bytes = self.encoding.workspace_bytes(args, common.max_prompt_tokens)?;
+        common.minimum_memory_bytes = sum(&[common.minimum_memory_bytes, buffer_bytes,
+            encoding_workspace_bytes]).map_err(|_| Failure::usage("job_memory_arithmetic"))?;
         if common.minimum_memory_bytes > common.memory_bytes {
             return Err(Failure { exit: ErrorCode::AdmissionOrResourceLimit, code: "job_population_memory" });
         }
         Ok(JobExecutionLimits { common, transport, native, buffer_bytes, preparation_reserve_bytes,
-            io_reserve_bytes, journal_reserve_bytes, serialization_reserve_bytes })
+            io_reserve_bytes, journal_reserve_bytes, serialization_reserve_bytes, encoding_workspace_bytes })
     }
 }
 impl JobCommand {
@@ -154,9 +199,11 @@ impl JobCommand {
                 "source jobs use complete --defaults or per-record task_args, not --options"));
         }
         let args = JobArgs { kind, source: source::SourceArgs::from_matches(matches)?,
-            defaults: DefaultsArgs::from_arg_matches(matches)?, storage: StorageArgs::from_arg_matches(matches)? };
+            defaults: DefaultsArgs::from_arg_matches(matches)?, storage: StorageArgs::from_arg_matches(matches)?,
+            encoding: EncodingArgs::from_arg_matches(matches)? };
         let mut native = Int4Args::from_arg_matches(matches)?;
         native.compute = compute::Args::from_matches(matches)?;
+        native.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
         Ok((Self { mode, args }, native))
     }
     pub(super) fn run_owned<R: Read + Send + 'static>(self, args: Int4Args, input: R,

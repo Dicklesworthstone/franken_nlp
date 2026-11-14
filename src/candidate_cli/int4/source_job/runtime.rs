@@ -10,6 +10,7 @@ use crate::{
         corpus::jobs::{HostedJobError, JobHostLimits, SourceJobRequest}},
     jobs::{JobError, JobSecret, runner::source::grouped_int4::Int4SourceJobPlanner},
     native_engine::strict_int4::{StrictInt4Error, weights::snapshot::INT4_SNAPSHOT_VERSION},
+    tokenizer::untrusted::UntrustedEncoding,
 };
 
 pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
@@ -46,10 +47,20 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let model = super::super::runtime::load_model(&engine, &args, common, remaining()?, cancellation.clone())?;
     remaining()?;
     let (source_planner, vocabulary) = source::planner()?;
-    let planner = Int4SourceJobPlanner::for_model(model.model_identity(), Arc::new(source_planner),
-        source::task(job.kind), budget, job.source.planning(&args), defaults, limits.native)
-        .map_err(|_| CandidateError::Planning)?;
+    let encoding = args.input_encoding.policy(args.max_input_bytes, common.max_prompt_tokens)?;
+    let encoding_work_limits = job.encoding.limits(&args)?;
+    // This single original Arc owns the complete invocation allowance. Do not
+    // fork the composed encoder at record, compiler or hosted-run boundaries.
+    let source_planner = match encoding_work_limits {
+        Some(work) => source_planner.with_map_document_encoding(encoding.clone(), work)
+            .map_err(|_| CandidateError::Planning)?,
+        None => source_planner,
+    };
+    let planner = Int4SourceJobPlanner::for_model_with_document_encoding(model.model_identity(),
+        Arc::new(source_planner), source::task(job.kind), budget,
+        job.source.planning(&args), defaults, limits.native).map_err(|_| CandidateError::Planning)?;
     planner.check_job_limits(lifetime).map_err(|_| CandidateError::Planning)?;
+    check_encoding_quote(&planner, &encoding, encoding_work_limits, limits.encoding_workspace_bytes)?;
     remaining()?;
     let identity = planner.execution_identity().clone();
     let mut snapshot = common.snapshot_pin.map(|_| SnapshotRecord::new("loaded", common.snapshot_need));
@@ -90,11 +101,21 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         model_content_sha256: &content, candidate_format: &identity.artifact_format,
         quant_recipe: &identity.quant_recipe, group_width: model.model_identity().group_width(),
         integer_kernel: common.kernel.kind().id(), snapshot,
+        input_encoding: input_encoding::reported_policy(&encoding), encoding_work_limits,
         compute_schedule: compute::Schedule::for_threads(common.compute.threads), output: &report,
     };
     // Metadata only. Delivery/flush failure may follow durable commits and
     // never authorizes retry without the authenticated resume path.
     publish_report(&response, output, &remaining, &cancellation)
+}
+
+fn check_encoding_quote(planner: &Int4SourceJobPlanner, encoding: &UntrustedEncoding,
+    total: Option<SafeBpeWorkLimits>, workspace: u64) -> Result<(), Failure> {
+    if planner.document_encoding() != encoding || planner.encoding_work_limits() != total
+        || planner.encoding_workspace_bytes() != workspace {
+        return Err(Failure::usage("source_job_tokenizer_quote"));
+    }
+    Ok(())
 }
 
 fn execution_failure(error: HostedJobError) -> Failure {
@@ -173,6 +194,10 @@ struct Response<'a, T: Serialize> {
     snapshot: Option<SnapshotRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compute_schedule: Option<compute::Schedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<&'a UntrustedEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding_work_limits: Option<SafeBpeWorkLimits>,
     output: &'a T,
 }
 #[cfg(test)]

@@ -32,6 +32,13 @@ fn lifetime(job: &JobArgs, args: &Int4Args, common: Int4Limits) -> JobLimits {
         max_journal_bytes: 64 * MIB, max_attempts: 5,
         max_work: JobWork::from_int4(work, job.source.mask_visits() * 3) }
 }
+fn assert_same_native_limits(left: Int4SourceBatchLimits, right: Int4SourceBatchLimits) {
+    assert_eq!(left.max_model_work, right.max_model_work);
+    assert_eq!(left.masks.max_visits_per_item, right.masks.max_visits_per_item);
+    assert_eq!(left.masks.max_visits_per_run, right.masks.max_visits_per_run);
+    assert_eq!(left.masks.per_mask.max_trie_node_visits, right.masks.per_mask.max_trie_node_visits);
+    assert_eq!(left.masks.per_mask.checkpoint_interval_nodes, right.masks.per_mask.checkpoint_interval_nodes);
+}
 struct NoRead;
 impl Read for NoRead {
     fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private input accessed before admission"); }
@@ -297,7 +304,7 @@ fn persistent_source_job_width_preserves_every_semantic_and_lifetime_limit() {
                 assert_eq!(common.native, serial_common.native);
                 assert_eq!(c.args.source.budget(&args, common),
                     serial.args.source.budget(&serial_args, serial_common));
-                assert_eq!(limits.native, serial_limits.native);
+                assert_same_native_limits(limits.native, serial_limits.native);
                 assert_eq!(limits.buffer_bytes, serial_limits.buffer_bytes);
                 assert_eq!(limits.transport, serial_limits.transport);
                 assert!(limits.common.minimum_memory_bytes >= serial_limits.common.minimum_memory_bytes);
@@ -347,7 +354,7 @@ fn resumed_source_jobs_keep_lifetime_work_when_worker_width_changes() {
         let fixed = lifetime(&start.args, &start_args, start_common);
         let first = start.args.lifetime_limits(&start_args, start_common, fixed).unwrap();
         let next = resume.args.lifetime_limits(&resume_args, resume_common, fixed).unwrap();
-        assert_eq!(first.native, next.native);
+        assert_same_native_limits(first.native, next.native);
         assert_eq!(first.buffer_bytes, next.buffer_bytes);
         assert_eq!(start.args.source.budget(&start_args, start_common),
             resume.args.source.budget(&resume_args, resume_common));
@@ -355,5 +362,90 @@ fn resumed_source_jobs_keep_lifetime_work_when_worker_width_changes() {
         boundary.memory_bytes = next.common.minimum_memory_bytes - 1;
         assert_eq!(resume.args.lifetime_limits(&resume_args, boundary, fixed).unwrap_err().code,
             "job_population_memory");
+    }
+}
+
+
+#[test]
+fn compact_source_jobs_parse_fixed_call_and_invocation_caps_for_all_tasks_and_widths() {
+    use crate::tokenizer::untrusted::UntrustedEncoding;
+    for kind in [Kind::Ner, Kind::Keyphrases, Kind::Summarize, Kind::Answer] {
+        for operation in ["start", "resume"] {
+            for width in ["1", "4"] {
+                let (c, args) = command(kind, operation, &["--compute-threads", width,
+                    "--max-input-bytes", "8192", "--input-encoding", "safe-bpe-v1",
+                    "--max-tokenizer-pair-checks", "7777", "--max-tokenizer-pair-bytes", "65536",
+                    "--max-total-tokenizer-input-bytes", "32768",
+                    "--max-total-tokenizer-output-tokens", "16384",
+                    "--max-total-tokenizer-pair-checks", "100000",
+                    "--max-total-tokenizer-pair-bytes", "1000000"]);
+                let common = c.args.validate(&args).unwrap();
+                let UntrustedEncoding::SafeBpeV1(call) = args.input_encoding.policy(
+                    args.max_input_bytes, common.max_prompt_tokens).unwrap() else { panic!("wrong input policy"); };
+                assert_eq!(call.max_input_bytes, 8192);
+                assert_eq!(call.max_output_tokens, common.max_prompt_tokens);
+                assert_eq!(call.max_pair_checks, 7777);
+                assert_eq!(call.max_pair_bytes, 65536);
+                assert_eq!(c.args.encoding.limits(&args).unwrap(), Some(SafeBpeWorkLimits {
+                    max_input_bytes: 32768, max_output_tokens: 16384,
+                    max_pair_checks: 100000, max_pair_bytes: 1000000 }));
+                assert_eq!(c.args.encoding.workspace_bytes(&args, common.max_prompt_tokens).unwrap(),
+                    call.requirements().unwrap().workspace_bytes + 1024);
+                assert_eq!(common.compute.threads.to_string(), width);
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_or_unselected_compact_work_caps_refuse_before_private_source_job_io() {
+    for kind in [Kind::Ner, Kind::Keyphrases, Kind::Summarize, Kind::Answer] {
+        for flag in ["--max-total-tokenizer-input-bytes", "--max-total-tokenizer-output-tokens",
+            "--max-total-tokenizer-pair-checks", "--max-total-tokenizer-pair-bytes"] {
+            let (c, args) = command(kind, "start", &[flag, "1"]);
+            assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().code,
+                "source_job_input_encoding");
+            for value in ["0", "18446744073709551615"] {
+                let (c, args) = command(kind, "resume",
+                    &["--input-encoding", "safe-bpe-v1", flag, value]);
+                assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().code,
+                    "source_job_tokenizer_work");
+            }
+        }
+        for flag in ["--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
+            let (c, args) = command(kind, "resume",
+                &["--input-encoding", "safe-bpe-v1", "--max-input-bytes", "8192", flag, "0"]);
+            assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().exit, ErrorCode::Usage);
+        }
+    }
+}
+
+#[test]
+fn compact_workspace_adds_to_full_and_retained_input_without_renewing_native_work() {
+    for retained in [false, true] {
+        let mut options = vec!["--max-input-bytes", "8192", "--compute-threads", "4"];
+        if retained { options.extend(["--use-retained-input", "--max-retained-input-mib", "16"]); }
+        let (byte, byte_args) = command(Kind::Answer, "resume", &options);
+        let common = byte.args.validate(&byte_args).unwrap();
+        let fixed = lifetime(&byte.args, &byte_args, common);
+        let baseline = byte.args.lifetime_limits(&byte_args, common, fixed).unwrap();
+        assert_eq!(byte.args.encoding.limits(&byte_args).unwrap(), None);
+        assert_eq!(baseline.encoding_workspace_bytes, 0);
+        options.extend(["--input-encoding", "safe-bpe-v1"]);
+        let (compact, args) = command(Kind::Answer, "resume", &options);
+        let common = compact.args.validate(&args).unwrap();
+        let selected = compact.args.lifetime_limits(&args, common, fixed).unwrap();
+        assert!(selected.encoding_workspace_bytes > 1024);
+        assert_eq!(selected.buffer_bytes, baseline.buffer_bytes);
+        assert_same_native_limits(selected.native, baseline.native);
+        assert_eq!(selected.common.compute, baseline.common.compute);
+        assert_eq!(selected.common.native, baseline.common.native);
+        assert_eq!(selected.common.minimum_memory_bytes,
+            baseline.common.minimum_memory_bytes + selected.encoding_workspace_bytes);
+        let mut short = common; short.memory_bytes = selected.common.minimum_memory_bytes - 1;
+        assert_eq!(compact.args.lifetime_limits(&args, short, fixed).unwrap_err().code,
+            "job_population_memory");
+        short.memory_bytes += 1;
+        assert!(compact.args.lifetime_limits(&args, short, fixed).is_ok());
     }
 }

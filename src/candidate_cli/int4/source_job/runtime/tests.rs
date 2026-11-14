@@ -112,7 +112,7 @@ fn all_tasks_publish_only_authenticated_progress_and_public_model_provenance() {
             candidate_format: "fixture-candidate-format", quant_recipe: "fixture-grouped-int4",
             group_width: args.group_width, integer_kernel: common.kernel.kind().id(),
             snapshot: Some(SnapshotRecord::new("loaded", common.snapshot_need)),
-            compute_schedule: None, output: &report,
+            compute_schedule: None, input_encoding: None, encoding_work_limits: None, output: &report,
         };
         let mut bytes = Vec::new(); publish(&response, job_cli::REPORT_BYTES, &mut bytes).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -122,6 +122,8 @@ fn all_tasks_publish_only_authenticated_progress_and_public_model_provenance() {
         assert_eq!(value["group_width"], args.group_width);
         assert_eq!(value["snapshot"]["format"], INT4_SNAPSHOT_VERSION);
         assert!(value.get("compute_schedule").is_none());
+        assert!(value.get("input_encoding").is_none());
+        assert!(value.get("encoding_work_limits").is_none());
         assert_eq!(value["output"]["attempts"], 3); assert_eq!(value["output"]["committed"], 2);
         assert_eq!(value["output"]["reserved_work"], serde_json::to_value(limits.max_work).unwrap());
         for private in ["text", "passages", "options", "key", "job_dir", "defaults", "results", "documents"] {
@@ -129,6 +131,21 @@ fn all_tasks_publish_only_authenticated_progress_and_public_model_provenance() {
         }
         assert!(bytes.ends_with(b"\n"));
         assert_eq!(publish(&response, 1, &mut NoWrite), Err(CandidateError::Output));
+        let policy = UntrustedEncoding::SafeBpeV1(crate::tokenizer::untrusted::SafeBpeLimits {
+            max_input_bytes: 8192, max_output_tokens: 4096,
+            max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24,
+        });
+        let total = SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 32_768,
+            max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 };
+        let compact = Response { input_encoding: Some(&policy),
+            encoding_work_limits: Some(total), ..response };
+        let mut bytes = Vec::new(); publish(&compact, job_cli::REPORT_BYTES, &mut bytes).unwrap();
+        let mut selected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(selected["input_encoding"], serde_json::to_value(policy).unwrap());
+        assert_eq!(selected["encoding_work_limits"], serde_json::to_value(total).unwrap());
+        selected.as_object_mut().unwrap().remove("input_encoding");
+        selected.as_object_mut().unwrap().remove("encoding_work_limits");
+        assert_eq!(selected, value);
     }
 }
 
@@ -286,7 +303,8 @@ fn worker_schedule_is_optional_physical_metadata_only() {
             source_root_sha256: &source, model_content_sha256: &content,
             candidate_format: "fixture-candidate-format", quant_recipe: "fixture-grouped-int4",
             group_width: args.group_width, integer_kernel: common.kernel.kind().id(),
-            snapshot: None, compute_schedule: compute::Schedule::for_threads(width), output: &report,
+            snapshot: None, compute_schedule: compute::Schedule::for_threads(width),
+            input_encoding: None, encoding_work_limits: None, output: &report,
         };
         let mut bytes = Vec::new();
         publish_report(&response, &mut bytes, &|| Ok(Duration::from_secs(1)),

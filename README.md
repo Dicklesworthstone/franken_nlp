@@ -3923,6 +3923,28 @@ Library callers use `NlpEngine::job_int4_source_with_threads` for the same
 worker path. Byte-preserving input and the existing full-projection,
 sequential-prompt planning contract remain in force.
 
+All four retained source tasks also accept explicit
+`--input-encoding safe-bpe-v1`. Original source bytes remain exact and template
+controls stay excluded; QA question, passage manifest and joined evidence
+share the per-record `--max-tokenizer-*` allowance. One original planner owns
+the cumulative ledger across every record, compiler reconstruction, failed
+preparation and hosted transfer. Its four invocation ceilings are
+`--max-total-tokenizer-input-bytes`,
+`--max-total-tokenizer-output-tokens`,
+`--max-total-tokenizer-pair-checks` and
+`--max-total-tokenizer-pair-bytes` (defaults 67108864, 4194304, 268435456
+and 4294967296 respectively). The private recipe authenticates all eight caps;
+resume refuses changes before replay or tail repair.
+
+Encoder workspace and its retained counter owner are admitted alongside the
+population and native state, with the CLI quote checked against the actual
+factory. A resumed invocation receives the same declared tokenizer allowance;
+native/mask lifetime work and attempts remain spent. Byte fallback remains
+the default, with unchanged recipe and report serialization. Compact tokens
+can change model output and make no quality or speed claim. Library callers
+use `Int4SourceJobPlanner::for_model_with_document_encoding` with an original
+`SourceTaskPlanner::with_map_document_encoding` owner and fixed total limits.
+
 The library entry points are the sealed `Int4SourceJobPlanner::for_model`
 and `NlpEngine::job_int4_source`, with `SourceJobRequest` and
 `JobHostLimits`. Planning binds the real resident model and complete fixed

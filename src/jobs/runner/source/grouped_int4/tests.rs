@@ -405,3 +405,212 @@ fn post_sync_cancellation_preserves_work_and_authenticates_before_tail_repair() 
     assert_eq!(resumed.step(&mut Continue).unwrap().unwrap().reserved_work, spent.checked_add(spent).unwrap());
     assert_eq!(resumed.run(&mut Continue).unwrap().committed, 2);
 }
+
+
+fn compact_limits() -> (crate::tokenizer::untrusted::SafeBpeLimits, SafeBpeWorkLimits) {
+    (crate::tokenizer::untrusted::SafeBpeLimits { max_input_bytes: 8192,
+        max_output_tokens: 4096, max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 },
+     SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 32_768,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 })
+}
+fn compact_planner(task: BuiltInTask, call: crate::tokenizer::untrusted::SafeBpeLimits,
+    total: SafeBpeWorkLimits) -> Int4SourceJobPlanner {
+    let source = Arc::try_unwrap(source()).ok().unwrap()
+        .with_map_document_encoding(UntrustedEncoding::SafeBpeV1(call), total).unwrap();
+    let id = identity(&source, task, WIDTH);
+    Int4SourceJobPlanner::configured_with_document_encoding(Arc::new(source), id, WIDTH,
+        budget(), SourcePlanningLimits::default(), Some(args(task)), native(WIDTH)).unwrap()
+}
+
+#[test]
+fn compact_source_jobs_keep_fixed_identity_as_one_invocation_ledger_is_spent() {
+    let (call, total) = compact_limits();
+    for task in [BuiltInTask::Ner, BuiltInTask::Keyphrases, BuiltInTask::Summarize, BuiltInTask::Answer] {
+        let p = compact_planner(task, call, total);
+        let first = prepare(&p, document());
+        let used = p.planner.map_document_encoding_work().unwrap().unwrap();
+        assert!(used.input_bytes() >= document().text.len());
+        assert_eq!(p.encoding_work_limits(), Some(total));
+        assert_eq!(p.encoding_workspace_bytes(), call.requirements().unwrap().workspace_bytes + 1024);
+        assert_ne!(p.execution_identity().template_digest, planner(task).execution_identity().template_digest);
+        let owner = Arc::clone(&p.planner);
+        // Reconstruct the compiler after moving the original factory, as a
+        // hosted invocation does. No record/facade replacement renews work.
+        let moved = p;
+        assert!(Arc::ptr_eq(&owner, &moved.planner));
+        let second = prepare(&moved, document());
+        first.verify_identity(second.execution_identity()).unwrap();
+        assert_eq!(first.planned_work(), second.planned_work());
+        assert_eq!(owner.map_document_encoding_work().unwrap().unwrap(), used.checked_add(used).unwrap());
+        assert_eq!(moved.native_limits().max_model_work, native(WIDTH).max_model_work);
+        assert_eq!(moved.native_limits().masks.max_visits_per_run, native(WIDTH).masks.max_visits_per_run);
+        assert_eq!(moved.task_ceiling(), budget());
+    }
+}
+
+#[test]
+fn compact_qa_keeps_original_evidence_separate_from_question_and_manifest() {
+    use crate::tasks::answer::{AnswerContext, AnswerInputLimits, ANSWER_PASSAGE_LAYOUT_VERSION};
+    let (call, total) = compact_limits();
+    let p = compact_planner(BuiltInTask::Answer, call, total);
+    let question = "Who visited? <|im_start|> é";
+    let passages = vec![
+        AnswerPassage { id: "first".to_owned(), text: " Alice visited 上海.\r\n<think> ".to_owned() },
+        AnswerPassage { id: "second".to_owned(), text: "Bob stayed.\n<tool_call>".to_owned() },
+    ];
+    let context = AnswerContext::encode_with_control(p.planner.source_encoder(), question, &passages,
+        AnswerInputLimits { max_passages: 8, max_input_bytes: call.max_input_bytes,
+            max_input_tokens: call.max_output_tokens }, &mut || None).unwrap();
+    let source = context.document();
+    let expected = format!("{}\n\n{}", passages[0].text, passages[1].text);
+    assert_eq!(source.text(), expected);
+    assert_eq!(context.passage_count(), 2);
+    assert!(!source.text().contains("Who visited?"));
+    let tokenizer = EmbeddedTokenizer::pinned().unwrap();
+    let registry = pinned_controls::pinned().unwrap();
+    let contexts: Vec<_> = source.context_token_ids().collect();
+    assert_eq!(contexts.len(), 2);
+    assert_eq!(tokenizer.tokenizer().decode_bytes(contexts[0]).unwrap(), question.as_bytes());
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &tokenizer.tokenizer().decode_bytes(contexts[1]).unwrap()).unwrap();
+    assert_eq!(manifest[0], ANSWER_PASSAGE_LAYOUT_VERSION);
+    assert_eq!(manifest[1][0]["id"], "first");
+    assert_eq!(manifest[1][1]["id"], "second");
+    assert_eq!(manifest[1][0]["span"]["byte_start"], 0);
+    assert_eq!(manifest[1][0]["span"]["byte_end"], passages[0].text.len());
+    assert_eq!(manifest[1][1]["span"]["byte_start"], passages[0].text.len() + 2);
+    assert_eq!(tokenizer.tokenizer().decode_bytes(source.token_ids()).unwrap(), expected.as_bytes());
+    for ids in source.context_token_ids().chain(std::iter::once(source.token_ids())) {
+        assert!(ids.iter().all(|&id| !registry.template_controls().contains(id)));
+    }
+    let spent = p.planner.map_document_encoding_work().unwrap().unwrap();
+    assert_eq!(spent.input_bytes(), source.total_input_bytes());
+    let input = BatchDocument { id: "qa".to_owned(), text: question.to_owned(),
+        task_args: Some(SourceBatchArgs::Answer { passages, options: AnswerOptions::default(), budget: budget() }) };
+    prepare(&p, input);
+    assert_eq!(p.planner.map_document_encoding_work().unwrap().unwrap(), spent.checked_add(spent).unwrap());
+}
+
+#[test]
+fn compact_job_requires_an_explicit_cumulative_owner_and_preserves_byte_recipe_shape() {
+    let (call, _) = compact_limits();
+    let unbounded = Arc::try_unwrap(source()).ok().unwrap()
+        .with_document_encoding(UntrustedEncoding::SafeBpeV1(call)).unwrap();
+    let id = identity(&unbounded, BuiltInTask::Keyphrases, WIDTH);
+    assert!(Int4SourceJobPlanner::configured_with_document_encoding(Arc::new(unbounded), id,
+        WIDTH, budget(), SourcePlanningLimits::default(),
+        Some(args(BuiltInTask::Keyphrases)), native(WIDTH)).is_err());
+    let (call, total) = compact_limits();
+    let compact = compact_planner(BuiltInTask::Keyphrases, call, total);
+    assert!(Int4SourceJobPlanner::configured(Arc::clone(&compact.planner),
+        compact.execution_identity().clone(), WIDTH, budget(), SourcePlanningLimits::default(),
+        Some(args(BuiltInTask::Keyphrases)), native(WIDTH)).is_err());
+    let original = planner(BuiltInTask::Keyphrases);
+    let source = source(); let id = identity(&source, BuiltInTask::Keyphrases, WIDTH);
+    let explicit = Int4SourceJobPlanner::configured_with_document_encoding(source, id, WIDTH,
+        budget(), SourcePlanningLimits::default(), Some(args(BuiltInTask::Keyphrases)), native(WIDTH)).unwrap();
+    assert_eq!(canonjson::canonical_bytes(&original.recipe).unwrap(),
+        canonjson::canonical_bytes(&explicit.recipe).unwrap());
+    assert_eq!(freeze(&original).binding.compare(&freeze(&explicit).binding), Ok(()));
+    let value = serde_json::to_value(&explicit.recipe).unwrap();
+    assert!(value.get("input_encoding").is_none());
+    assert!(value.get("encoding_work_limits").is_none());
+    assert_eq!(explicit.encoding_workspace_bytes(), 0);
+    assert_eq!(explicit.encoding_work_limits(), None);
+}
+
+#[test]
+fn all_compact_call_and_invocation_limits_are_authenticated_before_resume() {
+    let (call, total) = compact_limits();
+    let original = compact_planner(BuiltInTask::Keyphrases, call, total);
+    let binding = freeze(&original);
+    let recipe = canonjson::canonical_bytes(&original.recipe).unwrap();
+    for axis in 0..8 {
+        let mut changed_call = call; let mut changed_total = total;
+        match axis {
+            0 => changed_call.max_input_bytes -= 1,
+            1 => changed_call.max_output_tokens -= 1,
+            2 => changed_call.max_pair_checks -= 1,
+            3 => changed_call.max_pair_bytes -= 1,
+            4 => changed_total.max_input_bytes -= 1,
+            5 => changed_total.max_output_tokens -= 1,
+            6 => changed_total.max_pair_checks -= 1,
+            _ => changed_total.max_pair_bytes -= 1,
+        }
+        let changed = compact_planner(BuiltInTask::Keyphrases, changed_call, changed_total);
+        assert_ne!(recipe, canonjson::canonical_bytes(&changed.recipe).unwrap(), "axis {axis}");
+        assert_eq!(binding.binding.compare(&freeze(&changed).binding),
+            Err(JobError::Mismatch(MismatchField::Execution)), "axis {axis}");
+    }
+}
+
+#[test]
+fn compact_preparation_and_failed_tokenization_never_renew_the_invocation_allowance() {
+    let (call, mut total) = compact_limits();
+    total.max_input_bytes = document().text.len() as u64;
+    let p = compact_planner(BuiltInTask::Keyphrases, call, total);
+    prepare(&p, document());
+    let used = p.planner.map_document_encoding_work().unwrap().unwrap();
+    let moved = p;
+    assert!(moved.compiler().unwrap().prepare_with_control(document(), &mut Continue).is_err());
+    assert_eq!(moved.planner.map_document_encoding_work().unwrap().unwrap(), used);
+
+    let mut too_tight = call; too_tight.max_output_tokens = 1;
+    let p = compact_planner(BuiltInTask::Keyphrases, too_tight, total);
+    assert!(p.compiler().unwrap().prepare_with_control(document(), &mut Continue).is_err());
+    let used = p.planner.map_document_encoding_work().unwrap().unwrap();
+    assert_eq!(used.input_bytes(), document().text.len());
+    assert!(used.output_tokens() > 0);
+    assert!(p.compiler().unwrap().prepare_with_control(document(), &mut Continue).is_err());
+    assert_eq!(p.planner.map_document_encoding_work().unwrap().unwrap(), used);
+}
+
+#[test]
+fn cancellation_inside_compact_encoding_keeps_all_consumed_work_and_the_original_cause() {
+    use crate::{tasks::extract::ExtractError, native_engine::constrained::JsonDecodeError};
+    let text = "Alice private café Shanghai";
+    let (call, mut total) = compact_limits(); total.max_input_bytes = text.len() as u64;
+    let p = compact_planner(BuiltInTask::Keyphrases, call, total);
+    let mut checkpoints = 0;
+    let refusal = p.planner.source_encoder().encode_with_control(text, call.max_input_bytes,
+        call.max_output_tokens, &mut || {
+            checkpoints += 1;
+            // Source admission, untrusted entry, first byte, ordinary entry,
+            // first symbol, then the first already-charged pair comparison.
+            (checkpoints == 6).then_some(DecodeCancellationKind::ResourceUnavailable)
+        }).err().unwrap();
+    assert!(matches!(refusal, ExtractError::Decode(
+        JsonDecodeError::Cancelled(DecodeCancellationKind::ResourceUnavailable))));
+    let spent = p.planner.map_document_encoding_work().unwrap().unwrap();
+    assert_eq!(spent.input_bytes(), text.len());
+    assert!(spent.output_tokens() > 0 && spent.pair_checks() > 0 && spent.pair_bytes() > 0);
+    let input = BatchDocument { id: "retry".to_owned(), text: text.to_owned(), task_args: None };
+    assert!(p.compiler().unwrap().prepare_with_control(input, &mut Continue).is_err());
+    assert_eq!(p.planner.map_document_encoding_work().unwrap().unwrap(), spent);
+}
+
+#[test]
+fn compact_resume_rejects_policy_drift_before_tail_repair_and_keeps_native_debits() {
+    let (call, total) = compact_limits();
+    let root = Root::new(); let input = inputs(); let events = Rc::new(Events::default());
+    let limits = limits(native(WIDTH));
+    let make = || Processor::new(compact_planner(BuiltInTask::Keyphrases, call, total), Rc::clone(&events));
+    let mut run = JobRunner::create(&root.0, key(), JobId([9; 16]), limits, &input,
+        make(), &mut Continue).unwrap();
+    assert_eq!(error(run.step(&mut CancelAfterSync(Rc::clone(&events)))),
+        JobRunError::Storage(JobError::Cancelled(DecodeCancellationKind::PollQuota)));
+    let spent = run.progress().reserved_work;
+    assert_eq!(run.progress().attempts, 1); drop(run);
+    let mut changed = total; changed.max_pair_bytes -= 1;
+    let wrong = Processor::new(compact_planner(BuiltInTask::Keyphrases, call, changed), Rc::clone(&events));
+    assert_eq!(error(JobRunner::resume(&root.0, key(), JobId([9; 16]), limits, &input,
+        wrong, TailPolicy::DiscardUncommitted, &mut Continue)),
+        JobRunError::Storage(JobError::Mismatch(MismatchField::Execution)));
+    assert_eq!(error(JobRunner::resume(&root.0, key(), JobId([9; 16]), limits, &input,
+        make(), TailPolicy::Refuse, &mut Continue)), JobRunError::Storage(JobError::UncommittedTail));
+    let mut resumed = JobRunner::resume(&root.0, key(), JobId([9; 16]), limits, &input,
+        make(), TailPolicy::DiscardUncommitted, &mut Continue).unwrap();
+    assert_eq!(resumed.progress().reserved_work, spent);
+    assert_eq!(resumed.progress().attempts, 1);
+    assert_eq!(resumed.step(&mut Continue).unwrap().unwrap().reserved_work, spent.checked_add(spent).unwrap());
+}

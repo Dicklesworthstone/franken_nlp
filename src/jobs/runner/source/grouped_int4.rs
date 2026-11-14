@@ -20,6 +20,7 @@ use crate::{
     tasks::{BuiltInTask, extract::ExtractionVocabulary, ir::TaskBudget,
         source_planning::{SourcePlanningLimits, SourceTaskPlanner, SOURCE_PROMPT_VERSION,
             grouped_int4::{Int4SourceTaskRun, PreparedInt4SourceTask, INT4_SOURCE_EXECUTION}}},
+    tokenizer::untrusted::{SafeBpeWorkLimits, UntrustedEncoding},
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -45,6 +46,10 @@ pub struct Int4SourceJobRecipe {
     planning: PlanningRecipe,
     native: NativeRecipe,
     defaults: Option<SourceBatchArgs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<UntrustedEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding_work_limits: Option<SafeBpeWorkLimits>,
 }
 #[derive(Serialize)]
 struct NativeRecipe {
@@ -74,7 +79,8 @@ impl Int4SourceJobRecipe {
                 compiler: CompilerRecipe { max_schema_bytes, max_string_bytes, max_array_items,
                     max_output_bytes, max_states, max_transitions, max_mask_bytes }, source },
             native: NativeRecipe { max_model_work, max_trie_node_visits, checkpoint_interval_nodes,
-                max_visits_per_item, max_visits_per_run }, defaults };
+                max_visits_per_item, max_visits_per_run }, defaults,
+            input_encoding: None, encoding_work_limits: None };
         // Bound complete private defaults before the native compiler clones
         // them. Leave room for JobRunner's protocol/input-profile envelope.
         bounded_json(&recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
@@ -91,11 +97,31 @@ pub struct Int4SourceJobPlanner {
     planning: SourcePlanningLimits,
     native: Int4SourceBatchLimits,
     recipe: Int4SourceJobRecipe,
+    encoding_workspace_bytes: u64,
 }
 impl Int4SourceJobPlanner {
     #[allow(clippy::too_many_arguments)]
     pub fn for_model(model: &Int4ModelIdentity, planner: Arc<SourceTaskPlanner>, task: BuiltInTask,
         ceiling: TaskBudget, planning: SourcePlanningLimits, defaults: Option<SourceBatchArgs>,
+        native: Int4SourceBatchLimits) -> Result<Self, BatchFault> {
+        if planner.document_encoding() != &UntrustedEncoding::ByteFallback {
+            return Err(BatchCode::Admission.into());
+        }
+        Self::for_model_with_document_encoding(model, planner, task, ceiling, planning, defaults, native)
+    }
+
+    /// Explicit compact-input job admission. Safe BPE requires the planner's
+    /// complete cumulative encoding allowance, configured once before this
+    /// factory is created. This SAME Arc and ledger span every record, failed
+    /// preparation and reconstruction in the invocation; no per-item fork or
+    /// reset occurs. The private recipe authenticates all call and total caps.
+    /// Hosts reserve encoding_workspace_bytes in addition to native and input
+    /// storage. An explicit resume admits the same declared tokenizer allowance
+    /// while all persisted native/mask work and attempts remain spent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_model_with_document_encoding(model: &Int4ModelIdentity,
+        planner: Arc<SourceTaskPlanner>, task: BuiltInTask, ceiling: TaskBudget,
+        planning: SourcePlanningLimits, defaults: Option<SourceBatchArgs>,
         native: Int4SourceBatchLimits) -> Result<Self, BatchFault> {
         let absent = Sha256Digest::of_bytes(b"null");
         // Unbound model fields never escape: bind_candidate_model derives
@@ -112,15 +138,29 @@ impl Int4SourceJobPlanner {
             calibration_digest: absent, decision_policy_digest: absent,
             backend_semantic_version: STRICT_INT4_EXECUTION.to_owned(), host_class: None, compiler_identity: None,
         }, model).map_err(|_| BatchCode::Admission)?;
-        Self::configured(planner, identity, model.group_width(), ceiling, planning, defaults, native)
+        Self::configured_with_document_encoding(planner, identity, model.group_width(), ceiling,
+            planning, defaults, native)
     }
 
-    // Private setup seam also used by planning/storage fixtures. Public
+    // Private byte-compatibility seam for planning/storage fixtures. Public
     // callers can construct this factory only from a real Int4ModelIdentity.
+    #[cfg(test)]
     fn configured(planner: Arc<SourceTaskPlanner>, identity: ExecutionIdentity, group_width: usize,
         ceiling: TaskBudget, planning: SourcePlanningLimits, defaults: Option<SourceBatchArgs>,
         native: Int4SourceBatchLimits) -> Result<Self, BatchFault> {
         source_batch::check_configuration(&planner, &identity, ceiling, planning, defaults.as_ref(), group_width)?;
+        Self::configured_with_document_encoding(planner, identity, group_width, ceiling, planning, defaults, native)
+    }
+
+    fn configured_with_document_encoding(planner: Arc<SourceTaskPlanner>, identity: ExecutionIdentity,
+        group_width: usize, ceiling: TaskBudget, planning: SourcePlanningLimits,
+        defaults: Option<SourceBatchArgs>, native: Int4SourceBatchLimits) -> Result<Self, BatchFault> {
+        source_batch::check_configuration_with_document_encoding(&planner, &identity, ceiling,
+            planning, defaults.as_ref(), group_width)?;
+        // The existing composed source encoder owns the invocation ledger.
+        // A one-record safe-BPE policy without its cumulative owner refuses.
+        let encoding_workspace_bytes = planner.map_document_encoding_workspace_bytes()
+            .map_err(|_| BatchCode::InvalidLimits)?;
         source_batch::validate_limits(native)?;
         let resident = Int4MemoryRequirement::for_context(planning.max_context_tokens, group_width)
             .map_err(|_| BatchCode::InvalidLimits)?;
@@ -130,12 +170,19 @@ impl Int4SourceJobPlanner {
         if let Some(args) = &defaults {
             check_args(args, &identity.task_spec, ceiling)?;
         }
-        let recipe = Int4SourceJobRecipe::new(identity.task_spec.clone(), group_width,
+        let mut recipe = Int4SourceJobRecipe::new(identity.task_spec.clone(), group_width,
             ceiling, planning, native, defaults)?;
-        Ok(Self { planner, identity, planning, native, recipe })
+        recipe.input_encoding = (planner.document_encoding() != &UntrustedEncoding::ByteFallback)
+            .then(|| planner.document_encoding().clone());
+        recipe.encoding_work_limits = planner.map_document_encoding_limits();
+        bounded_json(&recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
+        Ok(Self { planner, identity, planning, native, recipe, encoding_workspace_bytes })
     }
 
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.planner.document_encoding() }
+    pub fn encoding_work_limits(&self) -> Option<SafeBpeWorkLimits> { self.recipe.encoding_work_limits }
+    pub fn encoding_workspace_bytes(&self) -> u64 { self.encoding_workspace_bytes }
     pub fn task_ceiling(&self) -> TaskBudget { self.recipe.task_ceiling }
     pub fn native_limits(&self) -> Int4SourceBatchLimits { self.native }
     pub fn check_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> {
@@ -148,7 +195,7 @@ impl Int4SourceJobPlanner {
     }
 
     fn compiler(&self) -> Result<Int4SourceBatchPlanner<'_>, BatchFault> {
-        Int4SourceBatchPlanner::new(&self.planner, self.identity.clone(), self.task_ceiling(),
+        Int4SourceBatchPlanner::new_with_document_encoding(&self.planner, self.identity.clone(), self.task_ceiling(),
             self.planning, self.recipe.defaults.clone(), self.recipe.group_width)
     }
 
@@ -186,7 +233,8 @@ pub struct Int4SourceJobProcessor<'p, 'e, 'weights, 'v, A: Int4SourceBatchAdmiss
 impl<'p, 'e, 'weights, 'v, A: Int4SourceBatchAdmission> Int4SourceJobProcessor<'p, 'e, 'weights, 'v, A> {
     pub fn new(planner: &'p Int4SourceJobPlanner, engine: &'e mut StrictInt4Engine<'weights>,
         vocabulary: &'v ExtractionVocabulary, admission: A) -> Result<Self, BatchFault> {
-        let native = NativeInt4SourceBatch::new(planner.compiler()?, engine, vocabulary, admission, planner.native)?;
+        let native = NativeInt4SourceBatch::new_with_document_encoding(
+            planner.compiler()?, engine, vocabulary, admission, planner.native)?;
         Ok(Self { native, planner })
     }
 }
