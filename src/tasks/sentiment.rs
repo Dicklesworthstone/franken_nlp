@@ -22,3 +22,5 @@ pub use planning::{SENTIMENT_PROMPT_VERSION, SentimentPlanner, SentimentPlanning
 pub mod quantized;
 pub mod grouped_int4;
 pub mod batch;
+/// Independently sampled, schema-locked scores with bounded justifications.
+pub mod sampled;
