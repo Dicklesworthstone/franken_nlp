@@ -58,7 +58,7 @@ fn shared_tail_compiles_only_quotes_and_lifts_native_citations_across_source_win
             budget: tail.budget };
         let plan = planner.plan_int4_with_control(&request, &PlanContext::new(&tail.identity, tail.budget).unwrap(),
             tail.planning, 32, &mut maps::Continue).unwrap();
-        let run = tail.execute(discovery, &planner, |actual, _| {
+        let run = tail.execute(discovery, |actual, _| {
             assert_eq!(actual.execution_identity(), plan.execution_identity());
             let spans = scan_occurrences(evidence_text, "é", &mut GroundingBudget::default()).unwrap();
             raw.bullets = vec![CitedBullet { text: "final assertion".to_owned(), citations: vec![SourceCitation {
@@ -89,7 +89,7 @@ fn empty_evidence_never_enters_scalar_phase_and_late_failure_publishes_no_result
         } }
         let (map, tail) = prepared.into_parts(); let discovery = map.execute_with_driver(&admitted, driver).unwrap();
         let mut calls = 0;
-        let result = tail.execute(discovery, &planner, |_, _| {
+        let result = tail.execute(discovery, |_, _| {
             calls += 1;
             Err(Int4SourceError::Cancelled(DecodeCancellationKind::Deadline).into())
         }, &mut maps::Continue);

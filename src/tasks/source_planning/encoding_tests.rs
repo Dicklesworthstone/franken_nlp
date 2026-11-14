@@ -193,3 +193,53 @@ fn population_operations_share_static_tables_but_never_share_work_allowances() {
     assert_eq!(first.map_document_encoding_work().unwrap(), Some(spent.checked_add(spent).unwrap()));
     assert!(std::mem::size_of::<SourceTaskPlanner>() + 2 * std::mem::size_of::<usize>() <= 512);
 }
+
+#[test]
+fn retained_continuations_cannot_renew_the_original_document_allowance() {
+    use crate::tokenizer::untrusted::{SafeBpeWork, SafeBpeWorkLimits};
+    let complete = SafeBpeWorkLimits { max_input_bytes: (SOURCE.len() * 2) as u64,
+        max_output_tokens: 1 << 20, max_pair_checks: 1 << 28, max_pair_bytes: 1 << 32 };
+    let owner = planner(UntrustedEncoding::ByteFallback).with_map_document_encoding(policy(), complete).unwrap();
+    let retained = owner.retain_map_document_operation().unwrap();
+    let separate_document = owner.fork_map_document_operation().unwrap();
+    assert!(Arc::ptr_eq(&owner.tokenizer, &retained.tokenizer));
+    assert!(Arc::ptr_eq(&owner.controls, &retained.controls));
+    assert_eq!(owner.template_digest(), retained.template_digest());
+    owner.source_encoder().encode_with_control(SOURCE, 8192, 8192, &mut || None).unwrap();
+    let spent = owner.map_document_encoding_work().unwrap().unwrap();
+    assert_eq!(retained.map_document_encoding_work().unwrap(), Some(spent));
+    retained.source_encoder().encode_with_control(SOURCE, 8192, 8192, &mut || None).unwrap();
+    let total = spent.checked_add(spent).unwrap();
+    assert_eq!(owner.map_document_encoding_work().unwrap(), Some(total));
+    assert_eq!(separate_document.map_document_encoding_work().unwrap(), Some(SafeBpeWork::default()));
+    assert!(owner.source_encoder().encode_with_control(SOURCE, 8192, 8192, &mut || None).is_err());
+    // The continuation owns the exhausted counter even after its original
+    // caller and every earlier prepared stage have left scope.
+    drop(owner);
+    assert!(retained.source_encoder().encode_with_control(SOURCE, 8192, 8192, &mut || None).is_err());
+    assert_eq!(retained.map_document_encoding_work().unwrap(), Some(total));
+    separate_document.source_encoder().encode_with_control(SOURCE, 8192, 8192, &mut || None).unwrap();
+    assert!(planner(policy()).retain_map_document_operation().is_err());
+}
+
+#[test]
+fn retained_encoding_refuses_reentry_without_deadlock_or_refund() {
+    use crate::tokenizer::untrusted::SafeBpeWorkLimits;
+    let complete = SafeBpeWorkLimits { max_input_bytes: 1 << 20, max_output_tokens: 1 << 20,
+        max_pair_checks: 1 << 28, max_pair_bytes: 1 << 32 };
+    let owner = planner(UntrustedEncoding::ByteFallback).with_map_document_encoding(policy(), complete).unwrap();
+    let retained = owner.retain_map_document_operation().unwrap();
+    let mut checked = false;
+    let document = owner.source_encoder().encode_with_control(SOURCE, 8192, 8192, &mut || {
+        if !checked {
+            checked = true;
+            assert!(retained.source_encoder().encode_with_control("nested", 8192, 8192, &mut || None).is_err());
+        }
+        None
+    }).unwrap();
+    assert!(checked);
+    assert_eq!(document.text(), SOURCE);
+    let spent = owner.map_document_encoding_work().unwrap().unwrap();
+    assert_eq!(spent.input_bytes(), SOURCE.len());
+    assert_eq!(retained.map_document_encoding_work().unwrap(), Some(spent));
+}

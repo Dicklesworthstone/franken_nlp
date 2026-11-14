@@ -20,7 +20,7 @@ pub struct SourceDocumentEncoder {
     encoding: UntrustedEncoding,
     /// Explicit composed-operation authority, shared by every use of this
     /// encoder. Only counters are retained; there is no source-text cache.
-    encoding_work: Option<(SafeBpeWorkLimits, std::sync::Mutex<SafeBpeWork>)>,
+    encoding_work: Option<(SafeBpeWorkLimits, std::sync::Arc<std::sync::Mutex<SafeBpeWork>>)>,
 }
 impl SourceDocumentEncoder {
     pub fn pinned(controls: &TemplateControlIds) -> Result<Self, ExtractError> {
@@ -48,7 +48,7 @@ impl SourceDocumentEncoder {
         if !matches!(self.encoding, UntrustedEncoding::SafeBpeV1(_)) {
             return Err(ExtractError::Contract("cumulative source encoding requires safe BPE"));
         }
-        self.encoding_work = Some((limits, std::sync::Mutex::new(SafeBpeWork::default())));
+        self.encoding_work = Some((limits, std::sync::Arc::new(std::sync::Mutex::new(SafeBpeWork::default()))));
         Ok(self)
     }
     pub fn cumulative_encoding_limits(&self) -> Option<SafeBpeWorkLimits> {
@@ -64,7 +64,24 @@ impl SourceDocumentEncoder {
             (UntrustedEncoding::SafeBpeV1(call), Some(limits)) => {
                 call.validate().and_then(|()| limits.validate())
                     .map_err(|_| ExtractError::Contract("invalid document operation encoding policy"))?;
-                Some((limits, std::sync::Mutex::new(SafeBpeWork::default())))
+                Some((limits, std::sync::Arc::new(std::sync::Mutex::new(SafeBpeWork::default()))))
+            },
+            _ => return Err(ExtractError::Contract("document operation requires a cumulative encoding policy")),
+        };
+        Ok(Self { tokenizer: std::sync::Arc::clone(&self.tokenizer),
+            controls: std::sync::Arc::clone(&self.controls), control_digest: self.control_digest,
+            encoding: self.encoding.clone(), encoding_work })
+    }
+    /// Retain the SAME admitted operation for data-dependent continuations.
+    /// A generated evidence pass must not renew the discovery pass's budget,
+    /// even if its caller supplies another planner with an identical policy.
+    pub(crate) fn retain_map_document_operation(&self) -> Result<Self, ExtractError> {
+        let encoding_work = match (&self.encoding, &self.encoding_work) {
+            (UntrustedEncoding::ByteFallback, None) => None,
+            (UntrustedEncoding::SafeBpeV1(call), Some((limits, work))) => {
+                call.validate().and_then(|()| limits.validate())
+                    .map_err(|_| ExtractError::Contract("invalid document operation encoding policy"))?;
+                Some((*limits, std::sync::Arc::clone(work)))
             },
             _ => return Err(ExtractError::Contract("document operation requires a cumulative encoding policy")),
         };

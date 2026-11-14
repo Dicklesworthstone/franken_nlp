@@ -63,7 +63,7 @@ impl PreparedInt4SummaryHierarchy<'_> {
         }
         let mut hierarchy_cohorts = Int4HierarchyCohortStats::default();
         let document = tail.execute(discovery, |tail, collection, remaining, control| {
-            tail.reduce_with_execution(collection, remaining, planner, vocabulary,
+            tail.reduce_with_execution(collection, remaining, vocabulary,
                 execution::Execution::Cohorts { weights, budget, kernel, max_groups: schedule.max_groups,
                     stats: &mut hierarchy_cohorts }, control)
         }, control)?;

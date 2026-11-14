@@ -36,7 +36,7 @@ impl PreparedInt4SummaryHierarchy<'_> {
             // The full discovery driver has drained. A single scalar engine is
             // reused across every level and omitted entirely for empty evidence.
             let mut engine = phases::scalar_engine(weights, budget, kernel, control)?;
-            tail.reduce(collection, remaining, planner, &mut engine, vocabulary, control)
+            tail.reduce(collection, remaining, &mut engine, vocabulary, control)
         }, control)?;
         phases::finish(document, mapped.cohorts, native_chunks, source_windows, planned, actual, cap, control)
     }

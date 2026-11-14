@@ -95,7 +95,7 @@ impl SourceTaskPlanner {
         context: &PlanContext<'_>, planning: SourcePlanningLimits, mapping: Int4SourceMapLimits,
         group_width: usize, control: &mut C) -> Result<PreparedInt4SummaryHierarchy<'s>, Int4SourceMapError> {
         checkpoint(control)?;
-        self.encoder.require_byte_encoding().map_err(Int4SourceError::from)?;
+        self.map_document_encoding_workspace_bytes().map_err(Int4SourceError::from)?;
         hierarchy.validate()?; request.validate(planning)?;
         let capacity = self.int4_map_capacity_with_control(&SourceMapTask::Summarize(request.synthesis_options),
             budget, context, planning, group_width, control)?;
@@ -140,7 +140,7 @@ impl<'s> PreparedInt4SummaryHierarchy<'s> {
         let (map, tail) = self.into_parts();
         let discovery = map.execute_with_control(admitted, engine, vocabulary, control)?;
         tail.execute(discovery, |tail, collection, remaining, control|
-            tail.reduce(collection, remaining, planner, engine, vocabulary, control), control)
+            tail.reduce(collection, remaining, engine, vocabulary, control), control)
     }
 }
 /// One semantic continuation for serial and cohort discovery. Scheduling never
@@ -171,18 +171,18 @@ impl SummaryHierarchyTail<'_> {
     }
     #[allow(clippy::too_many_arguments)]
     fn reduce<C: DecodeStepControl>(&self, collection: evidence::Collection, remaining: &mut GroundingBudget,
-        planner: &SourceTaskPlanner, engine: &mut StrictInt4Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
+        engine: &mut StrictInt4Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
         -> Result<execution::Reduced, Int4SourceMapError> {
-        self.reduce_with_execution(collection, remaining, planner, vocabulary,
+        self.reduce_with_execution(collection, remaining, vocabulary,
             execution::Execution::Scalar(engine), control)
     }
     #[allow(clippy::too_many_arguments)]
     fn reduce_with_execution<'a, 'w, C: DecodeStepControl>(&'a self, collection: evidence::Collection,
-        remaining: &mut GroundingBudget, planner: &'a SourceTaskPlanner, vocabulary: &'a ExtractionVocabulary,
+        remaining: &mut GroundingBudget, vocabulary: &'a ExtractionVocabulary,
         execution: execution::Execution<'a, 'w>, control: &mut C)
         -> Result<execution::Reduced, Int4SourceMapError> {
         let base = &self.base;
-        let mut driver = execution::Native { planner, identity: &base.identity, budget: base.budget, planning: base.planning,
+        let mut driver = execution::Native { planner: &base.operation, identity: &base.identity, budget: base.budget, planning: base.planning,
             options: base.request.synthesis_options, mapping: self.mapping, execution, vocabulary,
             group_width: self.expected.group_width() };
         execution::reduce(base.source, collection, base.request, self.expected, self.mapping.reduction.max_result_bytes as u64,

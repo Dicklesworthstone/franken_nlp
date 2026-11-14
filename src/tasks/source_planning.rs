@@ -242,13 +242,12 @@ impl SourceTaskPlanner {
         self.encoder = self.encoder.with_document_encoding(policy)?;
         Ok(self)
     }
-    /// Admit compact input for one complete INT4 NER/keyphrase/plain-summary
-    /// or independent-passage QA map. All probes, chunk plans and host replanning
-    /// share this
+    /// Admit compact input for one complete INT4 source-document operation.
+    /// All probes, chunk plans, dependent neural synthesis and host replanning share this
     /// nonrenewable ledger for the planner's entire lifetime. Create another
     /// explicitly admitted planner for a different document; there is no reset.
     /// Population factories explicitly admit a fresh ledger per original
-    /// document and retain it through reconstruction. Neural synthesis stays byte-only.
+    /// document and retain it through reconstruction and every hierarchy level.
     pub fn with_map_document_encoding(mut self, policy: UntrustedEncoding,
         work: crate::tokenizer::untrusted::SafeBpeWorkLimits) -> Result<Self, SourcePlanningError> {
         if !matches!(policy, UntrustedEncoding::SafeBpeV1(_)) {
@@ -279,6 +278,15 @@ impl SourceTaskPlanner {
             controls: Arc::clone(&self.controls), eos: self.eos,
             template_digest: self.template_digest, byte_template_digest: self.byte_template_digest })
     }
+    /// Keep the exact original ledger alive across discovery and all later
+    /// evidence passes. This alias never grants a fresh operation allowance.
+    pub(crate) fn retain_map_document_operation(&self) -> Result<Self, SourcePlanningError> {
+        self.map_document_encoding_workspace_bytes()?;
+        Ok(Self { tokenizer: Arc::clone(&self.tokenizer),
+            encoder: self.encoder.retain_map_document_operation()?,
+            controls: Arc::clone(&self.controls), eos: self.eos,
+            template_digest: self.template_digest, byte_template_digest: self.byte_template_digest })
+    }
     /// Reserve this payload in addition to the retained task-plan estimate.
     /// The same workspace is reused sequentially by probes and chunk plans.
     pub fn map_document_encoding_workspace_bytes(&self) -> Result<u64, SourcePlanningError> {
@@ -286,12 +294,15 @@ impl SourceTaskPlanner {
             (UntrustedEncoding::ByteFallback, None) => Ok(0),
             (UntrustedEncoding::SafeBpeV1(call), Some(work)) => {
                 work.validate().map_err(|_| SourcePlanningError::Contract("invalid source map encoding budget"))?;
-                // The operation owns only shared immutable tables plus its
-                // private counter; the retained plan reserve prices all text.
-                if std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>() > 512 {
+                // Price the operation, its retained continuation alias and
+                // shared counter. Large immutable tables are not duplicated;
+                // the separate retained-plan reserve prices all private text.
+                if 2 * std::mem::size_of::<Self>()
+                    + std::mem::size_of::<std::sync::Mutex<crate::tokenizer::untrusted::SafeBpeWork>>()
+                    + 2 * std::mem::size_of::<usize>() > 1024 {
                     return Err(SourcePlanningError::Contract("source document operation workspace"));
                 }
-                call.requirements().map(|quote| quote.workspace_bytes + 512)
+                call.requirements().map(|quote| quote.workspace_bytes + 1024)
                     .map_err(|_| SourcePlanningError::Contract("invalid source map encoding workspace"))
             },
             _ => Err(SourcePlanningError::Contract("source maps require cumulative encoding admission")),

@@ -36,7 +36,7 @@ impl PreparedInt4SummarySynthesis<'_> {
         let planned = discovery.planned_model_work;
         let actual = discovery.model_work;
         let mapping = tail.mapping;
-        let document = tail.execute(discovery, planner, |plan, control| {
+        let document = tail.execute(discovery, |plan, control| {
             // No scalar KV is allocated for empty evidence. Discovery engines
             // have already physically drained before this phase can allocate.
             let mut engine = phases::scalar_engine(weights, budget, kernel, control)?;

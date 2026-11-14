@@ -68,8 +68,10 @@ impl Driver for Native<'_, '_> {
     }
     fn count<C: DecodeStepControl>(&mut self, text: &str, control: &mut C) -> Result<usize, Int4SourceMapError> {
         checkpoint(control)?;
-        let count = self.planner.source_encoder().encode(text, self.planning.max_input_bytes, self.planning.max_input_bytes)
-            .map_err(|_| Int4SourceMapError::WorkLimit)?.total_token_count();
+        let count = self.planner.source_encoder().encode_with_control(text,
+            self.planning.max_input_bytes, self.planning.max_input_bytes,
+            &mut || control.prefill_checkpoint(0))
+            .map_err(Int4SourceError::from)?.total_token_count();
         checkpoint(control)?;
         Ok(count)
     }

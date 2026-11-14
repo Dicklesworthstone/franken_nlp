@@ -174,6 +174,9 @@ impl Int4SummarySynthesisPreflight {
 pub struct PreparedInt4SummarySynthesis<'s> {
     source: &'s str,
     map: PreparedInt4SourceMap<'s>,
+    /// Shares the original document's nonrenewable encoding ledger. The
+    /// data-dependent evidence pass must not accept a fresh same-policy owner.
+    operation: SourceTaskPlanner,
     identity: ExecutionIdentity,
     budget: TaskBudget,
     planning: SourcePlanningLimits,
@@ -190,7 +193,7 @@ impl SourceTaskPlanner {
         planning: SourcePlanningLimits, mapping: Int4SourceMapLimits, group_width: usize, control: &mut C)
         -> Result<PreparedInt4SummarySynthesis<'s>, Int4SourceMapError> {
         checkpoint(control)?;
-        self.encoder.require_byte_encoding().map_err(Int4SourceError::from)?;
+        let operation = self.retain_map_document_operation().map_err(Int4SourceError::from)?;
         request.validate(planning)?;
         let (mut discovery_limits, synthesis_reserve) = reserve(budget, planning, mapping, group_width)?;
         discovery_limits.verification = meet_verification(discovery_limits.verification, request.limits.verification);
@@ -210,7 +213,7 @@ impl SourceTaskPlanner {
         if !fits(expected.reserved_model_work()?, mapping.max_model_work)
             || expected.reserved_mask_visits()? > mapping.max_mask_visits { return Err(Int4SourceMapError::WorkLimit); }
         checkpoint(control)?;
-        Ok(PreparedInt4SummarySynthesis { source, map, identity: context.execution_identity().clone(),
+        Ok(PreparedInt4SummarySynthesis { source, map, operation, identity: context.execution_identity().clone(),
             budget, planning, mapping, request, expected })
     }
 }
@@ -251,8 +254,8 @@ impl<'s> PreparedInt4SummarySynthesis<'s> {
         Ok(())
     }
     fn into_parts(self) -> (PreparedInt4SourceMap<'s>, SummarySynthesisTail<'s>) {
-        let Self { source, map, identity, budget, planning, mapping, request, expected } = self;
-        (map, SummarySynthesisTail { source, identity, budget, planning, mapping, request, expected })
+        let Self { source, map, operation, identity, budget, planning, mapping, request, expected } = self;
+        (map, SummarySynthesisTail { source, operation, identity, budget, planning, mapping, request, expected })
     }
     pub fn execute_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
         planner: &SourceTaskPlanner, engine: &mut StrictInt4Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
@@ -263,7 +266,7 @@ impl<'s> PreparedInt4SummarySynthesis<'s> {
         let (map, tail) = self.into_parts();
         let discovery = map.execute_with_control(admitted, engine, vocabulary, control)?;
         let mapping = tail.mapping;
-        tail.execute(discovery, planner, |plan, control| run_final(plan, engine, vocabulary, mapping, control), control)
+        tail.execute(discovery, |plan, control| run_final(plan, engine, vocabulary, mapping, control), control)
     }
 }
 
@@ -271,6 +274,7 @@ impl<'s> PreparedInt4SummarySynthesis<'s> {
 /// schedules enter this one evidence/verification/finalization implementation.
 struct SummarySynthesisTail<'s> {
     source: &'s str,
+    operation: SourceTaskPlanner,
     identity: ExecutionIdentity,
     budget: TaskBudget,
     planning: SourcePlanningLimits,
@@ -280,10 +284,10 @@ struct SummarySynthesisTail<'s> {
 }
 impl SummarySynthesisTail<'_> {
     fn execute<C: DecodeStepControl, F>(self, discovery: Int4SourceMapRun,
-        planner: &SourceTaskPlanner, run: F, control: &mut C)
+        run: F, control: &mut C)
         -> Result<Int4SummarySynthesisRun, Int4SourceMapError>
         where F: FnOnce(&PreparedInt4SourceTask, &mut C) -> Result<Int4SourceTaskRun, Int4SourceMapError> {
-        let Self { source, identity, budget, planning, mapping, request, expected } = self;
+        let Self { source, operation, identity, budget, planning, mapping, request, expected } = self;
         expected.discovery.verify_completed_with_control(&discovery, control)?;
         let mut remaining = remaining_verification(request.limits.verification, discovery.verification_used)?;
         let collection = evidence::collect(source, discovery.mapped.root().value(), request.map_options,
@@ -293,7 +297,7 @@ impl SummarySynthesisTail<'_> {
             let context = PlanContext::new(&identity, budget).map_err(|_| Int4SourceMapError::Admission)?;
             let final_request = SourceTaskRequest::Summarize { document: copy(&collection.text)?,
                 options: request.synthesis_options, budget };
-            let plan = planner.plan_int4_with_control(&final_request, &context, planning, expected.group_width(), control)?;
+            let plan = operation.plan_int4_with_control(&final_request, &context, planning, expected.group_width(), control)?;
             let planned = plan.planned_work();
             if !fits(planned, expected.synthesis_reserve) { return Err(Int4SourceMapError::WorkLimit); }
             let native = run(&plan, control)?;
