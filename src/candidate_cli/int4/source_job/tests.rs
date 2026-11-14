@@ -276,3 +276,84 @@ fn unavailable_profile_refuses_all_four_jobs_before_private_file_access() {
         assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().code, "owned_job_profile_unavailable");
     }
 }
+
+
+#[test]
+fn persistent_source_job_width_preserves_every_semantic_and_lifetime_limit() {
+    for kind in [Kind::Ner, Kind::Keyphrases, Kind::Summarize, Kind::Answer] {
+        for operation in ["start", "resume"] {
+            let (serial, serial_args) = command(kind, operation, &[]);
+            let serial_common = serial.args.validate(&serial_args).unwrap();
+            let fixed = lifetime(&serial.args, &serial_args, serial_common);
+            let serial_limits = serial.args.lifetime_limits(&serial_args, serial_common, fixed).unwrap();
+            for width in [1, 2, 4, 64] {
+                let width_text = width.to_string();
+                let (c, args) = command(kind, operation, &["--compute-threads", &width_text]);
+                let common = c.args.validate(&args).unwrap();
+                let limits = c.args.lifetime_limits(&args, common, fixed).unwrap();
+                assert_eq!(common.compute.threads, width);
+                assert_eq!(common.compute, args.compute.admit(args.group_width).unwrap());
+                assert_eq!(common.compute.workspace_bytes == 0, width == 1);
+                assert_eq!(common.native, serial_common.native);
+                assert_eq!(c.args.source.budget(&args, common),
+                    serial.args.source.budget(&serial_args, serial_common));
+                assert_eq!(limits.native, serial_limits.native);
+                assert_eq!(limits.buffer_bytes, serial_limits.buffer_bytes);
+                assert_eq!(limits.transport, serial_limits.transport);
+                assert!(limits.common.minimum_memory_bytes >= serial_limits.common.minimum_memory_bytes);
+                #[cfg(feature = "asupersync-runtime")]
+                {
+                    let host = compute::resource_config(common);
+                    assert_eq!(host.scoped_cpu_children_per_coordinator, width - 1);
+                    assert_eq!(host.thread_ceiling, width + 1);
+                    assert_eq!(host.runtime_workers, 1);
+                    assert_eq!(host.max_blocking_coordinators, 1);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn worker_width_and_incompatible_schedules_refuse_before_private_source_job_io() {
+    for kind in [Kind::Ner, Kind::Keyphrases, Kind::Summarize, Kind::Answer] {
+        for width in ["0", "65", "18446744073709551615"] {
+            let mut words = argv(kind, "start");
+            words.extend(["--compute-threads", width].into_iter().map(str::to_owned));
+            if let Ok((c, args)) = parse(kind, words) {
+                assert!(c.execute_owned(args, NoRead, &mut NoWrite).is_err());
+            }
+        }
+        for option in ["--prefill-rows", "--cohort-heads", "--cohort-documents", "--max-selected-rows"] {
+            let mut words = argv(kind, "resume");
+            words.extend(["--compute-threads", "4", option, "1"].into_iter().map(str::to_owned));
+            assert!(parse(kind, words).is_err());
+        }
+        let (c, mut args) = command(kind, "resume", &["--compute-threads", "4"]);
+        args.memory_mib = 1;
+        assert!(c.execute_owned(args, NoRead, &mut NoWrite).is_err());
+    }
+}
+
+#[test]
+fn resumed_source_jobs_keep_lifetime_work_when_worker_width_changes() {
+    for kind in [Kind::Ner, Kind::Keyphrases, Kind::Summarize, Kind::Answer] {
+        let (start, start_args) = command(kind, "start",
+            &["--compute-threads", "4", "--spool-input", "--max-retained-input-mib", "16"]);
+        let (resume, resume_args) = command(kind, "resume",
+            &["--compute-threads", "2", "--use-retained-input", "--max-retained-input-mib", "16"]);
+        let start_common = start.args.validate(&start_args).unwrap();
+        let resume_common = resume.args.validate(&resume_args).unwrap();
+        let fixed = lifetime(&start.args, &start_args, start_common);
+        let first = start.args.lifetime_limits(&start_args, start_common, fixed).unwrap();
+        let next = resume.args.lifetime_limits(&resume_args, resume_common, fixed).unwrap();
+        assert_eq!(first.native, next.native);
+        assert_eq!(first.buffer_bytes, next.buffer_bytes);
+        assert_eq!(start.args.source.budget(&start_args, start_common),
+            resume.args.source.budget(&resume_args, resume_common));
+        let mut boundary = resume_common;
+        boundary.memory_bytes = next.common.minimum_memory_bytes - 1;
+        assert_eq!(resume.args.lifetime_limits(&resume_args, boundary, fixed).unwrap_err().code,
+            "job_population_memory");
+    }
+}

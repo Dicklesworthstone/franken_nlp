@@ -3885,6 +3885,24 @@ without loading the model. Failed final output delivery or a deadline after
 commit does not imply rollback; inspect or explicitly resume the job.
 `--discard-uncommitted-tail` remains an explicit resume-only policy.
 
+All four source-job commands accept `--compute-threads N` on `start` and
+`resume`. Widths 2 through 64 reuse one bounded numerical row team for the
+complete invocation, every pending source task, durable commits and optional
+materialization; the default width of one preserves serial execution.
+Worker scratch and process capacity are admitted before private input access.
+Every worker joins before progress or terminal metadata is returned.
+
+The worker width is physical scheduling only. Changing it on authenticated
+resume does not change the frozen semantic recipe, refill native/mask work,
+or add attempts. Nonserial metadata adds `compute_schedule`; serial metadata
+keeps its existing shape. Original cancellation and the invocation deadline
+cover final metadata staging, write and flush. A late delivery failure can
+follow durable progress and still requires authenticated status/resume.
+
+Library callers use `NlpEngine::job_int4_source_with_threads` for the same
+worker path. Byte-preserving input and the existing full-projection,
+sequential-prompt planning contract remain in force.
+
 The library entry points are the sealed `Int4SourceJobPlanner::for_model`
 and `NlpEngine::job_int4_source`, with `SourceJobRequest` and
 `JobHostLimits`. Planning binds the real resident model and complete fixed

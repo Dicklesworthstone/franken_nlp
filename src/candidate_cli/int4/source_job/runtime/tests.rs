@@ -111,7 +111,8 @@ fn all_tasks_publish_only_authenticated_progress_and_public_model_provenance() {
             source_root_sha256: &source, model_content_sha256: &content,
             candidate_format: "fixture-candidate-format", quant_recipe: "fixture-grouped-int4",
             group_width: args.group_width, integer_kernel: common.kernel.kind().id(),
-            snapshot: Some(SnapshotRecord::new("loaded", common.snapshot_need)), output: &report,
+            snapshot: Some(SnapshotRecord::new("loaded", common.snapshot_need)),
+            compute_schedule: None, output: &report,
         };
         let mut bytes = Vec::new(); publish(&response, job_cli::REPORT_BYTES, &mut bytes).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -120,6 +121,7 @@ fn all_tasks_publish_only_authenticated_progress_and_public_model_provenance() {
         assert_eq!(value["model_content_sha256"], content);
         assert_eq!(value["group_width"], args.group_width);
         assert_eq!(value["snapshot"]["format"], INT4_SNAPSHOT_VERSION);
+        assert!(value.get("compute_schedule").is_none());
         assert_eq!(value["output"]["attempts"], 3); assert_eq!(value["output"]["committed"], 2);
         assert_eq!(value["output"]["reserved_work"], serde_json::to_value(limits.max_work).unwrap());
         for private in ["text", "passages", "options", "key", "job_dir", "defaults", "results", "documents"] {
@@ -187,4 +189,116 @@ fn final_report_delivery_failure_never_changes_the_durable_completion_record() {
     assert_eq!(failure.code, "report_delivery");
     assert_eq!(serde_json::to_value(&report).unwrap(), before);
     assert_eq!(before["committed"], 2); assert_eq!(before["status"], "complete");
+}
+
+
+#[test]
+fn original_cancellation_survives_every_publication_boundary() {
+    let remaining = || Ok(Duration::from_secs(1));
+    for cause in [
+        DecodeCancellationKind::User, DecodeCancellationKind::Timeout, DecodeCancellationKind::Deadline,
+        DecodeCancellationKind::PollQuota, DecodeCancellationKind::CostBudget,
+        DecodeCancellationKind::FailFast, DecodeCancellationKind::RaceLost,
+        DecodeCancellationKind::ParentCancelled, DecodeCancellationKind::ResourceUnavailable,
+        DecodeCancellationKind::Shutdown, DecodeCancellationKind::LinkedExit,
+    ] {
+        let cancellation = CancellationToken::default();
+        cancellation.cancel(cause);
+        let expected = job_failure(JobError::Cancelled(cause));
+        let failure = publish_report(&serde_json::json!({"committed": 2}), &mut NoWrite,
+            &remaining, &cancellation).unwrap_err();
+        assert_eq!(failure.exit, expected.exit); assert_eq!(failure.code, expected.code);
+        let native = execution_failure(HostedJobError::Host(HostedError::Int4(
+            Int4HostError::Native(StrictInt4Error::Cancelled(cause)))));
+        assert_eq!(native.exit, expected.exit); assert_eq!(native.code, expected.code);
+    }
+
+    struct CancelDuringSerialize<'a>(&'a CancellationToken);
+    impl Serialize for CancelDuringSerialize<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.0.cancel(DecodeCancellationKind::User);
+            serializer.serialize_str("metadata")
+        }
+    }
+    let cancellation = CancellationToken::default();
+    let failure = publish_report(&CancelDuringSerialize(&cancellation), &mut NoWrite,
+        &remaining, &cancellation).unwrap_err();
+    assert_eq!(failure.exit, ErrorCode::Cancelled);
+    assert_eq!(failure.code, "job_cancelled");
+
+    struct CancelDuringFlush { bytes: Vec<u8>, cancellation: CancellationToken }
+    impl Write for CancelDuringFlush {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes); Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.cancellation.cancel(DecodeCancellationKind::Deadline); Ok(())
+        }
+    }
+    let cancellation = CancellationToken::default();
+    let mut writer = CancelDuringFlush { bytes: Vec::new(), cancellation: cancellation.clone() };
+    let progress = serde_json::json!({"committed": 2, "attempts": 3});
+    let before = progress.clone();
+    let failure = publish_report(&progress, &mut writer, &remaining, &cancellation).unwrap_err();
+    assert_eq!(failure.exit, ErrorCode::BudgetOrTimeout);
+    assert_eq!(failure.code, "job_execution_budget");
+    assert!(!writer.bytes.is_empty());
+    assert_eq!(progress, before);
+}
+
+#[test]
+fn deadline_before_staging_before_delivery_or_after_flush_never_reports_success() {
+    use std::cell::Cell;
+    for fail_at in 1..=3 {
+        let checks = Cell::new(0);
+        let remaining = || {
+            checks.set(checks.get() + 1);
+            if checks.get() == fail_at { Err(CandidateError::Timeout) }
+            else { Ok(Duration::from_secs(1)) }
+        };
+        let mut bytes = Vec::new();
+        let progress = serde_json::json!({"committed": 2, "attempts": 3});
+        let failure = publish_report(&progress, &mut bytes, &remaining,
+            &CancellationToken::default()).unwrap_err();
+        let expected = Failure::from(CandidateError::Timeout);
+        assert_eq!(failure.exit, expected.exit); assert_eq!(failure.code, expected.code);
+        assert_eq!(bytes.is_empty(), fail_at < 3);
+        assert_eq!(progress["committed"], 2);
+        assert_eq!(progress["attempts"], 3);
+    }
+}
+
+#[test]
+fn worker_schedule_is_optional_physical_metadata_only() {
+    let (command, args) = parts(Kind::Answer);
+    let common = command.args.validate(&args).unwrap();
+    let limits = lifetime(&command.args, &args, common);
+    let id = JobId([0x12; 16]);
+    let report = progress_report(completed(id, limits), id, limits, true,
+        RunMode::Resume { discard_uncommitted: false }, "answer").unwrap();
+    let content = "ab".repeat(32); let source = "cd".repeat(32);
+    let mut baseline = None;
+    for width in [1, 2, 64] {
+        let response = Response {
+            protocol: "fnlp-candidate-int4-source-job-v1", schema_version: 1,
+            scope: "real-source-current-candidate-int4", evidence: "non_authoritative",
+            task: "answer", model_id: "Nanbeige4.2-3B", source_revision: "fixture-public-revision",
+            source_root_sha256: &source, model_content_sha256: &content,
+            candidate_format: "fixture-candidate-format", quant_recipe: "fixture-grouped-int4",
+            group_width: args.group_width, integer_kernel: common.kernel.kind().id(),
+            snapshot: None, compute_schedule: compute::Schedule::for_threads(width), output: &report,
+        };
+        let mut bytes = Vec::new();
+        publish_report(&response, &mut bytes, &|| Ok(Duration::from_secs(1)),
+            &CancellationToken::default()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        if width == 1 { assert!(value.get("compute_schedule").is_none()); }
+        else {
+            assert_eq!(value["compute_schedule"]["execution"], "int4-output-row-team-v1");
+            assert_eq!(value["compute_schedule"]["declared_compute_threads"], width);
+        }
+        value.as_object_mut().unwrap().remove("compute_schedule");
+        if let Some(expected) = &baseline { assert_eq!(expected, &value); }
+        else { baseline = Some(value); }
+    }
 }

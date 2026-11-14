@@ -38,14 +38,16 @@ pub(super) fn definition(kind: Kind) -> clap::Command {
     let name = match kind { Kind::Ner => "ner-job", Kind::Keyphrases => "keyphrases-job",
         Kind::Summarize => "summarize-job", Kind::Answer => "answer-job" };
     let operation = |name: &'static str, about: &'static str| {
-        DefaultsArgs::augment_args(StorageArgs::augment_args(source::definition(kind).name(name).about(about)
+        let command = DefaultsArgs::augment_args(StorageArgs::augment_args(source::definition(kind).name(name).about(about)
             .long_about("Start or resume one fixed source-task job on a resident source-converted or independently pinned snapshot INT4 model. Requires --store-results, an existing protected --job-dir, original --job-id and --key-file, and immutable --limits. By default, supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation; explicit retained-input replay is available. For answer, text is the question and typed task_args supplies passages, options and budget unless an explicit complete --defaults file does so. Other tasks use shipped options unless explicit bounded defaults or per-record arguments override them. A record cannot switch task families or change the complete resident KV allowance. Flush controls and duplicate IDs anywhere in the population reject. Resume authenticates exact population, model/group identity, options and recipe before replay or tail repair. Lifetime native work includes every group dot and does not renew on resume; failed attempts remain debited. Stdout contains only progress/provenance metadata. Results remain in the explicit owner-only spool; --materialize publishes verified materialized.ndjson only after all items commit. Structural citations do not certify semantic support, and failed inference is never successful QA abstention. Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64.")
             .after_help(job_cli::INPUT_RETENTION_HELP)
             .mut_arg("options", |arg| arg.hide(true))
             .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population; omit with --use-retained-input; '-' reads stdin"))
             .mut_arg("max_input_bytes", |arg| arg.help("Outer cap for each complete NDJSON record and decoded source input; immutable stored input ceiling must fit"))
             .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoints for this invocation; persisted work and attempts never renew"))))
-            .mut_arg("store_results", |arg| arg.help("Required consent to retain private source-task results in the owner-only spool"))
+            .mut_arg("store_results", |arg| arg.help("Required consent to retain private source-task results in the owner-only spool"));
+        compute::definition(command)
+            .after_long_help("--compute-threads 1..=64 selects one persistent numerical team for the complete authenticated invocation; one retains serial execution. All pending records, constrained tokens, durable commits and optional materialization share that team. Worker scratch and process thread capacity are admitted before private IO. Width is physical metadata and may change on explicit resume without changing recipes or refunding native/mask work or attempts. Native cohorts, prompt-prefill schedules and compact input remain refused. Metadata is published only after every worker joins and while the original deadline and cancellation remain valid.")
     };
     let start = operation("start", "Create a new explicitly retained source-task INT4 job");
     let resume = operation("resume", "Authenticate the complete original population and execute pending INT4 source tasks")
@@ -83,7 +85,13 @@ impl JobArgs {
             || self.defaults.defaults.as_deref().is_some_and(|path| !local(path)) {
             return Err(Failure::usage("source_job_defaults"));
         }
-        let common = self.source.validate(args).map_err(Failure::from)?;
+        // This workflow binds a complete resident KV and full projection.
+        // Only worker width is configurable; prefill/cohort and compact-input
+        // policies require their own authenticated planning contracts.
+        if args.prefill()?.is_some() || !args.input_encoding.is_default() {
+            return Err(CandidateError::Arguments.into());
+        }
+        let common = self.source.validate_batch_with_prefill(args).map_err(Failure::from)?;
         for mib in [s.journal_memory_mib, s.serialization_memory_mib] {
             if mib.checked_mul(MIB).is_none_or(|bytes| bytes > common.memory_bytes) {
                 return Err(Failure::usage("job_memory_options"));
@@ -147,7 +155,9 @@ impl JobCommand {
         }
         let args = JobArgs { kind, source: source::SourceArgs::from_matches(matches)?,
             defaults: DefaultsArgs::from_arg_matches(matches)?, storage: StorageArgs::from_arg_matches(matches)? };
-        Ok((Self { mode, args }, Int4Args::from_arg_matches(matches)?))
+        let mut native = Int4Args::from_arg_matches(matches)?;
+        native.compute = compute::Args::from_matches(matches)?;
+        Ok((Self { mode, args }, native))
     }
     pub(super) fn run_owned<R: Read + Send + 'static>(self, args: Int4Args, input: R,
         output: &mut impl Write, diagnostics: &mut impl Write) -> ExitCode {
