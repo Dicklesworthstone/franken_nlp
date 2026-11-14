@@ -108,10 +108,10 @@ fn run<P: Int4ScoredJobTask>(engine: &NlpEngine, model: &ResidentInt4, planner: 
     let request = SourceJobRequest { root: job.storage.job_dir, key, job_id, limits: lifetime,
         mode: open_mode(mode, job.storage.input_retention)?, materialize };
     let progress = if common.compute.threads == 1 {
-        engine.job_int4_scored(model, planner, request, host, common.kernel, reader, cancellation)
+        engine.job_int4_scored(model, planner, request, host, common.kernel, reader, cancellation.clone())
     } else {
         engine.job_int4_scored_with_threads(model, planner, request, host, common.kernel,
-            common.compute.threads, reader, cancellation)
+            common.compute.threads, reader, cancellation.clone())
     }.map_err(execution_failure)?;
     remaining()?;
     let report = progress_report(progress, job_id, lifetime, materialize, mode, task)?;
@@ -129,7 +129,7 @@ fn run<P: Int4ScoredJobTask>(engine: &NlpEngine, model: &ResidentInt4, planner: 
     };
     // A report-write error can follow durable commits. No private scores,
     // labels, documents, paths or keys are included, and rollback is not implied.
-    publish_report(&response, output, &remaining)
+    publish_report(&response, output, &remaining, &cancellation)
 }
 
 fn execution_failure(error: HostedJobError) -> Failure {
@@ -144,17 +144,20 @@ fn execution_failure(error: HostedJobError) -> Failure {
 }
 
 fn publish_report<T: Serialize>(response: &T, output: &mut impl Write,
-    remaining: &impl Fn() -> Result<Duration, CandidateError>) -> Result<(), Failure> {
-    remaining()?;
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(job_cli::REPORT_BYTES).map_err(|_| CandidateError::Memory)?;
-    let mut staged = BoundedOutput { bytes, cap: job_cli::REPORT_BYTES };
-    serde_json::to_writer(&mut staged, response).map_err(|_| CandidateError::Output)?;
-    staged.write_all(b"\n").map_err(|_| CandidateError::Output)?;
-    remaining()?;
-    output.write_all(&staged.bytes).and_then(|()| output.flush()).map_err(|_| CandidateError::Output)?;
-    remaining()?;
-    Ok(())
+    remaining: &impl Fn() -> Result<Duration, CandidateError>,
+    cancellation: &CancellationToken) -> Result<(), Failure> {
+    let check = || {
+        if cancellation.cause().is_some() { return Err(CandidateError::Execution); }
+        remaining().map(|_| ())
+    };
+    // Keep the original token and absolute deadline through serialization and
+    // delivery. Cancellation after a durable commit never implies rollback.
+    publish_checked(response, job_cli::REPORT_BYTES, output, &check).map_err(|error| {
+        match (error, cancellation.cause()) {
+            (CandidateError::Execution, Some(cause)) => job_failure(JobError::Cancelled(cause)),
+            (error, _) => Failure::from(error),
+        }
+    })
 }
 
 fn read_config(path: &std::path::Path, cap: usize,

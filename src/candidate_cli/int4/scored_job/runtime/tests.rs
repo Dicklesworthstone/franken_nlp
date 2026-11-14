@@ -170,14 +170,15 @@ fn original_native_cancellation_causes_keep_the_durable_policy_boundary() {
 #[test]
 fn scored_metadata_must_still_fit_and_have_time_before_and_after_delivery() {
     let available = || Ok(Duration::from_secs(1));
+    let cancellation = CancellationToken::default();
     let oversized = "x".repeat(job_cli::REPORT_BYTES);
-    assert!(publish_report(&oversized, &mut NoIo, &available).is_err());
+    assert!(publish_report(&oversized, &mut NoIo, &available, &cancellation).is_err());
     let checks = std::cell::Cell::new(0);
     let expired_before_write = || {
         checks.set(checks.get() + 1);
         if checks.get() == 1 { available() } else { Err(CandidateError::Timeout) }
     };
-    assert_eq!(publish_report(&true, &mut NoIo, &expired_before_write).unwrap_err().exit,
+    assert_eq!(publish_report(&true, &mut NoIo, &expired_before_write, &cancellation).unwrap_err().exit,
         ErrorCode::BudgetOrTimeout);
     let checks = std::cell::Cell::new(0);
     let expired_after_flush = || {
@@ -185,7 +186,7 @@ fn scored_metadata_must_still_fit_and_have_time_before_and_after_delivery() {
         if checks.get() < 3 { available() } else { Err(CandidateError::Timeout) }
     };
     let mut delivered = Vec::new();
-    assert_eq!(publish_report(&true, &mut delivered, &expired_after_flush).unwrap_err().exit,
+    assert_eq!(publish_report(&true, &mut delivered, &expired_after_flush, &cancellation).unwrap_err().exit,
         ErrorCode::BudgetOrTimeout);
     assert_eq!(delivered, b"true\n");
     struct BrokenFlush(Vec<u8>);
@@ -194,6 +195,61 @@ fn scored_metadata_must_still_fit_and_have_time_before_and_after_delivery() {
         fn flush(&mut self) -> io::Result<()> { Err(io::Error::other("fixture flush")) }
     }
     let mut broken = BrokenFlush(Vec::new());
-    assert!(publish_report(&true, &mut broken, &available).is_err());
+    assert!(publish_report(&true, &mut broken, &available, &cancellation).is_err());
     assert_eq!(broken.0, b"true\n");
+}
+
+#[test]
+fn scored_metadata_preserves_every_original_cancellation_before_staging() {
+    use crate::native_engine::decode::DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let cancellation = CancellationToken::default();
+        cancellation.cancel(cause);
+        let expected = job_failure(JobError::Cancelled(cause));
+        let failure = publish_report(&true, &mut NoIo, &|| Ok(Duration::from_secs(1)),
+            &cancellation).unwrap_err();
+        assert_eq!(failure.exit, expected.exit);
+        assert_eq!(failure.code, expected.code);
+    }
+}
+
+#[test]
+fn cancellation_during_metadata_serialization_prevents_the_first_external_byte() {
+    use crate::native_engine::decode::DecodeCancellationKind;
+    struct CancelWhileSerializing<'a>(&'a CancellationToken);
+    impl Serialize for CancelWhileSerializing<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.0.cancel(DecodeCancellationKind::ParentCancelled);
+            serializer.serialize_bool(true)
+        }
+    }
+    let cancellation = CancellationToken::default();
+    let failure = publish_report(&CancelWhileSerializing(&cancellation), &mut NoIo,
+        &|| Ok(Duration::from_secs(1)), &cancellation).unwrap_err();
+    assert_eq!(failure.exit, ErrorCode::Cancelled);
+    assert_eq!(failure.code, "job_cancelled");
+}
+
+#[test]
+fn cancellation_during_metadata_flush_fails_after_delivery_with_the_first_cause() {
+    use crate::native_engine::decode::DecodeCancellationKind;
+    struct CancelOnFlush { bytes: Vec<u8>, cancellation: CancellationToken }
+    impl Write for CancelOnFlush {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes); Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.cancellation.cancel(DecodeCancellationKind::ResourceUnavailable);
+            self.cancellation.cancel(DecodeCancellationKind::User);
+            Ok(())
+        }
+    }
+    let cancellation = CancellationToken::default();
+    let mut output = CancelOnFlush { bytes: Vec::new(), cancellation: cancellation.clone() };
+    let failure = publish_report(&true, &mut output, &|| Ok(Duration::from_secs(1)),
+        &cancellation).unwrap_err();
+    assert_eq!(output.bytes, b"true\n");
+    assert_eq!(failure.exit, ErrorCode::AdmissionOrResourceLimit);
+    assert_eq!(failure.code, "job_resource_limit");
 }

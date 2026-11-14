@@ -184,10 +184,22 @@ pub(in crate::candidate_cli) fn progress_report(p: JobProgress, expected: JobId,
         committed_spool_bytes: p.spool_bytes, materialized: p.materialized })
 }
 fn cancelled(cause: DecodeCancellationKind) -> Failure {
-    let budget = matches!(cause, DecodeCancellationKind::Deadline | DecodeCancellationKind::Timeout
-        | DecodeCancellationKind::PollQuota | DecodeCancellationKind::CostBudget);
-    Failure { exit: if budget { ErrorCode::BudgetOrTimeout } else { ErrorCode::Cancelled },
-        code: if budget { "job_execution_budget" } else { "job_cancelled" } }
+    // Preserve the complete cancellation domain at the durable policy boundary.
+    // A supervised failure without a retained underlying error is generic failure;
+    // a race loser escaping as a terminal job outcome is an invariant failure.
+    let (exit, code) = match cause {
+        DecodeCancellationKind::Deadline | DecodeCancellationKind::Timeout
+        | DecodeCancellationKind::PollQuota | DecodeCancellationKind::CostBudget =>
+            (ErrorCode::BudgetOrTimeout, "job_execution_budget"),
+        DecodeCancellationKind::User | DecodeCancellationKind::ParentCancelled
+        | DecodeCancellationKind::Shutdown => (ErrorCode::Cancelled, "job_cancelled"),
+        DecodeCancellationKind::ResourceUnavailable =>
+            (ErrorCode::AdmissionOrResourceLimit, "job_resource_limit"),
+        DecodeCancellationKind::FailFast | DecodeCancellationKind::LinkedExit =>
+            (ErrorCode::Generic, "job_supervised_failure"),
+        DecodeCancellationKind::RaceLost => (ErrorCode::Generic, "job_internal_race_lost"),
+    };
+    Failure { exit, code }
 }
 pub(in crate::candidate_cli) fn job_failure(error: JobError) -> Failure {
     let (exit, code) = match error {
@@ -221,7 +233,14 @@ pub(in crate::candidate_cli) fn host_failure(error: HostedJobError) -> Failure {
             };
             Failure { exit, code: "job_task_failed" }
         }
+        HostedJobError::Host(HostedError::Stopped { stop, task_error: Some(error) })
+            if matches!(stop.kind, DecodeCancellationKind::FailFast | DecodeCancellationKind::LinkedExit) =>
+                host_failure(HostedJobError::Host(*error)),
         HostedJobError::Host(HostedError::Stopped { stop, .. }) => cancelled(stop.kind),
+        HostedJobError::Host(HostedError::Native(
+            crate::native_engine::strict_int8::StrictInt8Error::Cancelled(cause)))
+        | HostedJobError::Host(HostedError::Int4(crate::hosted::Int4HostError::Native(
+            crate::native_engine::strict_int4::StrictInt4Error::Cancelled(cause)))) => cancelled(cause),
         HostedJobError::Host(HostedError::Reservation(_) | HostedError::Limits(_) | HostedError::Reentrant
             | HostedError::MissingRuntimeContext | HostedError::SingleCoordinatorRequired) =>
             Failure { exit: ErrorCode::AdmissionOrResourceLimit, code: "job_host_admission" },

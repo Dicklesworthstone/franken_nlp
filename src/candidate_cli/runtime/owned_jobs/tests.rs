@@ -126,3 +126,59 @@ fn impossible_population_memory_fails_before_resident_loading() {
     assert!(preflight_memory(zero, lifetime(), limits, JobInputMemory::CompletePopulation).is_err());
     assert!(preflight_memory(zero, lifetime(), limits, JobInputMemory::RetainedRecord).is_err());
 }
+
+#[test]
+fn every_job_cancellation_cause_keeps_its_documented_exit_policy() {
+    use crate::native_engine::decode::DecodeCancellationKind::*;
+    let cases = [
+        (User, ErrorCode::Cancelled, "job_cancelled"),
+        (Timeout, ErrorCode::BudgetOrTimeout, "job_execution_budget"),
+        (Deadline, ErrorCode::BudgetOrTimeout, "job_execution_budget"),
+        (PollQuota, ErrorCode::BudgetOrTimeout, "job_execution_budget"),
+        (CostBudget, ErrorCode::BudgetOrTimeout, "job_execution_budget"),
+        (FailFast, ErrorCode::Generic, "job_supervised_failure"),
+        (RaceLost, ErrorCode::Generic, "job_internal_race_lost"),
+        (ParentCancelled, ErrorCode::Cancelled, "job_cancelled"),
+        (ResourceUnavailable, ErrorCode::AdmissionOrResourceLimit, "job_resource_limit"),
+        (Shutdown, ErrorCode::Cancelled, "job_cancelled"),
+        (LinkedExit, ErrorCode::Generic, "job_supervised_failure"),
+    ];
+    for (cause, exit, code) in cases {
+        let stored = job_failure(JobError::Cancelled(cause));
+        let processor = host_failure(HostedJobError::Job(JobRunError::Processor(
+            crate::batch::BatchFault::cancelled(cause))));
+        assert_eq!(stored.exit, exit); assert_eq!(stored.code, code);
+        assert_eq!(processor.exit, exit); assert_eq!(processor.code, code);
+    }
+}
+
+#[test]
+fn supervised_job_stops_preserve_retained_typed_host_failures() {
+    use crate::native_engine::decode::DecodeCancellationKind::*;
+    for kind in [FailFast, LinkedExit] {
+        let stopped = |error| HostedJobError::Host(HostedError::Stopped {
+            stop: crate::hosted::RunStop { kind, runtime_reason: None, runtime_checkpoint_error: None },
+            task_error: Some(Box::new(error)),
+        });
+        let admission = host_failure(stopped(HostedError::Limits("fixture memory")));
+        assert_eq!(admission.exit, ErrorCode::AdmissionOrResourceLimit);
+        assert_eq!(admission.code, "job_host_admission");
+        let budget = host_failure(stopped(HostedError::Native(
+            crate::native_engine::strict_int8::StrictInt8Error::Cancelled(CostBudget))));
+        assert_eq!(budget.exit, ErrorCode::BudgetOrTimeout);
+        assert_eq!(budget.code, "job_execution_budget");
+        let resource = host_failure(stopped(HostedError::Int4(crate::hosted::Int4HostError::Native(
+            crate::native_engine::strict_int4::StrictInt4Error::Cancelled(ResourceUnavailable)))));
+        assert_eq!(resource.exit, ErrorCode::AdmissionOrResourceLimit);
+        assert_eq!(resource.code, "job_resource_limit");
+        assert_eq!(host_failure(stopped(HostedError::Panicked)).exit, ErrorCode::Generic);
+    }
+    // An ordinary caller stop retains its original authority even if a task
+    // also returned an error while draining.
+    let ordinary = host_failure(HostedJobError::Host(HostedError::Stopped {
+        stop: crate::hosted::RunStop { kind: User, runtime_reason: None, runtime_checkpoint_error: None },
+        task_error: Some(Box::new(HostedError::Limits("fixture memory"))),
+    }));
+    assert_eq!(ordinary.exit, ErrorCode::Cancelled);
+    assert_eq!(ordinary.code, "job_cancelled");
+}
