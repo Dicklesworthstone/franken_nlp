@@ -901,7 +901,7 @@ the coordinator; one keeps the serial path. The admitted team spans the
 complete invocation, pending items, durable commits and optional
 materialization. Worker scratch and the process thread envelope are included
 in admission before private IO, and all workers join before progress returns.
-This route retains its byte-input, full-projection, sequential-prompt contract.
+This route retains its full-projection, sequential-prompt contract.
 
 Worker width is physical scheduling metadata. An authenticated resume may
 change it without changing the private recipe or renewing native work, mask
@@ -911,6 +911,26 @@ remain authoritative through metadata staging and final write/flush.
 
 Library callers select `NlpEngine::job_int4_extract_with_threads` for widths
 2 through 64, or keep the existing serial entry point.
+
+Explicit `--input-encoding safe-bpe-v1` compacts the untrusted schema and
+source while preserving their original bytes and excluding template controls.
+Both segments share the per-record `--max-tokenizer-*` ceilings. One retained
+ledger also spans every record, failed preparation and host transfer, bounded
+by `--max-total-tokenizer-input-bytes`,
+`--max-total-tokenizer-output-tokens`,
+`--max-total-tokenizer-pair-checks` and
+`--max-total-tokenizer-pair-bytes` (defaults 67108864, 4194304, 268435456
+and 4294967296 respectively). These eight ceilings are authenticated in the
+private recipe and must match on resume. Remaining work can tighten admission
+without changing the identity of an otherwise successful plan.
+
+Encoder workspace is included beside the owned population and native state.
+Resume receives the same declared tokenizer allowance for its new invocation;
+persisted native work, mask work and attempts remain spent. Compact encoding
+can change model output and makes no quality or speed claim. Byte fallback
+remains the default with its existing recipe and metadata shape. Library
+callers opt in with `Int4ExtractionJobPlanner::with_document_encoding` and
+explicit `SafeBpeWorkLimits` before opening the job.
 
 The library entry point is `NlpEngine::job_int4_extract`, with a sealed
 `Int4ExtractionJobPlanner`, charged resident model, caller-owned input,

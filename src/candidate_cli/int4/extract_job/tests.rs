@@ -102,7 +102,6 @@ fn invalid_worker_widths_and_unsupported_schedules_refuse_before_private_io() {
         vec!["--compute-threads", "2", "--prefill-rows", "2"],
         vec!["--compute-threads", "2", "--cohort-documents", "2"],
         vec!["--compute-threads", "2", "--max-selected-rows", "8"],
-        vec!["--compute-threads", "2", "--input-encoding", "safe-bpe-v1"],
     ] {
         let mut words = argv("resume");
         words.extend(extra.into_iter().map(str::to_owned));
@@ -373,4 +372,78 @@ fn unavailable_profile_refuses_before_reading_any_private_file_or_input() {
     let (c, args) = command("resume", &["--discard-uncommitted-tail"]);
     assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().code,
         "owned_job_profile_unavailable");
+}
+
+
+#[test]
+fn compact_jobs_admit_both_encoder_owners_without_renewing_lifetime_work() {
+    use crate::tokenizer::untrusted::UntrustedEncoding;
+    for operation in ["start", "resume"] {
+        for width in ["1", "4"] {
+            for retained in [false, true] {
+                let mut extra = vec!["--compute-threads", width, "--preparation-mib", "1024"];
+                if retained {
+                    extra.extend([if operation == "start" { "--spool-input" } else { "--use-retained-input" },
+                        "--max-retained-input-mib", "16"]);
+                }
+                let (byte, byte_args) = command(operation, &extra);
+                let byte_common = byte.args.validate(&byte_args).unwrap();
+                let fixed = lifetime(&byte.args, &byte_args, byte_common);
+                let baseline = byte.args.lifetime_limits(&byte_args, byte_common, fixed).unwrap();
+                assert_eq!(baseline.encoding_workspace_bytes, 0);
+                assert_eq!(baseline.encoding_work_limits, None);
+                extra.extend(["--input-encoding", "safe-bpe-v1"]);
+                let (compact, args) = command(operation, &extra);
+                let common = compact.args.validate(&args).unwrap();
+                let admitted = compact.args.lifetime_limits(&args, common, fixed).unwrap();
+                let policy = compact.args.extraction.encoding_policy(&args, common.max_prompt_tokens).unwrap();
+                let UntrustedEncoding::SafeBpeV1(call) = policy else { panic!("compact policy lost"); };
+                let workspace = call.requirements().unwrap().workspace_bytes;
+                assert_eq!(admitted.encoding_workspace_bytes, workspace);
+                assert_eq!(admitted.buffer_bytes - baseline.buffer_bytes, workspace);
+                assert_eq!(admitted.preparation_reserve_bytes, baseline.preparation_reserve_bytes);
+                assert!(common.preparation_bytes >= workspace);
+                assert_eq!(admitted.native.max_model_work, fixed.max_work.int4_model_work());
+                assert_eq!(admitted.native.masks.max_visits_per_run, fixed.max_work.mask_node_visits);
+                assert_eq!(admitted.native.max_model_work, baseline.native.max_model_work);
+                assert_eq!(admitted.native.masks.max_visits_per_item, baseline.native.masks.max_visits_per_item);
+                assert_eq!(admitted.native.masks.per_mask.max_trie_node_visits,
+                    baseline.native.masks.per_mask.max_trie_node_visits);
+                assert_eq!(admitted.native.masks.per_mask.checkpoint_interval_nodes,
+                    baseline.native.masks.per_mask.checkpoint_interval_nodes);
+                assert_eq!(admitted.common.native, baseline.common.native);
+                assert_eq!(admitted.common.compute, baseline.common.compute);
+                assert_eq!(admitted.encoding_work_limits, Some(SafeBpeWorkLimits {
+                    max_input_bytes: 64 * MIB, max_output_tokens: 4 * MIB,
+                    max_pair_checks: 256 * MIB, max_pair_bytes: 4096 * MIB,
+                }));
+                let mut short = common; short.memory_bytes = admitted.common.minimum_memory_bytes - 1;
+                assert_eq!(compact.args.lifetime_limits(&args, short, fixed).unwrap_err().code,
+                    "job_population_memory");
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_limits_and_missing_encoder_memory_refuse_before_private_job_io() {
+    for option in ["--max-total-tokenizer-input-bytes", "--max-total-tokenizer-output-tokens",
+        "--max-total-tokenizer-pair-checks", "--max-total-tokenizer-pair-bytes"] {
+        let (c, args) = command("start", &[option, "1"]);
+        assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().code,
+            "extract_job_input_encoding");
+    }
+    for option in ["--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes",
+        "--max-total-tokenizer-input-bytes", "--max-total-tokenizer-output-tokens",
+        "--max-total-tokenizer-pair-checks", "--max-total-tokenizer-pair-bytes"] {
+        for value in ["0", "18446744073709551615"] {
+            let (c, args) = command("resume", &["--input-encoding", "safe-bpe-v1",
+                "--preparation-mib", "1024", option, value]);
+            assert!(c.execute_owned(args, NoRead, &mut NoWrite).is_err());
+        }
+    }
+    let (c, mut args) = command("start", &["--input-encoding", "safe-bpe-v1",
+        "--compute-threads", "4", "--preparation-mib", "1024"]);
+    args.memory_mib = 1;
+    assert!(c.execute_owned(args, NoRead, &mut NoWrite).is_err());
 }

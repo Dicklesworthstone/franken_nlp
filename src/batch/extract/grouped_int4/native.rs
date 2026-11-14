@@ -83,6 +83,24 @@ impl<'e, 'weights, 'v, A: Int4ExtractionBatchAdmission> NativeInt4ExtractionBatc
     pub fn reserved_model_work(&self) -> Int4Work { self.run.reserved }
     pub fn reserved_mask_visits(&self) -> u64 { self.run.mask_visits }
     pub fn is_poisoned(&self) -> bool { self.run.failed || !self.driver.clean() }
+
+    /// A durable adapter supplies its retained invocation ledger. Ordinary
+    /// streams keep their existing per-record preparation contract.
+    pub(crate) fn prepare_with_invocation_encoding_work<C: DecodeStepControl>(&mut self,
+        document: BatchDocument<ExtractionBatchArgs>, used: &mut SafeBpeWork,
+        total: Option<SafeBpeWorkLimits>, control: &mut C,
+    ) -> Result<PreparedInt4BatchExtraction, BatchItemFailure> {
+        self.run.ready()?;
+        self.run.failed = true;
+        let result = (|| {
+            let prepared = self.compiler.prepare_with_invocation_encoding_work(
+                document, used, total, control).map_err(preparation_failure)?;
+            preflight(&prepared, &self.driver)?;
+            Ok(prepared)
+        })();
+        if !result.as_ref().is_err_and(|e: &BatchItemFailure| e.stop) { self.run.failed = false; }
+        result
+    }
 }
 impl<A: Int4ExtractionBatchAdmission> BatchProcessor for NativeInt4ExtractionBatch<'_, '_, '_, A> {
     type Args = ExtractionBatchArgs;

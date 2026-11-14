@@ -94,8 +94,13 @@ impl NlpEngine {
         constrained_int4::check_model(planner.execution_identity(), model.model_identity())
             .map_err(|_| HostedError::ModelIdentity)?;
         planner.check_job_limits(request.limits).map_err(HostedError::BatchSetup)?;
-        let required = job_requirements(model.model_identity().group_width(), planner.task_ceiling(),
+        let mut required = job_requirements(model.model_identity().group_width(), planner.task_ceiling(),
             request.limits, limits, request.mode.input_memory())?;
+        // The caller's preparation reserve remains independently live. The
+        // hosted owner also admits the fixed encoder workspace before any
+        // population read, even when retained input is replayed on demand.
+        required.input_bytes = sum(&[required.input_bytes,
+            planner.encoding_workspace_bytes().map_err(HostedError::BatchSetup)?])?;
         let team_scratch = compute_threads.map(|width|
             int4_task_team_workspace_bytes(width, model.model_identity().group_width())).transpose()?.unwrap_or(0);
         sum(&[required.input_bytes, required.native.kv_bytes, required.workspace_bytes, team_scratch])?;
@@ -382,10 +387,19 @@ mod tests {
                 assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
                 drained(&host, &baseline);
             }
-            {
+            for compact in [false, true] {
                 let (planner, request, limits) = planner(&model);
-                let required = job_requirements(32, planner.task_ceiling(), request.limits,
+                let planner = if compact {
+                    use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding};
+                    planner.with_document_encoding(UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+                        max_input_bytes: 8192, max_output_tokens: 128,
+                        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24,
+                    }), Some(SafeBpeWorkLimits { max_input_bytes: 65536, max_output_tokens: 4096,
+                        max_pair_checks: 1 << 22, max_pair_bytes: 1 << 26 })).unwrap()
+                } else { planner };
+                let mut required = job_requirements(32, planner.task_ceiling(), request.limits,
                     limits, request.mode.input_memory()).unwrap();
+                required.input_bytes = sum(&[required.input_bytes, planner.encoding_workspace_bytes().unwrap()]).unwrap();
                 let room = sum(&[required.input_bytes, required.native.kv_bytes,
                     required.workspace_bytes, int4_task_team_workspace_bytes(4, 32).unwrap() - 1]).unwrap();
                 let bytes = host.resources().config().memory_ceiling_bytes

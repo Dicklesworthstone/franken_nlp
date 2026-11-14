@@ -16,7 +16,7 @@ use crate::{
         strict_int4::{Int4ModelIdentity, Int4Work, StrictInt4Engine}},
     tasks::{extract::{ExtractionVocabulary, grouped_int4::{Int4ExtractRun, INT4_EXTRACT_VERSION}},
         ir::TaskBudget},
-    tokenizer::untrusted::UntrustedEncoding,
+    tokenizer::untrusted::{SafeBpeWork, SafeBpeWorkLimits, UntrustedEncoding},
 };
 use serde::Serialize;
 
@@ -43,10 +43,15 @@ pub struct Int4ExtractionJobRecipe {
     source: SourceRuntimeLimits,
     native: NativeRecipe,
     defaults: ExtractionBatchArgs,
-    /// Complete-document compact encoding is explicit private resume authority.
-    /// Omission preserves the original byte-fallback recipe exactly.
+    /// Compact encoding is explicit private resume authority. Omission
+    /// preserves the original byte-fallback recipe exactly.
     #[serde(skip_serializing_if = "Option::is_none")]
     input_encoding: Option<UntrustedEncoding>,
+    /// Single-context jobs retain one allowance across every record and
+    /// failed preparation in an invocation. Document jobs keep their existing
+    /// separately authenticated complete-document preparation contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding_work_limits: Option<SafeBpeWorkLimits>,
 }
 #[derive(Serialize)]
 struct NativeRecipe {
@@ -85,7 +90,8 @@ impl Int4ExtractionJobRecipe {
             compiler: CompilerRecipe { max_schema_bytes, max_string_bytes, max_array_items,
                 max_output_bytes, max_states, max_transitions, max_mask_bytes }, source,
             native: NativeRecipe { max_model_work, max_trie_node_visits, checkpoint_interval_nodes,
-                max_visits_per_item, max_visits_per_run }, defaults, input_encoding: None };
+                max_visits_per_item, max_visits_per_run }, defaults, input_encoding: None,
+            encoding_work_limits: None };
         // Bound before cloning exact schema bytes into the native compiler.
         // Keep room for JobRunner's protocol/input-profile wrapper.
         bounded_json(&recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
@@ -101,6 +107,7 @@ pub struct Int4ExtractionJobPlanner {
     identity: ExecutionIdentity,
     recipe: Int4ExtractionJobRecipe,
     native: Int4ExtractionBatchLimits,
+    encoding_work: SafeBpeWork,
 }
 impl Int4ExtractionJobPlanner {
     pub fn for_model(model: &Int4ModelIdentity, ceiling: TaskBudget, compiler_limits: CompileLimits,
@@ -111,7 +118,7 @@ impl Int4ExtractionJobPlanner {
         let compiler = Int4ExtractionBatchPlanner::for_model(model, ceiling, compiler_limits,
             source_limits, Some(recipe.defaults.clone()))?.require_shared_defaults()?;
         let identity = compiler.base_execution_identity().clone();
-        Ok(Self { compiler, identity, recipe, native })
+        Ok(Self { compiler, identity, recipe, native, encoding_work: SafeBpeWork::default() })
     }
 
     // Synthetic identity is only a planning fixture, never a production
@@ -127,14 +134,67 @@ impl Int4ExtractionJobPlanner {
         let compiler = Int4ExtractionBatchPlanner::pinned(controls, eos, identity, group_width, ceiling,
             compiler_limits, source_limits, Some(recipe.defaults.clone()))?.require_shared_defaults()?;
         let identity = compiler.base_execution_identity().clone();
-        Ok(Self { compiler, identity, recipe, native })
+        Ok(Self { compiler, identity, recipe, native, encoding_work: SafeBpeWork::default() })
+    }
+
+    /// Select compact schema/source preparation before opening any job files.
+    /// Both the per-record policy and all invocation ceilings are authenticated.
+    /// One ledger moves with this factory into execution; changing records,
+    /// failed preparation or reconstruction cannot renew it.
+    pub fn with_document_encoding(mut self, policy: UntrustedEncoding,
+        total: Option<SafeBpeWorkLimits>) -> Result<Self, BatchFault> {
+        self.check_document_encoding()?;
+        encoding_workspace(&policy, total)?;
+        if self.document_encoding() == &policy && self.recipe.encoding_work_limits == total {
+            return Ok(self);
+        }
+        if self.encoding_work != SafeBpeWork::default() {
+            return Err(BatchCode::InvalidExecution.into());
+        }
+        self.compiler = self.compiler.with_document_encoding(policy.clone())?;
+        self.recipe.input_encoding = match policy {
+            UntrustedEncoding::ByteFallback => None,
+            compact @ UntrustedEncoding::SafeBpeV1(_) => Some(compact),
+        };
+        self.recipe.encoding_work_limits = total;
+        self.check_document_encoding()?;
+        bounded_json(&self.recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
+        Ok(self)
+    }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.compiler.document_encoding() }
+    pub fn encoding_work_limits(&self) -> Option<SafeBpeWorkLimits> { self.recipe.encoding_work_limits }
+    pub fn encoding_workspace_bytes(&self) -> Result<u64, BatchFault> {
+        self.check_document_encoding()?;
+        encoding_workspace(self.document_encoding(), self.encoding_work_limits())
+    }
+    fn check_document_encoding(&self) -> Result<(), BatchFault> {
+        let expected = match &self.recipe.input_encoding {
+            None => &UntrustedEncoding::ByteFallback,
+            Some(UntrustedEncoding::ByteFallback) => return Err(BatchCode::Admission.into()),
+            Some(compact @ UntrustedEncoding::SafeBpeV1(_)) => compact,
+        };
+        if self.document_encoding() != expected { return Err(BatchCode::Admission.into()); }
+        encoding_workspace(expected, self.recipe.encoding_work_limits)?;
+        Ok(())
     }
 
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn task_ceiling(&self) -> TaskBudget { self.recipe.task_ceiling }
     pub fn native_limits(&self) -> Int4ExtractionBatchLimits { self.native }
     pub fn check_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> {
+        self.check_document_encoding()?;
         check_job_limits(&self.recipe, limits)
+    }
+}
+fn encoding_workspace(policy: &UntrustedEncoding, total: Option<SafeBpeWorkLimits>)
+    -> Result<u64, BatchFault> {
+    match (policy, total) {
+        (UntrustedEncoding::ByteFallback, None) => Ok(0),
+        (UntrustedEncoding::SafeBpeV1(_), Some(total)) => {
+            total.validate().map_err(|_| BatchCode::InvalidLimits)?;
+            crate::batch::extract::grouped_int4::memory::encoding_workspace_bytes(policy)
+        }
+        _ => Err(BatchCode::Admission.into()),
     }
 }
 fn check_job_limits(recipe: &Int4ExtractionJobRecipe, limits: JobLimits) -> Result<(), BatchFault> {
@@ -153,13 +213,16 @@ pub struct Int4ExtractionJobProcessor<'e, 'weights, 'v, A: Int4ExtractionBatchAd
     native: NativeInt4ExtractionBatch<'e, 'weights, 'v, A>,
     identity: ExecutionIdentity,
     recipe: Int4ExtractionJobRecipe,
+    encoding_work: SafeBpeWork,
 }
 impl<'e, 'weights, 'v, A: Int4ExtractionBatchAdmission> Int4ExtractionJobProcessor<'e, 'weights, 'v, A> {
     pub fn new(planner: Int4ExtractionJobPlanner, engine: &'e mut StrictInt4Engine<'weights>,
         vocabulary: &'v ExtractionVocabulary, admission: A) -> Result<Self, BatchFault> {
-        let Int4ExtractionJobPlanner { compiler, identity, recipe, native } = planner;
-        let native = NativeInt4ExtractionBatch::new(compiler, engine, vocabulary, admission, native)?;
-        Ok(Self { native, identity, recipe })
+        planner.check_document_encoding()?;
+        let Int4ExtractionJobPlanner { compiler, identity, recipe, native, encoding_work } = planner;
+        let native = NativeInt4ExtractionBatch::new_with_document_encoding(
+            compiler, engine, vocabulary, admission, native)?;
+        Ok(Self { native, identity, recipe, encoding_work })
     }
 }
 impl<A: Int4ExtractionBatchAdmission> BatchProcessor for Int4ExtractionJobProcessor<'_, '_, '_, A> {
@@ -169,11 +232,17 @@ impl<A: Int4ExtractionBatchAdmission> BatchProcessor for Int4ExtractionJobProces
     type Prepared = PreparedInt4BatchExtraction;
     type Output = GuardedOutput<Int4ExtractRun, A::Guard>;
     fn prepare(&mut self, document: BatchDocument<Self::Args>) -> Result<Self::Prepared, BatchItemFailure> {
-        self.native.prepare(shared_document(document)?)
+        struct Uncontrolled;
+        impl DecodeStepControl for Uncontrolled {
+            fn checkpoint(&mut self, _: usize)
+                -> Option<crate::native_engine::decode::DecodeCancellationKind> { None }
+        }
+        self.prepare_with_control(document, &mut Uncontrolled)
     }
     fn prepare_with_control<C: DecodeStepControl>(&mut self, document: BatchDocument<Self::Args>,
         control: &mut C) -> Result<Self::Prepared, BatchItemFailure> {
-        self.native.prepare_with_control(shared_document(document)?, control)
+        self.native.prepare_with_invocation_encoding_work(shared_document(document)?,
+            &mut self.encoding_work, self.recipe.encoding_work_limits, control)
     }
     fn planned_work(&self, prepared: &Self::Prepared) -> BatchWork { self.native.planned_work(prepared) }
     fn execute<C: DecodeStepControl>(&mut self, prepared: Self::Prepared, control: &mut C)
@@ -192,14 +261,17 @@ impl<A: Int4ExtractionBatchAdmission> DurableBatchProcessor for Int4ExtractionJo
     }
     fn durable_work(&self, prepared: &Self::Prepared) -> Result<JobWork, BatchItemFailure> {
         if self.native.is_poisoned() { return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)); }
-        durable_plan_work(prepared, self.recipe.native.max_visits_per_item)
+        durable_plan_work(prepared, self.recipe.native.max_visits_per_item,
+            self.recipe.input_encoding.as_ref().unwrap_or(&UntrustedEncoding::ByteFallback))
     }
     fn max_result_bytes(&self, prepared: &Self::Prepared) -> u64 { prepared.extraction_plan().max_result_bytes() }
 }
-fn durable_plan_work(prepared: &PreparedInt4BatchExtraction, masks: u64) -> Result<JobWork, BatchItemFailure> {
-    // A prepared plan can be passed through the public processor trait. Its
-    // strategy must match the immutable full-head recipe before journaling.
-    if prepared.extraction_plan().selected_rows().is_some() {
+fn durable_plan_work(prepared: &PreparedInt4BatchExtraction, masks: u64, encoding: &UntrustedEncoding)
+    -> Result<JobWork, BatchItemFailure> {
+    // Public processor traits can receive a foreign prepared plan. Strategy
+    // and exact encoder policy must match the fixed recipe before journaling.
+    if prepared.extraction_plan().selected_rows().is_some()
+        || prepared.source().document_encoding() != encoding {
         return Err(BatchItemFailure::fatal(BatchCode::Admission));
     }
     // Copy the already group-aware quote. Recomputing it with INT8

@@ -89,12 +89,12 @@ fn injected_selected_plans_refuse_before_durable_work_is_journalable() {
     let p = planner();
     let dense = p.compiler.prepare(shared_document(document("Alice")).unwrap()).unwrap();
     let masks = p.recipe.native.max_visits_per_item;
-    assert_eq!(durable_plan_work(&dense, masks).unwrap(), JobWork::from_int4(dense.planned_work(), masks));
+    assert_eq!(durable_plan_work(&dense, masks, &UntrustedEncoding::ByteFallback).unwrap(), JobWork::from_int4(dense.planned_work(), masks));
     for max_rows_per_step in [7, NANBEIGE_VOCAB_SIZE] {
         let selected = planner().compiler.with_selected_rows(
             crate::native_engine::constrained_int4::sparse::Int4JsonSparseLimits { max_rows_per_step }).unwrap();
         let prepared = selected.prepare(shared_document(document("Alice")).unwrap()).unwrap();
-        let failure = durable_plan_work(&prepared, masks).unwrap_err();
+        let failure = durable_plan_work(&prepared, masks, &UntrustedEncoding::ByteFallback).unwrap_err();
         assert!(failure.stop); assert_eq!(failure.fault.code, BatchCode::Admission);
     }
 }
@@ -268,13 +268,13 @@ impl BatchProcessor for Processor {
     type Prepared = PreparedInt4BatchExtraction;
     type Output = GuardedOutput<Output, Guard>;
     fn prepare(&mut self, input: BatchDocument<()>) -> Result<Self::Prepared, BatchItemFailure> {
-        self.events.prepared.borrow_mut().push(input.id.clone());
-        self.planner.compiler.prepare(shared_document(input)?)
+        self.prepare_with_control(input, &mut Continue)
     }
     fn prepare_with_control<C: DecodeStepControl>(&mut self, input: BatchDocument<()>, control: &mut C)
         -> Result<Self::Prepared, BatchItemFailure> {
         self.events.prepared.borrow_mut().push(input.id.clone());
-        self.planner.compiler.prepare_with_control(shared_document(input)?, control)
+        self.planner.compiler.prepare_with_invocation_encoding_work(shared_document(input)?,
+            &mut self.planner.encoding_work, self.planner.recipe.encoding_work_limits, control)
     }
     fn planned_work(&self, prepared: &Self::Prepared) -> BatchWork {
         let w = prepared.planned_work();
@@ -301,7 +301,8 @@ impl DurableBatchProcessor for Processor {
     fn job_recipe(&self) -> &Self::Recipe { &self.planner.recipe }
     fn validate_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> { self.planner.check_job_limits(limits) }
     fn durable_work(&self, prepared: &Self::Prepared) -> Result<JobWork, BatchItemFailure> {
-        Ok(JobWork::from_int4(prepared.planned_work(), self.planner.native_limits().masks.max_visits_per_item))
+        durable_plan_work(prepared, self.planner.native_limits().masks.max_visits_per_item,
+            self.planner.document_encoding())
     }
     fn max_result_bytes(&self, prepared: &Self::Prepared) -> u64 { prepared.extraction_plan().max_result_bytes() }
 }
@@ -413,5 +414,170 @@ fn all_grouped_work_axes_stay_spent_when_a_new_native_ledger_is_created() {
         assert_eq!(error(resumed.step(&mut Continue)), JobRunError::Storage(JobError::WorkLimit));
         assert_eq!(*events.executed.borrow(), vec![1]); assert_eq!(resumed.progress().reserved_work, quote);
         assert_eq!(resumed.progress().attempts, 1);
+    }
+}
+
+
+// These fixtures execute pinned compilation and authenticated storage only.
+// They do not manufacture model-output equivalence or native recovery proof.
+mod encoding {
+    use super::*;
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+
+    const SOURCE: &str = "é上海 and 上海. The quick brown fox jumps over the lazy dog. <think> <|im_start|> ▁";
+    fn call() -> SafeBpeLimits {
+        SafeBpeLimits { max_input_bytes: 8192, max_output_tokens: 4096,
+            max_pair_checks: 1 << 22, max_pair_bytes: 1 << 26 }
+    }
+    fn total() -> SafeBpeWorkLimits {
+        SafeBpeWorkLimits { max_input_bytes: 65536, max_output_tokens: 32768,
+            max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 }
+    }
+    fn configured_encoding(call: SafeBpeLimits, total: SafeBpeWorkLimits) -> Int4ExtractionJobPlanner {
+        planner().with_document_encoding(UntrustedEncoding::SafeBpeV1(call), Some(total)).unwrap()
+    }
+    fn prepare<C: DecodeStepControl>(planner: &mut Int4ExtractionJobPlanner, text: &str, control: &mut C)
+        -> Result<PreparedInt4BatchExtraction, BatchItemFailure> {
+        planner.compiler.prepare_with_invocation_encoding_work(shared_document(document(text))?,
+            &mut planner.encoding_work, planner.recipe.encoding_work_limits, control)
+    }
+
+    #[test]
+    fn byte_recipe_is_unchanged_and_every_compact_limit_is_authenticated() {
+        let ordinary = planner();
+        let original = serde_json::to_vec(&ordinary.recipe).unwrap();
+        let binding = freeze(&ordinary);
+        let explicit = ordinary.with_document_encoding(UntrustedEncoding::ByteFallback, None).unwrap();
+        assert_eq!(serde_json::to_vec(&explicit.recipe).unwrap(), original);
+        assert_eq!(explicit.encoding_workspace_bytes().unwrap(), 0);
+        binding.binding.compare(&freeze(&explicit).binding).unwrap();
+        let baseline = serde_json::to_value(&explicit.recipe).unwrap();
+        assert!(baseline.get("input_encoding").is_none());
+        assert!(baseline.get("encoding_work_limits").is_none());
+
+        let compact = configured_encoding(call(), total());
+        let frozen = freeze(&compact);
+        assert_eq!(compact.encoding_workspace_bytes().unwrap(), call().requirements().unwrap().workspace_bytes);
+        let mut value = serde_json::to_value(&compact.recipe).unwrap();
+        assert_eq!(value.as_object_mut().unwrap().remove("input_encoding"),
+            Some(serde_json::to_value(UntrustedEncoding::SafeBpeV1(call())).unwrap()));
+        assert_eq!(value.as_object_mut().unwrap().remove("encoding_work_limits"),
+            Some(serde_json::to_value(total()).unwrap()));
+        assert_eq!(value, baseline);
+        assert_eq!(binding.binding.compare(&frozen.binding), Err(JobError::Mismatch(MismatchField::Recipe)));
+        for axis in 0..8 {
+            let mut call = call(); let mut total = total();
+            match axis {
+                0 => call.max_input_bytes += 1, 1 => call.max_output_tokens += 1,
+                2 => call.max_pair_checks += 1, 3 => call.max_pair_bytes += 1,
+                4 => total.max_input_bytes += 1, 5 => total.max_output_tokens += 1,
+                6 => total.max_pair_checks += 1, _ => total.max_pair_bytes += 1,
+            }
+            let changed = configured_encoding(call, total);
+            assert_eq!(frozen.binding.compare(&freeze(&changed).binding),
+                Err(JobError::Mismatch(MismatchField::Recipe)), "axis {axis}");
+        }
+        assert!(planner().with_document_encoding(UntrustedEncoding::SafeBpeV1(call()), None).is_err());
+        assert!(planner().with_document_encoding(UntrustedEncoding::ByteFallback, Some(total())).is_err());
+        let mut invalid = total(); invalid.max_input_bytes = 0;
+        assert!(planner().with_document_encoding(UntrustedEncoding::SafeBpeV1(call()), Some(invalid)).is_err());
+    }
+
+    #[test]
+    fn one_invocation_ledger_covers_schema_source_records_and_factory_transfer() {
+        let bytes = defaults().schema.len() + SOURCE.len();
+        let mut cap = total(); cap.max_input_bytes = (2 * bytes) as u64;
+        let mut compact = configured_encoding(call(), cap);
+        let first = prepare(&mut compact, SOURCE, &mut Continue).unwrap();
+        assert_eq!(compact.encoding_work.input_bytes(), bytes);
+        let mut moved = compact;
+        let second = prepare(&mut moved, SOURCE, &mut Continue).unwrap();
+        assert_eq!(moved.encoding_work.input_bytes(), bytes * 2);
+        assert_eq!(first.execution_identity(), second.execution_identity());
+        assert_eq!(first.planned_work(), second.planned_work());
+        assert_eq!(first.source().document_encoding(), &UntrustedEncoding::SafeBpeV1(call()));
+        assert_eq!(first.source().text(), SOURCE);
+        let tokenizer = EmbeddedTokenizer::pinned().unwrap();
+        let controls = pinned_controls::pinned().unwrap();
+        let schema = defaults().schema;
+        for (index, text) in [(2, schema.as_str()), (4, SOURCE)] {
+            let tokens = first.task_plan().ir().prompt_segments()[index].token_ids();
+            assert_eq!(tokenizer.tokenizer().decode_bytes(tokens).unwrap(), text.as_bytes());
+            assert!(tokens.iter().all(|&id| !controls.template_controls().contains(id)));
+        }
+        let spent = moved.encoding_work;
+        let failure = prepare(&mut moved, SOURCE, &mut Continue).err().unwrap();
+        assert!(failure.stop); assert_eq!(failure.fault.code, BatchCode::WorkLimit);
+        assert_eq!(moved.encoding_work, spent);
+        let byte = planner().compiler.prepare(shared_document(document(SOURCE)).unwrap()).unwrap();
+        assert!(durable_plan_work(&byte, native(WIDTH).masks.max_visits_per_item,
+            moved.document_encoding()).is_err());
+        assert!(durable_plan_work(&first, native(WIDTH).masks.max_visits_per_item,
+            &UntrustedEncoding::ByteFallback).is_err());
+        let mut processor = Processor::new(moved, Rc::new(Events::default()));
+        let failure = processor.prepare(document(SOURCE)).err().unwrap();
+        assert_eq!(failure.fault.code, BatchCode::WorkLimit);
+        assert_eq!(processor.planner.encoding_work, spent);
+    }
+
+    #[test]
+    fn failed_preparation_keeps_consumed_tokenizer_work_and_original_cancellation() {
+        let mut small = call(); small.max_pair_checks = 1;
+        let mut compact = configured_encoding(small, total());
+        assert!(prepare(&mut compact, SOURCE, &mut Continue).is_err());
+        let first = compact.encoding_work;
+        assert!(first.input_bytes() > 0); assert_eq!(first.pair_checks(), 1);
+        assert!(prepare(&mut compact, SOURCE, &mut Continue).is_err());
+        assert_eq!(compact.encoding_work.input_bytes(), first.input_bytes() * 2);
+        assert_eq!(compact.encoding_work.pair_checks(), first.pair_checks() * 2);
+
+        struct Control { calls: usize, stop_at: usize, cause: DecodeCancellationKind }
+        impl DecodeStepControl for Control {
+            fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+                self.calls += 1; (self.calls == self.stop_at).then_some(self.cause)
+            }
+        }
+        let mut counter = Control { calls: 0, stop_at: usize::MAX, cause: DecodeCancellationKind::User };
+        prepare(&mut configured_encoding(call(), total()), SOURCE, &mut counter).unwrap();
+        use DecodeCancellationKind::*;
+        for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+            ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+            let mut compact = configured_encoding(call(), total());
+            let mut control = Control { calls: 0, stop_at: (counter.calls / 2).max(1), cause };
+            let failure = prepare(&mut compact, SOURCE, &mut control).err().unwrap();
+            assert_eq!(failure.fault.cancellation, Some(cause));
+            assert!(compact.encoding_work.input_bytes() > 0);
+        }
+    }
+
+    #[test]
+    fn compact_resume_authenticates_totals_before_tail_repair_and_keeps_native_debits() {
+        let root = Root::new(); let inputs = inputs(); let events = Rc::new(Events::default());
+        let make = || configured_encoding(call(), total());
+        let limits = job_limits(native(WIDTH));
+        let mut control = CancelAfterSync(Rc::clone(&events));
+        let mut run = JobRunner::create(&root.0, key(), JobId([9; 16]), limits, &inputs,
+            Processor::new(make(), Rc::clone(&events)), &mut control).unwrap();
+        assert_eq!(error(run.step(&mut control)),
+            JobRunError::Storage(JobError::Cancelled(DecodeCancellationKind::PollQuota)));
+        let spent = run.progress().reserved_work;
+        assert_eq!(run.progress().attempts, 1); assert_eq!(run.progress().committed, 0);
+        drop(run);
+        let before = events.prepared.borrow().len();
+        let mut changed = total(); changed.max_pair_checks += 1;
+        assert_eq!(error(JobRunner::resume(&root.0, key(), JobId([9; 16]), limits, &inputs,
+            Processor::new(configured_encoding(call(), changed), Rc::clone(&events)),
+            TailPolicy::DiscardUncommitted, &mut Continue)),
+            JobRunError::Storage(JobError::Mismatch(MismatchField::Recipe)));
+        assert_eq!(events.prepared.borrow().len(), before);
+        assert_eq!(error(JobRunner::resume(&root.0, key(), JobId([9; 16]), limits, &inputs,
+            Processor::new(make(), Rc::clone(&events)), TailPolicy::Refuse, &mut Continue)),
+            JobRunError::Storage(JobError::UncommittedTail));
+        let mut resumed = JobRunner::resume(&root.0, key(), JobId([9; 16]), limits, &inputs,
+            Processor::new(make(), Rc::clone(&events)), TailPolicy::DiscardUncommitted, &mut Continue).unwrap();
+        assert_eq!(resumed.progress().reserved_work, spent);
+        assert_eq!(resumed.step(&mut Continue).unwrap().unwrap().reserved_work, spent.checked_add(spent).unwrap());
+        assert_eq!(resumed.run(&mut Continue).unwrap().attempts, 3);
+        assert_eq!(*events.executed.borrow(), vec![1, 1, 2]);
     }
 }

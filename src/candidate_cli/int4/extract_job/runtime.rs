@@ -20,6 +20,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let input_memory = job.storage.input_retention.input_memory()?;
     // Recheck options at the owned boundary before private IO/runtime creation.
     let common = job.validate(&args)?;
+    let encoding = job.extraction.encoding_policy(&args, common.max_prompt_tokens)?;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
@@ -36,7 +37,8 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let common = limits.common;
     // Cross-check the CLI quote against the same hosted reservation calculator
     // BEFORE key/schema/model reads. Neither calculation is a memory permit.
-    check_host_quote(host_limits(&args, limits, remaining()?), lifetime, limits.buffer_bytes, input_memory)?;
+    check_host_quote(host_limits(&args, limits, remaining()?), lifetime,
+        limits.buffer_bytes, limits.encoding_workspace_bytes, input_memory)?;
     let key = JobSecret::read(&job.storage.key_file).map_err(job_failure)?;
     remaining()?;
     let schema = read_config(job.extraction.schema_path(), SCHEMA_BYTES, &remaining)?;
@@ -49,8 +51,12 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     remaining()?;
     let planner = Int4ExtractionJobPlanner::for_model(model.model_identity(), budget,
         job.extraction.compiler(), job.extraction.source_limits(), defaults, limits.native)
+        .and_then(|planner| planner.with_document_encoding(encoding.clone(), limits.encoding_work_limits))
         .map_err(|_| CandidateError::Planning)?;
     planner.check_job_limits(lifetime).map_err(|_| CandidateError::Planning)?;
+    if planner.encoding_workspace_bytes().map_err(|_| CandidateError::Memory)? != limits.encoding_workspace_bytes {
+        return Err(Failure::usage("job_host_memory_quote"));
+    }
     remaining()?;
     let controls = crate::tokenizer::pinned_controls::pinned().map_err(|_| CandidateError::Identity)?;
     let vocabulary = ExtractionVocabulary::pinned(controls.template_controls())
@@ -93,7 +99,9 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         model_content_sha256: &content, candidate_format: &identity.artifact_format,
         quant_recipe: &identity.quant_recipe, group_width: model.model_identity().group_width(),
         integer_kernel: common.kernel.kind().id(), snapshot,
-        compute_schedule: compute::Schedule::for_threads(common.compute.threads), output: &report,
+        compute_schedule: compute::Schedule::for_threads(common.compute.threads),
+        input_encoding: input_encoding::reported_policy(&encoding),
+        encoding_work_limits: limits.encoding_work_limits, output: &report,
     };
     // Metadata only: result bytes remain in the explicit owner-only spool.
     // Delivery failure can follow a durable commit and never implies rollback.
@@ -144,8 +152,11 @@ fn host_limits(args: &Int4Args, limits: JobExecutionLimits, remaining: Duration)
         serialization_reserve_bytes: limits.serialization_reserve_bytes,
     }
 }
-fn check_host_quote(host: JobHostLimits, job: JobLimits, expected: u64, input: JobInputMemory) -> Result<(), Failure> {
-    if host.required_buffer_bytes_for_input(job, input).map_err(host_failure)? != expected {
+fn check_host_quote(host: JobHostLimits, job: JobLimits, expected: u64, encoding_workspace_bytes: u64,
+    input: JobInputMemory) -> Result<(), Failure> {
+    let required = host.required_buffer_bytes_for_input(job, input).map_err(host_failure)?
+        .checked_add(encoding_workspace_bytes).ok_or_else(|| Failure::usage("job_memory_arithmetic"))?;
+    if required != expected {
         return Err(Failure::usage("job_host_memory_quote"));
     }
     Ok(())
@@ -176,6 +187,10 @@ struct Response<'a, T: Serialize> {
     snapshot: Option<SnapshotRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compute_schedule: Option<compute::Schedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<&'a crate::tokenizer::untrusted::UntrustedEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding_work_limits: Option<SafeBpeWorkLimits>,
     output: &'a T,
 }
 

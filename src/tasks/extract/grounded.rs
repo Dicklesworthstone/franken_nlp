@@ -117,21 +117,43 @@ impl SourceDocumentEncoder {
         &self, schema: &str, text: &str, policy: &UntrustedEncoding,
         max_bytes: usize, max_tokens: usize, work: &mut SafeBpeWork, checkpoint: &mut F,
     ) -> Result<(SourceDocument, SourceDocument), ExtractError> {
+        self.encode_schema_and_source_with_budget(schema, text, policy, policy,
+            max_bytes, max_tokens, work, checkpoint)
+    }
+
+    /// Invocation admission may tighten work without changing the immutable
+    /// schema/source policy carried by a successful preparation. The effective
+    /// allowance can only narrow the declared byte-preserving encoder.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_schema_and_source_with_budget<F: FnMut() -> Option<DecodeCancellationKind>>(
+        &self, schema: &str, text: &str, policy: &UntrustedEncoding, effective: &UntrustedEncoding,
+        max_bytes: usize, max_tokens: usize, work: &mut SafeBpeWork, checkpoint: &mut F,
+    ) -> Result<(SourceDocument, SourceDocument), ExtractError> {
         encoding_checkpoint(checkpoint)?;
-        policy.validate().map_err(|_| ExtractError::Contract("invalid extraction document encoding policy"))?;
+        policy.validate().and_then(|()| effective.validate())
+            .map_err(|_| ExtractError::Contract("invalid extraction document encoding policy"))?;
+        match (policy, effective) {
+            (UntrustedEncoding::ByteFallback, UntrustedEncoding::ByteFallback) => {}
+            (UntrustedEncoding::SafeBpeV1(declared), UntrustedEncoding::SafeBpeV1(allowed))
+                if allowed.max_input_bytes <= declared.max_input_bytes
+                    && allowed.max_output_tokens <= declared.max_output_tokens
+                    && allowed.max_pair_checks <= declared.max_pair_checks
+                    && allowed.max_pair_bytes <= declared.max_pair_bytes => {}
+            _ => return Err(ExtractError::Contract("extraction encoding allowance widened")),
+        }
         let total = schema.len().checked_add(text.len()).ok_or(ExtractError::AllocationRefused)?;
-        let byte_limit = match policy {
+        let byte_limit = match effective {
             UntrustedEncoding::ByteFallback => max_bytes.min(max_tokens),
             UntrustedEncoding::SafeBpeV1(limits) => max_bytes.min(limits.max_input_bytes),
         };
         if total > byte_limit {
             return Err(ExtractError::Contract("schema and source exceed aggregate byte or token budget"));
         }
-        let schema = self.encode_part(schema, policy, work, checkpoint)?;
+        let schema = self.encode_part(schema, effective, work, checkpoint)?;
         if schema.ids().len() > max_tokens {
             return Err(ExtractError::Contract("schema token budget exceeded"));
         }
-        let source = self.encode_part(text, policy, work, checkpoint)?;
+        let source = self.encode_part(text, effective, work, checkpoint)?;
         let tokens = schema.ids().len().checked_add(source.ids().len()).ok_or(ExtractError::AllocationRefused)?;
         if tokens > max_tokens {
             return Err(ExtractError::Contract("schema and source exceed aggregate token budget"));

@@ -67,12 +67,12 @@ fn cli_memory_quote_agrees_with_the_host_and_cannot_replace_host_validation() {
     let job = lifetime(&command.args, &args, common);
     let limits = command.args.lifetime_limits(&args, common, job).unwrap();
     let host = host_limits(&args, limits, Duration::from_secs(30));
-    check_host_quote(host, job, limits.buffer_bytes, JobInputMemory::CompletePopulation).unwrap();
-    check_host_quote(host, job, limits.buffer_bytes - 2 * job.max_snapshot_bytes, JobInputMemory::RetainedRecord).unwrap();
-    assert_eq!(check_host_quote(host, job, limits.buffer_bytes - 1, JobInputMemory::CompletePopulation)
+    check_host_quote(host, job, limits.buffer_bytes, 0, JobInputMemory::CompletePopulation).unwrap();
+    check_host_quote(host, job, limits.buffer_bytes - 2 * job.max_snapshot_bytes, 0, JobInputMemory::RetainedRecord).unwrap();
+    assert_eq!(check_host_quote(host, job, limits.buffer_bytes - 1, 0, JobInputMemory::CompletePopulation)
         .unwrap_err().code, "job_host_memory_quote");
     let mut invalid = host; invalid.journal_reserve_bytes = 0;
-    assert_eq!(check_host_quote(invalid, job, limits.buffer_bytes, JobInputMemory::CompletePopulation)
+    assert_eq!(check_host_quote(invalid, job, limits.buffer_bytes, 0, JobInputMemory::CompletePopulation)
         .unwrap_err().code, "job_host_admission");
     assert_eq!(host.native.context_tokens, args.context_tokens);
     assert_eq!(host.native.run.max_checkpoints, args.max_checkpoints);
@@ -99,7 +99,7 @@ fn completion_envelope_contains_candidate_identity_and_authenticated_progress_on
         candidate_format: "fixture-candidate-format", quant_recipe: "fixture-grouped-int4",
         group_width: args.group_width, integer_kernel: common.kernel.kind().id(),
         snapshot: Some(SnapshotRecord::new("loaded", common.snapshot_need)),
-        compute_schedule: None, output: &report,
+        compute_schedule: None, input_encoding: None, encoding_work_limits: None, output: &report,
     };
     let mut bytes = Vec::new();
     publish(&response, job_cli::REPORT_BYTES, &mut bytes).unwrap();
@@ -119,12 +119,28 @@ fn completion_envelope_contains_candidate_identity_and_authenticated_progress_on
     }
     assert!(bytes.ends_with(b"\n"));
     assert!(value.get("compute_schedule").is_none());
+    assert!(value.get("input_encoding").is_none());
+    assert!(value.get("encoding_work_limits").is_none());
     let mut threaded = response;
     threaded.compute_schedule = compute::Schedule::for_threads(4);
     let mut threaded_value = serde_json::to_value(&threaded).unwrap();
     assert_eq!(threaded_value.as_object_mut().unwrap().remove("compute_schedule"),
         compute::Schedule::for_threads(4).map(serde_json::to_value).transpose().unwrap());
     assert_eq!(threaded_value, value);
+    let policy = crate::tokenizer::untrusted::UntrustedEncoding::SafeBpeV1(
+        crate::tokenizer::untrusted::SafeBpeLimits { max_input_bytes: 8192, max_output_tokens: 4096,
+            max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 });
+    let total = SafeBpeWorkLimits { max_input_bytes: 64 * MIB, max_output_tokens: 4 * MIB,
+        max_pair_checks: 256 * MIB, max_pair_bytes: 4096 * MIB };
+    threaded.input_encoding = Some(&policy);
+    threaded.encoding_work_limits = Some(total);
+    let mut compact_value = serde_json::to_value(&threaded).unwrap();
+    assert_eq!(compact_value.as_object_mut().unwrap().remove("input_encoding"),
+        Some(serde_json::to_value(&policy).unwrap()));
+    assert_eq!(compact_value.as_object_mut().unwrap().remove("encoding_work_limits"),
+        Some(serde_json::to_value(total).unwrap()));
+    compact_value.as_object_mut().unwrap().remove("compute_schedule");
+    assert_eq!(compact_value, value);
     assert_eq!(publish(&threaded, 1, &mut NoWrite), Err(CandidateError::Output));
 }
 
@@ -227,4 +243,28 @@ fn report_budget_and_original_deadline_cover_staging_and_complete_delivery() {
     let mut broken = BrokenFlush(Vec::new());
     assert!(publish_report(&true, &mut broken, &available, &stop).is_err());
     assert_eq!(broken.0, b"true\n");
+}
+
+
+#[test]
+fn compact_workspace_is_separate_from_cli_preparation_and_owned_population() {
+    let (command, mut args) = parts();
+    let matches = input_encoding::definition(clap::Command::new("fixture"))
+        .try_get_matches_from(["fixture", "--input-encoding", "safe-bpe-v1"]).unwrap();
+    args.input_encoding = input_encoding::InputEncodingArgs::from_matches(&matches).unwrap();
+    args.preparation_mib = 1024;
+    let common = command.args.validate(&args).unwrap();
+    let job = lifetime(&command.args, &args, common);
+    let limits = command.args.lifetime_limits(&args, common, job).unwrap();
+    let host = host_limits(&args, limits, Duration::from_secs(30));
+    assert!(limits.encoding_workspace_bytes > 0);
+    for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
+        let base = host.required_buffer_bytes_for_input(job, input).unwrap();
+        let quoted = base.checked_add(limits.encoding_workspace_bytes).unwrap();
+        check_host_quote(host, job, quoted, limits.encoding_workspace_bytes, input).unwrap();
+        assert_eq!(check_host_quote(host, job, quoted - 1, limits.encoding_workspace_bytes, input)
+            .unwrap_err().code, "job_host_memory_quote");
+        assert_eq!(check_host_quote(host, job, base, limits.encoding_workspace_bytes, input)
+            .unwrap_err().code, "job_host_memory_quote");
+    }
 }

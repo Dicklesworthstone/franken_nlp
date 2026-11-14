@@ -210,6 +210,14 @@ impl ExtractionBatchPlanner {
         &self, document: BatchDocument<ExtractionBatchArgs>, policy: &UntrustedEncoding,
         work: &mut SafeBpeWork, checkpoint: &mut F,
     ) -> Result<ExtractionInput, BatchFault> {
+        self.prepare_input_with_encoding_budget(document, policy, policy, work, checkpoint)
+    }
+    // A retained invocation tightens tokenizer work while keeping the fixed
+    // policy in SourceDocument and the eventual extraction identity.
+    fn prepare_input_with_encoding_budget<F: FnMut() -> Option<crate::native_engine::decode::DecodeCancellationKind>>(
+        &self, document: BatchDocument<ExtractionBatchArgs>, policy: &UntrustedEncoding,
+        effective: &UntrustedEncoding, work: &mut SafeBpeWork, checkpoint: &mut F,
+    ) -> Result<ExtractionInput, BatchFault> {
         if let Some(cause) = checkpoint() { return Err(BatchFault::cancelled(cause)); }
         policy.validate().map_err(|_| BatchCode::InvalidLimits)?;
         let args = document.task_args.or_else(|| self.defaults.clone()).ok_or(BatchCode::Planning)?;
@@ -224,8 +232,8 @@ impl ExtractionBatchPlanner {
             UntrustedEncoding::ByteFallback => untrusted_tokens,
             UntrustedEncoding::SafeBpeV1(limits) => limits.max_input_bytes,
         };
-        let (schema, source) = self.encoder.encode_schema_and_source_with_work(&args.schema,
-            &document.text, policy, input_bytes, untrusted_tokens, work, checkpoint).map_err(|error| match error {
+        let (schema, source) = self.encoder.encode_schema_and_source_with_budget(&args.schema,
+            &document.text, policy, effective, input_bytes, untrusted_tokens, work, checkpoint).map_err(|error| match error {
                 ExtractError::Decode(JsonDecodeError::Cancelled(cause)) => BatchFault::cancelled(cause),
                 ExtractError::AllocationRefused => BatchCode::Allocation.into(),
                 _ => BatchCode::Planning.into(),

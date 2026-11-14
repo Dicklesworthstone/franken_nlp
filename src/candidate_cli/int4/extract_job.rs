@@ -8,6 +8,7 @@ use crate::{
     batch::extract::{ExtractionMaskBudget, grouped_int4::Int4ExtractionBatchLimits},
     candidate_cli::{batch::IO_BUFFER_BYTES, jobs::{self as job_cli, Failure, RunMode}},
     jobs::{JobId, JobLimits, population::PopulationReadLimits},
+    tokenizer::untrusted::SafeBpeWorkLimits,
 };
 
 #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
@@ -23,6 +24,38 @@ pub(super) struct JobCommand {
 pub(super) struct JobArgs {
     pub extraction: extract::ExtractionArgs,
     pub storage: StorageArgs,
+    encoding: EncodingArgs,
+}
+#[derive(Args, Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct EncodingArgs {
+    /// Total schema/source bytes encoded in this invocation; safe-bpe-v1 only, default 67108864.
+    #[arg(long)]
+    max_total_tokenizer_input_bytes: Option<u64>,
+    /// Total untrusted tokens encoded in this invocation; safe-bpe-v1 only, default 4194304.
+    #[arg(long)]
+    max_total_tokenizer_output_tokens: Option<u64>,
+    /// Total BPE pair checks in this invocation; safe-bpe-v1 only, default 268435456.
+    #[arg(long)]
+    max_total_tokenizer_pair_checks: Option<u64>,
+    /// Total examined pair bytes in this invocation; safe-bpe-v1 only, default 4294967296.
+    #[arg(long)]
+    max_total_tokenizer_pair_bytes: Option<u64>,
+}
+impl EncodingArgs {
+    fn limits(self, args: &Int4Args) -> Result<Option<SafeBpeWorkLimits>, Failure> {
+        if args.input_encoding.is_default() {
+            return if self == Self::default() { Ok(None) }
+                else { Err(Failure::usage("extract_job_input_encoding")) };
+        }
+        let total = SafeBpeWorkLimits {
+            max_input_bytes: self.max_total_tokenizer_input_bytes.unwrap_or(64 * MIB),
+            max_output_tokens: self.max_total_tokenizer_output_tokens.unwrap_or(4 * MIB),
+            max_pair_checks: self.max_total_tokenizer_pair_checks.unwrap_or(256 * MIB),
+            max_pair_bytes: self.max_total_tokenizer_pair_bytes.unwrap_or(4096 * MIB),
+        };
+        total.validate().map_err(|_| Failure::usage("extract_job_tokenizer_work"))?;
+        Ok(Some(total))
+    }
 }
 #[derive(Args)]
 pub(super) struct StorageArgs {
@@ -62,12 +95,13 @@ pub(super) struct StorageArgs {
 
 pub(super) fn definition() -> clap::Command {
     let operation = |name: &'static str, about: &'static str| {
-        compute::definition(StorageArgs::augment_args(extract::definition().name(name).about(about)
-            .long_about("Retain and resume schema/source extraction with one resident source-converted or independently pinned snapshot INT4 model. Requires --store-results, an existing protected --job-dir, original --job-id and --key-file, immutable --limits, and one exact shared --schema. By default, supply the COMPLETE original NDJSON population on every invocation; explicit retained-input replay is available. Non-null task_args and flush controls are refused. Resume authenticates exact input bytes, schema, model/group identity and recipe before replay or tail repair. Lifetime native work includes every INT4 group dot and does not renew on resume; failed attempts remain debited. Stdout is metadata only; retained private results are read through explicit job verification/materialization. --materialize publishes only after all items commit. Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. Serial execution remains the default. --compute-threads 2..=64 reuses one admitted numerical row team across the invocation; physical width may change on authenticated resume without changing the recipe or replenishing any lifetime work. Worker scratch and the installed thread envelope are priced before private IO. No prefill, cohorts, selected-row override, compact-input override, automatic retry, key/directory creation, release activation or semantic-accuracy claim.")
+        input_encoding::definition(compute::definition(EncodingArgs::augment_args(
+            StorageArgs::augment_args(extract::definition().name(name).about(about)
+            .long_about("Retain and resume schema/source extraction with one resident source-converted or independently pinned snapshot INT4 model. Requires --store-results, an existing protected --job-dir, original --job-id and --key-file, immutable --limits, and one exact shared --schema. By default, supply the COMPLETE original NDJSON population on every invocation; explicit retained-input replay is available. Non-null task_args and flush controls are refused. Resume authenticates exact input bytes, schema, model/group identity and recipe before replay or tail repair. Lifetime native work includes every INT4 group dot and does not renew on resume; failed attempts remain debited. Stdout is metadata only; retained private results are read through explicit job verification/materialization. --materialize publishes only after all items commit. Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. Serial execution remains the default. --compute-threads 2..=64 reuses one admitted numerical row team across the invocation; physical width may change on authenticated resume without changing the recipe or replenishing any lifetime work. Worker scratch and the installed thread envelope are priced before private IO. No prefill, cohorts, selected-row override, automatic retry, key/directory creation, release activation or semantic-accuracy claim. --input-encoding safe-bpe-v1 explicitly preserves source/schema bytes while encoding them compactly. The two segments share each record's tokenizer allowance; all records, failed preparations and reconstruction also debit one invocation ledger. The four --max-total-tokenizer-* ceilings and per-record policy are authenticated: repeat them on resume. A resumed invocation receives only that declared tokenizer allowance; persisted native work and attempts remain spent. Encoder workspace is admitted beside CLI preparation and owned job input. There is no byte fallback, truncation or claim of identical model output.")
             .after_help(job_cli::INPUT_RETENTION_HELP)
             .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population; omit with --use-retained-input; '-' reads stdin"))
             .mut_arg("max_input_bytes", |arg| arg.help("Outer cap on each complete NDJSON record; immutable JobLimits.max_input_bytes_per_item must fit"))
-            .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoints for this complete invocation; persisted work and attempt ceilings do not renew"))))
+            .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoints for this complete invocation; persisted work and attempt ceilings do not renew"))))))
     };
     let start = operation("start", "Create a new explicitly retained INT4 extraction job");
     let resume = operation("resume", "Authenticate the original population and run pending INT4 extraction items")
@@ -91,6 +125,8 @@ pub(super) struct JobExecutionLimits {
     pub io_reserve_bytes: u64,
     pub journal_reserve_bytes: u64,
     pub serialization_reserve_bytes: u64,
+    pub encoding_workspace_bytes: u64,
+    pub encoding_work_limits: Option<SafeBpeWorkLimits>,
 }
 
 impl JobArgs {
@@ -105,12 +141,10 @@ impl JobArgs {
             || s.journal_memory_mib == 0 || s.serialization_memory_mib == 0 {
             return Err(Failure::usage("explicit_storage_or_job_options"));
         }
-        // This route owns a physical worker schedule but retains the existing
-        // byte-input, full-head, sequential-prompt recipe. Never silently
-        // discard a programmatic policy that is not authenticated by the job.
-        if args.prefill()?.is_some() || !args.input_encoding.is_default() {
-            return Err(CandidateError::Arguments.into());
-        }
+        // Physical workers and explicitly authenticated compact input share
+        // the full-head, sequential-prompt extraction contract.
+        if args.prefill()?.is_some() { return Err(CandidateError::Arguments.into()); }
+        self.encoding.limits(args)?;
         let common = self.extraction.validate_batch_with_prefill(args).map_err(Failure::from)?;
         for mib in [s.journal_memory_mib, s.serialization_memory_mib] {
             if mib.checked_mul(MIB).is_none_or(|bytes| bytes > common.memory_bytes) {
@@ -143,6 +177,10 @@ impl JobArgs {
             max_lines: self.storage.max_input_lines,
         };
         transport.validate().map_err(|_| Failure::usage("job_transport"))?;
+        let encoding = self.extraction.encoding_policy(args, common.max_prompt_tokens)?;
+        let encoding_workspace_bytes = crate::batch::extract::grouped_int4::memory::encoding_workspace_bytes(&encoding)
+            .map_err(|_| Failure::usage("extract_job_input_encoding"))?;
+        let encoding_work_limits = self.encoding.limits(args)?;
         let preparation_reserve_bytes = common.preparation_bytes;
         let io_reserve_bytes = product(IO_BUFFER_BYTES as u64, 2)?;
         let journal_reserve_bytes = product(self.storage.journal_memory_mib, MIB)?;
@@ -152,7 +190,7 @@ impl JobArgs {
         let buffer_bytes = sum(&[
             self.storage.input_retention.buffer_bytes(job)?,
             preparation_reserve_bytes, io_reserve_bytes,
-            journal_reserve_bytes, serialization_reserve_bytes,
+            journal_reserve_bytes, serialization_reserve_bytes, encoding_workspace_bytes,
         ]).map_err(|_| Failure::usage("job_memory_arithmetic"))?;
         common.minimum_memory_bytes = common.minimum_memory_bytes.checked_add(buffer_bytes)
             .ok_or_else(|| Failure::usage("job_memory_arithmetic"))?;
@@ -160,7 +198,8 @@ impl JobArgs {
             return Err(Failure { exit: ErrorCode::AdmissionOrResourceLimit, code: "job_population_memory" });
         }
         Ok(JobExecutionLimits { common, transport, native, buffer_bytes, preparation_reserve_bytes,
-            io_reserve_bytes, journal_reserve_bytes, serialization_reserve_bytes })
+            io_reserve_bytes, journal_reserve_bytes, serialization_reserve_bytes,
+            encoding_workspace_bytes, encoding_work_limits })
     }
 }
 
@@ -174,9 +213,10 @@ impl JobCommand {
             _ => return Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "extract-job operation refused")),
         };
         let args = JobArgs { extraction: extract::ExtractionArgs::from_matches(matches)?,
-            storage: StorageArgs::from_arg_matches(matches)? };
+            storage: StorageArgs::from_arg_matches(matches)?, encoding: EncodingArgs::from_arg_matches(matches)? };
         let mut native = Int4Args::from_arg_matches(matches)?;
         native.compute = compute::Args::from_matches(matches)?;
+        native.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
         Ok((Self { mode, args }, native))
     }
 

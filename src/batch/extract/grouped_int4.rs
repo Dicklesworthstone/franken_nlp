@@ -10,7 +10,7 @@ use crate::{
         strict_int4::{Int4ModelIdentity, Int4Work, STRICT_INT4_EXECUTION},
         constrained_int4::{Int4JsonError, sparse::Int4JsonSparseLimits}},
     tasks::extract::grouped_int4::{Int4ExtractError, Int4ExtractPlan},
-    tokenizer::pinned_controls,
+    tokenizer::{pinned_controls, untrusted::SafeBpeWorkLimits},
 };
 
 mod native;
@@ -177,6 +177,37 @@ impl Int4ExtractionBatchPlanner {
     ) -> Result<PreparedInt4BatchExtraction, BatchItemFailure> {
         self.prepare_with_encoding_work(document, policy, &mut SafeBpeWork::default(), control)
     }
+    /// Retained jobs own one invocation ledger across every schema/source
+    /// preparation, including failures and reconstruction. Effective bounds
+    /// only decide admission; successful plans retain the configured policy.
+    pub(crate) fn prepare_with_invocation_encoding_work<C: DecodeStepControl>(&self,
+        document: BatchDocument<ExtractionBatchArgs>, used: &mut SafeBpeWork,
+        total: Option<SafeBpeWorkLimits>, control: &mut C,
+    ) -> Result<PreparedInt4BatchExtraction, BatchItemFailure> {
+        let effective = match (self.document_encoding(), total) {
+            (UntrustedEncoding::ByteFallback, None) if *used == SafeBpeWork::default() =>
+                return self.prepare_with_control(document, control),
+            (UntrustedEncoding::SafeBpeV1(call), Some(total)) => {
+                checkpoint(control)?;
+                UntrustedEncoding::SafeBpeV1(total.remaining_call(*used, *call)
+                    .map_err(|_| BatchItemFailure::fatal(BatchCode::WorkLimit))?)
+            }
+            _ => return Err(BatchItemFailure::fatal(BatchCode::Admission)),
+        };
+        if self.shared_defaults_only && document.task_args.is_some() {
+            return Err(BatchItemFailure::reject(BatchCode::InvalidEnvelope));
+        }
+        let mut work = SafeBpeWork::default();
+        let input = self.compiler.prepare_input_with_encoding_budget(document,
+            self.document_encoding(), &effective, &mut work, &mut || control.prefill_checkpoint(0));
+        // Debit before propagating any encoding or cancellation failure.
+        *used = used.checked_add(work).ok_or_else(|| BatchItemFailure::fatal(BatchCode::WorkLimit))?;
+        let input = input.map_err(planning_fault)?;
+        let result = self.prepare_from_input(input);
+        checkpoint(control)?;
+        result
+    }
+
     /// Only composed planning supplies an existing work ledger. A public
     /// one-request preparation still creates one complete-record allowance.
     fn prepare_with_encoding_work<C: DecodeStepControl>(&self,
