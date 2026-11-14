@@ -8,7 +8,7 @@ use super::{CandidateError, GenerationOptions};
 use clap::Args;
 use crate::native_engine::{lmhead::NANBEIGE_VOCAB_SIZE, strict_int8::prefill::Int8PrefillLimits};
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub(super) struct GenerationPolicyArgs {
     /// Explicit candidate layer-major prompt execution, 1..=64 rows per morsel.
     /// Omitted keeps sequential prefill. Extra scratch is process-admitted.

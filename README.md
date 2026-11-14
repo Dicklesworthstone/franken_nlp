@@ -1145,6 +1145,24 @@ serial/cohort equivalence with standalone maps and work exhaustion across
 flush. Compilation, native parity and task quality remain subject to their
 separate controller validation gates.
 
+## Implemented candidate sampled sentiment
+
+`fnlp candidate source-int4 sentiment-sampled` implements independent seeded
+score-and-explanation generations for any subset of valence, arousal,
+dominance and approach. Each requested sample produces a grammar-constrained
+integer score in `[-100,100]` and a bounded, nonempty justification. The result
+retains every sample and reports mean, median, minimum, maximum and population
+standard deviation per axis. These describe generated-score variation; they
+are not calibrated confidence intervals or psychological measurements.
+
+The command requires an explicit `--seed`, local source inputs or a pinned
+snapshot, and a declared memory budget. Native work, masks, output storage and
+the deadline apply to the complete axis-by-sample bundle. A failed generation
+returns no partial bundle. This is a separate candidate route with its own
+versioned prompt and sampler; existing distribution sentiment is unchanged.
+See [sampled sentiment usage and limits](docs/native-sampled-sentiment-int4.md)
+for commands, result fields, reproducibility, admission and validation status.
+
 ## Implemented candidate compact faithfulness maps
 
 `fnlp candidate source-int4 faithfulness-map` accepts
