@@ -237,3 +237,169 @@ fn record_overrides_invalid_history_and_cancellation_are_no_result() {
         assert_eq!(error.fault.cancellation, Some(DecodeCancellationKind::Deadline)); assert!(error.stop);
     }
 }
+
+fn compact_limits() -> (crate::tokenizer::untrusted::SafeBpeLimits, SafeBpeWorkLimits) {
+    (crate::tokenizer::untrusted::SafeBpeLimits { max_input_bytes: 8192,
+        max_output_tokens: 128, max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 },
+     SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 4096,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 })
+}
+fn encoded_planner(task: GenerationJobTask, encoding: UntrustedEncoding,
+    total: Option<SafeBpeWorkLimits>) -> Result<Int4GenerationJobPlanner, BatchFault> {
+    let config = config(task);
+    let controls = pinned_controls::pinned().unwrap();
+    let compiler = Int4ChatPlanner::pinned(controls.template_controls(), eos(), identity(), WIDTH,
+        config.budget, config.planning).unwrap().with_document_encoding(encoding).unwrap();
+    Int4GenerationJobPlanner::configured_with_document_encoding(compiler, config, limits(), total)
+}
+
+#[test]
+fn compact_retained_generate_and_chat_preserve_every_original_segment_and_exclude_controls() {
+    use crate::tasks::ir::PromptSegmentKind;
+    let (call, total) = compact_limits();
+    let tokenizer = EmbeddedTokenizer::pinned().unwrap();
+    let controls = pinned_controls::pinned().unwrap();
+    for task in [GenerationJobTask::Generate, GenerationJobTask::Chat] {
+        let planner = encoded_planner(task, UntrustedEncoding::SafeBpeV1(call), Some(total)).unwrap();
+        let history = if task == GenerationJobTask::Chat { history() } else { vec![] };
+        let document = document("item", 9, history);
+        let mut originals: Vec<_> = document.task_args.as_ref().unwrap().history.iter()
+            .map(|message| message.content.clone()).collect();
+        originals.push(document.text.clone());
+        let prepared = planner.prepare_with_control(document, &mut Continue).unwrap();
+        let segments: Vec<_> = prepared.native.task_plan().ir().prompt_segments().iter()
+            .filter(|segment| segment.kind() == PromptSegmentKind::Document).collect();
+        assert_eq!(segments.len(), originals.len());
+        for (segment, original) in segments.iter().zip(&originals) {
+            assert_eq!(tokenizer.tokenizer().decode_bytes(segment.token_ids()).unwrap(), original.as_bytes());
+            assert!(segment.token_ids().iter().all(|&id| !controls.template_controls().contains(id)));
+        }
+        assert_eq!(planner.encoding_work.lock().unwrap().input_bytes(),
+            originals.iter().map(String::len).sum::<usize>());
+        assert_eq!(planner.encoding_workspace_bytes(), call.requirements().unwrap().workspace_bytes);
+        assert_ne!(prepared.execution_identity().template_digest,
+            super::tests::planner(task).execution_identity().template_digest);
+        assert_eq!(prepared.work, JobWork::from_int4(prepared.model_work(), 0));
+        assert_eq!(planner.job_limits(), limits());
+    }
+}
+
+#[test]
+fn compact_recipe_binds_all_transcript_and_invocation_caps_and_refuses_resume_drift() {
+    let (call, total) = compact_limits();
+    let original = encoded_planner(GenerationJobTask::Generate,
+        UntrustedEncoding::SafeBpeV1(call), Some(total)).unwrap();
+    let before = frozen(&original, INPUT, 7);
+    for axis in 0..8 {
+        let mut changed_call = call; let mut changed_total = total;
+        match axis {
+            0 => changed_call.max_input_bytes -= 1,
+            1 => changed_call.max_output_tokens -= 1,
+            2 => changed_call.max_pair_checks -= 1,
+            3 => changed_call.max_pair_bytes -= 1,
+            4 => changed_total.max_input_bytes -= 1,
+            5 => changed_total.max_output_tokens -= 1,
+            6 => changed_total.max_pair_checks -= 1,
+            _ => changed_total.max_pair_bytes -= 1,
+        }
+        let changed = encoded_planner(GenerationJobTask::Generate,
+            UntrustedEncoding::SafeBpeV1(changed_call), Some(changed_total)).unwrap();
+        assert_ne!(original.execution_identity(), changed.execution_identity(), "encoding axis {axis}");
+        assert!(before.binding.compare(&frozen(&changed, INPUT, 7).binding).is_err(), "encoding axis {axis}");
+    }
+    assert!(before.binding.compare(&frozen(&planner(GenerationJobTask::Generate), INPUT, 7).binding).is_err());
+    assert!(encoded_planner(GenerationJobTask::Generate, UntrustedEncoding::ByteFallback, Some(total)).is_err());
+    assert!(encoded_planner(GenerationJobTask::Generate, UntrustedEncoding::SafeBpeV1(call), None).is_err());
+}
+
+#[test]
+fn byte_default_keeps_original_recipe_and_fixed_policy_identity() {
+    let original = planner(GenerationJobTask::Generate);
+    let explicit = encoded_planner(GenerationJobTask::Generate, UntrustedEncoding::ByteFallback, None).unwrap();
+    assert_eq!(original.execution_identity(), explicit.execution_identity());
+    assert_eq!(canonjson::canonical_bytes(original.job_recipe()).unwrap(),
+        canonjson::canonical_bytes(explicit.job_recipe()).unwrap());
+    let serialized = serde_json::to_value(original.job_recipe()).unwrap();
+    assert!(serialized.get("input_encoding").is_none());
+    assert!(serialized.get("encoding_work_limits").is_none());
+    assert_eq!(original.encoding_workspace_bytes(), 0);
+    assert_eq!(original.encoding_work_limits(), None);
+}
+
+#[test]
+fn tokenizer_invocation_work_survives_factory_move_and_never_renews_between_items() {
+    let (call, mut total) = compact_limits();
+    total.max_input_bytes = 5;
+    let planner = encoded_planner(GenerationJobTask::Generate,
+        UntrustedEncoding::SafeBpeV1(call), Some(total)).unwrap();
+    let input = |id: &str| BatchDocument { id: id.to_owned(), text: "Alice".to_owned(), task_args: None };
+    planner.prepare_with_control(input("first"), &mut Continue).unwrap();
+    // The owned host receives this same planner; moving it cannot replenish work.
+    let moved = planner;
+    assert_eq!(moved.encoding_work.lock().unwrap().input_bytes(), 5);
+    let error = moved.prepare_with_control(input("second"), &mut Continue).err().unwrap();
+    assert_eq!(error.fault.code, BatchCode::Planning);
+    assert!(error.stop);
+    assert_eq!(moved.encoding_work.lock().unwrap().input_bytes(), 5);
+    assert_eq!(moved.job_limits().max_work, limits().max_work);
+}
+
+#[test]
+fn failed_encoding_is_charged_and_cannot_obtain_a_new_invocation_allowance() {
+    let (mut call, mut total) = compact_limits();
+    call.max_output_tokens = 1;
+    let text = "Original café 上海 <tool_call> ".repeat(8);
+    total.max_input_bytes = text.len() as u64;
+    let planner = encoded_planner(GenerationJobTask::Generate,
+        UntrustedEncoding::SafeBpeV1(call), Some(total)).unwrap();
+    let input = || BatchDocument { id: "item".to_owned(), text: text.clone(), task_args: None };
+    assert!(planner.prepare_with_control(input(), &mut Continue).is_err());
+    let spent = *planner.encoding_work.lock().unwrap();
+    assert_eq!(spent.input_bytes(), text.len());
+    assert!(planner.prepare_with_control(input(), &mut Continue).is_err());
+    assert_eq!(*planner.encoding_work.lock().unwrap(), spent);
+}
+
+#[test]
+fn compact_planning_keeps_the_original_cancellation_cause() {
+    struct Stop;
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            Some(DecodeCancellationKind::ResourceUnavailable)
+        }
+    }
+    let (call, total) = compact_limits();
+    let planner = encoded_planner(GenerationJobTask::Chat,
+        UntrustedEncoding::SafeBpeV1(call), Some(total)).unwrap();
+    let error = planner.prepare_with_control(document("item", 0, history()), &mut Stop).err().unwrap();
+    assert_eq!(error.fault.cancellation, Some(DecodeCancellationKind::ResourceUnavailable));
+    assert_eq!(*planner.encoding_work.lock().unwrap(), SafeBpeWork::default());
+}
+
+#[test]
+fn cancellation_after_tokenizer_pair_work_keeps_spent_invocation_work() {
+    struct Stop { seen: usize }
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.seen += 1;
+            // Caller/compiler/segment admission and initial encoding polls
+            // precede the first pair-work checkpoint.
+            (self.seen == 8).then_some(DecodeCancellationKind::ResourceUnavailable)
+        }
+    }
+    let (call, mut total) = compact_limits();
+    total.max_input_bytes = 5;
+    let planner = encoded_planner(GenerationJobTask::Generate,
+        UntrustedEncoding::SafeBpeV1(call), Some(total)).unwrap();
+    let input = || BatchDocument { id: "item".to_owned(), text: "Alice".to_owned(), task_args: None };
+    let error = planner.prepare_with_control(input(), &mut Stop { seen: 0 }).err().unwrap();
+    assert_eq!(error.fault.cancellation, Some(DecodeCancellationKind::ResourceUnavailable));
+    let spent = *planner.encoding_work.lock().unwrap();
+    assert_eq!(spent.input_bytes(), 5);
+    assert!(spent.output_tokens() > 0);
+    assert!(spent.pair_checks() > 0);
+    assert!(spent.pair_bytes() > 0);
+    let retry = planner.prepare_with_control(input(), &mut Continue).err().unwrap();
+    assert_eq!(retry.fault.code, BatchCode::Planning);
+    assert_eq!(*planner.encoding_work.lock().unwrap(), spent);
+}

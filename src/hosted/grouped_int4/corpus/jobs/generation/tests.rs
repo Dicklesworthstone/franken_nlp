@@ -192,6 +192,7 @@ fn owned_population_factory_and_native_result_fit_the_existing_blocking_boundary
     send::<Int4GenerationJobPlanner>();
     send::<GenerationInput<Cursor<Vec<u8>>>>();
     send::<GenerationExecution<Cursor<Vec<u8>>>>();
+    send::<GenerationCompletion<Cursor<Vec<u8>>>>();
     send::<crate::tasks::chat::grouped_int4::Int4ChatResult>();
     let _entry = NlpEngine::job_int4_generation::<Cursor<Vec<u8>>>;
     let _team_entry = NlpEngine::job_int4_generation_with_threads::<Cursor<Vec<u8>>>;
@@ -366,5 +367,24 @@ mod team {
         }
         drop(model); drop(preparation); drop(lease);
         drained(&host, &idle);
+    }
+}
+
+#[test]
+fn compact_encoder_workspace_coexists_with_complete_or_retained_input_and_native_storage() {
+    let (task, envelope, job, host) = fixture();
+    let workspace = crate::tokenizer::untrusted::SafeBpeLimits {
+        max_input_bytes: 4096, max_output_tokens: 2048,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24,
+    }.requirements().unwrap().workspace_bytes;
+    for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
+        let plain = requirements(WIDTH, task, envelope, job, host, input).unwrap();
+        let selected = with_encoding_workspace(
+            requirements(WIDTH, task, envelope, job, host, input).unwrap(), workspace).unwrap();
+        assert_eq!(selected.input_bytes, plain.input_bytes + workspace);
+        assert_eq!(selected.workspace_bytes, plain.workspace_bytes);
+        assert_eq!(selected.native, plain.native);
+        assert!(with_encoding_workspace(
+            requirements(WIDTH, task, envelope, job, host, input).unwrap(), u64::MAX).is_err());
     }
 }

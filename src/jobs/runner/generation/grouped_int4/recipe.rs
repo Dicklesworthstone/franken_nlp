@@ -47,6 +47,10 @@ pub struct Int4GenerationJobRecipe {
     pub(super) job: JobLimits,
     planning: PlanningRecipe,
     native: NativeRecipe,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<UntrustedEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) encoding_work_limits: Option<SafeBpeWorkLimits>,
 }
 impl Int4GenerationJobRecipe {
     pub(super) fn new(config: Int4GenerationJobConfig, group_width: usize, job: JobLimits) -> Result<Self, BatchFault> {
@@ -57,9 +61,18 @@ impl Int4GenerationJobRecipe {
             sampler_version: sampler_version(&generation), processor_version: PROCESSOR_VERSION,
             addressing: "exact-item-id-and-sample-index; original-ordinal-delivery; no-attempt-reseed-v1",
             reservation_policy: "complete-native-all-five-work-per-attempt; full-resident-kv-v1",
-            task, generation, budget, group_width, context_tokens, job, planning: planning.into(), native: native.into() };
+            task, generation, budget, group_width, context_tokens, job, planning: planning.into(), native: native.into(),
+            input_encoding: None, encoding_work_limits: None };
         bounded_json(&recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
         Ok(recipe)
+    }
+    pub(super) fn with_document_encoding(mut self, encoding: &UntrustedEncoding,
+        total: Option<SafeBpeWorkLimits>) -> Result<Self, BatchFault> {
+        encoding_workspace(encoding, total)?;
+        self.input_encoding = (encoding != &UntrustedEncoding::ByteFallback).then(|| encoding.clone());
+        self.encoding_work_limits = total;
+        bounded_json(&self, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
+        Ok(self)
     }
     pub(super) fn native_limits(&self) -> Int4GenerationBudget {
         Int4GenerationBudget { native: Int4RunBudget { max_forward_positions: self.native.max_forward_positions,
@@ -83,6 +96,19 @@ impl Int4GenerationJobRecipe {
         Ok(())
     }
 }
+pub(super) fn encoding_workspace(encoding: &UntrustedEncoding, total: Option<SafeBpeWorkLimits>)
+    -> Result<u64, BatchFault> {
+    match (encoding, total) {
+        (UntrustedEncoding::ByteFallback, None) => Ok(0),
+        (UntrustedEncoding::SafeBpeV1(call), Some(total)) => {
+            total.validate().map_err(|_| BatchCode::InvalidLimits)?;
+            call.requirements().map(|required| required.workspace_bytes)
+                .map_err(|_| BatchCode::InvalidLimits.into())
+        }
+        _ => Err(BatchCode::InvalidLimits.into()),
+    }
+}
+
 pub(super) fn sampler_version(options: &GenerationOptions) -> &'static str {
     match &options.sampling { GenerationSampling::Greedy => "fnlp-greedy-v1", GenerationSampling::Seeded { .. } => SAMPLER_VERSION }
 }

@@ -141,18 +141,26 @@ fn retained_text_jobs_admit_explicit_worker_teams_without_widening_lifetime_work
 }
 
 #[test]
-fn invalid_worker_width_and_unwired_encoding_refuse_before_private_io() {
+fn invalid_worker_width_and_tokenizer_work_refuse_before_private_io() {
     for task in ["generate", "chat"] {
         for width in ["0", "65", "18446744073709551615"] {
             let (c, args) = command("resume", task, &["--compute-threads", width]);
             assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().exit, ErrorCode::Usage);
         }
     }
-    let matches = input_encoding::definition(clap::Command::new("encoding"))
-        .try_get_matches_from(["encoding", "--input-encoding", "safe-bpe-v1"]).unwrap();
-    let (c, mut args) = command("start", "generate", &[]);
-    args.input_encoding = input_encoding::InputEncodingArgs::from_matches(&matches).unwrap();
-    assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().code, "text_job_input_encoding");
+    for flag in ["--max-total-tokenizer-input-bytes", "--max-total-tokenizer-output-tokens",
+        "--max-total-tokenizer-pair-checks", "--max-total-tokenizer-pair-bytes"] {
+        let (c, args) = command("start", "generate", &[flag, "1"]);
+        assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().code, "text_job_input_encoding");
+        for value in ["0", "18446744073709551615"] {
+            let (c, args) = command("resume", "chat", &["--input-encoding", "safe-bpe-v1", flag, value]);
+            assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().code, "text_job_tokenizer_work");
+        }
+    }
+    for flag in ["--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
+        let (c, args) = command("resume", "generate", &["--input-encoding", "safe-bpe-v1", flag, "0"]);
+        assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().exit, ErrorCode::Usage);
+    }
 }
 
 #[test]
@@ -325,5 +333,61 @@ fn unavailable_owned_profile_refuses_before_private_input_or_storage() {
     for task in ["generate", "chat"] {
         let (c, args) = command("start", task, &[]);
         assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().code, "owned_text_job_profile_unavailable");
+    }
+}
+
+#[test]
+fn compact_text_jobs_parse_both_operations_and_preserve_explicit_invocation_authority() {
+    use crate::tokenizer::untrusted::UntrustedEncoding;
+    for operation in ["start", "resume"] {
+        for task in ["generate", "chat"] {
+            for width in ["1", "4"] {
+                let (c, args) = command(operation, task, &["--input-encoding", "safe-bpe-v1",
+                    "--compute-threads", width, "--max-tokenizer-pair-checks", "1234",
+                    "--max-tokenizer-pair-bytes", "32768", "--max-total-tokenizer-input-bytes", "8192",
+                    "--max-total-tokenizer-output-tokens", "4096", "--max-total-tokenizer-pair-checks", "7777",
+                    "--max-total-tokenizer-pair-bytes", "65536"]);
+                let common = c.args.validate(&args).unwrap();
+                let UntrustedEncoding::SafeBpeV1(call) = args.input_encoding.policy(
+                    args.max_input_bytes, common.max_prompt_tokens).unwrap() else { panic!("wrong policy"); };
+                assert_eq!(call.max_input_bytes, args.max_input_bytes);
+                assert_eq!(call.max_output_tokens, common.max_prompt_tokens);
+                assert_eq!(call.max_pair_checks, 1234);
+                assert_eq!(call.max_pair_bytes, 32768);
+                assert_eq!(c.args.encoding.limits(&args).unwrap(), Some(SafeBpeWorkLimits {
+                    max_input_bytes: 8192, max_output_tokens: 4096,
+                    max_pair_checks: 7777, max_pair_bytes: 65536 }));
+                assert_eq!(common.compute.threads, width.parse::<usize>().unwrap());
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_workspaces_are_admitted_without_changing_native_lifetime_or_input_ownership() {
+    for retained in [false, true] {
+        let storage = if retained { vec!["--use-retained-input", "--max-retained-input-mib", "8"] }
+            else { vec![] };
+        let (byte, args) = command("resume", "generate", &storage);
+        let common = byte.args.validate(&args).unwrap();
+        let job = lifetime(&args, common);
+        let baseline = byte.args.lifetime_limits(&args, common, job).unwrap();
+        let mut options = storage; options.extend(["--input-encoding", "safe-bpe-v1"]);
+        let (compact, args) = command("resume", "generate", &options);
+        let common = compact.args.validate(&args).unwrap();
+        let selected = compact.args.lifetime_limits(&args, common, job).unwrap();
+        assert_eq!(selected.buffer_bytes, baseline.buffer_bytes);
+        assert_eq!(selected.encoding_workspace_bytes, args.input_encoding.workspace_bytes(
+            args.max_input_bytes, common.max_prompt_tokens).unwrap());
+        assert!(selected.encoding_workspace_bytes > 0);
+        assert_eq!(selected.common.minimum_memory_bytes,
+            baseline.common.minimum_memory_bytes + selected.encoding_workspace_bytes);
+        assert_eq!(selected.native.native.max_forward_positions, baseline.native.native.max_forward_positions);
+        assert_eq!(selected.native.native.max_projection_work, baseline.native.native.max_projection_work);
+        assert_eq!(selected.native.max_sampler_bytes, baseline.native.max_sampler_bytes);
+        let mut short = common; short.memory_bytes = selected.common.minimum_memory_bytes - 1;
+        assert_eq!(compact.args.lifetime_limits(&args, short, job).unwrap_err().code, "job_population_memory");
+        short.memory_bytes += 1;
+        assert!(compact.args.lifetime_limits(&args, short, job).is_ok());
     }
 }

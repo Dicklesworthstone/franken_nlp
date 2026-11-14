@@ -4549,6 +4549,26 @@ item and token while preserving ordered whole-item commits. Width is a physical
 schedule, so it may change on resume without changing the authenticated task
 recipe, original sample addresses or lifetime work allowances.
 
+Explicit `--input-encoding safe-bpe-v1` also supports these retained jobs.
+It compacts untrusted prompt/history bytes losslessly without admitting template
+control IDs. Byte fallback remains the default, with its existing recipe and
+report shape. The four `--max-tokenizer-*` ceilings apply across each complete
+transcript; four `--max-total-tokenizer-*` ceilings bound all preparation in one
+start/resume invocation:
+
+- `--max-total-tokenizer-input-bytes` (default 67108864)
+- `--max-total-tokenizer-output-tokens` (default 4194304)
+- `--max-total-tokenizer-pair-checks` (default 268435456)
+- `--max-total-tokenizer-pair-bytes` (default 4294967296)
+
+The same consumed ledger follows every message, item and host handoff; failed
+or cancelled encoding does not refund work. The original encoding policy and
+all eight ceilings are authenticated before resume or tail repair. A resume
+gets the same declared bounded tokenizer allowance for its new invocation;
+native lifetime work and attempts remain cumulative. Encoder workspace is
+included in admission before private IO. Compact encoding can change generated
+output and makes no parity, quality or speed claim.
+
 Supply the **complete original population** on start and ordinary resume,
 including already committed items. Explicit input retention also permits
 resume without the original population file. The wire format is
@@ -4662,8 +4682,9 @@ stored semantic results and their identities do not include that width.
 The adapter rejects `--prefill-rows` and cohort scheduling. It uses the existing
 pinned no-thinking/no-tools generation contract. Library callers construct
 `Int4GenerationJobPlanner::for_model` with the actual model identity,
-`Int4GenerationJobConfig` and exact `JobLimits`, then call
-`NlpEngine::job_int4_generation` or `job_int4_generation_with_threads` with
+`Int4GenerationJobConfig` and exact `JobLimits`; explicit compact input uses
+`for_model_with_document_encoding` with a fixed policy and `SafeBpeWorkLimits`.
+Then call `NlpEngine::job_int4_generation` or `job_int4_generation_with_threads` with
 `SourceJobRequest` and `JobHostLimits`. The threaded method requires a compatible
 installed resource-host thread envelope. Cancellation or report failure may
 follow committed progress; authenticate and resume the job to reconcile it.

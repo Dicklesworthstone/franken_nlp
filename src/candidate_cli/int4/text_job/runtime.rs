@@ -7,9 +7,10 @@ use crate::{
     candidate_cli::runtime::owned_jobs::{host_failure, job_failure, open_mode, progress_report},
     hosted::{CancellationToken, NativeLimits, ResidentInt4, RunLimits,
         corpus::jobs::{JobHostLimits, SourceJobRequest}},
-    jobs::{JobSecret, runner::generation::grouped_int4::{Int4GenerationJobConfig, Int4GenerationJobPlanner}},
+    jobs::{JobError, JobSecret, runner::generation::grouped_int4::{Int4GenerationJobConfig, Int4GenerationJobPlanner}},
     native_engine::strict_int4::weights::snapshot::INT4_SNAPSHOT_VERSION,
     tasks::{chat::{ChatLimits, grouped_int4::Int4ChatPlanner}, ir::TaskBudget},
+    tokenizer::untrusted::UntrustedEncoding,
 };
 
 pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
@@ -40,11 +41,16 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let model = super::super::runtime::load_model(&engine, &args, common, remaining()?, cancellation.clone())?;
     remaining()?;
     let planner = prepare(&model, &job, &args, limits, lifetime)?;
+    if planner.encoding_work_limits() != job.encoding.limits(&args)? {
+        return Err(Failure::usage("text_job_tokenizer_quote"));
+    }
     remaining()?;
     // Quote the actual native factory and complete host occupancy before the
     // optional snapshot creates any file. Only the host grants reservations.
     check_native_quote(&planner, &args, limits, host_limits(&args, limits, remaining()?), lifetime, input_memory)?;
     let identity = planner.execution_identity().clone();
+    let encoding = planner.document_encoding().clone();
+    let encoding_work_limits = planner.encoding_work_limits();
     let mut snapshot = common.snapshot_pin.map(|_| SnapshotRecord::new("loaded", common.snapshot_need));
     if let Some(path) = &args.save_snapshot {
         let pin = engine.save_int4_snapshot(&model, path.clone(), common.snapshot_budget(false)?,
@@ -60,11 +66,14 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     // The host authenticates the complete population and exact recipe before
     // replay/repair, executes only pending whole items and drains physically.
     let progress = if common.compute.threads == 1 {
-        engine.job_int4_generation(&model, planner, request, host, common.kernel, reader, cancellation)
+        engine.job_int4_generation(&model, planner, request, host, common.kernel, reader, cancellation.clone())
     } else {
         engine.job_int4_generation_with_threads(&model, planner, request, host,
-            common.kernel, common.compute.threads, reader, cancellation)
+            common.kernel, common.compute.threads, reader, cancellation.clone())
     }.map_err(host_failure)?;
+    if let Some(cause) = cancellation.cause() {
+        return Err(job_failure(JobError::Cancelled(cause)));
+    }
     remaining()?;
     let report = progress_report(progress, job_id, lifetime, materialize, mode, task)?;
     let content = identity.logical_model_digest.to_hex();
@@ -76,11 +85,24 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         model_content_sha256: &content, candidate_format: &identity.artifact_format,
         quant_recipe: &identity.quant_recipe, group_width: model.model_identity().group_width(),
         integer_kernel: common.kernel.kind().id(), snapshot,
+        input_encoding: input_encoding::reported_policy(&encoding), encoding_work_limits,
         compute_schedule: compute::Schedule::for_threads(common.compute.threads), output: &report,
     };
     // No prompts, histories, seeds, tokens, generated text or scores on stdout.
     // Report delivery failure can follow committed progress and is not rollback.
-    publish(&response, job_cli::REPORT_BYTES, output).map_err(Failure::from)
+    publish_report(&response, output, &remaining, &cancellation)
+}
+
+fn publish_report<T: Serialize>(response: &T, output: &mut impl Write,
+    remaining: &impl Fn() -> Result<Duration, CandidateError>, cancellation: &CancellationToken)
+    -> Result<(), Failure> {
+    publish_checked(response, job_cli::REPORT_BYTES, output, &|| {
+        if cancellation.cause().is_some() { return Err(CandidateError::Execution); }
+        remaining().map(|_| ())
+    }).map_err(|error| match (error, cancellation.cause()) {
+        (CandidateError::Execution, Some(cause)) => job_failure(JobError::Cancelled(cause)),
+        (error, _) => Failure::from(error),
+    })
 }
 
 fn task_limits(args: &Int4Args, common: Int4Limits) -> Result<(TaskBudget, ChatLimits), Failure> {
@@ -107,7 +129,10 @@ fn prepare(model: &ResidentInt4, job: &JobArgs, args: &Int4Args,
     // the actual loaded model contract; no unbound fabricated model identity.
     let eos = Int4ChatPlanner::for_model(model.model_identity(), budget, planning)
         .map_err(|_| CandidateError::Planning)?.eos_token_id();
-    Int4GenerationJobPlanner::for_model(model.model_identity(), configuration(job, args, limits, eos)?, lifetime)
+    Int4GenerationJobPlanner::for_model_with_document_encoding(model.model_identity(),
+        configuration(job, args, limits, eos)?, lifetime,
+        args.input_encoding.policy(args.max_input_bytes, limits.common.max_prompt_tokens)?,
+        job.encoding.limits(args)?)
         .map_err(|_| Failure::usage("text_job_pinned_configuration"))
 }
 fn read_config(path: &std::path::Path, cap: usize,
@@ -141,7 +166,9 @@ fn check_native_quote(planner: &Int4GenerationJobPlanner, args: &Int4Args,
     let (task, _) = task_limits(args, limits.common)?;
     let native = planner.native_limits();
     let work = job.max_work.int4_model_work();
-    if planner.context_tokens() != host.native.context_tokens || planner.context_tokens() != args.context_tokens
+    if planner.document_encoding() != &args.input_encoding.policy(args.max_input_bytes, limits.common.max_prompt_tokens)?
+        || planner.encoding_workspace_bytes() != limits.encoding_workspace_bytes
+        || planner.context_tokens() != host.native.context_tokens || planner.context_tokens() != args.context_tokens
         || planner.group_width() != args.group_width || planner.task_budget() != task
         || planner.max_result_bytes() != task.max_output_bytes
         || planner.output_token_ceiling() != u64::from(task.max_output_tokens)
@@ -151,7 +178,10 @@ fn check_native_quote(planner: &Int4GenerationJobPlanner, args: &Int4Args,
         || native.native.max_projection_work != work.projections {
         return Err(Failure::usage("text_job_native_quote"));
     }
-    let quoted = simultaneous_memory(args.group_width, native, task, host, job, limits.common, input)?;
+    let quoted = sum(&[simultaneous_memory(
+        args.group_width, native, task, host, job, limits.common, input)?,
+        // Additional to the CLI's already-admitted encoder preparation.
+        limits.encoding_workspace_bytes])?;
     if quoted > limits.common.minimum_memory_bytes || quoted > limits.common.memory_bytes {
         return Err(Failure { exit: ErrorCode::AdmissionOrResourceLimit, code: "text_job_native_memory" });
     }
@@ -192,6 +222,10 @@ struct Response<'a, T: Serialize> {
     group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<SnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<&'a UntrustedEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding_work_limits: Option<SafeBpeWorkLimits>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compute_schedule: Option<compute::Schedule>,
     output: &'a T,

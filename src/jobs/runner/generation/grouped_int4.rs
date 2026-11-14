@@ -20,9 +20,10 @@ use crate::{
     tasks::{chat::{ChatLimits, ChatMessage, ChatRequest, ChatRole, GenerateRequest,
         grouped_int4::{Int4ChatError, Int4ChatPlanner, Int4ChatResult, PreparedInt4Chat}},
         ir::TaskBudget},
+    tokenizer::untrusted::{SafeBpeWork, SafeBpeWorkLimits, UntrustedEncoding},
 };
 use serde::Serialize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 mod recipe;
 mod execution;
@@ -46,6 +47,10 @@ pub struct Int4GenerationJobPlanner {
     compiler: Int4ChatPlanner,
     identity: ExecutionIdentity,
     recipe: Int4GenerationJobRecipe,
+    encoding_workspace_bytes: u64,
+    // This owner moves intact into the hosted runner. It is never recreated
+    // per record, authenticated input replay, failed preparation or attempt.
+    encoding_work: Mutex<SafeBpeWork>,
     owner: Arc<()>,
 }
 impl Int4GenerationJobPlanner {
@@ -58,11 +63,31 @@ impl Int4GenerationJobPlanner {
             .map_err(|error| failure(error, BatchCode::Planning).fault)?;
         Self::configured(compiler, config, limits)
     }
+    /// Opt in before opening a retained job. The private recipe binds all
+    /// per-transcript and complete-invocation tokenizer ceilings. Resume gets
+    /// its declared new invocation allowance, never new lifetime native work.
+    pub fn for_model_with_document_encoding(model: &Int4ModelIdentity,
+        config: Int4GenerationJobConfig, limits: JobLimits, encoding: UntrustedEncoding,
+        encoding_work_limits: Option<SafeBpeWorkLimits>) -> Result<Self, BatchFault> {
+        recipe::validate(&config, model.group_width(), limits)?;
+        recipe::encoding_workspace(&encoding, encoding_work_limits)?;
+        let compiler = Int4ChatPlanner::for_model(model, config.budget, config.planning)
+            .and_then(|compiler| compiler.with_document_encoding(encoding))
+            .map_err(|error| failure(error, BatchCode::Planning).fault)?;
+        Self::configured_with_document_encoding(compiler, config, limits, encoding_work_limits)
+    }
     // Planning fixtures use the real pinned compiler. Production construction
     // is exclusively model-bound; there is no public identity/receipt factory.
     fn configured(compiler: Int4ChatPlanner, config: Int4GenerationJobConfig, limits: JobLimits)
         -> Result<Self, BatchFault> {
+        Self::configured_with_document_encoding(compiler, config, limits, None)
+    }
+    fn configured_with_document_encoding(compiler: Int4ChatPlanner,
+        config: Int4GenerationJobConfig, limits: JobLimits,
+        encoding_work_limits: Option<SafeBpeWorkLimits>) -> Result<Self, BatchFault> {
         recipe::validate(&config, compiler.group_width(), limits)?;
+        let encoding_workspace_bytes = recipe::encoding_workspace(
+            compiler.document_encoding(), encoding_work_limits)?;
         if config.generation.eos_token_ids != [compiler.eos_token_id()]
             || config.generation.banned_token_ids.contains(&compiler.eos_token_id()) {
             return Err(BatchCode::InvalidLimits.into());
@@ -76,12 +101,22 @@ impl Int4GenerationJobPlanner {
         let policy = canonjson::canonical_bytes(&("fnlp-int4-generation-job-policy-v1",
             INT4_GENERATION_VERSION, PROCESSOR_VERSION, config.task, &config.generation))
             .map_err(|_| BatchCode::Planning)?;
-        identity.decision_policy_digest = Sha256Digest::of_bytes(&policy);
+        identity.decision_policy_digest = match encoding_work_limits {
+            None => Sha256Digest::of_bytes(&policy),
+            Some(total) => Sha256Digest::of_bytes(&canonjson::canonical_bytes(&(
+                "fnlp-int4-generation-job-encoding-v1", &policy,
+                compiler.document_encoding(), total)).map_err(|_| BatchCode::Planning)?),
+        };
         identity.validate().map_err(|_| BatchCode::Admission)?;
-        let recipe = Int4GenerationJobRecipe::new(config, compiler.group_width(), limits)?;
-        Ok(Self { compiler, identity, recipe, owner: Arc::new(()) })
+        let recipe = Int4GenerationJobRecipe::new(config, compiler.group_width(), limits)?
+            .with_document_encoding(compiler.document_encoding(), encoding_work_limits)?;
+        Ok(Self { compiler, identity, recipe, encoding_workspace_bytes,
+            encoding_work: Mutex::new(SafeBpeWork::default()), owner: Arc::new(()) })
     }
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.compiler.document_encoding() }
+    pub fn encoding_work_limits(&self) -> Option<SafeBpeWorkLimits> { self.recipe.encoding_work_limits }
+    pub fn encoding_workspace_bytes(&self) -> u64 { self.encoding_workspace_bytes }
     pub fn task_budget(&self) -> TaskBudget { self.recipe.budget }
     pub fn native_limits(&self) -> Int4GenerationBudget { self.recipe.native_limits() }
     pub fn job_limits(&self) -> JobLimits { self.recipe.job }
@@ -104,16 +139,22 @@ impl Int4GenerationJobPlanner {
         // clone. Exact input and history strings move into the typed request.
         let generation = self.recipe.generation.clone();
         let budget = self.task_budget();
+        let mut encoding_work = self.encoding_work.try_lock()
+            .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
         let native = match self.recipe.task {
-            GenerationJobTask::Generate => self.compiler.plan_generate(&GenerateRequest {
-                item_id: document.id, sample_index, prompt: document.text, generation, budget }),
+            GenerationJobTask::Generate => self.compiler.plan_generate_with_encoding_work(&GenerateRequest {
+                item_id: document.id, sample_index, prompt: document.text, generation, budget },
+                &mut encoding_work, self.encoding_work_limits(), control),
             GenerationJobTask::Chat => {
                 let mut messages = args.history;
                 messages.try_reserve_exact(1).map_err(|_| BatchItemFailure::fatal(BatchCode::Allocation))?;
                 messages.push(ChatMessage { role: ChatRole::User, content: document.text });
-                self.compiler.plan_chat(&ChatRequest { item_id: document.id, sample_index, messages, generation, budget })
+                self.compiler.plan_chat_with_encoding_work(
+                    &ChatRequest { item_id: document.id, sample_index, messages, generation, budget },
+                    &mut encoding_work, self.encoding_work_limits(), control)
             }
         }.map_err(|error| failure(error, BatchCode::Planning))?;
+        drop(encoding_work);
         // Compilation is bounded and polled around, not claimed preemptible.
         poll(control)?;
         let work = JobWork::from_int4(native.planned_work(), 0);

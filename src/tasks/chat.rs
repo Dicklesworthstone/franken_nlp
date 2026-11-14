@@ -211,6 +211,16 @@ impl ChatPlanner {
     }
     fn compile_input_with_control<C: DecodeStepControl>(&self, kind: BuiltInTask, messages: &[ChatMessage],
         options: &GenerationOptions, budget: TaskBudget, control: &mut C) -> Result<ChatInput, ChatError> {
+        self.compile_input_with_encoding_work(kind, messages, options, budget,
+            &self.document_encoding, &mut SafeBpeWork::default(), control)
+    }
+    // Composed internal callers may tighten encoding work without changing the
+    // frozen policy identity. They retain consumed work even when planning fails.
+    #[allow(clippy::too_many_arguments)]
+    fn compile_input_with_encoding_work<C: DecodeStepControl>(&self, kind: BuiltInTask,
+        messages: &[ChatMessage], options: &GenerationOptions, budget: TaskBudget,
+        encoding: &UntrustedEncoding, encoding_work: &mut SafeBpeWork, control: &mut C)
+        -> Result<ChatInput, ChatError> {
         planning_checkpoint(control)?;
         // Reject invalid/oversized caller-owned option collections before
         // rendering, tokenizing messages or cloning them into a sealed plan.
@@ -237,9 +247,8 @@ impl ChatPlanner {
         // the leading <|im_start|>; never prepend configured BOS here.
         let mut tail = rendered.as_str(); let mut segments = Vec::new();
         let mut token_total = 0_usize;
-        // One work ledger for the complete transcript. A second message never
-        // renews BPE input, output, pair-comparison or examined-byte limits.
-        let mut encoding_work = SafeBpeWork::default();
+        // The same ledger covers every message in this transcript, including
+        // failure; a composed caller additionally owns its enclosing allowance.
         let cap = (budget.max_input_tokens as usize).min(self.limits.generation.max_prompt_tokens);
         for (message, slot) in messages.iter().zip(&placeholders) {
             planning_checkpoint(control)?;
@@ -247,7 +256,7 @@ impl ChatPlanner {
             let scaffold = self.tokenizer.tokenizer().encode_ids_with_options(before, EncodeOptions { add_bos: false, add_eos: false })
                 .map_err(|_| ChatError::Encoding)?;
             token_total = add_tokens(token_total, scaffold.len(), cap)?;
-            let document_ids = match &self.document_encoding {
+            let document_ids = match encoding {
                 UntrustedEncoding::ByteFallback => {
                     let source = self.encoder.encode(&message.content, self.limits.max_message_bytes,
                         cap.saturating_sub(token_total)).map_err(|_| ChatError::Encoding)?;
@@ -257,7 +266,7 @@ impl ChatPlanner {
                     let encoder = UntrustedDocumentEncoder::new(self.tokenizer.tokenizer(), &self.controls);
                     let mut cancelled = None;
                     let encoded = encoder.encode_with_policy(message.content.as_bytes(), policy,
-                        &mut encoding_work, &mut || {
+                        encoding_work, &mut || {
                             if cancelled.is_none() { cancelled = control.checkpoint(0); }
                             cancelled.is_none()
                         });

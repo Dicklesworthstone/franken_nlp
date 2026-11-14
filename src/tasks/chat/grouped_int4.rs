@@ -5,6 +5,7 @@
 //! to INT8/eager. Model loading, runtime admission and publication are external.
 
 use super::*;
+use crate::tokenizer::untrusted::SafeBpeWorkLimits;
 use crate::native_engine::{
     decode::DecodeCancellationKind,
     generation::grouped_int4::{Int4GenerationBudget, Int4GenerationError, Int4GenerationPlan, Int4GenerationRun},
@@ -94,6 +95,49 @@ impl Int4ChatPlanner {
         }
         self.compile(BuiltInTask::Generate, &request.item_id, request.sample_index,
             &[ChatMessage { role: ChatRole::User, content: request.prompt.clone() }], &request.generation, request.budget, control)
+    }
+    /// Retained jobs keep one nonrenewable invocation ledger across all item
+    /// preparations. These internal methods cannot replace the pinned policy.
+    pub(crate) fn plan_chat_with_encoding_work<C: DecodeStepControl>(&self,
+        request: &ChatRequest, used: &mut SafeBpeWork, limits: Option<SafeBpeWorkLimits>,
+        control: &mut C) -> Result<PreparedInt4Chat, Int4ChatError> {
+        self.compile_with_encoding_work(BuiltInTask::Chat, &request.item_id, request.sample_index,
+            &request.messages, &request.generation, request.budget, used, limits, control)
+    }
+    pub(crate) fn plan_generate_with_encoding_work<C: DecodeStepControl>(&self,
+        request: &GenerateRequest, used: &mut SafeBpeWork, limits: Option<SafeBpeWorkLimits>,
+        control: &mut C) -> Result<PreparedInt4Chat, Int4ChatError> {
+        if request.prompt.len() > self.compiler.limits.max_message_bytes
+            || request.prompt.len() > self.compiler.limits.max_total_message_bytes {
+            return Err(ChatError::Limit("prompt bytes").into());
+        }
+        self.compile_with_encoding_work(BuiltInTask::Generate, &request.item_id, request.sample_index,
+            &[ChatMessage { role: ChatRole::User, content: request.prompt.clone() }],
+            &request.generation, request.budget, used, limits, control)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn compile_with_encoding_work<C: DecodeStepControl>(&self, kind: BuiltInTask, item: &str,
+        sample: u64, messages: &[ChatMessage], options: &GenerationOptions, budget: TaskBudget,
+        used: &mut SafeBpeWork, limits: Option<SafeBpeWorkLimits>, control: &mut C)
+        -> Result<PreparedInt4Chat, Int4ChatError> {
+        let encoding = match (self.document_encoding(), limits) {
+            (UntrustedEncoding::ByteFallback, None) => UntrustedEncoding::ByteFallback,
+            (UntrustedEncoding::SafeBpeV1(call), Some(total)) =>
+                UntrustedEncoding::SafeBpeV1(total.remaining_call(*used, *call)
+                    .map_err(|_| ChatError::Limit("invocation tokenizer work"))?),
+            _ => return Err(ChatError::Contract("invocation tokenizer policy").into()),
+        };
+        let mut work = SafeBpeWork::default();
+        let compiled = self.compiler.compile_input_with_encoding_work(
+            kind, messages, options, budget, &encoding, &mut work, control);
+        // Debit before propagating a planning or cancellation error. Neither a
+        // failed item nor the next transcript restores this invocation budget.
+        *used = used.checked_add(work).ok_or(ChatError::Limit("invocation tokenizer work"))?;
+        let input = compiled?;
+        let native = Int4GenerationPlan::compile(input.prompt, input.options, input.identity,
+            self.group_width, item, sample, self.compiler.limits.generation)?;
+        Ok(PreparedInt4Chat { task: input.task, native,
+            tokenizer: Arc::clone(&self.compiler.tokenizer), sample_index: sample })
     }
     #[allow(clippy::too_many_arguments)]
     fn compile<C: DecodeStepControl>(&self, kind: BuiltInTask, item: &str, sample: u64, messages: &[ChatMessage],

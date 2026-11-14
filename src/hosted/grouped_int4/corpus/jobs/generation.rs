@@ -34,6 +34,16 @@ struct GenerationExecution<R> {
     lease: EngineLease,
 }
 
+// Keep admitted input/encoder and native claims until ordinary completion
+// crosses the dispatcher's physical team join. Early stop/unwind draining
+// remains owned by the shared dispatcher and its worker/model/cleanup guards.
+struct GenerationCompletion<R> {
+    result: Result<JobProgress, JobRunError>,
+    input: Charged<GenerationInput<R>>,
+    native: NativeJobCharges,
+    lease: EngineLease,
+}
+
 impl NlpEngine {
     /// Start or resume generation/chat over the COMPLETE original NDJSON
     /// population. The model-bound factory fixes task, seed, sampling options,
@@ -100,14 +110,16 @@ impl NlpEngine {
             native: planner.native_limits(), lifetime: request.limits.max_work,
             result_bytes: planner.max_result_bytes(), output_tokens: planner.output_token_ceiling(),
         };
-        let required = requirements(planner.group_width(), planner.task_budget(), envelope,
-            request.limits, limits, request.mode.input_memory())?;
+        let required = with_encoding_workspace(
+            requirements(planner.group_width(), planner.task_budget(), envelope,
+                request.limits, limits, request.mode.input_memory())?,
+            planner.encoding_workspace_bytes())?;
         // The dispatcher owns and charges this additional worker storage.
         // Check the simultaneous quote before reserving or reading input.
         let team_scratch = compute_threads.map(|width|
             int4_task_team_workspace_bytes(width, model.model_identity().group_width()))
             .transpose()?.unwrap_or(0);
-        sum(&[required.workspace_bytes, team_scratch])?;
+        sum(&[required.input_bytes, required.native.kv_bytes, required.workspace_bytes, team_scratch])?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(GenerationInput { preparation: Some((planner, request)), reader }))?;
@@ -125,7 +137,11 @@ impl NlpEngine {
         }?;
         // Runtime cancellation/drain failure takes precedence over a job return;
         // authenticated resume reconciles any lost durable acknowledgement.
-        completed.map_err(HostedJobError::Job)
+        let GenerationCompletion { result, input, native, lease } = completed;
+        drop(input);
+        drop(native);
+        drop(lease);
+        result.map_err(HostedJobError::Job)
     }
 }
 
@@ -134,7 +150,7 @@ impl<R: BufRead> GenerationExecution<R> {
     /// routes use the same authenticated population, planner and job runner.
     fn run<'weights>(self, weights: &'weights Int4ModelWeights, kernel: PackedInt4Kernel,
         projection: Option<&'weights mut (dyn Int4ProjectionExecutor + 'weights)>,
-        control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
+        control: &mut RunControl) -> Result<GenerationCompletion<R>, HostedError> {
         let Self { mut input, kv, scratch, envelope, limits, required, lease } = self;
         checkpoint(control)?;
         let (planner, request) = input.value.preparation.take()
@@ -142,7 +158,10 @@ impl<R: BufRead> GenerationExecution<R> {
         let population = match read_population(&mut input.value.reader,
             &request, limits.transport, control) {
             Ok(population) => population,
-            Err(error) => return Ok(Err(JobRunError::Storage(error))),
+            Err(error) => return Ok(GenerationCompletion {
+                result: Err(JobRunError::Storage(error)), input,
+                native: NativeJobCharges::Pending { _kv: kv, _scratch: scratch }, lease,
+            }),
         };
         checkpoint(control)?;
         let mut engine = allocate_native(kv, scratch, || {
@@ -163,13 +182,22 @@ impl<R: BufRead> GenerationExecution<R> {
                 .map_err(JobRunError::Processor)?;
             run_population(request, &population, processor, control)
         })();
-        drop(engine);
+        let ChargedNative { value, _kv, _scratch } = engine;
+        drop(value);
         drop(population);
         drop(planner);
-        drop(input);
-        drop(lease);
-        Ok(result)
+        Ok(GenerationCompletion { result, input,
+            native: NativeJobCharges::Committed { _kv, _scratch }, lease })
     }
+}
+
+// One encoder workspace coexists with the complete input owner and native
+// state. The moved planner keeps its already-consumed invocation ledger.
+fn with_encoding_workspace(mut required: Requirements, workspace: u64)
+    -> Result<Requirements, HostedError> {
+    required.input_bytes = sum(&[required.input_bytes, workspace])?;
+    sum(&[required.input_bytes, required.native.kv_bytes, required.workspace_bytes])?;
+    Ok(required)
 }
 
 fn requirements(width: usize, task: TaskBudget, envelope: GenerationEnvelope,

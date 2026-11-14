@@ -9,6 +9,7 @@ use crate::{
     candidate_cli::{batch::IO_BUFFER_BYTES, jobs::{self as job_cli, Failure, RunMode}},
     jobs::{JobLimits, population::PopulationReadLimits, runner::generation::GenerationJobTask},
     native_engine::{generation::grouped_int4::Int4GenerationBudget, strict_int4::Int4RunBudget},
+    tokenizer::untrusted::SafeBpeWorkLimits,
 };
 
 #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
@@ -18,14 +19,48 @@ mod runtime;
 mod tests;
 
 pub(super) struct JobCommand { mode: RunMode, args: JobArgs }
-struct JobArgs { task: GenerationJobTask, storage: StorageArgs }
+struct JobArgs { task: GenerationJobTask, storage: StorageArgs, encoding: EncodingArgs }
+
+/// Work for one start/resume invocation, shared by every transcript and item.
+#[derive(Args, Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct EncodingArgs {
+    /// Total untrusted bytes encoded in this invocation; safe-bpe-v1 only, default 67108864.
+    #[arg(long)]
+    max_total_tokenizer_input_bytes: Option<u64>,
+    /// Total untrusted tokens encoded in this invocation; safe-bpe-v1 only, default 4194304.
+    #[arg(long)]
+    max_total_tokenizer_output_tokens: Option<u64>,
+    /// Total BPE pair checks in this invocation; safe-bpe-v1 only, default 268435456.
+    #[arg(long)]
+    max_total_tokenizer_pair_checks: Option<u64>,
+    /// Total examined pair bytes in this invocation; safe-bpe-v1 only, default 4294967296.
+    #[arg(long)]
+    max_total_tokenizer_pair_bytes: Option<u64>,
+}
+impl EncodingArgs {
+    fn limits(self, args: &Int4Args) -> Result<Option<SafeBpeWorkLimits>, Failure> {
+        if args.input_encoding.is_default() {
+            return if self == Self::default() { Ok(None) }
+                else { Err(Failure::usage("text_job_input_encoding")) };
+        }
+        let total = SafeBpeWorkLimits {
+            max_input_bytes: self.max_total_tokenizer_input_bytes.unwrap_or(64 * MIB),
+            max_output_tokens: self.max_total_tokenizer_output_tokens.unwrap_or(4 * MIB),
+            max_pair_checks: self.max_total_tokenizer_pair_checks.unwrap_or(256 * MIB),
+            max_pair_bytes: self.max_total_tokenizer_pair_bytes.unwrap_or(4096 * MIB),
+        };
+        total.validate().map_err(|_| Failure::usage("text_job_tokenizer_work"))?;
+        Ok(Some(total))
+    }
+}
 
 pub(super) fn definition() -> clap::Command {
     let operation = |name: &'static str, about: &'static str| {
         let tasks = ["generate", "chat"].into_iter().map(|task| {
-            let command = compute::definition(StorageArgs::augment_args(Int4Args::augment_args(clap::Command::new(task))))
+            let command = input_encoding::definition(EncodingArgs::augment_args(compute::definition(
+                StorageArgs::augment_args(Int4Args::augment_args(clap::Command::new(task))))))
                 .about("Retain complete native results under one immutable generation recipe")
-                .long_about("Run or resume retained generate/chat items on one resident grouped-INT4 model. By default, supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation; explicit retained-input replay is available. text is the prompt or final user turn; optional task_args contains only sample_index and, for chat, history. Shared seed, stops, penalties, logprobs, context, task limits and model/group identity are authenticated and cannot change on resume. No seed means greedy; no implicit random seed is generated. Requires --store-results, existing protected --job-dir and --key-file, exact --job-id, and immutable --limits. All five native lifetime work axes are charged before each attempt and never refunded for EOS, failure or cancellation; mask_node_visits must be zero. Results commit only after whole native completion. Stdout is metadata only; --materialize publishes verified private results after every item commits. Items execute in order; --compute-threads 2..=64 reuses one persistent output-row team across the entire invocation. Physical width may change on resume without changing the authenticated recipe or renewing its work. Worker scratch and the process thread envelope are admitted before IO. --prefill-rows and cohort scheduling are unsupported. No partial-token checkpoints, flush controls, per-record policy changes, automatic retry, thinking mode, tools, model download or release activation. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
+                .long_about("Run or resume retained generate/chat items on one resident grouped-INT4 model. By default, supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation; explicit retained-input replay is available. text is the prompt or final user turn; optional task_args contains only sample_index and, for chat, history. Shared seed, stops, penalties, logprobs, context, task limits and model/group identity are authenticated and cannot change on resume. No seed means greedy; no implicit random seed is generated. Requires --store-results, existing protected --job-dir and --key-file, exact --job-id, and immutable --limits. All five native lifetime work axes are charged before each attempt and never refunded for EOS, failure or cancellation; mask_node_visits must be zero. Results commit only after whole native completion. Stdout is metadata only; --materialize publishes verified private results after every item commits. Items execute in order; --compute-threads 2..=64 reuses one persistent output-row team across the entire invocation. Physical width may change on resume without changing the authenticated recipe or renewing its work. Worker scratch and the process thread envelope are admitted before IO. Explicit --input-encoding safe-bpe-v1 compacts untrusted prompt/history bytes without admitting template-control IDs. Per-transcript byte/token/pair ceilings and all --max-total-tokenizer-* invocation ceilings are authenticated in the private recipe. One retained invocation ledger spans all messages, items and failed preparation; neither a record nor the host boundary renews it. Resume starts the same declared bounded tokenizer allowance, not new lifetime native work or attempts. Encoder workspace is admitted before private IO. Compact tokens may change model output and imply no parity, quality or speed claim. --prefill-rows and cohort scheduling are unsupported. No partial-token checkpoints, flush controls, per-record policy changes, automatic retry, thinking mode, tools, model download or release activation. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
                 .after_help(job_cli::INPUT_RETENTION_HELP)
                 .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population; omit with --use-retained-input; '-' reads stdin"))
                 .mut_arg("max_input_bytes", |arg| arg.help("Outer ceiling for each complete NDJSON record; immutable JobLimits.max_input_bytes_per_item must fit"))
@@ -58,6 +93,7 @@ struct JobExecutionLimits {
     io_reserve_bytes: u64,
     journal_reserve_bytes: u64,
     serialization_reserve_bytes: u64,
+    encoding_workspace_bytes: u64,
 }
 
 impl JobArgs {
@@ -76,10 +112,8 @@ impl JobArgs {
             return Err(Failure::usage("explicit_text_job_storage"));
         }
         if args.prefill()?.is_some() { return Err(Failure::usage("text_job_serial_schedule")); }
-        // The retained recipe still uses its original byte-fallback compiler.
-        // Reject a programmatic encoding override rather than ignoring it.
-        if !args.input_encoding.is_default() { return Err(Failure::usage("text_job_input_encoding")); }
         let common = args.validate_text_compute()?;
+        self.encoding.limits(args)?;
         for mib in [s.journal_memory_mib, s.serialization_memory_mib] {
             if mib.checked_mul(MIB).is_none_or(|bytes| bytes > common.memory_bytes) {
                 return Err(Failure::usage("text_job_memory"));
@@ -122,13 +156,15 @@ impl JobArgs {
             preparation_reserve_bytes, io_reserve_bytes,
             journal_reserve_bytes, serialization_reserve_bytes,
         ]).map_err(|_| Failure::usage("job_memory_arithmetic"))?;
-        common.minimum_memory_bytes = common.minimum_memory_bytes.checked_add(buffer_bytes)
-            .ok_or_else(|| Failure::usage("job_memory_arithmetic"))?;
+        let encoding_workspace_bytes = args.input_encoding.workspace_bytes(
+            args.max_input_bytes, common.max_prompt_tokens)?;
+        common.minimum_memory_bytes = sum(&[common.minimum_memory_bytes, buffer_bytes,
+            encoding_workspace_bytes]).map_err(|_| Failure::usage("job_memory_arithmetic"))?;
         if common.minimum_memory_bytes > common.memory_bytes {
             return Err(Failure { exit: ErrorCode::AdmissionOrResourceLimit, code: "job_population_memory" });
         }
         Ok(JobExecutionLimits { common, transport, native, buffer_bytes, preparation_reserve_bytes,
-            io_reserve_bytes, journal_reserve_bytes, serialization_reserve_bytes })
+            io_reserve_bytes, journal_reserve_bytes, serialization_reserve_bytes, encoding_workspace_bytes })
     }
 }
 
@@ -146,9 +182,11 @@ impl JobCommand {
             "resume" => RunMode::Resume { discard_uncommitted: matches.get_flag("discard_uncommitted_tail") },
             _ => return Err(invalid("text-job operation refused")),
         };
-        let args = JobArgs { task, storage: StorageArgs::from_arg_matches(matches)? };
+        let args = JobArgs { task, storage: StorageArgs::from_arg_matches(matches)?,
+            encoding: EncodingArgs::from_arg_matches(matches)? };
         let mut native = Int4Args::from_arg_matches(matches)?;
         native.compute = compute::Args::from_matches(matches)?;
+        native.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
         Ok((Self { mode, args }, native))
     }
     pub(super) fn run_owned<R: Read + Send + 'static>(self, args: Int4Args, input: R,

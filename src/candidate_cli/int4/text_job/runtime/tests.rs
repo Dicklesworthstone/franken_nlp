@@ -160,7 +160,8 @@ fn complete_envelope_publishes_only_public_model_identity_and_authenticated_prog
         source_root_sha256: &source, model_content_sha256: &content,
         candidate_format: "fixture-candidate-format", quant_recipe: "fixture-grouped-int4",
         group_width: args.group_width, integer_kernel: common.kernel.kind().id(),
-        snapshot: Some(SnapshotRecord::new("loaded", common.snapshot_need)), compute_schedule: None, output: &report,
+        snapshot: Some(SnapshotRecord::new("loaded", common.snapshot_need)),
+        input_encoding: None, encoding_work_limits: None, compute_schedule: None, output: &report,
     };
     let mut bytes = Vec::new(); publish(&response, job_cli::REPORT_BYTES, &mut bytes).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -169,6 +170,8 @@ fn complete_envelope_publishes_only_public_model_identity_and_authenticated_prog
     assert_eq!(value["model_content_sha256"], content);
     assert_eq!(value["group_width"], args.group_width);
     assert!(value.get("compute_schedule").is_none());
+    assert!(value.get("input_encoding").is_none());
+    assert!(value.get("encoding_work_limits").is_none());
     assert_eq!(value["snapshot"]["format"], INT4_SNAPSHOT_VERSION);
     assert_eq!(value["output"]["operation"], "resume");
     assert_eq!(value["output"]["task"], "chat");
@@ -189,4 +192,53 @@ fn complete_envelope_publishes_only_public_model_identity_and_authenticated_prog
     assert_eq!(selected["compute_schedule"]["declared_compute_threads"], 4);
     assert_eq!(selected["output"], value["output"]);
     assert!(selected.get("compute").is_none());
+    let (compact_command, compact_args) = command("resume", "chat", &["--input-encoding", "safe-bpe-v1"]);
+    let policy = compact_args.input_encoding.policy(compact_args.max_input_bytes, common.max_prompt_tokens).unwrap();
+    let total = compact_command.args.encoding.limits(&compact_args).unwrap();
+    let compact = Response { input_encoding: Some(&policy), encoding_work_limits: total, ..scheduled };
+    let mut bytes = Vec::new(); publish(&compact, job_cli::REPORT_BYTES, &mut bytes).unwrap();
+    let compact_value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(compact_value["input_encoding"], serde_json::to_value(policy).unwrap());
+    assert_eq!(compact_value["encoding_work_limits"], serde_json::to_value(total).unwrap());
+    assert_eq!(compact_value["output"], value["output"]);
+}
+
+#[test]
+fn expired_or_cancelled_metadata_never_reports_successful_delivery() {
+    use crate::native_engine::decode::DecodeCancellationKind;
+    let response = serde_json::json!({"schema_version":1,"status":"committed"});
+    let token = CancellationToken::default();
+    assert_eq!(publish_report(&response, &mut NoWrite, &|| Err(CandidateError::Timeout), &token)
+        .unwrap_err().exit, ErrorCode::BudgetOrTimeout);
+    token.cancel(DecodeCancellationKind::ResourceUnavailable);
+    assert_eq!(publish_report(&response, &mut NoWrite, &|| Ok(Duration::from_secs(1)), &token)
+        .unwrap_err().exit, ErrorCode::AdmissionOrResourceLimit);
+    struct CancelOnFlush { token: CancellationToken, bytes: Vec<u8> }
+    impl Write for CancelOnFlush {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes); Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.token.cancel(DecodeCancellationKind::Deadline); Ok(())
+        }
+    }
+    let token = CancellationToken::default();
+    let mut sink = CancelOnFlush { token: token.clone(), bytes: Vec::new() };
+    assert_eq!(publish_report(&response, &mut sink, &|| Ok(Duration::from_secs(1)), &token)
+        .unwrap_err().exit, ErrorCode::BudgetOrTimeout);
+    assert!(!sink.bytes.is_empty()); // delivered bytes are not a rollback claim
+}
+
+#[test]
+fn metadata_serialization_cannot_outrun_the_original_deadline() {
+    use std::cell::Cell;
+    let checks = Cell::new(0_usize);
+    let response = serde_json::json!({"schema_version":1,"status":"committed"});
+    let remaining = || {
+        checks.set(checks.get() + 1);
+        if checks.get() == 1 { Ok(Duration::from_secs(1)) } else { Err(CandidateError::Timeout) }
+    };
+    let error = publish_report(&response, &mut NoWrite, &remaining, &CancellationToken::default()).unwrap_err();
+    assert_eq!(error.exit, ErrorCode::BudgetOrTimeout);
+    assert_eq!(checks.get(), 2);
 }
