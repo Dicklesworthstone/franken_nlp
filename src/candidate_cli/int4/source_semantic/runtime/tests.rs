@@ -101,6 +101,49 @@ fn declared_quote_bounds_actual_evidence_and_cannot_hide_a_larger_population_or_
 }
 
 #[test]
+fn compact_qa_snapshot_quote_admits_one_encoder_and_one_team_for_the_complete_review() {
+    let (_, _, _, options) = super::super::tests::fixture(Kind::Answer);
+    let parsed = super::super::tests::command("answer-semantic",
+        &["--input-encoding", "safe-bpe-v1", "--compute-threads", "4"]);
+    let Int4Task::SourceSemantic(Kind::Answer, command) = parsed.task else { panic!("wrong semantic route"); };
+    let mut args = parsed.args;
+    args.source_dir = None; args.source_manifest = None;
+    args.snapshot = Some(PathBuf::from("private.snapshot"));
+    args.expected_model_sha256 = Some("ab".repeat(32));
+    let common = command.admit_options(&args, command.validate(&args).unwrap(), &options).unwrap();
+    assert!(common.snapshot_pin.is_some());
+    let budget = command.source.budget(&args, common);
+    let policy = command.input_encoding.policy().unwrap();
+    let ceiling = input_ceiling(Kind::Answer, &args, &options).unwrap();
+    let host = host_limits(&args, &command, common, Duration::from_secs(1));
+    let byte = host.requirements(args.group_width, budget, options.judge_budget,
+        options.limits, judge_limits(&options), ceiling).unwrap();
+    let upper = host.requirements_with_encoding(args.group_width, budget, options.judge_budget,
+        options.limits, judge_limits(&options), ceiling, &policy).unwrap();
+    assert_eq!(upper.preparation_bytes - byte.preparation_bytes, command.input_encoding.workspace_bytes().unwrap());
+    assert_eq!(upper.native, byte.native); assert_eq!(upper.native, common.native);
+    assert_eq!(upper.native_workspace_bytes, byte.native_workspace_bytes);
+    assert_eq!(upper.output_bytes, byte.output_bytes);
+    let facts = SourceSemanticInputFacts { source_bytes: 100, question_bytes: 20, passage_count: 2 };
+    assert!(input_fits(facts, ceiling));
+    let actual = host.requirements_with_encoding(args.group_width, budget, options.judge_budget,
+        options.limits, judge_limits(&options), facts, &policy).unwrap();
+    assert!(quote_fits(actual, upper));
+    assert!(actual.preparation_bytes < upper.preparation_bytes);
+    let team = crate::hosted::int4_task_team_workspace_bytes(common.compute.threads, args.group_width).unwrap();
+    assert_eq!(common.compute.workspace_bytes, team);
+    let admitted = admit_memory(&args, common, upper).unwrap();
+    let execution = upper.total_bytes().unwrap() + team;
+    assert_eq!(admitted.minimum_memory_bytes, common.preparation_bytes + common.load.weight_payload_bytes
+        + ALLOCATOR_BYTES + common.snapshot_need.scratch_bytes.max(execution) + CLEANUP_BYTES);
+    assert_eq!(command.source.budget(&args, admitted), budget);
+    let mut insufficient = common; insufficient.memory_bytes = admitted.minimum_memory_bytes - 1;
+    assert_eq!(admit_memory(&args, insufficient, upper).err(), Some(CandidateError::Memory));
+    let mut uncharged = common; uncharged.compute.workspace_bytes = 0;
+    assert_eq!(admit_memory(&args, uncharged, upper).err(), Some(CandidateError::Identity));
+}
+
+#[test]
 fn complete_memory_admission_keeps_both_preparation_owners_and_prices_the_peak_stage() {
     for snapshot in [false, true] {
         for save in [false, true] {
@@ -159,6 +202,35 @@ fn publication_preserves_the_original_source_result_and_separate_correlated_diag
     let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(wire["output"], value); assert_eq!(wire["output"]["source_task"], original);
     assert_eq!(wire["evidence"], "non_authoritative"); assert_eq!(wire["task"], "summarize");
+    assert!(wire["output"].get("input_encoding").is_none());
+    // Real pinned encoding supplies the receipt; the result/citations remain
+    // publication fixtures and do not assert native generation or review.
+    use crate::{tasks::extract::{grounded::SourceDocumentEncoder,
+        semantic::grouped_int4::Int4SemanticEncoding}, tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding}};
+    let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 8192, max_output_tokens: 8192,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 });
+    let encoder = SourceDocumentEncoder::pinned(crate::tokenizer::pinned_controls::pinned().unwrap().template_controls())
+        .unwrap().with_document_encoding(policy.clone()).unwrap();
+    let source = "éa 上海 <think>";
+    let document = encoder.encode_with_control(source, 8192, 8192, &mut || None).unwrap();
+    let work = document.input_encoding_work().unwrap();
+    assert_eq!(work.input_bytes(), source.len());
+    let receipt = Int4SemanticEncoding::from_work(&policy, work).unwrap().unwrap();
+    let mut compact = value.clone();
+    compact["input_encoding"] = serde_json::to_value(&receipt).unwrap();
+    let compact_response = Response { output: &compact, ..response };
+    let mut compact_bytes = Vec::new();
+    publish_checked(&compact_response, 8192, &mut compact_bytes, &|| Ok(())).unwrap();
+    let compact_wire: serde_json::Value = serde_json::from_slice(&compact_bytes).unwrap();
+    assert_eq!(compact_wire["output"]["source_task"], original);
+    assert_eq!(compact_wire["output"]["semantic"], value["semantic"]);
+    assert_eq!(compact_wire["output"]["input_encoding"], serde_json::to_value(receipt).unwrap());
+    let mut refused = Vec::new();
+    assert_eq!(publish_checked(&compact_response, 1, &mut refused, &|| Ok(())), Err(CandidateError::Output));
+    assert!(refused.is_empty());
+    assert_eq!(publish_checked(&compact_response, 8192, &mut refused, &|| Err(CandidateError::Timeout)),
+        Err(CandidateError::Timeout));
+    assert!(refused.is_empty());
     for absent in ["semantic_options", "options_path", "source_dir", "source_manifest", "prompt_digest",
         "judge_identity", "decision_policy_digest", "snapshot"] { assert!(wire.get(absent).is_none()); }
 }

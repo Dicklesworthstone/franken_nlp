@@ -2,14 +2,15 @@
 use super::*;
 use crate::{native_engine::{lmhead::NANBEIGE_VOCAB_SIZE, strict_int4::Int4Work},
     tasks::{ir::TaskBudget, judge::FaithfulnessPolicy,
-        source_planning::grouped_int4::semantic::SourceSemanticLimits}};
+        source_planning::grouped_int4::semantic::SourceSemanticLimits},
+    tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding}};
 
 fn argv(task: &str, extra: &[&str]) -> Vec<String> {
     ["candidate", "source-int4", task, "--source-dir", "explicit-source",
         "--source-manifest", "explicit-manifest.json", "--memory-mib", "8192",
         "--semantic-options", "semantic.json"].into_iter().chain(extra.iter().copied()).map(str::to_owned).collect()
 }
-fn command(task: &str, extra: &[&str]) -> Int4Command {
+pub(super) fn command(task: &str, extra: &[&str]) -> Int4Command {
     let matches = crate::candidate_cli::definition().try_get_matches_from(argv(task, extra)).unwrap();
     let CandidateCommand::SourceInt4(command) = CandidateCommand::from_matches(&matches).unwrap()
         else { panic!("wrong candidate route"); };
@@ -66,18 +67,95 @@ fn each_explicit_task_supports_both_model_inputs_without_enabling_review_on_ordi
 }
 
 #[test]
-fn incompatible_generation_projection_and_encoding_options_refuse_before_io() {
+fn incompatible_generation_and_projection_options_refuse_before_io() {
     let seed = "ab".repeat(32);
     for name in ["summarize-semantic", "answer-semantic"] {
         for flags in [vec!["--seed", seed.as_str()], vec!["--logprobs"], vec!["--stop", "END"],
             vec!["--prefill-rows", "1"], vec!["--presence-penalty-milli", "0"],
             vec!["--max-output-bytes", "65536"], vec!["--max-selected-rows", "166144"],
             vec!["--cohort-documents", "2"],
-            vec!["--input-encoding", "safe-bpe-v1"], vec!["--think"], vec!["--tools", "tools.json"],
+            vec!["--think"], vec!["--tools", "tools.json"],
             vec!["--retry", "1"]] {
             if let Ok(matches) = crate::candidate_cli::definition().try_get_matches_from(argv(name, &flags)) {
                 if let Ok(command) = CandidateCommand::from_matches(&matches) {
                     assert_eq!(command.execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments), "{name} {flags:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_source_reviews_admit_both_model_inputs_with_separate_whole_operation_tokenizer_caps() {
+    for (name, kind) in [("summarize-semantic", Kind::Summarize), ("answer-semantic", Kind::Answer)] {
+        let (byte, byte_args, byte_common, options) = fixture(kind);
+        assert_eq!(byte.input_encoding.policy().unwrap(), UntrustedEncoding::ByteFallback);
+        assert_eq!(byte.input_encoding.workspace_bytes().unwrap(), 0);
+        assert_eq!(byte_args.preparation_mib, 512);
+        for snapshot in [false, true] {
+            let mut command = command(name, &["--input-encoding", "safe-bpe-v1"]);
+            assert_eq!(command.args.preparation_mib, 1024);
+            if snapshot {
+                command.args.source_dir = None; command.args.source_manifest = None;
+                command.args.snapshot = Some(PathBuf::from("private.snapshot"));
+                command.args.expected_model_sha256 = Some("ab".repeat(32));
+            }
+            let Int4Task::SourceSemantic(actual, semantic) = command.task else { panic!("wrong semantic route"); };
+            assert_eq!(actual, kind);
+            assert!(command.args.input_encoding.is_default(), "semantic policy is separately owned");
+            let UntrustedEncoding::SafeBpeV1(limits) = semantic.input_encoding.policy().unwrap()
+                else { panic!("compact policy required"); };
+            assert_eq!(limits, SafeBpeLimits { max_input_bytes: SafeBpeLimits::MAX_INPUT_BYTES,
+                max_output_tokens: SafeBpeLimits::MAX_OUTPUT_TOKENS,
+                max_pair_checks: SafeBpeLimits::MAX_PAIR_CHECKS, max_pair_bytes: SafeBpeLimits::MAX_PAIR_BYTES });
+            assert!(limits.max_output_tokens > command.args.context_tokens);
+            assert_eq!(semantic.input_encoding.workspace_bytes().unwrap(), limits.requirements().unwrap().workspace_bytes);
+            let common = semantic.validate(&command.args).unwrap();
+            let admitted = semantic.admit_options(&command.args, common, &options).unwrap();
+            assert_eq!(admitted.snapshot_pin.is_some(), snapshot);
+            assert_eq!(admitted.native, byte_common.native);
+            assert_eq!(semantic.source.budget(&command.args, admitted), byte.source.budget(&byte_args, byte_common));
+        }
+        let command = command(name, &["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "4096",
+            "--max-tokenizer-output-tokens", "2048", "--max-tokenizer-pair-checks", "7777",
+            "--max-tokenizer-pair-bytes", "65536"]);
+        let Int4Task::SourceSemantic(_, semantic) = command.task else { panic!("wrong semantic route"); };
+        assert_eq!(semantic.input_encoding.policy().unwrap(), UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+            max_input_bytes: 4096, max_output_tokens: 2048, max_pair_checks: 7777, max_pair_bytes: 65536 }));
+        assert!(semantic.validate(&command.args).is_ok());
+    }
+}
+
+#[test]
+fn compact_source_preparation_defaults_preserve_explicit_overrides_and_refuse_an_underquote_before_io() {
+    for name in ["summarize-semantic", "answer-semantic"] {
+        assert_eq!(command(name, &["--input-encoding", "byte-fallback"]).args.preparation_mib, 512);
+        for preparation in ["1", "512"] {
+            let command = command(name, &["--input-encoding", "safe-bpe-v1", "--preparation-mib", preparation]);
+            assert_eq!(command.args.preparation_mib, preparation.parse::<u64>().unwrap());
+            assert_eq!(command.execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+        }
+        let command = command(name, &["--input-encoding", "safe-bpe-v1", "--preparation-mib", "1536"]);
+        assert_eq!(command.args.preparation_mib, 1536);
+        let Int4Task::SourceSemantic(_, semantic) = command.task else { panic!("wrong semantic route"); };
+        assert!(semantic.validate(&command.args).is_ok());
+    }
+}
+
+#[test]
+fn source_review_tokenizer_options_refuse_missing_opt_in_and_invalid_bounds_before_io() {
+    for name in ["summarize-semantic", "answer-semantic"] {
+        for (flag, above_maximum) in [("--max-tokenizer-input-bytes", "1048577"),
+            ("--max-tokenizer-output-tokens", "1048577"), ("--max-tokenizer-pair-checks", "67108865"),
+            ("--max-tokenizer-pair-bytes", "536870913")] {
+            let matches = crate::candidate_cli::definition().try_get_matches_from(argv(name, &[flag, "1"])).unwrap();
+            assert!(CandidateCommand::from_matches(&matches).is_err(), "{name} {flag}");
+            for value in ["0", above_maximum] {
+                let matches = crate::candidate_cli::definition().try_get_matches_from(argv(name, &[
+                    "--input-encoding", "safe-bpe-v1", flag, value])).unwrap();
+                if let Ok(command) = CandidateCommand::from_matches(&matches) {
+                    assert_eq!(command.execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments),
+                        "{name} {flag} {value}");
                 }
             }
         }
@@ -200,8 +278,9 @@ fn input_ceiling_retains_all_qa_dimensions_and_debug_redacts_paths() {
 fn both_source_reviews_admit_one_explicit_team_without_multiplying_task_budgets() {
     for (name, kind) in [("summarize-semantic", Kind::Summarize), ("answer-semantic", Kind::Answer)] {
         let (_, _, _, options) = fixture(kind);
-        for width in ["1", "2", "4"] {
-            let command = command(name, &["--compute-threads", width]);
+        for (encoding, width) in ["byte-fallback", "safe-bpe-v1"].into_iter()
+            .flat_map(|encoding| ["1", "2", "4"].into_iter().map(move |width| (encoding, width))) {
+            let command = command(name, &["--compute-threads", width, "--input-encoding", encoding]);
             let Int4Task::SourceSemantic(actual, semantic) = command.task else { panic!("wrong semantic route"); };
             assert_eq!(actual, kind);
             let args = command.args;
@@ -212,6 +291,9 @@ fn both_source_reviews_admit_one_explicit_team_without_multiplying_task_budgets(
             assert_eq!(semantic.source.budget(&args, admitted), semantic.source.budget(&args, common));
             assert_eq!(admitted.compute.workspace_bytes == 0, width == "1");
             assert!(admitted.prefill.is_none() && admitted.cohort.is_none());
+            assert!(args.input_encoding.is_default());
+            assert_eq!(matches!(semantic.input_encoding.policy().unwrap(), UntrustedEncoding::SafeBpeV1(_)),
+                encoding == "safe-bpe-v1");
         }
         for width in ["0", "65"] {
             assert_eq!(command(name, &["--compute-threads", width]).execute(&mut NoIo, &mut NoIo),

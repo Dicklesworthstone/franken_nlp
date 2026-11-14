@@ -54,6 +54,7 @@ pub(super) fn execute(kind: Kind, args: Int4Args, command: SemanticSourceArgs, _
     remaining()?;
     let options = parse_options(&read_local(&command.semantic_options, OPTIONS_BYTES)?)?;
     let common = command.admit_options(&args, common, &options)?;
+    let encoding = command.input_encoding.policy()?;
     let source_budget = command.source.budget(&args, common);
     let planning = judge_limits(&options); let judge_budget = options.judge_budget;
     let semantic_limits = options.limits; let native_work = options.max_model_work;
@@ -63,7 +64,8 @@ pub(super) fn execute(kind: Kind, args: Int4Args, command: SemanticSourceArgs, _
     // and before source conversion or snapshot access. Actual inputs can only
     // reduce this quote; they cannot extend the admitted population or budget.
     let ceiling = input_ceiling(kind, &args, &options)?;
-    let upper = host.requirements(args.group_width, source_budget, judge_budget, semantic_limits, planning, ceiling)
+    let upper = host.requirements_with_encoding(args.group_width, source_budget, judge_budget,
+        semantic_limits, planning, ceiling, &encoding)
         .map_err(|_| CandidateError::Memory)?;
     let common = admit_memory(&args, common, upper)?;
     remaining()?;
@@ -75,7 +77,8 @@ pub(super) fn execute(kind: Kind, args: Int4Args, command: SemanticSourceArgs, _
     let request = crate::candidate_cli::source::request(kind, text, option_json.as_deref(), source_budget, args.max_input_bytes)?;
     let facts = options.input_facts(&request).map_err(planning_error)?;
     if !input_fits(facts, ceiling) { return Err(CandidateError::Identity); }
-    let quote = host.requirements(args.group_width, source_budget, judge_budget, semantic_limits, planning, facts)
+    let quote = host.requirements_with_encoding(args.group_width, source_budget, judge_budget,
+        semantic_limits, planning, facts, &encoding)
         .map_err(|_| CandidateError::Memory)?;
     if !quote_fits(quote, upper) { return Err(CandidateError::Identity); }
     let common = admit_memory(&args, common, quote)?;
@@ -88,6 +91,7 @@ pub(super) fn execute(kind: Kind, args: Int4Args, command: SemanticSourceArgs, _
     remaining()?;
     let mut control = DeadlineControl { started, deadline };
     let (compiler, vocabulary) = source::planner()?;
+    let compiler = compiler.with_document_encoding(encoding.clone()).map_err(|_| CandidateError::Planning)?;
     let identity = source::identity(model.model_identity(), &compiler, source::task(kind))?;
     let context = PlanContext::new(&identity, source_budget).map_err(|_| CandidateError::Planning)?;
     let prepared_source = compiler.plan_int4_with_control(&request, &context, command.source.planning(&args),
@@ -95,16 +99,18 @@ pub(super) fn execute(kind: Kind, args: Int4Args, command: SemanticSourceArgs, _
         .map_err(|e| e.cancellation().map(cancelled).unwrap_or(CandidateError::Planning))?;
     drop(compiler);
     let judge = Int4JudgePlanner::for_model(model.model_identity(), judge_budget, planning)
+        .and_then(|planner| planner.with_document_encoding(encoding.clone()))
         .map_err(|e| e.cancellation().map(cancelled).unwrap_or(CandidateError::Planning))?;
     let prepared = PreparedInt4SourceSemantic::new(prepared_source, request, judge, options, &mut control)
         .map_err(planning_error)?;
-    let actual = host.requirements(prepared.group_width(), prepared.source_budget(), prepared.judge_budget(),
-        prepared.semantic_limits(), prepared.judge_planning_limits(), prepared.input_facts()).map_err(|_| CandidateError::Memory)?;
+    let actual = host.requirements_with_encoding(prepared.group_width(), prepared.source_budget(), prepared.judge_budget(),
+        prepared.semantic_limits(), prepared.judge_planning_limits(), prepared.input_facts(), prepared.input_encoding())
+        .map_err(|_| CandidateError::Memory)?;
     if prepared.group_width() != args.group_width || prepared.source_budget() != source_budget
         || prepared.judge_budget() != judge_budget || prepared.semantic_limits() != semantic_limits
         || prepared.input_facts() != facts || prepared.policy_digest() != policy_digest
         || prepared.max_model_work() != native_work || prepared.max_result_bytes() != common.result_bytes as u64
-        || actual != quote {
+        || prepared.input_encoding() != &encoding || actual != quote {
         return Err(CandidateError::Identity);
     }
     admit_memory(&args, common, actual)?;

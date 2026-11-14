@@ -2918,6 +2918,16 @@ whole-request work allowance and deadline. See
 [INT4 summary and answer review](docs/source-semantic.md) for complete options,
 CLI examples, evidence scope, resource admission and the hosted API.
 
+All three composed review commands (`extract-semantic`, `summarize-semantic`
+and `answer-semantic`) also accept `--input-encoding safe-bpe-v1`, including
+source conversion, digest-pinned snapshots and persistent `--compute-threads`
+teams. One cumulative tokenizer allowance covers the original schema/source/QA
+metadata and every review claim and evidence window. Exact original citations
+remain authoritative. Compact output includes the selected policy and actual
+whole-request tokenizer work; byte-default output keeps its existing shape.
+See [compact semantic input](docs/source-semantic.md#compact-input-across-generation-and-review)
+for the four independent work caps and preparation-memory defaults.
+
 Single-request `answer` reads a JSON object instead of plain document text:
 
 ```json
@@ -4815,6 +4825,20 @@ diagnostics. The same model performs both passes. These are explicitly
 uncalibrated, correlated signals; the command never repairs a field,
 automatically accepts a document, or certifies factual correctness. Ordinary
 `extract`, extraction batches and extraction jobs keep their existing behavior.
+
+Add `--input-encoding safe-bpe-v1` to compactly encode both extraction and review
+with one immutable policy. The original schema and source consume the same
+four-axis tokenizer allowance as all subsequent field claims, complete-source
+prompts and evidence windows. Policies must match before generation starts;
+completed accounting must equal original work plus every review plan's delta.
+There is no renewal between fields. One sequential tokenizer workspace is
+admitted before private document/schema/model IO, and compact results add
+`output.input_encoding: { policy, work }`. The default `--preparation-mib` is
+1,024 in compact mode and remains 512 in byte mode; explicit overrides must
+cover the declared requirement. Source conversion, snapshot load/save and
+persistent compute teams all support this option. See the
+[compact semantic input contract](docs/source-semantic.md#compact-input-across-generation-and-review)
+for limits, failure behavior and the unchanged diagnostic scope.
 
 The command requires a local `--semantic-options` file containing the complete
 `tasks::extract::semantic::grouped_int4::Int4SemanticOptions` contract, including

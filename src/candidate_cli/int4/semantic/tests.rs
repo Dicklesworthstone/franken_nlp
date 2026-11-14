@@ -4,6 +4,7 @@ use crate::{
     native_engine::{lmhead::NANBEIGE_VOCAB_SIZE, strict_int4::Int4Work},
     tasks::{extract::semantic::{ClaimPathStep, ClaimRule, ClaimValueKind,
         SemanticLimits, SemanticVerificationSpec}, judge::FaithfulnessPolicy},
+    tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding},
 };
 
 fn argv(extra: &[&str]) -> Vec<String> {
@@ -12,7 +13,7 @@ fn argv(extra: &[&str]) -> Vec<String> {
         "--schema", "schema.json", "--semantic-options", "semantic.json"]
         .into_iter().chain(extra.iter().copied()).map(str::to_owned).collect()
 }
-fn command(extra: &[&str]) -> Int4Command {
+pub(super) fn command(extra: &[&str]) -> Int4Command {
     let matches = crate::candidate_cli::definition().try_get_matches_from(argv(extra)).unwrap();
     let CandidateCommand::SourceInt4(command) = CandidateCommand::from_matches(&matches).unwrap()
         else { panic!("wrong candidate route"); };
@@ -68,6 +69,80 @@ fn semantic_selection_is_explicit_and_both_model_inputs_share_it() {
         "candidate", "source-int4", "extract", "--source-dir", "source", "--source-manifest", "manifest",
         "--memory-mib", "8192", "--schema", "schema.json", "--semantic-options", "semantic.json",
     ]).is_err());
+}
+
+#[test]
+fn compact_semantic_policy_has_separate_aggregate_limits_and_supports_both_model_inputs() {
+    let (byte, byte_args, byte_common, options) = fixture();
+    assert!(byte_args.input_encoding.is_default());
+    assert_eq!(byte.input_encoding.policy().unwrap(), UntrustedEncoding::ByteFallback);
+    assert_eq!(byte.input_encoding.workspace_bytes().unwrap(), 0);
+    assert_eq!(byte_args.preparation_mib, 512);
+    for snapshot in [false, true] {
+        let mut command = command(&["--input-encoding", "safe-bpe-v1"]);
+        assert_eq!(command.args.preparation_mib, 1024);
+        if snapshot {
+            command.args.source_dir = None; command.args.source_manifest = None;
+            command.args.snapshot = Some(PathBuf::from("private.snapshot"));
+            command.args.expected_model_sha256 = Some("ab".repeat(32));
+        }
+        let Int4Task::Semantic(semantic) = command.task else { panic!("wrong semantic route"); };
+        assert!(command.args.input_encoding.is_default(), "semantic policy must not use the text-task allowance");
+        let policy = semantic.input_encoding.policy().unwrap();
+        let UntrustedEncoding::SafeBpeV1(limits) = policy else { panic!("compact policy required"); };
+        assert_eq!(limits, SafeBpeLimits { max_input_bytes: SafeBpeLimits::MAX_INPUT_BYTES,
+            max_output_tokens: SafeBpeLimits::MAX_OUTPUT_TOKENS,
+            max_pair_checks: SafeBpeLimits::MAX_PAIR_CHECKS, max_pair_bytes: SafeBpeLimits::MAX_PAIR_BYTES });
+        assert!(limits.max_output_tokens > command.args.context_tokens);
+        assert_eq!(semantic.input_encoding.workspace_bytes().unwrap(), limits.requirements().unwrap().workspace_bytes);
+        let common = semantic.validate(&command.args).unwrap();
+        let admitted = semantic.admit_options(&command.args, common, &options).unwrap();
+        assert_eq!(admitted.snapshot_pin.is_some(), snapshot);
+        assert_eq!(admitted.native, byte_common.native);
+        assert_eq!(semantic.extraction.budget(&command.args, admitted), byte.extraction.budget(&byte_args, byte_common));
+    }
+    let command = command(&["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "4096",
+        "--max-tokenizer-output-tokens", "2048", "--max-tokenizer-pair-checks", "7777",
+        "--max-tokenizer-pair-bytes", "65536"]);
+    let Int4Task::Semantic(semantic) = command.task else { panic!("wrong semantic route"); };
+    assert_eq!(semantic.input_encoding.policy().unwrap(), UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 4096, max_output_tokens: 2048, max_pair_checks: 7777, max_pair_bytes: 65536 }));
+    assert!(semantic.validate(&command.args).is_ok());
+}
+
+#[test]
+fn compact_semantic_preparation_defaults_preserve_explicit_overrides_and_refuse_an_underquote_before_io() {
+    assert_eq!(command(&["--input-encoding", "byte-fallback"]).args.preparation_mib, 512);
+    for preparation in ["1", "512"] {
+        let command = command(&["--input-encoding", "safe-bpe-v1", "--preparation-mib", preparation]);
+        assert_eq!(command.args.preparation_mib, preparation.parse::<u64>().unwrap());
+        let mut output = Vec::new();
+        assert_eq!(command.execute(&mut NoRead, &mut output), Err(CandidateError::Arguments));
+        assert!(output.is_empty());
+    }
+    let command = command(&["--input-encoding", "safe-bpe-v1", "--preparation-mib", "1536"]);
+    assert_eq!(command.args.preparation_mib, 1536);
+    let Int4Task::Semantic(semantic) = command.task else { panic!("wrong semantic route"); };
+    assert!(semantic.validate(&command.args).is_ok());
+}
+
+#[test]
+fn semantic_tokenizer_overrides_require_opt_in_and_valid_bounds_before_io() {
+    for (flag, above_maximum) in [("--max-tokenizer-input-bytes", "1048577"),
+        ("--max-tokenizer-output-tokens", "1048577"), ("--max-tokenizer-pair-checks", "67108865"),
+        ("--max-tokenizer-pair-bytes", "536870913")] {
+        let matches = crate::candidate_cli::definition().try_get_matches_from(argv(&[flag, "1"])).unwrap();
+        assert!(CandidateCommand::from_matches(&matches).is_err(), "{flag} must require compact opt-in");
+        for value in ["0", above_maximum] {
+            let matches = crate::candidate_cli::definition().try_get_matches_from(argv(&[
+                "--input-encoding", "safe-bpe-v1", flag, value])).unwrap();
+            if let Ok(command) = CandidateCommand::from_matches(&matches) {
+                let mut output = Vec::new();
+                assert_eq!(command.execute(&mut NoRead, &mut output), Err(CandidateError::Arguments), "{flag} {value}");
+                assert!(output.is_empty());
+            }
+        }
+    }
 }
 
 #[test]
@@ -172,8 +247,9 @@ fn arguments_debug_omits_private_paths_and_claim_options() {
 #[test]
 fn persistent_workers_are_explicit_and_do_not_change_semantic_budgets() {
     let (_, _, _, options) = fixture();
-    for width in ["1", "2", "4"] {
-        let command = command(&["--compute-threads", width]);
+    for (encoding, width) in ["byte-fallback", "safe-bpe-v1"].into_iter()
+        .flat_map(|encoding| ["1", "2", "4"].into_iter().map(move |width| (encoding, width))) {
+        let command = command(&["--compute-threads", width, "--input-encoding", encoding]);
         let Int4Task::Semantic(semantic) = command.task else { panic!("wrong semantic route"); };
         let args = command.args;
         let common = semantic.validate(&args).unwrap();
@@ -183,6 +259,9 @@ fn persistent_workers_are_explicit_and_do_not_change_semantic_budgets() {
         assert_eq!(semantic.extraction.budget(&args, admitted), semantic.extraction.budget(&args, common));
         assert_eq!(admitted.compute.workspace_bytes == 0, width == "1");
         assert!(admitted.prefill.is_none() && admitted.cohort.is_none());
+        assert!(args.input_encoding.is_default());
+        assert_eq!(matches!(semantic.input_encoding.policy().unwrap(), UntrustedEncoding::SafeBpeV1(_)),
+            encoding == "safe-bpe-v1");
     }
     for width in ["0", "65"] {
         assert_eq!(command(&["--compute-threads", width]).execute(&mut NoRead, &mut Vec::new()),

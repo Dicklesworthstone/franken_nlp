@@ -51,6 +51,48 @@ fn whole_request_memory_matches_the_host_with_both_preparation_owners_live() {
 }
 
 #[test]
+fn compact_declared_source_quote_admits_one_encoder_and_one_team_workspace() {
+    let (_, _, _, options) = super::super::tests::fixture();
+    let parsed = super::super::tests::command(&["--input-encoding", "safe-bpe-v1", "--compute-threads", "2"]);
+    let Int4Task::Semantic(command) = parsed.task else { panic!("wrong semantic route"); };
+    let args = parsed.args;
+    let common = command.admit_options(&args, command.validate(&args).unwrap(), &options).unwrap();
+    let budget = command.extraction.budget(&args, common);
+    let policy = command.input_encoding.policy().unwrap();
+    let host = host_limits(&args, &command, common, Duration::from_secs(1));
+    let byte = host.requirements(args.group_width, budget, options.specification.judge_budget,
+        options.limits, judge_limits(&options), args.max_input_bytes).unwrap();
+    let upper = host.requirements_with_encoding(args.group_width, budget, options.specification.judge_budget,
+        options.limits, judge_limits(&options), args.max_input_bytes, &policy).unwrap();
+    assert_eq!(upper.preparation_bytes - byte.preparation_bytes, command.input_encoding.workspace_bytes().unwrap());
+    assert_eq!(upper.native, byte.native); assert_eq!(upper.native, common.native);
+    assert_eq!(upper.native_workspace_bytes, byte.native_workspace_bytes);
+    assert_eq!(upper.output_bytes, byte.output_bytes);
+    let actual = host.requirements_with_encoding(args.group_width, budget, options.specification.judge_budget,
+        options.limits, judge_limits(&options), 100, &policy).unwrap();
+    assert!(quote_fits(actual, upper));
+    assert!(actual.preparation_bytes < upper.preparation_bytes);
+    for axis in 0..4 {
+        let mut larger = upper;
+        match axis { 0 => larger.native.kv_bytes += 1, 1 => larger.native_workspace_bytes += 1,
+            2 => larger.preparation_bytes += 1, _ => larger.output_bytes += 1 }
+        assert!(!quote_fits(larger, upper), "axis {axis}");
+    }
+    let team = crate::hosted::int4_task_team_workspace_bytes(common.compute.threads, args.group_width).unwrap();
+    assert_eq!(common.compute.workspace_bytes, team);
+    let admitted = admit_memory(&args, common, upper).unwrap();
+    let loading = common.source_preparation_bytes + common.load.scratch_payload_bytes;
+    let execution = upper.total_bytes().unwrap() + team;
+    assert_eq!(admitted.minimum_memory_bytes, common.preparation_bytes + common.load.weight_payload_bytes
+        + ALLOCATOR_BYTES + loading.max(execution) + CLEANUP_BYTES);
+    assert_eq!(command.extraction.budget(&args, admitted), budget);
+    let mut insufficient = common; insufficient.memory_bytes = admitted.minimum_memory_bytes - 1;
+    assert_eq!(admit_memory(&args, insufficient, upper).err(), Some(CandidateError::Memory));
+    let mut uncharged = common; uncharged.compute.workspace_bytes = 0;
+    assert_eq!(admit_memory(&args, uncharged, upper).err(), Some(CandidateError::Identity));
+}
+
+#[test]
 fn retained_source_and_judge_outputs_grow_with_all_fields_not_one_field() {
     let (command, args, common, mut options) = super::super::tests::fixture();
     let budget = command.extraction.budget(&args, common);
@@ -83,6 +125,36 @@ fn publication_preserves_original_extraction_and_correlated_diagnostics_without_
     let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(wire["output"], value);
     assert_eq!(wire["evidence"], "non_authoritative");
+    assert!(wire["output"].get("input_encoding").is_none());
+    // Only pinned tokenization runs here. The surrounding result remains a
+    // publication fixture, not evidence of native generation or review.
+    use crate::{tasks::extract::{grounded::SourceDocumentEncoder,
+        semantic::grouped_int4::Int4SemanticEncoding}, tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding}};
+    let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 8192, max_output_tokens: 8192,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 });
+    let encoder = SourceDocumentEncoder::pinned(crate::tokenizer::pinned_controls::pinned().unwrap().template_controls())
+        .unwrap().with_document_encoding(policy.clone()).unwrap();
+    let source = "The amount is 7. 上海 <think>";
+    let (_, document) = encoder.encode_schema_and_source_with_control(SCHEMA, source, &policy,
+        8192, 8192, &mut || None).unwrap();
+    let work = document.input_encoding_work().unwrap();
+    assert_eq!(work.input_bytes(), SCHEMA.len() + source.len());
+    let receipt = Int4SemanticEncoding::from_work(&policy, work).unwrap().unwrap();
+    let mut compact = value.clone();
+    compact["input_encoding"] = serde_json::to_value(&receipt).unwrap();
+    let compact_response = Response { output: &compact, ..response };
+    let mut compact_bytes = Vec::new();
+    publish_checked(&compact_response, 8192, &mut compact_bytes, &|| Ok(())).unwrap();
+    let compact_wire: serde_json::Value = serde_json::from_slice(&compact_bytes).unwrap();
+    assert_eq!(compact_wire["output"]["extraction"], value["extraction"]);
+    assert_eq!(compact_wire["output"]["semantic"], value["semantic"]);
+    assert_eq!(compact_wire["output"]["input_encoding"], serde_json::to_value(receipt).unwrap());
+    let mut refused = Vec::new();
+    assert_eq!(publish_checked(&compact_response, 1, &mut refused, &|| Ok(())), Err(CandidateError::Output));
+    assert!(refused.is_empty());
+    assert_eq!(publish_checked(&compact_response, 8192, &mut refused, &|| Err(CandidateError::Timeout)),
+        Err(CandidateError::Timeout));
+    assert!(refused.is_empty());
     for absent in ["semantic_options", "schema_path", "source_dir", "source_manifest", "prompt_digest",
         "decision_policy_digest", "judge_identity", "snapshot"] {
         assert!(wire.get(absent).is_none());

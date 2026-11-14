@@ -89,6 +89,21 @@ pub(super) fn document_definition(command: clap::Command) -> clap::Command {
             .help("Cumulative untrusted tokens produced during one complete document preparation; separate from per-chunk context, safe-bpe-v1 only, default and maximum 1048576"))
 }
 
+/// One immutable tokenizer policy covers the source task and every complete
+/// semantic review; native context and work limits remain separate ceilings.
+pub(super) fn semantic_definition(command: clap::Command) -> clap::Command {
+    document_definition(command)
+        .mut_arg("preparation_mib", |arg| arg
+            .default_value_if("input_encoding", clap::builder::ArgPredicate::Equals("safe-bpe-v1".into()), "1024")
+            .help("Preparation memory ceiling in MiB; defaults to 512 for byte input or 1024 for compact semantic review, including the admitted tokenizer workspace"))
+        .mut_arg("input_encoding", |arg| arg.help("Semantic input policy; safe-bpe-v1 shares one bounded tokenizer allowance across original task preparation and every review"))
+        .mut_arg("max_tokenizer_input_bytes", |arg| arg.help("Cumulative bytes encoded across the original source/schema/question and every semantic claim/evidence window; safe-bpe-v1 only, default and maximum 1048576"))
+        .mut_arg("max_tokenizer_output_tokens", |arg| arg.help("Cumulative untrusted tokens across the original task and all semantic review planning; separate from native context, safe-bpe-v1 only, default and maximum 1048576"))
+        .mut_arg("max_tokenizer_pair_checks", |arg| arg.help("Cumulative BPE pair-comparison cap across the original task and all semantic review planning; safe-bpe-v1 only, default 67108864"))
+        .mut_arg("max_tokenizer_pair_bytes", |arg| arg.help("Cumulative BPE examined-pair byte cap across the original task and all semantic review planning; safe-bpe-v1 only, default 536870912"))
+        .after_long_help("Compact semantic input: --input-encoding safe-bpe-v1 preserves exact untrusted bytes and excludes template-control tokens. ONE tokenizer allowance covers the original schema, source, question and passage metadata plus every review claim, full-source prompt and evidence window. All four tokenizer ceilings are cumulative; none reset between fields or statements. Every review must compile and preflight before review inference; tokenizer exhaustion returns no combined success. One transient encoder workspace is admitted before private document/model IO. Compact output.input_encoding records the exact policy and cumulative actual work; byte-default responses retain their existing shape. Source conversion, snapshot load/save and the admitted numerical team share this policy. This changes prompt tokens and makes no tokenizer-parity, identical-output, quality or measured-speed claim.")
+}
+
 impl DocumentInputEncodingArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let options = Self { encoding: InputEncodingArgs::from_matches(matches)?,

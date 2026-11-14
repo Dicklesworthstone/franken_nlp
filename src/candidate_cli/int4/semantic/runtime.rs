@@ -60,21 +60,28 @@ pub(super) fn execute(args: Int4Args, command: SemanticArgs, _admitted: Int4Limi
     remaining()?;
     let options = parse_options(&read_local(&command.semantic_options, OPTIONS_BYTES)?)?;
     let common = command.admit_options(&args, common, &options)?;
-    remaining()?;
-    let document = if args.input.as_os_str() == "-" { read_input(input, args.max_input_bytes)? }
-        else { read_local(&args.input, args.max_input_bytes)? };
-    remaining()?;
-    let schema = read_local(command.extraction.schema_path(), crate::candidate_cli::extract::SCHEMA_BYTES)?;
+    let encoding = command.input_encoding.policy()?;
     let budget = command.extraction.budget(&args, common);
-    let request = source_schema(&command, &options, schema, &document, budget)?;
-    let source_bytes = document.len();
     let planning = judge_limits(&options);
     let native_work = options.max_model_work;
     let semantic_limits = options.limits;
     let judge_budget = options.specification.judge_budget;
     let host = host_limits(&args, &command, common, remaining()?);
-    let quote = host.requirements(args.group_width, budget, judge_budget, semantic_limits, planning, source_bytes)
-        .map_err(|_| CandidateError::Memory)?;
+    // Admit the declared source ceiling and one encoder workspace before
+    // opening the private document/schema or touching model files.
+    let upper = host.requirements_with_encoding(args.group_width, budget, judge_budget,
+        semantic_limits, planning, args.max_input_bytes, &encoding).map_err(|_| CandidateError::Memory)?;
+    let common = admit_memory(&args, common, upper)?;
+    remaining()?;
+    let document = if args.input.as_os_str() == "-" { read_input(input, args.max_input_bytes)? }
+        else { read_local(&args.input, args.max_input_bytes)? };
+    remaining()?;
+    let schema = read_local(command.extraction.schema_path(), crate::candidate_cli::extract::SCHEMA_BYTES)?;
+    let request = source_schema(&command, &options, schema, &document, budget)?;
+    let source_bytes = document.len();
+    let quote = host.requirements_with_encoding(args.group_width, budget, judge_budget,
+        semantic_limits, planning, source_bytes, &encoding).map_err(|_| CandidateError::Memory)?;
+    if source_bytes > args.max_input_bytes || !quote_fits(quote, upper) { return Err(CandidateError::Identity); }
     let common = admit_memory(&args, common, quote)?;
     remaining()?;
     let cancellation = CancellationToken::default();
@@ -83,6 +90,7 @@ pub(super) fn execute(args: Int4Args, command: SemanticArgs, _admitted: Int4Limi
     let mut control = DeadlineControl { started, deadline };
     let compiler = Int4ExtractionBatchPlanner::for_model(model.model_identity(), budget,
         command.extraction.compiler(), command.extraction.source_limits(), None)
+        .and_then(|planner| planner.with_document_encoding(encoding.clone()))
         .map_err(|_| CandidateError::Planning)?;
     let extraction = compiler.prepare_with_control(BatchDocument {
         id: "cli".to_owned(), text: document, task_args: Some(request),
@@ -93,6 +101,7 @@ pub(super) fn execute(args: Int4Args, command: SemanticArgs, _admitted: Int4Limi
     extraction.verify_identity(extraction.execution_identity()).map_err(|_| CandidateError::Identity)?;
     drop(compiler);
     let judge = Int4JudgePlanner::for_model(model.model_identity(), judge_budget, planning)
+        .and_then(|planner| planner.with_document_encoding(encoding.clone()))
         .map_err(|error| error.cancellation().map(cancelled).unwrap_or(CandidateError::Planning))?;
     let prepared = PreparedInt4SemanticExtraction::new(extraction, judge, options, &mut control)
         .map_err(planning_error)?;
@@ -102,13 +111,13 @@ pub(super) fn execute(args: Int4Args, command: SemanticArgs, _admitted: Int4Limi
     remaining()?;
     // Actual sealed factory facts must reproduce the pre-model quote before
     // saving a snapshot. Dynamic field prompts only exist after extraction.
-    let actual = host.requirements(prepared.group_width(), prepared.extraction_budget(), prepared.judge_budget(),
-        prepared.semantic_limits(), prepared.judge_planning_limits(), prepared.source_bytes())
+    let actual = host.requirements_with_encoding(prepared.group_width(), prepared.extraction_budget(), prepared.judge_budget(),
+        prepared.semantic_limits(), prepared.judge_planning_limits(), prepared.source_bytes(), prepared.input_encoding())
         .map_err(|_| CandidateError::Memory)?;
     if prepared.group_width() != args.group_width || prepared.extraction_budget() != budget
         || prepared.judge_budget() != judge_budget || prepared.semantic_limits() != semantic_limits
         || prepared.source_bytes() != source_bytes || prepared.max_model_work() != native_work
-        || prepared.max_result_bytes() != common.result_bytes as u64
+        || prepared.input_encoding() != &encoding || prepared.max_result_bytes() != common.result_bytes as u64
         || actual.native != quote.native || actual.native_workspace_bytes != quote.native_workspace_bytes
         || actual.preparation_bytes != quote.preparation_bytes || actual.output_bytes != quote.output_bytes {
         return Err(CandidateError::Identity);
@@ -191,6 +200,10 @@ fn admit_memory(args: &Int4Args, mut common: Int4Limits, quote: Int4SemanticHost
         ALLOCATOR_BYTES, load.max(save).max(execute), CLEANUP_BYTES])?;
     if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Memory); }
     Ok(common)
+}
+fn quote_fits(actual: Int4SemanticHostRequirements, ceiling: Int4SemanticHostRequirements) -> bool {
+    actual.native == ceiling.native && actual.native_workspace_bytes <= ceiling.native_workspace_bytes
+        && actual.preparation_bytes <= ceiling.preparation_bytes && actual.output_bytes <= ceiling.output_bytes
 }
 fn fits(work: Int4Work, cap: Int4Work) -> bool {
     work.forward_positions <= cap.forward_positions && work.projected_logits <= cap.projected_logits

@@ -68,11 +68,72 @@ fnlp candidate source-int4 answer-semantic question.json \
 
 Both commands accept the existing task-specific `--options FILE`. Input may
 come from `-`; configuration files must be bounded local files. The snapshot
-and source-conversion routes use the same composition. The initial review
-route uses sequential full-vocabulary execution and byte-fallback input.
-Compute teams, packed prefill, selected output rows and Safe-BPE are not
-enabled on these composed commands. Ordinary source tasks, batches, maps,
-synthesis and jobs retain their own interfaces.
+and source-conversion routes use the same composition. Full-vocabulary review
+supports the serial route and one persistent numerical team selected with
+`--compute-threads N` (1 through 64). Byte fallback remains the default input
+policy. Add `--input-encoding safe-bpe-v1` to use bounded compact input across
+both stages. Ordinary source tasks, batches, maps, synthesis and jobs retain
+their own interfaces.
+
+## Compact input across generation and review
+
+`summarize-semantic`, `answer-semantic`, and `extract-semantic` accept the same
+explicit compact policy. It preserves exact source bytes and excludes
+privileged template-control tokens, including when control-looking strings
+appear in ordinary input. Original byte/scalar citation offsets remain tied
+to the original evidence. Questions and passage metadata do not become
+citation evidence.
+
+One tokenizer allowance covers the entire composition: the original document,
+extraction schema, or QA question and passage metadata, followed by every
+generated claim, repeated full-source prompt, and evidence window. The
+prepared task retains its actual initial work. Reviews continue those same
+counters and never receive a fresh allowance per field, statement, or head.
+
+| Flag | Default and maximum | Scope |
+| --- | ---: | --- |
+| `--max-tokenizer-input-bytes` | 1,048,576 | Cumulative untrusted bytes encoded across both stages |
+| `--max-tokenizer-output-tokens` | 1,048,576 | Cumulative untrusted tokens produced across both stages |
+| `--max-tokenizer-pair-checks` | 67,108,864 | Cumulative BPE pair comparisons |
+| `--max-tokenizer-pair-bytes` | 536,870,912 | Cumulative examined-pair bytes |
+
+These flags require `--input-encoding safe-bpe-v1`. They are distinct from
+original input size, per-head context capacity, and native model work. A source
+may fit the first generation while its complete set of reviews exceeds the
+remaining tokenizer allowance. All review plans must compile and preflight
+before any review forward; exhaustion yields no combined success result and
+does not trigger truncation, retry, or a different encoding policy.
+
+For example, add compact input and two persistent workers to a pinned-snapshot
+summary review:
+
+```bash
+fnlp candidate source-int4 summarize-semantic document.txt \
+  --snapshot nanbeige.int4.snapshot \
+  --expected-model-sha256 "$EXPECTED_MODEL_SHA256" \
+  --memory-mib 8192 --context-tokens 2048 \
+  --semantic-options source-semantic.json \
+  --input-encoding safe-bpe-v1 --compute-threads 2
+```
+
+One transient tokenizer workspace is included in the hosted preparation quote,
+independently of the number of statements. Worker workspace is additional.
+The CLI admits the declared input ceiling before opening private documents,
+schemas, task options or model files; actual prepared requirements must fit
+that ceiling. `--preparation-mib` defaults to 1,024 for compact semantic input
+and retains 512 for byte input. An explicit value is preserved and must cover
+the complete declared preparation requirement.
+
+Compact combined results add `output.input_encoding`, containing the exact
+`policy` and actual cumulative `work` (`input_bytes`, `output_tokens`,
+`pair_checks`, `pair_bytes`). Empty summaries, abstained answers and extractions
+with no reviewable fields still report their original preparation work.
+Byte-default results omit this field. Source conversion, snapshot loading,
+optional snapshot saving and persistent numerical teams use the same policy.
+
+Compact encoding changes the prompt token sequence. It does not establish
+identical model output, tokenizer parity, improved task quality, or a measured
+speedup. The same-model diagnostic limitations above continue to apply.
 
 ## Complete review options
 
@@ -158,10 +219,19 @@ that the subsequent semantic task completed.
 Library callers construct a native `PreparedInt4SourceTask` and pass it with
 the exact original `SourceTaskRequest`, an `Int4JudgePlanner`, and explicit
 options to `PreparedInt4SourceSemantic::new`. They then call
-`NlpEngine::execute_int4_semantic_source` with
-`Int4SourceSemanticHostLimits`. The shared `requirements` method supplies the
-modeled complete memory quote before execution. Prepared plans are sealed;
-caller-supplied result JSON cannot authorize the second stage.
+`NlpEngine::execute_int4_semantic_source`, or
+`NlpEngine::execute_int4_semantic_source_with_threads` for an admitted persistent
+team, with `Int4SourceSemanticHostLimits`. Configure both `SourceTaskPlanner`
+and `Int4JudgePlanner` with the same `with_document_encoding` policy before
+preparing compact input. The consuming composed constructor rejects any policy
+or tokenizer-limit mismatch before native generation.
+
+Use `requirements_with_encoding` to quote the complete memory requirement for
+that policy before execution; `requirements` preserves the byte-default quote.
+Prepared plans expose their sealed initial `input_encoding_work`, and completed
+results report the independently reconciled original-plus-review total.
+Prepared plans are sealed; caller-supplied result JSON cannot authorize the
+second stage.
 
 This implementation and its regression sources have undergone source review.
 Rust compilation, controller-run tests, real-model behavior, performance and
