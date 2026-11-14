@@ -238,7 +238,7 @@ fn real_cli_reuses_epochs_and_refuses_late_input_or_lifetime_mask_exhaustion() {
             cleanup_reserve_bytes: CLEANUP_BYTES }, CancellationToken::default()).unwrap();
     let (source, vocabulary) = crate::candidate_cli::int4::source::planner().unwrap();
     let source_identity = crate::candidate_cli::int4::source::identity(model.model_identity(), &source, BuiltInTask::Ner).unwrap();
-    let (resolver, resolution_identity) = crate::candidate_cli::int4::resolve::runtime::planner(model.model_identity()).unwrap();
+    let (resolver, resolution_identity) = crate::candidate_cli::int4::resolve::runtime::planner(model.model_identity(), None).unwrap();
     let config = Int4EntityCorpusHostConfig { source_identity, resolution_identity, task,
         transport: limits.transport, native: native(&args, Duration::from_secs(args.timeout_seconds)),
         preparation_reserve_bytes: limits.common.preparation_bytes,
@@ -331,7 +331,7 @@ fn persistent_entity_teams_match_all_three_scalar_apis_and_drain_before_delivery
             cleanup_reserve_bytes: CLEANUP_BYTES }, CancellationToken::default()).unwrap();
     let (source, vocabulary) = crate::candidate_cli::int4::source::planner().unwrap();
     let source_identity = crate::candidate_cli::int4::source::identity(model.model_identity(), &source, BuiltInTask::Ner).unwrap();
-    let (resolver, resolution_identity) = crate::candidate_cli::int4::resolve::runtime::planner(model.model_identity()).unwrap();
+    let (resolver, resolution_identity) = crate::candidate_cli::int4::resolve::runtime::planner(model.model_identity(), None).unwrap();
     let (source, resolver, vocabulary) = (Arc::new(source), Arc::new(resolver), Arc::new(vocabulary));
     let loaded = engine.resources().memory_snapshot();
     let assert_drained = || {

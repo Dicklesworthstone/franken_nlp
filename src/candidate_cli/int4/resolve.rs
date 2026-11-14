@@ -1,6 +1,10 @@
 //! Complete source-anchored INT4 entity resolution over an explicit snapshot.
 use super::*;
 use serde::Deserialize;
+#[cfg(feature = "asupersync-runtime")]
+use serde::Serialize;
+use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding};
+use super::source_map::encoding::EncodingLimits;
 use crate::{batch::BatchWork,
     corpus::entities_int4::cohort::Int4EntitySchedule,
     corpus::{resolve::{ResolutionDocument, ResolveOptions, ResolveLimits},
@@ -61,10 +65,34 @@ struct GraphArgs {
     graph_reserve_mib: u64,
 }
 
+/// Explicit cumulative preparation work. NER and pair scoring have separate
+/// ledgers because the complete pair graph is known only after discovery.
+#[derive(Args, Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct EncodingArgs {
+    #[arg(long)]
+    max_total_tokenizer_input_bytes: Option<u64>,
+    #[arg(long)]
+    max_total_tokenizer_output_tokens: Option<u64>,
+    #[arg(long)]
+    max_total_tokenizer_pair_checks: Option<u64>,
+    #[arg(long)]
+    max_total_tokenizer_pair_bytes: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ResolveArgs {
     scoring: classify::ScoringArgs, graph: GraphArgs, discovery: discovery::DiscoveryArgs,
-    cohorts: CohortArgs,
+    cohorts: CohortArgs, encoding: EncodingArgs,
+}
+
+#[cfg(feature = "asupersync-runtime")]
+#[derive(Serialize)]
+struct EncodingReport {
+    policy: UntrustedEncoding,
+    complete_phase_limits: SafeBpeWorkLimits,
+    resolution_budget_scope: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discovery_budget_scope: Option<&'static str>,
 }
 
 // Deliberately no Debug: original documents and mention surfaces are private.
@@ -85,9 +113,16 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("max_dot_products", |arg| arg.default_value("100000000000000"))
         .mut_arg("max_result_bytes", |arg| arg.help("Complete native resolution result; candidate provenance is additional"))
         .mut_arg("max_forward_positions", |arg| arg.help("Whole-snapshot native forward ceiling, shared by all discovery chunks, pairs and both presentation orders")));
-    compute::definition(CohortArgs::augment_args(discovery::DiscoveryArgs::augment_args(command)))
+    input_encoding::definition(EncodingArgs::augment_args(compute::definition(
+        CohortArgs::augment_args(discovery::DiscoveryArgs::augment_args(command)))))
+        .mut_arg("max_tokenizer_pair_checks", |arg| arg.help("Safe-BPE pair checks per encoded mention record or source segment"))
+        .mut_arg("max_tokenizer_pair_bytes", |arg| arg.help("Safe-BPE pair bytes per encoded mention record or source segment"))
+        .mut_arg("max_total_tokenizer_input_bytes", |arg| arg.help("Cumulative input bytes per complete NER snapshot operation or complete pair-graph operation; safe-bpe-v1 only"))
+        .mut_arg("max_total_tokenizer_output_tokens", |arg| arg.help("Cumulative encoded tokens per complete NER snapshot operation or complete pair-graph operation; separate from native context"))
+        .mut_arg("max_total_tokenizer_pair_checks", |arg| arg.help("Cumulative Safe-BPE pair checks per complete NER snapshot operation or pair-graph operation"))
+        .mut_arg("max_total_tokenizer_pair_bytes", |arg| arg.help("Cumulative Safe-BPE examined bytes per complete NER snapshot operation or pair-graph operation"))
         .mut_arg("compute_threads", |arg| arg.help("Coordinator plus persistent INT4 row workers, 1..=64; 1 is serial. One team covers every NER chunk, candidate pair and both presentation orders; resolve-corpus reuses it across all flush epochs. Cannot combine with --cohort-pairs or --cohort-chunks. Worker scratch is admitted before IO"))
-        .after_long_help("Native cohorts are explicit and independently selected. --cohort-pairs N executes both presentation orders of up to N complete pairs together (1..=32 pairs, at most 64 heads). --cohort-chunks N executes up to N independent NER discovery chunks together (1..=64); it requires --discover-entities and also applies to unchunked documents. All original sources and the complete pair graph retain their existing semantics. Every window drains before a dependent phase starts. The requested schedule admits its complete native phase peak and simultaneous preparation without enlarging any task's context or replenishing native, mask or grounding budgets. Physical cohort counters are separate from the semantic result. No measured speedup or model parity is implied.")
+        .after_long_help("Native cohorts are explicit and independently selected. --cohort-pairs N executes both presentation orders of up to N complete pairs together (1..=32 pairs, at most 64 heads). --cohort-chunks N executes up to N independent NER discovery chunks together (1..=64); it requires --discover-entities and also applies to unchunked documents. All original sources and the complete pair graph retain their existing semantics. Every window drains before a dependent phase starts. The requested schedule admits its complete native phase peak and simultaneous preparation without enlarging any task's context or replenishing native, mask or grounding budgets. Physical cohort counters are separate from the semantic result. No measured speedup or model parity is implied.\n\n--input-encoding safe-bpe-v1 preserves the exact original source and serialized mention-record bytes while excluding template-control tokens. It supports supplied mentions, NER discovery, original-document chunking, native cohorts and persistent row teams. Per-call byte/token ceilings are min(--max-input-bytes, 1048576). --max-total-tokenizer-input-bytes and --max-total-tokenizer-output-tokens default to eight times --max-input-bytes; total pair checks default to 268435456 and examined pair bytes to 4294967296. One NER ledger covers the complete snapshot's sizing probes, retained plans and execution reconstruction. Pair scoring separately uses one ledger across every pair, preliminary preflight and hosted reconstruction, and reuses encoded records for reverse presentation. Neither a pair, presentation order nor host boundary renews its allowance. These are complete snapshot phase budgets, not lifetime corpus tokenizer counters. Corpus flush starts a new snapshot with the same fixed ceilings. Every workspace is admitted before private input/model IO. Exhaustion rejects without byte fallback, context truncation or partial graph publication. Compact policy and every ceiling bind execution identity and are reported in provenance; different input tokens may change model output and imply no quality, parity or speed claim.")
 }
 impl ResolveArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
@@ -97,18 +132,22 @@ impl ResolveArgs {
         }
         Ok(Self { scoring: classify::ScoringArgs::from_matches(matches)?, graph: GraphArgs::from_arg_matches(matches)?,
             discovery: discovery::DiscoveryArgs::from_arg_matches(matches)?,
-            cohorts: CohortArgs::from_arg_matches(matches)? })
+            cohorts: CohortArgs::from_arg_matches(matches)?, encoding: EncodingArgs::from_arg_matches(matches)? })
     }
     pub(super) fn validate(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
         self.cohorts.validate(self.discovery.discover_entities)?;
         // Numerical row teams retain serial prompt/task order. They do not
         // enable prefill or compose with independent native cohort schedules.
         if args.prefill()?.is_some() || self.scoring.cohort_head_limit().is_some()
-            || !args.input_encoding.is_default()
             || (args.compute.threads() != 1 && self.cohorts.enabled()) {
             return Err(CandidateError::Arguments);
         }
-        let mut limits = self.scoring.validate_one_off_with_prefill(args)?;
+        let encoding_bytes = self.encoding_workspace_bytes(args)?;
+        // The shared score quote prices retained prompts, not a single-call
+        // text encoder. Entity phases admit their own cumulative workspaces.
+        let mut storage = args.clone();
+        storage.input_encoding = input_encoding::InputEncodingArgs::default();
+        let mut limits = self.scoring.validate_one_off_with_prefill(&storage)?;
         let g = self.graph;
         if self.scoring.budget(limits).max_output_tokens != 2
             || !(1..=4096).contains(&g.max_documents) || !(1..=16_384).contains(&g.max_mentions)
@@ -128,13 +167,51 @@ impl ResolveArgs {
         // and complete graph until physical completion. This is a conservative
         // declared reservation quote, not an OS RSS estimate.
         limits.minimum_memory_bytes = sum(&[limits.minimum_memory_bytes, limits.preparation_bytes,
-            graph_bytes, self.host_input_bytes(args)?, self.discovery.temporary_bytes(limits, self.graph.max_documents)?])?;
+            graph_bytes, self.host_input_bytes(args)?, self.discovery.temporary_bytes(limits, self.graph.max_documents)?,
+            encoding_bytes, encoding_bytes])?;
         #[cfg(feature = "asupersync-runtime")]
         if self.cohorts.enabled() {
             limits.minimum_memory_bytes = limits.minimum_memory_bytes.max(runtime::cohort_memory_floor(self, args, limits)?);
         }
         if limits.minimum_memory_bytes > limits.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(limits)
+    }
+    fn encoding_limits(self, args: &Int4Args) -> Result<Option<EncodingLimits>, CandidateError> {
+        if args.input_encoding.is_default() {
+            return if self.encoding == EncodingArgs::default() { Ok(None) } else { Err(CandidateError::Arguments) };
+        }
+        // Counting probes must be able to encode a candidate before the
+        // lossless chunker shrinks it. Actual prompts independently obey KV.
+        let bytes = args.max_input_bytes.min(SafeBpeLimits::MAX_INPUT_BYTES);
+        let UntrustedEncoding::SafeBpeV1(call) = args.input_encoding.policy(bytes, bytes)?
+            else { return Err(CandidateError::Arguments); };
+        let default_work = u64::try_from(args.max_input_bytes).ok()
+            .and_then(|bytes| bytes.checked_mul(8)).ok_or(CandidateError::Arguments)?;
+        let complete = SafeBpeWorkLimits {
+            max_input_bytes: self.encoding.max_total_tokenizer_input_bytes.unwrap_or(default_work),
+            max_output_tokens: self.encoding.max_total_tokenizer_output_tokens.unwrap_or(default_work),
+            max_pair_checks: self.encoding.max_total_tokenizer_pair_checks.unwrap_or(268_435_456),
+            max_pair_bytes: self.encoding.max_total_tokenizer_pair_bytes.unwrap_or(4_294_967_296),
+        };
+        complete.validate().map_err(|_| CandidateError::Arguments)?;
+        Ok(Some(EncodingLimits { call, complete }))
+    }
+    fn encoding_workspace_bytes(self, args: &Int4Args) -> Result<u64, CandidateError> {
+        let Some(limits) = self.encoding_limits(args)? else { return Ok(0); };
+        let resolution = limits.workspace_bytes()?;
+        // Keep both phase reservations even though their tokenization is
+        // sequential. Each operation owns its private nonrenewable ledger.
+        let source = if self.discovery.discover_entities { limits.workspace_bytes()? } else { 0 };
+        sum(&[resolution, source])
+    }
+    #[cfg(feature = "asupersync-runtime")]
+    fn encoding_report(self, args: &Int4Args) -> Result<Option<EncodingReport>, CandidateError> {
+        Ok(self.encoding_limits(args)?.map(|limits| EncodingReport {
+            policy: limits.policy(), complete_phase_limits: limits.complete,
+            resolution_budget_scope: "complete_snapshot_pair_preflight_and_reconstruction",
+            discovery_budget_scope: self.discovery.discover_entities
+                .then_some("complete_snapshot_discovery_and_reconstruction"),
+        }))
     }
     fn graph_bytes(self) -> Result<u64, CandidateError> { mib(self.graph.graph_reserve_mib) }
     fn host_input_bytes(self, args: &Int4Args) -> Result<u64, CandidateError> {

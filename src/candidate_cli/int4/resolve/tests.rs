@@ -374,3 +374,81 @@ fn unsupported_row_teams_and_native_cohort_combinations_refuse_before_any_io() {
     let raw = command(&["--discover-entities", "--chunked", "--compute-threads", "3"]);
     assert_eq!(options(&raw).validate(&raw.args).unwrap().compute.threads, 3);
 }
+
+#[test]
+fn compact_resolution_prices_both_preparation_owners_and_preserves_native_authority() {
+    let ordinary = command(&[]);
+    let byte_options = options(&ordinary);
+    let byte = byte_options.validate(&ordinary.args).unwrap();
+    assert!(byte_options.encoding_limits(&ordinary.args).unwrap().is_none());
+    assert_eq!(byte_options.encoding_workspace_bytes(&ordinary.args).unwrap(), 0);
+
+    let mut compact = command(&["--input-encoding", "safe-bpe-v1"]);
+    let selected = options(&compact);
+    let encoding = selected.encoding_limits(&compact.args).unwrap().unwrap();
+    assert_eq!(encoding.call.max_input_bytes, compact.args.max_input_bytes);
+    assert_eq!(encoding.call.max_output_tokens, compact.args.max_input_bytes);
+    assert_eq!(encoding.complete.max_input_bytes, compact.args.max_input_bytes as u64 * 8);
+    assert_eq!(encoding.complete.max_output_tokens, compact.args.max_input_bytes as u64 * 8);
+    let workspace = encoding.workspace_bytes().unwrap();
+    assert_eq!(selected.encoding_workspace_bytes(&compact.args).unwrap(), workspace);
+    let limits = selected.validate(&compact.args).unwrap();
+    assert_eq!(limits.minimum_memory_bytes, byte.minimum_memory_bytes + 2 * workspace);
+    assert_eq!(limits.native.kv_bytes, byte.native.kv_bytes);
+    assert_eq!(selected.scoring.work_ceiling(), byte_options.scoring.work_ceiling());
+    assert_eq!(selected.scoring_limits(&compact.args, limits).planning.max_pairs,
+        byte_options.scoring_limits(&ordinary.args, byte).planning.max_pairs);
+
+    compact.args.memory_mib = (limits.minimum_memory_bytes - 1) / MIB;
+    let mut output = Vec::new();
+    assert_eq!(compact.execute(&mut NoRead, &mut output), Err(CandidateError::Arguments));
+    assert!(output.is_empty());
+}
+
+#[test]
+fn compact_discovery_admits_separate_ner_and_pair_workspaces_for_every_schedule() {
+    for schedule in [vec![], vec!["--compute-threads", "3"],
+        vec!["--cohort-chunks", "2", "--cohort-pairs", "2"]] {
+        let mut flags = vec!["--discover-entities", "--chunked"];
+        flags.extend(schedule);
+        let ordinary = command(&flags);
+        let baseline = options(&ordinary).validate(&ordinary.args).unwrap();
+        flags.extend(["--input-encoding", "safe-bpe-v1"]);
+        let compact = command(&flags);
+        let selected = options(&compact);
+        let encoding = selected.encoding_limits(&compact.args).unwrap().unwrap();
+        let expected = 2 * encoding.workspace_bytes().unwrap();
+        assert_eq!(selected.encoding_workspace_bytes(&compact.args).unwrap(), expected);
+        let actual = selected.validate(&compact.args).unwrap();
+        assert_eq!(actual.minimum_memory_bytes, baseline.minimum_memory_bytes + 2 * expected);
+        assert_eq!(actual.native.kv_bytes, baseline.native.kv_bytes);
+        assert_eq!(selected.scoring.work_ceiling(), options(&ordinary).scoring.work_ceiling());
+        assert_eq!(selected.discovery, options(&ordinary).discovery);
+    }
+}
+
+#[test]
+fn compact_phase_limits_refuse_without_opt_in_or_before_private_io_when_invalid() {
+    for flag in ["--max-total-tokenizer-input-bytes", "--max-total-tokenizer-output-tokens",
+        "--max-total-tokenizer-pair-checks", "--max-total-tokenizer-pair-bytes"] {
+        let mut output = Vec::new();
+        assert_eq!(command(&[flag, "1"]).execute(&mut NoRead, &mut output), Err(CandidateError::Arguments));
+        assert_eq!(command(&["--input-encoding", "safe-bpe-v1", flag, "0"])
+            .execute(&mut NoRead, &mut output), Err(CandidateError::Arguments));
+        assert_eq!(command(&["--input-encoding", "safe-bpe-v1", flag, "18446744073709551615"])
+            .execute(&mut NoRead, &mut output), Err(CandidateError::Arguments));
+        assert!(output.is_empty());
+    }
+    for flag in ["--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
+        assert!(parsed(&["--source-dir", "s", "--source-manifest", "m", flag, "1"]).is_err());
+        assert_eq!(command(&["--input-encoding", "safe-bpe-v1", flag, "0"])
+            .execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+    }
+    let compact = command(&["--input-encoding", "safe-bpe-v1",
+        "--max-total-tokenizer-input-bytes", "500000", "--max-total-tokenizer-output-tokens", "300000",
+        "--max-total-tokenizer-pair-checks", "1000000", "--max-total-tokenizer-pair-bytes", "10000000"]);
+    let limits = options(&compact).encoding_limits(&compact.args).unwrap().unwrap();
+    assert_eq!(limits.complete, SafeBpeWorkLimits { max_input_bytes: 500000, max_output_tokens: 300000,
+        max_pair_checks: 1000000, max_pair_bytes: 10000000 });
+    options(&compact).validate(&compact.args).unwrap();
+}

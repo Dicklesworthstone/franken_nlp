@@ -237,3 +237,49 @@ fn invalid_corpus_teams_and_cohort_combinations_refuse_before_policy_model_and_s
         assert_eq!(command.execute_owned(args, NoIo, NoIo).err().unwrap().exit, ErrorCode::Usage);
     }
 }
+
+#[test]
+fn compact_corpus_policy_and_workspace_are_per_epoch_without_renewing_native_work() {
+    let (ordinary, ordinary_args) = args(&["--chunked"]);
+    let byte = ordinary.validate(&ordinary_args).unwrap();
+    let (compact, mut compact_args) = args(&["--chunked", "--input-encoding", "safe-bpe-v1"]);
+    let encoding = compact.resolution.encoding_limits(&compact_args).unwrap().unwrap();
+    assert_eq!(encoding.call.max_input_bytes, SafeBpeLimits::MAX_INPUT_BYTES);
+    assert_eq!(encoding.call.max_output_tokens, SafeBpeLimits::MAX_OUTPUT_TOKENS);
+    assert_eq!(encoding.complete.max_input_bytes, compact_args.max_input_bytes as u64 * 8);
+    let workspace = 2 * encoding.workspace_bytes().unwrap();
+    assert_eq!(compact.resolution.encoding_workspace_bytes(&compact_args).unwrap(), workspace);
+    let actual = compact.validate(&compact_args).unwrap();
+    assert_eq!(actual.common.minimum_memory_bytes, byte.common.minimum_memory_bytes + workspace * 2);
+    assert_eq!(actual.common.native.kv_bytes, byte.common.native.kv_bytes);
+    assert_eq!(compact.resolution.scoring.work_ceiling(), ordinary.resolution.scoring.work_ceiling());
+    assert_eq!(actual.transport.max_input_bytes, byte.transport.max_input_bytes);
+    assert_eq!(actual.transport.max_records, byte.transport.max_records);
+    let (single, single_args) = args(&["--chunked", "--input-encoding", "safe-bpe-v1", "--max-snapshots", "1"]);
+    assert_eq!(single.resolution.encoding_limits(&single_args).unwrap(), Some(encoding));
+
+    compact_args.memory_mib = (actual.common.minimum_memory_bytes - 1) / MIB;
+    assert!(compact.validate(&compact_args).is_err());
+    assert!(compact.execute_owned(compact_args, NoIo, NoIo).is_err());
+}
+
+#[test]
+fn compact_corpus_invalid_phase_limits_refuse_before_fixed_policy_or_stream_io() {
+    for flags in [
+        vec!["--max-total-tokenizer-input-bytes", "1"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-input-bytes", "0"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-output-tokens", "0"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-pair-checks", "0"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-pair-bytes", "0"],
+    ] {
+        let (command, common) = args(&flags);
+        assert!(command.validate(&common).is_err());
+        assert!(command.execute_owned(common, NoIo, NoIo).is_err());
+    }
+    for flags in [vec!["--compute-threads", "3"], vec!["--cohort-chunks", "2", "--cohort-pairs", "2"]] {
+        let mut compact = vec!["--chunked", "--input-encoding", "safe-bpe-v1"];
+        compact.extend(flags);
+        let (command, common) = args(&compact);
+        command.validate(&common).unwrap();
+    }
+}

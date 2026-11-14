@@ -33,8 +33,10 @@ pub(super) fn memory_floor(args: &Int4Args, command: &CorpusArgs, common: Int4Li
         .map_err(host_failure)?;
     // Resident model allocation and the caller's policy/planner preparation
     // coexist with every host-owned parser, graph, output and native claim.
+    let encoding_bytes = command.resolution.encoding_workspace_bytes(args).map_err(candidate_failure)?;
     sum(&[common.load.weight_payload_bytes, ALLOCATOR_BYTES, common.preparation_bytes,
-        requirement.total_bytes().map_err(host_failure)?, common.compute.workspace_bytes]).map_err(candidate_failure)
+        requirement.total_bytes().map_err(host_failure)?, common.compute.workspace_bytes,
+        encoding_bytes, encoding_bytes]).map_err(candidate_failure)
 }
 
 pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
@@ -43,13 +45,16 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let started = Instant::now();
     let limits = command.validate(&args)?;
     let common = limits.common;
+    let encoding = command.resolution.encoding_limits(&args).map_err(candidate_failure)?;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or_else(|| cancelled(DecodeCancellationKind::Deadline));
     let engine = NlpEngine::builder().resource_config(compute::resource_config(common))
         .build().map_err(|_| candidate_failure(CandidateError::Runtime))?;
     let lease = engine.resources().acquire_lease();
-    let _preparation = lease.reserve(MemoryClass::JobBuffers, common.preparation_bytes)
+    let preparation_bytes = sum(&[common.preparation_bytes,
+        command.resolution.encoding_workspace_bytes(&args).map_err(candidate_failure)?]).map_err(candidate_failure)?;
+    let _preparation = lease.reserve(MemoryClass::JobBuffers, preparation_bytes)
         .map_err(|_| candidate_failure(CandidateError::Memory))?.commit()
         .map_err(|_| candidate_failure(CandidateError::Memory))?;
     remaining()?;
@@ -68,6 +73,11 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     }
     remaining()?;
     let (source, vocabulary) = crate::candidate_cli::int4::source::planner().map_err(candidate_failure)?;
+    let source = match encoding {
+        Some(limits) => source.with_map_document_encoding(limits.policy(), limits.complete)
+            .map_err(|_| candidate_failure(CandidateError::Planning))?,
+        None => source,
+    };
     remaining()?;
     let cancellation = CancellationToken::default();
     let model = crate::candidate_cli::int4::runtime::load_model_with_failure(&engine, &args, common,
@@ -75,8 +85,8 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     remaining()?;
     let source_identity = crate::candidate_cli::int4::source::identity(model.model_identity(), &source,
         BuiltInTask::Ner).map_err(candidate_failure)?;
-    let (resolver, resolution_identity) = crate::candidate_cli::int4::resolve::runtime::planner(model.model_identity())
-        .map_err(candidate_failure)?;
+    let (resolver, resolution_identity) = crate::candidate_cli::int4::resolve::runtime::planner(
+        model.model_identity(), encoding).map_err(candidate_failure)?;
     let (source, resolver, vocabulary) = (Arc::new(source), Arc::new(resolver), Arc::new(vocabulary));
     // Authenticate the fixed recipe against the actual loaded model, including
     // the empty-epoch policy, before optional snapshot publication or corpus IO.

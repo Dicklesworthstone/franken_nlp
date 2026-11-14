@@ -52,8 +52,9 @@ fn complete_cohort_memory_floor(command: ResolveArgs, args: &Int4Args, limits: I
     // The host quote owns its planners, graph, simultaneous native preparation,
     // complete phase peak and result. The CLI's source and serialization owner
     // remains separate, as do the moved original document capacities.
+    let encoding_bytes = command.encoding_workspace_bytes(args)?;
     sum(&[limits.load.weight_payload_bytes, ALLOCATOR_BYTES, limits.preparation_bytes,
-        command.host_input_bytes(args)?, host_bytes])
+        command.host_input_bytes(args)?, host_bytes, encoding_bytes, encoding_bytes])
 }
 
 struct DeadlineControl { started: Instant, deadline: Duration }
@@ -103,13 +104,19 @@ fn execution_error(error: HostedError) -> CandidateError {
         _ => CandidateError::Execution,
     }
 }
-pub(in crate::candidate_cli::int4::resolve) fn planner(model: &Int4ModelIdentity) -> Result<(ResolutionPlanner, ExecutionIdentity), CandidateError> {
+pub(in crate::candidate_cli::int4::resolve) fn planner(model: &Int4ModelIdentity,
+    encoding: Option<EncodingLimits>) -> Result<(ResolutionPlanner, ExecutionIdentity), CandidateError> {
     let registry = crate::tokenizer::pinned_controls::pinned().map_err(|_| CandidateError::Identity)?;
     let controls = registry.template_controls();
     let mut ends = controls.entries().iter().filter(|entry| entry.special && entry.surface == crate::template::IM_END);
     let eos = ends.next().ok_or(CandidateError::Identity)?.id;
     if ends.next().is_some() { return Err(CandidateError::Identity); }
     let planner = ResolutionPlanner::pinned(controls, eos).map_err(|_| CandidateError::Planning)?;
+    let planner = match encoding {
+        Some(limits) => planner.with_document_encoding(limits.policy(), limits.complete)
+            .map_err(|_| CandidateError::Planning)?,
+        None => planner,
+    };
     let absent = Sha256Digest::of_bytes(b"null");
     // The binder replaces every unbound model field from authenticated loaded
     // weights. The shared compiler binds both prompt orders and policy per pair.
@@ -154,7 +161,8 @@ pub(super) fn execute(args: Int4Args, command: ResolveArgs, _admitted: Int4Limit
     let engine = NlpEngine::builder().resource_config(compute::resource_config(limits))
         .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
-    let _preparation = lease.reserve(MemoryClass::JobBuffers, limits.preparation_bytes)
+    let preparation_bytes = sum(&[limits.preparation_bytes, command.encoding_workspace_bytes(&args)?])?;
+    let _preparation = lease.reserve(MemoryClass::JobBuffers, preparation_bytes)
         .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
     remaining()?;
     let text = if args.input.as_os_str() == "-" { read_input(input, args.max_input_bytes)? }
@@ -173,7 +181,7 @@ pub(super) fn execute(args: Int4Args, command: ResolveArgs, _admitted: Int4Limit
     let cancellation = CancellationToken::default();
     let model = super::super::runtime::load_model(&engine, &args, limits, remaining()?, cancellation.clone())?;
     remaining()?;
-    let (planner, identity) = planner(model.model_identity())?;
+    let (planner, identity) = planner(model.model_identity(), command.encoding_limits(&args)?)?;
     let scoring = command.scoring_limits(&args, limits);
     let prepared = planner.prepare_int4(&graph, &identity, scoring, model.model_identity(),
         &mut DeadlineControl { started, deadline }).map_err(planning_error)?;
@@ -209,6 +217,7 @@ pub(super) fn execute(args: Int4Args, command: ResolveArgs, _admitted: Int4Limit
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: limits.kernel.kind().id(), snapshot,
         cohort_pairs: command.cohorts.cohort_pairs, cohort_chunks: command.cohorts.cohort_chunks,
+        input_encoding: command.encoding_report(&args)?,
     };
     // Keep both the host result guard and CLI staging owner through write AND
     // flush. The full result is staged before the first external byte.
@@ -268,6 +277,8 @@ struct Provenance<'a> {
     cohort_pairs: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cohort_chunks: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<EncodingReport>,
 }
 #[derive(Serialize)]
 struct Response<'a, 'b, T: Serialize> {

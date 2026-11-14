@@ -110,7 +110,7 @@ fn completed_publication_keeps_cluster_data_and_hides_private_provenance() {
         model_id: "Nanbeige4.2-3B", source_revision: "fixture", source_root_sha256: "model-source-root",
         model_content_sha256: "model-content", candidate_format: "candidate-format", quant_recipe: "candidate:group=128",
         group_width: 128, integer_kernel: "s_scalar_i32", snapshot: None,
-        cohort_pairs: None, cohort_chunks: None };
+        cohort_pairs: None, cohort_chunks: None, input_encoding: None };
     let response = Response { provenance: &provenance, output: &result };
     let mut bytes = Vec::new(); publish(&response, 4096, &mut bytes).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -130,7 +130,7 @@ fn cohort_provenance_reports_only_explicit_physical_schedule() {
         model_id: "Nanbeige4.2-3B", source_revision: "fixture", source_root_sha256: "source-root",
         model_content_sha256: "model-content", candidate_format: "candidate-format", quant_recipe: "group=128",
         group_width: 128, integer_kernel: "s_scalar_i32", snapshot: None,
-        cohort_pairs: Some(3), cohort_chunks: None };
+        cohort_pairs: Some(3), cohort_chunks: None, input_encoding: None };
     let value = serde_json::to_value(&provenance).unwrap();
     assert_eq!(value["cohort_pairs"], 3);
     assert!(value.get("cohort_chunks").is_none());
@@ -198,7 +198,7 @@ fn row_team_receipt_is_physical_and_keeps_the_unchanged_complete_resolution_outp
         model_id: "Nanbeige4.2-3B", source_revision: "fixture", source_root_sha256: "source-root",
         model_content_sha256: "model-content", candidate_format: "candidate-format", quant_recipe: "group=32",
         group_width: 32, integer_kernel: "s_scalar_i32", snapshot: None,
-        cohort_pairs: None, cohort_chunks: None };
+        cohort_pairs: None, cohort_chunks: None, input_encoding: None };
     let response = Response { provenance: &provenance, output: &result };
     let scalar = serde_json::to_value(&response).unwrap();
     // Zero-work receipt is a wire fixture; it makes no neural-execution claim.
@@ -211,4 +211,37 @@ fn row_team_receipt_is_physical_and_keeps_the_unchanged_complete_resolution_outp
     assert_eq!(actual.as_object_mut().unwrap().remove("compute"), Some(serde_json::to_value(compute).unwrap()));
     assert_eq!(actual, scalar);
     assert_eq!(serde_json::to_value(compute::Response { response: &response, compute: None }).unwrap(), scalar);
+}
+
+#[test]
+fn compact_provenance_names_phase_limits_without_claiming_factory_work() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding};
+    let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 4096, max_output_tokens: 4096,
+        max_pair_checks: 1024, max_pair_bytes: 16_384,
+    });
+    let complete = SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 8192, max_pair_bytes: 131_072 };
+    let mut provenance = Provenance { protocol: "fnlp-candidate-int4-entities-v1", schema_version: 1,
+        scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "resolve",
+        model_id: "Nanbeige4.2-3B", source_revision: "fixture", source_root_sha256: "source-root",
+        model_content_sha256: "model-content", candidate_format: "candidate-format", quant_recipe: "group=32",
+        group_width: 32, integer_kernel: "s_scalar_i32", snapshot: None,
+        cohort_pairs: None, cohort_chunks: None, input_encoding: None };
+    let default = serde_json::to_value(&provenance).unwrap();
+    assert!(default.get("input_encoding").is_none());
+    provenance.input_encoding = Some(EncodingReport { policy: policy.clone(),
+        complete_phase_limits: complete, resolution_budget_scope: "complete_snapshot_pair_preflight_and_reconstruction",
+        discovery_budget_scope: Some("complete_snapshot_discovery_and_reconstruction") });
+    let encoded = serde_json::to_value(&provenance).unwrap();
+    assert_eq!(encoded["input_encoding"]["policy"], serde_json::to_value(policy).unwrap());
+    assert_eq!(encoded["input_encoding"]["complete_phase_limits"], serde_json::to_value(complete).unwrap());
+    assert_eq!(encoded["input_encoding"]["resolution_budget_scope"], "complete_snapshot_pair_preflight_and_reconstruction");
+    assert_eq!(encoded["input_encoding"]["discovery_budget_scope"], "complete_snapshot_discovery_and_reconstruction");
+    for absent in ["work_used", "documents", "text", "prompt", "surface", "snapshot_path"] {
+        assert!(encoded["input_encoding"].get(absent).is_none());
+    }
+    let mut without_policy = encoded;
+    without_policy.as_object_mut().unwrap().remove("input_encoding");
+    assert_eq!(without_policy, default);
 }

@@ -93,7 +93,8 @@ pub(super) fn execute(args: Int4Args, command: ResolveArgs,
     let engine = NlpEngine::builder().resource_config(compute::resource_config(limits))
         .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
-    let _preparation = lease.reserve(MemoryClass::JobBuffers, limits.preparation_bytes)
+    let preparation_bytes = sum(&[limits.preparation_bytes, command.encoding_workspace_bytes(&args)?])?;
+    let _preparation = lease.reserve(MemoryClass::JobBuffers, preparation_bytes)
         .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
     remaining()?;
     let text = if args.input.as_os_str() == "-" { read_input(input, args.max_input_bytes)? }
@@ -112,9 +113,15 @@ pub(super) fn execute(args: Int4Args, command: ResolveArgs,
     let model = crate::candidate_cli::int4::runtime::load_model(&engine, &args, limits,
         remaining()?, cancellation.clone())?;
     remaining()?;
+    let encoding = command.encoding_limits(&args)?;
     let (source, vocabulary) = source_cli::planner()?;
+    let source = match encoding {
+        Some(limits) => source.with_map_document_encoding(limits.policy(), limits.complete)
+            .map_err(|_| CandidateError::Planning)?,
+        None => source,
+    };
     let source_identity = source_cli::identity(model.model_identity(), &source, BuiltInTask::Ner)?;
-    let (resolver, resolution_identity) = super::planner(model.model_identity())?;
+    let (resolver, resolution_identity) = super::planner(model.model_identity(), encoding)?;
     let prepared = prepare_int4_entities(raw.documents, Arc::new(source), source_identity,
         Arc::new(resolver), resolution_identity.clone(), config, model.model_identity(),
         &mut DeadlineControl { started, deadline }).map_err(planning_error)?;
@@ -143,7 +150,8 @@ pub(super) fn execute(args: Int4Args, command: ResolveArgs,
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &resolution_identity.artifact_format, quant_recipe: &resolution_identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: limits.kernel.kind().id(), snapshot,
-        cohort_pairs: command.cohorts.cohort_pairs, cohort_chunks: command.cohorts.cohort_chunks };
+        cohort_pairs: command.cohorts.cohort_pairs, cohort_chunks: command.cohorts.cohort_chunks,
+        input_encoding: command.encoding_report(&args)? };
     let native = native_limits(&args, remaining()?);
     let cap = command.cohorts.output_cap(limits.result_bytes)?;
     if command.cohorts.enabled() {
