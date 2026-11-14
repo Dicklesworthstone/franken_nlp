@@ -9,7 +9,7 @@ use crate::{
         lmhead::scoring::ProjectionRows, portable_int8::ProjectionWork,
         strict_int4::{Int4ModelIdentity, weights::projection_fixture, STRICT_INT4_EXECUTION}},
     tasks::{ir::PromptSegment, judge::{JudgeError, JudgeLogits, JudgePlanner, PreparedJudge}},
-    tokenizer::pinned_controls,
+    tokenizer::{pinned_controls, untrusted::SafeBpeLimits},
     validation::{SourceSpan, validate_source_span},
 };
 
@@ -60,11 +60,14 @@ fn options() -> Int4SourceSemanticOptions {
         judge_budget: budget(), limits: SourceSemanticLimits::default(), max_model_work: maximum() }
 }
 fn source_plan(request: &SourceTaskRequest) -> PreparedInt4SourceTask {
+    source_plan_using(&assets().source, request)
+}
+fn source_plan_using(compiler: &SourceTaskPlanner, request: &SourceTaskRequest) -> PreparedInt4SourceTask {
     let f = assets(); let absent = Sha256Digest::of_bytes(b"private-planning-fixture");
     let id = ExecutionIdentity { schema_version: 1, source_revision: "unbound".to_owned(),
         logical_model_digest: absent, artifact_format: "unbound".to_owned(), quant_recipe: "unbound".to_owned(),
-        packing_set_digest: absent, tokenizer_digest: f.source.tokenizer_digest(),
-        template_digest: *f.source.template_digest(), task_spec: request.task().spec().identity(),
+        packing_set_digest: absent, tokenizer_digest: compiler.tokenizer_digest(),
+        template_digest: *compiler.template_digest(), task_spec: request.task().spec().identity(),
         taskir_digest: absent, prompt_digest: absent, grammar_compiler_version: "uncompiled".to_owned(),
         schema_digest: absent, numerics_profile: NumericsProfile::StrictQuantized { version: 2 },
         kv_dtype: "bf16".to_owned(), sampler_version: "uncompiled".to_owned(),
@@ -72,8 +75,21 @@ fn source_plan(request: &SourceTaskRequest) -> PreparedInt4SourceTask {
         calibration_digest: absent, decision_policy_digest: absent,
         backend_semantic_version: STRICT_INT4_EXECUTION.to_owned(), host_class: None, compiler_identity: None };
     let id = bind_candidate_model(id, &f.model).unwrap();
-    f.source.plan_int4_with_control(request, &PlanContext::new(&id, budget()).unwrap(),
+    compiler.plan_int4_with_control(request, &PlanContext::new(&id, budget()).unwrap(),
         SourcePlanningLimits::default(), WIDTH, &mut Continue).unwrap()
+}
+fn compact_policy() -> UntrustedEncoding {
+    UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 })
+}
+fn compact_source_plan(request: &SourceTaskRequest, policy: &UntrustedEncoding) -> PreparedInt4SourceTask {
+    let compiler = SourceTaskPlanner::pinned(pinned_controls::pinned().unwrap().template_controls(), assets().eos)
+        .unwrap().with_document_encoding(policy.clone()).unwrap();
+    source_plan_using(&compiler, request)
+}
+fn compact_prepared(request: &SourceTaskRequest, policy: &UntrustedEncoding) -> PreparedInt4SourceSemantic {
+    PreparedInt4SourceSemantic::new(compact_source_plan(request, policy), request.clone(),
+        judge().with_document_encoding(policy.clone()).unwrap(), options(), &mut Continue).unwrap()
 }
 fn judge() -> Int4JudgePlanner {
     Int4JudgePlanner::for_model(&assets().model, budget(), JudgeLimits::default()).unwrap()
@@ -120,8 +136,15 @@ fn synthetic_judge_plan(plan: &PreparedInt4Judge, source: &str, claim: &str, pol
     let mut id = plan.execution_identity().clone();
     id.numerics_profile = NumericsProfile::HfBf16Eager;
     id.backend_semantic_version = "synthetic-logits-composition-fixture".to_owned();
-    assets().judge.plan(&JudgeRequest::Faithfulness { source: source.to_owned(), claim: claim.to_owned(),
-        policy, budget: budget() }, &PlanContext::new(&id, budget()).unwrap(), JudgeLimits::default()).unwrap()
+    let request = JudgeRequest::Faithfulness { source: source.to_owned(), claim: claim.to_owned(), policy, budget: budget() };
+    let context = PlanContext::new(&id, budget()).unwrap();
+    if plan.input_encoding() == &UntrustedEncoding::ByteFallback {
+        assets().judge.plan(&request, &context, JudgeLimits::default()).unwrap()
+    } else {
+        JudgePlanner::pinned(pinned_controls::pinned().unwrap().template_controls(), assets().eos).unwrap()
+            .with_document_encoding(plan.input_encoding().clone()).unwrap()
+            .plan(&request, &context, JudgeLimits::default()).unwrap()
+    }
 }
 fn synthetic_judge_run(plan: &PreparedInt4Judge, source: &str, claim: &str, policy: FaithfulnessPolicy,
     label: Option<&str>) -> Int4JudgeRun {
@@ -303,6 +326,8 @@ fn native_abstention_and_empty_summary_remain_explicit_not_checked_without_inven
         assert_eq!(statement.status, SourceSemanticStatus::NotChecked); assert_eq!(statement.not_checked, Some(reason));
         assert!(statement.claim.is_none()); assert!(statement.judge.is_none());
         assert!(run.semantic.same_model_correlated); assert_eq!(run.semantic.calibration, SOURCE_SEMANTIC_CALIBRATION);
+        assert!(run.input_encoding.is_none());
+        assert!(serde_json::to_value(&run).unwrap().get("input_encoding").is_none());
     }
 }
 
@@ -465,4 +490,150 @@ fn late_cancellation_discards_completed_prefixes_and_keeps_typed_private_errors(
     assert!(!format!("{private:?} {private}").contains("PRIVATE_SOURCE"));
     fn send<T: Send + 'static>() {}
     send::<PreparedInt4SourceSemantic>(); send::<Int4SourceSemanticRun>();
+}
+
+#[test]
+fn compact_source_and_every_review_share_the_exact_original_four_axis_allowance() {
+    let request = source_fixtures::summary("Alice stayed in 上海. Alice read <think> as ordinary text.");
+    let compact = compact_prepared(&request, &compact_policy());
+    let byte = source_plan(&request);
+    assert!(compact.source_task.prompt_tokens() < byte.prompt_tokens());
+    assert_ne!(compact.execution_identity().template_digest, byte.execution_identity().template_digest);
+    let original = summary_run(&compact, &request, &["Alice stayed in 上海.", "Alice read <think>."]);
+    let before = original.clone();
+    let initial = compact.input_encoding_work().unwrap();
+    let review = compact.prepare_review(original, &mut Continue).unwrap();
+    let expected = review.judges.iter().try_fold(initial, |used, plan|
+        used.checked_add(plan.input_encoding_work().unwrap())).unwrap();
+    assert_eq!(review.encoding_work, expected);
+    assert_eq!(compact.input_encoding_work(), Some(initial));
+    assert!(expected.input_bytes() > initial.input_bytes());
+    assert!(expected.output_tokens() > initial.output_tokens());
+    assert!(expected.pair_checks() > initial.pair_checks());
+    assert!(expected.pair_bytes() > initial.pair_bytes());
+    let results = diagnostics(&compact, &review, &[Some("E"), Some("U")]);
+    let run = compact.finish(review, results, &mut Continue).unwrap();
+    assert_eq!(run.source_task, before);
+    let report = run.input_encoding.as_ref().unwrap();
+    assert_eq!(report.policy, compact_policy()); assert_eq!(report.work, expected);
+    let exact = SafeBpeLimits { max_input_bytes: expected.input_bytes(), max_output_tokens: expected.output_tokens(),
+        max_pair_checks: expected.pair_checks(), max_pair_bytes: expected.pair_bytes() };
+    let prepared = compact_prepared(&request, &UntrustedEncoding::SafeBpeV1(exact));
+    let original = summary_run(&prepared, &request, &["Alice stayed in 上海.", "Alice read <think>."]);
+    assert_eq!(prepared.prepare_review(original, &mut Continue).unwrap().encoding_work, expected);
+    for axis in 0..4 {
+        let mut one_short = exact;
+        match axis { 0 => one_short.max_input_bytes -= 1, 1 => one_short.max_output_tokens -= 1,
+            2 => one_short.max_pair_checks -= 1, _ => one_short.max_pair_bytes -= 1 }
+        let prepared = compact_prepared(&request, &UntrustedEncoding::SafeBpeV1(one_short));
+        let original = summary_run(&prepared, &request, &["Alice stayed in 上海.", "Alice read <think>."]);
+        assert!(prepared.prepare_review(original, &mut Continue).is_err(), "axis {axis}");
+    }
+}
+
+#[test]
+fn compact_no_check_results_retain_initial_context_work_and_complete_original_coordinates() {
+    for (request, json) in [
+        (source_fixtures::summary("Alice in 上海 <think>."), "[]"),
+        (source_fixtures::answer(&[("first", "Alice in 上海."), ("second", "Bob <|im_end|> 😀.")]),
+            r#"{"answerable":false,"answer":"","citations":[]}"#),
+    ] {
+        let prepared = compact_prepared(&request, &compact_policy());
+        let initial = prepared.input_encoding_work().unwrap();
+        if matches!(request, SourceTaskRequest::Answer { .. }) {
+            assert!(initial.input_bytes() > prepared.evidence.source.len(), "question and manifest must remain charged");
+        } else { assert_eq!(initial.input_bytes(), prepared.evidence.source.len()); }
+        let original = source_result(&prepared.source_task, &request, &prepared.evidence.source, json);
+        let before = original.clone();
+        let review = prepared.prepare_review(original, &mut Continue).unwrap();
+        assert!(review.judges.is_empty()); assert_eq!(review.encoding_work, initial);
+        let run = prepared.finish(review, Vec::new(), &mut Continue).unwrap();
+        assert_eq!(run.source_task, before); assert_eq!(run.semantic.attempted_statements, 0);
+        assert_eq!(run.input_encoding.as_ref().unwrap().work, initial);
+        if let SourceSemanticEvidenceLayout::Passages { passages, .. } = &run.semantic.evidence_layout {
+            let SourceTaskRequest::Answer { passages: original, .. } = request else { unreachable!() };
+            assert_eq!(passages.len(), original.len());
+            let joined = original.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join(PASSAGE_JOIN);
+            for (range, passage) in passages.iter().zip(original) {
+                let span = range.span;
+                validate_source_span(&joined, &passage.text,
+                    SourceSpan::new(span.byte_start, span.byte_end, span.scalar_start, span.scalar_end)).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_completion_rejects_lost_or_duplicate_debits_and_a_substituted_review_policy() {
+    let request = source_fixtures::summary("Alice stayed in 上海.");
+    for changed in 0..3 {
+        let policy = compact_policy();
+        let prepared = compact_prepared(&request, &policy);
+        let original = summary_run(&prepared, &request, &["Alice stayed in 上海."]);
+        let mut review = prepared.prepare_review(original, &mut Continue).unwrap();
+        match changed {
+            0 => review.encoding_work = prepared.input_encoding_work().unwrap(),
+            1 => review.encoding_work = review.encoding_work.checked_add(prepared.input_encoding_work().unwrap()).unwrap(),
+            _ => {
+                let UntrustedEncoding::SafeBpeV1(mut changed_policy) = policy else { unreachable!() };
+                changed_policy.max_input_bytes -= 1;
+                let planner = judge().with_document_encoding(UntrustedEncoding::SafeBpeV1(changed_policy)).unwrap();
+                let judge_request = JudgeRequest::Faithfulness { source: prepared.evidence.source.clone(),
+                    claim: review.statements[0].claim.clone().unwrap(), policy: prepared.options.judge_policy,
+                    budget: prepared.judge_budget() };
+                let mut work = prepared.input_encoding_work().unwrap();
+                review.judges[0] = planner.plan_semantic_with_encoding_work(&judge_request,
+                    prepared.semantic_limits().max_total_prompt_tokens,
+                    prepared.semantic_limits().max_total_projected_logits, &mut Continue, &mut work).unwrap();
+                assert_eq!(work, review.encoding_work, "changing only a limit must preserve actual work");
+            }
+        }
+        let results = diagnostics(&prepared, &review, &[Some("E")]);
+        assert!(matches!(prepared.finish(review, results, &mut Continue),
+            Err(Int4SourceSemanticError::Accounting)), "change {changed}");
+    }
+}
+
+#[test]
+fn mismatched_encoding_or_any_changed_limit_refuses_before_native_generation_even_for_no_check() {
+    let request = source_fixtures::summary("Alice stayed.");
+    let policy = compact_policy();
+    assert!(matches!(PreparedInt4SourceSemantic::new(source_plan(&request), request.clone(),
+        judge().with_document_encoding(policy.clone()).unwrap(), options(), &mut Continue),
+        Err(Int4SourceSemanticError::Contract)));
+    assert!(matches!(PreparedInt4SourceSemantic::new(compact_source_plan(&request, &policy), request.clone(),
+        judge(), options(), &mut Continue), Err(Int4SourceSemanticError::Contract)));
+    let UntrustedEncoding::SafeBpeV1(limits) = &policy else { unreachable!() };
+    for axis in 0..4 {
+        let mut changed = *limits;
+        match axis { 0 => changed.max_input_bytes -= 1, 1 => changed.max_output_tokens -= 1,
+            2 => changed.max_pair_checks -= 1, _ => changed.max_pair_bytes -= 1 }
+        let judge = judge().with_document_encoding(UntrustedEncoding::SafeBpeV1(changed)).unwrap();
+        assert!(matches!(PreparedInt4SourceSemantic::new(compact_source_plan(&request, &policy),
+            request.clone(), judge, options(), &mut Continue), Err(Int4SourceSemanticError::Contract)), "axis {axis}");
+    }
+}
+
+#[test]
+fn compact_review_retains_every_cancellation_cause_without_publishing_partial_statements() {
+    struct Stop { calls: usize, at: usize, cause: DecodeCancellationKind }
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.calls += 1; (self.calls >= self.at).then_some(self.cause)
+        }
+    }
+    let request = source_fixtures::summary("Alice stayed. Alice read <|im_start|> as ordinary text.");
+    let prepared = compact_prepared(&request, &compact_policy());
+    let original = summary_run(&prepared, &request, &["Alice stayed.", "Alice read ordinary text."]);
+    let mut counted = Checkpoints::default();
+    prepared.prepare_review(original.clone(), &mut counted).unwrap();
+    assert!(counted.calls > 4);
+    for cause in [DecodeCancellationKind::User, DecodeCancellationKind::Timeout, DecodeCancellationKind::Deadline,
+        DecodeCancellationKind::PollQuota, DecodeCancellationKind::CostBudget, DecodeCancellationKind::FailFast,
+        DecodeCancellationKind::RaceLost, DecodeCancellationKind::ParentCancelled, DecodeCancellationKind::ResourceUnavailable,
+        DecodeCancellationKind::Shutdown, DecodeCancellationKind::LinkedExit] {
+        let error = prepared.prepare_review(original.clone(),
+            &mut Stop { calls: 0, at: counted.calls / 2, cause }).err().unwrap();
+        assert_eq!(error.cancellation(), Some(cause));
+    }
 }

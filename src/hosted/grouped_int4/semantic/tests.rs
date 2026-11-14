@@ -123,3 +123,48 @@ fn source_planners_vocabulary_and_real_combined_output_cross_one_owned_boundary(
     let _entry = NlpEngine::execute_int4_semantic_extract;
     let _team_entry = NlpEngine::execute_int4_semantic_extract_with_threads;
 }
+
+
+#[test]
+fn compact_review_admits_one_sequential_encoder_workspace_for_every_field_count() {
+    let encoding = UntrustedEncoding::SafeBpeV1(crate::tokenizer::untrusted::SafeBpeLimits {
+        max_input_bytes: 8192, max_output_tokens: 4096, max_pair_checks: 1_000_000, max_pair_bytes: 4_000_000,
+    });
+    let UntrustedEncoding::SafeBpeV1(limits) = &encoding else { unreachable!() };
+    let workspace = limits.requirements().unwrap().workspace_bytes;
+    for fields in [1, 3, 64] {
+        let (host, extraction, judge, mut semantic, planning) = fixture();
+        semantic.max_fields = fields;
+        let legacy = host.requirements(32, extraction, judge, semantic, planning, 1024).unwrap();
+        let bytes = host.requirements_with_encoding(32, extraction, judge, semantic, planning, 1024,
+            &UntrustedEncoding::ByteFallback).unwrap();
+        let compact = host.requirements_with_encoding(32, extraction, judge, semantic, planning, 1024, &encoding).unwrap();
+        assert_eq!(legacy, bytes);
+        assert_eq!(compact.preparation_bytes - bytes.preparation_bytes, workspace);
+        assert_eq!(compact.native, bytes.native);
+        assert_eq!(compact.native_workspace_bytes, bytes.native_workspace_bytes);
+        assert_eq!(compact.output_bytes, bytes.output_bytes);
+        assert_eq!(compact.total_bytes().unwrap() - bytes.total_bytes().unwrap(), workspace);
+    }
+}
+
+#[test]
+fn compact_host_rejects_every_invalid_encoding_axis_and_workspace_overflow() {
+    let limits = crate::tokenizer::untrusted::SafeBpeLimits {
+        max_input_bytes: 8192, max_output_tokens: 4096, max_pair_checks: 1_000_000, max_pair_bytes: 4_000_000,
+    };
+    for axis in 0..4 {
+        let (host, extraction, judge, semantic, planning) = fixture();
+        let mut invalid = limits;
+        match axis { 0 => invalid.max_input_bytes = 0, 1 => invalid.max_output_tokens = 0,
+            2 => invalid.max_pair_checks = 0, _ => invalid.max_pair_bytes = 0 }
+        assert!(host.requirements_with_encoding(32, extraction, judge, semantic, planning, 1024,
+            &UntrustedEncoding::SafeBpeV1(invalid)).is_err(), "axis {axis}");
+    }
+    let (mut host, extraction, judge, semantic, planning) = fixture();
+    let total = host.requirements(32, extraction, judge, semantic, planning, 1024).unwrap().total_bytes().unwrap();
+    host.preparation_reserve_bytes = u64::MAX - (total - host.preparation_reserve_bytes);
+    assert_eq!(host.requirements(32, extraction, judge, semantic, planning, 1024).unwrap().total_bytes().unwrap(), u64::MAX);
+    assert!(host.requirements_with_encoding(32, extraction, judge, semantic, planning, 1024,
+        &UntrustedEncoding::SafeBpeV1(limits)).is_err());
+}

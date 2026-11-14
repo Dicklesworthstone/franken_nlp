@@ -1,5 +1,7 @@
 //! Admission and ownership contracts only; these fixtures perform no inference.
 use super::*;
+use crate::{tasks::extract::SourceDocumentEncoder,
+    tokenizer::{pinned_controls, untrusted::SafeBpeLimits}};
 
 fn fixture() -> (Int4SourceSemanticHostLimits, TaskBudget, TaskBudget, SourceSemanticLimits,
     JudgeLimits, SourceSemanticInputFacts) {
@@ -57,6 +59,77 @@ fn all_statement_plans_and_results_coexist_even_with_a_fixed_aggregate_prompt_bu
     assert!(four.preparation_bytes - one.preparation_bytes >=
         3 * (input.source_bytes as u64 + 4 * judge.max_output_bytes));
     assert!(four.total_bytes().unwrap() > one.total_bytes().unwrap());
+}
+
+#[test]
+fn compact_source_and_all_statement_reviews_admit_exactly_one_encoder_workspace() {
+    let (host, source, judge, mut semantic, planning, input) = fixture();
+    let limits = SafeBpeLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
+    let encoding = UntrustedEncoding::SafeBpeV1(limits);
+    for count in [1, 4] {
+        semantic.max_statements = count;
+        let byte = host.requirements(32, source, judge, semantic, planning, input).unwrap();
+        assert_eq!(byte, host.requirements_with_encoding(32, source, judge, semantic, planning,
+            input, &UntrustedEncoding::ByteFallback).unwrap());
+        let compact = host.requirements_with_encoding(32, source, judge, semantic, planning, input, &encoding).unwrap();
+        assert_eq!(compact.native, byte.native); assert_eq!(compact.native_workspace_bytes, byte.native_workspace_bytes);
+        assert_eq!(compact.output_bytes, byte.output_bytes);
+        assert_eq!(compact.preparation_bytes - byte.preparation_bytes, limits.requirements().unwrap().workspace_bytes);
+        assert_eq!(compact.total_bytes().unwrap() - byte.total_bytes().unwrap(), limits.requirements().unwrap().workspace_bytes);
+    }
+    for axis in 0..4 {
+        for oversized in [false, true] {
+            let mut invalid = limits;
+            match axis {
+                0 => invalid.max_input_bytes = if oversized { SafeBpeLimits::MAX_INPUT_BYTES + 1 } else { 0 },
+                1 => invalid.max_output_tokens = if oversized { SafeBpeLimits::MAX_OUTPUT_TOKENS + 1 } else { 0 },
+                2 => invalid.max_pair_checks = if oversized { SafeBpeLimits::MAX_PAIR_CHECKS + 1 } else { 0 },
+                _ => invalid.max_pair_bytes = if oversized { SafeBpeLimits::MAX_PAIR_BYTES + 1 } else { 0 },
+            }
+            assert!(host.requirements_with_encoding(32, source, judge, semantic, planning, input,
+                &UntrustedEncoding::SafeBpeV1(invalid)).is_err(), "axis {axis}, oversized {oversized}");
+        }
+    }
+}
+
+#[test]
+fn compact_completion_keeps_the_original_policy_and_never_drops_source_work() {
+    let limits = SafeBpeLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
+    let policy = UntrustedEncoding::SafeBpeV1(limits);
+    let encoder = SourceDocumentEncoder::pinned(pinned_controls::pinned().unwrap().template_controls()).unwrap()
+        .with_document_encoding(policy.clone()).unwrap();
+    let original = encoder.encode_with_context_and_control("Alice stayed in 上海.", &["Where?", "passage-id"], 4096, 4096,
+        &mut || None)
+        .unwrap().input_encoding_work().unwrap();
+    let later = encoder.encode_with_control("Alice stayed in 上海.", 4096, 4096, &mut || None)
+        .unwrap().input_encoding_work().unwrap();
+    let report = Int4SemanticEncoding { policy: policy.clone(), work: original.checked_add(later).unwrap() };
+    check_encoding_completion(Some(&report), &policy, Some(original)).unwrap();
+    let no_check = Int4SemanticEncoding { policy: policy.clone(), work: original };
+    check_encoding_completion(Some(&no_check), &policy, Some(original)).unwrap();
+    check_encoding_completion(None, &UntrustedEncoding::ByteFallback, None).unwrap();
+    assert!(check_encoding_completion(None, &policy, Some(original)).is_err());
+    assert!(check_encoding_completion(Some(&report), &policy, None).is_err());
+    assert!(check_encoding_completion(Some(&report), &UntrustedEncoding::ByteFallback, None).is_err());
+    let dropped = Int4SemanticEncoding { policy: policy.clone(), work: later };
+    assert!(check_encoding_completion(Some(&dropped), &policy, Some(original)).is_err());
+    for axis in 0..4 {
+        let mut changed = limits;
+        match axis { 0 => changed.max_input_bytes -= 1, 1 => changed.max_output_tokens -= 1,
+            2 => changed.max_pair_checks -= 1, _ => changed.max_pair_bytes -= 1 }
+        let changed = Int4SemanticEncoding { policy: UntrustedEncoding::SafeBpeV1(changed), work: report.work };
+        assert!(check_encoding_completion(Some(&changed), &policy, Some(original)).is_err(), "policy axis {axis}");
+        let mut exceeded = limits;
+        match axis { 0 => exceeded.max_input_bytes = report.work.input_bytes() - 1,
+            1 => exceeded.max_output_tokens = report.work.output_tokens() - 1,
+            2 => exceeded.max_pair_checks = report.work.pair_checks() - 1,
+            _ => exceeded.max_pair_bytes = report.work.pair_bytes() - 1 }
+        let exceeded_policy = UntrustedEncoding::SafeBpeV1(exceeded);
+        let exceeded = Int4SemanticEncoding { policy: exceeded_policy.clone(), work: report.work };
+        assert!(check_encoding_completion(Some(&exceeded), &exceeded_policy, Some(original)).is_err(), "budget axis {axis}");
+    }
 }
 
 #[test]

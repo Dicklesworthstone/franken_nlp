@@ -9,6 +9,7 @@ use crate::{
     native_engine::{kv::KV_BYTES_PER_TOKEN, lmhead::scoring::ScoringWork,
         strict_int4::{Int4RunBudget, scoring::Int4ScoringBudget}},
     tasks::{answer::{AnswerStatus, ANSWER_PASSAGE_LAYOUT_VERSION}, ir::ScoreSpace,
+        extract::semantic::grouped_int4::Int4SemanticEncoding,
         judge::{partition_evidence, FaithfulnessPolicy, FaithfulnessRelation, FaithfulnessResult,
             JudgeLimits, JudgeRequest, JudgeResult, FAITHFULNESS_VERSION,
             grouped_int4::{Int4JudgeError, Int4JudgePlanner, Int4JudgeRun, PreparedInt4Judge,
@@ -275,6 +276,15 @@ impl PreparedInt4SourceSemantic {
         judge: Int4JudgePlanner, options: Int4SourceSemanticOptions, control: &mut C)
         -> Result<Self, Int4SourceSemanticError> {
         poll(control)?;
+        if source_task.input_encoding() != judge.document_encoding() {
+            return Err(Int4SourceSemanticError::Contract);
+        }
+        let encoding = Int4SemanticEncoding::from_work(source_task.input_encoding(),
+            source_task.input_encoding_work().unwrap_or_default())
+            .map_err(|_| Int4SourceSemanticError::Contract)?;
+        if encoding.is_some() != source_task.input_encoding_work().is_some() {
+            return Err(Int4SourceSemanticError::Contract);
+        }
         let (ceiling, limits) = judge.semantic_configuration();
         check_configuration(&source_task, &request, judge.execution_identity(), judge.group_width(), ceiling, limits, &options)?;
         poll(control)?;
@@ -295,6 +305,15 @@ impl PreparedInt4SourceSemantic {
     pub fn semantic_limits(&self) -> SourceSemanticLimits { self.options.limits }
     pub fn policy_digest(&self) -> Sha256Digest { self.policy_digest }
     pub fn max_result_bytes(&self) -> u64 { self.options.limits.max_output_bytes }
+    /// One immutable input policy bounds the original source and ALL dependent
+    /// review heads, including every generated claim and evidence window.
+    pub fn input_encoding(&self) -> &UntrustedEncoding { self.source_task.input_encoding() }
+    pub fn input_encoding_work(&self) -> Option<SafeBpeWork> { self.source_task.input_encoding_work() }
+    /// The same transient encoder workspace is reused sequentially. Hosts
+    /// admit it before any native generation or review allocation.
+    pub fn encoding_workspace_bytes(&self) -> Result<u64, Int4SourceSemanticError> {
+        Ok(self.judge.document_encoding_workspace_bytes()?)
+    }
 
     pub fn execute_with_control<C: DecodeStepControl>(self, engine: &mut StrictInt4Engine<'_>,
         vocabulary: &ExtractionVocabulary, masks: MaskWorkLimits, mask_visits: u64, control: &mut C)
@@ -344,6 +363,10 @@ impl PreparedInt4SourceSemantic {
         let statements = prepare_statements(&self.source_task, &self.evidence, &source_task, self.options.limits, control)?;
         let count = statements.iter().filter(|s| s.claim.is_some()).count();
         let mut judges = vector(count)?; let mut work = Int4Work::default();
+        // Seed from the sealed original question/manifest/source encoding.
+        // The public consuming execution owns this ledger until completion;
+        // no statement, evidence head or failed review renews its allowance.
+        let mut encoding_work = self.input_encoding_work().unwrap_or_default();
         let mut logits_left = self.options.limits.max_total_projected_logits;
         // Fixed shares cap the sum of retained complete-head prompts. This
         // also makes statement order irrelevant to prompt admission authority.
@@ -353,7 +376,8 @@ impl PreparedInt4SourceSemantic {
             poll(control)?;
             let request = JudgeRequest::Faithfulness { source: copy(&self.evidence.source)?, claim: copy(claim)?,
                 policy: self.options.judge_policy, budget: self.options.judge_budget };
-            let plan = self.judge.plan_semantic_with_control(&request, prompt_share, logits_left, control)?;
+            let plan = self.judge.plan_semantic_with_encoding_work(&request, prompt_share,
+                logits_left, control, &mut encoding_work)?;
             if plan.group_width() != self.group_width() { return Err(Int4SourceSemanticError::Accounting); }
             same_model(self.execution_identity(), plan.execution_identity())?;
             logits_left = logits_left.checked_sub(plan.planned_work().projected_logits).ok_or(Int4SourceSemanticError::WorkBudget)?;
@@ -362,7 +386,9 @@ impl PreparedInt4SourceSemantic {
             judges.push(plan);
         }
         poll(control)?;
-        Ok(Review { source_task, statements, judges, work })
+        Int4SemanticEncoding::from_work(self.input_encoding(), encoding_work)
+            .map_err(|_| Int4SourceSemanticError::Accounting)?;
+        Ok(Review { source_task, statements, judges, work, encoding_work })
     }
     fn finish<C: DecodeStepControl>(self, review: Review, results: Vec<Int4JudgeRun>, control: &mut C)
         -> Result<Int4SourceSemanticRun, Int4SourceSemanticError> {
@@ -370,7 +396,18 @@ impl PreparedInt4SourceSemantic {
         let cap = self.max_result_bytes();
         let (statements, semantic_model_work, scoring, judge_head_count, rewound_positions) =
             finish_statements(&review.statements, &review.judges, results, self.options.judge_policy, group_width, control)?;
-        if semantic_model_work != review.work { return Err(Int4SourceSemanticError::Accounting); }
+        let mut encoding_work = self.input_encoding_work().unwrap_or_default();
+        for plan in &review.judges {
+            if plan.input_encoding() != self.input_encoding()
+                || plan.input_encoding_work().is_some() != self.input_encoding_work().is_some() {
+                return Err(Int4SourceSemanticError::Accounting);
+            }
+            encoding_work = encoding_work.checked_add(plan.input_encoding_work().unwrap_or_default())
+                .ok_or(Int4SourceSemanticError::Accounting)?;
+        }
+        if semantic_model_work != review.work || encoding_work != review.encoding_work {
+            return Err(Int4SourceSemanticError::Accounting);
+        }
         let reserved_model_work = reserve_combined(source_reserved_work, semantic_model_work, self.max_model_work())?;
         let model_work = plus(review.source_task.model_work, semantic_model_work)?;
         if !fits(model_work, reserved_model_work) { return Err(Int4SourceSemanticError::Accounting); }
@@ -383,6 +420,8 @@ impl PreparedInt4SourceSemantic {
             || statements.len() != attempted_statements + not_checked_statements {
             return Err(Int4SourceSemanticError::Accounting);
         }
+        let input_encoding = Int4SemanticEncoding::from_work(self.input_encoding(), review.encoding_work)
+            .map_err(|_| Int4SourceSemanticError::Accounting)?;
         let run = Int4SourceSemanticRun { schema_version: 1, execution: INT4_SOURCE_SEMANTIC_EXECUTION,
             numerics_profile: STRICT_INT4_PROFILE, group_width, source_reserved_work, semantic_model_work,
             reserved_model_work, model_work, judge_head_count, rewound_positions, source_task: review.source_task,
@@ -392,7 +431,8 @@ impl PreparedInt4SourceSemantic {
                 same_model_correlated: true, policy_digest: self.policy_digest, policy: self.options.judge_policy,
                 evidence_layout: self.evidence.layout, attempted_statements, decided_statements,
                 abstained_statements, not_checked_statements, statements, work: scoring },
-            untrusted_fields: ["source_task.result", "semantic.evidence_layout", "semantic.statements"] };
+            untrusted_fields: ["source_task.result", "semantic.evidence_layout", "semantic.statements"],
+            input_encoding };
         poll(control)?;
         check_size(&run, cap)?;
         poll(control)?;
@@ -488,9 +528,16 @@ pub struct Int4SourceSemanticRun {
     pub source_task: Int4SourceTaskRun,
     pub semantic: SourceSemanticReceipt,
     pub untrusted_fields: [&'static str; 3],
+    /// Compact policy and complete original-plus-review encoding work.
+    /// Omitted for byte input to preserve the existing result shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_encoding: Option<Int4SemanticEncoding>,
 }
 struct Statement { target: SourceSemanticTarget, claim: Option<String>, not_checked: Option<SourceSemanticNoCheck> }
-struct Review { source_task: Int4SourceTaskRun, statements: Vec<Statement>, judges: Vec<PreparedInt4Judge>, work: Int4Work }
+struct Review {
+    source_task: Int4SourceTaskRun, statements: Vec<Statement>, judges: Vec<PreparedInt4Judge>,
+    work: Int4Work, encoding_work: SafeBpeWork,
+}
 
 fn prepare_statements<C: DecodeStepControl>(prepared: &PreparedInt4SourceTask, evidence: &EvidenceContext,
     run: &Int4SourceTaskRun, limits: SourceSemanticLimits, control: &mut C)

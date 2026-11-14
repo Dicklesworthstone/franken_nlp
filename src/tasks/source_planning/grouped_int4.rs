@@ -7,6 +7,7 @@
 //! boundary. Citation membership does not certify factual support or quality.
 
 use super::*;
+use crate::tokenizer::untrusted::{SafeBpeWork, UntrustedEncoding};
 use crate::{
     native_engine::{
         constrained_int4::{self, Int4JsonBudget, Int4JsonError, sparse::Int4JsonSparseLimits},
@@ -114,6 +115,8 @@ pub struct PreparedInt4SourceTask {
     finalizer: Finalizer,
     budget: TaskBudget,
     request_digest: Sha256Digest,
+    input_encoding: UntrustedEncoding,
+    input_encoding_work: Option<SafeBpeWork>,
 }
 impl SourceTaskPlanner {
     /// The context must already identify the strict-v2 candidate and exact
@@ -133,7 +136,8 @@ impl SourceTaskPlanner {
         };
         let encode = |text: &str, control: &mut C| self.encoder.encode_with_control(text,
             limits.max_input_bytes, budget.max_input_tokens as usize, &mut || control.prefill_checkpoint(0));
-        let compile = |document: &SourceDocument, schema: &str, control: &mut C| -> Result<Int4ExtractPlan, Int4SourceError> {
+        let compile = |document: &SourceDocument, schema: &str, control: &mut C|
+            -> Result<(Int4ExtractPlan, UntrustedEncoding, Option<SafeBpeWork>), Int4SourceError> {
             checkpoint(control)?;
             let task = self.task(kind, document, schema, context, budget, limits)?;
             let decode = JsonDecodeOptions { max_new_tokens: budget.max_output_tokens as usize,
@@ -142,9 +146,9 @@ impl SourceTaskPlanner {
                 Some((document, limits.source)), task_spec, context.execution_identity().clone(), group_width)?
                 .with_finalizer_version(INT4_SOURCE_EXECUTION)?;
             checkpoint(control)?;
-            Ok(extraction)
+            Ok((extraction, document.document_encoding().clone(), document.input_encoding_work()))
         };
-        let (extraction, finalizer) = match request {
+        let ((extraction, input_encoding, input_encoding_work), finalizer) = match request {
             SourceTaskRequest::Ner { document, options, .. } => {
                 let schema = options.schema_source()?; let document = encode(document, control)?;
                 (compile(&document, &schema, control)?, Finalizer::Ner(options.clone()))
@@ -170,7 +174,8 @@ impl SourceTaskPlanner {
         checkpoint(control)?;
         let request_digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(request)
             .map_err(|_| SourcePlanningError::Serialization)?);
-        Ok(PreparedInt4SourceTask { extraction, finalizer, budget, request_digest })
+        Ok(PreparedInt4SourceTask { extraction, finalizer, budget, request_digest,
+            input_encoding, input_encoding_work })
     }
 }
 impl PreparedInt4SourceTask {
@@ -202,6 +207,12 @@ impl PreparedInt4SourceTask {
     pub fn max_result_bytes(&self) -> u64 { self.extraction.max_result_bytes() }
     pub fn max_kv_bytes(&self) -> u64 { self.extraction.max_kv_bytes() }
     pub fn task_budget(&self) -> TaskBudget { self.budget }
+    /// The sealed policy that encoded the original document and every auxiliary
+    /// context. A later semantic reader must preserve this exact allowance.
+    pub fn input_encoding(&self) -> &UntrustedEncoding { &self.input_encoding }
+    /// Actual original-source encoding work, including question and passage
+    /// metadata. Dependent review starts from these counters, never from zero.
+    pub fn input_encoding_work(&self) -> Option<SafeBpeWork> { self.input_encoding_work }
     /// Internal row association only. The public native result never exposes
     /// this fingerprint of private source text or caller task configuration.
     pub(crate) fn request_digest(&self) -> Sha256Digest { self.request_digest }

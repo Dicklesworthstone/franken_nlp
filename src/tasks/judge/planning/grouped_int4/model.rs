@@ -91,14 +91,17 @@ impl Int4JudgePlanner {
     }
     /// A composed second reader can only tighten prompt/logit work. Model,
     /// task ceiling and every other complete-head limit remain factory-owned.
-    pub(crate) fn plan_semantic_with_control<C: DecodeStepControl>(&self, request: &JudgeRequest,
-        prompt_tokens: usize, projected_logits: u64, control: &mut C)
+    /// The caller retains one tokenizer ledger across original preparation and
+    /// every dynamic claim, full-source prompt and evidence window.
+    pub(crate) fn plan_semantic_with_encoding_work<C: DecodeStepControl>(&self, request: &JudgeRequest,
+        prompt_tokens: usize, projected_logits: u64, control: &mut C, work: &mut SafeBpeWork)
         -> Result<PreparedInt4Judge, Int4JudgeError> {
+        checkpoint(control)?;
         if !matches!(request, JudgeRequest::Faithfulness { .. }) {
             return Err(JudgeError::Contract("semantic reader requires faithfulness").into());
         }
-        if self.document_encoding() != &UntrustedEncoding::ByteFallback {
-            return Err(JudgeError::Contract("composed semantic reader requires byte input admission").into());
+        if self.document_encoding() == &UntrustedEncoding::ByteFallback && *work != SafeBpeWork::default() {
+            return Err(JudgeError::Contract("byte semantic reader cannot carry compact tokenizer work").into());
         }
         let limits = JudgeLimits {
             max_total_prompt_tokens: self.limits.max_total_prompt_tokens.min(prompt_tokens),
@@ -107,7 +110,8 @@ impl Int4JudgePlanner {
         };
         let context = PlanContext::new(&self.identity, self.ceiling)
             .map_err(|_| JudgeError::Contract("judge plan context"))?;
-        self.compiler.plan_int4_with_control(request, &context, limits, &self.model, control)
+        check_model(context.execution_identity(), &self.model)?;
+        self.compiler.compile_int4_with_work(request, &context, limits, self.group_width(), control, work)
     }
 }
 fn uncompiled_identity(compiler: &JudgePlanner) -> ExecutionIdentity {

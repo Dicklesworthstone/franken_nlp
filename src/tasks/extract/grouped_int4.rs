@@ -177,7 +177,7 @@ impl Int4ExtractPlan {
     }
 
     /// Internal semantic composition may inspect the compiled schema only
-    /// while the original task and complete byte-token source remain attached.
+    /// while the original task and complete lossless source remain attached.
     /// This does not expose an eager executable or accept a replacement schema.
     pub(crate) fn semantic_schema(&self, task: &TaskPlan, source: &SourceDocument)
         -> Result<&crate::grammar::SchemaNode, Int4ExtractError> {
@@ -189,9 +189,16 @@ impl Int4ExtractPlan {
             .filter(|segment| segment.kind() == PromptSegmentKind::Document);
         if documents.next().is_none_or(|segment| segment.token_ids() != source.token_ids())
             || documents.next().is_some() || source.text().is_empty()
-            || source.text().len() != source.token_ids().len() {
+            || source.context_token_ids().len() != 0
+            || source.total_input_bytes() != source.text().len()
+            || source.total_token_count() != source.token_ids().len()
+            || (source.document_encoding() == &crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback
+                && source.text().len() != source.token_ids().len()) {
             return Err(Int4ExtractError::Identity);
         }
+        // SourceDocument is minted by the pinned lossless encoder. Exact
+        // attached token equality therefore binds the original UTF-8 bytes
+        // for compact input too, without re-encoding or changing offsets.
         Ok(self.extraction.program.declarative_schema())
     }
 

@@ -11,9 +11,9 @@ use crate::{
     native_engine::{constrained::JsonDecodeOutput,
         generation::grouped_int4::INT4_SOURCE_FORMAT, lmhead::NANBEIGE_VOCAB_SIZE,
         portable_int8::int4::convert::GROUPED_INT4_RECIPE,
-        strict_int4::STRICT_INT4_EXECUTION},
+        strict_int4::{Int4ModelIdentity, weights::projection_fixture, STRICT_INT4_EXECUTION}},
     tasks::{extract::{ExtractionGrounding, grouped_int4::INT4_EXTRACT_VERSION}, ir::ScoreSpace},
-    tokenizer::pinned_controls,
+    tokenizer::{embedded::EmbeddedTokenizer, pinned_controls, untrusted::SafeBpeLimits},
 };
 
 const WIDTH: usize = 127;
@@ -84,6 +84,71 @@ fn result(prepared: &PreparedInt4BatchExtraction, schema: &str, json: &str, grou
             output: JsonDecodeOutput { schema_version: 1, numerics_profile: STRICT_INT4_PROFILE.to_owned(),
                 token_ids: vec![token, options.eos_token_id], json: json.to_owned(), forward_positions: work.forward_positions,
                 projected_logits: work.projected_logits, mask_node_visit_charge: 1 } } }
+}
+
+fn model() -> &'static Int4ModelIdentity {
+    static MODEL: std::sync::OnceLock<Int4ModelIdentity> = std::sync::OnceLock::new();
+    MODEL.get_or_init(|| projection_fixture(WIDTH).0.identity().clone())
+}
+fn compact_limits() -> SafeBpeLimits {
+    SafeBpeLimits { max_input_bytes: 65_536, max_output_tokens: 8192,
+        max_pair_checks: 4_000_000, max_pair_bytes: 16_000_000 }
+}
+fn encoded_extraction(schema: &str, source: &str, encoding: UntrustedEncoding) -> PreparedInt4BatchExtraction {
+    let factory = Int4ExtractionBatchPlanner::for_model(model(), budget(), CompileLimits::default(),
+        SourceRuntimeLimits::default(), None).unwrap().with_document_encoding(encoding).unwrap();
+    factory.prepare_with_control(BatchDocument { id: "encoded-original".to_owned(), text: source.to_owned(),
+        task_args: Some(ExtractionBatchArgs { schema: schema.to_owned(), budget: budget(),
+            grounding: ExtractionBatchGrounding::Structural }) }, &mut Continue).unwrap()
+}
+fn encoded_preparation(schema: &str, source: &str, encoding: UntrustedEncoding,
+    options: Int4SemanticOptions) -> PreparedInt4SemanticExtraction {
+    let extraction = encoded_extraction(schema, source, encoding.clone());
+    let judge = Int4JudgePlanner::for_model(model(), budget(), JudgeLimits::default()).unwrap()
+        .with_document_encoding(encoding).unwrap();
+    PreparedInt4SemanticExtraction::new(extraction, judge, options, &mut Continue).unwrap()
+}
+fn array_options() -> Int4SemanticOptions {
+    let mut each = rule(); each.path = vec![ClaimPathStep::EachItem]; options(vec![each])
+}
+const ARRAY_SCHEMA: &str = r#"{"type":"array","maxItems":2,"items":{"type":"number"}}"#;
+const COMPACT_SOURCE: &str = "The document reports amounts 1 and 2. Café 上海 😀 <|im_start|> <tool_call>.";
+
+// The tiny projection fixture supplies only a sealed model identity. These
+// results exercise private composition with synthetic full-vocabulary logits;
+// no decoder, native model quality or inference evidence is claimed.
+fn review_results(prepared: &PreparedInt4SemanticExtraction, review: &Review) -> Vec<Int4JudgeRun> {
+    struct Flat;
+    impl crate::tasks::judge::JudgeLogits for Flat {
+        type Error = &'static str;
+        fn project(&mut self, _: usize, _: &[crate::tasks::ir::PromptSegment], _: &[u32],
+            rows: crate::native_engine::lmhead::scoring::ProjectionRows<'_>) -> Result<Vec<f32>, Self::Error> {
+            match rows {
+                crate::native_engine::lmhead::scoring::ProjectionRows::FullVocabulary { vocabulary_size } =>
+                    Ok(vec![0.0; vocabulary_size]),
+                _ => Err("full vocabulary required"),
+            }
+        }
+    }
+    let registry = pinned_controls::pinned().unwrap();
+    let eos = registry.template_controls().entries().iter()
+        .find(|entry| entry.special && entry.surface == crate::template::IM_END).unwrap().id;
+    let compiler = crate::tasks::judge::JudgePlanner::pinned(registry.template_controls(), eos).unwrap()
+        .with_document_encoding(prepared.input_encoding().clone()).unwrap();
+    let claims = review.fields.iter().filter_map(|field| field.claim.as_ref());
+    review.judges.iter().zip(claims).map(|(plan, claim)| {
+        let mut identity = plan.execution_identity().clone();
+        identity.numerics_profile = NumericsProfile::HfBf16Eager;
+        identity.backend_semantic_version = "synthetic-logits-composition-fixture".to_owned();
+        let context = crate::tasks::ir::PlanContext::new(&identity, budget()).unwrap();
+        let request = JudgeRequest::Faithfulness { source: prepared.extraction.source().text().to_owned(),
+            claim: claim.clone(), policy: prepared.options.specification.judge_policy, budget: budget() };
+        let generic = compiler.plan(&request, &context, JudgeLimits::default()).unwrap();
+        let result = generic.execute(generic.execution_identity(), &mut Flat).unwrap();
+        Int4JudgeRun { schema_version: 1, execution: INT4_JUDGE_EXECUTION.to_owned(),
+            numerics_profile: STRICT_INT4_PROFILE.to_owned(), group_width: WIDTH, result,
+            head_count: plan.head_count(), model_work: plan.planned_work(), rewound_positions: 0 }
+    }).collect()
 }
 
 #[test]
@@ -279,4 +344,162 @@ fn typed_cancellation_and_redacted_errors_survive_the_composed_boundary() {
     assert!(!format!("{private:?} {private}").contains("PRIVATE_SOURCE"));
     fn send<T: Send + 'static>() {}
     send::<PreparedInt4SemanticExtraction>(); send::<Int4SemanticExtractionRun>();
+}
+
+
+#[test]
+fn compact_semantic_schema_keeps_exact_source_bytes_and_schema_encoding_debit() {
+    let prepared = encoded_extraction(ARRAY_SCHEMA, COMPACT_SOURCE, UntrustedEncoding::SafeBpeV1(compact_limits()));
+    let source = prepared.source();
+    prepared.extraction_plan().semantic_schema(prepared.task_plan(), source).unwrap();
+    assert_eq!(source.text(), COMPACT_SOURCE);
+    assert_eq!(source.input_encoding_work().unwrap().input_bytes(), ARRAY_SCHEMA.len() + COMPACT_SOURCE.len());
+    assert!(source.token_ids().len() < source.text().len());
+    let tokenizer = EmbeddedTokenizer::pinned().unwrap();
+    assert_eq!(tokenizer.tokenizer().decode_bytes(source.token_ids()).unwrap(), COMPACT_SOURCE.as_bytes());
+    let registry = pinned_controls::pinned().unwrap();
+    assert!(source.token_ids().iter().all(|id| !registry.template_controls().ids().contains(id)));
+    let other = encoded_extraction(ARRAY_SCHEMA, "A different original source.", UntrustedEncoding::SafeBpeV1(compact_limits()));
+    assert!(prepared.extraction_plan().semantic_schema(prepared.task_plan(), other.source()).is_err());
+}
+
+#[test]
+fn extraction_and_review_require_the_identical_encoding_policy_before_generation() {
+    let policies = [
+        (UntrustedEncoding::ByteFallback, UntrustedEncoding::SafeBpeV1(compact_limits())),
+        (UntrustedEncoding::SafeBpeV1(compact_limits()), UntrustedEncoding::ByteFallback),
+    ];
+    for (source_encoding, judge_encoding) in policies {
+        let extraction = encoded_extraction(ARRAY_SCHEMA, COMPACT_SOURCE, source_encoding);
+        let judge = Int4JudgePlanner::for_model(model(), budget(), JudgeLimits::default()).unwrap()
+            .with_document_encoding(judge_encoding).unwrap();
+        assert!(matches!(PreparedInt4SemanticExtraction::new(extraction, judge, array_options(), &mut Continue),
+            Err(Int4SemanticError::Contract)));
+    }
+    for axis in 0..4 {
+        let mut limits = compact_limits();
+        match axis { 0 => limits.max_input_bytes -= 1, 1 => limits.max_output_tokens -= 1,
+            2 => limits.max_pair_checks -= 1, _ => limits.max_pair_bytes -= 1 }
+        let extraction = encoded_extraction(ARRAY_SCHEMA, COMPACT_SOURCE, UntrustedEncoding::SafeBpeV1(compact_limits()));
+        let judge = Int4JudgePlanner::for_model(model(), budget(), JudgeLimits::default()).unwrap()
+            .with_document_encoding(UntrustedEncoding::SafeBpeV1(limits)).unwrap();
+        assert!(matches!(PreparedInt4SemanticExtraction::new(extraction, judge, array_options(), &mut Continue),
+            Err(Int4SemanticError::Contract)), "axis {axis}");
+    }
+}
+
+#[test]
+fn compact_schema_source_and_every_field_share_all_four_nonrenewable_limits() {
+    let prepared = encoded_preparation(ARRAY_SCHEMA, COMPACT_SOURCE,
+        UntrustedEncoding::SafeBpeV1(compact_limits()), array_options());
+    let original = result(&prepared.extraction, ARRAY_SCHEMA, "[1,2]", false);
+    let review = prepared.prepare_review(original, &mut Continue).unwrap();
+    assert_eq!(review.judges.len(), 2);
+    let initial = prepared.input_encoding_work().unwrap();
+    let sum = review.judges.iter().fold(initial,
+        |work, plan| work.checked_add(plan.input_encoding_work().unwrap()).unwrap());
+    assert_eq!(review.encoding_work, sum);
+    assert!(sum.input_bytes() > initial.input_bytes());
+    assert!(sum.output_tokens() > initial.output_tokens());
+    assert!(sum.pair_checks() > initial.pair_checks());
+    assert!(sum.pair_bytes() > initial.pair_bytes());
+    for axis in 0..4 {
+        let mut limits = compact_limits();
+        match axis { 0 => limits.max_input_bytes = sum.input_bytes() - 1,
+            1 => limits.max_output_tokens = sum.output_tokens() - 1,
+            2 => limits.max_pair_checks = sum.pair_checks() - 1,
+            _ => limits.max_pair_bytes = sum.pair_bytes() - 1 }
+        let prepared = encoded_preparation(ARRAY_SCHEMA, COMPACT_SOURCE,
+            UntrustedEncoding::SafeBpeV1(limits), array_options());
+        // A fresh allowance would incorrectly permit both individual readers.
+        for field in &review.fields {
+            let request = JudgeRequest::Faithfulness { source: COMPACT_SOURCE.to_owned(),
+                claim: field.claim.clone().unwrap(), policy: prepared.options.specification.judge_policy,
+                budget: budget() };
+            prepared.judge.plan_with_control(&request, &mut Continue).unwrap();
+        }
+        let original = result(&prepared.extraction, ARRAY_SCHEMA, "[1,2]", false);
+        assert!(prepared.prepare_review(original, &mut Continue).is_err(), "axis {axis}");
+    }
+}
+
+#[test]
+fn compact_finish_reports_actual_aggregate_work_and_preserves_original_extraction() {
+    let prepared = encoded_preparation(ARRAY_SCHEMA, COMPACT_SOURCE,
+        UntrustedEncoding::SafeBpeV1(compact_limits()), array_options());
+    let original = result(&prepared.extraction, ARRAY_SCHEMA, "[1,2]", false);
+    let before = original.clone();
+    let review = prepared.prepare_review(original, &mut Continue).unwrap();
+    let used = review.encoding_work;
+    let results = review_results(&prepared, &review);
+    let run = prepared.finish(review, results, &mut Continue).unwrap();
+    assert_eq!(run.extraction, before);
+    assert_eq!(run.semantic.attempted_fields, 2);
+    assert!(run.semantic.same_model_correlated);
+    assert_eq!(run.semantic.calibration, "experimental_uncalibrated_diagnostic_only");
+    assert_eq!(run.input_encoding, Some(Int4SemanticEncoding {
+        policy: UntrustedEncoding::SafeBpeV1(compact_limits()), work: used }));
+    let json = serde_json::to_value(&run).unwrap();
+    assert_eq!(json["input_encoding"]["policy"]["kind"], "safe_bpe_v1");
+    assert_eq!(json["input_encoding"]["work"]["input_bytes"], used.input_bytes());
+    assert_eq!(json["input_encoding"]["work"]["pair_checks"], used.pair_checks());
+}
+
+#[test]
+fn compact_completion_refuses_lost_original_or_field_encoding_debits() {
+    for omit_original in [true, false] {
+        let prepared = encoded_preparation(ARRAY_SCHEMA, COMPACT_SOURCE,
+            UntrustedEncoding::SafeBpeV1(compact_limits()), array_options());
+        let original = result(&prepared.extraction, ARRAY_SCHEMA, "[1,2]", false);
+        let mut review = prepared.prepare_review(original, &mut Continue).unwrap();
+        let results = review_results(&prepared, &review);
+        review.encoding_work = if omit_original {
+            review.encoding_work.checked_sub(prepared.input_encoding_work().unwrap()).unwrap()
+        } else { prepared.input_encoding_work().unwrap() };
+        assert!(matches!(prepared.finish(review, results, &mut Continue), Err(Int4SemanticError::Accounting)));
+    }
+}
+
+#[test]
+fn no_claim_compact_output_keeps_initial_work_and_byte_output_keeps_its_shape() {
+    for encoding in [UntrustedEncoding::ByteFallback, UntrustedEncoding::SafeBpeV1(compact_limits())] {
+        let schema = r#"{"type":"null"}"#;
+        let prepared = encoded_preparation(schema, COMPACT_SOURCE, encoding.clone(), options(vec![]));
+        let initial = prepared.input_encoding_work();
+        let workspace = prepared.encoding_workspace_bytes().unwrap();
+        let original = result(&prepared.extraction, schema, "null", false);
+        let review = prepared.prepare_review(original, &mut Continue).unwrap();
+        assert!(review.judges.is_empty());
+        let run = prepared.finish(review, vec![], &mut Continue).unwrap();
+        assert_eq!(run.semantic.attempted_fields, 0);
+        match encoding {
+            UntrustedEncoding::ByteFallback => {
+                assert_eq!(workspace, 0); assert!(initial.is_none()); assert!(run.input_encoding.is_none());
+                assert!(serde_json::to_value(&run).unwrap().get("input_encoding").is_none());
+            }
+            UntrustedEncoding::SafeBpeV1(limits) => {
+                assert_eq!(workspace, limits.requirements().unwrap().workspace_bytes);
+                assert_eq!(run.input_encoding.unwrap().work, initial.unwrap());
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_semantic_cancellation_preserves_every_cause_and_returns_no_partial_result() {
+    struct Stop(DecodeCancellationKind);
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { Some(self.0) }
+    }
+    for cause in [DecodeCancellationKind::User, DecodeCancellationKind::Timeout, DecodeCancellationKind::Deadline,
+        DecodeCancellationKind::PollQuota, DecodeCancellationKind::CostBudget, DecodeCancellationKind::FailFast,
+        DecodeCancellationKind::RaceLost, DecodeCancellationKind::ParentCancelled,
+        DecodeCancellationKind::ResourceUnavailable, DecodeCancellationKind::Shutdown, DecodeCancellationKind::LinkedExit] {
+        let prepared = encoded_preparation(ARRAY_SCHEMA, COMPACT_SOURCE,
+            UntrustedEncoding::SafeBpeV1(compact_limits()), array_options());
+        let original = result(&prepared.extraction, ARRAY_SCHEMA, "[1,2]", false);
+        assert_eq!(prepared.prepare_review(original.clone(), &mut Stop(cause)).err().unwrap().cancellation(), Some(cause));
+        let review = prepared.prepare_review(original, &mut Continue).unwrap();
+        assert_eq!(prepared.finish(review, vec![], &mut Stop(cause)).err().unwrap().cancellation(), Some(cause));
+    }
 }

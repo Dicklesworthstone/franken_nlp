@@ -14,6 +14,7 @@ use crate::{
         quantized::check_size},
         judge::{partition_evidence, grouped_int4::{Int4JudgeError, Int4JudgePlanner,
             Int4JudgeRun, PreparedInt4Judge, INT4_JUDGE_EXECUTION}}},
+    tokenizer::untrusted::{SafeBpeWork, UntrustedEncoding},
 };
 
 pub const INT4_SEMANTIC_EXECUTION: &str = "grouped-int4-extraction-correlated-second-reader-v1";
@@ -90,6 +91,34 @@ impl Int4SemanticError {
     }
 }
 
+/// Explicit unqualified encoding policy and the actual nonrenewable work of
+/// the complete source preparation and every correlated review. Byte-default
+/// results omit this extension to preserve their existing serialized shape.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct Int4SemanticEncoding {
+    pub policy: UntrustedEncoding,
+    pub work: SafeBpeWork,
+}
+impl Int4SemanticEncoding {
+    pub(crate) fn from_work(policy: &UntrustedEncoding, work: SafeBpeWork)
+        -> Result<Option<Self>, Int4SemanticError> {
+        policy.validate().map_err(|_| Int4SemanticError::Contract)?;
+        match policy {
+            UntrustedEncoding::ByteFallback => {
+                if work != SafeBpeWork::default() { return Err(Int4SemanticError::Accounting); }
+                Ok(None)
+            }
+            UntrustedEncoding::SafeBpeV1(limits) => {
+                if work.input_bytes() > limits.max_input_bytes || work.output_tokens() > limits.max_output_tokens
+                    || work.pair_checks() > limits.max_pair_checks || work.pair_bytes() > limits.max_pair_bytes {
+                    return Err(Int4SemanticError::WorkBudget);
+                }
+                Ok(Some(Self { policy: policy.clone(), work }))
+            }
+        }
+    }
+}
+
 /// Consumes the actual prepared extraction and model-bound pinned judge. No
 /// deserialized output, replacement schema, identity or logits provider can
 /// supply the public execution path. The original source stays attached.
@@ -102,6 +131,14 @@ impl PreparedInt4SemanticExtraction {
     pub fn new<C: DecodeStepControl>(extraction: PreparedInt4BatchExtraction, judge: Int4JudgePlanner,
         options: Int4SemanticOptions, control: &mut C) -> Result<Self, Int4SemanticError> {
         poll(control)?;
+        let source = extraction.source();
+        if source.document_encoding() != judge.document_encoding()
+            || matches!(source.document_encoding(), UntrustedEncoding::SafeBpeV1(_))
+                != source.input_encoding_work().is_some() {
+            return Err(Int4SemanticError::Contract);
+        }
+        Int4SemanticEncoding::from_work(source.document_encoding(),
+            source.input_encoding_work().unwrap_or_default())?;
         let (ceiling, limits) = judge.semantic_configuration();
         check_configuration(&extraction, judge.execution_identity(), judge.group_width(), ceiling, limits, &options)?;
         poll(control)?;
@@ -118,6 +155,12 @@ impl PreparedInt4SemanticExtraction {
     pub fn source_bytes(&self) -> usize { self.extraction.source().text().len() }
     pub fn semantic_limits(&self) -> SemanticLimits { self.options.limits }
     pub fn max_result_bytes(&self) -> u64 { self.options.limits.max_output_bytes }
+    pub fn input_encoding(&self) -> &UntrustedEncoding { self.extraction.source().document_encoding() }
+    /// Includes the original schema and source; it is never a fresh review allowance.
+    pub fn input_encoding_work(&self) -> Option<SafeBpeWork> { self.extraction.source().input_encoding_work() }
+    pub fn encoding_workspace_bytes(&self) -> Result<u64, Int4SemanticError> {
+        self.judge.document_encoding_workspace_bytes().map_err(Into::into)
+    }
 
     /// The host admits all retained preparation, intermediate results, native
     /// workspace and final output. Every real field plan is compiled and
@@ -178,6 +221,7 @@ impl PreparedInt4SemanticExtraction {
         let count = fields.iter().filter(|f| f.claim.is_some()).count();
         let mut judges = vector(count)?;
         let mut work = Int4Work::default();
+        let mut encoding_work = self.input_encoding_work().unwrap_or_default();
         let s = &self.options.specification;
         let mut logits_left = self.options.limits.max_total_projected_logits;
         // Fixed per-field shares bound the sum of retained exact prompts.
@@ -188,7 +232,8 @@ impl PreparedInt4SemanticExtraction {
             poll(control)?;
             let request = JudgeRequest::Faithfulness { source: copy(self.extraction.source().text())?, claim: copy(claim)?,
                 policy: s.judge_policy, budget: s.judge_budget };
-            let plan = self.judge.plan_semantic_with_control(&request, prompt_share, logits_left, control)?;
+            let plan = self.judge.plan_semantic_with_encoding_work(&request, prompt_share, logits_left,
+                control, &mut encoding_work)?;
             if plan.group_width() != self.group_width() { return Err(Int4SemanticError::Accounting); }
             same_model(self.execution_identity(), plan.execution_identity())?;
             logits_left = logits_left.checked_sub(plan.planned_work().projected_logits).ok_or(Int4SemanticError::WorkBudget)?;
@@ -196,14 +241,16 @@ impl PreparedInt4SemanticExtraction {
             reserve_combined(self.extraction_reserved_work(), work, self.options.max_model_work)?;
             judges.push(plan);
         }
+        Int4SemanticEncoding::from_work(self.input_encoding(), encoding_work)?;
         poll(control)?;
-        Ok(Review { extraction, fields, judges, work })
+        Ok(Review { extraction, fields, judges, work, encoding_work })
     }
     fn finish<C: DecodeStepControl>(&self, review: Review, results: Vec<Int4JudgeRun>, control: &mut C)
         -> Result<Int4SemanticExtractionRun, Int4SemanticError> {
         poll(control)?;
         if results.len() != review.judges.len() { return Err(Int4SemanticError::Accounting); }
         let mut work = Int4Work::default(); let mut scoring = ScoringWork { prefix_evaluations: 0, scored_edges: 0, projected_logits: 0 };
+        let mut encoding_work = self.input_encoding_work().unwrap_or_default();
         let (mut head_count, mut rewound) = (0_usize, 0_u64);
         let mut verified = vector(results.len())?;
         for (plan, run) in review.judges.iter().zip(results) {
@@ -213,6 +260,12 @@ impl PreparedInt4SemanticExtraction {
                 || run.head_count != plan.head_count() {
                 return Err(Int4SemanticError::Accounting);
             }
+            if plan.input_encoding() != self.input_encoding()
+                || plan.input_encoding_work().is_some() != self.input_encoding_work().is_some() {
+                return Err(Int4SemanticError::Accounting);
+            }
+            encoding_work = encoding_work.checked_add(plan.input_encoding_work().unwrap_or_default())
+                .ok_or(Int4SemanticError::Accounting)?;
             let JudgeResult::Faithfulness(result) = run.result else { return Err(Int4SemanticError::Accounting); };
             if result.work.projected_logits != run.model_work.projected_logits {
                 return Err(Int4SemanticError::Accounting);
@@ -223,7 +276,9 @@ impl PreparedInt4SemanticExtraction {
             rewound = rewound.checked_add(run.rewound_positions).ok_or(Int4SemanticError::Accounting)?;
             verified.push(result);
         }
-        if work != review.work { return Err(Int4SemanticError::Accounting); }
+        if work != review.work || encoding_work != review.encoding_work {
+            return Err(Int4SemanticError::Accounting);
+        }
         let attempted = verified.len(); let mut verified = verified.into_iter(); let mut fields = vector(review.fields.len())?;
         let mut checked = 0;
         for field in review.fields {
@@ -251,6 +306,7 @@ impl PreparedInt4SemanticExtraction {
             extraction_reserved_work: self.extraction_reserved_work(), semantic_model_work: work,
             reserved_model_work: reserved, model_work: actual, judge_head_count: head_count,
             rewound_positions: rewound, extraction: review.extraction,
+            input_encoding: Int4SemanticEncoding::from_work(self.input_encoding(), review.encoding_work)?,
             semantic: SemanticVerificationReceipt { schema_version: 1, algorithm: SEMANTIC_VERIFICATION_VERSION.to_owned(),
                 claim_rendering: CLAIM_RENDER_VERSION.to_owned(), judge_algorithm: FAITHFULNESS_VERSION.to_owned(),
                 specification_revision: self.options.specification.revision.clone(),
@@ -304,7 +360,10 @@ fn prepare_fields(prepared: &PreparedInt4BatchExtraction, extraction: &Int4Extra
     let schema = prepared.extraction_plan().semantic_schema(prepared.task_plan(), prepared.source())?;
     claims::render_fields(schema, &value, &options.specification.claims, l).map_err(Into::into)
 }
-struct Review { extraction: Int4ExtractRun, fields: Vec<RenderedField>, judges: Vec<PreparedInt4Judge>, work: Int4Work }
+struct Review {
+    extraction: Int4ExtractRun, fields: Vec<RenderedField>, judges: Vec<PreparedInt4Judge>,
+    work: Int4Work, encoding_work: SafeBpeWork,
+}
 
 #[derive(Serialize)]
 pub struct Int4SemanticExtractionRun {
@@ -320,6 +379,8 @@ pub struct Int4SemanticExtractionRun {
     pub rewound_positions: u64,
     /// Original JSON, native tokens and source evidence are never rewritten.
     pub extraction: Int4ExtractRun,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_encoding: Option<Int4SemanticEncoding>,
     pub semantic: SemanticVerificationReceipt,
 }
 fn poll(control: &mut impl DecodeStepControl) -> Result<(), Int4SemanticError> {

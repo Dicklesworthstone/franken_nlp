@@ -4,7 +4,9 @@ use crate::{
     grammar::mask::MaskWorkLimits,
     execution_identity::Sha256Digest,
     native_engine::{constrained_int4, strict_int4::{Int4Work, STRICT_INT4_PROFILE}},
+    tokenizer::untrusted::{SafeBpeWork, UntrustedEncoding},
     tasks::{extract::ExtractionVocabulary, ir::TaskBudget, judge::JudgeLimits,
+        extract::semantic::grouped_int4::Int4SemanticEncoding,
         source_planning::{SourceTaskResult, grouped_int4::{INT4_SOURCE_EXECUTION, semantic::{
             Int4SourceSemanticError, Int4SourceSemanticRun, PreparedInt4SourceSemantic,
             SourceSemanticInputFacts, SourceSemanticLimits, SourceSemanticStatus,
@@ -41,7 +43,22 @@ impl Int4SourceSemanticHostLimits {
     pub fn requirements(self, width: usize, source: TaskBudget, judge: TaskBudget,
         semantic: SourceSemanticLimits, planning: JudgeLimits, input: SourceSemanticInputFacts)
         -> Result<Int4SourceSemanticHostRequirements, HostedError> {
+        self.requirements_with_encoding(width, source, judge, semantic, planning, input,
+            &UntrustedEncoding::ByteFallback)
+    }
+    /// Quote one shared encoder workspace before capturing private input or
+    /// starting native work. Original source and every review head use the same
+    /// immutable compact policy and reuse this allocation sequentially.
+    #[allow(clippy::too_many_arguments)]
+    pub fn requirements_with_encoding(self, width: usize, source: TaskBudget, judge: TaskBudget,
+        semantic: SourceSemanticLimits, planning: JudgeLimits, input: SourceSemanticInputFacts,
+        encoding: &UntrustedEncoding) -> Result<Int4SourceSemanticHostRequirements, HostedError> {
         self.native.run.validate()?;
+        let encoding_bytes = match encoding {
+            UntrustedEncoding::ByteFallback => 0,
+            UntrustedEncoding::SafeBpeV1(limits) => limits.requirements()
+                .map_err(|_| HostedError::Limits("INT4 semantic source encoding workspace"))?.workspace_bytes,
+        };
         source.validate().map_err(|_| HostedError::Limits("INT4 semantic source budget"))?;
         judge.validate().map_err(|_| HostedError::Limits("INT4 semantic source judge budget"))?;
         semantic.validate().map_err(task_error)?;
@@ -76,7 +93,7 @@ impl Int4SourceSemanticHostLimits {
         let preparation_bytes = sum(&[self.preparation_reserve_bytes, sources, prompts, candidates, ids, plans,
             judge_results, product(source.max_output_bytes, 6)?,
             product(semantic.max_total_claim_bytes as u64, 4)?, product(input.question_bytes as u64, 8)?,
-            product(input.passage_count as u64, 2048)?])?;
+            product(input.passage_count as u64, 2048)?, encoding_bytes])?;
         let native_workspace_bytes = sum(&[native.rope_bytes, native.scratch_payload_bound,
             self.native.allocator_reserve_bytes])?;
         let output_bytes = sum(&[product(semantic.max_output_bytes, 4)?,
@@ -105,6 +122,7 @@ impl NlpEngine {
         let required = checked_requirements(self, model, &prepared, limits)?;
         let width = prepared.group_width(); let source_work = prepared.source_reserved_work();
         let max_work = prepared.max_model_work(); let policy = prepared.policy_digest();
+        let encoding = prepared.input_encoding().clone(); let initial_encoding = prepared.input_encoding_work();
         let task_spec = prepared.execution_identity().task_spec.clone();
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.preparation_bytes)?,
@@ -127,6 +145,7 @@ impl NlpEngine {
                 let run = prepared.execute_with_control(&mut engine.value, &input.value.vocabulary,
                     limits.masks, limits.max_mask_node_visits, control).map_err(task_error)?;
                 check_completion(&run, width, &task_spec, source_work, max_work, policy)?;
+                check_encoding_completion(run.input_encoding.as_ref(), &encoding, initial_encoding)?;
                 if engine.value.is_poisoned() || !engine.value.kv_cache().all_slots_have_len(0) {
                     return Err(task_error(Int4SourceSemanticError::Accounting));
                 }
@@ -153,6 +172,7 @@ impl NlpEngine {
         let required = checked_requirements(self, model, &prepared, limits)?;
         let width = prepared.group_width(); let source_work = prepared.source_reserved_work();
         let max_work = prepared.max_model_work(); let policy = prepared.policy_digest();
+        let encoding = prepared.input_encoding().clone(); let initial_encoding = prepared.input_encoding_work();
         let task_spec = prepared.execution_identity().task_spec.clone();
         sum(&[required.total_bytes()?, int4_task_team_workspace_bytes(compute_threads, width)?])?;
         let lease = self.resources().acquire_lease();
@@ -177,6 +197,7 @@ impl NlpEngine {
                     let run = prepared.execute_with_control(&mut engine.value, &input.value.vocabulary,
                         limits.masks, limits.max_mask_node_visits, control).map_err(task_error)?;
                     check_completion(&run, width, &task_spec, source_work, max_work, policy)?;
+                    check_encoding_completion(run.input_encoding.as_ref(), &encoding, initial_encoding)?;
                     if engine.value.is_poisoned() || !engine.value.kv_cache().all_slots_have_len(0) {
                         return Err(task_error(Int4SourceSemanticError::Accounting));
                     }
@@ -205,8 +226,19 @@ fn checked_requirements(host: &NlpEngine, model: &ResidentInt4,
         || work.forward_positions > limits.native.context_tokens as u64 || !fits(work, prepared.max_model_work()) {
         return Err(HostedError::Limits("INT4 semantic source model and complete generation reservation"));
     }
-    limits.requirements(width, prepared.source_budget(), prepared.judge_budget(),
-        prepared.semantic_limits(), prepared.judge_planning_limits(), prepared.input_facts())
+    limits.requirements_with_encoding(width, prepared.source_budget(), prepared.judge_budget(),
+        prepared.semantic_limits(), prepared.judge_planning_limits(), prepared.input_facts(), prepared.input_encoding())
+}
+fn check_encoding_completion(report: Option<&Int4SemanticEncoding>, policy: &UntrustedEncoding,
+    original: Option<SafeBpeWork>) -> Result<(), HostedError> {
+    let failure = || task_error(Int4SourceSemanticError::Accounting);
+    let work = report.map_or_else(SafeBpeWork::default, |report| report.work);
+    let expected = Int4SemanticEncoding::from_work(policy, work).map_err(|_| failure())?;
+    if report != expected.as_ref() || original.is_some() != expected.is_some()
+        || work.checked_sub(original.unwrap_or_default()).is_none() {
+        return Err(failure());
+    }
+    Ok(())
 }
 fn check_completion(run: &Int4SourceSemanticRun, width: usize, task_spec: &str, source: Int4Work,
     ceiling: Int4Work, policy: Sha256Digest) -> Result<(), HostedError> {
