@@ -99,3 +99,48 @@ fn cancellation_causes_survive_private_error_mapping_and_physical_wrapper_failur
             Int4SemanticError::Cancelled(cause)))), expected);
     }
 }
+
+#[test]
+fn semantic_team_memory_is_one_workspace_at_the_complete_execution_peak() {
+    for width in ["2", "4"] {
+        let (command, mut args, _, options) = super::super::tests::fixture();
+        let matches = compute::definition(clap::Command::new("team"))
+            .try_get_matches_from(["team", "--compute-threads", width]).unwrap();
+        args.compute = compute::Args::from_matches(&matches).unwrap();
+        let common = command.admit_options(&args, command.validate(&args).unwrap(), &options).unwrap();
+        let quote = host_limits(&args, &command, common, Duration::from_secs(1))
+            .requirements(args.group_width, command.extraction.budget(&args, common),
+                options.specification.judge_budget, options.limits, judge_limits(&options), 100).unwrap();
+        let admitted = admit_memory(&args, common, quote).unwrap();
+        let extra = crate::hosted::int4_task_team_workspace_bytes(common.compute.threads, args.group_width).unwrap();
+        assert_eq!(common.compute.workspace_bytes, extra);
+        let execution = quote.total_bytes().unwrap() + extra;
+        let loading = common.source_preparation_bytes + common.load.scratch_payload_bytes;
+        assert_eq!(admitted.minimum_memory_bytes, common.preparation_bytes + common.load.weight_payload_bytes
+            + ALLOCATOR_BYTES + loading.max(execution) + CLEANUP_BYTES);
+        let config = compute::resource_config(admitted);
+        assert_eq!(config.scoped_cpu_children_per_coordinator + 1, common.compute.threads);
+        assert_eq!(config.thread_ceiling, common.compute.threads + 1);
+        let mut insufficient = common; insufficient.memory_bytes = admitted.minimum_memory_bytes - 1;
+        assert_eq!(admit_memory(&args, insufficient, quote).err(), Some(CandidateError::Memory));
+        let mut uncharged = common; uncharged.compute.workspace_bytes = 0;
+        assert_eq!(admit_memory(&args, uncharged, quote).err(), Some(CandidateError::Identity));
+    }
+}
+
+#[test]
+fn optional_worker_receipt_keeps_serial_wire_bytes_and_semantic_payload_unchanged() {
+    let value = serde_json::json!({"output":{"extraction":{"amount":7},
+        "semantic":{"same_model_correlated":true,"fields":[{"status":"contradicted"}]}}});
+    let mut baseline = Vec::new(); publish(&value, 4096, &mut baseline).unwrap();
+    let mut serial = Vec::new();
+    publish(&compute::Response { response: &value, compute: None }, 4096, &mut serial).unwrap();
+    assert_eq!(serial, baseline);
+    let receipt = crate::hosted::Int4ComputeReceipt { schedule: "int4-output-row-team-v1",
+        compute_threads: 4, completed_projections: 42, completed_rows: 128, completed_worker_rows: 96 };
+    let mut threaded = Vec::new();
+    publish(&compute::Response { response: &value, compute: Some(&receipt) }, 4096, &mut threaded).unwrap();
+    let wire: serde_json::Value = serde_json::from_slice(&threaded).unwrap();
+    assert_eq!(wire["output"], value["output"]);
+    assert_eq!(wire["compute"], serde_json::to_value(receipt).unwrap());
+}

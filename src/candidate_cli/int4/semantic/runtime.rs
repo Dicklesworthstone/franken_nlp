@@ -2,7 +2,7 @@
 use super::*;
 use std::{sync::Arc, time::{Duration, Instant}};
 use crate::{
-    NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
+    NlpEngine, MemoryClass,
     batch::{BatchDocument, extract::{ExtractionBatchArgs, ExtractionBatchGrounding,
         grouped_int4::Int4ExtractionBatchPlanner}},
     grammar::runtime::JsonProgram,
@@ -51,12 +51,8 @@ pub(super) fn execute(args: Int4Args, command: SemanticArgs, _admitted: Int4Limi
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: common.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().map_err(|_| CandidateError::Runtime)?;
+    let engine = NlpEngine::builder().resource_config(compute::resource_config(common))
+        .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
     // This charge owns all CLI inputs/planners and remains through write/flush.
     let _preparation = lease.reserve(MemoryClass::JobBuffers, common.preparation_bytes)
@@ -128,9 +124,14 @@ pub(super) fn execute(args: Int4Args, command: SemanticArgs, _admitted: Int4Limi
         if pin != model.model_identity().snapshot_pin() { return Err(CandidateError::Identity); }
         snapshot = Some(SnapshotRecord::new("saved", common.snapshot_need));
     }
-    let result = engine.execute_int4_semantic_extract(&model, prepared, vocabulary,
-        host_limits(&args, &command, common, remaining()?), common.kernel, cancellation)
-        .map_err(execution_error)?;
+    let limits = host_limits(&args, &command, common, remaining()?);
+    let result = if common.compute.threads > 1 {
+        compute::Completion::Team(engine.execute_int4_semantic_extract_with_threads(&model, prepared,
+            vocabulary, limits, common.kernel, common.compute.threads, cancellation).map_err(execution_error)?)
+    } else {
+        compute::Completion::serial(engine.execute_int4_semantic_extract(&model, prepared,
+            vocabulary, limits, common.kernel, cancellation).map_err(execution_error)?)
+    };
     check_result(result.result(), args.group_width, extraction_reserved, native_work)?;
     remaining()?;
     let content = identity.logical_model_digest.to_hex();
@@ -145,6 +146,7 @@ pub(super) fn execute(args: Int4Args, command: SemanticArgs, _admitted: Int4Limi
     };
     // The guarded combined result stays borrowed through serialization and
     // delivery. No per-field prefix or error-shaped success is published.
+    let response = compute::Response { response: &response, compute: result.compute() };
     publish_checked(&response, common.result_bytes.checked_add(4096).ok_or(CandidateError::Memory)?,
         output, &|| remaining().map(|_| ()))
 }
@@ -175,11 +177,16 @@ fn host_limits(args: &Int4Args, command: &SemanticArgs, common: Int4Limits, rema
 }
 fn admit_memory(args: &Int4Args, mut common: Int4Limits, quote: Int4SemanticHostRequirements)
     -> Result<Int4Limits, CandidateError> {
-    if quote.native != common.native { return Err(CandidateError::Identity); }
+    if quote.native != common.native || common.compute != args.compute.admit(args.group_width)? {
+        return Err(CandidateError::Identity);
+    }
     let load = if common.snapshot_pin.is_some() { common.snapshot_need.scratch_bytes }
         else { sum(&[common.source_preparation_bytes, common.load.scratch_payload_bytes])? };
     let save = if args.save_snapshot.is_some() { common.snapshot_need.scratch_bytes } else { 0 };
-    let execute = quote.total_bytes().map_err(|_| CandidateError::Memory)?;
+    // The dispatcher owns exactly one worker workspace across both stages.
+    // It is additional to the complete serial quote, never renewed per judge.
+    let execute = sum(&[quote.total_bytes().map_err(|_| CandidateError::Memory)?,
+        common.compute.workspace_bytes])?;
     common.minimum_memory_bytes = sum(&[common.preparation_bytes, common.load.weight_payload_bytes,
         ALLOCATOR_BYTES, load.max(save).max(execute), CLEANUP_BYTES])?;
     if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Memory); }

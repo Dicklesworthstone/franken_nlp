@@ -168,3 +168,31 @@ fn arguments_debug_omits_private_paths_and_claim_options() {
     semantic.semantic_options = PathBuf::from("PRIVATE_CLAIM_SPEC.json");
     assert_eq!(format!("{semantic:?}"), "SemanticArgs");
 }
+
+#[test]
+fn persistent_workers_are_explicit_and_do_not_change_semantic_budgets() {
+    let (_, _, _, options) = fixture();
+    for width in ["1", "2", "4"] {
+        let command = command(&["--compute-threads", width]);
+        let Int4Task::Semantic(semantic) = command.task else { panic!("wrong semantic route"); };
+        let args = command.args;
+        let common = semantic.validate(&args).unwrap();
+        let admitted = semantic.admit_options(&args, common, &options).unwrap();
+        assert_eq!(admitted.compute.threads, width.parse::<usize>().unwrap());
+        assert_eq!(admitted.compute, common.compute);
+        assert_eq!(semantic.extraction.budget(&args, admitted), semantic.extraction.budget(&args, common));
+        assert_eq!(admitted.compute.workspace_bytes == 0, width == "1");
+        assert!(admitted.prefill.is_none() && admitted.cohort.is_none());
+    }
+    for width in ["0", "65"] {
+        assert_eq!(command(&["--compute-threads", width]).execute(&mut NoRead, &mut Vec::new()),
+            Err(CandidateError::Arguments));
+    }
+    for flags in [vec!["--compute-threads", "2", "--prefill-rows", "1"],
+        vec!["--compute-threads", "2", "--cohort-documents", "2"],
+        vec!["--compute-threads", "2", "--max-selected-rows", "8"]] {
+        if let Ok(matches) = crate::candidate_cli::definition().try_get_matches_from(argv(&flags)) {
+            assert!(CandidateCommand::from_matches(&matches).is_err());
+        }
+    }
+}

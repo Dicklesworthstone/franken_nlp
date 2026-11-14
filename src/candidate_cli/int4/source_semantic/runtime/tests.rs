@@ -200,3 +200,57 @@ fn typed_cancellation_memory_and_identity_failures_keep_their_public_error_class
     assert_eq!(execution_error(HostedError::ResourceDomain), CandidateError::Identity);
     assert_eq!(execution_error(HostedError::Limits("refused")), CandidateError::Execution);
 }
+
+#[test]
+fn semantic_source_teams_price_one_workspace_and_the_installed_thread_envelope() {
+    for kind in [Kind::Summarize, Kind::Answer] {
+        for width in ["2", "4"] {
+            let (command, mut args, _, options) = super::super::tests::fixture(kind);
+            let matches = compute::definition(clap::Command::new("team"))
+                .try_get_matches_from(["team", "--compute-threads", width]).unwrap();
+            args.compute = compute::Args::from_matches(&matches).unwrap();
+            let common = command.admit_options(&args, command.validate(&args).unwrap(), &options).unwrap();
+            let facts = SourceSemanticInputFacts { source_bytes: 100,
+                question_bytes: if kind == Kind::Answer { 20 } else { 0 },
+                passage_count: if kind == Kind::Answer { 2 } else { 0 } };
+            let quote = host_limits(&args, &command, common, Duration::from_secs(1))
+                .requirements(args.group_width, command.source.budget(&args, common), options.judge_budget,
+                    options.limits, judge_limits(&options), facts).unwrap();
+            let admitted = admit_memory(&args, common, quote).unwrap();
+            let extra = crate::hosted::int4_task_team_workspace_bytes(common.compute.threads, args.group_width).unwrap();
+            assert_eq!(common.compute.workspace_bytes, extra);
+            let execution = quote.total_bytes().unwrap() + extra;
+            let loading = common.source_preparation_bytes + common.load.scratch_payload_bytes;
+            assert_eq!(admitted.minimum_memory_bytes, common.preparation_bytes + common.load.weight_payload_bytes
+                + ALLOCATOR_BYTES + loading.max(execution) + CLEANUP_BYTES);
+            let config = compute::resource_config(admitted);
+            assert_eq!(config.scoped_cpu_children_per_coordinator + 1, common.compute.threads);
+            assert_eq!(config.thread_ceiling, common.compute.threads + 1);
+            let mut insufficient = common; insufficient.memory_bytes = admitted.minimum_memory_bytes - 1;
+            assert_eq!(admit_memory(&args, insufficient, quote).err(), Some(CandidateError::Memory));
+            let mut uncharged = common; uncharged.compute.workspace_bytes = 0;
+            assert_eq!(admit_memory(&args, uncharged, quote).err(), Some(CandidateError::Identity));
+        }
+    }
+}
+
+#[test]
+fn physical_review_statistics_do_not_change_serial_payloads_or_allow_expired_publication() {
+    let value = serde_json::json!({"output":{"source_task":{"result":{"semantic_support":"not_assessed"}},
+        "semantic":{"same_model_correlated":true,"statements":[{"status":"unsupported"}]}}});
+    let mut baseline = Vec::new(); publish_checked(&value, 4096, &mut baseline, &|| Ok(())).unwrap();
+    let mut serial = Vec::new();
+    publish_checked(&compute::Response { response: &value, compute: None }, 4096, &mut serial, &|| Ok(())).unwrap();
+    assert_eq!(serial, baseline);
+    let receipt = crate::hosted::Int4ComputeReceipt { schedule: "int4-output-row-team-v1",
+        compute_threads: 2, completed_projections: 17, completed_rows: 100, completed_worker_rows: 50 };
+    let response = compute::Response { response: &value, compute: Some(&receipt) };
+    let mut threaded = Vec::new(); publish_checked(&response, 4096, &mut threaded, &|| Ok(())).unwrap();
+    let wire: serde_json::Value = serde_json::from_slice(&threaded).unwrap();
+    assert_eq!(wire["output"], value["output"]);
+    assert_eq!(wire["compute"], serde_json::to_value(receipt).unwrap());
+    let mut refused = Vec::new();
+    assert_eq!(publish_checked(&response, 4096, &mut refused, &|| Err(CandidateError::Timeout)),
+        Err(CandidateError::Timeout));
+    assert!(refused.is_empty());
+}

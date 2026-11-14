@@ -1,4 +1,4 @@
-//! Controller-only native composition comparison; source is not run evidence.
+//! Controller-only serial/team composition comparison; source is not run evidence.
 use super::*;
 use crate::{
     hosted::Int4JudgeHostLimits,
@@ -14,7 +14,7 @@ fn command(name: &str, snapshot: &str, pin: &str, memory: &str, kernel: &str)
         "candidate", "source-int4", name, "--snapshot", snapshot,
         "--expected-model-sha256", pin, "--memory-mib", memory, "--kernel", kernel,
         "--semantic-options", "fixture-options-not-read.json", "--context-tokens", "2048",
-        "--max-new-tokens", "512", "--timeout-seconds", "86400",
+        "--max-new-tokens", "512", "--timeout-seconds", "86400", "--compute-threads", "4",
     ]).unwrap();
     let CandidateCommand::SourceInt4(Int4Command {
         task: Int4Task::SourceSemantic(kind, command), args, batch: None, job: None,
@@ -49,8 +49,8 @@ fn prepare(kind: Kind, command: &SemanticSourceArgs, args: &Int4Args,
 }
 
 #[test]
-#[ignore = "run alone with a controller-admitted independently pinned snapshot for source/review native composition parity"]
-fn snapshot_source_review_preserves_direct_results_matches_individual_judges_and_releases_owners() {
+#[ignore = "run alone with a controller-admitted independently pinned snapshot for serial/team source/review parity"]
+fn snapshot_source_review_matches_individual_judges_and_persistent_teams_then_releases_owners() {
     assert!(crate::installed_process_resources().is_none(), "fixture requires a fresh process");
     let snapshot = std::env::var("FNLP_INT4_PREFILL_SNAPSHOT").expect("explicit existing snapshot required");
     let pin = std::env::var("FNLP_INT4_PREFILL_MODEL_SHA256").expect("independent model-content pin required");
@@ -67,12 +67,11 @@ fn snapshot_source_review_preserves_direct_results_matches_individual_judges_and
         policy.judge_budget, policy.limits, judge_limits(&policy), ceiling).unwrap();
     let common = admit_memory(&base_args, common, quote).unwrap();
     assert_eq!(kind, Kind::Summarize);
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: common.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().unwrap();
+    // Admit the widest tested numerical team before model IO. Direct serial
+    // calls below retain their existing schedule on this same resource host.
+    assert_eq!(common.compute.threads, 4);
+    let engine = NlpEngine::builder().resource_config(
+        crate::candidate_cli::int4::compute::resource_config(common)).build().unwrap();
     let idle = engine.resources().memory_snapshot();
     let lease = engine.resources().acquire_lease();
     let preparation = lease.reserve(MemoryClass::JobBuffers, common.preparation_bytes).unwrap().commit().unwrap();
@@ -116,7 +115,7 @@ fn snapshot_source_review_preserves_direct_results_matches_individual_judges_and
 
             let (source, vocabulary) = prepare(kind, &command, &args, &model, &request, &mut control);
             let judge = Int4JudgePlanner::for_model(model.model_identity(), policy.judge_budget, judge_limits(&policy)).unwrap();
-            let prepared = PreparedInt4SourceSemantic::new(source, request, judge, policy.clone(), &mut control).unwrap();
+            let prepared = PreparedInt4SourceSemantic::new(source, request.clone(), judge, policy.clone(), &mut control).unwrap();
             let result = engine.execute_int4_semantic_source(&model, prepared, vocabulary, host,
                 common.kernel, CancellationToken::default()).unwrap();
             let run = result.result();
@@ -152,10 +151,60 @@ fn snapshot_source_review_preserves_direct_results_matches_individual_judges_and
             assert_eq!(run.semantic_model_work, review_work);
             assert_eq!(run.judge_head_count, heads);
             assert_eq!(run.rewound_positions, rewound);
+            let serial = crate::canonjson::canonical_bytes(run).unwrap();
+            let serial_work = run.model_work;
             drop(result);
             assert_eq!(engine.resources().memory_snapshot(), resident);
             let closures = engine.resources().outstanding_closure_snapshot();
             assert_eq!(closures.active_closures, 0); assert_eq!(closures.wrapper_cancelled_closures, 0);
+
+            let mut projection_counts = None;
+            for threads in [2, 4] {
+                let (source, vocabulary) = prepare(kind, &command, &args, &model, &request, &mut control);
+                let judge = Int4JudgePlanner::for_model(model.model_identity(),
+                    policy.judge_budget, judge_limits(&policy)).unwrap();
+                let prepared = PreparedInt4SourceSemantic::new(source, request.clone(), judge,
+                    policy.clone(), &mut control).unwrap();
+                let team = engine.execute_int4_semantic_source_with_threads(&model, prepared,
+                    vocabulary, host, common.kernel, threads, CancellationToken::default()).unwrap();
+                // Compare the COMPLETE composition: original generation,
+                // every review verdict/evidence item and all semantic work.
+                assert_eq!(crate::canonjson::canonical_bytes(team.result()).unwrap(), serial);
+                assert_eq!(team.result().model_work, serial_work);
+                assert_eq!(crate::canonjson::canonical_bytes(&team.result().source_task).unwrap(), original);
+                let receipt = team.compute();
+                assert_eq!(receipt.schedule, "int4-output-row-team-v1");
+                assert_eq!(receipt.compute_threads, threads);
+                assert!(receipt.completed_projections > 0 && receipt.completed_worker_rows > 0);
+                assert!(receipt.completed_worker_rows <= receipt.completed_rows);
+                let counts = (receipt.completed_projections, receipt.completed_rows);
+                if let Some(expected) = projection_counts { assert_eq!(counts, expected); }
+                else { projection_counts = Some(counts); }
+                // A returned result owns output storage, while physical work
+                // and all scoped children have already drained.
+                assert_ne!(engine.resources().memory_snapshot(), resident);
+                let closures = engine.resources().outstanding_closure_snapshot();
+                assert_eq!(closures.active_closures, 0);
+                assert_eq!(closures.wrapper_cancelled_closures, 0);
+                drop(team);
+                assert_eq!(engine.resources().memory_snapshot(), resident);
+            }
+
+            let (source, vocabulary) = prepare(kind, &command, &args, &model, &request, &mut control);
+            let judge = Int4JudgePlanner::for_model(model.model_identity(),
+                policy.judge_budget, judge_limits(&policy)).unwrap();
+            let prepared = PreparedInt4SourceSemantic::new(source, request, judge,
+                policy.clone(), &mut control).unwrap();
+            let cancelled = CancellationToken::default();
+            cancelled.cancel(DecodeCancellationKind::User);
+            let error = engine.execute_int4_semantic_source_with_threads(&model, prepared,
+                vocabulary, host, common.kernel, 4, cancelled).err().expect("cancelled request has no result");
+            assert!(matches!(error, HostedError::Stopped { ref stop, .. }
+                if stop.kind == DecodeCancellationKind::User));
+            assert_eq!(engine.resources().memory_snapshot(), resident);
+            let closures = engine.resources().outstanding_closure_snapshot();
+            assert_eq!(closures.active_closures, 0);
+            assert_eq!(closures.wrapper_cancelled_closures, 0);
         }
         // This fixture must exercise actual review inference. No particular
         // relation is asserted, and no accuracy or calibration claim follows.

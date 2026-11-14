@@ -66,13 +66,13 @@ fn each_explicit_task_supports_both_model_inputs_without_enabling_review_on_ordi
 }
 
 #[test]
-fn incompatible_generation_projection_encoding_and_worker_options_refuse_before_io() {
+fn incompatible_generation_projection_and_encoding_options_refuse_before_io() {
     let seed = "ab".repeat(32);
     for name in ["summarize-semantic", "answer-semantic"] {
         for flags in [vec!["--seed", seed.as_str()], vec!["--logprobs"], vec!["--stop", "END"],
             vec!["--prefill-rows", "1"], vec!["--presence-penalty-milli", "0"],
             vec!["--max-output-bytes", "65536"], vec!["--max-selected-rows", "166144"],
-            vec!["--compute-threads", "2"], vec!["--cohort-documents", "2"],
+            vec!["--cohort-documents", "2"],
             vec!["--input-encoding", "safe-bpe-v1"], vec!["--think"], vec!["--tools", "tools.json"],
             vec!["--retry", "1"]] {
             if let Ok(matches) = crate::candidate_cli::definition().try_get_matches_from(argv(name, &flags)) {
@@ -194,4 +194,35 @@ fn input_ceiling_retains_all_qa_dimensions_and_debug_redacts_paths() {
     assert!(input_ceiling(Kind::Ner, &args, &options).is_err());
     semantic.semantic_options = PathBuf::from("PRIVATE_REVIEW_POLICY.json");
     assert_eq!(format!("{semantic:?}"), "SemanticSourceArgs");
+}
+
+#[test]
+fn both_source_reviews_admit_one_explicit_team_without_multiplying_task_budgets() {
+    for (name, kind) in [("summarize-semantic", Kind::Summarize), ("answer-semantic", Kind::Answer)] {
+        let (_, _, _, options) = fixture(kind);
+        for width in ["1", "2", "4"] {
+            let command = command(name, &["--compute-threads", width]);
+            let Int4Task::SourceSemantic(actual, semantic) = command.task else { panic!("wrong semantic route"); };
+            assert_eq!(actual, kind);
+            let args = command.args;
+            let common = semantic.validate(&args).unwrap();
+            let admitted = semantic.admit_options(&args, common, &options).unwrap();
+            assert_eq!(admitted.compute.threads, width.parse::<usize>().unwrap());
+            assert_eq!(admitted.compute, common.compute);
+            assert_eq!(semantic.source.budget(&args, admitted), semantic.source.budget(&args, common));
+            assert_eq!(admitted.compute.workspace_bytes == 0, width == "1");
+            assert!(admitted.prefill.is_none() && admitted.cohort.is_none());
+        }
+        for width in ["0", "65"] {
+            assert_eq!(command(name, &["--compute-threads", width]).execute(&mut NoIo, &mut NoIo),
+                Err(CandidateError::Arguments));
+        }
+        for flags in [vec!["--compute-threads", "2", "--prefill-rows", "1"],
+            vec!["--compute-threads", "2", "--cohort-documents", "2"],
+            vec!["--compute-threads", "2", "--max-selected-rows", "8"]] {
+            if let Ok(matches) = crate::candidate_cli::definition().try_get_matches_from(argv(name, &flags)) {
+                assert!(CandidateCommand::from_matches(&matches).is_err());
+            }
+        }
+    }
 }

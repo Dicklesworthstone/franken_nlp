@@ -24,9 +24,9 @@ impl std::fmt::Debug for SemanticArgs {
 }
 
 pub(super) fn definition() -> clap::Command {
-    extract::definition().name("extract-semantic")
+    compute::definition(extract::definition()).name("extract-semantic")
         .about("Experimentally review extracted scalar claims with the same INT4 model")
-        .long_about("Extract schema-valid JSON from one exact source, then run the existing full-source faithfulness judge for every configured non-verbatim scalar claim. --semantic-options is a complete Int4SemanticOptions JSON object with experimental_opt_in=true, schema-aware claim rules, an explicit judge policy/budget, semantic limits and five-axis whole-request native work limits. The original extraction is retained unchanged alongside entailed/contradicted/unsupported/not_checked diagnostics. Null, verbatim, unmapped and empty values are not_checked; absent optional properties are not invented. Every dynamic field judge is planned and preflighted before the first second-reader forward. The maximum original extraction reservation plus all field judgments share one nonrenewable work allowance. Failure yields no combined result. This is an uncalibrated same-model-correlated diagnostic, not independent proof, automatic acceptance or field repair. No sampling, thinking, tools, retry, durable resume, inference network, release activation or quality claim. Source conversion and digest-pinned snapshots share the actual native path. Optional snapshot save occurs only after fixed-policy and memory admission; dynamic claims are available only after extraction.")
+        .long_about("Extract schema-valid JSON from one exact source, then run the existing full-source faithfulness judge for every configured non-verbatim scalar claim. --semantic-options is a complete Int4SemanticOptions JSON object with experimental_opt_in=true, schema-aware claim rules, an explicit judge policy/budget, semantic limits and five-axis whole-request native work limits. The original extraction is retained unchanged alongside entailed/contradicted/unsupported/not_checked diagnostics. Null, verbatim, unmapped and empty values are not_checked; absent optional properties are not invented. Every dynamic field judge is planned and preflighted before the first second-reader forward. The maximum original extraction reservation plus all field judgments share one nonrenewable work allowance. --compute-threads N keeps one admitted numerical team across extraction and all field judgments; physical counters are reported separately from the unchanged semantic result. Worker scratch is admitted before input/model IO and every worker joins before completion. Failure yields no combined result. This is an uncalibrated same-model-correlated diagnostic, not independent proof, automatic acceptance or field repair. No sampling, thinking, tools, retry, durable resume, inference network, release activation or quality claim. Source conversion and digest-pinned snapshots share the actual native path. Optional snapshot save occurs only after fixed-policy and memory admission; dynamic claims are available only after extraction.")
         .arg(clap::Arg::new("semantic_options").long("semantic-options").required(true)
             .value_name("FILE").value_parser(clap::value_parser!(PathBuf))
             .help("Complete explicit experimental Int4SemanticOptions JSON; local file, never stdin"))
@@ -41,7 +41,10 @@ impl SemanticArgs {
     }
     pub(super) fn validate(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
         crate::candidate_cli::extract::check_schema_path(&self.semantic_options)?;
-        let common = self.extraction.validate(args)?;
+        if args.prefill()?.is_some() || !args.input_encoding.is_default() {
+            return Err(CandidateError::Arguments);
+        }
+        let common = self.extraction.validate_batch_with_prefill(args)?;
         self.storage(args, common, common.result_bytes)
     }
     fn storage(&self, args: &Int4Args, original: Int4Limits, result_bytes: usize)
@@ -52,7 +55,7 @@ impl SemanticArgs {
             OPTIONS_BYTES as u64 * 16])?;
         // Configuration/claim templates are caller-owned private data. The
         // complete combined output, not just the first-stage JSON, is priced.
-        args.validate_storage(result_bytes, args.max_new_tokens, original.max_prompt_tokens, 0, extra)
+        args.validate_source_storage(result_bytes, args.max_new_tokens, original.max_prompt_tokens, extra)
     }
     fn admit_options(&self, args: &Int4Args, common: Int4Limits, options: &Int4SemanticOptions)
         -> Result<Int4Limits, CandidateError> {

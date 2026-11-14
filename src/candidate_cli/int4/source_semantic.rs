@@ -18,9 +18,9 @@ impl std::fmt::Debug for SemanticSourceArgs {
 }
 pub(super) fn definitions() -> Vec<clap::Command> {
     [(Kind::Summarize, "summarize-semantic"), (Kind::Answer, "answer-semantic")].into_iter().map(|(kind, name)| {
-        source::definition(kind).name(name)
+        compute::definition(source::definition(kind)).name(name)
             .about("Generate a cited source result and explicitly review it against the complete original evidence")
-            .long_about("Run the existing cited-summary or passage-answer task, then the native faithfulness judge for each complete summary bullet or the complete question/answer pair. --semantic-options supplies a complete Int4SourceSemanticOptions JSON with experimental_opt_in=true, explicit judge policy/budget, statement limits and five-axis whole-request work ceilings. The original source result, generated tokens, citations and semantic_support=not_assessed remain unchanged. Separate entailed/contradicted/unsupported/judge_abstained/not_checked diagnostics are uncalibrated and same-model correlated. Review sees the COMPLETE original document or all original passages, not just the displayed citations; it does not certify citation-only entailment or atomize every material claim. Question and passage IDs are not evidence. Question/answer claim rendering and the exact passage layout are versioned and bound to the original request. An abstained answer or empty summary is explicitly not_checked; failed decoding, review admission, cancellation or native execution never becomes abstention. All dynamic judgments must compile and preflight before any review forward. One native engine and one nonrenewable source-reservation-plus-review work allowance cover the complete result. Source conversion and independently pinned snapshots share the route. Optional snapshot saving follows fixed-policy, evidence and memory admission. No repair, retry, selected output rows, prompt prefill, CPU team, compact input encoding, sampling, thinking, tools or durable resume. Blocking IO observes one end-to-end deadline cooperatively.")
+            .long_about("Run the existing cited-summary or passage-answer task, then the native faithfulness judge for each complete summary bullet or the complete question/answer pair. --semantic-options supplies a complete Int4SourceSemanticOptions JSON with experimental_opt_in=true, explicit judge policy/budget, statement limits and five-axis whole-request work ceilings. The original source result, generated tokens, citations and semantic_support=not_assessed remain unchanged. Separate entailed/contradicted/unsupported/judge_abstained/not_checked diagnostics are uncalibrated and same-model correlated. Review sees the COMPLETE original document or all original passages, not just the displayed citations; it does not certify citation-only entailment or atomize every material claim. Question and passage IDs are not evidence. Question/answer claim rendering and the exact passage layout are versioned and bound to the original request. An abstained answer or empty summary is explicitly not_checked; failed decoding, review admission, cancellation or native execution never becomes abstention. All dynamic judgments must compile and preflight before any review forward. One native engine and one nonrenewable source-reservation-plus-review work allowance cover the complete result. --compute-threads N keeps one admitted numerical team across source generation and every complete-statement judgment. Worker scratch is quoted before private input/model IO; separate physical counters describe actual projections and all workers join before completion. Source conversion and independently pinned snapshots share the route. Optional snapshot saving follows fixed-policy, evidence and memory admission. No repair, retry, selected output rows, prompt prefill, compact input encoding, sampling, thinking, tools or durable resume. Blocking IO observes one end-to-end deadline cooperatively.")
             .arg(clap::Arg::new("semantic_options").long("semantic-options").required(true)
                 .value_name("FILE").value_parser(clap::value_parser!(PathBuf))
                 .help("Complete explicit Int4SourceSemanticOptions JSON; bounded local file, never stdin"))
@@ -40,7 +40,10 @@ impl SemanticSourceArgs {
         if remote(&self.semantic_options) || self.source.options_path().is_some_and(remote) {
             return Err(CandidateError::Arguments);
         }
-        let common = self.source.validate(args)?;
+        if args.prefill()?.is_some() || !args.input_encoding.is_default() {
+            return Err(CandidateError::Arguments);
+        }
+        let common = self.source.validate_batch_with_prefill(args)?;
         self.storage(args, common, common.result_bytes)
     }
     fn storage(&self, args: &Int4Args, original: Int4Limits, result_bytes: usize)
@@ -48,7 +51,7 @@ impl SemanticSourceArgs {
         let source = self.source.budget(args, original);
         let extra = sum(&[128 * MIB, crate::candidate_cli::source::OPTIONS_BYTES as u64 * 16,
             source.max_output_bytes * 16, u64::from(source.max_grammar_states) * 32, OPTIONS_BYTES as u64 * 16])?;
-        args.validate_storage(result_bytes, args.max_new_tokens, original.max_prompt_tokens, 0, extra)
+        args.validate_source_storage(result_bytes, args.max_new_tokens, original.max_prompt_tokens, extra)
     }
     fn admit_options(&self, args: &Int4Args, common: Int4Limits, options: &Int4SourceSemanticOptions)
         -> Result<Int4Limits, CandidateError> {
