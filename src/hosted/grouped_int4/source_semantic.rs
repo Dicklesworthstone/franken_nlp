@@ -102,20 +102,10 @@ impl NlpEngine {
         vocabulary: Arc<ExtractionVocabulary>, limits: Int4SourceSemanticHostLimits, kernel: PackedInt4Kernel,
         cancellation: CancellationToken) -> Result<HostedOutput<Int4SourceSemanticRun>, HostedError> {
         dispatch::preflight(self, limits.native.run)?;
-        if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
-        for identity in [prepared.execution_identity(), prepared.judge_identity()] {
-            constrained_int4::check_model(identity, model.model_identity()).map_err(|_| HostedError::ModelIdentity)?;
-        }
+        let required = checked_requirements(self, model, &prepared, limits)?;
         let width = prepared.group_width(); let source_work = prepared.source_reserved_work();
         let max_work = prepared.max_model_work(); let policy = prepared.policy_digest();
         let task_spec = prepared.execution_identity().task_spec.clone();
-        if width != model.model_identity().group_width() || !matches!(task_spec.as_str(), "summarize-v1" | "answer-v1")
-            || prepared.judge_identity().task_spec != "judge-v1" || source_work.forward_positions == 0
-            || source_work.forward_positions > limits.native.context_tokens as u64 || !fits(source_work, max_work) {
-            return Err(HostedError::Limits("INT4 semantic source model and complete generation reservation"));
-        }
-        let required = limits.requirements(width, prepared.source_budget(), prepared.judge_budget(),
-            prepared.semantic_limits(), prepared.judge_planning_limits(), prepared.input_facts())?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.preparation_bytes)?,
             || Ok(Input { prepared: Some(prepared), vocabulary }))?;
@@ -147,6 +137,76 @@ impl NlpEngine {
             Ok(GuardedOutput::new(result.value, result._memory))
         })
     }
+
+    /// Keep one fixed numerical team through source generation and every
+    /// complete-statement judgment. The unchanged sealed composition owns
+    /// one source reservation, review allowance and cancellation lifetime.
+    /// Worker workspace is admitted once and workers physically join before
+    /// the complete guarded source result and diagnostics return.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_int4_semantic_source_with_threads(&self, model: &ResidentInt4,
+        prepared: PreparedInt4SourceSemantic, vocabulary: Arc<ExtractionVocabulary>,
+        limits: Int4SourceSemanticHostLimits, kernel: PackedInt4Kernel, compute_threads: usize,
+        cancellation: CancellationToken)
+        -> Result<HostedInt4TeamResult<Int4SourceSemanticRun>, HostedError> {
+        dispatch::preflight_int4_team(self, limits.native.run, compute_threads)?;
+        let required = checked_requirements(self, model, &prepared, limits)?;
+        let width = prepared.group_width(); let source_work = prepared.source_reserved_work();
+        let max_work = prepared.max_model_work(); let policy = prepared.policy_digest();
+        let task_spec = prepared.execution_identity().task_spec.clone();
+        sum(&[required.total_bytes()?, int4_task_team_workspace_bytes(compute_threads, width)?])?;
+        let lease = self.resources().acquire_lease();
+        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.preparation_bytes)?,
+            || Ok(Input { prepared: Some(prepared), vocabulary }))?;
+        let output = Pending::reserve(&lease, MemoryClass::JobBuffers, required.output_bytes)?;
+        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
+        let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.native_workspace_bytes)?;
+        dispatch::run_int4_team(self, limits.native.run, cancellation, model.clone(), compute_threads,
+            kernel, move |weights, control, team| {
+                let mut input = input;
+                checkpoint(control)?;
+                let prepared = input.value.prepared.take().ok_or(HostedError::CompletionMissing)?;
+                let mut engine = allocate_native(kv, scratch, || {
+                    StrictInt4Engine::new(weights, limits.native.context_tokens, Int4MemoryBudget {
+                        max_kv_bytes: required.native.kv_bytes, max_rope_bytes: required.native.rope_bytes,
+                        max_scratch_payload_bytes: required.native.scratch_payload_bound,
+                    }).map_err(native_error)?.with_kernel(kernel)
+                        .with_projection_executor(team).map_err(native_error)
+                })?;
+                let result = allocate(output, || {
+                    let run = prepared.execute_with_control(&mut engine.value, &input.value.vocabulary,
+                        limits.masks, limits.max_mask_node_visits, control).map_err(task_error)?;
+                    check_completion(&run, width, &task_spec, source_work, max_work, policy)?;
+                    if engine.value.is_poisoned() || !engine.value.kv_cache().all_slots_have_len(0) {
+                        return Err(task_error(Int4SourceSemanticError::Accounting));
+                    }
+                    checkpoint(control)?;
+                    Ok(run)
+                })?;
+                drop(engine);
+                let compute = team.stats().into();
+                drop(input); drop(lease);
+                Ok(HostedInt4TeamResult::new(GuardedOutput::new(result.value, result._memory), compute))
+            })
+    }
+}
+
+fn checked_requirements(host: &NlpEngine, model: &ResidentInt4,
+    prepared: &PreparedInt4SourceSemantic, limits: Int4SourceSemanticHostLimits)
+    -> Result<Int4SourceSemanticHostRequirements, HostedError> {
+    if !Arc::ptr_eq(host.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
+    for identity in [prepared.execution_identity(), prepared.judge_identity()] {
+        constrained_int4::check_model(identity, model.model_identity()).map_err(|_| HostedError::ModelIdentity)?;
+    }
+    let width = prepared.group_width(); let work = prepared.source_reserved_work();
+    if width != model.model_identity().group_width()
+        || !matches!(prepared.execution_identity().task_spec.as_str(), "summarize-v1" | "answer-v1")
+        || prepared.judge_identity().task_spec != "judge-v1" || work.forward_positions == 0
+        || work.forward_positions > limits.native.context_tokens as u64 || !fits(work, prepared.max_model_work()) {
+        return Err(HostedError::Limits("INT4 semantic source model and complete generation reservation"));
+    }
+    limits.requirements(width, prepared.source_budget(), prepared.judge_budget(),
+        prepared.semantic_limits(), prepared.judge_planning_limits(), prepared.input_facts())
 }
 fn check_completion(run: &Int4SourceSemanticRun, width: usize, task_spec: &str, source: Int4Work,
     ceiling: Int4Work, policy: Sha256Digest) -> Result<(), HostedError> {

@@ -162,5 +162,7 @@ fn sealed_preparation_vocabulary_and_combined_output_can_cross_one_owned_boundar
     fn send<T: Send + 'static>() {}
     send::<Input>(); send::<PreparedInt4SourceSemantic>(); send::<Int4SourceSemanticRun>();
     send::<Arc<ExtractionVocabulary>>();
+    send::<HostedInt4TeamResult<Int4SourceSemanticRun>>();
     let _entry = NlpEngine::execute_int4_semantic_source;
+    let _team_entry = NlpEngine::execute_int4_semantic_source_with_threads;
 }

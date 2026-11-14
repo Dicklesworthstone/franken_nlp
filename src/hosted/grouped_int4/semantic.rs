@@ -120,20 +120,10 @@ impl NlpEngine {
         limits: Int4SemanticHostLimits, kernel: PackedInt4Kernel, cancellation: CancellationToken)
         -> Result<HostedOutput<Int4SemanticExtractionRun>, HostedError> {
         dispatch::preflight(self, limits.native.run)?;
-        if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
-        for identity in [prepared.execution_identity(), prepared.judge_identity()] {
-            constrained_int4::check_model(identity, model.model_identity()).map_err(|_| HostedError::ModelIdentity)?;
-        }
+        let required = checked_requirements(self, model, &prepared, limits)?;
         let width = prepared.group_width();
         let extraction_work = prepared.extraction_reserved_work();
         let max_work = prepared.max_model_work();
-        if width != model.model_identity().group_width() || prepared.execution_identity().task_spec != "extract-v1"
-            || prepared.judge_identity().task_spec != "judge-v1" || extraction_work.forward_positions == 0
-            || extraction_work.forward_positions > limits.native.context_tokens as u64 || !fits(extraction_work, max_work) {
-            return Err(HostedError::Limits("INT4 semantic actual model and original extraction reservation"));
-        }
-        let required = limits.requirements(width, prepared.extraction_budget(), prepared.judge_budget(),
-            prepared.semantic_limits(), prepared.judge_planning_limits(), prepared.source_bytes())?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.preparation_bytes)?,
             || Ok(SemanticInput { prepared: Some(prepared), vocabulary }))?;
@@ -168,6 +158,81 @@ impl NlpEngine {
             Ok(GuardedOutput::new(result.value, result._memory))
         })
     }
+
+    /// Keep one admitted output-row team through extraction and every
+    /// complete-source field judgment. The ordinary sealed driver retains
+    /// the original work, mask, evidence and cancellation allowances.
+    /// Physical worker statistics are separate from semantic result identity.
+    /// Team workspace is charged once by the dispatcher and all workers join
+    /// before the guarded combined result becomes visible to the caller.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_int4_semantic_extract_with_threads(&self, model: &ResidentInt4,
+        prepared: PreparedInt4SemanticExtraction, vocabulary: Arc<ExtractionVocabulary>,
+        limits: Int4SemanticHostLimits, kernel: PackedInt4Kernel, compute_threads: usize,
+        cancellation: CancellationToken)
+        -> Result<HostedInt4TeamResult<Int4SemanticExtractionRun>, HostedError> {
+        dispatch::preflight_int4_team(self, limits.native.run, compute_threads)?;
+        let required = checked_requirements(self, model, &prepared, limits)?;
+        let width = prepared.group_width();
+        let extraction_work = prepared.extraction_reserved_work();
+        let max_work = prepared.max_model_work();
+        sum(&[required.total_bytes()?, int4_task_team_workspace_bytes(compute_threads, width)?])?;
+        let lease = self.resources().acquire_lease();
+        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.preparation_bytes)?,
+            || Ok(SemanticInput { prepared: Some(prepared), vocabulary }))?;
+        let output = Pending::reserve(&lease, MemoryClass::JobBuffers, required.output_bytes)?;
+        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
+        let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.native_workspace_bytes)?;
+        dispatch::run_int4_team(self, limits.native.run, cancellation, model.clone(), compute_threads,
+            kernel, move |weights, control, team| {
+                let mut input = input;
+                checkpoint(control)?;
+                let prepared = input.value.prepared.take().ok_or(HostedError::CompletionMissing)?;
+                let mut engine = allocate_native(kv, scratch, || {
+                    StrictInt4Engine::new(weights, limits.native.context_tokens,
+                        Int4MemoryBudget { max_kv_bytes: required.native.kv_bytes,
+                            max_rope_bytes: required.native.rope_bytes,
+                            max_scratch_payload_bytes: required.native.scratch_payload_bound })
+                        .map_err(native_error)?.with_kernel(kernel)
+                            .with_projection_executor(team).map_err(native_error)
+                })?;
+                let result = allocate(output, || {
+                    let result = prepared.execute_with_control(&mut engine.value, &input.value.vocabulary,
+                        limits.masks, limits.max_mask_node_visits, control).map_err(semantic_error)?;
+                    check_completion(&result, width, extraction_work, max_work)?;
+                    if engine.value.is_poisoned() || !engine.value.kv_cache().all_slots_have_len(0) {
+                        return Err(semantic_error(Int4SemanticError::Accounting));
+                    }
+                    checkpoint(control)?;
+                    Ok(result)
+                })?;
+                drop(engine);
+                let compute = team.stats().into();
+                drop(input);
+                drop(lease);
+                Ok(HostedInt4TeamResult::new(GuardedOutput::new(result.value, result._memory), compute))
+            })
+    }
+}
+
+/// Serial and team routes share model, whole-context and complete-result
+/// admission. Worker count cannot weaken either stage's authority or budget.
+fn checked_requirements(host: &NlpEngine, model: &ResidentInt4,
+    prepared: &PreparedInt4SemanticExtraction, limits: Int4SemanticHostLimits)
+    -> Result<Int4SemanticHostRequirements, HostedError> {
+    if !Arc::ptr_eq(host.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
+    for identity in [prepared.execution_identity(), prepared.judge_identity()] {
+        constrained_int4::check_model(identity, model.model_identity()).map_err(|_| HostedError::ModelIdentity)?;
+    }
+    let width = prepared.group_width();
+    let work = prepared.extraction_reserved_work();
+    if width != model.model_identity().group_width() || prepared.execution_identity().task_spec != "extract-v1"
+        || prepared.judge_identity().task_spec != "judge-v1" || work.forward_positions == 0
+        || work.forward_positions > limits.native.context_tokens as u64 || !fits(work, prepared.max_model_work()) {
+        return Err(HostedError::Limits("INT4 semantic actual model and original extraction reservation"));
+    }
+    limits.requirements(width, prepared.extraction_budget(), prepared.judge_budget(),
+        prepared.semantic_limits(), prepared.judge_planning_limits(), prepared.source_bytes())
 }
 fn check_completion(run: &Int4SemanticExtractionRun, width: usize, extraction: Int4Work, ceiling: Int4Work)
     -> Result<(), HostedError> {

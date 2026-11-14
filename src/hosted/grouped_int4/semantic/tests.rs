@@ -119,5 +119,7 @@ fn source_planners_vocabulary_and_real_combined_output_cross_one_owned_boundary(
     send::<PreparedInt4SemanticExtraction>();
     send::<Int4SemanticExtractionRun>();
     send::<Arc<ExtractionVocabulary>>();
+    send::<HostedInt4TeamResult<Int4SemanticExtractionRun>>();
     let _entry = NlpEngine::execute_int4_semantic_extract;
+    let _team_entry = NlpEngine::execute_int4_semantic_extract_with_threads;
 }
