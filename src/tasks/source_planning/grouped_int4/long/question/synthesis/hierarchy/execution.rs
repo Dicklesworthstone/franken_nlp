@@ -50,6 +50,34 @@ fn run_single<C: DecodeStepControl, D: Driver + ?Sized>(driver: &mut D,
     output.push(driver.run(passages[0], &witnesses[0], control)?);
     Ok(output)
 }
+/// Count the complete question, canonical passage manifest and joined evidence
+/// with the retained operation. A rejected context still consumes all work it
+/// performed. Encoding exhaustion or cancellation is never a grouping hint.
+pub(super) fn count_context<C: DecodeStepControl>(planner: &SourceTaskPlanner, question: &str,
+    passages: &[AnswerPassage], bytes: usize, mut limits: AnswerInputLimits,
+    capacity: Capacity, control: &mut C) -> Result<Option<usize>, Int4SourceMapError> {
+    checkpoint(control)?;
+    if bytes > capacity.input_bytes || passages.len() > limits.max_passages { return Ok(None); }
+    if matches!(planner.document_encoding(), crate::tokenizer::untrusted::UntrustedEncoding::SafeBpeV1(_)) {
+        // Actual compact tokens decide the context boundary. A safe token
+        // consumes at least one byte; this bounded counting ceiling avoids
+        // mistaking an over-context probe for renewed encoding-work authority.
+        // The original per-call and cumulative SafeBPE ceilings still apply.
+        limits.max_input_tokens = capacity.input_bytes;
+    }
+    let answer = match AnswerContext::encode_with_control(planner.source_encoder(), question, passages,
+        limits, &mut || control.prefill_checkpoint(0)) {
+        Ok(answer) => answer,
+        Err(AnswerError::InputBudgetExceeded) => return Ok(None),
+        Err(error) => return Err(Int4SourceError::from(error).into()),
+    };
+    let tokens = answer.document().total_token_count();
+    if tokens == 0 { return Err(invalid()); }
+    let prompt = capacity.scaffold.checked_add(tokens).ok_or(Int4SourceMapError::WorkLimit)?;
+    checkpoint(control)?;
+    Ok((prompt <= capacity.prompt).then_some(prompt))
+}
+
 impl Native<'_, '_> {
     fn plan<C: DecodeStepControl>(&mut self, passages: &[AnswerPassage], control: &mut C)
         -> Result<PreparedInt4SourceTask, Int4SourceMapError> {
@@ -79,23 +107,10 @@ impl Driver for Native<'_, '_> {
     }
     fn count<C: DecodeStepControl>(&mut self, passages: &[AnswerPassage], bytes: usize, control: &mut C)
         -> Result<Option<usize>, Int4SourceMapError> {
-        checkpoint(control)?;
-        if bytes > self.expected.capacity.input_bytes || passages.len() > self.planning.max_passages { return Ok(None); }
-        let answer = match AnswerContext::encode(self.planner.source_encoder(), self.question, passages, AnswerInputLimits {
+        count_context(self.planner, self.question, passages, bytes, AnswerInputLimits {
             max_passages: self.planning.max_passages, max_input_bytes: self.planning.max_input_bytes,
             max_input_tokens: self.budget.max_input_tokens as usize,
-        }) {
-            Ok(answer) => answer,
-            // Only this explicit size failure is a grouping boundary. Invalid
-            // input, allocation, serialization and tokenizer errors propagate.
-            Err(AnswerError::InputBudgetExceeded) => return Ok(None),
-            Err(error) => return Err(Int4SourceError::from(error).into()),
-        };
-        let tokens = answer.document().total_token_count();
-        if tokens == 0 { return Err(invalid()); }
-        let prompt = self.expected.capacity.scaffold.checked_add(tokens).ok_or(Int4SourceMapError::WorkLimit)?;
-        checkpoint(control)?;
-        Ok((prompt <= self.expected.capacity.prompt).then_some(prompt))
+        }, self.expected.capacity, control)
     }
     fn prepare<C: DecodeStepControl>(&mut self, passages: &[AnswerPassage], prompt: usize, control: &mut C)
         -> Result<Witness, Int4SourceMapError> {

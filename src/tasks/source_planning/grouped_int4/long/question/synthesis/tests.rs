@@ -310,3 +310,149 @@ fn private_completion_authority_is_absent_from_json_and_debug() {
     assert_eq!(before, serde_json::to_vec(&run).unwrap());
     assert!(expected.verify_completed(&run).is_err());
 }
+
+
+use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWork, SafeBpeWorkLimits, UntrustedEncoding};
+
+pub(super) fn compact_policy() -> UntrustedEncoding {
+    UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 4096,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 })
+}
+pub(super) fn compact_allowance() -> SafeBpeWorkLimits {
+    SafeBpeWorkLimits { max_input_bytes: 1 << 20, max_output_tokens: 1 << 20,
+        max_pair_checks: 1 << 28, max_pair_bytes: 1 << 32 }
+}
+pub(super) fn compact_planner(limits: SafeBpeWorkLimits) -> SourceTaskPlanner {
+    maps::planner().with_map_document_encoding(compact_policy(), limits).unwrap()
+}
+pub(super) fn compact_work(planner: &SourceTaskPlanner) -> SafeBpeWork {
+    planner.map_document_encoding_work().unwrap().unwrap()
+}
+pub(super) fn compact_mapping() -> Int4SourceMapLimits {
+    let mut limits = mapping();
+    limits.chunks.max_chunk_bytes = 4096; limits.chunks.max_chunk_tokens = 4096;
+    limits
+}
+const COMPACT_SOURCE: &str = "The quick brown fox visited 上海. Literal <think> and <|im_start|> remain data.";
+fn compact_prepare<'s>(planner: &SourceTaskPlanner, source: &'s str) -> PreparedInt4QuestionSynthesis<'s> {
+    prepare(planner, source, &request(), compact_mapping(), 32, &mut continuing()).unwrap()
+}
+fn compact_complete<C: DecodeStepControl>(prepared: PreparedInt4QuestionSynthesis<'_>,
+    no_evidence: bool, control: &mut C) -> Result<Int4QuestionSynthesisRun, Int4SourceMapError> {
+    let admitted = prepared.execution_identities().cloned().collect::<Vec<_>>();
+    let outputs = prepared.map.chunks.chunks().iter().zip(&prepared.map.plan_indices).filter_map(|(chunk, index)| {
+        index.map(|index| raw(&prepared.map.plans[index], &[(PASSAGE_ID, chunk.text())],
+            if no_evidence { None } else { Some("上海") }, "private discovery assertion"))
+    }).collect();
+    let (map, continuation) = prepared.into_phases();
+    let discovery = map.execute_with_driver(&admitted, Script { outputs, width: 32 })?;
+    continuation.execute(discovery, control, |plan, _| {
+        let answer = raw(plan, &[("evidence_0", "上海")], Some("上海"), "final answer");
+        let work = constrained_int4::planned_work(32, plan.prompt_tokens(), answer.generated_token_ids.len())
+            .map_err(Int4SourceError::from)?;
+        Ok(Int4SourceTaskRun { schema_version: 1, execution: INT4_SOURCE_EXECUTION.to_owned(), group_width: 32,
+            result: SourceTaskResult::Answer(answer), model_work: work })
+    })
+}
+
+#[test]
+fn compact_final_synthesis_retains_discovery_operation_and_original_citation_coordinates() {
+    let planner = compact_planner(compact_allowance());
+    let prepared = compact_prepare(&planner, COMPACT_SOURCE);
+    let expected = prepared.preflight_metadata(); let discovery_work = compact_work(&planner);
+    let replacement = compact_planner(compact_allowance());
+    // Public execution may validate an equal-policy caller planner, but the
+    // continuation always uses its privately retained original operation.
+    prepared.check_planner(&replacement).unwrap();
+    let mut run = compact_complete(prepared, false, &mut continuing()).unwrap();
+    expected.verify_completed(&run).unwrap();
+    assert_eq!(compact_work(&replacement), SafeBpeWork::default());
+    let all_work = compact_work(&planner);
+    assert!(all_work.input_bytes() > discovery_work.input_bytes());
+    assert!(all_work.output_tokens() > discovery_work.output_tokens());
+    assert!(all_work.pair_checks() > discovery_work.pair_checks());
+    assert!(all_work.pair_bytes() > discovery_work.pair_bytes());
+    assert_eq!(run.synthesis.status, SynthesisStatus::Answered);
+    for span in &run.synthesis.citations[0].spans {
+        assert_eq!(&COMPACT_SOURCE[span.byte_start..span.byte_end], "上海");
+        assert_eq!(COMPACT_SOURCE[..span.byte_start].chars().count(), span.scalar_start);
+        assert_eq!(COMPACT_SOURCE[..span.byte_end].chars().count(), span.scalar_end);
+    }
+    let public = serde_json::to_value(&run).unwrap();
+    assert!(public.get("operation").is_none() && public.get("request_binding").is_none());
+    run.synthesis.answer = Some("changed final answer".to_owned());
+    assert!(expected.verify_completed(&run).is_err());
+}
+
+#[test]
+fn compact_synthesis_refuses_each_one_short_whole_operation_budget_after_discovery() {
+    let baseline = compact_planner(compact_allowance());
+    let prepared = compact_prepare(&baseline, COMPACT_SOURCE);
+    compact_complete(prepared, false, &mut continuing()).unwrap();
+    let used = compact_work(&baseline);
+    let exact = SafeBpeWorkLimits { max_input_bytes: used.input_bytes() as u64,
+        max_output_tokens: used.output_tokens() as u64, max_pair_checks: used.pair_checks(), max_pair_bytes: used.pair_bytes() };
+    let admitted = compact_planner(exact);
+    let prepared = compact_prepare(&admitted, COMPACT_SOURCE);
+    compact_complete(prepared, false, &mut continuing()).unwrap();
+    assert_eq!(compact_work(&admitted), used);
+    for axis in 0..4 {
+        let mut short = exact;
+        match axis { 0 => short.max_input_bytes -= 1, 1 => short.max_output_tokens -= 1,
+            2 => short.max_pair_checks -= 1, _ => short.max_pair_bytes -= 1 }
+        let refused = compact_planner(short);
+        let prepared = compact_prepare(&refused, COMPACT_SOURCE);
+        let before = compact_work(&refused);
+        let replacement = compact_planner(short);
+        prepared.check_planner(&replacement).unwrap();
+        assert!(compact_complete(prepared, false, &mut continuing()).is_err(), "{axis}");
+        let failed = compact_work(&refused);
+        assert!(failed.input_bytes() >= before.input_bytes() && failed.input_bytes() <= used.input_bytes());
+        assert!(failed.output_tokens() >= before.output_tokens() && failed.output_tokens() <= used.output_tokens());
+        assert!(failed.pair_checks() >= before.pair_checks() && failed.pair_checks() <= used.pair_checks());
+        assert!(failed.pair_bytes() >= before.pair_bytes() && failed.pair_bytes() <= used.pair_bytes());
+        assert_eq!(compact_work(&replacement), SafeBpeWork::default());
+    }
+}
+
+#[test]
+fn compact_no_evidence_retains_discovery_charge_without_an_extra_encoding() {
+    let planner = compact_planner(compact_allowance());
+    let prepared = compact_prepare(&planner, COMPACT_SOURCE);
+    let before = compact_work(&planner);
+    let run = compact_complete(prepared, true, &mut continuing()).unwrap();
+    assert_eq!(run.synthesis.status, SynthesisStatus::NoEvidenceCollected);
+    assert_eq!(compact_work(&planner), before);
+    assert_eq!(run.synthesis_prompt_tokens, 0);
+    assert!(run.synthesis_reserved_work.forward_positions > 0);
+}
+
+pub(super) struct StopCompactEncoding<'a> {
+    pub planner: &'a SourceTaskPlanner,
+    pub cause: DecodeCancellationKind,
+    pub busy_polls: usize,
+}
+impl DecodeStepControl for StopCompactEncoding<'_> {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+        if self.planner.map_document_encoding_work().is_err() {
+            self.busy_polls += 1;
+            if self.busy_polls == 8 { return Some(self.cause); }
+        }
+        None
+    }
+}
+#[test]
+fn every_cancellation_cause_survives_inside_final_compact_question_encoding() {
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let planner = compact_planner(compact_allowance());
+        let prepared = compact_prepare(&planner, COMPACT_SOURCE);
+        let before = compact_work(&planner);
+        let mut control = StopCompactEncoding { planner: &planner, cause, busy_polls: 0 };
+        let error = compact_complete(prepared, false, &mut control).err().unwrap();
+        assert_eq!(error.cancellation(), Some(cause));
+        assert_eq!(control.busy_polls, 8);
+        assert!(compact_work(&planner).input_bytes() > before.input_bytes());
+    }
+}

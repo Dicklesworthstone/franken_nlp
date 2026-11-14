@@ -25,7 +25,9 @@ pub(crate) fn recipe(planner: &SourceTaskPlanner) -> Result<Option<EncodingRecip
 
 pub(crate) fn supported(task: &Int4SourceDocumentTask) -> bool {
     matches!(task, Int4SourceDocumentTask::Map(_) | Int4SourceDocumentTask::Keyphrases { .. }
-        | Int4SourceDocumentTask::Summary { .. } | Int4SourceDocumentTask::Question(_))
+        | Int4SourceDocumentTask::Summary { .. } | Int4SourceDocumentTask::Question(_)
+        | Int4SourceDocumentTask::SummarySynthesis(_) | Int4SourceDocumentTask::SummaryHierarchy { .. }
+        | Int4SourceDocumentTask::QuestionSynthesis(_) | Int4SourceDocumentTask::QuestionHierarchy { .. })
 }
 pub(crate) fn configure(planner: &SourceTaskPlanner, policy: UntrustedEncoding,
     complete: SafeBpeWorkLimits) -> Result<Arc<SourceTaskPlanner>, BatchFault> {

@@ -134,7 +134,7 @@ fn rejected_chunk_probes_also_consume_the_question_operations_encoding_allowance
 }
 
 #[test]
-fn compact_question_requires_a_whole_operation_allowance_and_does_not_enable_dynamic_synthesis() {
+fn compact_question_and_synthesis_require_one_whole_operation_allowance() {
     let question = qa::question(); let budget = fixtures::budget();
     let unbudgeted = fixtures::planner().with_document_encoding(policy()).unwrap();
     assert!(plan(&unbudgeted, SOURCE, &question, budget, mapping(), &mut fixtures::Continue).is_err());
@@ -142,11 +142,18 @@ fn compact_question_requires_a_whole_operation_allowance_and_does_not_enable_dyn
     let request = synthesis::SourceQuestionSynthesis { question,
         limits: synthesis::QuestionSynthesisLimits { max_evidence_passages: 8, max_evidence_bytes: 1024 } };
     let id = identity(&compact); let context = PlanContext::new(&id, budget).unwrap();
-    assert!(compact.preflight_int4_question_synthesis_with_control(SOURCE, &request, budget, &context,
-        SourcePlanningLimits::default(), mapping(), 32, &mut fixtures::Continue).is_err());
-    assert!(compact.plan_int4_question_synthesis_with_control(SOURCE, &request, budget, &context,
-        SourcePlanningLimits::default(), mapping(), 32, &mut fixtures::Continue).is_err());
-    assert_eq!(used(&compact), SafeBpeWork::default());
+    let expected = compact.preflight_int4_question_synthesis_with_control(SOURCE, &request, budget, &context,
+        SourcePlanningLimits::default(), mapping(), 32, &mut fixtures::Continue).unwrap();
+    let first = used(&compact);
+    let prepared = compact.plan_int4_question_synthesis_with_control(SOURCE, &request, budget, &context,
+        SourcePlanningLimits::default(), mapping(), 32, &mut fixtures::Continue).unwrap();
+    assert_eq!(expected, prepared.preflight_metadata());
+    assert!(first.input_bytes() > 0);
+    assert_eq!(used(&compact), first.checked_add(first).unwrap());
+    let unbudgeted_id = identity(&unbudgeted);
+    assert!(unbudgeted.plan_int4_question_synthesis_with_control(SOURCE, &request, budget,
+        &PlanContext::new(&unbudgeted_id, budget).unwrap(), SourcePlanningLimits::default(), mapping(), 32,
+        &mut fixtures::Continue).is_err());
 }
 
 struct StopInsideEncoding<'a> {

@@ -67,13 +67,7 @@ impl Driver for Native<'_, '_> {
         match self.execution { Execution::Scalar(_) => 1, Execution::Cohorts { max_groups, .. } => max_groups }
     }
     fn count<C: DecodeStepControl>(&mut self, text: &str, control: &mut C) -> Result<usize, Int4SourceMapError> {
-        checkpoint(control)?;
-        let count = self.planner.source_encoder().encode_with_control(text,
-            self.planning.max_input_bytes, self.planning.max_input_bytes,
-            &mut || control.prefill_checkpoint(0))
-            .map_err(Int4SourceError::from)?.total_token_count();
-        checkpoint(control)?;
-        Ok(count)
+        count_source(self.planner, self.planning, text, control)
     }
     fn prepare<C: DecodeStepControl>(&mut self, text: &str, control: &mut C) -> Result<Witness, Int4SourceMapError> {
         Witness::of(&self.plan(text, control)?)
@@ -119,6 +113,18 @@ impl Driver for Native<'_, '_> {
         **stats = completed;
         Ok(rows)
     }
+}
+/// Count a complete evidence probe using the same retained document operation
+/// as preparation and reconstruction. Even rejected groups keep their work.
+pub(super) fn count_source<C: DecodeStepControl>(planner: &SourceTaskPlanner, planning: SourcePlanningLimits,
+    text: &str, control: &mut C) -> Result<usize, Int4SourceMapError> {
+    checkpoint(control)?;
+    let count = planner.source_encoder().encode_with_control(text,
+        planning.max_input_bytes, planning.max_input_bytes,
+        &mut || control.prefill_checkpoint(0))
+        .map_err(Int4SourceError::from)?.total_token_count();
+    checkpoint(control)?;
+    Ok(count)
 }
 struct Group { segments: Range<usize>, bytes: usize, tokens: usize }
 fn groups<C: DecodeStepControl, D: Driver>(frontier: &evidence::Collection, cap: usize,

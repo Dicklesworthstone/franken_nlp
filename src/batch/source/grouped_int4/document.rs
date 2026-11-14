@@ -141,8 +141,9 @@ impl Int4SourceDocumentBatchPlanner {
     pub fn output_token_ceiling(&self) -> Result<u64, BatchFault> { self.task.output_token_ceiling(self.mapping, self.budget) }
     pub fn retained_defaults_bytes(&self) -> Result<u64, BatchFault> { self.task.retained_bytes() }
     /// Explicit compact policy for each complete original document. The
-    /// prepared record owns one ledger through preparation and reconstruction.
-    /// Synthesis/hierarchy remain byte-only; ordinary constructors are unchanged.
+    /// prepared record owns one ledger through preparation, reconstruction,
+    /// evidence synthesis and every hierarchy level. Ordinary constructors
+    /// retain their byte-only default.
     pub fn with_map_document_encoding(mut self, policy: UntrustedEncoding, complete: SafeBpeWorkLimits)
         -> Result<Self, BatchFault> {
         if !encoding::supported(&self.task) { return Err(BatchCode::InvalidLimits.into()); }

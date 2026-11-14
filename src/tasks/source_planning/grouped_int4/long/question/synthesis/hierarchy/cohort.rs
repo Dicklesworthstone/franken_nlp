@@ -33,7 +33,7 @@ impl PreparedInt4QuestionHierarchy<'_> {
                 // Allocate once for all hierarchy levels, after discovery has
                 // drained. No-evidence results never enter this closure.
                 let mut engine = staged::scalar_engine(weights, budget, kernel, control)?;
-                continuation.reduce(collection, remaining, planner, &mut engine, vocabulary, control)
+                continuation.reduce(collection, remaining, &mut engine, vocabulary, control)
             })?;
         finish(document, discovery.cohorts, cap, control)
     }

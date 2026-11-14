@@ -151,13 +151,10 @@ impl Int4QuestionDocumentBatchPlanner {
             hierarchy_groups: None, owner: Arc::new(()) })
     }
     /// Explicit compact policy for each original source/question pair. The
-    /// operation retained by preparation also pays for execution reconstruction.
-    /// Evidence synthesis and hierarchy remain byte-only.
+    /// operation retained by preparation also pays for execution reconstruction,
+    /// evidence synthesis and every hierarchy level.
     pub fn with_map_document_encoding(mut self, policy: UntrustedEncoding, complete: SafeBpeWorkLimits)
         -> Result<Self, BatchFault> {
-        if self.config.synthesis.is_some() || self.config.hierarchy.is_some() {
-            return Err(BatchCode::InvalidLimits.into());
-        }
         let planner = encoding::configure(&self.planner, policy, complete)?;
         let mut identity = self.identity.clone(); identity.template_digest = *planner.template_digest();
         super::check_configuration_with_document_encoding(&planner, &identity,

@@ -31,7 +31,7 @@ impl PreparedInt4QuestionSynthesis<'_> {
         let mapping = self.mapping;
         let (map, continuation) = self.into_phases();
         let discovery = map.execute_cohorts_with_control(admitted, weights, vocabulary, budget, kernel, control)?;
-        let document = continuation.execute(discovery.document, planner, control, |plan, control| {
+        let document = continuation.execute(discovery.document, control, |plan, control| {
             // No evidence never invokes this closure or allocates scalar KV.
             let mut engine = staged::scalar_engine(weights, budget, kernel, control)?;
             synthesis_pass(plan, &mut engine, vocabulary, mapping, control)

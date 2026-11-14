@@ -2,6 +2,7 @@
 //! quality evidence. The scripted tokenizer counts bytes only inside this seam.
 use super::*;
 use crate::tasks::source_planning::grouped_int4::long::tests as maps;
+use super::super::tests::{compact_mapping, compact_policy, compact_work};
 
 struct Control { calls: usize, stop: usize }
 impl DecodeStepControl for Control {
@@ -368,4 +369,153 @@ fn private_completion_authority_is_absent_from_json_and_debug() {
     run.result_binding[0] ^= 1;
     assert_eq!(before, serde_json::to_vec(&run).unwrap());
     assert!(expected.verify_completed(&run).is_err());
+}
+
+
+/// This fixture uses the production pinned planner/counting path. Only native
+/// logits are scripted; it does not establish model quality or throughput.
+struct CompactDriver<'a> {
+    planner: &'a SourceTaskPlanner,
+    identity: &'a ExecutionIdentity,
+    expected: Int4SummaryHierarchyPreflight,
+    budget: TaskBudget,
+    planning: SourcePlanningLimits,
+    width: usize,
+    inputs: Vec<String>,
+}
+impl CompactDriver<'_> {
+    fn plan<C: DecodeStepControl>(&self, text: &str, control: &mut C)
+        -> Result<PreparedInt4SourceTask, Int4SourceMapError> {
+        let context = PlanContext::new(self.identity, self.budget).map_err(|_| Int4SourceMapError::Admission)?;
+        let request = SourceTaskRequest::Summarize { document: text.to_owned(),
+            options: request().synthesis_options, budget: self.budget };
+        Ok(self.planner.plan_int4_with_control(&request, &context, self.planning, self.expected.group_width(), control)?)
+    }
+    fn witness(plan: &PreparedInt4SourceTask) -> Result<(Sha256Digest, usize, Int4Work), Int4SourceMapError> {
+        let identity = plan.execution_identity().canonical_json_bytes().map_err(|_| Int4SourceMapError::Admission)?;
+        Ok((Sha256Digest::of_bytes(&identity), plan.prompt_tokens(), plan.planned_work()))
+    }
+}
+impl execution::Driver for CompactDriver<'_> {
+    type Witness = (Sha256Digest, usize, Int4Work);
+    fn batch_width(&self) -> usize { self.width }
+    fn count<C: DecodeStepControl>(&mut self, text: &str, control: &mut C) -> Result<usize, Int4SourceMapError> {
+        execution::count_source(self.planner, self.planning, text, control)
+    }
+    fn prepare<C: DecodeStepControl>(&mut self, text: &str, control: &mut C) -> Result<Self::Witness, Int4SourceMapError> {
+        Self::witness(&self.plan(text, control)?)
+    }
+    fn run<C: DecodeStepControl>(&mut self, text: &str, witness: &Self::Witness, control: &mut C)
+        -> Result<(Int4SourceTaskRun, Int4Work), Int4SourceMapError> {
+        let plan = self.plan(text, control)?;
+        if Self::witness(&plan)? != *witness { return Err(Int4SourceMapError::Admission); }
+        self.inputs.push(text.to_owned());
+        let quote = text.chars().next().unwrap().to_string();
+        let spans = scan_occurrences(text, &quote, &mut GroundingBudget::default()).unwrap();
+        let work = constrained_int4::planned_work(self.expected.group_width(), plan.prompt_tokens(), 2).unwrap();
+        let raw = SummaryResult { schema_version: 1, task_spec_version: SUMMARIZE_TASK_VERSION.to_owned(),
+            numerics_profile: STRICT_INT4_PROFILE.to_owned(), citation_guarantee: CitationGuarantee::StructuralSourceMembership,
+            semantic_support: SummarySemanticSupport::NotAssessed, score_space: ScoreSpace::NotComputed,
+            bullets: vec![CitedBullet { text: format!("fixture-{quote}"), citations: vec![SourceCitation { quote,
+                occurrence: if spans.len() == 1 { SourceOccurrence::Anchored } else { SourceOccurrence::Ambiguous }, spans }] }],
+            generated_token_ids: vec![0, self.expected.discovery.eos_token_id], forward_positions: work.forward_positions,
+            projected_logits: work.projected_logits, mask_node_visit_charge: 1 };
+        Ok((Int4SourceTaskRun { schema_version: 1, execution: INT4_SOURCE_EXECUTION.to_owned(),
+            group_width: self.expected.group_width(), result: SourceTaskResult::Summarize(raw), model_work: work },
+            plan.planned_work()))
+    }
+    fn run_batch<C: DecodeStepControl>(&mut self, texts: &[&str], witnesses: &[Self::Witness], control: &mut C)
+        -> Result<Vec<(Int4SourceTaskRun, Int4Work)>, Int4SourceMapError> {
+        if texts.len() != witnesses.len() || texts.len() > self.width { return Err(invalid()); }
+        texts.iter().zip(witnesses).map(|(text, witness)| self.run(text, witness, control)).collect()
+    }
+}
+
+#[test]
+fn compact_hierarchy_keeps_one_ledger_across_rejected_probes_levels_and_reconstruction() {
+    const FIRST: &str = "The quick brown fox jumps over the lazy dog.";
+    const SECOND: &str = "A blue bird sings softly near the window.";
+    let source = format!("{FIRST} -- {SECOND}");
+    let counter = maps::planner().with_map_document_encoding(compact_policy(), compact_work()).unwrap();
+    let planning = SourcePlanningLimits::default();
+    let first_tokens = execution::count_source(&counter, planning, FIRST, &mut go()).unwrap();
+    let second_tokens = execution::count_source(&counter, planning, SECOND, &mut go()).unwrap();
+    let cap = first_tokens.max(second_tokens);
+    assert!(cap < FIRST.len() && cap < SECOND.len());
+    assert!(execution::count_source(&counter, planning, &format!("{FIRST}\n\n{SECOND}"), &mut go()).unwrap() > cap);
+    let mut previous = None;
+    for width in [1, 2] {
+        let planner = maps::planner().with_map_document_encoding(compact_policy(), compact_work()).unwrap();
+        let mut prepared = prepare(&planner, &source, compact_mapping(), limits(), 32).unwrap();
+        capacity(&mut prepared.expected, cap);
+        let ids = maps::admitted(&prepared.base.map); let mut script = maps::script(&prepared.base.map);
+        assert_eq!(script.outputs.len(), 1);
+        let SourceTaskResult::Summarize(raw) = script.outputs.front_mut().unwrap() else { panic!() };
+        raw.bullets = vec![CitedBullet { text: "DO_NOT_FEED_GENERATED_ASSERTIONS".to_owned(),
+            citations: [FIRST, SECOND].into_iter().map(|quote| SourceCitation { quote: quote.to_owned(),
+                occurrence: SourceOccurrence::Anchored,
+                spans: scan_occurrences(&source, quote, &mut GroundingBudget::default()).unwrap() }).collect() }];
+        let (map, tail) = prepared.into_parts();
+        let discovery = map.execute_with_driver(&ids, script).unwrap();
+        let before = planner.map_document_encoding_work().unwrap().unwrap();
+        let expected = tail.expected;
+        let mut inputs = Vec::new();
+        let run = tail.execute(discovery, |tail, collection, remaining, control| {
+            let mut budget = tail.base.budget;
+            budget.max_input_tokens = (expected.capacity.scaffold_tokens() + cap).try_into().unwrap();
+            let mut driver = CompactDriver { planner: &tail.base.operation, identity: &tail.base.identity,
+                expected, budget, planning: tail.base.planning, width, inputs: Vec::new() };
+            let result = execution::reduce(&source, collection, tail.base.request, expected, 4 << 20,
+                remaining, &mut driver, control)?;
+            inputs = driver.inputs;
+            Ok(result)
+        }, &mut go()).unwrap();
+        expected.verify_completed(&run).unwrap();
+        assert_eq!(inputs, [FIRST, SECOND, "T\n\nA"]);
+        assert_eq!(run.levels.len(), 2);
+        assert_eq!(run.final_pass, Some(2));
+        assert!(run.passes[..2].iter().all(|pass| pass.input_tokens < pass.input_bytes));
+        let after = planner.map_document_encoding_work().unwrap().unwrap();
+        let prepared_bytes = run.passes.iter().map(|pass| pass.input_bytes).sum::<usize>();
+        assert_eq!(after.input_bytes(), before.input_bytes() + run.tokenizer_work.bytes as usize + 2 * prepared_bytes,
+            "group counts, complete-level preparation and execution replanning must all remain charged");
+        assert!(after.output_tokens() > before.output_tokens());
+        assert!(after.pair_checks() > before.pair_checks() && after.pair_bytes() > before.pair_bytes());
+        let final_citation = &run.bullets()[0].citations[0];
+        assert_eq!(final_citation.quote, "T");
+        assert_eq!(final_citation.spans[0], VerifiedSourceSpan { byte_start: 0, byte_end: 1, scalar_start: 0, scalar_end: 1 });
+        let bytes = serde_json::to_vec(&run).unwrap();
+        if let Some(prior) = previous { assert_eq!(bytes, prior); }
+        previous = Some(bytes);
+    }
+}
+
+#[test]
+fn compact_hierarchy_group_count_preserves_each_terminal_cancellation_inside_encoding() {
+    use DecodeCancellationKind::*;
+    let planner = maps::planner().with_map_document_encoding(compact_policy(), compact_work()).unwrap();
+    let mut baseline = go();
+    execution::count_source(&planner, SourcePlanningLimits::default(), super::super::tests::COMPACT_SOURCE, &mut baseline).unwrap();
+    assert!(baseline.calls > 3);
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let planner = maps::planner().with_map_document_encoding(compact_policy(), compact_work()).unwrap();
+        let mut control = SealControl { calls: 0, stop: baseline.calls / 2, cause };
+        let error = execution::count_source(&planner, SourcePlanningLimits::default(),
+            super::super::tests::COMPACT_SOURCE, &mut control).unwrap_err();
+        assert_eq!(error.cancellation(), Some(cause));
+        assert_eq!(control.calls, baseline.calls / 2);
+    }
+}
+
+#[test]
+fn compact_hierarchy_counting_cannot_refund_an_exhausted_operation() {
+    let text = super::super::tests::COMPACT_SOURCE;
+    let mut exact = compact_work(); exact.max_input_bytes = text.len() as u64;
+    let planner = maps::planner().with_map_document_encoding(compact_policy(), exact).unwrap();
+    execution::count_source(&planner, SourcePlanningLimits::default(), text, &mut go()).unwrap();
+    let before = planner.map_document_encoding_work().unwrap().unwrap();
+    assert_eq!(before.input_bytes(), text.len());
+    assert!(execution::count_source(&planner, SourcePlanningLimits::default(), text, &mut go()).is_err());
+    assert_eq!(planner.map_document_encoding_work().unwrap().unwrap(), before);
 }

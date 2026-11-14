@@ -152,7 +152,13 @@ fn hierarchy_expectation<C: DecodeStepControl>(planner: &SourceTaskPlanner, requ
     let prompt = planning.max_context_tokens.checked_sub(budget.max_output_tokens as usize)
         .ok_or(Int4SourceMapError::InvalidLimits)?.min(budget.max_input_tokens as usize);
     if scaffold == 0 || scaffold >= prompt { return Err(Int4SourceMapError::InvalidLimits); }
-    let capacity = Capacity { scaffold, prompt, input_bytes: planning.max_input_bytes.min(budget.max_input_tokens as usize),
+    let input_bytes = match planner.document_encoding() {
+        crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback =>
+            planning.max_input_bytes.min(budget.max_input_tokens as usize),
+        crate::tokenizer::untrusted::UntrustedEncoding::SafeBpeV1(policy) =>
+            planning.max_input_bytes.min(policy.max_input_bytes),
+    };
+    let capacity = Capacity { scaffold, prompt, input_bytes,
         question_bytes: request.question.question.len(), eos: planner.eos };
     checkpoint(control)?;
     let request_binding = completion_binding::request(b"fnlp-int4-question-hierarchy-request-v1",
@@ -181,7 +187,7 @@ impl<'s> PreparedInt4QuestionHierarchy<'s> {
         let (map, continuation) = self.into_phases();
         let discovery = map.execute_with_control(admitted, engine, vocabulary, control)?;
         continuation.execute(discovery, control, |continuation, collection, remaining, control| {
-            continuation.reduce(collection, remaining, planner, engine, vocabulary, control)
+            continuation.reduce(collection, remaining, engine, vocabulary, control)
         })
     }
 }
@@ -204,10 +210,10 @@ impl HierarchyContinuation<'_> {
     }
     #[allow(clippy::too_many_arguments)]
     fn reduce<C: DecodeStepControl>(&self, collection: evidence::Collection, remaining: &mut GroundingBudget,
-        planner: &SourceTaskPlanner, engine: &mut StrictInt4Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
+        engine: &mut StrictInt4Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
         -> Result<execution::Reduced, Int4SourceMapError> {
         let base = &self.base;
-        let mut driver = execution::Native { planner, identity: &base.identity, question: &base.question,
+        let mut driver = execution::Native { planner: &base.operation, identity: &base.identity, question: &base.question,
             budget: base.budget, planning: base.planning, options: base.options, mapping: self.mapping,
             engine: execution::Engine::Scalar(engine), vocabulary, expected: self.expected };
         execution::reduce(base.source, collection, self.expected, self.mapping.reduction.max_result_bytes as u64,

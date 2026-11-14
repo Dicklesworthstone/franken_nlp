@@ -53,7 +53,7 @@ impl PreparedInt4QuestionHierarchy<'_> {
         let mut hierarchy_cohorts = Int4HierarchyCohortStats::default();
         let document = continuation.execute(discovery, control, |continuation, collection, remaining, control| {
             let base = &continuation.base;
-            let mut driver = execution::Native { planner, identity: &base.identity, question: &base.question,
+            let mut driver = execution::Native { planner: &base.operation, identity: &base.identity, question: &base.question,
                 budget: base.budget, planning: base.planning, options: base.options, mapping: continuation.mapping,
                 engine: execution::Engine::Cohorts { weights, budget, kernel, max_groups: schedule.max_groups,
                     stats: &mut hierarchy_cohorts }, vocabulary, expected: continuation.expected };

@@ -141,6 +141,9 @@ pub struct PreparedInt4QuestionSynthesis<'s> {
     source: &'s str,
     question: String,
     map: PreparedInt4Question<'s>,
+    // Retain the same nonrenewable encoding operation that admitted discovery.
+    // A replacement planner with identical policy cannot renew its allowance.
+    operation: SourceTaskPlanner,
     identity: ExecutionIdentity,
     budget: TaskBudget,
     planning: SourcePlanningLimits,
@@ -154,6 +157,7 @@ pub struct PreparedInt4QuestionSynthesis<'s> {
 struct Continuation<'s> {
     source: &'s str,
     question: String,
+    operation: SourceTaskPlanner,
     identity: ExecutionIdentity,
     budget: TaskBudget,
     planning: SourcePlanningLimits,
@@ -168,9 +172,7 @@ impl SourceTaskPlanner {
         planning: SourcePlanningLimits, mapping: Int4SourceMapLimits, group_width: usize, control: &mut C)
         -> Result<Int4QuestionSynthesisPreflight, Int4SourceMapError> {
         checkpoint(control)?;
-        // Compact discovery does not authorize the later data-dependent
-        // synthesis or hierarchy tokenization contract.
-        self.encoder.require_byte_encoding().map_err(Int4SourceError::from)?;
+        self.map_document_encoding_workspace_bytes().map_err(Int4SourceError::from)?;
         let (discovery_limits, reserve) = reserve(request.limits, budget, planning, mapping, group_width)?;
         let discovery = self.preflight_int4_question_with_control(source, &request.question, budget, context,
             planning, discovery_limits, group_width, control)?;
@@ -182,15 +184,13 @@ impl SourceTaskPlanner {
         planning: SourcePlanningLimits, mapping: Int4SourceMapLimits, group_width: usize, control: &mut C)
         -> Result<PreparedInt4QuestionSynthesis<'s>, Int4SourceMapError> {
         checkpoint(control)?;
-        // Compact discovery does not authorize the later data-dependent
-        // synthesis or hierarchy tokenization contract.
-        self.encoder.require_byte_encoding().map_err(Int4SourceError::from)?;
+        let operation = self.retain_map_document_operation().map_err(Int4SourceError::from)?;
         let (discovery_limits, reserve) = reserve(request.limits, budget, planning, mapping, group_width)?;
         let map = self.plan_int4_question_with_control(source, &request.question, budget, context,
             planning, discovery_limits, group_width, control)?;
         let expected = expectation(map.preflight_metadata(), reserve, request, budget, mapping, control)?;
         checkpoint(control)?;
-        Ok(PreparedInt4QuestionSynthesis { source, question: copy(&request.question.question)?, map,
+        Ok(PreparedInt4QuestionSynthesis { source, question: copy(&request.question.question)?, map, operation,
             identity: context.execution_identity().clone(), budget, planning, mapping, options: request.question.options, expected })
     }
 }
@@ -236,8 +236,8 @@ impl<'s> PreparedInt4QuestionSynthesis<'s> {
         Ok(())
     }
     fn into_phases(self) -> (PreparedInt4Question<'s>, Continuation<'s>) {
-        let Self { source, question, map, identity, budget, planning, mapping, options, expected } = self;
-        (map, Continuation { source, question, identity, budget, planning, mapping, options, expected })
+        let Self { source, question, map, operation, identity, budget, planning, mapping, options, expected } = self;
+        (map, Continuation { source, question, operation, identity, budget, planning, mapping, options, expected })
     }
     pub fn execute_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
         planner: &SourceTaskPlanner, engine: &mut StrictInt4Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
@@ -248,17 +248,17 @@ impl<'s> PreparedInt4QuestionSynthesis<'s> {
         let mapping = self.mapping;
         let (map, continuation) = self.into_phases();
         let discovery = map.execute_with_control(admitted, engine, vocabulary, control)?;
-        continuation.execute(discovery, planner, control, |plan, control| {
+        continuation.execute(discovery, control, |plan, control| {
             synthesis_pass(plan, engine, vocabulary, mapping, control)
         })
     }
 }
 impl Continuation<'_> {
     fn execute<C: DecodeStepControl, F>(self, discovery: Int4QuestionRun,
-        planner: &SourceTaskPlanner, control: &mut C, run: F)
+        control: &mut C, run: F)
         -> Result<Int4QuestionSynthesisRun, Int4SourceMapError>
         where F: FnOnce(&PreparedInt4SourceTask, &mut C) -> Result<Int4SourceTaskRun, Int4SourceMapError> {
-        let Self { source, question, identity, budget, planning, mapping, options, expected } = self;
+        let Self { source, question, operation, identity, budget, planning, mapping, options, expected } = self;
         expected.discovery.verify_completed_with_control(&discovery, control)?;
         let mut remaining = remaining_verification(expected.discovery.verification, discovery.verification_used)?;
         let collection = evidence::collect(source, discovery.mapped.root().value(), expected.limits, &mut remaining, control)?;
@@ -269,7 +269,7 @@ impl Continuation<'_> {
         } else {
             let context = PlanContext::new(&identity, budget).map_err(|_| Int4SourceMapError::Admission)?;
             let request = SourceTaskRequest::Answer { question, passages: collection.copy_passages()?, options, budget };
-            let plan = planner.plan_int4_with_control(&request, &context, planning, expected.discovery.group_width(), control)?;
+            let plan = operation.plan_int4_with_control(&request, &context, planning, expected.discovery.group_width(), control)?;
             let planned = plan.planned_work();
             if !fits(planned, expected.synthesis_reserve) { return Err(Int4SourceMapError::WorkLimit); }
             let native = run(&plan, control)?;

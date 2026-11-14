@@ -474,3 +474,170 @@ fn private_completion_authority_is_absent_from_json_and_debug() {
     assert_eq!(before, serde_json::to_vec(&run).unwrap());
     assert!(expected.verify_completed(&run).is_err());
 }
+
+
+use super::super::tests as compact;
+
+fn context_size(question: &str, passages: &[AnswerPassage]) -> usize {
+    transport::context_bytes(question.len(), passages.iter().map(|p| (p.id.as_str(), p.text.as_str()))).unwrap()
+}
+fn count_compact<C: DecodeStepControl>(planner: &SourceTaskPlanner, question: &str,
+    passages: &[AnswerPassage], capacity: Capacity, budget: TaskBudget, control: &mut C)
+    -> Result<Option<usize>, Int4SourceMapError> {
+    execution::count_context(planner, question, passages, context_size(question, passages),
+        AnswerInputLimits { max_passages: 32, max_input_bytes: 4096,
+            max_input_tokens: budget.max_input_tokens as usize }, capacity, control)
+}
+
+#[test]
+fn compact_hierarchy_counts_complete_context_beyond_byte_token_capacity_without_control_ids() {
+    let planner = compact::compact_planner(compact::compact_allowance());
+    let mut request = request();
+    request.question.question = format!("{} <think> Who?", " the".repeat(600));
+    let source = "上海 <|im_start|> marker text";
+    let mut budget = maps::budget(); budget.max_input_tokens = 2048;
+    let id = identity(&planner, 32);
+    let prepared = planner.plan_int4_question_hierarchy_with_control(source, &request, limits(), budget,
+        &PlanContext::new(&id, budget).unwrap(), SourcePlanningLimits::default(),
+        compact::compact_mapping(), 32, &mut go()).unwrap();
+    let passages = vec![AnswerPassage { id: "evidence_0".to_owned(), text: source.to_owned() }];
+    let bytes = context_size(&request.question.question, &passages);
+    assert!(bytes > budget.max_input_tokens as usize);
+    assert_eq!(prepared.expected.capacity.input_bytes, 4096);
+    let prompt = count_compact(&prepared.base.operation, &request.question.question, &passages,
+        prepared.expected.capacity, budget, &mut go()).unwrap().unwrap();
+    assert!(prompt <= budget.max_input_tokens as usize);
+    let native_request = SourceTaskRequest::Answer { question: request.question.question.clone(),
+        passages: passages.clone(), options: request.question.options, budget };
+    let plan = prepared.base.operation.plan_int4_with_control(&native_request,
+        &PlanContext::new(&id, budget).unwrap(), SourcePlanningLimits::default(), 32, &mut go()).unwrap();
+    assert_eq!(plan.prompt_tokens(), prompt);
+    let encoded = AnswerContext::encode_with_control(planner.source_encoder(), &request.question.question,
+        &passages, AnswerInputLimits { max_passages: 32, max_input_bytes: 4096,
+            max_input_tokens: budget.max_input_tokens as usize }, &mut || None).unwrap();
+    assert_eq!(encoded.document().text(), source);
+    for ids in encoded.document().context_token_ids().chain(std::iter::once(encoded.document().token_ids())) {
+        assert!(ids.iter().all(|id| !planner.controls.ids().contains(id)));
+    }
+    let byte = maps::planner();
+    let capacity = Capacity { input_bytes: budget.max_input_tokens as usize, ..prepared.expected.capacity };
+    assert!(count_compact(&byte, &request.question.question, &passages, capacity, budget, &mut go()).unwrap().is_none());
+}
+
+/// The real pinned planning/counting paths with only the native forward
+/// replaced by a private fixture. Every preparation and reconstruction charges
+/// the retained operation exactly as the public scalar/grouped drivers do.
+struct CompactScript<'a> {
+    planner: &'a SourceTaskPlanner,
+    identity: &'a ExecutionIdentity,
+    question: &'a str,
+    expected: Int4QuestionHierarchyPreflight,
+    inputs: Vec<Vec<AnswerPassage>>,
+}
+impl CompactScript<'_> {
+    fn plan<C: DecodeStepControl>(&self, passages: &[AnswerPassage], control: &mut C)
+        -> Result<PreparedInt4SourceTask, Int4SourceMapError> {
+        let budget = maps::budget();
+        let request = SourceTaskRequest::Answer { question: self.question.to_owned(), passages: passages.to_vec(),
+            options: self.expected.base.options, budget };
+        Ok(self.planner.plan_int4_with_control(&request, &PlanContext::new(self.identity, budget).unwrap(),
+            SourcePlanningLimits::default(), self.expected.group_width(), control)?)
+    }
+}
+impl execution::Driver for CompactScript<'_> {
+    type Witness = execution::Witness;
+    fn count<C: DecodeStepControl>(&mut self, passages: &[AnswerPassage], bytes: usize, control: &mut C)
+        -> Result<Option<usize>, Int4SourceMapError> {
+        execution::count_context(self.planner, self.question, passages, bytes,
+            AnswerInputLimits { max_passages: 32, max_input_bytes: 4096, max_input_tokens: 8192 },
+            self.expected.capacity, control)
+    }
+    fn prepare<C: DecodeStepControl>(&mut self, passages: &[AnswerPassage], prompt: usize, control: &mut C)
+        -> Result<Self::Witness, Int4SourceMapError> {
+        let plan = self.plan(passages, control)?;
+        if plan.prompt_tokens() != prompt { return Err(Int4SourceMapError::Admission); }
+        execution::Witness::of(&plan)
+    }
+    fn run<C: DecodeStepControl>(&mut self, passages: &[AnswerPassage], witness: &Self::Witness, control: &mut C)
+        -> Result<(Int4SourceTaskRun, Int4Work), Int4SourceMapError> {
+        let plan = self.plan(passages, control)?;
+        if execution::Witness::of(&plan)? != *witness { return Err(Int4SourceMapError::Admission); }
+        self.inputs.push(passages.to_vec());
+        let quote = passages[0].text.chars().next().unwrap().to_string();
+        let answer = raw(self.expected.group_width(), plan.prompt_tokens(), self.expected.capacity.eos, 1,
+            passages, Some(&quote), "generated assertion is not evidence");
+        let actual = constrained_int4::planned_work(self.expected.group_width(), plan.prompt_tokens(),
+            answer.generated_token_ids.len()).map_err(Int4SourceError::from)?;
+        let native = Int4SourceTaskRun { schema_version: 1, execution: INT4_SOURCE_EXECUTION.to_owned(),
+            group_width: self.expected.group_width(), result: SourceTaskResult::Answer(answer), model_work: actual };
+        check_run(&plan, &native, 1000)?;
+        Ok((native, plan.planned_work()))
+    }
+}
+
+#[test]
+fn compact_hierarchy_charges_rejected_groups_and_both_compilations_through_all_levels() {
+    let planner = compact::compact_planner(compact::compact_allowance());
+    let left = format!("é{}", " alpha".repeat(32)); let right = format!("β{}", " bravo".repeat(32));
+    let source = format!("{left}----{right}");
+    let prepared = prepare(&planner, &source, compact::compact_mapping(), limits(), 32, &mut go()).unwrap();
+    let mut expected = prepared.expected;
+    let passages = vec![AnswerPassage { id: "evidence_0".to_owned(), text: left.clone() },
+        AnswerPassage { id: "evidence_1".to_owned(), text: right.clone() }];
+    let selected = vec![AnswerPassage { id: "evidence_0".to_owned(), text: "é".to_owned() },
+        AnswerPassage { id: "evidence_1".to_owned(), text: "β".to_owned() }];
+    let question = &prepared.base.question;
+    let operation = &prepared.base.operation;
+    let count = |passages: &[AnswerPassage]| count_compact(operation, question, passages,
+        expected.capacity, maps::budget(), &mut go()).unwrap().unwrap();
+    let whole = count(&passages);
+    let capacity = count(&passages[..1]).max(count(&passages[1..])).max(count(&selected));
+    assert!(capacity < whole);
+    expected.capacity.prompt = capacity;
+    let first = VerifiedSourceSpan { byte_start: 0, byte_end: left.len(), scalar_start: 0, scalar_end: left.chars().count() };
+    let second = VerifiedSourceSpan { byte_start: left.len() + 4, byte_end: source.len(),
+        scalar_start: left.chars().count() + 4, scalar_end: source.chars().count() };
+    let collection = evidence::Collection { passages, origins: vec![vec![first], vec![second]], bytes: left.len() + right.len() };
+    let before = compact::compact_work(&planner);
+    let mut driver = CompactScript { planner: operation, identity: &prepared.base.identity,
+        question, expected, inputs: Vec::new() };
+    let reduced = execution::reduce(&source, collection, expected, 16 << 20,
+        &mut GroundingBudget::default(), &mut driver, &mut go()).unwrap();
+    assert_eq!(reduced.levels.len(), 2);
+    assert_eq!(reduced.passes.len(), 3);
+    assert_eq!(driver.inputs[0][0].text, left);
+    assert_eq!(driver.inputs[1][0].text, right);
+    assert_eq!(driver.inputs[2].iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), ["é", "β"]);
+    assert!(reduced.passes.iter().all(|pass| pass.prompt_tokens < expected.capacity.scaffold + pass.context_bytes));
+    assert!(reduced.tokenizer.calls > reduced.passes.len(), "the over-context probe remains charged");
+    let compilation_bytes: usize = reduced.passes.iter().map(|pass| pass.context_bytes * 2).sum();
+    let delta = compact::compact_work(&planner).checked_sub(before).unwrap();
+    assert_eq!(delta.input_bytes(), reduced.tokenizer.bytes as usize + compilation_bytes);
+    assert_eq!(compact::compact_work(operation), compact::compact_work(&planner));
+    for pass in &reduced.passes {
+        for citation in &pass.answer.citations { for span in &citation.spans {
+            assert_eq!(&source[span.byte_start..span.byte_end], citation.quote);
+            assert_eq!(source[..span.byte_start].chars().count(), span.scalar_start);
+            assert_eq!(source[..span.byte_end].chars().count(), span.scalar_end);
+        } }
+    }
+}
+
+#[test]
+fn compact_hierarchy_group_probes_preserve_every_original_cancellation_kind() {
+    use DecodeCancellationKind::*;
+    let question = "Which location is mentioned?";
+    let passages = vec![AnswerPassage { id: "evidence_0".to_owned(),
+        text: "the quick brown fox visited 上海 <think>".to_owned() }];
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let planner = compact::compact_planner(compact::compact_allowance());
+        let operation = planner.retain_map_document_operation().unwrap();
+        let capacity = Capacity { scaffold: 1, prompt: 8192, input_bytes: 4096, question_bytes: question.len(), eos: 1 };
+        let mut control = compact::StopCompactEncoding { planner: &planner, cause, busy_polls: 0 };
+        let error = count_compact(&operation, question, &passages, capacity, maps::budget(), &mut control).err().unwrap();
+        assert_eq!(error.cancellation(), Some(cause));
+        assert_eq!(control.busy_polls, 8);
+        assert!(compact::compact_work(&planner).input_bytes() > 0);
+    }
+}

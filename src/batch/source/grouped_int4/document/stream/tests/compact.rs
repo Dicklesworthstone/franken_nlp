@@ -2,7 +2,9 @@
 use super::*;
 use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWork, SafeBpeWorkLimits, UntrustedEncoding};
 
-const TEXT: &str = "Alice met Bob in 上海. Carol saw Alice.";
+// This short multilingual document leaves all four synthesis passes within
+// the fixture's existing eight-mask admission ceiling.
+const TEXT: &str = "Alice met Bob in 上海.";
 fn policy() -> UntrustedEncoding {
     UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 8192, max_output_tokens: 8192,
         max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 })
@@ -27,8 +29,8 @@ fn used(prepared: &PreparedInt4SourceDocumentBatch) -> SafeBpeWork {
 }
 
 #[test]
-fn all_independent_source_modes_share_one_operation_per_original_document() {
-    for index in [0, 1, 2, 3, 6, 9] {
+fn all_complete_source_modes_share_one_operation_per_original_document() {
+    for index in 0..10 {
         let byte = factory(index);
         let byte_prepared = byte.prepare_with_control(document(TEXT), &mut Continue).unwrap();
         assert_eq!(byte.encoding_workspace_bytes().unwrap(), 0);
@@ -53,8 +55,8 @@ fn all_independent_source_modes_share_one_operation_per_original_document() {
 
 #[test]
 fn preparation_and_execution_reconstruction_pay_every_axis_without_refund() {
-    // Plain source maps and question maps have different encoding paths.
-    for index in [0, 6] {
+    // Discovery, flat synthesis and hierarchy retain the same original operation.
+    for index in [0, 4, 5, 6, 7, 8] {
         let probe = factory(index).with_map_document_encoding(policy(), allowance()).unwrap();
         let prepared = probe.prepare_with_control(document(TEXT), &mut Continue).unwrap();
         let once = used(&prepared); let twice = once.checked_add(once).unwrap();
@@ -85,10 +87,7 @@ fn preparation_and_execution_reconstruction_pay_every_axis_without_refund() {
 }
 
 #[test]
-fn compact_policy_requires_explicit_authority_and_neural_routes_stay_closed() {
-    for index in [4, 5, 7, 8] {
-        assert!(factory(index).with_map_document_encoding(policy(), allowance()).is_err());
-    }
+fn compact_policy_requires_explicit_authority_and_preserves_prepared_ownership() {
     assert!(factory(0).with_map_document_encoding(UntrustedEncoding::ByteFallback, allowance()).is_err());
     let compact = factory(0).with_map_document_encoding(policy(), allowance()).unwrap();
     assert!(crate::batch::source::grouped_int4::check_configuration(&compact.planner, &compact.identity,

@@ -1,6 +1,7 @@
 //! Source-only planning and private synthetic receipt fixtures, not neural proof.
 use super::*;
 use crate::tasks::source_planning::grouped_int4::long::tests as maps;
+use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding};
 
 struct Control { calls: usize, stop: usize }
 impl DecodeStepControl for Control {
@@ -283,4 +284,155 @@ fn private_completion_authority_is_absent_from_json_and_debug() {
     run.result_binding[0] ^= 1;
     assert_eq!(before, serde_json::to_vec(&run).unwrap());
     assert!(expected.verify_completed(&run).is_err());
+}
+
+
+pub(super) const COMPACT_SOURCE: &str = "The quick brown fox jumps over the lazy dog. 上海 <think> <|im_start|> ▁";
+pub(super) fn compact_policy() -> UntrustedEncoding {
+    UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 4096,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 })
+}
+pub(super) fn compact_work() -> SafeBpeWorkLimits {
+    SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 }
+}
+pub(super) fn compact_mapping() -> Int4SourceMapLimits {
+    let mut mapping = maps::limits();
+    mapping.chunks.max_chunk_bytes = 4096;
+    mapping.chunks.max_chunk_tokens = 4096;
+    mapping
+}
+fn discovery_with_complete_quote<'s>(p: &SourceTaskPlanner, source: &'s str)
+    -> (Int4SummarySynthesisPreflight, SummarySynthesisTail<'s>, Int4SourceMapRun) {
+    let prepared = prepare(p, source, request(), compact_mapping(), 32, &mut continuing()).unwrap();
+    let expected = prepared.expected;
+    let ids = maps::admitted(&prepared.map); let mut driver = maps::script(&prepared.map);
+    assert_eq!(driver.outputs.len(), 1);
+    let SourceTaskResult::Summarize(raw) = driver.outputs.front_mut().unwrap() else { panic!() };
+    raw.bullets = vec![CitedBullet { text: "MAP_ASSERTION_IS_NOT_EVIDENCE".to_owned(),
+        citations: vec![SourceCitation { quote: source.to_owned(), occurrence: SourceOccurrence::Anchored,
+            spans: scan_occurrences(source, source, &mut GroundingBudget::default()).unwrap() }] }];
+    let (map, tail) = prepared.into_parts();
+    let discovery = map.execute_with_driver(&ids, driver).unwrap();
+    (expected, tail, discovery)
+}
+fn complete_quote_tail(tail: SummarySynthesisTail<'_>, discovery: Int4SourceMapRun) -> Int4SummarySynthesisRun {
+    let quote = tail.source.to_owned();
+    let SourceTaskResult::Summarize(raw) = &discovery.mapped.root().value().chunks().next().unwrap().native.result
+        else { panic!() };
+    let mut raw = raw.clone();
+    tail.execute(discovery, |plan, _| {
+        raw.bullets = vec![CitedBullet { text: "Synthetic final assertion".to_owned(),
+            citations: vec![SourceCitation { quote: quote.clone(), occurrence: SourceOccurrence::Anchored,
+                spans: scan_occurrences(&quote, &quote, &mut GroundingBudget::default()).unwrap() }] }];
+        let work = constrained_int4::planned_work(32, plan.prompt_tokens(), raw.generated_token_ids.len()).unwrap();
+        raw.forward_positions = work.forward_positions; raw.projected_logits = work.projected_logits;
+        Ok(Int4SourceTaskRun { schema_version: 1, execution: INT4_SOURCE_EXECUTION.to_owned(), group_width: 32,
+            result: SourceTaskResult::Summarize(raw), model_work: work })
+    }, &mut continuing()).unwrap()
+}
+
+#[test]
+fn compact_synthesis_uses_real_tokens_and_preserves_complete_original_evidence() {
+    let byte = maps::planner();
+    let (byte_expected, byte_tail, byte_discovery) = discovery_with_complete_quote(&byte, COMPACT_SOURCE);
+    let byte_run = complete_quote_tail(byte_tail, byte_discovery);
+    let compact = maps::planner().with_map_document_encoding(compact_policy(), compact_work()).unwrap();
+    let (expected, tail, discovery) = discovery_with_complete_quote(&compact, COMPACT_SOURCE);
+    let run = complete_quote_tail(tail, discovery);
+    expected.verify_completed(&run).unwrap();
+    assert_eq!(expected.source_span(), byte_expected.source_span());
+    assert_eq!(run.bullets, byte_run.bullets);
+    assert_eq!(run.evidence_bytes, COMPACT_SOURCE.len());
+    assert_eq!(run.evidence_segments, 1);
+    assert!(run.synthesis_prompt_tokens < byte_run.synthesis_prompt_tokens);
+    assert!(run.discovery.planned_model_work.forward_positions < byte_run.discovery.planned_model_work.forward_positions);
+    let used = compact.map_document_encoding_work().unwrap().unwrap();
+    assert_eq!(used.input_bytes(), 3 * COMPACT_SOURCE.len(), "probe, discovery plan and evidence plan share one ledger");
+    assert!(used.output_tokens() < used.input_bytes());
+    assert!(used.pair_checks() > 0 && used.pair_bytes() > 0);
+    assert_ne!(expected, byte_expected);
+    assert!(byte_expected.verify_completed(&run).is_err());
+    let compact_json = serde_json::to_value(&run).unwrap();
+    let byte_json = serde_json::to_value(&byte_run).unwrap();
+    assert_eq!(compact_json.as_object().unwrap().keys().collect::<Vec<_>>(),
+        byte_json.as_object().unwrap().keys().collect::<Vec<_>>());
+}
+
+#[test]
+fn one_request_compact_policy_cannot_authorize_discovery_and_synthesis() {
+    let unbudgeted = maps::planner().with_document_encoding(compact_policy()).unwrap();
+    assert!(prepare(&unbudgeted, COMPACT_SOURCE, request(), compact_mapping(), 32, &mut continuing()).is_err());
+}
+
+#[test]
+fn every_cumulative_encoding_axis_can_refuse_the_final_pass_before_native_work() {
+    let baseline = maps::planner().with_map_document_encoding(compact_policy(), compact_work()).unwrap();
+    let (_, tail, discovery) = discovery_with_complete_quote(&baseline, COMPACT_SOURCE);
+    complete_quote_tail(tail, discovery);
+    let total = baseline.map_document_encoding_work().unwrap().unwrap();
+    for axis in 0..4 {
+        let mut short = compact_work();
+        match axis {
+            0 => short.max_input_bytes = total.input_bytes() as u64 - 1,
+            1 => short.max_output_tokens = total.output_tokens() as u64 - 1,
+            2 => short.max_pair_checks = total.pair_checks() - 1,
+            _ => short.max_pair_bytes = total.pair_bytes() - 1,
+        }
+        let planner = maps::planner().with_map_document_encoding(compact_policy(), short).unwrap();
+        let (_, tail, discovery) = discovery_with_complete_quote(&planner, COMPACT_SOURCE);
+        let before = planner.map_document_encoding_work().unwrap().unwrap();
+        let mut calls = 0;
+        let error = tail.execute(discovery, |_, _| {
+            calls += 1; Err(Int4SourceMapError::Admission)
+        }, &mut continuing()).err().unwrap();
+        assert!(matches!(error, Int4SourceMapError::Source(_)), "{axis}");
+        assert_eq!(calls, 0, "exhausted axis {axis} must refuse before synthesis");
+        let after = planner.map_document_encoding_work().unwrap().unwrap();
+        assert!(after.input_bytes() >= before.input_bytes());
+        assert!(after.output_tokens() >= before.output_tokens());
+        assert!(after.pair_checks() >= before.pair_checks());
+        assert!(after.pair_bytes() >= before.pair_bytes());
+        assert!(planner.source_encoder().encode_with_control(COMPACT_SOURCE, 4096, 4096, &mut || None).is_err());
+        let retried = planner.map_document_encoding_work().unwrap().unwrap();
+        assert!(retried.input_bytes() >= after.input_bytes() && retried.output_tokens() >= after.output_tokens());
+        assert!(retried.pair_checks() >= after.pair_checks() && retried.pair_bytes() >= after.pair_bytes());
+    }
+}
+
+#[test]
+fn a_fresh_same_policy_planner_cannot_renew_the_retained_synthesis_allowance() {
+    let mut exact = compact_work(); exact.max_input_bytes = 2 * COMPACT_SOURCE.len() as u64;
+    let original = maps::planner().with_map_document_encoding(compact_policy(), exact).unwrap();
+    let replacement = maps::planner().with_map_document_encoding(compact_policy(), exact).unwrap();
+    let prepared = prepare(&original, COMPACT_SOURCE, request(), compact_mapping(), 32, &mut continuing()).unwrap();
+    prepared.check_planner(&replacement).unwrap();
+    let ids = maps::admitted(&prepared.map); let driver = maps::script(&prepared.map);
+    let (map, tail) = prepared.into_parts();
+    let discovery = map.execute_with_driver(&ids, driver).unwrap();
+    let error = tail.execute(discovery, |_, _| panic!("fresh planner renewed final evidence work"),
+        &mut continuing()).err().unwrap();
+    assert!(matches!(error, Int4SourceMapError::Source(_)));
+    assert_eq!(original.map_document_encoding_work().unwrap().unwrap().input_bytes(), exact.max_input_bytes as usize);
+    assert_eq!(replacement.map_document_encoding_work().unwrap().unwrap().input_bytes(), 0);
+}
+
+#[test]
+fn empty_compact_discovery_needs_no_new_encoding_or_final_model_allowance() {
+    let mut exact = compact_work(); exact.max_input_bytes = 2 * COMPACT_SOURCE.len() as u64;
+    let planner = maps::planner().with_map_document_encoding(compact_policy(), exact).unwrap();
+    let prepared = prepare(&planner, COMPACT_SOURCE, request(), compact_mapping(), 32, &mut continuing()).unwrap();
+    let expected = prepared.expected;
+    let ids = maps::admitted(&prepared.map); let mut driver = maps::script(&prepared.map);
+    for output in &mut driver.outputs {
+        let SourceTaskResult::Summarize(raw) = output else { panic!() }; raw.bullets.clear();
+    }
+    let (map, tail) = prepared.into_parts();
+    let discovery = map.execute_with_driver(&ids, driver).unwrap();
+    let before = planner.map_document_encoding_work().unwrap().unwrap();
+    let run = tail.execute(discovery, |_, _| panic!("empty evidence reached final encoding"),
+        &mut continuing()).unwrap();
+    expected.verify_completed(&run).unwrap();
+    assert_eq!(run.status, SummarySynthesisStatus::NoEvidenceCollected);
+    assert_eq!(planner.map_document_encoding_work().unwrap().unwrap(), before);
 }
