@@ -5,7 +5,9 @@
 //! manifest is authenticated and compatibility-checked before a network
 //! request. Every request is a bounded byte range with identity encoding.
 //! Mirrors are attempted sequentially in manifest order. A failed attempt
-//! rolls the staging file back to the exact pre-attempt length.
+//! rolls the staging file back to the exact pre-attempt length. If a complete
+//! part digest rejects a resumed prefix, its original bytes are copied into a
+//! synced, independently rehashed quarantine file before one fresh mirror pass.
 //!
 //! Filesystem calls are synchronous and checkpointed between bounded network
 //! frames. Pending transfers also check cancellation on a 100 ms runtime timer;
@@ -71,8 +73,10 @@ pub struct NetworkPartsRequest {
 
 #[derive(Clone, Copy, Debug)]
 pub struct NetworkPartsOptions {
-    /// Reuse and extend existing `.partial` files. Final verified parts are
-    /// always reused after a complete digest check, regardless of this flag.
+    /// Reuse and extend existing `.partial` files. A complete-part mismatch
+    /// quarantines a rejected retained prefix before restarting that part.
+    /// Final verified parts are always reused after a complete digest check,
+    /// regardless of this flag.
     pub resume: bool,
     /// Allowance for requested part-body bytes across ALL mirror attempts.
     /// Received bytes remain charged when an attempt fails or rolls back. A
@@ -115,6 +119,8 @@ pub struct NetworkPartReport {
     pub state: NetworkPartState,
     /// Mirror that completed the part; earlier windows may use prior mirrors.
     pub mirror_index: Option<usize>,
+    /// Original prefix bytes retained in the valid final part. Quarantined
+    /// rejected prefixes are excluded.
     pub resumed_bytes: u64,
     /// Body bytes received for this part, including discarded mirror attempts.
     pub downloaded_bytes: u64,
@@ -169,7 +175,7 @@ impl fmt::Display for NetworkPullError {
             Self::ExistingPart { part, detail } => write!(f, "network pull part {part} existing final refused: {detail}"),
             Self::Staging { part, operation, detail } => write!(f, "network pull part {part} staging {operation}: {detail}"),
             Self::NoMirrors { part } => write!(f, "network pull part {part} has no mirrors"),
-            Self::MirrorExhausted { part, attempts, last } => write!(f, "network pull part {part} exhausted {attempts} mirrors: {last}"),
+            Self::MirrorExhausted { part, attempts, last } => write!(f, "network pull part {part} exhausted {attempts} mirror passes: {last}"),
             Self::Redirect { part, mirror, detail } => write!(f, "network pull part {part} mirror {mirror} redirect refused: {detail}"),
             Self::Response { part, mirror, detail } => write!(f, "network pull part {part} mirror {mirror} response refused: {detail}"),
             Self::Body { part, mirror, detail } => write!(f, "network pull part {part} mirror {mirror} body failed: {detail}"),
@@ -267,27 +273,31 @@ pub async fn download_release_parts(
         }
         let staging_path = request.parts_dir.join(format!("{}{}", part.name, STAGING_SUFFIX));
         let mut staging = open_partial(index, &staging_path, options.resume)?;
-        let start = staging.metadata().map_err(|error| staging_error(index, "inspect", error))?.len();
+        let mut start = staging.metadata().map_err(|error| staging_error(index, "inspect", error))?.len();
         if start > part.bytes {
             return Err(NetworkPullError::Staging { part: index, operation: "length", detail: "partial exceeds declared part length".to_owned() });
         }
-        let prefix_hasher = hash_prefix(index, &mut staging, start, cx)?;
-        let resumed = start;
+        let mut prefix_hasher = hash_prefix(index, &mut staging, start, cx)?;
+        let mut resumed = start;
         if start == part.bytes {
             let observed = hex_lower(&prefix_hasher.clone().finalize());
-            if observed != part.sha256 {
-                return Err(NetworkPullError::Digest { part: index, expected: part.sha256.clone(), observed });
+            if observed == part.sha256 {
+                publish_part(index, &staging_path, &final_path)?;
+                verify_final(index, part, &final_path, || checkpoint(cx, Some(index)))?;
+                reused_total = reused_total.checked_add(part.bytes)
+                    .ok_or(NetworkPullError::InvalidOptions("reused byte arithmetic overflow"))?;
+                reports.push(NetworkPartReport {
+                    part: index, name: part.name.clone(), bytes: part.bytes, sha256: part.sha256.clone(),
+                    state: NetworkPartState::Reused, mirror_index: None, resumed_bytes: part.bytes,
+                    downloaded_bytes: 0, path: final_path,
+                });
+                continue;
             }
-            publish_part(index, &staging_path, &final_path)?;
-            verify_final(index, part, &final_path, || checkpoint(cx, Some(index)))?;
-            reused_total = reused_total.checked_add(part.bytes)
-                .ok_or(NetworkPullError::InvalidOptions("reused byte arithmetic overflow"))?;
-            reports.push(NetworkPartReport {
-                part: index, name: part.name.clone(), bytes: part.bytes, sha256: part.sha256.clone(),
-                state: NetworkPartState::Reused, mirror_index: None, resumed_bytes: part.bytes,
-                downloaded_bytes: 0, path: final_path,
-            });
-            continue;
+            quarantine_resumed_prefix(index, &mut staging, &staging_path, 0, start,
+                &prefix_hasher, || checkpoint(cx, Some(index)))?;
+            start = 0;
+            resumed = 0;
+            prefix_hasher = Sha256::new();
         }
 
         let downloaded_before_part = downloaded_total;
@@ -297,65 +307,81 @@ pub async fn download_release_parts(
         let mut last_error = None;
         if part.mirrors.is_empty() { return Err(NetworkPullError::NoMirrors { part: index }); }
 
-        for (mirror_index, mirror) in part.mirrors.iter().enumerate() {
-            // A later mirror may inherit complete, but unauthenticated, windows
-            // from an interrupted earlier mirror. It gets at most one fresh
-            // suffix attempt if those inherited bytes fail the final digest.
-            let mut inherited_windows = retained > start;
-            loop {
-                checkpoint(cx, Some(index))?;
-                // Failed traffic is never refunded. Recompute the allowance
-                // before every window and every mirror, before contacting it.
-                let request_end = next_range_end(index, retained, part.bytes,
-                    manifest.artifact.bytes, options.max_new_bytes, downloaded_total)?;
-                let mut hasher = retained_hasher.clone();
-                let result = drive_attempt(cx, index, mirror_index, options.request_timeout,
-                    fetch_range(cx, &client, index, mirror_index, mirror, retained, request_end, part.bytes,
-                        &mut staging, &mut hasher, &mut downloaded_total, options)).await;
-                match finish_attempt(index, mirror_index, part, retained, request_end,
-                    &mut staging, &hasher, result) {
-                    Ok(received) => {
-                        staging.flush().map_err(|error| staging_error(index, "flush-window", error))?;
-                        staging.sync_all().map_err(|error| staging_error(index, "sync-window", error))?;
-                        retained = retained.checked_add(received)
-                            .ok_or(NetworkPullError::InvalidOptions("part length arithmetic overflow"))?;
-                        retained_hasher = hasher;
-                        if retained == part.bytes {
-                            success = Some(mirror_index);
+        let mut passes = ResumeMirrorPasses::new(start);
+        loop {
+            for (mirror_index, mirror) in part.mirrors.iter().enumerate() {
+                passes.begin_mirror()?;
+                // A later mirror may inherit complete, but unauthenticated,
+                // windows from an interrupted earlier mirror. It gets at most
+                // one fresh suffix attempt if those windows fail the digest.
+                let mut inherited_windows = retained > start;
+                loop {
+                    checkpoint(cx, Some(index))?;
+                    // Failed traffic is never refunded. Recompute the allowance
+                    // before every window and mirror, before contacting it.
+                    let request_end = next_range_end(index, retained, part.bytes,
+                        manifest.artifact.bytes, options.max_new_bytes, downloaded_total)?;
+                    let mut hasher = retained_hasher.clone();
+                    let result = drive_attempt(cx, index, mirror_index, options.request_timeout,
+                        fetch_range(cx, &client, index, mirror_index, mirror, retained, request_end, part.bytes,
+                            &mut staging, &mut hasher, &mut downloaded_total, options)).await;
+                    match finish_attempt(index, mirror_index, part, retained, request_end,
+                        &mut staging, &hasher, result) {
+                        Ok(received) => {
+                            staging.flush().map_err(|error| staging_error(index, "flush-window", error))?;
+                            staging.sync_all().map_err(|error| staging_error(index, "sync-window", error))?;
+                            retained = retained.checked_add(received)
+                                .ok_or(NetworkPullError::InvalidOptions("part length arithmetic overflow"))?;
+                            retained_hasher = hasher;
+                            if retained == part.bytes {
+                                success = Some(mirror_index);
+                                break;
+                            }
+                        }
+                        // Cancellation and local storage errors are terminal.
+                        // Earlier completed windows remain synced and resumable.
+                        Err(error @ (NetworkPullError::Cancelled { .. } | NetworkPullError::Staging { .. })) => return Err(error),
+                        Err(error @ NetworkPullError::Digest { .. }) => {
+                            // Try the remaining suffix mirrors before deciding
+                            // whether the original prefix needs a fresh pass.
+                            restore_window_prefix(index, &mut staging, 0, start)?;
+                            passes.reject_digest();
+                            retained = start;
+                            retained_hasher = prefix_hasher.clone();
+                            last_error = Some(error);
+                            if inherited_windows {
+                                inherited_windows = false;
+                                continue;
+                            }
+                            break;
+                        }
+                        Err(error) => {
+                            last_error = Some(error);
                             break;
                         }
                     }
-                    // Cancellation and local storage errors are terminal. The
-                    // completed earlier windows remain synced and resumable.
-                    Err(error @ (NetworkPullError::Cancelled { .. } | NetworkPullError::Staging { .. })) => return Err(error),
-                    Err(error @ NetworkPullError::Digest { .. }) => {
-                        // Only the complete part has a trusted digest. Do not
-                        // let a corrupt earlier window poison all later mirrors.
-                        // Preserve exactly the prefix supplied by the caller.
-                        restore_window_prefix(index, &mut staging, 0, start)?;
-                        retained = start;
-                        retained_hasher = prefix_hasher.clone();
-                        last_error = Some(error);
-                        if inherited_windows {
-                            inherited_windows = false;
-                            continue;
-                        }
-                        break;
-                    }
-                    Err(error) => {
-                        last_error = Some(error);
-                        break;
-                    }
                 }
+                if success.is_some() { break; }
             }
-            if success.is_some() { break; }
+            if !passes.restart_after_pass(success.is_some()) { break; }
+            // All suffix mirrors failed and at least one complete digest
+            // rejected the resumed prefix. Preserve it before one fresh pass.
+            // Setting start to zero bounds this recovery to once per part.
+            restore_window_prefix(index, &mut staging, 0, start)?;
+            quarantine_resumed_prefix(index, &mut staging, &staging_path,
+                0, start, &prefix_hasher, || checkpoint(cx, Some(index)))?;
+            start = 0;
+            resumed = 0;
+            prefix_hasher = Sha256::new();
+            retained = 0;
+            retained_hasher = Sha256::new();
         }
         let Some(mirror_index) = success else {
             // Give exhausted enclosing work its typed budget outcome even if
             // the last available mirror consumed the final allowance.
             next_range_end(index, retained, part.bytes, manifest.artifact.bytes,
                 options.max_new_bytes, downloaded_total)?;
-            return Err(exhausted_mirrors(index, part.mirrors.len(), last_error));
+            return Err(exhausted_mirrors(index, passes.attempted, last_error));
         };
         publish_part(index, &staging_path, &final_path)?;
         verify_final(index, part, &final_path, || checkpoint(cx, Some(index)))?;
@@ -429,6 +455,36 @@ async fn drive_attempt<T>(
     }
 }
 
+/// One ordered suffix pass may be followed by one fresh pass after a complete
+/// digest rejection. A later suffix mirror gets its chance before any original
+/// prefix is quarantined. Transport failures alone never authorize a restart.
+struct ResumeMirrorPasses {
+    resumed: bool,
+    rejected: bool,
+    restarted: bool,
+    attempted: usize,
+}
+
+impl ResumeMirrorPasses {
+    fn new(prefix_bytes: u64) -> Self {
+        Self { resumed: prefix_bytes != 0, rejected: false, restarted: false, attempted: 0 }
+    }
+
+    fn begin_mirror(&mut self) -> Result<(), NetworkPullError> {
+        self.attempted = self.attempted.checked_add(1)
+            .ok_or(NetworkPullError::InvalidOptions("mirror attempt count overflow"))?;
+        Ok(())
+    }
+
+    fn reject_digest(&mut self) { self.rejected = true; }
+
+    fn restart_after_pass(&mut self, complete: bool) -> bool {
+        if complete || !self.resumed || !self.rejected || self.restarted { return false; }
+        self.restarted = true;
+        true
+    }
+}
+
 fn exhausted_mirrors(part: usize, attempts: usize, last: Option<NetworkPullError>) -> NetworkPullError {
     match last {
         // Keep the typed terminal timeout for the CLI's budget exit code.
@@ -482,9 +538,10 @@ fn finish_attempt(
     checked
 }
 
-/// Forget only windows appended during this invocation after a whole-part
-/// digest failure. An earlier complete artifact part and the caller's retained
-/// incomplete prefix are never rewritten. The network charge is unchanged.
+/// Restore a part boundary after a whole-part digest failure. Callers preserve
+/// the original resume prefix unless quarantine_resumed_prefix has first
+/// retained and authenticated its copy. Earlier complete artifact parts are
+/// never rewritten. The network charge is unchanged.
 fn restore_window_prefix(
     part: usize, file: &mut File, artifact_offset: u64, start: u64,
 ) -> Result<(), NetworkPullError> {
@@ -494,6 +551,104 @@ fn restore_window_prefix(
     file.seek(SeekFrom::Start(length)).map_err(|error| staging_error(part, "seek-part-windows", error))?;
     file.sync_all().map_err(|error| staging_error(part, "sync-part-windows", error))?;
     Ok(())
+}
+
+/// Preserve a rejected caller-provided prefix before restarting its part.
+///
+/// Call only after a complete-part digest mismatch, after rolling back new
+/// windows to the exact original prefix. The source range is at most one
+/// manifest-bounded part. A same-directory create-new copy is independently
+/// rehashed and synced before the active file is shortened. Copy/verification
+/// failures and their cancellation checkpoints leave the active prefix
+/// unchanged; after reset starts, its original bytes remain in the verified
+/// copy. Incomplete copies are retained, never deleted.
+///
+/// This assumes the existing stable-path/single-writer candidate contract
+/// and does not protect against concurrent same-user mutation or promise
+/// directory-entry durability across a crash.
+fn quarantine_resumed_prefix(
+    part: usize, file: &mut File, path: &Path, artifact_offset: u64,
+    length: u64, expected: &Sha256,
+    mut check: impl FnMut() -> Result<(), NetworkPullError>,
+) -> Result<PathBuf, NetworkPullError> {
+    check()?;
+    if length == 0 {
+        return Err(NetworkPullError::InvalidOptions("cannot quarantine an empty resume prefix"));
+    }
+    let source_length = artifact_offset.checked_add(length)
+        .ok_or(NetworkPullError::InvalidOptions("resume quarantine range overflow"))?;
+    super::check_staging_path(file, path, source_length)?;
+    let expected_digest = hex_lower(&expected.clone().finalize());
+    // Fixed-size names avoid exceeding component limits for a long original
+    // basename. The source-path digest separates unrelated staging files.
+    let source_id = hex_lower(&Sha256::digest(path.as_os_str().as_encoded_bytes()));
+    let mut created = None;
+    for slot in 0..32_u8 {
+        check()?;
+        let retained_path = path.with_file_name(format!(
+            "fnlp-rejected-resume-{source_id}-{part:02}-{expected_digest}-{slot:02}",
+        ));
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&retained_path) {
+            Ok(copy) => { created = Some((retained_path, copy)); break; }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(staging_error(part, "create-resume-quarantine", error)),
+        }
+    }
+    let (retained_path, mut copy) = created.ok_or_else(|| NetworkPullError::Staging {
+        part, operation: "create-resume-quarantine",
+        detail: "all bounded quarantine names already exist; original prefix retained".to_owned(),
+    })?;
+    let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
+    file.seek(SeekFrom::Start(artifact_offset))
+        .map_err(|error| staging_error(part, "seek-resume-quarantine", error))?;
+    let mut remaining = length;
+    let mut copied = Sha256::new();
+    while remaining != 0 {
+        check()?;
+        let want = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        file.read_exact(&mut buffer[..want])
+            .map_err(|error| staging_error(part, "read-resume-quarantine", error))?;
+        copy.write_all(&buffer[..want])
+            .map_err(|error| staging_error(part, "write-resume-quarantine", error))?;
+        copied.update(&buffer[..want]);
+        remaining -= want as u64;
+    }
+    if hex_lower(&copied.finalize()) != expected_digest {
+        return Err(NetworkPullError::Staging { part, operation: "verify-resume-quarantine",
+            detail: "retained prefix changed after its initial hash; original bytes retained".to_owned() });
+    }
+    copy.flush().map_err(|error| staging_error(part, "flush-resume-quarantine", error))?;
+    copy.sync_all().map_err(|error| staging_error(part, "sync-resume-quarantine", error))?;
+    // Verify the held copy itself before discarding any bytes from the active
+    // file; hashing only the input to write_all would not establish this.
+    copy.seek(SeekFrom::Start(0))
+        .map_err(|error| staging_error(part, "seek-quarantine-verification", error))?;
+    let mut remaining = length;
+    let mut verified = Sha256::new();
+    while remaining != 0 {
+        check()?;
+        let want = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        copy.read_exact(&mut buffer[..want])
+            .map_err(|error| staging_error(part, "read-quarantine-verification", error))?;
+        verified.update(&buffer[..want]);
+        remaining -= want as u64;
+    }
+    if hex_lower(&verified.finalize()) != expected_digest {
+        return Err(NetworkPullError::Staging { part, operation: "verify-resume-quarantine",
+            detail: "quarantine copy does not preserve the retained prefix".to_owned() });
+    }
+    check()?;
+    super::check_staging_path(&copy, &retained_path, length)?;
+    super::check_staging_path(file, path, source_length)?;
+    restore_window_prefix(part, file, artifact_offset, 0)?;
+    Ok(retained_path)
 }
 
 fn charge_body_bytes(downloaded: &mut u64, bytes: usize) -> Result<(), NetworkPullError> {
@@ -1463,6 +1618,176 @@ mod tests {
             ("Content-Length".to_owned(), "1".to_owned()),
         ];
         assert!(validate_response_head(0, 0, 206, &headers, 0, 0, 1).is_err());
+    }
+
+
+    #[test]
+    fn rejected_resumed_prefix_is_quarantined_before_a_fresh_part_retry() {
+        let path = attempt_path();
+        let mut file = open_partial(0, &path, true).unwrap();
+        file.write_all(b"aX").unwrap();
+        let mut prefix = Sha256::new(); prefix.update(b"aX");
+        let part = ReleasePart { id: 0, name: "fixture.part00".to_owned(),
+            bytes: 6, sha256: hex_lower(&Sha256::digest(b"abcdef")), mirrors: Vec::new() };
+        let mut downloaded = 0;
+        let mut bad = prefix.clone();
+        file.write_all(b"cdef").unwrap(); bad.update(b"cdef");
+        charge_body_bytes(&mut downloaded, 4).unwrap();
+        assert!(matches!(finish_attempt(0, 0, &part, 2, 5, &mut file, &bad, Ok(4)),
+            Err(NetworkPullError::Digest { .. })));
+        let retained = quarantine_resumed_prefix(0, &mut file, &path, 0, 2,
+            &prefix, || Ok(())).unwrap();
+        assert_eq!(fs::read(retained).unwrap(), b"aX");
+        assert_eq!(fs::read(&path).unwrap(), b"");
+        assert_eq!(file.stream_position().unwrap(), 0);
+        let end = next_range_end(0, 0, part.bytes, part.bytes, Some(10), downloaded).unwrap();
+        let mut fresh = Sha256::new();
+        file.write_all(b"abcdef").unwrap(); fresh.update(b"abcdef");
+        charge_body_bytes(&mut downloaded, 6).unwrap();
+        assert_eq!(finish_attempt(0, 0, &part, 0, end, &mut file, &fresh, Ok(6)).unwrap(), 6);
+        assert_eq!(fs::read(path).unwrap(), b"abcdef");
+        assert_eq!(downloaded, 10, "the rejected suffix remains charged");
+    }
+
+    #[test]
+    fn complete_rejected_partial_is_retained_and_a_zero_budget_cannot_fetch_again() {
+        let path = attempt_path();
+        let mut file = open_partial(0, &path, true).unwrap();
+        file.write_all(b"wrong!").unwrap();
+        let mut prefix = Sha256::new(); prefix.update(b"wrong!");
+        let retained = quarantine_resumed_prefix(0, &mut file, &path, 0, 6,
+            &prefix, || Ok(())).unwrap();
+        assert_eq!(fs::read(retained).unwrap(), b"wrong!");
+        assert_eq!(file.metadata().unwrap().len(), 0);
+        assert!(matches!(next_range_end(0, 0, 6, 6, Some(0), 0),
+            Err(NetworkPullError::DownloadBudgetExceeded {
+                limit: 0, downloaded_bytes: 0, retained_bytes: 0, total_bytes: 6, part: 0,
+            })));
+        assert!(matches!(next_range_end(0, 0, 6, 6, Some(4), 4),
+            Err(NetworkPullError::DownloadBudgetExceeded { downloaded_bytes: 4, .. })));
+    }
+
+    #[test]
+    fn every_quarantine_cancellation_boundary_keeps_the_original_prefix() {
+        let bytes = vec![b'X'; COPY_BUFFER_BYTES + 1];
+        for stop in 1..=7 {
+            let path = attempt_path();
+            let mut file = open_partial(0, &path, true).unwrap();
+            file.write_all(&bytes).unwrap();
+            let mut prefix = Sha256::new(); prefix.update(&bytes);
+            let mut calls = 0;
+            let result = quarantine_resumed_prefix(0, &mut file, &path, 0, bytes.len() as u64,
+                &prefix, || {
+                    calls += 1;
+                    if calls == stop {
+                        Err(NetworkPullError::Cancelled { cause: Some(CancelKind::CostBudget), part: Some(0) })
+                    } else { Ok(()) }
+                });
+            assert!(matches!(result, Err(NetworkPullError::Cancelled {
+                cause: Some(CancelKind::CostBudget), part: Some(0),
+            })), "boundary {stop}");
+            assert_eq!(calls, stop);
+            assert_eq!(fs::read(path).unwrap(), bytes, "boundary {stop} must not truncate");
+        }
+    }
+
+    #[test]
+    fn quarantine_refuses_a_changed_prefix_even_when_its_length_is_unchanged() {
+        let path = attempt_path();
+        let mut file = open_partial(0, &path, true).unwrap();
+        file.write_all(b"new").unwrap();
+        let mut original = Sha256::new(); original.update(b"old");
+        assert!(matches!(quarantine_resumed_prefix(0, &mut file, &path, 0, 3,
+            &original, || Ok(())),
+            Err(NetworkPullError::Staging { operation: "verify-resume-quarantine", .. })));
+        assert_eq!(fs::read(path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn bounded_quarantine_namespace_preserves_every_copy_and_fails_closed_when_full() {
+        let path = attempt_path();
+        let mut file = open_partial(0, &path, true).unwrap();
+        let mut prefix = Sha256::new(); prefix.update(b"bad");
+        let mut retained = Vec::new();
+        for _ in 0..32 {
+            file.write_all(b"bad").unwrap();
+            let copy = quarantine_resumed_prefix(0, &mut file, &path, 0, 3,
+                &prefix, || Ok(())).unwrap();
+            assert!(!retained.contains(&copy));
+            retained.push(copy);
+        }
+        file.write_all(b"bad").unwrap();
+        assert!(matches!(quarantine_resumed_prefix(0, &mut file, &path, 0, 3,
+            &prefix, || Ok(())),
+            Err(NetworkPullError::Staging { operation: "create-resume-quarantine", .. })));
+        assert_eq!(fs::read(path).unwrap(), b"bad");
+        for copy in retained { assert_eq!(fs::read(copy).unwrap(), b"bad"); }
+    }
+
+    #[test]
+    fn quarantine_checks_source_identity_and_range_before_creating_a_copy() {
+        let path = attempt_path();
+        let other = attempt_path();
+        let mut file = open_partial(0, &path, true).unwrap();
+        file.write_all(b"bad").unwrap();
+        let mut prefix = Sha256::new(); prefix.update(b"bad");
+        assert!(quarantine_resumed_prefix(0, &mut file, &path, u64::MAX, 3,
+            &prefix, || Ok(())).is_err());
+        assert!(quarantine_resumed_prefix(0, &mut file, &path, 0, 4,
+            &prefix, || Ok(())).is_err());
+        assert!(quarantine_resumed_prefix(0, &mut file, &other, 0, 3,
+            &prefix, || Ok(())).is_err());
+        assert_eq!(fs::read(path).unwrap(), b"bad");
+        assert!(!other.exists());
+    }
+
+    #[test]
+    fn a_later_valid_suffix_mirror_preserves_the_prefix_within_a_tight_budget() {
+        let (mut file, part, prefix) = attempt_fixture(b"ab", b"abcdef");
+        let mut passes = ResumeMirrorPasses::new(2);
+        let mut downloaded = 0;
+        let mut complete = false;
+        for (mirror, bytes) in [b"XXXX".as_slice(), b"cdef"].into_iter().enumerate() {
+            passes.begin_mirror().unwrap();
+            let end = next_range_end(0, 2, part.bytes, part.bytes, Some(8), downloaded).unwrap();
+            let mut hasher = prefix.clone();
+            file.write_all(bytes).unwrap(); hasher.update(bytes);
+            charge_body_bytes(&mut downloaded, bytes.len()).unwrap();
+            match finish_attempt(0, mirror, &part, 2, end, &mut file, &hasher, Ok(4)) {
+                Ok(_) => { complete = true; break; }
+                Err(NetworkPullError::Digest { .. }) => passes.reject_digest(),
+                Err(error) => panic!("unexpected suffix error: {error}"),
+            }
+        }
+        assert!(complete);
+        assert!(!passes.restart_after_pass(complete), "success must never quarantine a valid prefix");
+        assert_eq!(passes.attempted, 2);
+        assert_eq!(downloaded, 8, "a needless full retry would exceed the admitted allowance");
+        file.rewind().unwrap();
+        let mut bytes = Vec::new(); file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"abcdef");
+    }
+
+    #[test]
+    fn fresh_mirror_pass_requires_a_digest_rejection_and_runs_at_most_once() {
+        let mut fresh = ResumeMirrorPasses::new(0);
+        fresh.begin_mirror().unwrap();
+        fresh.reject_digest();
+        assert!(!fresh.restart_after_pass(false), "no original prefix exists to repair");
+
+        let mut resumed = ResumeMirrorPasses::new(2);
+        resumed.begin_mirror().unwrap();
+        resumed.begin_mirror().unwrap();
+        assert!(!resumed.restart_after_pass(false), "transient failures retain resumable progress");
+        resumed.reject_digest();
+        assert!(resumed.restart_after_pass(false));
+        resumed.begin_mirror().unwrap();
+        resumed.begin_mirror().unwrap();
+        resumed.reject_digest();
+        assert!(!resumed.restart_after_pass(false), "a malicious mirror cannot cause a retry loop");
+        assert!(matches!(exhausted_mirrors(0, resumed.attempted,
+            Some(NetworkPullError::Digest { part: 0, expected: "a".repeat(64), observed: "b".repeat(64) })),
+            NetworkPullError::MirrorExhausted { attempts: 4, .. }));
     }
 
     #[test]

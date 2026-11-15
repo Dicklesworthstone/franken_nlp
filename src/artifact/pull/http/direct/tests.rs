@@ -164,7 +164,7 @@ fn corrupt_unverified_tail_cannot_pass_when_the_part_completes() {
     file.write_all(b"FG").unwrap(); hasher.update(b"FG");
     assert!(matches!(finish_artifact_attempt(1, 0, &manifest.parts[1], 3, 2, 3,
         &mut file, &hasher, Ok(2)), Err(NetworkPullError::Digest { part: 1, .. })));
-    assert_eq!(fs::read(path).unwrap(), b"abcDX", "refuse rather than repair retained input");
+    assert_eq!(fs::read(path).unwrap(), b"abcDX", "the digest gate preserves input until quarantine completes");
 }
 
 #[test]
@@ -310,4 +310,58 @@ fn later_window_timeout_retains_synced_artifact_progress_and_absolute_budget() {
         Err(NetworkPullError::DownloadBudgetExceeded {
             limit: 3, downloaded_bytes: 3, retained_bytes: 10, total_bytes: 12, part: 2,
         })));
+}
+
+#[test]
+fn rejected_resume_tail_is_quarantined_and_only_its_part_restarts() {
+    let manifest = manifest();
+    let part = &manifest.parts[1];
+    let (path, mut file) = stage(b"abcDX");
+    let prefix = authenticate_prefix(&mut file, &manifest, 5,
+        &mut [0_u8; 2], &mut |_| Ok(())).unwrap();
+    let mut downloaded = 0;
+    let mut failed = prefix.partial_hasher.clone();
+    file.write_all(b"FG").unwrap(); failed.update(b"FG");
+    charge_body_bytes(&mut downloaded, 2).unwrap();
+    assert!(matches!(finish_artifact_attempt(1, 0, part, 3, 2, 3,
+        &mut file, &failed, Ok(2)), Err(NetworkPullError::Digest { part: 1, .. })));
+    restore_window_prefix(1, &mut file, 3, 2).unwrap();
+    let retained = quarantine_resumed_prefix(1, &mut file, &path, 3, 2,
+        &prefix.partial_hasher, || Ok(())).unwrap();
+    assert_eq!(fs::read(retained).unwrap(), b"DX", "preserve the caller's exact rejected tail");
+    assert_eq!(fs::read(&path).unwrap(), b"abc", "the authenticated first part stays in place");
+    assert_eq!(file.stream_position().unwrap(), 3);
+    let resumed_bytes = prefix.verified_bytes;
+    let mut fresh = Sha256::new(); fresh.update(b"DEFG");
+    let end = artifact_range_end(1, 3, 0, part.bytes, 12, Some(11), downloaded).unwrap();
+    file.write_all(b"DEFG").unwrap();
+    charge_body_bytes(&mut downloaded, 4).unwrap();
+    assert_eq!(finish_artifact_attempt(1, 0, part, 3, 0, end,
+        &mut file, &fresh, Ok(4)).unwrap(), 4);
+    let mut last = Sha256::new(); last.update(b"hijkl");
+    file.write_all(b"hijkl").unwrap();
+    charge_body_bytes(&mut downloaded, 5).unwrap();
+    assert_eq!(finish_artifact_attempt(2, 0, &manifest.parts[2], 7, 0, 4,
+        &mut file, &last, Ok(5)).unwrap(), 5);
+    assert_eq!(fs::read(path).unwrap(), b"abcDEFGhijkl");
+    assert_eq!(resumed_bytes, 3, "a rejected prefix is not counted as reused");
+    assert_eq!(12 - resumed_bytes, 9, "only valid new artifact bytes are retained");
+    assert_eq!(downloaded, 11, "failed traffic remains charged in addition to all fresh bytes");
+}
+
+#[test]
+fn cancelling_rejected_tail_quarantine_never_changes_authenticated_or_retained_bytes() {
+    let (path, mut file) = stage(b"abcDX");
+    let mut prefix = Sha256::new(); prefix.update(b"DX");
+    let mut checks = 0;
+    let result = quarantine_resumed_prefix(1, &mut file, &path, 3, 2, &prefix, || {
+        checks += 1;
+        if checks == 5 {
+            Err(NetworkPullError::Cancelled { cause: Some(CancelKind::Deadline), part: Some(1) })
+        } else { Ok(()) }
+    });
+    assert!(matches!(result, Err(NetworkPullError::Cancelled {
+        cause: Some(CancelKind::Deadline), part: Some(1),
+    })));
+    assert_eq!(fs::read(path).unwrap(), b"abcDX");
 }
