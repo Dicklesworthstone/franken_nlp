@@ -5,7 +5,7 @@
 use std::{error::Error, fmt, sync::Mutex};
 use serde::{Deserialize, Serialize};
 use super::{
-    attention::{QUERY_HEAD_COUNT, eager_gqa_attention_from_cache},
+    attention::{AttentionError, QUERY_HEAD_COUNT, eager_gqa_attention_from_cache_with_control},
     decode::{DecodeCancellationKind, DecodeStepControl},
     int4::PackedInt4Kernel,
     kv::{KV_BYTES_PER_TOKEN, KV_SLOT_COUNT, PHYSICAL_LAYER_COUNT, KvCache, slot_for},
@@ -30,6 +30,8 @@ pub use weights::{Int4ModelError, Int4ModelIdentity, Int4ModelLoadBudget,
     Int4ModelLoadRequirement, Int4ModelWeights};
 use weights::{Int4Layer, PROJECTION_SHAPES};
 use projection::{Int4ProjectionExecutor, Int4ProjectionKind, Int4ProjectionOp};
+#[cfg(test)]
+use super::attention::eager_gqa_attention_from_cache;
 
 // Version 1 remains the existing INT8 program. Version 2 names this distinct
 // grouped-INT4 candidate in the central ExecutionIdentity profile namespace.
@@ -64,6 +66,15 @@ impl fmt::Display for StrictInt4Error {
     }
 }
 impl Error for StrictInt4Error {}
+impl From<AttentionError> for StrictInt4Error {
+    fn from(error: AttentionError) -> Self {
+        match error {
+            AttentionError::Cancelled(cause) => Self::Cancelled(cause),
+            AttentionError::Allocation => Self::Allocation,
+            _ => Self::Attention,
+        }
+    }
+}
 impl From<GroupedInt4Error> for StrictInt4Error {
     fn from(error: GroupedInt4Error) -> Self {
         match error { GroupedInt4Error::Linear(LinearError::Cancelled(cause)) => Self::Cancelled(cause),
@@ -138,7 +149,9 @@ impl Int4MemoryRequirement {
         Ok(Self { kv_bytes: n * KV_BYTES_PER_TOKEN as u64,
             rope_bytes: (n * NANBEIGE_HEAD_DIM as u64 + (NANBEIGE_HEAD_DIM / 2) as u64) * 4,
             // Same conservative simultaneous reference-vector allowance as
-            // strict INT8, plus the reusable group unpacking payload. Weights,
+            // strict INT8. Controlled attention reuses only 4*n context bytes
+            // and one stack head, within the existing 16*n allowance. Plus
+            // the reusable group unpacking payload. Weights,
             // allocator slack, caller output and host overhead are separate.
             scratch_payload_bound: (32 * I + V + NANBEIGE_HEAD_DIM) as u64 * 4 + 16 * n + group_width as u64 })
     }
@@ -324,7 +337,7 @@ impl<C: DecodeStepControl> LayerExecutor<Int4Layer> for Executor<'_, '_, C> {
         for (out, value) in value_bits.iter_mut().zip(&value) { *out = value.to_bits(); }
         cache.append(binding.kv_slot(), positions.cache_position, &key_bits, &value_bits).map_err(|_| StrictInt4Error::Cache)?;
         poll(self.control)?;
-        let attention = eager_gqa_attention_from_cache(&query, cache, binding.kv_slot()).map_err(|_| StrictInt4Error::Attention)?;
+        let attention = eager_gqa_attention_from_cache_with_control(&query, cache, binding.kv_slot(), self.control)?;
         finite(&attention)?; poll(self.control)?;
         self.activation.encode_bf16(&attention)?;
         let update = self.project(projection(Int4ProjectionKind::AttentionOutput), &layer.o)?;

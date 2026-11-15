@@ -90,6 +90,32 @@ fn partial_causal_failure_leaves_only_a_private_prefix_for_session_cleanup() {
     assert!(state.open().is_err());
 }
 #[test]
+fn cancellation_inside_attention_keeps_its_cause_and_requires_poisoned_cleanup() {
+    struct DeadlineControl { polls: usize }
+    impl DecodeStepControl for DeadlineControl {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.polls += 1;
+            // Two causal-driver checks, attention entry, then score/max/exp/
+            // sum/probability checks. Stop at the first weighted-value block.
+            (self.polls == 9).then_some(DecodeCancellationKind::Deadline)
+        }
+    }
+    let mut cache = KvCache::try_with_capacity(2).unwrap();
+    let rope = RopeTablesF32::nanbeige(2).unwrap();
+    let mut query = vec![Bf16::from_bits(0); 2 * Q];
+    let mut key = vec![Bf16::from_bits(0); 2 * K];
+    let value = vec![Bf16::from_f32(3.0); 2 * K];
+    let error = attend_rows(&mut query, &mut key, &value, 2, 0, 22, &rope,
+        &mut cache, &mut DeadlineControl { polls: 0 }).unwrap_err();
+    assert_eq!(error, StrictInt4Error::Cancelled(DecodeCancellationKind::Deadline));
+    assert_eq!(cache.len_for_slot(22).unwrap(), 1);
+    let mut state = RunState { active: true, poisoned: true };
+    end_session(&mut cache, &mut state);
+    assert!(cache.all_slots_have_len(0));
+    assert!(state.poisoned);
+    assert!(state.open().is_err());
+}
+#[test]
 fn invalid_prompt_tokens_are_checked_as_one_complete_input() {
     assert!(check_tokens(&[]).is_err()); assert!(check_tokens(&[0, V as u32]).is_err());
     assert!(check_tokens(&[0, V as u32 - 1]).is_ok());

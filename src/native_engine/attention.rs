@@ -2,6 +2,7 @@
 
 use super::tensor::{Bf16, cast_f32_to_bf16};
 use super::{
+    decode::{DecodeCancellationKind, DecodeStepControl},
     kv::{KV_ELEMENTS_PER_POSITION, KvCache, KvCacheError},
     rope::NANBEIGE_HEAD_DIM,
 };
@@ -14,6 +15,9 @@ pub const KV_HEAD_COUNT: usize = 8;
 pub const QUERY_HEADS_PER_KV_HEAD: usize = QUERY_HEAD_COUNT / KV_HEAD_COUNT;
 /// Eager attention scale, `1 / sqrt(128)`.
 pub const ATTENTION_SCALE: f32 = 0.088_388_346;
+/// Maximum consecutive cache positions or softmax entries between checkpoints.
+/// Each QK or weighted-value position has the fixed 128-element head width.
+pub const ATTENTION_POSITIONS_PER_CHECKPOINT: usize = 32;
 
 /// Eager-attention shape or grouping refusal.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,6 +45,10 @@ pub enum AttentionError {
     },
     /// Attention has no defined reduction over an empty sequence.
     EmptySequence,
+    /// The admitted output or context scratch could not be allocated.
+    Allocation,
+    /// Cooperative cancellation retains its exact policy-boundary cause.
+    Cancelled(DecodeCancellationKind),
 }
 
 impl From<KvCacheError> for AttentionError {
@@ -317,6 +325,148 @@ pub fn eager_gqa_attention_from_cache_prefix(
     Ok(output)
 }
 
+/// Checkpointed eager GQA over the complete resident cache prefix.
+///
+/// Uses the same QK/scaled-score/probability BF16 cast points and the same
+/// increasing-position reductions as the simple reference above. One fallible
+/// f32 context buffer is reused across all 48 heads, through scores,
+/// exponentials and BF16-rounded probabilities. The 128-wide value accumulator
+/// stays on the stack. This is not the distinct online-softmax float program.
+///
+/// Callers own admission and work accounting. No token or attention work is
+/// refunded on error, and no partially completed output is returned.
+pub fn eager_gqa_attention_from_cache_with_control<C: DecodeStepControl + ?Sized>(
+    query: &[Bf16],
+    cache: &KvCache,
+    slot: usize,
+    control: &mut C,
+) -> Result<Vec<Bf16>, AttentionError> {
+    let sequence_len = cache.len_for_slot(slot)?;
+    eager_gqa_attention_from_cache_prefix_with_control(query, cache, slot, sequence_len, control)
+}
+
+/// Checkpointed causal-prefix variant for ragged/prefill callers. A later
+/// resident position is never visible merely because its K/V already exists.
+pub fn eager_gqa_attention_from_cache_prefix_with_control<C: DecodeStepControl + ?Sized>(
+    query: &[Bf16],
+    cache: &KvCache,
+    slot: usize,
+    sequence_len: usize,
+    control: &mut C,
+) -> Result<Vec<Bf16>, AttentionError> {
+    let query_width = QUERY_HEAD_COUNT * NANBEIGE_HEAD_DIM;
+    if query.len() != query_width {
+        return Err(AttentionError::QueryVectorLength {
+            expected: query_width,
+            actual: query.len(),
+        });
+    }
+    let available_positions = cache.len_for_slot(slot)?;
+    if sequence_len > available_positions {
+        return Err(AttentionError::CausalPrefixUnavailable {
+            requested_positions: sequence_len,
+            available_positions,
+        });
+    }
+    if sequence_len == 0 {
+        return Err(AttentionError::EmptySequence);
+    }
+    attention_checkpoint(control)?;
+    let mut output = attention_buffer(query_width, Bf16::from_bits(0))?;
+    let mut scratch = attention_buffer(sequence_len, 0.0_f32)?;
+    for kv_head in 0..KV_HEAD_COUNT {
+        let kv_start = kv_head * NANBEIGE_HEAD_DIM;
+        let kv_end = kv_start + NANBEIGE_HEAD_DIM;
+        for query_offset in 0..QUERY_HEADS_PER_KV_HEAD {
+            let query_head = kv_head * QUERY_HEADS_PER_KV_HEAD + query_offset;
+            let query_start = query_head * NANBEIGE_HEAD_DIM;
+            let query_end = query_start + NANBEIGE_HEAD_DIM;
+            let query_values = &query[query_start..query_end];
+            for (block, scores) in scratch.chunks_mut(ATTENTION_POSITIONS_PER_CHECKPOINT).enumerate() {
+                attention_checkpoint(control)?;
+                let base = block * ATTENTION_POSITIONS_PER_CHECKPOINT;
+                for (offset, score) in scores.iter_mut().enumerate() {
+                    let key = cache.key_at(slot, base + offset)?;
+                    *score = qk_score_bf16_cast_points_from_values(
+                        query_values.iter().map(|value| value.to_f32()),
+                        key[kv_start..kv_end].iter().map(|value| Bf16::from_bits(*value).to_f32()),
+                    ).to_f32();
+                }
+            }
+            eager_probabilities_in_place(&mut scratch, control)?;
+            let mut accumulated = [0.0_f32; NANBEIGE_HEAD_DIM];
+            for (block, probabilities) in scratch.chunks(ATTENTION_POSITIONS_PER_CHECKPOINT).enumerate() {
+                attention_checkpoint(control)?;
+                let base = block * ATTENTION_POSITIONS_PER_CHECKPOINT;
+                for (offset, &probability) in probabilities.iter().enumerate() {
+                    let value = cache.value_at(slot, base + offset)?;
+                    for (destination, source) in accumulated.iter_mut().zip(&value[kv_start..kv_end]) {
+                        *destination += probability * Bf16::from_bits(*source).to_f32();
+                    }
+                }
+            }
+            for (destination, value) in output[query_start..query_end].iter_mut().zip(accumulated) {
+                *destination = Bf16::from_f32(value);
+            }
+        }
+    }
+    attention_checkpoint(control)?;
+    Ok(output)
+}
+
+/// Reuses the score storage without changing the reference's reduction order.
+/// In particular, checkpoint blocks are NOT independently summed: `sum::<f32>`
+/// receives the same complete ordered stream as softmax_f32_cast_back.
+fn eager_probabilities_in_place<C: DecodeStepControl + ?Sized>(
+    scores: &mut [f32],
+    control: &mut C,
+) -> Result<(), AttentionError> {
+    let mut cancelled = None;
+    let maximum = checkpointed_values(scores, control, &mut cancelled).reduce(f32::max);
+    if let Some(cause) = cancelled { return Err(AttentionError::Cancelled(cause)); }
+    let maximum = maximum.ok_or(AttentionError::EmptySequence)?;
+    for block in scores.chunks_mut(ATTENTION_POSITIONS_PER_CHECKPOINT) {
+        attention_checkpoint(control)?;
+        for score in block { *score = (*score - maximum).exp(); }
+    }
+    let denominator = checkpointed_values(scores, control, &mut cancelled).sum::<f32>();
+    if let Some(cause) = cancelled { return Err(AttentionError::Cancelled(cause)); }
+    for block in scores.chunks_mut(ATTENTION_POSITIONS_PER_CHECKPOINT) {
+        attention_checkpoint(control)?;
+        for score in block { *score = Bf16::from_f32(*score / denominator).to_f32(); }
+    }
+    Ok(())
+}
+
+fn checkpointed_values<'a, C: DecodeStepControl + ?Sized>(
+    values: &'a [f32],
+    control: &'a mut C,
+    cancelled: &'a mut Option<DecodeCancellationKind>,
+) -> impl Iterator<Item = f32> + 'a {
+    values.iter().copied().enumerate().map_while(move |(index, value)| {
+        if index.is_multiple_of(ATTENTION_POSITIONS_PER_CHECKPOINT)
+            && let Some(cause) = control.prefill_checkpoint(0) {
+            *cancelled = Some(cause);
+            return None;
+        }
+        Some(value)
+    })
+}
+
+fn attention_checkpoint<C: DecodeStepControl + ?Sized>(control: &mut C) -> Result<(), AttentionError> {
+    match control.prefill_checkpoint(0) {
+        Some(cause) => Err(AttentionError::Cancelled(cause)),
+        None => Ok(()),
+    }
+}
+
+fn attention_buffer<T: Clone>(length: usize, value: T) -> Result<Vec<T>, AttentionError> {
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(length).map_err(|_| AttentionError::Allocation)?;
+    buffer.resize(length, value);
+    Ok(buffer)
+}
+
 /// Computes native causal GQA for every row in an already-populated prefill.
 ///
 /// `queries` has one contiguous 48 × 128 row per cache position.  Row `n`
@@ -442,6 +592,139 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    struct Control {
+        polls: usize,
+        cancel_at: Option<usize>,
+        cause: DecodeCancellationKind,
+    }
+    impl Control {
+        fn uninterrupted() -> Self {
+            Self { polls: 0, cancel_at: None, cause: DecodeCancellationKind::User }
+        }
+    }
+    impl DecodeStepControl for Control {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.polls += 1;
+            (self.cancel_at == Some(self.polls)).then_some(self.cause)
+        }
+    }
+
+    fn cancellation_kinds() -> [DecodeCancellationKind; 11] {
+        use DecodeCancellationKind::*;
+        [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+            ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit]
+    }
+
+    fn controlled_case(capacity: usize, slot: usize) -> (Vec<Bf16>, KvCache) {
+        let mut cache = KvCache::try_with_capacity(capacity).expect("bounded attention fixture");
+        for position in 0..capacity {
+            let key: Vec<_> = (0..KV_ELEMENTS_PER_POSITION)
+                .map(|index| bf16_bits(((index * 7 + position * 13) % 67) as f32 / 32.0 - 1.0))
+                .collect();
+            let value: Vec<_> = (0..KV_ELEMENTS_PER_POSITION)
+                .map(|index| bf16_bits(((index * 17 + position * 11) % 127) as f32 / 8.0 - 8.0))
+                .collect();
+            cache.append(slot, position, &key, &value).expect("fixture K/V append");
+        }
+        let query = (0..QUERY_HEAD_COUNT * NANBEIGE_HEAD_DIM)
+            .map(|index| Bf16::from_f32(((index * 3) % 31) as f32 / 16.0 - 1.0))
+            .collect();
+        (query, cache)
+    }
+
+    #[test]
+    fn controlled_gqa_is_bit_exact_at_causal_and_checkpoint_boundaries() {
+        for slot in [0, 22, 43] {
+            let (query, cache) = controlled_case(65, slot);
+            for prefix in [1, 2, 15, 16, 17, 31, 32, 33, 63, 64, 65] {
+                let expected = eager_gqa_attention_from_cache_prefix(&query, &cache, slot, prefix)
+                    .expect("independent simple eager reference");
+                let actual = eager_gqa_attention_from_cache_prefix_with_control(
+                    &query, &cache, slot, prefix, &mut Control::uninterrupted(),
+                ).expect("bounded checkpointed eager execution");
+                assert_eq!(actual.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                    "slot {slot}, causal prefix {prefix}");
+            }
+        }
+    }
+
+    #[test]
+    fn in_place_probabilities_retain_cast_points_and_float_edge_behavior() {
+        let mut cases = vec![vec![-0.0], vec![0.0, -0.0], vec![-500.0, -501.0, -499.0],
+            vec![f32::INFINITY, 0.0], vec![f32::NEG_INFINITY],
+            vec![f32::NAN, 1.0], vec![f32::NAN, f32::NAN],
+            vec![0.0, f32::EPSILON, -f32::EPSILON]];
+        cases.push((0..67).map(|index| ((index * 17) % 29) as f32 / 32.0 - 0.5).collect());
+        for scores in cases {
+            let expected = softmax_f32_cast_back(&scores).expect("simple softmax reference");
+            let mut actual = scores;
+            eager_probabilities_in_place(&mut actual, &mut Control::uninterrupted())
+                .expect("same eager softmax with reused storage");
+            assert_eq!(actual.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|value| value.to_f32().to_bits()).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn each_attention_phase_observes_every_cancellation_cause_without_a_result() {
+        let (query, cache) = controlled_case(65, 22);
+        let blocks = 65_usize.div_ceil(ATTENTION_POSITIONS_PER_CHECKPOINT);
+        // Stop inside the second bounded block of QK, max, exp, sum,
+        // probability cast and weighted-value reduction, respectively.
+        for phase in 0..6 {
+            for cause in cancellation_kinds() {
+                let cancel_at = 1 + phase * blocks + 2;
+                let mut control = Control { polls: 0, cancel_at: Some(cancel_at), cause };
+                let result = eager_gqa_attention_from_cache_with_control(&query, &cache, 22, &mut control);
+                assert_eq!(result, Err(AttentionError::Cancelled(cause)), "phase {phase}");
+                assert_eq!(control.polls, cancel_at, "no work or polling after cancellation");
+            }
+        }
+    }
+
+    #[test]
+    fn completed_attention_still_checks_cancellation_before_returning_output() {
+        let (query, cache) = controlled_case(2, 0);
+        let mut complete = Control::uninterrupted();
+        eager_gqa_attention_from_cache_with_control(&query, &cache, 0, &mut complete)
+            .expect("count completed-run checkpoints");
+        let mut cancelled = Control {
+            polls: 0, cancel_at: Some(complete.polls), cause: DecodeCancellationKind::Deadline,
+        };
+        assert_eq!(eager_gqa_attention_from_cache_with_control(&query, &cache, 0, &mut cancelled),
+            Err(AttentionError::Cancelled(DecodeCancellationKind::Deadline)));
+    }
+
+    #[test]
+    fn controlled_attention_validates_shapes_before_polling() {
+        let (query, cache) = controlled_case(2, 0);
+        let mut control = Control { polls: 0, cancel_at: Some(1), cause: DecodeCancellationKind::User };
+        assert!(matches!(eager_gqa_attention_from_cache_prefix_with_control(
+            &query[..query.len() - 1], &cache, 0, 2, &mut control,
+        ), Err(AttentionError::QueryVectorLength { .. })));
+        assert_eq!(eager_gqa_attention_from_cache_prefix_with_control(
+            &query, &cache, 0, 0, &mut control,
+        ), Err(AttentionError::EmptySequence));
+        assert!(matches!(eager_gqa_attention_from_cache_prefix_with_control(
+            &query, &cache, 0, 3, &mut control,
+        ), Err(AttentionError::CausalPrefixUnavailable { .. })));
+        assert_eq!(control.polls, 0);
+    }
+
+    #[test]
+    fn strict_engines_preserve_attention_cancellation_and_allocation_errors() {
+        use crate::native_engine::{strict_int4::StrictInt4Error, strict_int8::StrictInt8Error};
+        for cause in cancellation_kinds() {
+            assert_eq!(StrictInt4Error::from(AttentionError::Cancelled(cause)), StrictInt4Error::Cancelled(cause));
+            assert_eq!(StrictInt8Error::from(AttentionError::Cancelled(cause)), StrictInt8Error::Cancelled(cause));
+        }
+        assert_eq!(StrictInt4Error::from(AttentionError::Allocation), StrictInt4Error::Allocation);
+        assert_eq!(StrictInt8Error::from(AttentionError::Allocation), StrictInt8Error::Allocation);
+        assert_eq!(StrictInt4Error::from(AttentionError::EmptySequence), StrictInt4Error::Attention);
+        assert_eq!(StrictInt8Error::from(AttentionError::EmptySequence), StrictInt8Error::Attention);
     }
 
     #[test]

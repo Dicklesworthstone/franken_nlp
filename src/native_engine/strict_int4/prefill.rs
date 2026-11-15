@@ -196,7 +196,7 @@ fn attend_rows<C: DecodeStepControl>(query: &mut [Bf16], key: &mut [Bf16], value
         for (out, value) in value_bits.iter_mut().zip(v) { *out = value.to_bits(); }
         cache.append(slot, position, &key_bits, &value_bits).map_err(|_| StrictInt4Error::Cache)?;
         poll(control)?;
-        let attention = eager_gqa_attention_from_cache(q, cache, slot).map_err(|_| StrictInt4Error::Attention)?;
+        let attention = eager_gqa_attention_from_cache_with_control(q, cache, slot, control)?;
         finite(&attention)?;
         output[index * Q..(index + 1) * Q].copy_from_slice(&attention);
     }

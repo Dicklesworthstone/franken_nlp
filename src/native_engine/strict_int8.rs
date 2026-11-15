@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     artifact_bridge::{ArtifactBridgeError, ArtifactIdentity, ArtifactLoadBudget, ArtifactLoadReceipt,
         CurrentCandidateArtifactSource, LoadedArtifactWeights},
-    attention::{QUERY_HEAD_COUNT, eager_gqa_attention_from_cache},
+    attention::{AttentionError, QUERY_HEAD_COUNT, eager_gqa_attention_from_cache_with_control},
     decode::{DecodeCancellationKind, DecodeStepControl},
     kv::{KV_BYTES_PER_TOKEN, KV_SLOT_COUNT, PHYSICAL_LAYER_COUNT, KvCache, slot_for},
     layer::{NANBEIGE_HIDDEN_SIZE as H, NANBEIGE_INTERMEDIATE_SIZE as I,
@@ -32,6 +32,8 @@ mod weights;
 pub use weights::Int8WeightView;
 use weights::Int8Layer;
 use crate::tokenizer::embedded::{EmbeddedTokenizer, EmbeddedTokenizerError};
+#[cfg(test)]
+use super::attention::eager_gqa_attention_from_cache;
 
 pub const STRICT_INT8_PROFILE: &str = "strict-quantized-v1";
 pub const STRICT_INT8_EXECUTION: &str = "portable-int8-bf16-rails-eager-gqa-v1";
@@ -64,6 +66,15 @@ impl fmt::Display for StrictInt8Error {
     }
 }
 impl Error for StrictInt8Error {}
+impl From<AttentionError> for StrictInt8Error {
+    fn from(error: AttentionError) -> Self {
+        match error {
+            AttentionError::Cancelled(cause) => Self::Cancelled(cause),
+            AttentionError::Allocation => Self::Allocation,
+            _ => Self::Attention,
+        }
+    }
+}
 impl From<LinearError> for StrictInt8Error {
     fn from(error: LinearError) -> Self {
         match error { LinearError::Cancelled(cause) => Self::Cancelled(cause), other => Self::Linear(other) }
@@ -221,7 +232,9 @@ impl Int8MemoryRequirement {
             rope_bytes: (n * NANBEIGE_HEAD_DIM as u64 + (NANBEIGE_HEAD_DIM / 2) as u64) * 4,
             // Conservative simultaneous reference-vector payload allowance:
             // 32 maximum-intermediate-width f32 rails, one full head, and
-            // 16 bytes/context for scores/exp/division/BF16 probabilities.
+            // 16 bytes/context for reference attention. The controlled eager
+            // path reuses one 4-byte/context buffer across every phase/head,
+            // so it remains within this conservative existing allowance.
             // Includes activation bytes, hidden copies and one-head scratch.
             // Vec metadata, allocator slack and source weights are excluded.
             scratch_payload_bound: (32 * I + V + NANBEIGE_HEAD_DIM) as u64 * 4 + 16 * n,
@@ -436,7 +449,7 @@ impl<'w, C: DecodeStepControl> LayerExecutor<Int8Layer<'w>> for Executor<'_, C> 
         for (out, value) in value_bits.iter_mut().zip(&value) { *out = value.to_bits(); }
         cache.append(binding.kv_slot(), positions.cache_position, &key_bits, &value_bits).map_err(|_| StrictInt8Error::Cache)?;
         poll(self.control)?;
-        let attention = eager_gqa_attention_from_cache(&query, cache, binding.kv_slot()).map_err(|_| StrictInt8Error::Attention)?;
+        let attention = eager_gqa_attention_from_cache_with_control(&query, cache, binding.kv_slot(), self.control)?;
         finite(&attention)?; poll(self.control)?;
         self.activation.encode_bf16(&attention)?;
         let update = project(layer.o, self.activation, self.ledger, self.control)?;

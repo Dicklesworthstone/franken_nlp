@@ -121,7 +121,7 @@ pub(super) fn attend_sequences<C: DecodeStepControl>(query: &mut [Bf16], key: &m
         let cache = &mut sequences[step.sequence].cache;
         cache.append(slot, position, &key_bits, &value_bits).map_err(|_| StrictInt4Error::Cache)?;
         poll(control)?;
-        let attention = eager_gqa_attention_from_cache(q, cache, slot).map_err(|_| StrictInt4Error::Attention)?;
+        let attention = eager_gqa_attention_from_cache_with_control(q, cache, slot, control)?;
         finite(&attention)?; output[index * Q..(index + 1) * Q].copy_from_slice(&attention);
     }
     poll(control)?; Ok(output)
