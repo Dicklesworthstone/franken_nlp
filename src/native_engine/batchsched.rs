@@ -15,6 +15,7 @@
 
 use std::{error::Error, fmt};
 use super::{
+    attention::AttentionError,
     decode::DecodeCancellationKind,
     hf_bf16_eager::{HfBf16EagerError, HfBf16EagerWeights, HF_BF16_EAGER_PROFILE},
     kv::{KvCache, KV_BYTES_PER_TOKEN, KV_SLOT_COUNT},
@@ -38,8 +39,8 @@ pub const MAX_BATCH_ROWS: usize = 128;
 pub const MAX_BATCH_CONTEXT: usize = 8192;
 
 /// Host-owned cooperative cancellation authority. Calls occur between stages,
-/// before each output-weight row, and before each row's bounded attention work.
-/// Attention itself retains the existing eager primitive's cancellation granularity.
+/// before each output-weight row, and inside every bounded attention scan.
+/// QK, softmax and weighted-value work share this same request allowance.
 pub trait BatchControl {
     fn checkpoint(&mut self) -> Option<DecodeCancellationKind>;
 }
@@ -68,7 +69,16 @@ impl fmt::Display for BatchError {
 }
 impl Error for BatchError {}
 impl From<HfBf16EagerError> for BatchError {
-    fn from(error: HfBf16EagerError) -> Self { Self::Native(error) }
+    fn from(error: HfBf16EagerError) -> Self {
+        match error {
+            HfBf16EagerError::Attention(AttentionError::Cancelled(cause)) => Self::Cancelled(cause),
+            HfBf16EagerError::Attention(AttentionError::Allocation) => Self::Allocation,
+            other => Self::Native(other),
+        }
+    }
+}
+impl From<AttentionError> for BatchError {
+    fn from(error: AttentionError) -> Self { Self::from(HfBf16EagerError::from(error)) }
 }
 
 /// Non-allocating payload estimate. K/V and RoPE are exact requested payloads;
