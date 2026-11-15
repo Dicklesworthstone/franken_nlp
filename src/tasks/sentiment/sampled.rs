@@ -27,7 +27,9 @@ use crate::{
     template::{Conversation, Message, MessageRole, RenderOptions, TemplateBuilder, ToolFormat},
     tokenizer::{bpe::EncodeOptions, embedded::{EmbeddedTokenizer, PINNED_TOKENIZER_MODEL_BYTES,
         PINNED_ADDED_TOKENS_BYTES, PINNED_TOKENIZER_CONFIG_BYTES, PINNED_SPECIAL_TOKENS_MAP_BYTES},
-        pinned_controls, specials::TemplateControlIds, untrusted::UntrustedDocumentEncoder},
+        pinned_controls, specials::TemplateControlIds,
+        untrusted::{SafeBpeWork, UntrustedDocument, UntrustedDocumentEncoder,
+            UntrustedDocumentError, UntrustedEncoding}},
 };
 use super::{SentimentAxis, SentimentRequest};
 
@@ -115,7 +117,7 @@ impl SampledSentimentLimits {
 /// Privacy-safe typed failure; native cancellation causes are never replaced.
 pub enum SampledSentimentError {
     Limits, Identity, Tokenizer, Template, Schema, Allocation, Serialization,
-    WorkBudget, OutputBudget, NoResult, Accounting, Native(Int4JsonError), Cancelled(DecodeCancellationKind),
+    WorkBudget, TokenizerWork, OutputBudget, NoResult, Accounting, Native(Int4JsonError), Cancelled(DecodeCancellationKind),
 }
 impl fmt::Display for SampledSentimentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -128,6 +130,7 @@ impl fmt::Display for SampledSentimentError {
             Self::Allocation => "sampled sentiment bounded allocation refused",
             Self::Serialization => "sampled sentiment canonical serialization refused",
             Self::WorkBudget => "sampled sentiment complete generation work exceeds admission",
+            Self::TokenizerWork => "sampled sentiment document encoding work exceeds admission",
             Self::OutputBudget => "sampled sentiment complete result exceeds its byte budget",
             Self::NoResult => "sampled sentiment sample failed independent content validation",
             Self::Accounting => "sampled sentiment native output or aggregate accounting differs",
@@ -172,6 +175,7 @@ struct AxisPrompt { axis: SentimentAxis, instruction: String }
 struct AxisTemplate { axis: SentimentAxis, instruction: Vec<u32>, scaffold: Vec<u32> }
 struct Compiler { tokenizer: EmbeddedTokenizer, controls: TemplateControlIds,
     global: Vec<u32>, axes: Vec<AxisTemplate>, template_digest: Sha256Digest,
+    byte_template_digest: Sha256Digest, input_encoding: UntrustedEncoding,
     schema: String, schema_digest: Sha256Digest, decode: JsonDecodeOptions }
 
 /// Pinned task compiler derived from an actual authenticated native model.
@@ -191,6 +195,22 @@ impl SampledSentimentPlanner {
         constrained_int4::check_model(&identity, model)?;
         Ok(Self { compiler, identity, group_width: model.group_width(), options, ceiling, limits })
     }
+    /// Select a bounded, lossless document encoding once for the entire
+    /// axis-by-sample bundle. The encoded document is reused, while each
+    /// independent native prompt still pays its full forward cost. Compact
+    /// encoding changes prompt tokens and the sampled request identity; it
+    /// makes no identical-output or task-quality claim.
+    ///
+    /// Admit the policy's workspace before private input or planning. The
+    /// prepared plan's complete preparation quote retains that allowance.
+    pub fn with_input_encoding(mut self, encoding: UntrustedEncoding)
+        -> Result<Self, SampledSentimentError> {
+        self.compiler.set_input_encoding(encoding)?;
+        self.identity.template_digest = self.compiler.template_digest;
+        self.identity.validate().map_err(|_| SampledSentimentError::Identity)?;
+        Ok(self)
+    }
+    pub fn input_encoding(&self) -> &UntrustedEncoding { &self.compiler.input_encoding }
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn plan(&self, request: &SentimentRequest) -> Result<PreparedSampledSentiment, SampledSentimentError> {
         self.plan_with_control(request, &mut Continue)
@@ -211,6 +231,7 @@ pub struct PreparedSampledSentiment {
     decode: JsonDecodeOptions, controls: BTreeSet<u32>, identity: ExecutionIdentity,
     group_width: usize, work: Int4Work, budget: TaskBudget, context: usize,
     max_result_bytes: u64, preparation_bytes: u64,
+    input_encoding: UntrustedEncoding, encoding_work: SafeBpeWork,
 }
 impl PreparedSampledSentiment {
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
@@ -220,6 +241,10 @@ impl PreparedSampledSentiment {
     pub fn group_width(&self) -> usize { self.group_width }
     pub fn max_result_bytes(&self) -> u64 { self.max_result_bytes }
     pub fn sample_count(&self) -> usize { self.axes.len() * self.options.samples }
+    pub fn input_encoding(&self) -> &UntrustedEncoding { &self.input_encoding }
+    /// Actual encoding work for the one source segment shared by all axes and
+    /// samples. Native execution work remains separately charged per sample.
+    pub fn encoding_work(&self) -> SafeBpeWork { self.encoding_work }
     /// Declared payload reserve, not measured RSS. Includes pinned compiler/
     /// vocabulary construction allowance and simultaneous result serialization.
     pub fn preparation_requirement_bytes(&self) -> u64 { self.preparation_bytes }
@@ -463,9 +488,49 @@ impl Compiler {
             options.max_justification_chars,
             [PINNED_TOKENIZER_MODEL_BYTES, PINNED_ADDED_TOKENS_BYTES, PINNED_TOKENIZER_CONFIG_BYTES,
                 PINNED_SPECIAL_TOKENS_MAP_BYTES].map(Sha256Digest::of_bytes), controls.ids()))?;
-        Ok(Self { tokenizer, controls: controls.clone(), global, axes, template_digest, schema, schema_digest,
+        Ok(Self { tokenizer, controls: controls.clone(), global, axes, template_digest,
+            byte_template_digest: template_digest, input_encoding: UntrustedEncoding::ByteFallback,
+            schema, schema_digest,
             decode: JsonDecodeOptions { max_new_tokens: options.max_sample_tokens, eos_token_id: eos,
                 excluded_token_ids: controls.ids().clone() } })
+    }
+
+    fn set_input_encoding(&mut self, encoding: UntrustedEncoding) -> Result<(), SampledSentimentError> {
+        encoding.validate().map_err(|_| SampledSentimentError::WorkBudget)?;
+        let template_digest = if encoding == UntrustedEncoding::ByteFallback { self.byte_template_digest }
+            else { digest(&("sampled-sentiment-untrusted-encoding-v1", self.byte_template_digest, &encoding))? };
+        self.template_digest = template_digest;
+        self.input_encoding = encoding;
+        Ok(())
+    }
+
+    fn encoding_workspace_bytes(&self) -> Result<u64, SampledSentimentError> {
+        match &self.input_encoding {
+            UntrustedEncoding::ByteFallback => Ok(0),
+            UntrustedEncoding::SafeBpeV1(limits) => limits.requirements()
+                .map(|need| need.workspace_bytes).map_err(|_| SampledSentimentError::WorkBudget),
+        }
+    }
+
+    fn encode_document<C: DecodeStepControl>(&self, source: &[u8], work: &mut SafeBpeWork,
+        control: &mut C) -> Result<UntrustedDocument, SampledSentimentError> {
+        let mut cancelled = None;
+        let encoded = UntrustedDocumentEncoder::new(self.tokenizer.tokenizer(), &self.controls)
+            .encode_with_policy(source, &self.input_encoding, work, &mut || {
+                if cancelled.is_none() { cancelled = control.prefill_checkpoint(0); }
+                cancelled.is_none()
+            });
+        if let Some(cause) = cancelled { return Err(SampledSentimentError::Cancelled(cause)); }
+        let document = encoded.map_err(|error| match error {
+            UntrustedDocumentError::AllocationRefused => SampledSentimentError::Allocation,
+            UntrustedDocumentError::InvalidEncodingLimits { .. } => SampledSentimentError::Limits,
+            UntrustedDocumentError::EncodingBudget { .. } => SampledSentimentError::TokenizerWork,
+            _ => SampledSentimentError::Tokenizer,
+        })?;
+        if self.input_encoding == UntrustedEncoding::ByteFallback && document.ids().len() != source.len() {
+            return Err(SampledSentimentError::Tokenizer);
+        }
+        Ok(document)
     }
 }
 
@@ -487,6 +552,17 @@ fn compile_request<C: DecodeStepControl>(compiler: &Compiler, identity: &Executi
     let generations = ordered.len().checked_mul(options.samples).ok_or(SampledSentimentError::WorkBudget)?;
     let output_tokens = generations.checked_mul(options.max_sample_tokens).ok_or(SampledSentimentError::WorkBudget)?;
     if output_tokens as u64 > u64::from(request.budget.max_output_tokens) { return Err(SampledSentimentError::WorkBudget); }
+    let encoding_workspace = compiler.encoding_workspace_bytes()?;
+    let mut encoding_work = SafeBpeWork::default();
+    // The default route keeps its cheap byte-count refusal before encoding.
+    // Compact geometry must use the actual bounded tokenization, never the
+    // source byte count. Encode once, before composing any independent axis.
+    let compact_document = match &compiler.input_encoding {
+        UntrustedEncoding::ByteFallback => None,
+        UntrustedEncoding::SafeBpeV1(_) => Some(compiler.encode_document(
+            request.document.as_bytes(), &mut encoding_work, control)?),
+    };
+    let source_tokens = compact_document.as_ref().map_or(request.document.len(), |source| source.ids().len());
     let mut executed_prompt_tokens = 0_usize;
     let mut retained_prompt_tokens = 0_usize;
     let mut context = 0_usize;
@@ -495,7 +571,7 @@ fn compile_request<C: DecodeStepControl>(compiler: &Compiler, identity: &Executi
     for axis in &ordered {
         let template = compiler.axes.iter().find(|entry| entry.axis == *axis).ok_or(SampledSentimentError::Template)?;
         let length = compiler.global.len().checked_add(template.instruction.len())
-            .and_then(|n| n.checked_add(request.document.len())).and_then(|n| n.checked_add(template.scaffold.len()))
+            .and_then(|n| n.checked_add(source_tokens)).and_then(|n| n.checked_add(template.scaffold.len()))
             .ok_or(SampledSentimentError::WorkBudget)?;
         executed_prompt_tokens = executed_prompt_tokens.checked_add(length.checked_mul(options.samples)
             .ok_or(SampledSentimentError::WorkBudget)?).ok_or(SampledSentimentError::WorkBudget)?;
@@ -520,11 +596,13 @@ fn compile_request<C: DecodeStepControl>(compiler: &Compiler, identity: &Executi
     compile.max_states = compile.max_states.min(request.budget.max_grammar_states as usize);
     compile.max_string_bytes = compile.max_string_bytes.min(options.max_justification_chars.saturating_mul(4));
     let program = JsonProgram::compile(&compiler.schema, compile).map_err(|_| SampledSentimentError::Schema)?;
-    let preparation_bytes = preparation_quote(retained_prompt_tokens, max_result_bytes, program.max_output_bytes())?;
+    let preparation_bytes = preparation_quote(retained_prompt_tokens, max_result_bytes, program.max_output_bytes())?
+        .checked_add(encoding_workspace).ok_or(SampledSentimentError::WorkBudget)?;
     checkpoint(control)?;
-    let document = UntrustedDocumentEncoder::new(compiler.tokenizer.tokenizer(), &compiler.controls)
-        .encode(request.document.as_bytes()).map_err(|_| SampledSentimentError::Tokenizer)?;
-    if document.ids().len() != request.document.len() { return Err(SampledSentimentError::Tokenizer); }
+    let document = match compact_document {
+        Some(document) => document,
+        None => compiler.encode_document(request.document.as_bytes(), &mut encoding_work, control)?,
+    };
     checkpoint(control)?;
     let context_identity = PlanContext::new(identity, ceiling).map_err(|_| SampledSentimentError::Identity)?;
     let mut axes = reserved(ordered.len())?;
@@ -565,7 +643,8 @@ fn compile_request<C: DecodeStepControl>(compiler: &Compiler, identity: &Executi
     checkpoint(control)?;
     Ok(PreparedSampledSentiment { axes, program, options: options.clone(),
         decode: compiler.decode.clone(), controls: compiler.controls.ids().clone(), identity: sealed,
-        group_width, work, budget: request.budget, context, max_result_bytes, preparation_bytes })
+        group_width, work, budget: request.budget, context, max_result_bytes, preparation_bytes,
+        input_encoding: compiler.input_encoding.clone(), encoding_work })
 }
 
 fn unbound_identity(compiler: &Compiler) -> ExecutionIdentity {
