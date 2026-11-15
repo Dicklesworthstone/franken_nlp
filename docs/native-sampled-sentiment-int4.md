@@ -1,8 +1,10 @@
 # Native INT4 sampled sentiment
 
-The explicit candidate command `fnlp candidate source-int4 sentiment-sampled`
-generates independent scores and explanations on the local grouped-INT4
-candidate. It implements the independent generation portion of plan §7.5,
+The explicit candidate commands `fnlp candidate source-int4 sentiment-sampled`
+and `fnlp candidate source-int4 sentiment-sampled-batch` generate independent
+scores and explanations on the local grouped-INT4 candidate. The first accepts
+one document; the second serves a bounded ordered NDJSON stream with one resident
+model. They implement the independent generation portion of plan §7.5,
 Mode B. Each axis and sample starts from an empty logical KV cache and its
 own semantic sample address. It does not sample the distribution-mode bins.
 
@@ -96,8 +98,8 @@ not become part of the semantic request identity. The optional top-level
 additional thread, and unsupported or over-budget widths are refused before
 private input/model IO rather than silently narrowed.
 
-The planner exposes `with_input_encoding`, `input_encoding` and
-`encoding_work` for embedders; the hosted adapter exposes
+The planner exposes `with_input_encoding` and `input_encoding`; prepared plans
+expose `encoding_work` for embedders. The hosted adapter exposes
 `execute_int4_sampled_sentiment_with_threads`. Encoder workspace, worker
 scratch, native state and complete result ownership are included in admission.
 Same-recipe serial/team replay is an explicit model-present gate, not an
@@ -105,8 +107,9 @@ assumed result of source inspection.
 
 ## Layer-major prompt prefill
 
-`--prefill-rows N` selects bounded layer-major prompt execution for every
-independent sample. N is an explicit maximum morsel width from 1 through 64.
+For the single-document command, `--prefill-rows N` selects bounded layer-major
+prompt execution for every independent sample. N is an explicit maximum morsel
+width from 1 through 64.
 Use this option with serial compute (`--compute-threads 1`, the default); a
 larger compute team and prompt morsels are mutually exclusive schedules.
 Compact input can be combined with either schedule. The source conversion,
@@ -214,8 +217,147 @@ entire semantic bundle, including earlier successful samples.
 This route accepts the scalar or explicitly selected supported packed kernel,
 with serial scheduling and byte input encoding as defaults. It rejects text-generation
 processors, stops, token biases and logprobs.
-Focus-area presets, sampled corpus/durable jobs, statistical intervals
+Focus-area presets, sampled durable jobs, statistical intervals
 and automatic default selection are outside this implementation slice.
+
+## Resident NDJSON populations
+
+`sentiment-sampled-batch` applies the same independently sampled task to a finite
+ordered stream. Each invocation loads or converts the candidate weights once,
+constructs one pinned vocabulary and task compiler, and keeps one native engine
+resident through all documents. Documents and their independent samples execute
+sequentially; the command does not collect the corpus in memory.
+
+Create `sentiment-population.ndjson`:
+
+```jsonl
+{"id":"review-1","text":"The support agent fixed the problem quickly.","task_args":{"axes":["valence","arousal"]}}
+{"id":"review-2","text":"The repeated failures were frustrating."}
+{"flush":true}
+{"id":"review-1","text":"The support agent fixed the problem quickly.","task_args":{"axes":["valence","arousal"]}}
+```
+
+```sh
+fnlp candidate source-int4 sentiment-sampled-batch sentiment-population.ndjson \
+  --snapshot /path/to/local-int4-snapshot \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --memory-mib 8192 \
+  --seed 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --samples 4 \
+  --input-encoding safe-bpe-v1 \
+  --compute-threads 4 \
+  --max-requests 1000 \
+  --max-total-input-bytes 67108864 \
+  --max-total-output-bytes 67108864
+```
+
+Omit the positional input, or use `-`, for stdin. The existing pinned
+`--source-dir` plus `--source-manifest` route and optional `--save-snapshot`
+are also available. The authenticated snapshot pin, seed, sampler settings,
+resource ceilings, input encoding and physical schedule stay fixed for the
+invocation. Work defaults may exhaust before the request limit; the command
+does not multiply compute authority by `--max-requests`.
+
+### Records and epochs
+
+Every document is a closed `{id,text,task_args?}` object. `task_args` accepts
+only `axes`; omitting it or supplying `{}` requests all four axes for that
+document. Selecting axes on one record does not change the next record's
+defaults. Empty or duplicate axes, unknown fields, duplicate JSON keys and
+attempts to supply a seed, budget, model identity or replacement document in
+`task_args` are rejected. `text` is preserved exactly and must fit the chosen
+encoding and single-context limits; there is no chunking or truncation.
+
+IDs are nonempty UTF-8 strings of at most 128 bytes with no control characters.
+Each ID is unique within its numbered epoch, including IDs whose planning or
+execution failed. The exact `{"flush":true}` control drains and acknowledges
+all earlier output, advances the epoch, and then clears duplicate-ID storage.
+It does not change model state, sampler policy, deadlines or resource ceilings.
+An ordinary writer flush acknowledges local delivery, not remote consumption
+or durable storage. EOF emits a final flush followed by the terminal event.
+
+The caller's item ID is bound into its private sampling address along with
+the model, prompt, compiled grammar, seed, policy and axis/sample ordinal.
+Different IDs remain separately addressable even when their text is identical.
+The same ID and request preserve their address across input ordering and flush
+boundaries; sequence numbers and epoch counters do not enter the draw key.
+Replays must retain the same semantic item context. The public output does not
+reveal the seed or document-dependent identity digests.
+
+### Whole-run budgets and bounded delivery
+
+| Option | Default and scope in the batch command |
+| --- | --- |
+| `--max-requests` | 1000 nonempty input records, including malformed records and explicit flush controls |
+| `--max-line-bytes` | 1048576 bytes before LF, including any CR, JSON syntax and task arguments |
+| `--max-total-input-bytes` | 67108864 bytes for the entire stream, including blank lines and delimiters |
+| `--max-total-output-bytes` | 67108864 bytes for all candidate wrappers, results, acknowledgements and terminal frames |
+| `--max-input-bytes` | Complete source text allowance for each document |
+| `--max-result-bytes` | Complete sampled task result per document; framing is separately reserved |
+| Five native-work flags listed above | One cumulative ceiling for the entire invocation |
+| `--max-mask-node-visits` | One cumulative mask allowance for every document, axis, sample and EOS |
+| Tokenizer pair limits | One bounded complete source encoding per record, reused across all its axes and samples |
+
+Before a document enters native execution, the processor charges its full
+maximum-token schedule on all five native counters and its complete mask
+allowance. Early completion, admission failure and later sample failure retain
+that charge. A flush never restores it. Per-document preparation can reject a
+record before native admission without consuming unused model work. The
+transport summary reports conservative reserved forward/logit work; successful
+task results separately report their actual complete five-axis model work,
+generated tokens and mask accounting.
+
+Every output line is a candidate provenance wrapper with protocol
+`fnlp-candidate-int4-sentiment-sampled-batch-v1`, scope
+`real-source-current-candidate-int4`, evidence `non_authoritative`, and public
+actual-model provenance. Its `record` retains the canonical
+`fnlp-item-local-batch-v1` event. Events are `run_start`, `doc`, `doc_error`,
+`flush` and terminal `run_complete` or `run_error`. A successful `doc` contains
+the entire validated sampled result under `record.result`, including every
+requested sample and descriptive statistic. Document events carry the request
+sequence, input line and byte offset, and echo a valid caller ID when available.
+Error categories are fixed; they do not copy source snippets, parser details
+or filesystem paths. Empty LF/CRLF records are ignored; whitespace-only lines
+are malformed. The final input record need not end in LF.
+
+One bounded frame is staged and checked before publication. Provenance and
+terminal frames count against the output budget, and the result's resource
+guard survives serialization, write and flush. No whole-population result array
+is retained. A partial write or failed flush poisons output: the command does
+not retry or append another record to an uncertain output prefix.
+
+Require both `run_complete` and process exit 0. `run_complete` acknowledges EOF
+and terminal delivery; inspect its summary because failed documents still
+cause a nonzero CLI exit. Earlier complete frames remain valid when a later
+document fails. Every sample must succeed before its document result is
+published. Recoverable planning or clean task rejection may continue to the
+next document. Cancellation, broken native state, host-admission failure and
+transport failure stop the invocation. All eleven typed cancellation causes
+are preserved, and cancellation never renews consumed work.
+
+### Resident library and compute routes
+
+The library exposes `SampledSentimentBatchPlanner`,
+`SampledSentimentBatchLimits` and the sealed `NativeSampledSentimentBatch`
+adapter. `sampled_sentiment_batch_preparation_bytes` quotes the largest retained
+axis bundle, compiler/vocabulary allowance, result staging and one encoder
+workspace before private IO. The task planner's `plan_for_item_with_control`
+binds the caller ID while preserving the original one-shot planning methods.
+The hosted methods
+`NlpEngine::batch_int4_sampled_sentiment` and
+`NlpEngine::batch_int4_sampled_sentiment_with_threads` own the reader, writer,
+compiler and vocabulary through physical completion and delivery under one
+blocking invocation and one run controller.
+
+The CLI defaults to byte fallback and `--compute-threads 1`. Compact encoding
+and explicit widths 2–64 use the same admitted source/snapshot routes as the
+single-document command. A numerical team persists for the whole stream, and
+all workers join before `run_complete` can be published under the original
+cancellation control. Owned IO remains charged through that final publication.
+The batch route rejects `--prefill-rows` before IO; layer-major prompt execution
+is currently exposed by the single-document command. There is no implicit
+schedule fallback or renewal of native/mask work at worker, item or epoch
+boundaries. Memory reservations are modeled commitments, not measured RSS.
 
 ## Verification status
 
@@ -239,6 +381,16 @@ numeric/source-bound/Unicode grammars, native and mask limits, all cancellation
 causes and finalizer refusal. CLI admission fixtures cover the complete declared
 prompt workspace, short inputs, source/snapshot/save paths and incompatible
 physical schedules.
+
+Resident batch regression definitions cover strict record arguments, all five
+native counters plus mask debit, failed admission, clean and poisoned failure
+paths, cross-factory plans, all cancellation causes, guard ownership through
+delivery/unwind, actual NDJSON duplicate/flush handling, partial writes and
+post-join footer cancellation. Host fixtures cover complete resident KV,
+reused sampler/workspace, compact preparation and every admission axis.
+These are source definitions and independent review, not executed batch or
+real-model evidence. Batch parity, replay, failure and physical-drain evidence
+remain part of the controller's model-present gates.
 
 Rust compilation, executable fixtures, production DSR qualification, real-model
 replay/cancellation and human-label quality evaluation remain **UNRUN**. The

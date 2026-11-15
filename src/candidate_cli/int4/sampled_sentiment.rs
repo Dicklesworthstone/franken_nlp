@@ -11,6 +11,7 @@ use crate::{
 
 #[cfg(feature = "asupersync-runtime")]
 mod runtime;
+pub(super) mod corpus;
 #[cfg(test)]
 mod tests;
 

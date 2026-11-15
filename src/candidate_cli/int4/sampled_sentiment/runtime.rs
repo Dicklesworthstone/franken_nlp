@@ -21,7 +21,7 @@ impl DecodeStepControl for DeadlineControl {
     }
 }
 
-fn cancelled(cause: DecodeCancellationKind) -> Failure {
+pub(super) fn cancelled(cause: DecodeCancellationKind) -> Failure {
     use DecodeCancellationKind::*;
     let (exit, code) = match cause {
         Timeout | Deadline | PollQuota | CostBudget => (ErrorCode::BudgetOrTimeout, "sampled_sentiment_budget"),
@@ -33,7 +33,7 @@ fn cancelled(cause: DecodeCancellationKind) -> Failure {
     Failure { exit, code, cancellation: Some(cause) }
 }
 
-fn task_failure(error: SampledSentimentError) -> Failure {
+pub(super) fn task_failure(error: SampledSentimentError) -> Failure {
     if let Some(cause) = error.cancellation() { return cancelled(cause); }
     use SampledSentimentError::*;
     let (exit, code) = match error {
@@ -63,7 +63,7 @@ fn admission_failure(_: CandidateError) -> Failure {
         code: "sampled_sentiment_plan_admission", cancellation: None }
 }
 
-fn host_failure(error: HostedError) -> Failure {
+pub(super) fn host_failure(error: HostedError) -> Failure {
     match error {
         HostedError::Stopped { stop, task_error } => {
             if matches!(stop.kind, DecodeCancellationKind::FailFast | DecodeCancellationKind::LinkedExit) {
