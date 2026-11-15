@@ -261,12 +261,32 @@ does not multiply compute authority by `--max-requests`.
 ### Records and epochs
 
 Every document is a closed `{id,text,task_args?}` object. `task_args` accepts
-only `axes`; omitting it or supplying `{}` requests all four axes for that
-document. Selecting axes on one record does not change the next record's
-defaults. Empty or duplicate axes, unknown fields, duplicate JSON keys and
-attempts to supply a seed, budget, model identity or replacement document in
-`task_args` are rejected. `text` is preserved exactly and must fit the chosen
-encoding and single-context limits; there is no chunking or truncation.
+`axes` and an optional `budget`; omitting axes requests all four dimensions.
+Selecting axes or a tighter budget on one record does not change the next
+record's defaults. Empty or duplicate axes, unknown fields, duplicate JSON
+keys and attempts to supply a seed, model identity or replacement document
+are rejected. `text` is preserved exactly and must fit the chosen encoding
+and single-context limits; there is no chunking or truncation.
+
+A record may supply a complete `task_args.budget` object to impose stricter
+limits than the invocation's task budget. All five fields are required,
+positive, and no larger than their admitted invocation ceilings:
+
+| Budget field | Record constraint |
+| --- | --- |
+| `max_input_tokens` | Maximum tokens in each complete prompted sample |
+| `max_output_tokens` | Must admit the full requested axes × samples × per-sample token ceiling |
+| `max_output_bytes` | Maximum bytes in the complete sampled result |
+| `max_grammar_states` | Maximum states allowed by the compiled output grammar |
+| `max_kv_bytes` | Must still cover the existing resident native KV allocation |
+
+An omitted budget uses the invocation's task ceiling. A widened, zero,
+incomplete or malformed budget rejects that record before native execution;
+later valid records can continue. A tighter output-token cap that cannot
+admit the full sample schedule rejects the record instead of reducing
+samples or truncating generation. Tightening KV does not resize the resident
+engine. Per-record limits never replenish whole-run native, mask, checkpoint,
+transport or deadline allowances.
 
 IDs are nonempty UTF-8 strings of at most 128 bytes with no control characters.
 Each ID is unique within its numbered epoch, including IDs whose planning or

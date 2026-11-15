@@ -25,17 +25,20 @@ use crate::{
     tokenizer::untrusted::UntrustedEncoding,
 };
 
-/// Per-record task data only. Sampler policy, seed, budgets and model identity
-/// are fixed by the admitted planner and cannot be replaced by input JSON.
+/// Per-record task data only. A budget can tighten every planner ceiling;
+/// sampler policy, seed and model identity remain fixed for the invocation.
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SampledSentimentBatchArgs {
     #[serde(default = "all_axes")]
     pub axes: Vec<SentimentAxis>,
+    /// Omission uses the run ceiling. Every supplied field must fit it.
+    #[serde(default)]
+    pub budget: Option<TaskBudget>,
 }
 fn all_axes() -> Vec<SentimentAxis> { SentimentAxis::ALL.to_vec() }
 impl Default for SampledSentimentBatchArgs {
-    fn default() -> Self { Self { axes: all_axes() } }
+    fn default() -> Self { Self { axes: all_axes(), budget: None } }
 }
 
 /// Native and mask work are nonrenewable for the whole invocation. The
@@ -120,11 +123,22 @@ impl SampledSentimentBatchPlanner {
         control: &mut C) -> Result<PreparedSampledSentiment, BatchItemFailure> {
         checkpoint(control)?;
         let args = document.task_args.unwrap_or_default();
+        let budget = item_budget(args.budget, self.task_budget)?;
         // Planning owns one cumulative compact allowance for this complete
         // record. The source is encoded once and reused across axes/samples.
         self.planner.plan_for_item_with_control(&SentimentRequest { document: document.text,
-            axes: args.axes, budget: self.task_budget }, &document.id, control).map_err(task_failure)
+            axes: args.axes, budget }, &document.id, control).map_err(task_failure)
     }
+}
+
+fn item_budget(requested: Option<TaskBudget>, ceiling: TaskBudget) -> Result<TaskBudget, BatchItemFailure> {
+    let budget = requested.unwrap_or(ceiling);
+    if budget.validate().is_err() || budget.max_input_tokens > ceiling.max_input_tokens
+        || budget.max_output_tokens > ceiling.max_output_tokens || budget.max_output_bytes > ceiling.max_output_bytes
+        || budget.max_grammar_states > ceiling.max_grammar_states || budget.max_kv_bytes > ceiling.max_kv_bytes {
+        return Err(BatchItemFailure::reject(BatchCode::Planning));
+    }
+    Ok(budget)
 }
 
 /// Read-only execution facts from the sealed task, never deserialized authority.

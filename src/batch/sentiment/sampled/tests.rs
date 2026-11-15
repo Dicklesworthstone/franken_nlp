@@ -152,11 +152,14 @@ fn decrement(work: &mut Int4Work, axis: usize) {
 }
 
 #[test]
-fn record_arguments_allow_only_axes_and_default_to_the_complete_set() {
+fn record_arguments_allow_axes_and_tighter_budgets_with_complete_defaults() {
     let defaults: SampledSentimentBatchArgs = serde_json::from_str("{}").unwrap();
-    assert_eq!(defaults.axes, SentimentAxis::ALL);
+    assert_eq!(defaults.axes, SentimentAxis::ALL); assert!(defaults.budget.is_none());
     let selected: SampledSentimentBatchArgs = serde_json::from_str(r#"{"axes":["arousal"]}"#).unwrap();
-    assert_eq!(selected.axes, [SentimentAxis::Arousal]);
+    assert_eq!(selected.axes, [SentimentAxis::Arousal]); assert!(selected.budget.is_none());
+    let requested = serde_json::json!({"axes": ["arousal"], "budget": task()});
+    let selected: SampledSentimentBatchArgs = serde_json::from_value(requested).unwrap();
+    assert_eq!(selected.budget, Some(task()));
     for bad in [r#"{"seed":"secret"}"#, r#"{"samples":1}"#, r#"{"budget":{}}"#,
         r#"{"axes":null}"#, r#"{"axes":["unknown"]}"#, r#"{"document":"replace"}"#,
         r#"{"id":"replace-semantic-address"}"#] {
@@ -305,6 +308,7 @@ impl BatchProcessor for Harness {
         -> Result<Self::Prepared, BatchItemFailure> {
         self.run.enter()?;
         let result = (|| {
+            item_budget(document.task_args.unwrap_or_default().budget, task())?;
             let mode = if document.text == "reject" { Mode::NoResult } else { Mode::Success };
             let record = prepare_checked(plan(mode), &self.seal, &self.driver, self.run.limits, 1024, control)?;
             self.run.check_available(record.plan.facts().model_work, record.mask_node_visits)?;
@@ -385,4 +389,56 @@ fn deferred_footer_uses_original_control_after_worker_join() {
     assert_eq!(completion.publish(&mut bytes, &mut stop).unwrap_err().fault.cancellation,
         Some(DecodeCancellationKind::Shutdown));
     assert!(!frames(&bytes).iter().any(|event| event["event"] == "run_complete"));
+}
+
+#[test]
+fn record_budgets_can_tighten_every_ceiling_without_changing_the_run_defaults() {
+    let ceiling = task();
+    assert_eq!(item_budget(None, ceiling).unwrap(), ceiling);
+    let tighter = TaskBudget { max_input_tokens: ceiling.max_input_tokens / 2,
+        max_output_tokens: ceiling.max_output_tokens / 2, max_output_bytes: ceiling.max_output_bytes / 2,
+        max_grammar_states: ceiling.max_grammar_states / 2, max_kv_bytes: ceiling.max_kv_bytes / 2 };
+    assert_eq!(item_budget(Some(tighter), ceiling).unwrap(), tighter);
+    assert_eq!(item_budget(None, ceiling).unwrap(), ceiling);
+    for field in 0..5 {
+        for zero in [false, true] {
+            let mut bad = ceiling;
+            match field {
+                0 => bad.max_input_tokens = if zero { 0 } else { ceiling.max_input_tokens + 1 },
+                1 => bad.max_output_tokens = if zero { 0 } else { ceiling.max_output_tokens + 1 },
+                2 => bad.max_output_bytes = if zero { 0 } else { ceiling.max_output_bytes + 1 },
+                3 => bad.max_grammar_states = if zero { 0 } else { ceiling.max_grammar_states + 1 },
+                _ => bad.max_kv_bytes = if zero { 0 } else { ceiling.max_kv_bytes + 1 },
+            }
+            let error = item_budget(Some(bad), ceiling).unwrap_err();
+            assert_eq!(error.fault.code, BatchCode::Planning); assert!(!error.stop);
+        }
+    }
+}
+
+#[test]
+fn widened_record_budgets_reject_before_admission_without_spending_work_or_breaking_the_stream() {
+    let probe = Rc::new(Probe::default()); let mut processor = Harness::new(&probe, 1);
+    let mut input = String::new();
+    for field in 0..5 {
+        let mut budget = task();
+        match field { 0 => budget.max_input_tokens += 1, 1 => budget.max_output_tokens += 1,
+            2 => budget.max_output_bytes += 1, 3 => budget.max_grammar_states += 1, _ => budget.max_kv_bytes += 1 }
+        input.push_str(&serde_json::to_string(&serde_json::json!({
+            "id": format!("refused-{field}"), "text": "PRIVATE_BUDGET_DOCUMENT", "task_args": {"budget": budget}
+        })).unwrap());
+        input.push('\n');
+    }
+    input.push_str("{\"id\":\"accepted\",\"text\":\"ok\"}\n");
+    let mut reader = Cursor::new(input.into_bytes());
+    let mut sink = Sink { bytes: Vec::new(), probe: Rc::clone(&probe), delivering_result: false, fail_result: false };
+    let summary = run_ndjson(&mut reader, &mut sink, &mut processor, transport(), &mut Continue).unwrap();
+    assert_eq!((summary.succeeded, summary.failed), (1, 5));
+    assert_eq!(summary.reserved_work, transport_work(work(1)));
+    assert_eq!(probe.calls.get(), 1); assert_eq!(probe.admissions.get(), 1); assert_eq!(probe.drops.get(), 1);
+    assert_eq!(processor.run.remaining, work(0)); assert_eq!(processor.run.remaining_masks, 0);
+    let events = frames(&sink.bytes);
+    assert_eq!(events.iter().filter(|event| event["error"]["code"] == "planning").count(), 5);
+    assert_eq!(events.last().unwrap()["event"], "run_complete");
+    assert!(!std::str::from_utf8(&sink.bytes).unwrap().contains("PRIVATE_BUDGET_DOCUMENT"));
 }
