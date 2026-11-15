@@ -533,3 +533,55 @@ fn shared_encoding_ledger_retains_work_and_original_cancellation() {
         assert_eq!(work.input_bytes(), request.document.len());
     }
 }
+
+#[test]
+fn population_item_addresses_bind_ids_but_not_record_order_or_flush_epochs() {
+    for encoding in [UntrustedEncoding::ByteFallback, UntrustedEncoding::SafeBpeV1(compact_limits())] {
+        let planner = encoding_planner(encoding);
+        let request = request();
+        let one_shot = planner.plan(&request).unwrap();
+        let first = planner.plan_for_item_with_control(&request, "record-a", &mut Continue).unwrap();
+        let other = planner.plan_for_item_with_control(&request, "record-b", &mut Continue).unwrap();
+        // Reusing a stable caller ID after intervening records or a transport
+        // flush keeps the key; neither sequence nor epoch is a task argument.
+        let mut reordered = request.clone(); reordered.axes.reverse();
+        let replay = planner.plan_for_item_with_control(&reordered, "record-a", &mut Continue).unwrap();
+        assert_eq!(first.execution_identity(), replay.execution_identity());
+        assert_ne!(first.execution_identity(), other.execution_identity());
+        assert_ne!(first.execution_identity(), one_shot.execution_identity());
+        assert_eq!(first.execution_identity().template_digest, one_shot.execution_identity().template_digest);
+        assert_eq!(first.encoding_work(), one_shot.encoding_work());
+        assert_eq!(first.planned_work(), one_shot.planned_work());
+        assert_eq!(first.preparation_requirement_bytes(), one_shot.preparation_requirement_bytes());
+        for (((first, other), replay), one_shot) in first.axes.iter().zip(&other.axes)
+            .zip(&replay.axes).zip(&one_shot.axes) {
+            assert_eq!(first.prompt, other.prompt);
+            assert_eq!(first.prompt, one_shot.prompt);
+            assert_eq!(first.identity, replay.identity);
+            assert_ne!(first.identity.receipt_identity().unwrap(), other.identity.receipt_identity().unwrap());
+            assert_ne!(first.identity.receipt_identity().unwrap(), one_shot.identity.receipt_identity().unwrap());
+        }
+        assert!(matches!(first.verify_identity(other.execution_identity()), Err(SampledSentimentError::Identity)));
+        assert_eq!(planner.plan(&request).unwrap().execution_identity(), one_shot.execution_identity());
+        let mut changed = request.clone(); changed.document.push('!');
+        let changed = planner.plan_for_item_with_control(&changed, "record-a", &mut Continue).unwrap();
+        assert_ne!(first.execution_identity(), changed.execution_identity());
+    }
+}
+
+#[test]
+fn population_ids_are_bounded_before_document_preparation() {
+    struct Count(usize);
+    impl DecodeStepControl for Count {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { self.0 += 1; None }
+    }
+    let planner = encoding_planner(UntrustedEncoding::SafeBpeV1(compact_limits()));
+    let request = request();
+    for id in ["".to_owned(), "record\nprivate".to_owned(), "\u{7f}".to_owned(), "x".repeat(257), "é".repeat(129)] {
+        let mut control = Count(0);
+        assert!(matches!(planner.plan_for_item_with_control(&request, &id, &mut control),
+            Err(SampledSentimentError::Limits)));
+        assert_eq!(control.0, 1);
+    }
+    assert!(planner.plan_for_item_with_control(&request, &"é".repeat(128), &mut Continue).is_ok());
+}

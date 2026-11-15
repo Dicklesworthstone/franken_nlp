@@ -235,6 +235,27 @@ impl SampledSentimentPlanner {
         compile_request(&self.compiler, &self.identity, self.group_width, &self.options,
             self.ceiling, self.limits, request, control)
     }
+    /// Give one population record its own stable sample addresses. The caller
+    /// ID joins the complete semantic identity through a private length-framed
+    /// digest; transport sequence, record order and flush epoch never enter it.
+    /// IDs follow the generation contract: 1..=256 UTF-8 bytes, no controls.
+    /// The original one-shot planning APIs retain their existing identities.
+    pub fn plan_for_item_with_control<C: DecodeStepControl>(&self, request: &SentimentRequest,
+        item_id: &str, control: &mut C) -> Result<PreparedSampledSentiment, SampledSentimentError> {
+        checkpoint(control)?;
+        if item_id.is_empty() || item_id.len() > 256 || item_id.chars().any(char::is_control) {
+            return Err(SampledSentimentError::Limits);
+        }
+        let mut prepared = self.plan_with_control(request, control)?;
+        for axis in &mut prepared.axes {
+            axis.identity.decision_policy_digest = item_address_digest(&axis.identity, item_id)?;
+            axis.identity.validate().map_err(|_| SampledSentimentError::Identity)?;
+        }
+        prepared.identity.decision_policy_digest = item_address_digest(&prepared.identity, item_id)?;
+        prepared.identity.validate().map_err(|_| SampledSentimentError::Identity)?;
+        checkpoint(control)?;
+        Ok(prepared)
+    }
     /// Composition boundary for callers retaining one tokenizer allowance
     /// across repeated preparation attempts. Failed/cancelled work is retained
     /// in `work`; no sample or axis creates another encoding allowance.
@@ -749,6 +770,22 @@ fn budget_fits(value: TaskBudget, ceiling: TaskBudget) -> bool {
 }
 fn digest<T: Serialize + ?Sized>(value: &T) -> Result<Sha256Digest, SampledSentimentError> {
     canonjson::canonical_bytes(value).map(|bytes| Sha256Digest::of_bytes(&bytes)).map_err(|_| SampledSentimentError::Serialization)
+}
+fn item_address_digest(identity: &ExecutionIdentity, item_id: &str) -> Result<Sha256Digest, SampledSentimentError> {
+    // Project the complete existing identity instead of assembling a partial
+    // sampler key. This retains model, source, task, grammar, policy, seed and
+    // group bindings. Neither this digest nor the ID is added to task output.
+    let prior = identity.receipt_identity().map_err(|_| SampledSentimentError::Identity)?.to_hex();
+    let parts = [b"sampled-sentiment-item-address-v1".as_slice(), prior.as_bytes(), item_id.as_bytes()];
+    let bytes = parts.iter().try_fold(0_usize, |size, part|
+        size.checked_add(8).and_then(|size| size.checked_add(part.len())))
+        .ok_or(SampledSentimentError::Accounting)?;
+    let mut framed = reserved(bytes)?;
+    for part in parts {
+        framed.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        framed.extend_from_slice(part);
+    }
+    Ok(Sha256Digest::of_bytes(&framed))
 }
 fn reserved<T>(count: usize) -> Result<Vec<T>, SampledSentimentError> {
     let mut values = Vec::new(); values.try_reserve_exact(count).map_err(|_| SampledSentimentError::Allocation)?; Ok(values)

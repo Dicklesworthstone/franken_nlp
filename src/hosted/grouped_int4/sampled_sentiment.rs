@@ -4,6 +4,8 @@
 //! Explicit parallel execution keeps one fixed projection team alive across
 //! the entire bundle; sample addressing and per-row reductions stay unchanged.
 
+mod corpus;
+
 use super::*;
 use crate::{
     grammar::mask::MaskWorkLimits,
