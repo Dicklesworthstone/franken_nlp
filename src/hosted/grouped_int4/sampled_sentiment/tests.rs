@@ -98,6 +98,23 @@ fn sampled_plans_and_guarded_results_cross_the_one_owned_team_boundary() {
     send::<HostedInt4TeamResult<SampledSentimentRun>>();
     let _serial = NlpEngine::execute_int4_sampled_sentiment;
     let _team = NlpEngine::execute_int4_sampled_sentiment_with_threads;
+    let _prefill = NlpEngine::execute_int4_sampled_sentiment_layer_major;
+}
+
+#[test]
+fn sampled_prefill_admits_declared_rows_once_even_for_a_short_prompt() {
+    for samples in [1, 4, 32] {
+        let (limits, task, work) = fixture(samples);
+        let (required, base) = requirements(limits, task, 47, 128, work, PREPARATION).unwrap();
+        for rows in [1, 4, 64] {
+            let extra = Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+            let prefill = Int4PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: extra };
+            assert_eq!(super::super::prefill::with_extra_workspace(base, Some(prefill)).unwrap(), base + extra);
+            assert_eq!(required.kv_bytes, task.max_kv_bytes);
+            assert!(super::super::prefill::with_extra_workspace(base, Some(Int4PrefillLimits {
+                max_extra_scratch_bytes: extra - 1, ..prefill })).is_err());
+        }
+    }
 }
 
 #[test]
@@ -122,7 +139,7 @@ fn persistent_sample_team_prices_extra_workers_without_multiplying_kv_or_sampler
 /// process. The tiny ownership fixtures elsewhere cannot establish seeded
 /// task parity. This gate requires every sample and explanation to complete.
 #[test]
-#[ignore = "controller-only pinned model: sampled sentiment serial/2/4-thread parity, bounded input and physical drain"]
+#[ignore = "controller-only pinned model: sampled sentiment serial/team/prefill parity, bounded input and physical drain"]
 fn native_sampled_bundles_keep_every_sample_across_physical_team_widths() {
     use crate::{LeakResponsePolicy, ResourceHostConfig, RuntimePreset,
         tasks::sentiment::{SentimentAxis, SentimentRequest,
@@ -206,6 +223,26 @@ fn native_sampled_bundles_keep_every_sample_across_physical_team_widths() {
             drop(team);
             drained();
         }
+        for rows in [1, 4] {
+            let prefill = Int4PrefillLimits { max_batch_rows: rows,
+                max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap() };
+            let scheduled = host.execute_int4_sampled_sentiment_layer_major(&model, make(),
+                Arc::clone(&vocabulary), limits, PackedInt4Kernel::scalar(), prefill,
+                CancellationToken::default()).unwrap();
+            assert_eq!(crate::canonjson::canonical_bytes(scheduled.result()).unwrap(), expected);
+            assert!(host.resources().memory_snapshot().committed_bytes > baseline.committed_bytes);
+            assert_eq!(host.resources().memory_snapshot().reserved_bytes, 0);
+            assert_eq!(host.resources().outstanding_closure_snapshot().active_closures, 0);
+            drop(scheduled);
+            drained();
+        }
+        for rows in [0, 65] {
+            assert!(host.execute_int4_sampled_sentiment_layer_major(&model, make(),
+                Arc::clone(&vocabulary), limits, PackedInt4Kernel::scalar(),
+                Int4PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX },
+                CancellationToken::default()).is_err());
+            drained();
+        }
         for threads in [0, 1, 5, 65] {
             assert!(matches!(host.execute_int4_sampled_sentiment_with_threads(&model, make(),
                 Arc::clone(&vocabulary), limits, PackedInt4Kernel::scalar(), threads,
@@ -223,6 +260,16 @@ fn native_sampled_bundles_keep_every_sample_across_physical_team_widths() {
         cancel.cancel(DecodeCancellationKind::ParentCancelled);
         assert!(matches!(host.execute_int4_sampled_sentiment_with_threads(&model, make(),
             Arc::clone(&vocabulary), limits, PackedInt4Kernel::scalar(), 2, cancel),
+            Err(HostedError::Stopped { stop: RunStop {
+                kind: DecodeCancellationKind::ParentCancelled, .. }, .. })));
+        drained();
+
+        let cancel = CancellationToken::default();
+        cancel.cancel(DecodeCancellationKind::ParentCancelled);
+        assert!(matches!(host.execute_int4_sampled_sentiment_layer_major(&model, make(),
+            Arc::clone(&vocabulary), limits, PackedInt4Kernel::scalar(),
+            Int4PrefillLimits { max_batch_rows: 4,
+                max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(4).unwrap() }, cancel),
             Err(HostedError::Stopped { stop: RunStop {
                 kind: DecodeCancellationKind::ParentCancelled, .. }, .. })));
         drained();

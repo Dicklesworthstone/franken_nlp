@@ -30,8 +30,8 @@ pub mod sparse;
 mod prefill;
 mod sampled;
 pub use sampled::{JsonSamplingOptions, INT4_JSON_SAMPLED_EXECUTION, JSON_SAMPLER_VERSION,
-    decode_json_int4_sampled, json_sampling_workspace_bytes};
-pub(crate) use sampled::decode_json_int4_sampled_with;
+    decode_json_int4_sampled, decode_json_int4_sampled_layer_major, json_sampling_workspace_bytes};
+pub(crate) use sampled::{decode_json_int4_sampled_with, decode_json_int4_sampled_layer_major_with};
 
 /// Group dots, MACs and attention pairs are additional to JSON/mask work.
 /// The KV ceiling prices the engine's complete resident capacity.

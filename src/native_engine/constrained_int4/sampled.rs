@@ -75,6 +75,21 @@ pub fn decode_json_int4_sampled<C: DecodeStepControl>(
         sampling, budget, max_sampler_bytes, control, Ok)
 }
 
+/// Run the exact sampled decoder after bounded causal layer-major prompt
+/// morsels. The caller admits the additional workspace before execution.
+/// Prompt scheduling never enters the private draw key or changes the sample
+/// address, grammar mask, final-prefill head or scored terminal EOS.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_json_int4_sampled_layer_major<C: DecodeStepControl>(
+    engine: &mut StrictInt4Engine<'_>, identity: &ExecutionIdentity, prompt: &[u32],
+    program: &JsonProgram, vocabulary: &VocabMaskOracle, options: &JsonDecodeOptions,
+    sampling: &JsonSamplingOptions, budget: Int4JsonBudget, max_sampler_bytes: u64,
+    prefill: Int4PrefillLimits, control: &mut C,
+) -> Result<Int4JsonRun, Int4JsonError> {
+    decode_json_int4_sampled_layer_major_with(engine, identity, prompt, program, vocabulary,
+        options, sampling, budget, max_sampler_bytes, prefill, control, Ok)
+}
+
 /// Finalize while the exclusive native session still owns its complete KV.
 /// The same session-drop cleanup applies on success, typed failure and unwind.
 #[allow(clippy::too_many_arguments)]
@@ -85,6 +100,31 @@ pub(crate) fn decode_json_int4_sampled_with<C, T, E, F>(
     control: &mut C, finalize: F,
 ) -> Result<T, E>
 where C: DecodeStepControl, E: From<Int4JsonError>, F: FnOnce(Int4JsonRun) -> Result<T, E> {
+    decode_json_int4_sampled_scheduled(engine, identity, prompt, program, vocabulary,
+        options, sampling, budget, max_sampler_bytes, None, control, finalize)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_json_int4_sampled_layer_major_with<C, T, E, F>(
+    engine: &mut StrictInt4Engine<'_>, identity: &ExecutionIdentity, prompt: &[u32],
+    program: &JsonProgram, vocabulary: &VocabMaskOracle, options: &JsonDecodeOptions,
+    sampling: &JsonSamplingOptions, budget: Int4JsonBudget, max_sampler_bytes: u64,
+    prefill: Int4PrefillLimits, control: &mut C, finalize: F,
+) -> Result<T, E>
+where C: DecodeStepControl, E: From<Int4JsonError>, F: FnOnce(Int4JsonRun) -> Result<T, E> {
+    decode_json_int4_sampled_scheduled(engine, identity, prompt, program, vocabulary,
+        options, sampling, budget, max_sampler_bytes, Some(prefill), control, finalize)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_json_int4_sampled_scheduled<C, T, E, F>(
+    engine: &mut StrictInt4Engine<'_>, identity: &ExecutionIdentity, prompt: &[u32],
+    program: &JsonProgram, vocabulary: &VocabMaskOracle, options: &JsonDecodeOptions,
+    sampling: &JsonSamplingOptions, budget: Int4JsonBudget, max_sampler_bytes: u64,
+    prefill: Option<Int4PrefillLimits>, control: &mut C, finalize: F,
+) -> Result<T, E>
+where C: DecodeStepControl, E: From<Int4JsonError>, F: FnOnce(Int4JsonRun) -> Result<T, E> {
+    if let Some(limits) = prefill { limits.validate().map_err(Int4JsonError::from).map_err(E::from)?; }
     sampling.validate().map_err(E::from)?;
     check_sampler_budget(max_sampler_bytes).map_err(E::from)?;
     check_request(engine, identity, prompt, vocabulary, options, budget).map_err(E::from)?;
@@ -95,8 +135,12 @@ where C: DecodeStepControl, E: From<Int4JsonError>, F: FnOnce(Int4JsonRun) -> Re
         .map_err(E::from)?;
     let group_width = engine.model_identity().group_width();
     let mut session = engine.session(budget.native, control).map_err(Int4JsonError::from).map_err(E::from)?;
-    drive_selected(group_width, prompt, program, vocabulary, options, budget,
-        &mut session, &mut selection, finalize)
+    match prefill {
+        Some(limits) => prefill::drive_layer_major_selected(group_width, prompt, program, vocabulary,
+            options, budget, &mut session, &mut selection, limits, finalize),
+        None => drive_selected(group_width, prompt, program, vocabulary, options, budget,
+            &mut session, &mut selection, finalize),
+    }
 }
 
 fn check_sampler_budget(max_sampler_bytes: u64) -> Result<(), Int4JsonError> {

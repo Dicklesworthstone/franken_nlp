@@ -31,7 +31,7 @@ fn sampled_mode_requires_seed_and_rejects_unsupported_generation_policies() {
         "--source-manifest", "m", "--memory-mib", "16384"]).is_err());
     for flags in [
         &["--max-output-bytes", "65536"][..], &["--logprobs"][..],
-        &["--prefill-rows", "1"][..], &["--min-new-tokens", "0"][..],
+        &["--min-new-tokens", "0"][..],
         &["--repetition-penalty-milli", "1000"][..],
         &["--presence-penalty-milli", "0"][..],
         &["--frequency-penalty-milli", "0"][..],
@@ -78,6 +78,91 @@ fn compact_input_and_fixed_teams_preserve_the_independent_sampling_policy() {
         short.memory_mib = (limits.minimum_memory_bytes - 1) / MIB;
         let mut output = Vec::new();
         assert_eq!(sampled.execute(short, &mut NoRead, &mut output).unwrap_err().exit, ErrorCode::Usage);
+        assert!(output.is_empty());
+    }
+}
+
+#[test]
+fn sampled_prefill_admits_full_declared_workspace_and_preserves_each_samples_policy() {
+    for compact in [false, true] { for mode in 0..3 {
+        let configure = |args: &mut Int4Args| {
+            // The actual document is smaller than a 64-row morsel. Neither
+            // source length nor the number of samples can shrink this quote.
+            args.max_input_bytes = 32;
+            match mode {
+                0 => (),
+                1 => args.save_snapshot = Some(PathBuf::from("new-private-snapshot")),
+                _ => {
+                    args.source_dir = None; args.source_manifest = None;
+                    args.snapshot = Some(PathBuf::from("private-pinned-snapshot"));
+                    args.expected_model_sha256 = Some(SEED.to_owned());
+                }
+            }
+        };
+        let flags = if compact { vec!["--input-encoding", "safe-bpe-v1"] } else { Vec::new() };
+        let (mut serial_args, serial) = command(&flags);
+        configure(&mut serial_args);
+        let serial_limits = serial.validate(&serial_args).unwrap();
+        let request = parse_request("{\"document\":\"a\"}",
+            serial.budget(&serial_args, serial_limits, 4).unwrap(), serial_args.max_input_bytes).unwrap();
+        assert_eq!(request.document, "a");
+        assert!(serial_limits.prefill.is_none());
+        for rows in ["1", "4", "64"] {
+            let mut flags = flags.clone(); flags.extend(["--prefill-rows", rows]);
+            let (mut args, sampled) = command(&flags);
+            configure(&mut args);
+            let limits = sampled.validate(&args).unwrap();
+            let prefill = limits.prefill.unwrap();
+            assert_eq!(prefill.max_batch_rows, rows.parse::<usize>().unwrap());
+            assert_eq!(prefill.max_extra_scratch_bytes,
+                Int4PrefillLimits::required_extra_scratch_bytes(prefill.max_batch_rows).unwrap());
+            assert_eq!(limits.minimum_memory_bytes,
+                serial_limits.minimum_memory_bytes + prefill.max_extra_scratch_bytes);
+            assert_eq!(limits.compute.threads, 1);
+            assert_eq!(limits.compute.workspace_bytes, 0);
+            assert!(limits.cohort.is_none());
+            assert_eq!(sampled.options(&args).unwrap(), serial.options(&serial_args).unwrap());
+            assert_eq!(sampled.budget(&args, limits, 4).unwrap(), request.budget);
+            assert_eq!(sampled.work_ceiling(), serial.work_ceiling());
+            assert_eq!(sampled.masks(), serial.masks());
+            assert_eq!(sampled.max_mask_node_visits, serial.max_mask_node_visits);
+            assert_eq!(limits.native, serial_limits.native);
+            assert_eq!(limits.load, serial_limits.load);
+            assert_eq!(args.input_encoding.policy(args.max_input_bytes, limits.max_prompt_tokens).unwrap(),
+                serial_args.input_encoding.policy(serial_args.max_input_bytes, serial_limits.max_prompt_tokens).unwrap());
+            args.memory_mib = (limits.minimum_memory_bytes - 1) / MIB;
+            let mut output = Vec::new();
+            assert_eq!(sampled.execute(args, &mut NoRead, &mut output).unwrap_err().exit, ErrorCode::Usage);
+            assert!(output.is_empty());
+        }
+    } }
+}
+
+#[test]
+fn sampled_prefill_does_not_double_count_a_larger_source_loading_peak() {
+    let (mut base_args, base) = command(&[]);
+    base_args.source_preparation_mib = 16384;
+    base_args.memory_mib = 65536;
+    let original = base.validate(&base_args).unwrap();
+    let (mut args, sampled) = command(&["--prefill-rows", "64"]);
+    args.source_preparation_mib = base_args.source_preparation_mib;
+    args.memory_mib = base_args.memory_mib;
+    let admitted = sampled.validate(&args).unwrap();
+    assert!(admitted.prefill.unwrap().max_extra_scratch_bytes > 0);
+    assert_eq!(admitted.minimum_memory_bytes, original.minimum_memory_bytes);
+}
+
+#[test]
+fn sampled_prefill_refuses_invalid_rows_and_team_combinations_before_private_io() {
+    for flags in [
+        &["--prefill-rows", "0"][..], &["--prefill-rows", "65"][..],
+        &["--prefill-rows", "18446744073709551615"][..],
+        &["--prefill-rows", "1", "--compute-threads", "2"][..],
+        &["--prefill-rows", "64", "--compute-threads", "4", "--input-encoding", "safe-bpe-v1"][..],
+    ] {
+        let (args, sampled) = command(flags);
+        let mut output = Vec::new();
+        assert_eq!(sampled.execute(args, &mut NoRead, &mut output).unwrap_err().exit, ErrorCode::Usage);
         assert!(output.is_empty());
     }
 }
@@ -215,7 +300,8 @@ fn whole_bundle_ceiling_never_renews_a_native_work_axis() {
 #[cfg(not(feature = "asupersync-runtime"))]
 #[test]
 fn unavailable_runtime_refuses_before_reading_or_publishing() {
-    for flags in [&[][..], &["--compute-threads", "4", "--input-encoding", "safe-bpe-v1"][..]] {
+    for flags in [&[][..], &["--compute-threads", "4", "--input-encoding", "safe-bpe-v1"][..],
+        &["--prefill-rows", "4", "--input-encoding", "safe-bpe-v1"][..]] {
         let (args, command) = command(flags);
         let mut output = Vec::new();
         let error = command.execute(args, &mut NoRead, &mut output).unwrap_err();

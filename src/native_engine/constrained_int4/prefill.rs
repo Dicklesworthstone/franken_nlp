@@ -29,9 +29,22 @@ pub(super) fn drive_layer_major<V, D, T, E, F>(group_width: usize, prompt: &[u32
     vocabulary: &V, options: &JsonDecodeOptions, budget: Int4JsonBudget, driver: &mut D,
     limits: Int4PrefillLimits, finalize: F) -> Result<T, E>
 where V: Vocabulary, D: PrefillDriver, E: From<Int4JsonError>, F: FnOnce(Int4JsonRun) -> Result<T, E> {
+    drive_layer_major_selected(group_width, prompt, program, vocabulary, options, budget,
+        driver, &mut Greedy, limits, finalize)
+}
+
+/// Scheduling only replaces the causal prompt append operation. The caller's
+/// greedy or addressed-sampling selector remains the same owned value through
+/// every content token, the scored terminal EOS and independent finalization.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn drive_layer_major_selected<V, D, S, T, E, F>(group_width: usize, prompt: &[u32],
+    program: &JsonProgram, vocabulary: &V, options: &JsonDecodeOptions, budget: Int4JsonBudget,
+    driver: &mut D, selection: &mut S, limits: Int4PrefillLimits, finalize: F) -> Result<T, E>
+where V: Vocabulary, D: PrefillDriver, S: Selection, E: From<Int4JsonError>,
+    F: FnOnce(Int4JsonRun) -> Result<T, E> {
     // The public entrypoint validates before opening a session too. Keep this
     // private composition boundary unable to enter a driver on invalid limits.
     limits.validate().map_err(Int4JsonError::from).map_err(E::from)?;
-    drive(group_width, prompt, program, vocabulary, options, budget,
-        &mut LayerMajor { inner: driver, limits }, finalize)
+    drive_selected(group_width, prompt, program, vocabulary, options, budget,
+        &mut LayerMajor { inner: driver, limits }, selection, finalize)
 }

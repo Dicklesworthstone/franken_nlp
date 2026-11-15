@@ -10,7 +10,7 @@ use crate::{
     native_engine::{
         constrained::JsonWorkBudget,
         constrained_int4::{Int4JsonBudget, json_sampling_workspace_bytes},
-        strict_int4::Int4Work,
+        strict_int4::{Int4Work, prefill::Int4PrefillLimits},
     },
     tasks::{ir::TaskBudget, sentiment::sampled::{PreparedSampledSentiment,
         SampledSentimentError, SampledSentimentRun, SampledSentimentVocabulary}},
@@ -38,6 +38,29 @@ impl NlpEngine {
         prepared: PreparedSampledSentiment, vocabulary: Arc<SampledSentimentVocabulary>,
         limits: SampledSentimentHostLimits, kernel: PackedInt4Kernel,
         cancellation: CancellationToken) -> Result<HostedOutput<SampledSentimentRun>, HostedError> {
+        self.execute_int4_sampled_sentiment_scheduled(model, prepared, vocabulary,
+            limits, kernel, None, cancellation)
+    }
+
+    /// Admit the full declared causal prompt workspace once for the complete
+    /// sample bundle. Each sample retains its independent empty-KV session,
+    /// exact grammar and addressed draw; decoding remains sequential.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_int4_sampled_sentiment_layer_major(&self, model: &ResidentInt4,
+        prepared: PreparedSampledSentiment, vocabulary: Arc<SampledSentimentVocabulary>,
+        limits: SampledSentimentHostLimits, kernel: PackedInt4Kernel,
+        prefill: Int4PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedOutput<SampledSentimentRun>, HostedError> {
+        self.execute_int4_sampled_sentiment_scheduled(model, prepared, vocabulary,
+            limits, kernel, Some(prefill), cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_int4_sampled_sentiment_scheduled(&self, model: &ResidentInt4,
+        prepared: PreparedSampledSentiment, vocabulary: Arc<SampledSentimentVocabulary>,
+        limits: SampledSentimentHostLimits, kernel: PackedInt4Kernel,
+        prefill: Option<Int4PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedOutput<SampledSentimentRun>, HostedError> {
         dispatch::preflight(self, limits.native.run)?;
         if !Arc::ptr_eq(self.resources(), model.resources()) {
             return Err(HostedError::ResourceDomain);
@@ -52,6 +75,7 @@ impl NlpEngine {
         let (required, scratch_bytes) = requirements(limits, prepared.task_budget(),
             prepared.required_context(), prepared.group_width(), work,
             prepared.preparation_requirement_bytes())?;
+        let scratch_bytes = super::prefill::with_extra_workspace(scratch_bytes, prefill)?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers,
             limits.preparation_reserve_bytes)?, || Ok((prepared, vocabulary)))?;
@@ -72,7 +96,7 @@ impl NlpEngine {
             let result = allocate(output, || {
                 let (prepared, vocabulary) = &input.value;
                 execute_prepared(prepared, vocabulary, &mut engine.value, limits,
-                    required.kv_bytes, work, control)
+                    required.kv_bytes, work, prefill, control)
             })?;
             drop(engine);
             drop(input);
@@ -112,16 +136,18 @@ impl NlpEngine {
         };
         parallel::execute_task(self, model, (prepared, vocabulary), limits.native,
             kernel, compute_threads, memory, cancellation, move |input, engine, control| {
-                execute_prepared(&input.0, &input.1, engine, limits, required.kv_bytes, work, control)
+                execute_prepared(&input.0, &input.1, engine, limits, required.kv_bytes, work, None, control)
             })
     }
 }
 
 /// The schedule cannot change sample execution, complete-work validation or
-/// the terminal checkpoint. Both hosts use this one task/finalization boundary.
+/// the terminal checkpoint. All hosts use this one task/finalization boundary.
+#[allow(clippy::too_many_arguments)]
 fn execute_prepared(prepared: &PreparedSampledSentiment, vocabulary: &SampledSentimentVocabulary,
     engine: &mut StrictInt4Engine<'_>, limits: SampledSentimentHostLimits, kv_bytes: u64,
-    work: Int4Work, control: &mut RunControl) -> Result<SampledSentimentRun, HostedError> {
+    work: Int4Work, prefill: Option<Int4PrefillLimits>, control: &mut RunControl)
+    -> Result<SampledSentimentRun, HostedError> {
     let budget = Int4JsonBudget {
         native: Int4RunBudget::exact(work),
         json: JsonWorkBudget { max_forward_positions: work.forward_positions,
@@ -129,8 +155,12 @@ fn execute_prepared(prepared: &PreparedSampledSentiment, vocabulary: &SampledSen
             max_total_mask_node_visits: limits.max_mask_node_visits,
             mask_limits: limits.mask_limits },
     };
-    let run = prepared.execute_with_control(engine, prepared.execution_identity(), vocabulary,
-        budget, limits.max_sampler_bytes, control).map_err(task_error)?;
+    let run = match prefill {
+        None => prepared.execute_with_control(engine, prepared.execution_identity(), vocabulary,
+            budget, limits.max_sampler_bytes, control),
+        Some(prefill) => prepared.execute_layer_major_with_control(engine, prepared.execution_identity(),
+            vocabulary, budget, limits.max_sampler_bytes, prefill, control),
+    }.map_err(task_error)?;
     if !fits(run.model_work, work) || run.group_width != prepared.group_width()
         || engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) {
         return Err(HostedError::Limits("sampled sentiment completion accounting"));

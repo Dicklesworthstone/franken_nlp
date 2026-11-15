@@ -103,6 +103,30 @@ scratch, native state and complete result ownership are included in admission.
 Same-recipe serial/team replay is an explicit model-present gate, not an
 assumed result of source inspection.
 
+## Layer-major prompt prefill
+
+`--prefill-rows N` selects bounded layer-major prompt execution for every
+independent sample. N is an explicit maximum morsel width from 1 through 64.
+Use this option with serial compute (`--compute-threads 1`, the default); a
+larger compute team and prompt morsels are mutually exclusive schedules.
+Compact input can be combined with either schedule. The source conversion,
+snapshot load and optional snapshot-save routes accept the same choices.
+
+For example, replace `--compute-threads 4` in the compact-input command above
+with `--prefill-rows 4`. The host reserves the full declared prompt workspace
+once for the entire bundle, even if a prompt contains fewer than four rows.
+Each sample still starts with empty logical KV, and each attention row sees
+only its own causal prefix. The two model passes, final-prefill output head,
+grammar mask, sample address and scored terminal EOS use the same contracts.
+Generation after the prompt remains sequential.
+
+The native API exposes `decode_json_int4_sampled_layer_major`; prepared tasks
+expose `execute_layer_major_with_control`; the hosted entry point is
+`execute_int4_sampled_sentiment_layer_major`. This schedule uses the existing
+candidate response shape and does not change semantic identity or result
+fields. Exact same-recipe result parity and performance remain controller
+model gates; no speedup is claimed from source inspection.
+
 ## Sampling and complete results
 
 For each axis the model produces a closed JSON object with an integer `score`
@@ -162,6 +186,7 @@ The seed and document-dependent identity hashes are omitted from normal output.
 | `--max-tokenizer-pair-checks` | 4194304 for one complete source encoding; compact mode only |
 | `--max-tokenizer-pair-bytes` | 67108864 examined bytes for that same encoding; compact mode only |
 | `--compute-threads` | 1; explicit coordinator-plus-worker width 1–64 |
+| `--prefill-rows` | Omitted; explicit layer-major prompt morsels of 1–64 rows, with serial compute |
 
 All five native-work flags—`--max-forward-positions`,
 `--max-projected-logits`, `--max-attention-pairs`, `--max-dot-products` and
@@ -188,7 +213,7 @@ entire semantic bundle, including earlier successful samples.
 
 This route accepts the scalar or explicitly selected supported packed kernel,
 with serial scheduling and byte input encoding as defaults. It rejects text-generation
-processors, stops, token biases, logprobs and prompt chunk schedules.
+processors, stops, token biases and logprobs.
 Focus-area presets, sampled corpus/durable jobs, statistical intervals
 and automatic default selection are outside this implementation slice.
 
@@ -207,7 +232,13 @@ workspace admission before IO, all cancellation causes inside encoding,
 stable default response bytes, bounded physical receipts and publication
 deadlines. An ignored controller-only native fixture compares complete seeded
 results at serial, two-thread and four-thread widths within each encoding
-recipe, then checks width/memory refusal, cancellation and physical drain.
+recipe, plus one-row and four-row prompt morsels, then checks width/memory
+refusal, cancellation and physical drain. Synthetic-driver prefill regressions
+cover addressed samples across morsel widths, exact generated tokens and work,
+numeric/source-bound/Unicode grammars, native and mask limits, all cancellation
+causes and finalizer refusal. CLI admission fixtures cover the complete declared
+prompt workspace, short inputs, source/snapshot/save paths and incompatible
+physical schedules.
 
 Rust compilation, executable fixtures, production DSR qualification, real-model
 replay/cancellation and human-label quality evaluation remain **UNRUN**. The

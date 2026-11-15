@@ -20,6 +20,7 @@ use crate::{
         generation::grouped_int4::bind_candidate_model,
         lmhead::NANBEIGE_VOCAB_SIZE,
         strict_int4::{Int4ModelIdentity, Int4RunBudget, Int4Work, StrictInt4Engine, StrictInt4Error,
+            prefill::Int4PrefillLimits,
             STRICT_INT4_EXECUTION, STRICT_INT4_PROFILE},
     },
     tasks::{BuiltInTask, ir::{DecodeStrategy, DependencyScope, FinitePostcondition, GrammarReference,
@@ -254,7 +255,27 @@ impl PreparedSampledSentiment {
         admitted: &ExecutionIdentity, vocabulary: &SampledSentimentVocabulary,
         budget: Int4JsonBudget, max_sampler_bytes: u64, control: &mut C)
         -> Result<SampledSentimentRun, SampledSentimentError> {
+        self.execute_scheduled(engine, admitted, vocabulary, budget, max_sampler_bytes, None, control)
+    }
+
+    /// Reuse one admitted causal prompt workspace across every independently
+    /// addressed sample. Physical morsel width never changes the sealed prompt,
+    /// sample address, generation limits or complete-result boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_layer_major_with_control<C: DecodeStepControl>(&self, engine: &mut StrictInt4Engine<'_>,
+        admitted: &ExecutionIdentity, vocabulary: &SampledSentimentVocabulary,
+        budget: Int4JsonBudget, max_sampler_bytes: u64, prefill: Int4PrefillLimits, control: &mut C)
+        -> Result<SampledSentimentRun, SampledSentimentError> {
+        self.execute_scheduled(engine, admitted, vocabulary, budget, max_sampler_bytes, Some(prefill), control)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_scheduled<C: DecodeStepControl>(&self, engine: &mut StrictInt4Engine<'_>,
+        admitted: &ExecutionIdentity, vocabulary: &SampledSentimentVocabulary,
+        budget: Int4JsonBudget, max_sampler_bytes: u64, prefill: Option<Int4PrefillLimits>, control: &mut C)
+        -> Result<SampledSentimentRun, SampledSentimentError> {
         checkpoint(control)?;
+        if let Some(limits) = prefill { limits.validate()?; }
         self.verify_identity(admitted)?;
         constrained_int4::check_model(&self.identity, engine.model_identity())?;
         if engine.model_identity().group_width() != self.group_width || engine.is_poisoned()
@@ -285,10 +306,15 @@ impl PreparedSampledSentiment {
                         max_kv_bytes: budget.json.max_kv_bytes,
                         max_total_mask_node_visits: mask_charge,
                         mask_limits: budget.json.mask_limits } };
-                let checked = constrained_int4::decode_json_int4_sampled_with(engine, &axis.identity,
-                    &axis.prompt, &self.program, &vocabulary.oracle, &self.decode, &sampling,
-                    sample_budget, max_sampler_bytes, control,
-                    |run| self.finalize_sample(axis, sample_index, run))?;
+                let finalize = |run| self.finalize_sample(axis, sample_index, run);
+                let checked = match prefill {
+                    None => constrained_int4::decode_json_int4_sampled_with(engine, &axis.identity,
+                        &axis.prompt, &self.program, &vocabulary.oracle, &self.decode, &sampling,
+                        sample_budget, max_sampler_bytes, control, finalize),
+                    Some(limits) => constrained_int4::decode_json_int4_sampled_layer_major_with(engine,
+                        &axis.identity, &axis.prompt, &self.program, &vocabulary.oracle, &self.decode,
+                        &sampling, sample_budget, max_sampler_bytes, limits, control, finalize),
+                }?;
                 // Check cumulative retained sample storage before committing
                 // this sample to the bundle; the final envelope is checked too.
                 let serialized = canonjson::canonical_bytes(&checked).map_err(|_| SampledSentimentError::Serialization)?;

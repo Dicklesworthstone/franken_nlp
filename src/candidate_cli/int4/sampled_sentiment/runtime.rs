@@ -167,8 +167,12 @@ pub(super) fn execute(args: Int4Args, command: SampledArgs, _admitted: Int4Limit
             host, limits.kernel, limits.compute.threads, cancellation)
             .map(compute::Completion::Team)
     } else {
-        engine.execute_int4_sampled_sentiment(&model, prepared, vocabulary,
-            host, limits.kernel, cancellation).map(compute::Completion::serial)
+        match limits.prefill {
+            None => engine.execute_int4_sampled_sentiment(&model, prepared, vocabulary,
+                host, limits.kernel, cancellation),
+            Some(prefill) => engine.execute_int4_sampled_sentiment_layer_major(&model,
+                prepared, vocabulary, host, limits.kernel, prefill, cancellation),
+        }.map(compute::Completion::serial)
     }.map_err(host_failure)?;
     let used = result.result().model_work;
     if result.result().group_width != args.group_width
