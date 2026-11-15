@@ -585,3 +585,139 @@ fn population_ids_are_bounded_before_document_preparation() {
     }
     assert!(planner.plan_for_item_with_control(&request, &"é".repeat(128), &mut Continue).is_ok());
 }
+
+const COMPLETE_MASK_CHARGE_PER_TOKEN: u64 = 17;
+
+fn complete_bundle(plan: &PreparedSampledSentiment) -> SampledSentimentRun {
+    let mut dimensions = Vec::new();
+    let mut model_work = Int4Work::default();
+    let mut generated_tokens = 0_u64;
+    let mut mask_node_visit_charge = 0_u64;
+    for axis in &plan.axes {
+        let mut samples = Vec::new();
+        for index in 0..plan.options.samples {
+            let mut raw = synthetic(plan, axis, r#"{"score":45,"justification":"Helpful wording."}"#);
+            raw.output.mask_node_visit_charge = raw.output.token_ids.len() as u64 * COMPLETE_MASK_CHARGE_PER_TOKEN;
+            let sample = plan.finalize_sample(axis, index, raw).unwrap();
+            model_work = model_work.checked_add(sample.model_work).unwrap();
+            generated_tokens += sample.generated_tokens as u64;
+            mask_node_visit_charge += sample.mask_node_visit_charge;
+            samples.push(sample);
+        }
+        dimensions.push(aggregate(axis.axis, samples).unwrap());
+    }
+    SampledSentimentRun {
+        schema_version: 1, execution: SAMPLED_SENTIMENT_EXECUTION.to_owned(), task_spec: "sentiment-v1".to_owned(),
+        prompt_template_sha256: plan.identity.template_digest, numerics_profile: STRICT_INT4_PROFILE.to_owned(),
+        group_width: plan.group_width, aggregation: SAMPLED_SENTIMENT_AGGREGATION_VERSION.to_owned(),
+        interpretation: "generated_score_variation_not_calibrated_confidence".to_owned(),
+        justification_status: "unverified_model_explanations_from_untrusted_document".to_owned(),
+        sampler_version: JSON_SAMPLER_VERSION.to_owned(), samples_per_axis: plan.options.samples,
+        dimensions, model_work, generated_tokens, mask_node_visit_charge,
+    }
+}
+
+#[test]
+fn completed_bundles_revalidate_axes_ordinals_aggregates_and_exact_native_accounting() {
+    let plan = prepare(&request()).unwrap();
+    let original = complete_bundle(&plan);
+    plan.verify_completed_with_control(&original, COMPLETE_MASK_CHARGE_PER_TOKEN,
+        original.mask_node_visit_charge, &mut Continue).unwrap();
+    for case in 0..29 {
+        let mut broken = original.clone();
+        match case {
+            0 => { broken.dimensions.pop(); }
+            1 => { broken.dimensions[0].samples.pop(); }
+            2 => broken.dimensions[0].samples[1].sample_index = 0,
+            3 => broken.dimensions[0].axis = SentimentAxis::Arousal,
+            4 => broken.dimensions[0].mean += 1.0,
+            5 => broken.dimensions[0].median += 1.0,
+            6 => broken.dimensions[0].minimum -= 1,
+            7 => broken.dimensions[0].maximum += 1,
+            8 => broken.dimensions[0].population_stddev = f64::NAN,
+            9 => broken.dimensions[0].low_anchor.push('!'),
+            10 => broken.dimensions[0].high_anchor.push('!'),
+            11 => broken.dimensions[0].samples[0].score = 101,
+            12 => broken.dimensions[0].samples[0].justification = " \t\n".to_owned(),
+            13 => broken.dimensions[0].samples[0].justification = "é".repeat(options().max_justification_chars + 1),
+            14 => broken.dimensions[0].samples[0].generated_tokens = 0,
+            15 => broken.dimensions[0].samples[0].generated_tokens = options().max_sample_tokens + 1,
+            16 => broken.model_work.attention_pairs -= 1,
+            17 => broken.generated_tokens -= 1,
+            18 => broken.mask_node_visit_charge = 1,
+            19 => broken.samples_per_axis -= 1,
+            20 => broken.prompt_template_sha256 = Sha256Digest::of_bytes(b"another task template"),
+            21 => broken.aggregation.push('!'),
+            22 => broken.interpretation.push('!'),
+            23 => broken.justification_status.push('!'),
+            24 => broken.sampler_version.push('!'),
+            25 => broken.group_width = 64,
+            26 => broken.execution.push('!'),
+            27 => {
+                for dimension in &mut broken.dimensions {
+                    for sample in &mut dimension.samples { sample.mask_node_visit_charge = 0; }
+                }
+                broken.mask_node_visit_charge = 0;
+            }
+            _ => {
+                broken.dimensions[0].samples[0].mask_node_visit_charge += 1;
+                broken.dimensions[0].samples[1].mask_node_visit_charge -= 1;
+            }
+        }
+        assert!(plan.verify_completed_with_control(&broken, COMPLETE_MASK_CHARGE_PER_TOKEN,
+            u64::MAX, &mut Continue).is_err(), "case {case}");
+    }
+    for axis in 0..5 {
+        let mut broken = original.clone();
+        let work = &mut broken.dimensions[0].samples[0].model_work;
+        match axis { 0 => work.forward_positions -= 1, 1 => work.projected_logits -= 1,
+            2 => work.attention_pairs -= 1, 3 => work.projections.dot_products -= 1,
+            _ => work.projections.multiply_accumulates -= 1 }
+        assert!(plan.verify_completed_with_control(&broken, COMPLETE_MASK_CHARGE_PER_TOKEN,
+            u64::MAX, &mut Continue).is_err(), "native axis {axis}");
+    }
+}
+
+#[test]
+fn complete_validation_preserves_item_encoding_addresses_and_exact_output_and_mask_caps() {
+    for encoding in [UntrustedEncoding::ByteFallback, UntrustedEncoding::SafeBpeV1(compact_limits())] {
+        let planner = encoding_planner(encoding);
+        let mut plan = planner.plan_for_item_with_control(&request(), "stable-record", &mut Continue).unwrap();
+        let complete = complete_bundle(&plan);
+        let masks = complete.mask_node_visit_charge;
+        plan.verify_completed_with_control(&complete, COMPLETE_MASK_CHARGE_PER_TOKEN, masks, &mut Continue).unwrap();
+        assert!(matches!(plan.verify_completed_with_control(&complete, COMPLETE_MASK_CHARGE_PER_TOKEN, masks - 1,
+            &mut Continue), Err(SampledSentimentError::Accounting)));
+        assert!(matches!(plan.verify_completed_with_control(&complete, 0, masks, &mut Continue),
+            Err(SampledSentimentError::Accounting)));
+        assert!(matches!(plan.verify_completed_with_control(&complete, COMPLETE_MASK_CHARGE_PER_TOKEN + 1, masks,
+            &mut Continue), Err(SampledSentimentError::Accounting)));
+        let bytes = canonjson::canonical_bytes(&complete).unwrap().len() as u64;
+        plan.max_result_bytes = bytes;
+        plan.verify_completed_with_control(&complete, COMPLETE_MASK_CHARGE_PER_TOKEN, masks, &mut Continue).unwrap();
+        plan.max_result_bytes -= 1;
+        assert!(matches!(plan.verify_completed_with_control(&complete, COMPLETE_MASK_CHARGE_PER_TOKEN, masks,
+            &mut Continue), Err(SampledSentimentError::OutputBudget)));
+    }
+}
+
+#[test]
+fn complete_validation_keeps_every_original_cancellation_cause_at_each_bundle_level() {
+    struct DuringVerification { calls: usize, stop: usize, cause: DecodeCancellationKind }
+    impl DecodeStepControl for DuringVerification {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.calls += 1; (self.calls == self.stop).then_some(self.cause)
+        }
+    }
+    let plan = prepare(&request()).unwrap(); let complete = complete_bundle(&plan);
+    for cause in [DecodeCancellationKind::User, DecodeCancellationKind::Timeout, DecodeCancellationKind::Deadline,
+        DecodeCancellationKind::PollQuota, DecodeCancellationKind::CostBudget, DecodeCancellationKind::FailFast,
+        DecodeCancellationKind::RaceLost, DecodeCancellationKind::ParentCancelled, DecodeCancellationKind::ResourceUnavailable,
+        DecodeCancellationKind::Shutdown, DecodeCancellationKind::LinkedExit] {
+        for stop in [1, 2, 3] {
+            let error = plan.verify_completed_with_control(&complete, COMPLETE_MASK_CHARGE_PER_TOKEN,
+                complete.mask_node_visit_charge, &mut DuringVerification { calls: 0, stop, cause }).err().unwrap();
+            assert_eq!(error.cancellation(), Some(cause));
+        }
+    }
+}

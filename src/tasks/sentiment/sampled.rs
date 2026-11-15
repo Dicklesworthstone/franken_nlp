@@ -392,14 +392,73 @@ impl PreparedSampledSentiment {
             sampler_version: JSON_SAMPLER_VERSION.to_owned(),
             samples_per_axis: self.options.samples, dimensions, model_work: actual_work,
             generated_tokens: actual_tokens, mask_node_visit_charge: actual_mask };
+        // The decoder charges this fixed bound for every selected token,
+        // including EOS. This is charged work, not observed trie traversal.
+        let mask_charge_per_token = vocabulary.oracle.trie().node_count()
+            .min(budget.json.mask_limits.max_trie_node_visits) as u64;
+        self.verify_completed_with_control(&result, mask_charge_per_token,
+            budget.json.max_total_mask_node_visits, control)?;
+        Ok(result)
+    }
+
+    /// Recheck the complete bundle and every sample's native and mask charges.
+    /// This is structural validation, not a claim that explanations are true.
+    fn verify_completed_with_control<C: DecodeStepControl>(&self,
+        run: &SampledSentimentRun, mask_charge_per_token: u64, mask_ceiling: u64, control: &mut C)
+        -> Result<(), SampledSentimentError> {
         checkpoint(control)?;
-        if !fits_work(actual_work, self.work) || actual_tokens > u64::from(self.budget.max_output_tokens)
-            || actual_mask > budget.json.max_total_mask_node_visits {
+        if mask_charge_per_token == 0 || run.schema_version != 1 || run.execution != SAMPLED_SENTIMENT_EXECUTION
+            || run.task_spec != "sentiment-v1" || run.prompt_template_sha256 != self.identity.template_digest
+            || run.numerics_profile != STRICT_INT4_PROFILE || run.group_width != self.group_width
+            || run.aggregation != SAMPLED_SENTIMENT_AGGREGATION_VERSION
+            || run.interpretation != "generated_score_variation_not_calibrated_confidence"
+            || run.justification_status != "unverified_model_explanations_from_untrusted_document"
+            || run.sampler_version != JSON_SAMPLER_VERSION || run.samples_per_axis != self.options.samples
+            || run.dimensions.len() != self.axes.len() {
             return Err(SampledSentimentError::Accounting);
         }
-        check_output_size(&result, self.max_result_bytes)?;
-        checkpoint(control)?;
-        Ok(result)
+        let mut work = Int4Work::default();
+        let mut tokens = 0_u64;
+        let mut masks = 0_u64;
+        for (axis, dimension) in self.axes.iter().zip(&run.dimensions) {
+            checkpoint(control)?;
+            if dimension.axis != axis.axis || dimension.samples.len() != self.options.samples {
+                return Err(SampledSentimentError::Accounting);
+            }
+            for (index, sample) in dimension.samples.iter().enumerate() {
+                checkpoint(control)?;
+                if sample.sample_index != index || !(-100..=100).contains(&sample.score)
+                    || sample.justification.trim().is_empty()
+                    || sample.justification.chars().count() > self.options.max_justification_chars
+                    || sample.generated_tokens == 0 || sample.generated_tokens > self.options.max_sample_tokens {
+                    return Err(SampledSentimentError::Accounting);
+                }
+                let positions = axis.prompt.len().checked_add(sample.generated_tokens - 1)
+                    .ok_or(SampledSentimentError::Accounting)?;
+                let logits = sample.generated_tokens.checked_mul(NANBEIGE_VOCAB_SIZE)
+                    .ok_or(SampledSentimentError::Accounting)?;
+                let expected = Int4Work::for_sequence(self.group_width, 0, positions, logits)?;
+                let expected_masks = (sample.generated_tokens as u64).checked_mul(mask_charge_per_token)
+                    .ok_or(SampledSentimentError::Accounting)?;
+                if sample.model_work != expected || !fits_work(expected, axis.work)
+                    || sample.mask_node_visit_charge != expected_masks {
+                    return Err(SampledSentimentError::Accounting);
+                }
+                work = work.checked_add(expected)?;
+                tokens = tokens.checked_add(sample.generated_tokens as u64).ok_or(SampledSentimentError::Accounting)?;
+                masks = masks.checked_add(expected_masks).ok_or(SampledSentimentError::Accounting)?;
+            }
+            if aggregate(axis.axis, dimension.samples.clone())? != *dimension {
+                return Err(SampledSentimentError::Accounting);
+            }
+        }
+        if work != run.model_work || tokens != run.generated_tokens || masks != run.mask_node_visit_charge
+            || !fits_work(work, self.work) || tokens > u64::from(self.budget.max_output_tokens)
+            || masks > mask_ceiling {
+            return Err(SampledSentimentError::Accounting);
+        }
+        check_output_size(run, self.max_result_bytes)?;
+        checkpoint(control)
     }
 
     pub fn verify_identity(&self, admitted: &ExecutionIdentity) -> Result<(), SampledSentimentError> {

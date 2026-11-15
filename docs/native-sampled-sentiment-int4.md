@@ -202,10 +202,18 @@ cleared between them. Native buffers and result ownership remain charged
 through physical completion and publication.
 
 The invocation deadline spans input, model preparation, planning, native work
-and publication checks. Blocking input/output remains cooperative. The complete
-result is validated and serialized before its first output byte; a transport
-failure during delivery can still leave partially written bytes and a nonzero
-exit. Consumers must require successful completion.
+and publication checks. Blocking input/output remains cooperative. Before
+returning a complete bundle, the shared finalizer rechecks the requested axis
+and sample order, scores, explanation bounds, implementation metadata and
+recomputed descriptive statistics. It reconstructs each sample's five native
+work counts from the actual prompt and generated-token count, including EOS,
+and reconciles every sample's charged mask allowance and the bundle totals.
+Mask charges describe reserved accounting, not measured trie traversal.
+The same checks protect serial, persistent-team, layer-major and corpus calls.
+
+The complete result is validated and serialized before its first output byte;
+a transport failure during delivery can still leave partially written bytes
+and a nonzero exit. Consumers must require successful completion.
 
 Invalid CLI settings are refused before input or model access. Resource and
 whole-schedule admission failures use exit 9; exhausted tokenizer/execution/output/mask
@@ -385,8 +393,8 @@ The change includes source regressions for grammar legality and actual-program
 binding, seeded replay addresses, existing greedy behavior, all cancellation
 causes, complete bundle admission, Unicode explanation lengths, independent
 sample validation, aggregate statistics, CLI rejection before IO and stable
-failure categories. Source reviews, nonwriting Rust syntax parsing and diff
-hygiene were performed. These are not executed test evidence.
+failure categories. The current follow-up has source review and text-integrity checks only;
+its added regressions have not been executed.
 
 Additional regressions cover compact Unicode/control-marker round trips, exact
 tokenizer limits, complete repeated-prompt accounting, policy-bound identities,
