@@ -107,9 +107,9 @@ assumed result of source inspection.
 
 ## Layer-major prompt prefill
 
-For the single-document command, `--prefill-rows N` selects bounded layer-major
-prompt execution for every independent sample. N is an explicit maximum morsel
-width from 1 through 64.
+For both single-document and resident-population commands, `--prefill-rows N`
+selects bounded layer-major prompt execution for every independent sample.
+N is an explicit maximum morsel width from 1 through 64.
 Use this option with serial compute (`--compute-threads 1`, the default); a
 larger compute team and prompt morsels are mutually exclusive schedules.
 Compact input can be combined with either schedule. The source conversion,
@@ -117,7 +117,9 @@ snapshot load and optional snapshot-save routes accept the same choices.
 
 For example, replace `--compute-threads 4` in the compact-input command above
 with `--prefill-rows 4`. The host reserves the full declared prompt workspace
-once for the entire bundle, even if a prompt contains fewer than four rows.
+once for the entire invocation, even if a prompt contains fewer than four rows.
+In the corpus route, the reservation remains in place across every record and
+flush; it does not multiply by document, axis or sample count.
 Each sample still starts with empty logical KV, and each attention row sees
 only its own causal prefix. The two model passes, final-prefill output head,
 grammar mask, sample address and scored terminal EOS use the same contracts.
@@ -125,10 +127,10 @@ Generation after the prompt remains sequential.
 
 The native API exposes `decode_json_int4_sampled_layer_major`; prepared tasks
 expose `execute_layer_major_with_control`; the hosted entry point is
-`execute_int4_sampled_sentiment_layer_major`. This schedule uses the existing
-candidate response shape and does not change semantic identity or result
-fields. Exact same-recipe result parity and performance remain controller
-model gates; no speedup is claimed from source inspection.
+`execute_int4_sampled_sentiment_layer_major`. The sampled result shape and
+semantic identity are unchanged. The corpus wrapper reports the selected
+prompt schedule separately. Exact same-recipe result parity and performance
+remain controller model gates; no speedup is claimed from source inspection.
 
 ## Sampling and complete results
 
@@ -266,6 +268,12 @@ resource ceilings, input encoding and physical schedule stay fixed for the
 invocation. Work defaults may exhaust before the request limit; the command
 does not multiply compute authority by `--max-requests`.
 
+For layer-major prompt execution, use `--compute-threads 1 --prefill-rows 4`
+in the same command. This selects bounded causal prompt morsels for every
+fresh sample in every document. Widths 1–64 are supported; the prompt schedule
+cannot combine with a larger compute team. Compact input and source,
+snapshot-load and snapshot-save routes remain available.
+
 ### Records and epochs
 
 Every document is a closed `{id,text,task_args?}` object. `task_args` accepts
@@ -325,6 +333,7 @@ reveal the seed or document-dependent identity digests.
 | Five native-work flags listed above | One cumulative ceiling for the entire invocation |
 | `--max-mask-node-visits` | One cumulative mask allowance for every document, axis, sample and EOS |
 | Tokenizer pair limits | One bounded complete source encoding per record, reused across all its axes and samples |
+| `--prefill-rows` | Omitted by default; 1–64 causal prompt rows with one admitted workspace for the entire stream, using serial compute |
 
 Before a document enters native execution, the processor charges its full
 maximum-token schedule on all five native counters and its complete mask
@@ -338,7 +347,10 @@ generated tokens and mask accounting.
 Every output line is a candidate provenance wrapper with protocol
 `fnlp-candidate-int4-sentiment-sampled-batch-v1`, scope
 `real-source-current-candidate-int4`, evidence `non_authoritative`, and public
-actual-model provenance. Its `record` retains the canonical
+actual-model provenance. With layer-major prompts, its optional
+`prefill_schedule` records the native execution version, declared maximum rows
+and admitted workspace bytes. The field is omitted by default; it reports the
+selected schedule without claiming a measured speedup. Its `record` retains the canonical
 `fnlp-item-local-batch-v1` event. Events are `run_start`, `doc`, `doc_error`,
 `flush` and terminal `run_complete` or `run_error`. A successful `doc` contains
 the entire validated sampled result under `record.result`, including every
@@ -372,8 +384,9 @@ axis bundle, compiler/vocabulary allowance, result staging and one encoder
 workspace before private IO. The task planner's `plan_for_item_with_control`
 binds the caller ID while preserving the original one-shot planning methods.
 The hosted methods
-`NlpEngine::batch_int4_sampled_sentiment` and
-`NlpEngine::batch_int4_sampled_sentiment_with_threads` own the reader, writer,
+`NlpEngine::batch_int4_sampled_sentiment`,
+`NlpEngine::batch_int4_sampled_sentiment_with_threads` and
+`NlpEngine::batch_int4_sampled_sentiment_layer_major` own the reader, writer,
 compiler and vocabulary through physical completion and delivery under one
 blocking invocation and one run controller.
 
@@ -382,10 +395,15 @@ and explicit widths 2–64 use the same admitted source/snapshot routes as the
 single-document command. A numerical team persists for the whole stream, and
 all workers join before `run_complete` can be published under the original
 cancellation control. Owned IO remains charged through that final publication.
-The batch route rejects `--prefill-rows` before IO; layer-major prompt execution
-is currently exposed by the single-document command. There is no implicit
-schedule fallback or renewal of native/mask work at worker, item or epoch
-boundaries. Memory reservations are modeled commitments, not measured RSS.
+The layer-major corpus route reserves its complete declared prompt workspace
+before reading population data, including when actual prompts are shorter than
+the selected width. Serial and layer-major routes drop their native allocation
+before publishing `run_complete`, retaining charged IO and the original
+cancellation control through that final write. Invalid rows, insufficient
+workspace, or combined team/prefill schedules are refused before execution.
+There is no implicit schedule fallback or renewal of native/mask work at
+worker, item or epoch boundaries. Memory reservations are modeled commitments,
+not measured RSS.
 
 ## Verification status
 
@@ -416,6 +434,10 @@ paths, cross-factory plans, all cancellation causes, guard ownership through
 delivery/unwind, actual NDJSON duplicate/flush handling, partial writes and
 post-join footer cancellation. Host fixtures cover complete resident KV,
 reused sampler/workspace, compact preparation and every admission axis.
+Additional regression definitions cover per-record budget tightening without
+native debit on rejected records, exact complete-bundle accounting, bounded
+corpus prefill admission, unchanged stream work across prompt schedules,
+source/snapshot/save CLI routes and public schedule provenance.
 These are source definitions and independent review, not executed batch or
 real-model evidence. Batch parity, replay, failure and physical-drain evidence
 remain part of the controller's model-present gates.

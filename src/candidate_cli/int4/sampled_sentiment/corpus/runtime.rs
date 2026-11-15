@@ -7,7 +7,8 @@ use crate::{
     candidate_cli::batch::CandidateWriter,
     hosted::{CancellationToken, HostedError, NativeLimits, RunLimits, corpus::CorpusLimits},
     native_engine::{decode::DecodeCancellationKind,
-        strict_int4::weights::snapshot::INT4_SNAPSHOT_VERSION},
+        strict_int4::{prefill::{Int4PrefillLimits, INT4_LAYER_MAJOR_PREFILL_VERSION},
+            weights::snapshot::INT4_SNAPSHOT_VERSION}},
     tasks::sentiment::sampled::{SampledSentimentPlanner, SampledSentimentVocabulary},
 };
 use super::super::runtime::{cancelled, host_failure, task_failure};
@@ -110,6 +111,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         quant_recipe: &identity.quant_recipe, group_width: args.group_width,
         integer_kernel: common.kernel.kind().id(), snapshot,
         compute_schedule: compute::Schedule::for_threads(common.compute.threads),
+        prefill_schedule: common.prefill.map(PrefillSchedule::new).transpose()?,
         input_encoding: input_encoding::reported_policy(&encoding),
     };
     // Only this framing sink owns stdout. The host's terminal event is final;
@@ -127,7 +129,12 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         engine.batch_int4_sampled_sentiment_with_threads(&model, planner, corpus, common.kernel,
             common.compute.threads, reader, writer, cancellation)
     } else {
-        engine.batch_int4_sampled_sentiment(&model, planner, corpus, common.kernel, reader, writer, cancellation)
+        match common.prefill {
+            None => engine.batch_int4_sampled_sentiment(&model, planner, corpus,
+                common.kernel, reader, writer, cancellation),
+            Some(prefill) => engine.batch_int4_sampled_sentiment_layer_major(&model,
+                planner, corpus, common.kernel, prefill, reader, writer, cancellation),
+        }
     }.map_err(execution_failure)?;
     completed(summary)
 }
@@ -140,6 +147,18 @@ impl SnapshotRecord {
     }
 }
 #[derive(Serialize)]
+struct PrefillSchedule {
+    execution: &'static str,
+    max_batch_rows: usize,
+    admitted_workspace_bytes: u64,
+}
+impl PrefillSchedule {
+    fn new(limits: Int4PrefillLimits) -> Result<Self, CandidateError> {
+        Ok(Self { execution: INT4_LAYER_MAJOR_PREFILL_VERSION, max_batch_rows: limits.max_batch_rows,
+            admitted_workspace_bytes: limits.validate().map_err(|_| CandidateError::Arguments)? })
+    }
+}
+#[derive(Serialize)]
 struct Provenance<'a> {
     protocol: &'static str, schema_version: u32, scope: &'static str, evidence: &'static str,
     task: &'static str, model_id: &'static str, source_revision: &'a str, source_root_sha256: &'a str,
@@ -149,6 +168,8 @@ struct Provenance<'a> {
     snapshot: Option<SnapshotRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compute_schedule: Option<compute::Schedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefill_schedule: Option<PrefillSchedule>,
     #[serde(skip_serializing_if = "Option::is_none")]
     input_encoding: Option<&'a crate::tokenizer::untrusted::UntrustedEncoding>,
 }
@@ -185,7 +206,7 @@ mod tests {
             source_root_sha256: "public-root", model_content_sha256: "public-content",
             candidate_format: "candidate", quant_recipe: "recipe", group_width: 128,
             integer_kernel: "s_scalar_i32", snapshot: None,
-            compute_schedule: compute::Schedule::for_threads(4),
+            compute_schedule: compute::Schedule::for_threads(4), prefill_schedule: None,
             input_encoding: input_encoding::reported_policy(&encoding) };
         let mut output = Vec::new();
         {
@@ -204,7 +225,58 @@ mod tests {
             assert_eq!(value["evidence"], "non_authoritative");
             assert_eq!(value["compute_schedule"]["declared_compute_threads"], 4);
             assert!(value.get("input_encoding").is_none());
+            assert!(value.get("prefill_schedule").is_none());
             assert!(value.get("effective_seed").is_none());
+        }
+    }
+
+    #[test]
+    fn physical_prefill_provenance_is_explicit_on_every_event_and_absent_on_default() {
+        use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+        for rows in [None, Some(1), Some(4), Some(64)] {
+            for compact in [false, true] {
+                let encoding = if compact { UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+                    max_input_bytes: 32, max_output_tokens: 64, max_pair_checks: 1024, max_pair_bytes: 16384,
+                }) } else { UntrustedEncoding::ByteFallback };
+                let prefill = rows.map(|max_batch_rows| Int4PrefillLimits {
+                    max_batch_rows, max_extra_scratch_bytes:
+                        Int4PrefillLimits::required_extra_scratch_bytes(max_batch_rows).unwrap(),
+                });
+                let provenance = Provenance { protocol: "fnlp-candidate-int4-sentiment-sampled-batch-v1",
+                    schema_version: 1, scope: "real-source-current-candidate-int4", evidence: "non_authoritative",
+                    task: "sentiment-sampled", model_id: "Nanbeige4.2-3B", source_revision: "public-revision",
+                    source_root_sha256: "public-root", model_content_sha256: "public-content",
+                    candidate_format: "candidate", quant_recipe: "recipe", group_width: 128,
+                    integer_kernel: "s_scalar_i32", snapshot: None,
+                    compute_schedule: compute::Schedule::for_threads(1),
+                    prefill_schedule: prefill.map(PrefillSchedule::new).transpose().unwrap(),
+                    input_encoding: input_encoding::reported_policy(&encoding) };
+                let mut output = Vec::new();
+                {
+                    let mut writer = CandidateWriter::new(&mut output, &provenance, 4096, 16384).unwrap();
+                    for record in [b"{\"event\":\"run_start\"}\n".as_slice(),
+                        b"{\"event\":\"doc\",\"result\":{\"fixture\":true}}\n", b"{\"event\":\"run_complete\"}\n"] {
+                        writer.write_all(record).unwrap(); writer.flush().unwrap();
+                    }
+                }
+                let text = String::from_utf8(output).unwrap();
+                assert_eq!(text.lines().count(), 3);
+                for line in text.lines() {
+                    let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                    assert_eq!(value["evidence"], "non_authoritative");
+                    assert!(value.get("compute_schedule").is_none());
+                    assert_eq!(value.get("input_encoding").is_some(), compact);
+                    if let Some(prefill) = prefill {
+                        assert_eq!(value["prefill_schedule"]["execution"], INT4_LAYER_MAJOR_PREFILL_VERSION);
+                        assert_eq!(value["prefill_schedule"]["max_batch_rows"], prefill.max_batch_rows);
+                        assert_eq!(value["prefill_schedule"]["admitted_workspace_bytes"],
+                            prefill.max_extra_scratch_bytes);
+                    } else { assert!(value.get("prefill_schedule").is_none()); }
+                }
+                for private in ["effective_seed", "prompt_digest", "request_key", "private-document", "private-snapshot"] {
+                    assert!(!text.contains(private));
+                }
+            }
         }
     }
 }
