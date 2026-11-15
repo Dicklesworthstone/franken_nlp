@@ -16,7 +16,8 @@ use crate::{
         constrained_int4::{self, Int4JsonBudget, JSON_SAMPLER_VERSION, json_sampling_workspace_bytes},
         decode::DecodeStepControl,
         portable_int8::ProjectionWork,
-        strict_int4::{Int4MemoryRequirement, Int4RunBudget, Int4Work, StrictInt4Engine, STRICT_INT4_PROFILE},
+        strict_int4::{Int4MemoryRequirement, Int4RunBudget, Int4Work, StrictInt4Engine, STRICT_INT4_PROFILE,
+            prefill::Int4PrefillLimits},
     },
     tasks::{ir::TaskBudget, sentiment::{SentimentAxis, SentimentRequest,
         sampled::{PreparedSampledSentiment, SampledSentimentError, SampledSentimentLimits,
@@ -182,7 +183,19 @@ pub struct NativeSampledSentimentBatch<'e, 'w, A: SampledSentimentBatchAdmission
 impl<'e, 'w, A: SampledSentimentBatchAdmission> NativeSampledSentimentBatch<'e, 'w, A> {
     pub fn new(compiler: SampledSentimentBatchPlanner, engine: &'e mut StrictInt4Engine<'w>,
         admission: A) -> Result<Self, BatchFault> {
+        Self::new_scheduled(compiler, engine, admission, None)
+    }
+    /// Reuse one admitted layer-major prompt workspace across the whole stream.
+    /// The caller must reserve its additional payload before constructing this
+    /// adapter. Sample addresses, task budgets and run work remain unchanged.
+    pub fn new_layer_major(compiler: SampledSentimentBatchPlanner, engine: &'e mut StrictInt4Engine<'w>,
+        admission: A, prefill: Int4PrefillLimits) -> Result<Self, BatchFault> {
+        Self::new_scheduled(compiler, engine, admission, Some(prefill))
+    }
+    fn new_scheduled(compiler: SampledSentimentBatchPlanner, engine: &'e mut StrictInt4Engine<'w>,
+        admission: A, prefill: Option<Int4PrefillLimits>) -> Result<Self, BatchFault> {
         compiler.limits.validate()?;
+        validate_prefill(prefill)?;
         constrained_int4::check_model(compiler.base_execution_identity(), engine.model_identity())
             .map_err(|_| BatchCode::Admission)?;
         if compiler.group_width() != engine.model_identity().group_width() || !clean(engine) {
@@ -190,7 +203,7 @@ impl<'e, 'w, A: SampledSentimentBatchAdmission> NativeSampledSentimentBatch<'e, 
         }
         let run = RunState::new(compiler.limits);
         let vocabulary = Arc::clone(&compiler.vocabulary);
-        Ok(Self { compiler, driver: NativeDriver { engine, vocabulary }, admission, run })
+        Ok(Self { compiler, driver: NativeDriver { engine, vocabulary, prefill }, admission, run })
     }
     pub fn remaining_model_work(&self) -> Int4Work { self.run.remaining }
     pub fn remaining_mask_visits(&self) -> u64 { self.run.remaining_masks }
@@ -249,6 +262,7 @@ impl Plan for PreparedSampledSentiment {
     }
 }
 trait Driver<P: Plan> {
+    fn prefill(&self) -> Option<Int4PrefillLimits> { None }
     fn clean(&self) -> bool;
     fn capacity(&self) -> usize;
     fn group_width(&self) -> usize;
@@ -256,9 +270,19 @@ trait Driver<P: Plan> {
     fn execute<C: DecodeStepControl>(&mut self, plan: &P, identity: &ExecutionIdentity,
         budget: Int4JsonBudget, sampler_bytes: u64, control: &mut C) -> Result<SampledSentimentRun, BatchItemFailure>;
 }
-struct NativeDriver<'e, 'w> { engine: &'e mut StrictInt4Engine<'w>, vocabulary: Arc<SampledSentimentVocabulary> }
+struct NativeDriver<'e, 'w> {
+    engine: &'e mut StrictInt4Engine<'w>, vocabulary: Arc<SampledSentimentVocabulary>,
+    prefill: Option<Int4PrefillLimits>,
+}
+fn validate_prefill(prefill: Option<Int4PrefillLimits>) -> Result<(), BatchFault> {
+    if let Some(limits) = prefill {
+        limits.validate().map_err(|_| BatchCode::InvalidLimits)?;
+    }
+    Ok(())
+}
 fn clean(engine: &StrictInt4Engine<'_>) -> bool { !engine.is_poisoned() && engine.kv_cache().all_slots_have_len(0) }
 impl Driver<PreparedSampledSentiment> for NativeDriver<'_, '_> {
+    fn prefill(&self) -> Option<Int4PrefillLimits> { self.prefill }
     fn clean(&self) -> bool { clean(self.engine) }
     fn capacity(&self) -> usize { self.engine.kv_cache().capacity_positions() }
     fn group_width(&self) -> usize { self.engine.model_identity().group_width() }
@@ -268,13 +292,18 @@ impl Driver<PreparedSampledSentiment> for NativeDriver<'_, '_> {
     }
     fn execute<C: DecodeStepControl>(&mut self, plan: &PreparedSampledSentiment, identity: &ExecutionIdentity,
         budget: Int4JsonBudget, sampler_bytes: u64, control: &mut C) -> Result<SampledSentimentRun, BatchItemFailure> {
-        plan.execute_with_control(self.engine, identity, &self.vocabulary, budget, sampler_bytes, control)
-            .map_err(task_failure)
+        match self.prefill {
+            Some(prefill) => plan.execute_layer_major_with_control(self.engine, identity, &self.vocabulary,
+                budget, sampler_bytes, prefill, control),
+            None => plan.execute_with_control(self.engine, identity, &self.vocabulary,
+                budget, sampler_bytes, control),
+        }.map_err(task_failure)
     }
 }
 
 fn preflight<P: Plan, D: Driver<P>>(plan: &P, driver: &D, limits: SampledSentimentBatchLimits)
     -> Result<(u64, u64), BatchItemFailure> {
+    validate_prefill(driver.prefill()).map_err(BatchItemFailure::fatal)?;
     if !driver.clean() { return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)); }
     let facts = plan.facts();
     if facts.group_width != driver.group_width() || facts.identity.task_spec != "sentiment-v1"

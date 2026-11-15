@@ -35,7 +35,21 @@ impl NlpEngine {
         planner: SampledSentimentBatchPlanner, limits: CorpusLimits, kernel: PackedInt4Kernel,
         reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        self.run_int4_sampled_sentiment_corpus(model, planner, limits, kernel, None, reader, writer, cancellation)
+        self.run_int4_sampled_sentiment_corpus(model, planner, limits, kernel, None, None, reader, writer, cancellation)
+    }
+
+    /// Execute each fresh sample prompt in bounded causal layer-major morsels.
+    /// One resident engine and one admitted prompt workspace serve the complete
+    /// stream; input order, item seeds and aggregate work allowances are unchanged.
+    /// Generation remains sequential, and success is published after native drain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int4_sampled_sentiment_layer_major<R, W>(&self, model: &ResidentInt4,
+        planner: SampledSentimentBatchPlanner, limits: CorpusLimits, kernel: PackedInt4Kernel,
+        prefill: Int4PrefillLimits, reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        self.run_int4_sampled_sentiment_corpus(model, planner, limits, kernel,
+            None, Some(prefill), reader, writer, cancellation)
     }
 
     /// Preserve the identical item semantics with one persistent numerical
@@ -49,15 +63,19 @@ impl NlpEngine {
         -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
         self.run_int4_sampled_sentiment_corpus(model, planner, limits, kernel,
-            Some(compute_threads), reader, writer, cancellation)
+            Some(compute_threads), None, reader, writer, cancellation)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn run_int4_sampled_sentiment_corpus<R, W>(&self, model: &ResidentInt4,
         planner: SampledSentimentBatchPlanner, limits: CorpusLimits, kernel: PackedInt4Kernel,
-        compute_threads: Option<usize>, reader: R, writer: W, cancellation: CancellationToken)
+        compute_threads: Option<usize>, prefill: Option<Int4PrefillLimits>,
+        reader: R, writer: W, cancellation: CancellationToken)
         -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        if compute_threads.is_some() && prefill.is_some() {
+            return Err(HostedError::Limits("sampled corpus prefill and compute teams are separate schedules"));
+        }
         match compute_threads {
             Some(width) => dispatch::preflight_int4_team(self, limits.native.run, width)?,
             None => dispatch::preflight(self, limits.native.run)?,
@@ -69,8 +87,8 @@ impl NlpEngine {
             return Err(HostedError::ModelIdentity);
         }
         let work = planner.limits();
-        let required = requirements(model.model_identity().group_width(), work, planner.task_budget(),
-            planner.preparation_requirement_bytes(), limits)?;
+        let required = scheduled_requirements(model.model_identity().group_width(), work, planner.task_budget(),
+            planner.preparation_requirement_bytes(), limits, prefill)?;
         let team_scratch = compute_threads.map(|width|
             int4_task_team_workspace_bytes(width, model.model_identity().group_width()))
             .transpose()?.unwrap_or(0);
@@ -97,13 +115,19 @@ impl NlpEngine {
                 context: limits.native.context_tokens, kv_bytes: required.native.kv_bytes,
                 work, preparation_bytes: limits.preparation_reserve_bytes,
                 output_bytes: limits.transport.max_output_line_bytes as u64 };
-            let result = {
-                let mut processor = NativeSampledSentimentBatch::new(planner, &mut engine.value, admission)
-                    .map_err(HostedError::BatchSetup)?;
-                stream::run_ndjson(&mut input.value.reader, &mut input.value.writer,
-                    &mut processor, limits.transport, control).map_err(HostedError::Batch)
+            let completion = {
+                let mut processor = match prefill {
+                    None => NativeSampledSentimentBatch::new(planner, &mut engine.value, admission),
+                    Some(prefill) => NativeSampledSentimentBatch::new_layer_major(
+                        planner, &mut engine.value, admission, prefill),
+                }.map_err(HostedError::BatchSetup)?;
+                stream::deferred::run_ndjson_deferred(&mut input.value.reader, &mut input.value.writer,
+                    &mut processor, limits.transport, control).map_err(HostedError::Batch)?
             };
+            // No final success until the native allocation is physically gone.
+            // Retain the charged IO and original control through publication.
             drop(engine);
+            let result = completion.publish(&mut input.value.writer, control).map_err(HostedError::Batch);
             drop(input);
             drop(lease);
             result
@@ -161,6 +185,16 @@ fn requirements(width: usize, work: SampledSentimentBatchLimits, task: TaskBudge
     let workspace_bytes = sum(&[native.rope_bytes, native.scratch_payload_bound,
         limits.native.allocator_reserve_bytes, sampler])?;
     Ok(Requirements { native, workspace_bytes, input_bytes })
+}
+
+/// Price the full declared prompt morsel once, even for a shorter document.
+/// Native KV, result claims and transport/preparation owners are unchanged.
+fn scheduled_requirements(width: usize, work: SampledSentimentBatchLimits, task: TaskBudget,
+    preparation_bytes: u64, limits: CorpusLimits, prefill: Option<Int4PrefillLimits>)
+    -> Result<Requirements, HostedError> {
+    let mut required = requirements(width, work, task, preparation_bytes, limits)?;
+    required.workspace_bytes = super::super::prefill::with_extra_workspace(required.workspace_bytes, prefill)?;
+    Ok(required)
 }
 
 struct Admission<'a> {

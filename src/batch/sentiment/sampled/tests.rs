@@ -96,8 +96,11 @@ impl SampledSentimentBatchAdmission for Admission {
         Ok((identity, Guard(Rc::clone(&self.probe))))
     }
 }
-struct Engine { probe: Rc<Probe>, clean: bool, capacity: usize, masks: u64 }
+struct Engine {
+    probe: Rc<Probe>, clean: bool, capacity: usize, masks: u64, prefill: Option<Int4PrefillLimits>,
+}
 impl Driver<FixturePlan> for Engine {
+    fn prefill(&self) -> Option<Int4PrefillLimits> { self.prefill }
     fn clean(&self) -> bool { self.clean }
     fn capacity(&self) -> usize { self.capacity }
     fn group_width(&self) -> usize { 32 }
@@ -138,7 +141,7 @@ impl Driver<FixturePlan> for Engine {
     }
 }
 fn host(probe: &Rc<Probe>, total: u64) -> (Engine, Admission, RunState) {
-    (Engine { probe: Rc::clone(probe), clean: true, capacity: 32, masks: 5 },
+    (Engine { probe: Rc::clone(probe), clean: true, capacity: 32, masks: 5, prefill: None },
         Admission { probe: Rc::clone(probe), refuse: false, wrong_identity: false, cancel_as_rejection: false },
         RunState::new(limits(total)))
 }
@@ -441,4 +444,59 @@ fn widened_record_budgets_reject_before_admission_without_spending_work_or_break
     assert_eq!(events.iter().filter(|event| event["error"]["code"] == "planning").count(), 5);
     assert_eq!(events.last().unwrap()["event"], "run_complete");
     assert!(!std::str::from_utf8(&sink.bytes).unwrap().contains("PRIVATE_BUDGET_DOCUMENT"));
+}
+
+#[test]
+fn invalid_prefill_schedules_stop_before_admission_and_native_work() {
+    let required = Int4PrefillLimits::required_extra_scratch_bytes(4).unwrap();
+    for prefill in [
+        Int4PrefillLimits { max_batch_rows: 0, max_extra_scratch_bytes: u64::MAX },
+        Int4PrefillLimits { max_batch_rows: 65, max_extra_scratch_bytes: u64::MAX },
+        Int4PrefillLimits { max_batch_rows: usize::MAX, max_extra_scratch_bytes: u64::MAX },
+        Int4PrefillLimits { max_batch_rows: 4, max_extra_scratch_bytes: required - 1 },
+    ] {
+        let probe = Rc::new(Probe::default()); let mut processor = Harness::new(&probe, 1);
+        processor.driver.prefill = Some(prefill);
+        let mut reader = Cursor::new(b"{\"id\":\"one\",\"text\":\"ok\"}\n");
+        let mut sink = Sink { bytes: Vec::new(), probe: Rc::clone(&probe),
+            delivering_result: false, fail_result: false };
+        let error = run_ndjson(&mut reader, &mut sink, &mut processor, transport(), &mut Continue).unwrap_err();
+        assert_eq!(error.fault.code, BatchCode::InvalidLimits);
+        assert_eq!(probe.admissions.get(), 0); assert_eq!(probe.calls.get(), 0);
+        assert_eq!(probe.drops.get(), 0); assert!(!probe.live.get());
+        assert_eq!(processor.run.state, State::Failed);
+        assert_eq!(processor.run.remaining, work(1)); assert_eq!(processor.run.remaining_masks, 5);
+        assert!(!frames(&sink.bytes).iter().any(|event|
+            event["event"] == "doc" || event["event"] == "run_complete"));
+    }
+}
+
+#[test]
+fn admitted_prefill_widths_preserve_stream_identity_and_nonrenewable_work() {
+    let prefill = |rows| Int4PrefillLimits { max_batch_rows: rows,
+        max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap() };
+    let mut expected_results = None;
+    // These private drivers exercise the actual stream accounting and
+    // schedule preflight; task/native model gates own numerical parity.
+    for schedule in [None, Some(prefill(1)), Some(prefill(4)), Some(prefill(64))] {
+        let probe = Rc::new(Probe::default()); let mut processor = Harness::new(&probe, 2);
+        processor.driver.prefill = schedule;
+        let input = b"{\"id\":\"one\",\"text\":\"ok\"}\n{\"flush\":true}\n{\"id\":\"two\",\"text\":\"ok\"}\n{\"id\":\"three\",\"text\":\"unfunded\"}\n";
+        let mut reader = Cursor::new(input);
+        let mut sink = Sink { bytes: Vec::new(), probe: Rc::clone(&probe),
+            delivering_result: false, fail_result: false };
+        let summary = run_ndjson(&mut reader, &mut sink, &mut processor, transport(), &mut Continue).unwrap();
+        assert_eq!(summary.succeeded, 2); assert_eq!(summary.failed, 1);
+        assert_eq!(summary.reserved_work, transport_work(work(2)));
+        assert_eq!(probe.admissions.get(), 2); assert_eq!(probe.calls.get(), 2);
+        assert_eq!(probe.drops.get(), 2); assert!(!probe.live.get());
+        assert_eq!(processor.run.remaining, work(0)); assert_eq!(processor.run.remaining_masks, 0);
+        let events = frames(&sink.bytes);
+        assert!(events.iter().any(|event| event["error"]["code"] == "work_limit"));
+        let results = events.iter().filter(|event| event["event"] == "doc")
+            .map(|event| event["result"].clone()).collect::<Vec<_>>();
+        assert_eq!(results.len(), 2);
+        if let Some(expected) = &expected_results { assert_eq!(&results, expected); }
+        else { expected_results = Some(results); }
+    }
 }

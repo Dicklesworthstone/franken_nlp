@@ -143,10 +143,49 @@ fn owned_planner_and_io_cross_one_physical_serial_or_team_boundary() {
     send::<SampledSentimentRun>();
     let _serial = NlpEngine::batch_int4_sampled_sentiment::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
     let _team = NlpEngine::batch_int4_sampled_sentiment_with_threads::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    let _prefill = NlpEngine::batch_int4_sampled_sentiment_layer_major::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
     for width in [0, 1, 65, usize::MAX] { assert!(int4_task_team_workspace_bytes(width, 32).is_err()); }
     for width in [2, 4, 64] {
         let worker = int4_task_team_workspace_bytes(width, 32).unwrap();
         let required = requirements(32, work_limits(32, 8), task(32), PREPARATION, corpus()).unwrap();
         assert!(sum(&[required.workspace_bytes, worker]).unwrap() > required.workspace_bytes);
     }
+}
+
+#[test]
+fn corpus_prefill_prices_the_full_declared_morsel_once_across_all_records_and_samples() {
+    for width in [1, 3, 32, 128] {
+        let base = requirements(width, work_limits(width, 1), task(width), PREPARATION, corpus()).unwrap();
+        for rows in [1, 4, 64] {
+            let extra = Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+            let prefill = Int4PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: extra };
+            for samples in [1, 8, 128] {
+                let required = scheduled_requirements(width, work_limits(width, samples),
+                    task(width), PREPARATION, corpus(), Some(prefill)).unwrap();
+                // The task prompt ceiling is 32, so a 64-row declaration also
+                // checks that short prompts cannot shrink the admission quote.
+                assert_eq!(required.native, base.native);
+                assert_eq!(required.input_bytes, base.input_bytes);
+                assert_eq!(required.workspace_bytes, base.workspace_bytes + extra);
+            }
+        }
+        assert_eq!(scheduled_requirements(width, work_limits(width, 1), task(width),
+            PREPARATION, corpus(), None).unwrap(), base);
+    }
+}
+
+#[test]
+fn corpus_prefill_refuses_invalid_rows_and_short_workspace_before_population_allocation() {
+    for rows in [0, 65, usize::MAX] {
+        let prefill = Int4PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX };
+        assert!(scheduled_requirements(32, work_limits(32, 8), task(32),
+            PREPARATION, corpus(), Some(prefill)).is_err());
+    }
+    let extra = Int4PrefillLimits::required_extra_scratch_bytes(4).unwrap();
+    assert!(scheduled_requirements(32, work_limits(32, 8), task(32), PREPARATION,
+        corpus(), Some(Int4PrefillLimits { max_batch_rows: 4, max_extra_scratch_bytes: extra - 1 })).is_err());
+    let mut short_kv = task(32);
+    short_kv.max_kv_bytes -= 1;
+    assert!(scheduled_requirements(32, work_limits(32, 8), short_kv, PREPARATION,
+        corpus(), Some(Int4PrefillLimits { max_batch_rows: 4, max_extra_scratch_bytes: extra })).is_err());
 }
