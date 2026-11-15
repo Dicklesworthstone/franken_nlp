@@ -5,6 +5,7 @@ use super::*;
 use std::sync::OnceLock;
 use crate::native_engine::constrained::{JsonDecodeError, JsonDecodeOutput, JsonWorkBudget};
 use crate::grammar::mask::MaskWorkLimits;
+use crate::tokenizer::untrusted::SafeBpeLimits;
 
 fn options() -> SampledSentimentOptions {
     SampledSentimentOptions { effective_seed: [37; 32], samples: 3, temperature_milli: 1000,
@@ -285,6 +286,7 @@ fn aggregate_mask_and_sampler_work_is_reserved_for_all_samples() {
         mask_limits: MaskWorkLimits { max_trie_node_visits: step as usize, checkpoint_interval_nodes: 1 } } };
     let sampler = json_sampling_workspace_bytes().unwrap();
     assert_eq!(prepared.preflight(&vocabulary, budget, sampler).unwrap(), one);
+    assert_eq!(prepared.complete_mask_charge(&vocabulary, budget, sampler).unwrap(), total);
     budget.json.max_total_mask_node_visits = total - 1;
     assert!(matches!(prepared.preflight(&vocabulary, budget, sampler), Err(SampledSentimentError::WorkBudget)));
     budget.json.max_total_mask_node_visits = total;
@@ -463,5 +465,71 @@ fn cancellation_inside_compact_encoding_keeps_the_original_cause_and_consumed_wo
         let mut request = request(); request.document.clone_from(&source);
         let error = planner.plan_with_control(&request, &mut DuringEncoding { calls: 0, cause }).err().unwrap();
         assert_eq!(error.cancellation(), Some(cause));
+    }
+}
+
+#[test]
+fn shared_encoding_ledger_never_refunds_failed_preparation() {
+    let planner = encoding_planner(UntrustedEncoding::SafeBpeV1(compact_limits()));
+    let mut request = request();
+    request.document = "A helpful answer made the customer feel reassured. ".repeat(12);
+    let mut measured = SafeBpeWork::default();
+    planner.plan_with_encoding_work(&request, &mut Continue, &mut measured).unwrap();
+    let exact = SafeBpeLimits { max_input_bytes: measured.input_bytes(),
+        max_output_tokens: measured.output_tokens(), max_pair_checks: measured.pair_checks(),
+        max_pair_bytes: measured.pair_bytes() };
+    let exact_planner = planner.with_input_encoding(UntrustedEncoding::SafeBpeV1(exact)).unwrap();
+    let mut work = SafeBpeWork::default();
+    let planned = exact_planner.plan_with_encoding_work(&request, &mut Continue, &mut work).unwrap();
+    assert_eq!(planned.encoding_work(), measured);
+    assert!(matches!(exact_planner.plan_with_encoding_work(&request, &mut Continue, &mut work),
+        Err(SampledSentimentError::TokenizerWork)));
+    assert_eq!(work, measured);
+    for axis in 0..4 {
+        let mut short = exact;
+        match axis { 0 => short.max_input_bytes -= 1, 1 => short.max_output_tokens -= 1,
+            2 => short.max_pair_checks -= 1, _ => short.max_pair_bytes -= 1 }
+        let planner = encoding_planner(UntrustedEncoding::SafeBpeV1(short));
+        let mut failed_work = SafeBpeWork::default();
+        assert!(matches!(planner.plan_with_encoding_work(&request, &mut Continue, &mut failed_work),
+            Err(SampledSentimentError::TokenizerWork)));
+        if axis != 0 { assert_eq!(failed_work.input_bytes(), request.document.len()); }
+        let retained = failed_work;
+        assert!(planner.plan_with_encoding_work(&request, &mut Continue, &mut failed_work).is_err());
+        assert_eq!(failed_work, retained);
+    }
+    // A successful encoding followed by context rejection is still spent.
+    request.budget.max_input_tokens = 1;
+    let mut rejected = SafeBpeWork::default();
+    assert!(matches!(exact_planner.plan_with_encoding_work(&request, &mut Continue, &mut rejected),
+        Err(SampledSentimentError::WorkBudget)));
+    assert_eq!(rejected, measured);
+    request.budget.max_input_tokens = budget().max_input_tokens;
+    assert!(exact_planner.plan_with_encoding_work(&request, &mut Continue, &mut rejected).is_err());
+    assert_eq!(rejected, measured);
+}
+
+#[test]
+fn shared_encoding_ledger_retains_work_and_original_cancellation() {
+    struct StopDuringEncoding { calls: usize, cause: DecodeCancellationKind }
+    impl DecodeStepControl for StopDuringEncoding {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.calls += 1;
+            (self.calls == 5).then_some(self.cause)
+        }
+    }
+    let planner = encoding_planner(UntrustedEncoding::SafeBpeV1(compact_limits()));
+    let mut request = request();
+    request.document = "The service was reassuring and helpful. ".repeat(48);
+    for cause in [DecodeCancellationKind::User, DecodeCancellationKind::Timeout, DecodeCancellationKind::Deadline,
+        DecodeCancellationKind::PollQuota, DecodeCancellationKind::CostBudget, DecodeCancellationKind::FailFast,
+        DecodeCancellationKind::RaceLost, DecodeCancellationKind::ParentCancelled, DecodeCancellationKind::ResourceUnavailable,
+        DecodeCancellationKind::Shutdown, DecodeCancellationKind::LinkedExit] {
+        let mut control = StopDuringEncoding { calls: 0, cause };
+        let mut work = SafeBpeWork::default();
+        let error = planner.plan_with_encoding_work(&request, &mut control, &mut work).err().unwrap();
+        assert_eq!(control.calls, 5);
+        assert_eq!(error.cancellation(), Some(cause));
+        assert_eq!(work.input_bytes(), request.document.len());
     }
 }

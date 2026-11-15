@@ -36,6 +36,93 @@ fn samples_share_one_native_capacity_and_sampler_reservation() {
 }
 
 #[test]
+fn persistent_workers_add_one_team_reserve_without_multiplying_sample_storage() {
+    for threads in [2, 3, 8, 64] {
+        let team = int4_task_team_workspace_bytes(threads, 128).unwrap();
+        assert!(team > 0);
+        let mut previous = None;
+        for samples in [1, 4, 32] {
+            let (limits, task, work) = fixture(samples);
+            let (native, scratch) = requirements(limits, task, 47, 128, work, PREPARATION).unwrap();
+            let complete_scratch = sum(&[scratch, team]).unwrap();
+            assert!(complete_scratch > scratch);
+            assert_eq!(native.kv_bytes, task.max_kv_bytes);
+            if let Some(expected) = previous { assert_eq!(complete_scratch, expected); }
+            previous = Some(complete_scratch);
+        }
+        assert!(sum(&[u64::MAX, team]).is_err());
+    }
+    for threads in [0, 1, 65, usize::MAX] {
+        assert!(int4_task_team_workspace_bytes(threads, 128).is_err());
+    }
+}
+
+#[test]
+fn sampled_plans_and_guarded_results_cross_the_one_owned_team_boundary() {
+    fn send<T: Send + 'static>() {}
+    send::<PreparedSampledSentiment>();
+    send::<Arc<SampledSentimentVocabulary>>();
+    send::<SampledSentimentRun>();
+    send::<HostedInt4TeamResult<SampledSentimentRun>>();
+    let _serial = NlpEngine::execute_int4_sampled_sentiment;
+    let _team = NlpEngine::execute_int4_sampled_sentiment_with_threads;
+    let _prefill = NlpEngine::execute_int4_sampled_sentiment_layer_major;
+}
+
+#[test]
+fn sampled_prefill_admits_declared_rows_once_even_for_a_short_prompt() {
+    for samples in [1, 4, 32] {
+        let (limits, task, work) = fixture(samples);
+        let (required, base) = requirements(limits, task, 47, 128, work, PREPARATION).unwrap();
+        for rows in [1, 4, 64] {
+            let extra = Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+            let prefill = Int4PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: extra };
+            assert_eq!(super::super::prefill::with_extra_workspace(base, Some(prefill)).unwrap(), base + extra);
+            assert_eq!(required.kv_bytes, task.max_kv_bytes);
+            assert!(super::super::prefill::with_extra_workspace(base, Some(Int4PrefillLimits {
+                max_extra_scratch_bytes: extra - 1, ..prefill })).is_err());
+        }
+    }
+}
+
+#[test]
+fn complete_masks_are_admitted_before_any_native_allocation() {
+    use crate::{native_engine::strict_int4::weights::projection_fixture,
+        tasks::sentiment::{SentimentAxis, SentimentRequest,
+            sampled::{SampledSentimentLimits, SampledSentimentOptions, SampledSentimentPlanner}}};
+    // A tiny test-only weight identity binds the real pinned planner without
+    // allocating native KV or executing any model forward.
+    let (weights, _) = projection_fixture(4);
+    let task = TaskBudget { max_input_tokens: 2048, max_output_tokens: 1024,
+        max_output_bytes: 65_536, max_grammar_states: 4096,
+        max_kv_bytes: Int4MemoryRequirement::for_context(2048, 4).unwrap().kv_bytes };
+    let options = SampledSentimentOptions { effective_seed: [17; 32], samples: 2,
+        temperature_milli: 1000, top_k: None, top_p_ppm: 1_000_000,
+        max_sample_tokens: 32, max_justification_chars: 64 };
+    let planner = SampledSentimentPlanner::for_model(weights.identity(), options, task,
+        SampledSentimentLimits::default()).unwrap();
+    let prepared = planner.plan(&SentimentRequest { document: "Helpful service.".to_owned(),
+        axes: vec![SentimentAxis::Valence, SentimentAxis::Arousal], budget: task }).unwrap();
+    let vocabulary = SampledSentimentVocabulary::pinned().unwrap();
+    let (mut limits, _, _) = fixture(1);
+    limits.native.context_tokens = 2048;
+    limits.max_model_work = prepared.planned_work();
+    limits.max_mask_node_visits = u64::MAX;
+    let (native, _) = requirements(limits, task, prepared.required_context(), 4,
+        prepared.planned_work(), prepared.preparation_requirement_bytes()).unwrap();
+    let quote = |limits: SampledSentimentHostLimits| prepared.complete_mask_charge(&vocabulary,
+        execution_budget(prepared.planned_work(), native.kv_bytes, limits), limits.max_sampler_bytes);
+    let complete = quote(limits).unwrap();
+    assert!(complete >= prepared.sample_count() as u64 * 32);
+    limits.max_mask_node_visits = complete - 1;
+    assert!(matches!(quote(limits), Err(SampledSentimentError::WorkBudget)));
+    limits.max_mask_node_visits = complete;
+    assert_eq!(quote(limits).unwrap(), complete);
+    limits.max_sampler_bytes -= 1;
+    assert!(matches!(quote(limits), Err(SampledSentimentError::WorkBudget)));
+}
+
+#[test]
 fn every_complete_model_work_axis_is_admitted_before_native_allocation() {
     let (baseline, task, work) = fixture(4);
     for axis in 0..5 {
@@ -83,36 +170,21 @@ fn task_errors_retain_cancellation_without_disclosing_nested_text() {
         JsonDecodeError::InvalidRequest("PRIVATE_DOCUMENT_OR_SEED"))));
     assert!(!format!("{error:?} {error}").contains("PRIVATE_DOCUMENT_OR_SEED"));
     assert!(error.source().is_some());
-    let error = task_error(SampledSentimentError::Cancelled(DecodeCancellationKind::ParentCancelled));
-    let HostedError::Int4(Int4HostError::SampledSentiment(error)) = error else {
-        panic!("sampled task error was flattened");
-    };
-    assert_eq!(error.cancellation(), Some(DecodeCancellationKind::ParentCancelled));
-}
-
-#[test]
-fn sampled_plans_and_guarded_results_cross_the_one_owned_team_boundary() {
-    fn send<T: Send + 'static>() {}
-    send::<PreparedSampledSentiment>();
-    send::<Arc<SampledSentimentVocabulary>>();
-    send::<HostedInt4TeamResult<SampledSentimentRun>>();
-    let _serial = NlpEngine::execute_int4_sampled_sentiment;
-    let _team = NlpEngine::execute_int4_sampled_sentiment_with_threads;
-    let _prefill = NlpEngine::execute_int4_sampled_sentiment_layer_major;
-}
-
-#[test]
-fn sampled_prefill_admits_declared_rows_once_even_for_a_short_prompt() {
-    for samples in [1, 4, 32] {
-        let (limits, task, work) = fixture(samples);
-        let (required, base) = requirements(limits, task, 47, 128, work, PREPARATION).unwrap();
-        for rows in [1, 4, 64] {
-            let extra = Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
-            let prefill = Int4PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: extra };
-            assert_eq!(super::super::prefill::with_extra_workspace(base, Some(prefill)).unwrap(), base + extra);
-            assert_eq!(required.kv_bytes, task.max_kv_bytes);
-            assert!(super::super::prefill::with_extra_workspace(base, Some(Int4PrefillLimits {
-                max_extra_scratch_bytes: extra - 1, ..prefill })).is_err());
+    for cause in [DecodeCancellationKind::User, DecodeCancellationKind::Timeout,
+        DecodeCancellationKind::Deadline, DecodeCancellationKind::PollQuota,
+        DecodeCancellationKind::CostBudget, DecodeCancellationKind::FailFast,
+        DecodeCancellationKind::RaceLost, DecodeCancellationKind::ParentCancelled,
+        DecodeCancellationKind::ResourceUnavailable, DecodeCancellationKind::Shutdown,
+        DecodeCancellationKind::LinkedExit] {
+        for inner in [SampledSentimentError::Cancelled(cause),
+            SampledSentimentError::Native(Int4JsonError::Decode(JsonDecodeError::Cancelled(cause))),
+            SampledSentimentError::Native(Int4JsonError::Native(StrictInt4Error::Cancelled(cause)))] {
+            let error = task_error(inner);
+            assert!(error.source().is_some());
+            let HostedError::Int4(Int4HostError::SampledSentiment(error)) = error else {
+                panic!("sampled task error was flattened");
+            };
+            assert_eq!(error.cancellation(), Some(cause));
         }
     }
 }

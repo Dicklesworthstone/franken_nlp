@@ -76,6 +76,8 @@ impl NlpEngine {
             prepared.required_context(), prepared.group_width(), work,
             prepared.preparation_requirement_bytes())?;
         let scratch_bytes = super::prefill::with_extra_workspace(scratch_bytes, prefill)?;
+        prepared.complete_mask_charge(&vocabulary, execution_budget(work, required.kv_bytes, limits),
+            limits.max_sampler_bytes).map_err(task_error)?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers,
             limits.preparation_reserve_bytes)?, || Ok((prepared, vocabulary)))?;
@@ -129,6 +131,8 @@ impl NlpEngine {
         let (required, scratch_bytes) = requirements(limits, prepared.task_budget(),
             prepared.required_context(), prepared.group_width(), work,
             prepared.preparation_requirement_bytes())?;
+        prepared.complete_mask_charge(&vocabulary, execution_budget(work, required.kv_bytes, limits),
+            limits.max_sampler_bytes).map_err(task_error)?;
         let memory = parallel::TaskMemory {
             required, scratch_bytes, output_bytes: prepared.max_result_bytes(),
             output_tokens: u64::from(prepared.task_budget().max_output_tokens),
@@ -148,13 +152,7 @@ fn execute_prepared(prepared: &PreparedSampledSentiment, vocabulary: &SampledSen
     engine: &mut StrictInt4Engine<'_>, limits: SampledSentimentHostLimits, kv_bytes: u64,
     work: Int4Work, prefill: Option<Int4PrefillLimits>, control: &mut RunControl)
     -> Result<SampledSentimentRun, HostedError> {
-    let budget = Int4JsonBudget {
-        native: Int4RunBudget::exact(work),
-        json: JsonWorkBudget { max_forward_positions: work.forward_positions,
-            max_projected_logits: work.projected_logits, max_kv_bytes: kv_bytes,
-            max_total_mask_node_visits: limits.max_mask_node_visits,
-            mask_limits: limits.mask_limits },
-    };
+    let budget = execution_budget(work, kv_bytes, limits);
     let run = match prefill {
         None => prepared.execute_with_control(engine, prepared.execution_identity(), vocabulary,
             budget, limits.max_sampler_bytes, control),
@@ -167,6 +165,17 @@ fn execute_prepared(prepared: &PreparedSampledSentiment, vocabulary: &SampledSen
     }
     checkpoint(control)?;
     Ok(run)
+}
+
+fn execution_budget(work: Int4Work, kv_bytes: u64, limits: SampledSentimentHostLimits)
+    -> Int4JsonBudget {
+    Int4JsonBudget {
+        native: Int4RunBudget::exact(work),
+        json: JsonWorkBudget { max_forward_positions: work.forward_positions,
+            max_projected_logits: work.projected_logits, max_kv_bytes: kv_bytes,
+            max_total_mask_node_visits: limits.max_mask_node_visits,
+            mask_limits: limits.mask_limits },
+    }
 }
 
 fn task_error(error: SampledSentimentError) -> HostedError {

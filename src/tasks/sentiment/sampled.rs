@@ -196,6 +196,14 @@ impl SampledSentimentPlanner {
         constrained_int4::check_model(&identity, model)?;
         Ok(Self { compiler, identity, group_width: model.group_width(), options, ceiling, limits })
     }
+    /// Construct a model-bound planner with an explicit input policy. The
+    /// original constructor remains byte-default and identity compatible.
+    pub fn for_model_with_encoding(model: &Int4ModelIdentity, options: SampledSentimentOptions,
+        ceiling: TaskBudget, limits: SampledSentimentLimits, encoding: UntrustedEncoding)
+        -> Result<Self, SampledSentimentError> {
+        encoding.validate().map_err(|_| SampledSentimentError::WorkBudget)?;
+        Self::for_model(model, options, ceiling, limits)?.with_input_encoding(encoding)
+    }
     /// Select a bounded, lossless document encoding once for the entire
     /// axis-by-sample bundle. The encoded document is reused, while each
     /// independent native prompt still pays its full forward cost. Compact
@@ -213,6 +221,12 @@ impl SampledSentimentPlanner {
     }
     pub fn input_encoding(&self) -> &UntrustedEncoding { &self.compiler.input_encoding }
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
+    pub fn group_width(&self) -> usize { self.group_width }
+    pub fn task_budget(&self) -> TaskBudget { self.ceiling }
+    pub fn limits(&self) -> SampledSentimentLimits { self.limits }
+    pub fn encoding_workspace_bytes(&self) -> Result<u64, SampledSentimentError> {
+        self.compiler.encoding_workspace_bytes()
+    }
     pub fn plan(&self, request: &SentimentRequest) -> Result<PreparedSampledSentiment, SampledSentimentError> {
         self.plan_with_control(request, &mut Continue)
     }
@@ -220,6 +234,15 @@ impl SampledSentimentPlanner {
         -> Result<PreparedSampledSentiment, SampledSentimentError> {
         compile_request(&self.compiler, &self.identity, self.group_width, &self.options,
             self.ceiling, self.limits, request, control)
+    }
+    /// Composition boundary for callers retaining one tokenizer allowance
+    /// across repeated preparation attempts. Failed/cancelled work is retained
+    /// in `work`; no sample or axis creates another encoding allowance.
+    pub fn plan_with_encoding_work<C: DecodeStepControl>(&self, request: &SentimentRequest,
+        control: &mut C, work: &mut SafeBpeWork)
+        -> Result<PreparedSampledSentiment, SampledSentimentError> {
+        compile_request_with_work(&self.compiler, &self.identity, self.group_width, &self.options,
+            self.ceiling, self.limits, request, control, work)
     }
 }
 
@@ -249,6 +272,15 @@ impl PreparedSampledSentiment {
     /// Declared payload reserve, not measured RSS. Includes pinned compiler/
     /// vocabulary construction allowance and simultaneous result serialization.
     pub fn preparation_requirement_bytes(&self) -> u64 { self.preparation_bytes }
+
+    /// Complete, checked mask allowance for one axis-by-sample bundle. Corpus
+    /// owners debit this bound before native execution and never refund failed
+    /// attempts. The same preflight is used by the actual native execution.
+    pub fn complete_mask_charge(&self, vocabulary: &SampledSentimentVocabulary,
+        budget: Int4JsonBudget, max_sampler_bytes: u64) -> Result<u64, SampledSentimentError> {
+        self.preflight(vocabulary, budget, max_sampler_bytes)?.checked_mul(self.sample_count() as u64)
+            .ok_or(SampledSentimentError::WorkBudget)
+    }
 
     #[allow(clippy::too_many_arguments)]
     pub fn execute_with_control<C: DecodeStepControl>(&self, engine: &mut StrictInt4Engine<'_>,
@@ -564,7 +596,17 @@ impl Compiler {
 fn compile_request<C: DecodeStepControl>(compiler: &Compiler, identity: &ExecutionIdentity, group_width: usize,
     options: &SampledSentimentOptions, ceiling: TaskBudget, limits: SampledSentimentLimits,
     request: &SentimentRequest, control: &mut C) -> Result<PreparedSampledSentiment, SampledSentimentError> {
+    compile_request_with_work(compiler, identity, group_width, options, ceiling, limits,
+        request, control, &mut SafeBpeWork::default())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_request_with_work<C: DecodeStepControl>(compiler: &Compiler, identity: &ExecutionIdentity, group_width: usize,
+    options: &SampledSentimentOptions, ceiling: TaskBudget, limits: SampledSentimentLimits,
+    request: &SentimentRequest, control: &mut C, encoding_work: &mut SafeBpeWork)
+    -> Result<PreparedSampledSentiment, SampledSentimentError> {
     checkpoint(control)?; options.validate()?; limits.validate()?;
+    let encoding_workspace = compiler.encoding_workspace_bytes()?;
     request.budget.validate().map_err(|_| SampledSentimentError::Limits)?;
     if request.document.is_empty() || request.document.len() > limits.max_input_bytes
         || request.axes.is_empty() || request.axes.len() > SentimentAxis::ALL.len()
@@ -578,15 +620,15 @@ fn compile_request<C: DecodeStepControl>(compiler: &Compiler, identity: &Executi
     let generations = ordered.len().checked_mul(options.samples).ok_or(SampledSentimentError::WorkBudget)?;
     let output_tokens = generations.checked_mul(options.max_sample_tokens).ok_or(SampledSentimentError::WorkBudget)?;
     if output_tokens as u64 > u64::from(request.budget.max_output_tokens) { return Err(SampledSentimentError::WorkBudget); }
-    let encoding_workspace = compiler.encoding_workspace_bytes()?;
-    let mut encoding_work = SafeBpeWork::default();
-    // The default route keeps its cheap byte-count refusal before encoding.
-    // Compact geometry must use the actual bounded tokenization, never the
-    // source byte count. Encode once, before composing any independent axis.
+    // Compact preparation must first establish the actual complete source
+    // token count. The byte policy keeps its original preallocation refusal.
+    // One encoding is reused across axes and samples; its ledger also survives
+    // a later context, grammar or admission failure.
+    let before_encoding = *encoding_work;
     let compact_document = match &compiler.input_encoding {
         UntrustedEncoding::ByteFallback => None,
         UntrustedEncoding::SafeBpeV1(_) => Some(compiler.encode_document(
-            request.document.as_bytes(), &mut encoding_work, control)?),
+            request.document.as_bytes(), encoding_work, control)?),
     };
     let source_tokens = compact_document.as_ref().map_or(request.document.len(), |source| source.ids().len());
     let mut executed_prompt_tokens = 0_usize;
@@ -627,7 +669,7 @@ fn compile_request<C: DecodeStepControl>(compiler: &Compiler, identity: &Executi
     checkpoint(control)?;
     let document = match compact_document {
         Some(document) => document,
-        None => compiler.encode_document(request.document.as_bytes(), &mut encoding_work, control)?,
+        None => compiler.encode_document(request.document.as_bytes(), encoding_work, control)?,
     };
     checkpoint(control)?;
     let context_identity = PlanContext::new(identity, ceiling).map_err(|_| SampledSentimentError::Identity)?;
@@ -670,7 +712,8 @@ fn compile_request<C: DecodeStepControl>(compiler: &Compiler, identity: &Executi
     Ok(PreparedSampledSentiment { axes, program, options: options.clone(),
         decode: compiler.decode.clone(), controls: compiler.controls.ids().clone(), identity: sealed,
         group_width, work, budget: request.budget, context, max_result_bytes, preparation_bytes,
-        input_encoding: compiler.input_encoding.clone(), encoding_work })
+        input_encoding: compiler.input_encoding.clone(),
+        encoding_work: encoding_work.checked_sub(before_encoding).ok_or(SampledSentimentError::Accounting)? })
 }
 
 fn unbound_identity(compiler: &Compiler) -> ExecutionIdentity {
