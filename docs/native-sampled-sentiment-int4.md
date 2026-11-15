@@ -46,10 +46,62 @@ No command above downloads weights. Memory requirements depend on context,
 group width and source/snapshot preparation; insufficient admission is refused.
 
 The positional input `-` reads stdin. The complete original document bytes are preserved by
-the control-excluding byte encoder. The source must fit a single native context
+the selected control-excluding encoder. Byte fallback remains the default.
+The source must fit a single native context
 alongside the axis prompt and generated tokens. Increase the explicitly
 admitted context for larger documents; this route does not chunk or truncate.
 Prompt-injection resistance and explanation quality require empirical tests.
+
+## Compact input and persistent CPU workers
+
+The explicit options can be used together with either pinned source conversion
+or a digest-pinned snapshot:
+
+```sh
+fnlp candidate source-int4 sentiment-sampled sentiment-request.json \
+  --snapshot /path/to/local-int4-snapshot \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --memory-mib 8192 \
+  --seed 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --samples 4 \
+  --input-encoding safe-bpe-v1 \
+  --compute-threads 4
+```
+
+`MODEL_CONTENT_SHA256` must come from the trusted conversion record, independently
+of the snapshot being read. These options select candidate execution; they do
+not certify model quality or performance.
+
+`--input-encoding safe-bpe-v1` uses the existing bounded BPE encoder for the
+document. It preserves exact source bytes, including Unicode, whitespace and
+marker-shaped text, while excluding every template-control token. The document
+is encoded once and its token sequence is reused across all axes and samples.
+Actual token counts govern context admission, and every independent sample
+still pays for its complete model prompt. There is no truncation, retry with a
+renewed tokenizer budget, or implicit byte fallback when encoding is exhausted.
+
+The complete encoding policy, including its limits, is bound to the template
+and sampled request identity. Compact tokenization can change the generated
+scores and explanations. Choosing byte fallback again restores the original
+byte-policy identity. The optional top-level `input_encoding` field records the
+compact policy; byte-default responses retain their existing shape.
+
+`--compute-threads N` selects the coordinator plus persistent numerical row
+workers, with an allowed range of 1–64. One means serial execution. Larger
+widths use one supervised team for the whole axis-by-sample bundle, including
+all decoder projections and output heads. Each sample still starts with empty
+logical KV and retains its original semantic seed address; worker count does
+not become part of the semantic request identity. The optional top-level
+`compute` receipt reports the actual physical schedule. The runtime has one
+additional thread, and unsupported or over-budget widths are refused before
+private input/model IO rather than silently narrowed.
+
+The planner exposes `with_input_encoding`, `input_encoding` and
+`encoding_work` for embedders; the hosted adapter exposes
+`execute_int4_sampled_sentiment_with_threads`. Encoder workspace, worker
+scratch, native state and complete result ownership are included in admission.
+Same-recipe serial/team replay is an explicit model-present gate, not an
+assumed result of source inspection.
 
 ## Sampling and complete results
 
@@ -106,6 +158,10 @@ The seed and document-dependent identity hashes are omitted from normal output.
 | `--preparation-mib` | 1024; caller preparation and transferred host preparation are separately admitted |
 | `--mask-step-node-visits` | 2000000 trie visits per generated step |
 | `--max-mask-node-visits` | 32000000000 across the whole bundle |
+| `--input-encoding` | `byte-fallback`; `safe-bpe-v1` is an explicit alternative |
+| `--max-tokenizer-pair-checks` | 4194304 for one complete source encoding; compact mode only |
+| `--max-tokenizer-pair-bytes` | 67108864 examined bytes for that same encoding; compact mode only |
+| `--compute-threads` | 1; explicit coordinator-plus-worker width 1–64 |
 
 All five native-work flags—`--max-forward-positions`,
 `--max-projected-logits`, `--max-attention-pairs`, `--max-dot-products` and
@@ -124,16 +180,16 @@ failure during delivery can still leave partially written bytes and a nonzero
 exit. Consumers must require successful completion.
 
 Invalid CLI settings are refused before input or model access. Resource and
-whole-schedule admission failures use exit 9; exhausted execution/output/mask
+whole-schedule admission failures use exit 9; exhausted tokenizer/execution/output/mask
 budgets use exit 5; cancellation uses the stable cancellation taxonomy. An
 invalid completed sample or no legal completion uses structured no-result exit
 10. Internal accounting failures remain exit 1. Any failed sample withholds the
 entire semantic bundle, including earlier successful samples.
 
 This route accepts the scalar or explicitly selected supported packed kernel,
-with serial scheduling and byte input encoding. It rejects text-generation
-processors, stops, token biases, logprobs, prompt chunk schedules and compute
-teams. Focus-area presets, sampled corpus/durable jobs, statistical intervals
+with serial scheduling and byte input encoding as defaults. It rejects text-generation
+processors, stops, token biases, logprobs and prompt chunk schedules.
+Focus-area presets, sampled corpus/durable jobs, statistical intervals
 and automatic default selection are outside this implementation slice.
 
 ## Verification status
@@ -144,6 +200,14 @@ causes, complete bundle admission, Unicode explanation lengths, independent
 sample validation, aggregate statistics, CLI rejection before IO and stable
 failure categories. Source reviews, nonwriting Rust syntax parsing and diff
 hygiene were performed. These are not executed test evidence.
+
+Additional regressions cover compact Unicode/control-marker round trips, exact
+tokenizer limits, complete repeated-prompt accounting, policy-bound identities,
+workspace admission before IO, all cancellation causes inside encoding,
+stable default response bytes, bounded physical receipts and publication
+deadlines. An ignored controller-only native fixture compares complete seeded
+results at serial, two-thread and four-thread widths within each encoding
+recipe, then checks width/memory refusal, cancellation and physical drain.
 
 Rust compilation, executable fixtures, production DSR qualification, real-model
 replay/cancellation and human-label quality evaluation remain **UNRUN**. The

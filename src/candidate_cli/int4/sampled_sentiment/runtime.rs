@@ -37,6 +37,7 @@ fn task_failure(error: SampledSentimentError) -> Failure {
     if let Some(cause) = error.cancellation() { return cancelled(cause); }
     use SampledSentimentError::*;
     let (exit, code) = match error {
+        TokenizerWork => (ErrorCode::BudgetOrTimeout, "sampled_sentiment_encoding_budget"),
         Limits | WorkBudget | Allocation
             | Native(Int4JsonError::Decode(JsonDecodeError::AllocationRefused))
             | Native(Int4JsonError::Native(StrictInt4Error::Context
@@ -101,6 +102,7 @@ pub(super) fn execute(args: Int4Args, command: SampledArgs, _admitted: Int4Limit
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
     let options = command.options(&args)?;
+    let encoding = args.input_encoding.policy(args.max_input_bytes, limits.max_prompt_tokens)?;
     let engine = NlpEngine::builder().resource_config(compute::resource_config(limits))
         .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
@@ -114,11 +116,10 @@ pub(super) fn execute(args: Int4Args, command: SampledArgs, _admitted: Int4Limit
     let mut request = parse_request(&text,
         command.budget(&args, limits, SentimentAxis::ALL.len())?, args.max_input_bytes)?;
     request.budget = command.budget(&args, limits, request.axes.len())?;
-    // Byte encoding cannot fit a source longer than the complete prompt cap.
-    // Refuse this obvious no-result before touching model weights.
-    if request.document.len() > limits.max_prompt_tokens {
-        return Err(admission_failure(CandidateError::Planning));
-    }
+    // The byte route has an exact one-byte/one-token lower bound. Compact
+    // input must instead be judged by its actual bounded tokenizer result.
+    admit_source_bytes(&encoding, request.document.len(), limits.max_prompt_tokens)
+        .map_err(admission_failure)?;
     let samples = request.axes.len().checked_mul(command.samples).ok_or(CandidateError::Arguments)?;
     drop(text);
     remaining()?;
@@ -127,12 +128,14 @@ pub(super) fn execute(args: Int4Args, command: SampledArgs, _admitted: Int4Limit
         remaining()?, cancellation.clone(), host_failure)?;
     remaining()?;
     let planner = SampledSentimentPlanner::for_model(model.model_identity(), options,
-        request.budget, command.task_limits(&args)).map_err(task_failure)?;
+        request.budget, command.task_limits(&args)).map_err(task_failure)?
+        .with_input_encoding(encoding.clone()).map_err(task_failure)?;
     let prepared = planner.plan_with_control(&request, &mut DeadlineControl { started, deadline })
         .map_err(task_failure)?;
     command.admit_plan(prepared.required_context(), args.context_tokens, prepared.planned_work())
         .map_err(admission_failure)?;
     if prepared.sample_count() != samples || prepared.group_width() != args.group_width
+        || prepared.input_encoding() != &encoding
         || prepared.preparation_requirement_bytes() > limits.preparation_bytes {
         return Err(admission_failure(CandidateError::Planning));
     }
@@ -159,8 +162,14 @@ pub(super) fn execute(args: Int4Args, command: SampledArgs, _admitted: Int4Limit
         max_sampler_bytes: json_sampling_workspace_bytes().map_err(|_| CandidateError::Arguments)?,
         mask_limits: command.masks(), max_mask_node_visits: command.max_mask_node_visits,
     };
-    let result = engine.execute_int4_sampled_sentiment(&model, prepared, vocabulary,
-        host, limits.kernel, cancellation).map_err(host_failure)?;
+    let result = if limits.compute.threads > 1 {
+        engine.execute_int4_sampled_sentiment_with_threads(&model, prepared, vocabulary,
+            host, limits.kernel, limits.compute.threads, cancellation)
+            .map(compute::Completion::Team)
+    } else {
+        engine.execute_int4_sampled_sentiment(&model, prepared, vocabulary,
+            host, limits.kernel, cancellation).map(compute::Completion::serial)
+    }.map_err(host_failure)?;
     let used = result.result().model_work;
     if result.result().group_width != args.group_width
         || used.forward_positions > expected_work.forward_positions
@@ -180,8 +189,23 @@ pub(super) fn execute(args: Int4Args, command: SampledArgs, _admitted: Int4Limit
         quant_recipe: &identity.quant_recipe, group_width: args.group_width,
         integer_kernel: limits.kernel.kind().id(), snapshot,
     };
-    publish_checked(&Response { provenance: &provenance, output: result.result() },
+    publish_checked(&input_encoding::Response {
+        response: &compute::Response {
+            response: &Response { provenance: &provenance, output: result.result() },
+            compute: result.compute(),
+        },
+        input_encoding: input_encoding::reported_policy(&encoding),
+    },
         limits.result_bytes + 4096, output, &|| remaining().map(|_| ()))?;
+    Ok(())
+}
+
+fn admit_source_bytes(encoding: &crate::tokenizer::untrusted::UntrustedEncoding,
+    input_bytes: usize, max_prompt_tokens: usize) -> Result<(), CandidateError> {
+    if matches!(encoding, crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback)
+        && input_bytes > max_prompt_tokens {
+        return Err(CandidateError::Planning);
+    }
     Ok(())
 }
 

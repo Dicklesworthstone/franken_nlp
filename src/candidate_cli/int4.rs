@@ -213,7 +213,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(classify_map::threaded_definition())
         .subcommand(classify_map::corpus::definition())
         .subcommand(compute::definition(input_encoding::definition(sentiment::definition())))
-        .subcommand(sampled_sentiment::definition())
+        .subcommand(compute::definition(input_encoding::definition(sampled_sentiment::definition())))
         .subcommand(sentiment_map::threaded_definition())
         .subcommand(sentiment_map::corpus::definition())
         .subcommand(sentiment_map::job::definition())
@@ -384,14 +384,14 @@ impl Int4Command {
             _ => return Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source-int4 task refused")),
         };
         let mut args = Int4Args::from_arg_matches(matches)?;
-        if matches!(name, "generate" | "chat" | "classify" | "classify-map" | "classify-corpus" | "sentiment" | "sentiment-map" | "sentiment-corpus" | "judge" | "faithfulness-map" | "faithfulness-corpus" | "extract" | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch"
+        if matches!(name, "generate" | "chat" | "classify" | "classify-map" | "classify-corpus" | "sentiment" | "sentiment-sampled" | "sentiment-map" | "sentiment-corpus" | "judge" | "faithfulness-map" | "faithfulness-corpus" | "extract" | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch"
             | "redact" | "redact-document" | "redact-corpus" | "resolve" | "resolve-corpus"
             | "extract-batch" | "ner-batch" | "keyphrases-batch" | "summarize-batch" | "answer-batch"
             | "ner-map" | "keyphrases-map" | "summarize-map" | "answer-map"
             | "ner-corpus" | "keyphrases-corpus" | "summarize-corpus" | "answer-corpus") {
             args.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
         }
-        if matches!(name, "generate" | "chat" | "classify" | "sentiment" | "judge" | "extract"
+        if matches!(name, "generate" | "chat" | "classify" | "sentiment" | "sentiment-sampled" | "judge" | "extract"
             | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch" | "extract-batch"
             | "ner-batch" | "keyphrases-batch" | "summarize-batch" | "answer-batch"
             | "classify-map" | "classify-corpus" | "sentiment-map" | "sentiment-corpus" | "extract-map" | "extract-corpus"

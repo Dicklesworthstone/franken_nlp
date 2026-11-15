@@ -56,7 +56,7 @@ pub(super) struct SampledArgs {
 pub(super) fn definition() -> clap::Command {
     let mut command = Int4Args::augment_args(clap::Command::new("sentiment-sampled")
         .about("Generate independently sampled affect scores and explanations")
-        .long_about("For each requested valence, arousal, dominance or approach axis, generate --samples independent addressed JSON scores in [-100,100] with bounded explanations. --seed is required. Every generation is constrained and independently validated; one failure returns no bundle. Results retain all samples and descriptive aggregates, not calibrated confidence or psychological measurements. Input is {document,axes?}; omitted axes selects all four. The complete prompt is preserved with control-free byte encoding. Work, masks and deadlines are shared across the whole bundle. Uses explicitly selected local sources or a digest-pinned snapshot. This candidate has no quality certification, sampling of distribution-mode labels, parse-repair retry, thinking, tools, cohorts or prompt schedule override."))
+        .long_about("For each requested valence, arousal, dominance or approach axis, generate --samples independent addressed JSON scores in [-100,100] with bounded explanations. --seed is required. Every generation is constrained and independently validated; one failure returns no bundle. Results retain all samples and descriptive aggregates, not calibrated confidence or psychological measurements. Input is {document,axes?}; omitted axes selects all four. Byte fallback remains the default. --input-encoding safe-bpe-v1 preserves the complete document bytes while excluding template controls and compacting ordinary text under one bounded encoding allowance; that token sequence may change model output. --compute-threads 2..64 uses one persistent numerical row team across every axis and independent sample; fresh logical KV and seed addressing remain unchanged. Encoder and worker memory are admitted before private IO. Work, masks and deadlines are shared across the whole bundle. Uses explicitly selected local sources or a digest-pinned snapshot. This candidate has no quality or speed certification, sampling of distribution-mode labels, parse-repair retry, thinking, tools, cohorts or prompt schedule override."))
         .mut_arg("input", |arg| arg.help("Bounded sentiment JSON object; '-' reads stdin"))
         .mut_arg("seed", |arg| arg.required(true))
         .mut_arg("max_new_tokens", |arg| arg.default_value("256")
@@ -104,8 +104,7 @@ impl SampledArgs {
             || !(1..=16 * 1024 * 1024).contains(&self.max_forward_positions)
             || self.max_projected_logits == 0 || self.max_attention_pairs == 0
             || self.max_dot_products == 0 || self.max_multiply_accumulates == 0
-            || args.prefill()?.is_some() || args.compute.threads() != 1
-            || !args.input_encoding.is_default() || args.logprobs || args.max_output_bytes != 65_536 {
+            || args.prefill()?.is_some() || args.logprobs || args.max_output_bytes != 65_536 {
             return Err(CandidateError::Arguments);
         }
         // Defend internal construction as well as the parser. Sampling is the
@@ -122,6 +121,8 @@ impl SampledArgs {
             self.max_sample_json_bytes as u64 * 16])?;
         let mut limits = args.validate_storage(self.max_result_bytes, total_tokens,
             args.context_tokens - args.max_new_tokens + 1, sampler, extra)?;
+        // Common storage admission includes the declared encoder workspace and
+        // numerical team at the complete execution peak, before any private IO.
         // Caller preparation remains charged while the host owns the sealed
         // plans, vocabulary and output. These are separate simultaneous owners.
         limits.minimum_memory_bytes = sum(&[limits.minimum_memory_bytes, limits.preparation_bytes])?;
