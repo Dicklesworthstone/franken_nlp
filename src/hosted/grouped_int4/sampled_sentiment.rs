@@ -8,6 +8,9 @@ mod corpus;
 #[cfg(all(feature = "metadata-store", target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod job;
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub use job::{SampledSentimentJobRequirements, int4_sampled_sentiment_job_requirements};
 
 use super::*;
 use crate::{

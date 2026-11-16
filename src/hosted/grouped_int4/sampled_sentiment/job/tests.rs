@@ -93,13 +93,16 @@ fn retained_replay_removes_only_population_copies_and_keeps_sampler_native_and_p
 
 #[test]
 fn compact_workspace_is_in_the_planner_quote_and_does_not_renew_per_sample_or_attempt() {
-    use crate::batch::sentiment::sampled::sampled_sentiment_batch_preparation_bytes;
+    use crate::batch::sentiment::sampled::{sampled_sentiment_batch_preparation_bytes,
+        sampled_sentiment_job_preparation_bytes, SAMPLED_SENTIMENT_JOB_RECIPE_BYTES};
     let (task, work, job, host) = fixture(32, 8);
     let limits = SampledSentimentLimits::default();
     let encoding = SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 4096,
         max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
-    let base = sampled_sentiment_batch_preparation_bytes(task, limits, &UntrustedEncoding::ByteFallback).unwrap();
-    let compact = sampled_sentiment_batch_preparation_bytes(task, limits,
+    let base = sampled_sentiment_job_preparation_bytes(task, limits, &UntrustedEncoding::ByteFallback).unwrap();
+    assert_eq!(base, sampled_sentiment_batch_preparation_bytes(task, limits,
+        &UntrustedEncoding::ByteFallback).unwrap() + SAMPLED_SENTIMENT_JOB_RECIPE_BYTES);
+    let compact = sampled_sentiment_job_preparation_bytes(task, limits,
         &UntrustedEncoding::SafeBpeV1(encoding)).unwrap();
     assert_eq!(compact - base, encoding.requirements().unwrap().workspace_bytes);
     for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
@@ -188,11 +191,61 @@ fn owned_types_cross_serial_team_and_prefill_host_boundaries() {
     send::<SampledSentimentJobPlanner>();
     send::<JobInput<std::io::Cursor<Vec<u8>>>>();
     send::<JobExecution<std::io::Cursor<Vec<u8>>>>();
+    send::<DeferredSampledJob<std::io::Cursor<Vec<u8>>>>();
     let _serial = NlpEngine::job_int4_sampled_sentiment::<std::io::Cursor<Vec<u8>>>;
     let _team = NlpEngine::job_int4_sampled_sentiment_with_threads::<std::io::Cursor<Vec<u8>>>;
     let _prefill = NlpEngine::job_int4_sampled_sentiment_layer_major::<std::io::Cursor<Vec<u8>>>;
     for width in [0, 1, 65, usize::MAX] { assert!(int4_task_team_workspace_bytes(width, 32).is_err()); }
     for width in [2, 4, 64] { assert!(int4_task_team_workspace_bytes(width, 32).unwrap() > 0); }
+}
+
+#[test]
+fn public_pre_io_quote_prices_the_durable_output_claim_and_one_physical_team() {
+    let (task, work, job, host) = fixture(32, 8);
+    for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
+        let serial = int4_sampled_sentiment_job_requirements(32, task, work, PREPARATION,
+            job, host, input, None, None).unwrap();
+        assert_eq!(serial.input_bytes, host.required_buffer_bytes_for_input(job, input).unwrap());
+        assert_eq!(serial.output_reservation_bytes, 4 * task.max_output_bytes + 4096);
+        assert_eq!(serial.team_workspace_bytes, 0);
+        assert_eq!(serial.total_bytes().unwrap(), serial.input_bytes + serial.native.kv_bytes
+            + serial.workspace_bytes + serial.output_reservation_bytes);
+        for threads in [2, 4, 64] {
+            let team = int4_sampled_sentiment_job_requirements(32, task, work, PREPARATION,
+                job, host, input, None, Some(threads)).unwrap();
+            assert_eq!(team.team_workspace_bytes, int4_task_team_workspace_bytes(threads, 32).unwrap());
+            assert_eq!(team.total_bytes().unwrap() - serial.total_bytes().unwrap(),
+                team.team_workspace_bytes);
+            assert_eq!(team.native, serial.native);
+            assert_eq!(team.input_bytes, serial.input_bytes);
+            assert_eq!(team.workspace_bytes, serial.workspace_bytes);
+            assert_eq!(team.output_reservation_bytes, serial.output_reservation_bytes);
+        }
+        for threads in [0, 1, 65, usize::MAX] {
+            assert!(int4_sampled_sentiment_job_requirements(32, task, work, PREPARATION,
+                job, host, input, None, Some(threads)).is_err());
+        }
+    }
+}
+
+#[test]
+fn public_quote_keeps_tighter_stored_results_and_prefill_recipe_capacity_explicit() {
+    let (mut task, work, job, host) = fixture(32, 8);
+    task.max_output_bytes *= 2;
+    let serial = int4_sampled_sentiment_job_requirements(32, task, work, PREPARATION,
+        job, host, JobInputMemory::RetainedRecord, None, None).unwrap();
+    assert_eq!(serial.output_reservation_bytes, 4 * job.max_result_bytes as u64 + 4096);
+    let prefill = Int4PrefillLimits { max_batch_rows: 4,
+        max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(4).unwrap() };
+    let packed = int4_sampled_sentiment_job_requirements(32, task, work, PREPARATION,
+        job, host, JobInputMemory::RetainedRecord, Some(prefill), None).unwrap();
+    assert_eq!(packed.total_bytes().unwrap() - serial.total_bytes().unwrap(),
+        prefill.max_extra_scratch_bytes);
+    assert_eq!(packed.output_reservation_bytes, serial.output_reservation_bytes);
+    assert!(int4_sampled_sentiment_job_requirements(32, task, work, PREPARATION,
+        job, host, JobInputMemory::RetainedRecord, Some(prefill), Some(2)).is_err());
+    let overflow = SampledSentimentJobRequirements { output_reservation_bytes: u64::MAX, ..serial };
+    assert!(overflow.total_bytes().is_err());
 }
 
 mod lifecycle;

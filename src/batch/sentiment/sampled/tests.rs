@@ -500,3 +500,26 @@ fn admitted_prefill_widths_preserve_stream_identity_and_nonrenewable_work() {
         else { expected_results = Some(results); }
     }
 }
+
+#[test]
+fn durable_preparation_quote_keeps_recipe_and_encoder_storage_on_every_feature_graph() {
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    let planning = SampledSentimentLimits::default();
+    let policies = [UntrustedEncoding::ByteFallback, UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 8192, max_output_tokens: 8192,
+        max_pair_checks: 4 * 1024 * 1024, max_pair_bytes: 64 * 1024 * 1024 })];
+    for policy in policies {
+        let stream = sampled_sentiment_batch_preparation_bytes(task(), planning, &policy).unwrap();
+        let durable = sampled_sentiment_job_preparation_bytes(task(), planning, &policy).unwrap();
+        assert_eq!(durable - stream, SAMPLED_SENTIMENT_JOB_RECIPE_BYTES as u64);
+        let mut narrower = planning; narrower.max_result_bytes = task().max_output_bytes - 1;
+        assert_eq!(sampled_sentiment_job_preparation_bytes(task(), narrower, &policy).unwrap(), durable - 4);
+    }
+    let mut invalid = task(); invalid.max_input_tokens = 0;
+    assert!(sampled_sentiment_job_preparation_bytes(invalid, planning, &UntrustedEncoding::ByteFallback).is_err());
+    let mut invalid = planning; invalid.max_result_bytes = 0;
+    assert!(sampled_sentiment_job_preparation_bytes(task(), invalid, &UntrustedEncoding::ByteFallback).is_err());
+    let invalid = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 1,
+        max_output_tokens: 1, max_pair_checks: 0, max_pair_bytes: 1 });
+    assert!(sampled_sentiment_job_preparation_bytes(task(), planning, &invalid).is_err());
+}

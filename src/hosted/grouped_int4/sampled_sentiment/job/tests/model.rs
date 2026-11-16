@@ -4,7 +4,6 @@
 use super::*;
 use crate::{
     LeakResponsePolicy, ResourceHostConfig, RuntimePreset,
-    batch::sentiment::sampled::SampledSentimentBatchPlanner,
     execution_identity::Sha256Digest,
     hosted::corpus::jobs::JobOpenMode,
     jobs::{InputRetentionLimits, JobError, JobId, JobSecret, MismatchField, TailPolicy},
@@ -165,9 +164,9 @@ fn real_sampled_jobs_keep_committed_bytes_and_lifetime_work_across_physical_sche
             let compiler = SampledSentimentPlanner::for_model(model.model_identity(), sampling, task,
                 SampledSentimentLimits { max_input_bytes: 4096, max_total_prompt_tokens: 8192,
                     ..Default::default() }).unwrap().with_input_encoding(encoding.clone()).unwrap();
-            let compiler = SampledSentimentBatchPlanner::new(compiler, Arc::clone(&vocabulary), task, work).unwrap();
-            assert!(compiler.preparation_requirement_bytes() <= host.preparation_reserve_bytes);
-            SampledSentimentJobPlanner::new(compiler, job).unwrap()
+            let planner = SampledSentimentJobPlanner::new(compiler, Arc::clone(&vocabulary), work, job).unwrap();
+            assert!(planner.preparation_requirement_bytes() <= host.preparation_reserve_bytes);
+            planner
         };
         let mut expected = None;
         for (ordinal, schedule) in [Schedule::Serial, Schedule::Team, Schedule::Prefill].into_iter().enumerate() {
@@ -187,8 +186,10 @@ fn real_sampled_jobs_keep_committed_bytes_and_lifetime_work_across_physical_sche
                 assert_eq!(*reserved, progress.reserved_work);
             } else { expected = Some((bytes.clone(), progress.reserved_work)); }
             drained(&engine, &baseline);
+            // Team width is a physical execution choice. Prefill geometry is
+            // committed in the private recipe and must remain unchanged.
             let next = match schedule { Schedule::Serial => Schedule::Team,
-                Schedule::Team => Schedule::Prefill, Schedule::Prefill => Schedule::Serial };
+                Schedule::Team => Schedule::Serial, Schedule::Prefill => Schedule::Prefill };
             let mode = JobOpenMode::ResumeRetained { tail: TailPolicy::Refuse, retention };
             let drops = Arc::new(AtomicUsize::new(0));
             let replay = execute(&engine, &model, make(options.clone()), request(&root, job, mode), host, next,
@@ -224,6 +225,21 @@ fn real_sampled_jobs_keep_committed_bytes_and_lifetime_work_across_physical_sche
                 NeverRead(Arc::clone(&drops)), CancellationToken::default()).unwrap();
             assert_eq!(verified, progress);
             assert_eq!(drops.load(Ordering::SeqCst), 4);
+            drained(&engine, &baseline);
+
+            // A different prompt schedule must refuse before touching input
+            // or changing an authenticated completed job.
+            let changed_schedule = match schedule {
+                Schedule::Prefill => Schedule::Serial,
+                Schedule::Serial | Schedule::Team => Schedule::Prefill,
+            };
+            let error = execute(&engine, &model, make(options.clone()), request(&root, job, mode),
+                host, changed_schedule, NeverRead(Arc::clone(&drops)), CancellationToken::default())
+                .err().expect("prefill recipe changes must refuse completed replay");
+            assert!(matches!(error, HostedJobError::Job(JobRunError::Storage(
+                JobError::Mismatch(MismatchField::Recipe)))));
+            assert_eq!(drops.load(Ordering::SeqCst), 5);
+            assert_eq!(fs::read(root.join("materialized.ndjson")).unwrap(), bytes);
             drained(&engine, &baseline);
         }
     }

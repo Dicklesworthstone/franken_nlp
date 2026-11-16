@@ -88,6 +88,20 @@ pub fn sampled_sentiment_batch_preparation_bytes(task: TaskBudget, limits: Sampl
         .and_then(|n| n.checked_add(workspace)).ok_or_else(|| BatchCode::InvalidLimits.into())
 }
 
+/// Maximum canonical bytes for the fixed private durable recipe. Available
+/// without the optional storage backend so CLI admission can precede IO.
+pub const SAMPLED_SENTIMENT_JOB_RECIPE_BYTES: usize = 65_536;
+
+/// Pre-IO quote for the compiler, vocabulary, largest prepared bundle and
+/// bounded private durable recipe. Native/sampler buffers, transport, retained
+/// input and journal staging remain separate host charges.
+pub fn sampled_sentiment_job_preparation_bytes(task: TaskBudget, limits: SampledSentimentLimits,
+    encoding: &UntrustedEncoding) -> Result<u64, BatchFault> {
+    sampled_sentiment_batch_preparation_bytes(task, limits, encoding)?
+        .checked_add(SAMPLED_SENTIMENT_JOB_RECIPE_BYTES as u64)
+        .ok_or_else(|| BatchCode::InvalidLimits.into())
+}
+
 /// A model-bound compiler plus one immutable vocabulary for the whole stream.
 /// The caller's item ID is part of its private semantic sample address.
 /// Request sequence, input order and flush epochs never enter the RNG key.

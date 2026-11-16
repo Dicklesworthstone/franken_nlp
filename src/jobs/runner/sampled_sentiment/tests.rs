@@ -31,7 +31,7 @@ fn task() -> TaskBudget {
         max_grammar_states: 4096, max_kv_bytes: 1 << 30 }
 }
 fn planning() -> SampledSentimentLimits {
-    SampledSentimentLimits { max_result_bytes: 65536, ..Default::default() }
+    SampledSentimentLimits { max_input_bytes: 4096, max_result_bytes: 65536, ..Default::default() }
 }
 fn work(units: u64) -> Int4Work {
     Int4Work { forward_positions: 40 * units, projected_logits: 50 * units, attention_pairs: 60 * units,
@@ -203,7 +203,7 @@ fn public_adapter_is_owned_send_and_implements_the_existing_durable_boundary() {
     send::<SampledSentimentJobPlanner>();
     let _constructor = SampledSentimentJobPlanner::new;
     let _serial = SampledSentimentJobProcessor::<RefuseAdmission>::new;
-    let _layer_major = SampledSentimentJobProcessor::<RefuseAdmission>::new_layer_major;
+    let _layer_major = SampledSentimentJobPlanner::with_layer_major_prefill;
 }
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -352,4 +352,127 @@ fn changed_seed_refuses_retained_resume_before_repair_and_original_seed_recovers
     let done = resumed.run(&mut Continue).unwrap();
     assert_eq!((done.committed, done.attempts), (2, 3));
     assert_eq!(done.reserved_work, JobWork::from_int4(work(3), 15));
+}
+
+#[test]
+fn prompt_schedule_rows_workspace_and_backend_version_are_authenticated() {
+    let original = recipe(native());
+    for rows in [1, 4, 64] {
+        let prefill = Int4PrefillLimits { max_batch_rows: rows,
+            max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap() };
+        let selected = recipe(native()).with_prefill(prefill).unwrap();
+        distinct(&selected);
+        assert_eq!(selected.prefill_limits().unwrap().max_batch_rows, rows);
+        assert_eq!(selected.prefill_limits().unwrap().max_extra_scratch_bytes, prefill.max_extra_scratch_bytes);
+        let mut changed = prefill; changed.max_extra_scratch_bytes += 1;
+        let changed = recipe(native()).with_prefill(changed).unwrap();
+        assert_eq!(freeze(&selected).binding.compare(&freeze(&changed).binding),
+            Err(JobError::Mismatch(MismatchField::Recipe)));
+    }
+    let mut changed = recipe(native()); changed.native_execution = "other-native-execution"; distinct(&changed);
+    let mut changed = recipe(native()); changed.sample_address_stride += 1; distinct(&changed);
+    assert!(original.prefill_limits().is_none());
+    for rows in [0, 65] {
+        assert!(recipe(native()).with_prefill(Int4PrefillLimits {
+            max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX }).is_err());
+    }
+    assert!(recipe(native()).with_prefill(Int4PrefillLimits { max_batch_rows: 4,
+        max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(4).unwrap() - 1 }).is_err());
+}
+
+#[test]
+fn storage_limits_and_record_bounds_are_part_of_the_immutable_recipe() {
+    for axis in 0..10 {
+        let mut changed = limits(native());
+        match axis { 0 => changed.max_items += 1, 1 => changed.max_id_bytes += 1,
+            2 => changed.max_input_bytes_per_item += 1, 3 => changed.max_snapshot_bytes += 1,
+            4 => changed.max_result_bytes += 1, 5 => changed.max_spool_bytes += 1,
+            6 => changed.max_materialized_bytes += 1, 7 => changed.max_journal_bytes += 4096,
+            8 => changed.max_attempts += 1, _ => changed.max_id_bytes = 256 }
+        distinct(&SampledSentimentJobRecipe::new(32, task(), options(), planning(), native(),
+            UntrustedEncoding::ByteFallback, changed).unwrap());
+    }
+    let mut oversized = limits(native()); oversized.max_id_bytes = 257;
+    assert!(SampledSentimentJobRecipe::new(32, task(), options(), planning(), native(),
+        UntrustedEncoding::ByteFallback, oversized).is_err());
+    let mut narrow = limits(native()); narrow.max_input_bytes_per_item = planning().max_input_bytes - 1;
+    assert!(SampledSentimentJobRecipe::new(32, task(), options(), planning(), native(),
+        UntrustedEncoding::ByteFallback, narrow).is_err());
+}
+
+#[test]
+fn actual_model_bound_factory_quotes_recipe_and_uses_the_same_native_compiler() {
+    use crate::native_engine::strict_int4::weights::projection_fixture;
+    use crate::batch::sentiment::sampled::sampled_sentiment_batch_preparation_bytes;
+    let (model, _) = projection_fixture(32);
+    let vocabulary = Arc::new(SampledSentimentVocabulary::pinned().unwrap());
+    let make = |encoding: UntrustedEncoding| {
+        let compiler = SampledSentimentPlanner::for_model_with_encoding(model.identity(),
+            options(), task(), planning(), encoding).unwrap();
+        SampledSentimentJobPlanner::new(compiler, Arc::clone(&vocabulary), native(), limits(native())).unwrap()
+    };
+    let byte = make(UntrustedEncoding::ByteFallback);
+    assert_eq!(byte.preparation_requirement_bytes(),
+        sampled_sentiment_batch_preparation_bytes(task(), planning(), &UntrustedEncoding::ByteFallback).unwrap()
+            + SAMPLED_SENTIMENT_JOB_RECIPE_BYTES as u64);
+    assert_eq!(byte.max_result_bytes(), task().max_output_bytes);
+    assert_eq!(byte.base_execution_identity().task_spec, "sentiment-v1");
+    assert_eq!(byte.base_execution_identity().sampler_version, JSON_SAMPLER_VERSION);
+    assert_eq!(byte.group_width(), 32); assert_eq!(byte.task_budget(), task());
+    assert_eq!(byte.job_limits(), limits(native())); byte.check_job_limits(limits(native())).unwrap();
+    assert!(byte.prefill_limits().is_none());
+    let compact = make(compact());
+    assert_eq!(compact.document_encoding(), &self::compact());
+    assert_eq!(compact.preparation_requirement_bytes(),
+        sampled_sentiment_job_preparation_bytes(task(), planning(), &self::compact()).unwrap());
+    assert!(compact.preparation_requirement_bytes() > byte.preparation_requirement_bytes());
+    let identity = compact.base_execution_identity().clone();
+    let before = canonjson::canonical_bytes(compact.job_recipe()).unwrap();
+    let selected = compact.with_layer_major_prefill(Int4PrefillLimits { max_batch_rows: 4,
+        max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(4).unwrap() }).unwrap();
+    assert_eq!(selected.base_execution_identity(), &identity);
+    assert_ne!(canonjson::canonical_bytes(selected.job_recipe()).unwrap(), before);
+    assert_eq!(selected.prefill_limits().unwrap().max_batch_rows, 4);
+}
+
+#[test]
+fn exact_per_record_axes_and_tighter_budget_are_authenticated_before_any_resume() {
+    let root = Root::new(); let input = inputs(); let cap = native();
+    let events = Rc::new(Events::default()); let make = || Processor::new(cap, Rc::clone(&events));
+    let mut run = JobRunner::create(&root.0, key(), JobId([9; 16]), limits(cap), &input, make(), &mut Continue).unwrap();
+    run.step(&mut Continue).unwrap(); drop(run);
+    for axes in [vec!["valence"], vec!["arousal", "dominance"]] {
+        let mut smaller = task(); smaller.max_output_tokens -= 1; smaller.max_input_tokens -= 1;
+        let changed = serde_json::to_vec(&serde_json::json!({
+            "id": "beta", "text": "Private source B",
+            "task_args": { "axes": axes, "budget": smaller }
+        })).unwrap();
+        let replaced = [JobInput { id: input[0].id, original: input[0].original, normalized: input[0].normalized },
+            JobInput { id: "beta", original: &changed, normalized: &changed }];
+        assert_eq!(error(JobRunner::resume(&root.0, key(), JobId([9; 16]), limits(cap),
+            &replaced, make(), TailPolicy::DiscardUncommitted, &mut Continue)),
+            JobRunError::Storage(JobError::Mismatch(MismatchField::Population)));
+        assert_eq!(events.executions.get(), 1);
+    }
+    let mut resumed = JobRunner::resume(&root.0, key(), JobId([9; 16]), limits(cap), &input,
+        make(), TailPolicy::Refuse, &mut Continue).unwrap();
+    assert_eq!(resumed.run(&mut Continue).unwrap().committed, 2);
+    assert_eq!(events.executions.get(), 2);
+}
+
+#[test]
+fn invalid_task_data_is_rejected_for_the_complete_population_before_storage() {
+    for invalid in [r#"{"id":"beta","text":"private","task_args":{"seed":"replacement"}}"#,
+        r#"{"id":"beta","text":"private","task_args":{"samples":1}}"#,
+        r#"{"id":"beta","text":"private","task_args":{"axes":["unknown"]}}"#,
+        r#"{"id":"beta","text":"private","task_args":{"budget":{}}}"#] {
+        let root = Root::new(); let input = inputs();
+        let replaced = [JobInput { id: input[0].id, original: input[0].original, normalized: input[0].normalized },
+            JobInput { id: "beta", original: invalid.as_bytes(), normalized: invalid.as_bytes() }];
+        let events = Rc::new(Events::default());
+        assert_eq!(error(JobRunner::create(&root.0, key(), JobId([9; 16]), limits(native()),
+            &replaced, Processor::new(native(), Rc::clone(&events)), &mut Continue)), JobRunError::InvalidEnvelope);
+        assert_eq!(events.executions.get(), 0);
+        assert_eq!(fs::read_dir(&root.0).unwrap().count(), 0);
+    }
 }

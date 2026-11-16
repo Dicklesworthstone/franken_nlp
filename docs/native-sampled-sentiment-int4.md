@@ -3,16 +3,16 @@
 The explicit candidate commands `fnlp candidate source-int4 sentiment-sampled`,
 `sentiment-sampled-batch` and `sentiment-sampled-job start|resume` generate
 independent scores and explanations on the local grouped-INT4 candidate. They
-accept one document, serve a bounded ordered NDJSON stream, or retain and resume
-an authenticated population, respectively. Population routes use one resident
-model. They implement the independent generation portion of plan §7.5,
+serve one document, a bounded ordered NDJSON stream, or an explicitly retained
+authenticated population with durable resume, respectively. Each invocation
+uses one resident model. They implement the independent generation portion of plan §7.5,
 Mode B. Each axis and sample starts from an empty logical KV cache and its
 own semantic sample address. It does not sample the distribution-mode bins.
 
-This surface requires the `asupersync-runtime` implementation. The repository's
+These surfaces require the `asupersync-runtime` implementation; durable jobs
+additionally require `metadata-store` on Linux x86-64/AArch64. The repository's
 controller production-build, native parity and task-quality gates still apply;
 this change does not promote the no-flag public sentiment command.
-Durable jobs additionally require `metadata-store` on Linux x86-64 or AArch64.
 
 ## Request and command
 
@@ -149,7 +149,7 @@ uses millionths. With no `--top-k`, nucleus sampling covers the complete legal
 vocabulary. Explicit top-k accepts 1 through 20. Default temperature is 1000
 and default top-p is 1000000.
 
-The output protocol is `fnlp-candidate-int4-sentiment-sampled-v1`. Its `output`
+The single-document output protocol is `fnlp-candidate-int4-sentiment-sampled-v1`. Its `output`
 contains the following fields:
 
 | Field | Meaning |
@@ -195,9 +195,10 @@ The seed and document-dependent identity hashes are omitted from normal output.
 | `--compute-threads` | 1; explicit coordinator-plus-worker width 1–64 |
 | `--prefill-rows` | Omitted; explicit layer-major prompt morsels of 1–64 rows, with serial compute |
 
-All five native-work flags—`--max-forward-positions`,
+For the single-document command, all five native-work flags—`--max-forward-positions`,
 `--max-projected-logits`, `--max-attention-pairs`, `--max-dot-products` and
-`--max-multiply-accumulates`—bound the entire requested operation. Preflight
+`--max-multiply-accumulates`—bound the complete axis-by-sample bundle. The batch
+and durable-job sections below specify their population and lifetime scopes. Preflight
 prices the complete maximum-token schedule before its first native forward;
 completing a short sample does not renew a budget for another sample. The task
 token budget is N × requested axes × per-sample token cap. One admitted native
@@ -229,8 +230,9 @@ entire semantic bundle, including earlier successful samples.
 This route accepts the scalar or explicitly selected supported packed kernel,
 with serial scheduling and byte input encoding as defaults. It rejects text-generation
 processors, stops, token biases and logprobs.
-Focus-area presets, statistical intervals and automatic default selection are
-outside this implementation slice.
+Focus-area presets, statistical intervals and automatic default selection
+remain outside this implementation slice. Explicit retained jobs are described
+below; their lifetime work limits are separate from per-document CLI ceilings.
 
 ## Resident NDJSON populations
 
@@ -409,44 +411,78 @@ not measured RSS.
 
 ## Durable sampled populations
 
-`fnlp candidate source-int4 sentiment-sampled-job start|resume` connects the
-same complete sampled bundles to the authenticated job runner. It retains each
-completed result, skips committed items on resume, and durably charges every
-attempt against the original job's five native counters and grammar-mask limit.
-The model, vocabulary and native engine are reused throughout an invocation.
+`fnlp candidate source-int4 sentiment-sampled-job start|resume` runs the same
+independent sampled-sentiment task as a durable population job. One committed
+item contains the complete result for one document: every requested dimension,
+every independent sample, and the validated aggregate. A failed or interrupted
+bundle produces no successful partial item.
 
-Use unique `{id,text,task_args?}` records, such as:
+This route requires `metadata-store` and `asupersync-runtime` on Linux
+x86-64/AArch64. The model remains an explicitly selected source-converted or
+independently digest-pinned candidate. This feature does not establish model
+quality, performance, release readiness, or canonical artifact authority.
+
+### Input and immutable configuration
+
+Supply an NDJSON population with stable IDs unique across the entire frozen population:
 
 ```jsonl
-{"id":"review-1","text":"The support agent fixed the problem quickly.","task_args":{"axes":["valence","arousal"]}}
-{"id":"review-2","text":"The repeated failures were frustrating.","task_args":{"axes":["valence","arousal"]}}
+{"id":"first","text":"The service was helpful. I feel calm.","task_args":{"axes":["valence","arousal"]}}
+{"id":"second","text":"The parcel arrived broken.","task_args":{"axes":["valence","arousal"]}}
 ```
 
-IDs are unique across the entire frozen population. Flush controls are refused.
-The same closed `task_args` contract as the batch route accepts axes and a
-complete budget that can only tighten the invocation's task ceiling. Each item
-must fit one native context. Its entire requested sample bundle must validate
-before it can commit; a successful prefix of samples is never a successful item.
+Each record accepts `id`, `text`, and optional `task_args`. Omitted or null
+`task_args` selects all four affect dimensions. `task_args` may contain
+`axes` and an optional complete `TaskBudget` whose fields only tighten the
+invocation's task ceiling. It cannot replace the seed, sample count, model,
+encoding, or sampling policy. Each document must fit one native context. Flush
+controls are not accepted in durable jobs; do not reuse the flush or duplicate-ID
+examples from the streaming section as a durable population.
 
-Prepare an existing owner-only job directory, a protected regular key file
-containing exactly 32 random **raw bytes**, a random job ID represented by 32
-lowercase hexadecimal characters, and an immutable `JobLimits` file. These are
-the existing [owned job storage](owned-jobs.md) requirements. The command requires
-`--store-results` and creates neither the directory nor the key.
+Creation requires explicit `--store-results`, an existing protected
+`--job-dir`, a protected `--key-file` containing exactly 32 raw secret bytes,
+an explicit 32-character lowercase hexadecimal `--job-id`, and a
+`--limits` file. The CLI does not generate the key or ID, create the job
+directory, or silently adopt existing content. The sampling `--seed` is
+separate from the job-authentication key and must be supplied as 64 lowercase
+hexadecimal characters.
 
-For example, `sampled-job-limits.json` can declare these finite ceilings:
+These are the existing [owned job storage](owned-jobs.md) requirements. The
+job ID and authentication key should be independently generated random values.
+
+The authenticated recipe includes the effective seed, sampling policy,
+task/grammar/encoding ceilings, model and group identity, per-item work
+ceilings, and the complete immutable job limits. Repeat them on resume.
+Selecting `--prefill-rows` also freezes its row and workspace configuration;
+changing that choice requires a different job. A legal compute-team width is
+a physical execution choice and does not replenish any durable work allowance.
+
+### Lifetime work and storage limits
+
+The five native work flags and `--max-mask-node-visits` cap **one complete
+document**, across all requested dimensions and independent samples.
+`JobLimits.max_work` supplies the separate lifetime allowances for the job,
+including failed attempts. Each lifetime axis must be at least its per-document
+ceiling. The complete planned native and mask charge is journaled before an
+attempt executes. Cancellation, early EOS, a failed generation, and restart
+do not refund it. Item count and `max_attempts` do not multiply the allowance
+automatically.
+
+For a two-record example with the default per-document work ceilings, this
+`sampled-job-limits.json` allows up to ten complete maximum-sized attempts.
+It is an explicit budget example, not a measured work requirement:
 
 ```json
 {
-  "max_items": 100,
+  "max_items": 2,
   "max_id_bytes": 128,
   "max_input_bytes_per_item": 8192,
-  "max_snapshot_bytes": 8388608,
+  "max_snapshot_bytes": 131072,
   "max_result_bytes": 1048576,
-  "max_spool_bytes": 268435456,
-  "max_materialized_bytes": 268435456,
-  "max_journal_bytes": 67108864,
-  "max_attempts": 120,
+  "max_spool_bytes": 67108864,
+  "max_materialized_bytes": 8388608,
+  "max_journal_bytes": 16777216,
+  "max_attempts": 10,
   "max_work": {
     "model": {
       "forward_positions": 1310720,
@@ -462,107 +498,122 @@ For example, `sampled-job-limits.json` can declare these finite ceilings:
 }
 ```
 
-These limits bound admitted work and storage; they do not predict how many
-documents will fit. All six per-item work ceilings must fit their corresponding
-lifetime ceiling. Unlike finite distribution scoring, sampled jobs require a
-positive mask budget.
+The immutable input cap covers each complete NDJSON envelope and must fit
+`--max-input-bytes`; sampled job IDs are limited to 256 UTF-8 bytes.
+`--max-result-bytes` bounds the complete sample bundle and must fit the
+stored result limit. Disk ceilings do not stand in for RAM admission. The CLI
+prices the actual original-population or retained-record owner, planner and
+vocabulary, native KV/scratch, sampler, result staging, database/serialization
+allowances, and optional team or prefill workspace before opening the key,
+model, or population. `--memory-mib` remains a modeled process-ledger ceiling,
+not an operating-system RSS limit.
 
-Start and explicitly retain both the completed results and the original inputs:
+### Start and resume
 
-```sh
-fnlp candidate source-int4 sentiment-sampled-job start sentiment-population.ndjson \
-  --snapshot /path/to/local-int4-snapshot \
-  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
-  --memory-mib 16384 --group-width 128 --max-input-bytes 8192 \
-  --seed 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-  --samples 4 --input-encoding safe-bpe-v1 --compute-threads 4 \
-  --store-results --job-dir /private/sampled-job \
-  --job-id "$JOB_ID" --key-file /private/sampled-job.key \
-  --limits sampled-job-limits.json \
-  --spool-input --max-retained-input-mib 64 --materialize
-```
+The following Bash example uses a previously created pinned snapshot and
+pre-existing protected job credentials. Set `SNAPSHOT`, `MODEL_SHA256`,
+`SAMPLING_SEED`, `JOB_DIR`, `JOB_KEY_FILE`, and `JOB_ID` to their actual
+values. `MODEL_SHA256` must come from a trusted independent conversion or
+receipt. Adjust the declared memory ceiling for the selected model and host.
 
-Resume without opening the original population or reading population stdin:
+```bash
+sampled_job_args=(
+  --snapshot "$SNAPSHOT"
+  --expected-model-sha256 "$MODEL_SHA256"
+  --memory-mib 8192
+  --seed "$SAMPLING_SEED"
+  --samples 2
+  --max-input-bytes 8192
+  --max-result-bytes 1048576
+  --store-results
+  --job-dir "$JOB_DIR"
+  --key-file "$JOB_KEY_FILE"
+  --job-id "$JOB_ID"
+  --limits ./sampled-job-limits.json
+)
 
-```sh
+fnlp candidate source-int4 sentiment-sampled-job start ./population.ndjson \
+  "${sampled_job_args[@]}" \
+  --spool-input --max-retained-input-mib 16 --materialize
+
 fnlp candidate source-int4 sentiment-sampled-job resume \
-  --snapshot /path/to/local-int4-snapshot \
-  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
-  --memory-mib 16384 --group-width 128 --max-input-bytes 8192 \
-  --seed 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-  --samples 4 --input-encoding safe-bpe-v1 --compute-threads 4 \
-  --store-results --job-dir /private/sampled-job \
-  --job-id "$JOB_ID" --key-file /private/sampled-job.key \
-  --limits sampled-job-limits.json \
-  --use-retained-input --max-retained-input-mib 64 --materialize
+  "${sampled_job_args[@]}" \
+  --use-retained-input --max-retained-input-mib 16 --materialize
 ```
 
-Use a population containing only unique document records, without the flush and
-duplicate-ID examples from the streaming section. Source conversion using
-`--source-dir` plus `--source-manifest`, with optional `--save-snapshot NEW_FILE`,
-is also available. The declared memory ceiling must cover the selected model,
-context, input mode and job buffers; there is no automatic admission fallback.
+Input retention is separate consent from result retention.
+`--spool-input` stages exact private input envelopes in the protected job,
+validates the complete typed population, and authenticates it before inference.
+`--use-retained-input` restores that population under the exclusive job lock;
+omit the positional input argument. It does not open an original input file or
+read stdin, and corrupt or missing retained bytes never trigger a fallback.
+Replay keeps one record's payload at a time while retaining the complete ordered
+identity index under the immutable item/snapshot ceilings. See
+[retained input replay](retained-inputs.md) for the storage and recovery rules.
 
-Input retention is separate from result retention. Without `--spool-input`,
-supply the complete original population to every `resume`, including committed
-records. Retained replay instead authenticates the saved population with one
-record's payload in memory at a time. Its complete ordered identity index still
-obeys the original item and snapshot ceilings. See
-[retained input replay](retained-inputs.md) for exact storage and recovery rules.
+To retain results while continuing to supply the original population, omit
+both input-retention flags and their disk cap. Pass the **complete original
+NDJSON population** to both `start` and `resume`, including already committed
+records. Resume authenticates it before skipping committed items. Reordering,
+editing, or substituting records is refused.
 
-### Immutable replay and complete work charges
+Use `--source-dir` plus `--source-manifest` instead of the two snapshot flags
+to convert explicitly selected pinned local sources. An explicit
+`--save-snapshot NEW_FILE` can preserve that conversion for later invocations;
+it never overwrites a path. Resume still requires the same model/group identity.
+`--compute-threads 2..64` uses one persistent projection team for the whole
+invocation. Alternatively, `--prefill-rows 1..64` selects bounded layer-major
+prompts with serial compute; it cannot be combined with multiple compute
+threads. `--input-encoding safe-bpe-v1` is supported, and its complete bounded
+encoding policy is authenticated.
 
-Repeat the original effective seed, sample count, temperature, top-k/top-p,
-sample token and explanation bounds, grammar limits, task ceilings, encoding
-policy and all native/mask limits. The private recipe is derived from the actual
-owned planner and model, not caller-supplied replacement identity fields. It
-includes every sampled implementation version and the exact lifetime limits.
-Changing the original record bytes, IDs, order, model/group or recipe refuses
-resume before any permitted result-tail repair. Seed and recipe bytes are not
-copied into public metadata.
+To select the compact, persistent-team route in the example, add
+`--input-encoding safe-bpe-v1 --compute-threads 4` to both invocations. A legal
+compute width can change on resume; the chosen encoding and prefill recipe
+must remain identical. No cross-schedule parity or speedup follows from source
+inspection.
 
-The five native-work flags and `--max-mask-node-visits` bound **each item** on
-this route. `JobLimits.max_work` is the sole **whole-job lifetime authority**.
-Each prepared attempt reserves its complete maximum-token schedule, including
-every axis, sample, repeated prompt and grammar-mask allowance, before native
-execution. Early EOS, failed samples, interrupted attempts and later invocations
-do not refund that work. Actual complete result accounting remains in the
-private output; progress reports the durable reservation. Neither `max_items`
-nor `max_attempts` multiplies work authority.
+### Library entry points
 
-Results are synced to the spool before their journal pointer commits, with the
-output's resource guard retained through both operations. Uncommitted tails or
-output stages are refused by default. Explicit `resume --discard-uncommitted-tail`
-selects the existing recovery policy only after authenticating the original
-contract. Retained-input corruption is never repaired by that flag.
+`SampledSentimentJobPlanner::new` accepts the actual model-bound task planner,
+the pinned vocabulary, native per-item/lifetime ceilings, and immutable
+`JobLimits`. `with_layer_major_prefill` freezes an optional prompt schedule.
+`sampled_sentiment_job_preparation_bytes` is available without the optional
+storage backend, and `int4_sampled_sentiment_job_requirements` quotes the
+complete hosted execution envelope. Pass the sealed planner and explicit
+`SourceJobRequest` to `NlpEngine::job_int4_sampled_sentiment` or
+`job_int4_sampled_sentiment_with_threads`, with explicit `JobHostLimits`.
+`job_int4_sampled_sentiment_layer_major` also accepts and freezes an explicit
+prompt workspace. The shared job runner owns
+authentication, durable debit, recovery, result spooling and materialization.
 
-Serial execution is the default. `--compute-threads 2..64` retains one numerical
-team for the invocation; alternatively, `--compute-threads 1 --prefill-rows 1..64`
-uses one admitted layer-major prompt workspace across every fresh sample. Both
-support compact input. The physical schedule can change on an authenticated
-resume without changing sample addresses or replenishing work. All workers join
-and native allocations drain before progress returns. Original cancellation and
-the absolute deadline are rechecked even for an already-completed job and during
-metadata publication. Source review alone establishes no cross-schedule parity
-or performance result.
+### Completion and recovery
 
-Stdout uses `fnlp-candidate-int4-sentiment-sampled-job-v1` and contains candidate
-provenance, optional physical schedule metadata, and authenticated progress.
-It omits documents, scores, explanations, raw seeds and private recipe bytes.
-`--materialize` publishes ordered `materialized.ndjson` only after every item
-commits. Existing `fnlp job status`, `verify` and `materialize` work without
-loading the model. A failure can follow durable progress; it does not imply
-rollback or authorize restarting as a fresh job.
+Stdout uses `fnlp-candidate-int4-sentiment-sampled-job-v1` and contains one
+bounded candidate-provenance and progress report after the physical host drains;
+it does not contain private document text, scores, explanations, or the
+sampling seed. Successful results stay in the protected spool.
+`--materialize` publishes verified `materialized.ndjson` only after every
+record has committed.
 
-Library callers build `SampledSentimentJobPlanner` from the real
-`SampledSentimentBatchPlanner` and exact `JobLimits`, then use
-`NlpEngine::job_int4_sampled_sentiment`,
-`NlpEngine::job_int4_sampled_sentiment_with_threads`, or
-`NlpEngine::job_int4_sampled_sentiment_layer_major` with `SourceJobRequest` and
-`JobHostLimits`. Admission includes the selected input owner, caller and host
-preparation, journal and serializer buffers, model, full native KV, one sampler,
-physical workspace and complete guarded result. The existing job format and
-authentication protocol are reused.
+Each completed result is synced to the spool before its journal pointer
+commits, and its output guard survives both operations. The original
+cancellation and remaining deadline are checked for completed-job replay and
+before metadata serialization, before its first byte, and after its final flush.
+
+An error can follow durable progress, including during acknowledgement or
+metadata delivery. Do not infer rollback from a missing response. Use the
+existing authenticated `fnlp job status`, `verify` and `materialize` commands
+(which do not load the model), or explicitly
+resume with the original configuration. Interrupted uncommitted output stages
+or spool tails are refused by default; `resume --discard-uncommitted-tail`
+explicitly permits their removal only after authentication. There is no
+automatic retry or budget reset. That flag never repairs corrupt retained inputs.
+
+The source includes recipe/population authentication, persistent failed-attempt
+debit, complete-bundle publication, retained replay, host-lifetime, and CLI
+regression definitions. Their presence is not an execution result; controller
+validation and real-model qualification remain separate.
 
 ## Verification status
 
@@ -601,20 +652,17 @@ These are source definitions and independent review, not executed batch or
 real-model evidence. Batch parity, replay, failure and physical-drain evidence
 remain part of the controller's model-present gates.
 
-Durable-job regression definitions additionally cover planner-derived seed and
-policy authentication, exact lifetime limits, failed-attempt debits, committed
-item skipping, authentication before repair, guarded spool/journal publication,
-actual input-mode memory admission and CLI rejection before private IO.
-An explicitly ignored independently pinned real-snapshot fixture compares
-completed durable bundles, materialized bytes and reserved work across serial,
-four-worker and four-row prefill schedules within each encoding policy. It also
-checks retained replay without external input, completed-job cancellation,
-changed-seed refusal and physical drain. CLI runtime definitions cover private
-metadata exclusion and cancellation/deadline checks around final publication.
-These additions have source review only; their test bodies have not run.
+Durable-job regression definitions cover exact seed/sampler/encoding/grammar
+and prompt-schedule commitments, complete population authentication before
+recovery, all six persisted work axes after failed attempts, retained-input
+replay without reading the original stream, and guarded whole-bundle storage.
+Host and CLI definitions cover complete memory quotes, queued cancellation,
+reader/native failures, worker-join ownership, explicit storage consent,
+source/snapshot schedules and bounded metadata-only publication. These have
+source review and text-integrity checks; no execution result is claimed.
 
 Rust compilation, executable fixtures, production DSR qualification, real-model
 replay/cancellation and human-label quality evaluation remain **UNRUN**. The
 required production feature graph and DSR runner were unavailable in the
 implementation environment; no default-feature or GitHub Actions fallback was
-used. The related feature bead stays `in_progress` until those gates are met.
+used. The related feature beads stay `in_progress` until those gates are met.

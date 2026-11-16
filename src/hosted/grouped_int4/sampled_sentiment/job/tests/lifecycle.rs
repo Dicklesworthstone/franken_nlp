@@ -4,7 +4,6 @@
 use super::*;
 use crate::{
     LeakResponsePolicy, ResourceHostConfig, RuntimePreset,
-    batch::sentiment::sampled::SampledSentimentBatchPlanner,
     hosted::corpus::jobs::JobOpenMode,
     jobs::{JobId, JobSecret},
     native_engine::{decode::DecodeCancellationKind, strict_int4::weights::projection_fixture},
@@ -15,7 +14,8 @@ use std::{io::{self, Read}, path::PathBuf, sync::atomic::{AtomicU64, AtomicUsize
 #[derive(Clone, Copy)]
 enum Action { Refuse, Cancel(DecodeCancellationKind), Panic, Malformed }
 #[derive(Default)]
-struct Observation { reads: AtomicUsize, drops: AtomicUsize, input_at_drop: AtomicU64 }
+struct Observation { reads: AtomicUsize, drops: AtomicUsize,
+    input_at_drop: AtomicU64, native_at_drop: AtomicU64 }
 struct Reader { resources: Arc<EngineResources>, observed: Arc<Observation>,
     action: Action, stop: CancellationToken }
 impl Drop for Reader {
@@ -23,6 +23,9 @@ impl Drop for Reader {
         let snapshot = self.resources.memory_snapshot();
         self.observed.input_at_drop.store(snapshot.by_class.get(&MemoryClass::JobBuffers)
             .map_or(0, |value| value.committed_bytes + value.reserved_bytes), Ordering::SeqCst);
+        self.observed.native_at_drop.store([MemoryClass::KvPages, MemoryClass::ActivationScratch]
+            .iter().map(|class| snapshot.by_class.get(class)
+                .map_or(0, |value| value.committed_bytes + value.reserved_bytes)).sum(), Ordering::SeqCst);
         self.observed.drops.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -54,8 +57,7 @@ fn planner(model: &ResidentInt4, vocabulary: &Arc<SampledSentimentVocabulary>)
             ..SampledSentimentLimits::default() },
         UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 4096,
             max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 })).unwrap();
-    let planner = SampledSentimentJobPlanner::new(SampledSentimentBatchPlanner::new(
-        compiler, Arc::clone(vocabulary), task, work).unwrap(), job).unwrap();
+    let planner = SampledSentimentJobPlanner::new(compiler, Arc::clone(vocabulary), work, job).unwrap();
     assert!(planner.preparation_requirement_bytes() <= PREPARATION);
     let request = SourceJobRequest { root: PathBuf::from("/nonexistent/fnlp-sampled-job-lifecycle-refusal"),
         key: JobSecret::from_bytes([3; 32]), job_id: JobId([4; 16]), limits: job,
@@ -110,6 +112,10 @@ fn original_cancellation_and_owned_input_charges_survive_every_physical_schedule
             ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
             let (planner, request, limits) = planner(&model, &vocabulary);
             let charge = limits.required_buffer_bytes(request.limits).unwrap();
+            let native_charge = int4_sampled_sentiment_job_requirements(32, planner.task_budget(),
+                planner.native_limits(), planner.preparation_requirement_bytes(), request.limits, limits,
+                request.mode.input_memory(), None, None).unwrap();
+            let native_charge = native_charge.native.kv_bytes + native_charge.workspace_bytes;
             let stop = CancellationToken::default(); stop.cancel(cause);
             let observed = Arc::new(Observation::default());
             let reader = Reader { resources: Arc::clone(host.resources()), observed: Arc::clone(&observed),
@@ -121,11 +127,17 @@ fn original_cancellation_and_owned_input_charges_survive_every_physical_schedule
             assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
             assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
             assert!(observed.input_at_drop.load(Ordering::SeqCst) >= PREPARATION + charge);
+            assert!(observed.native_at_drop.load(Ordering::SeqCst) >= native_charge,
+                "native ownership must outlive the private reader on every terminal path");
             drained(&host, &baseline);
         }
         for action in [Action::Cancel(Deadline), Action::Panic, Action::Malformed] {
             let (planner, request, limits) = planner(&model, &vocabulary);
             let charge = limits.required_buffer_bytes(request.limits).unwrap();
+            let native_charge = int4_sampled_sentiment_job_requirements(32, planner.task_budget(),
+                planner.native_limits(), planner.preparation_requirement_bytes(), request.limits, limits,
+                request.mode.input_memory(), None, None).unwrap();
+            let native_charge = native_charge.native.kv_bytes + native_charge.workspace_bytes;
             let stop = CancellationToken::default();
             let observed = Arc::new(Observation::default());
             let reader = Reader { resources: Arc::clone(host.resources()), observed: Arc::clone(&observed),
@@ -145,6 +157,8 @@ fn original_cancellation_and_owned_input_charges_survive_every_physical_schedule
             assert_eq!(observed.reads.load(Ordering::SeqCst), 1);
             assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
             assert!(observed.input_at_drop.load(Ordering::SeqCst) >= PREPARATION + charge);
+            assert!(observed.native_at_drop.load(Ordering::SeqCst) >= native_charge,
+                "native ownership must outlive the private reader on every terminal path");
             drained(&host, &baseline);
         }
     }

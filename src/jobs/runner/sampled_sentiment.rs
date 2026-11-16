@@ -6,24 +6,27 @@
 //! publication. No alternate generator or deserialized recipe grants execution.
 
 use serde::Serialize;
+use std::sync::Arc;
 use crate::{
     batch::{BatchCode, BatchDocument, BatchFault, BatchItemFailure, BatchProcessor,
         BatchRequestContext, BatchWork, extract::ExtractionMaskBudget, output::GuardedOutput,
         sentiment::sampled::{NativeSampledSentimentBatch, PreparedSampledSentimentRecord,
             SampledSentimentBatchAdmission, SampledSentimentBatchArgs, SampledSentimentBatchLimits,
-            SampledSentimentBatchPlanner}},
+            SampledSentimentBatchPlanner, SAMPLED_SENTIMENT_JOB_RECIPE_BYTES}},
     execution_identity::ExecutionIdentity,
     grammar::{CompileLimits, mask::MaskWorkLimits, runtime::JSON_RUNTIME_VERSION},
     jobs::{JobLimits, JobWork, manifest::bounded_json, runner::DurableBatchProcessor},
-    native_engine::{constrained_int4::JSON_SAMPLER_VERSION, decode::DecodeStepControl,
-        strict_int4::{Int4MemoryRequirement, Int4Work, StrictInt4Engine, prefill::Int4PrefillLimits}},
+    native_engine::{constrained_int4::{INT4_JSON_SAMPLED_EXECUTION, JSON_SAMPLER_VERSION},
+        decode::DecodeStepControl, strict_int4::{Int4MemoryRequirement, Int4Work, StrictInt4Engine,
+            prefill::{Int4PrefillLimits, INT4_LAYER_MAJOR_PREFILL_VERSION}}},
     tasks::{ir::TaskBudget, sentiment::{SentimentAxis, sampled::{SampledSentimentLimits, SampledSentimentOptions,
-        SampledSentimentRun, SAMPLED_SENTIMENT_AGGREGATION_VERSION, SAMPLED_SENTIMENT_EXECUTION,
+        SampledSentimentPlanner, SampledSentimentRun, SampledSentimentVocabulary, MAX_SENTIMENT_SAMPLES,
+        SAMPLED_SENTIMENT_AGGREGATION_VERSION, SAMPLED_SENTIMENT_EXECUTION,
         SAMPLED_SENTIMENT_ITEM_ADDRESS_VERSION, SAMPLED_SENTIMENT_PROMPT_VERSION}}},
     tokenizer::untrusted::UntrustedEncoding,
 };
 
-const RECIPE_BYTES: usize = 65_536;
+pub use crate::batch::sentiment::sampled::sampled_sentiment_job_preparation_bytes;
 
 /// Serialize only for the owned job's keyed commitment. There is no Debug,
 /// Deserialize, public field or caller-supplied constructor; a recipe cannot
@@ -38,6 +41,8 @@ pub struct SampledSentimentJobRecipe {
     aggregation_version: &'static str,
     sampler_version: &'static str,
     item_address_version: &'static str,
+    sample_address_stride: usize,
+    native_execution: &'static str,
     grammar_version: &'static str,
     task_spec: &'static str,
     group_width: usize,
@@ -48,6 +53,15 @@ pub struct SampledSentimentJobRecipe {
     native: NativeRecipe,
     input_encoding: UntrustedEncoding,
     job: JobLimits,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefill: Option<PrefillRecipe>,
+}
+
+#[derive(Serialize)]
+struct PrefillRecipe {
+    execution: &'static str,
+    max_batch_rows: usize,
+    max_extra_scratch_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -111,22 +125,37 @@ impl SampledSentimentJobRecipe {
         native.validate()?;
         input_encoding.validate().map_err(|_| BatchCode::InvalidLimits)?;
         Int4MemoryRequirement::for_context(1, group_width).map_err(|_| BatchCode::InvalidLimits)?;
-        let recipe = Self { version: 1, dependency_scope: "item-local",
+        let recipe = Self { version: 2, dependency_scope: "item-local",
             input_policy: "exact-record-independent-axis-sample-addresses-v1",
             execution: SAMPLED_SENTIMENT_EXECUTION, prompt_version: SAMPLED_SENTIMENT_PROMPT_VERSION,
             aggregation_version: SAMPLED_SENTIMENT_AGGREGATION_VERSION,
             sampler_version: JSON_SAMPLER_VERSION, grammar_version: JSON_RUNTIME_VERSION,
             item_address_version: SAMPLED_SENTIMENT_ITEM_ADDRESS_VERSION,
+            sample_address_stride: MAX_SENTIMENT_SAMPLES, native_execution: INT4_JSON_SAMPLED_EXECUTION,
             task_spec: "sentiment-v1", group_width, task_budget,
             default_axes: SampledSentimentBatchArgs::default().axes, sampling,
-            planning: planning.into(), native: native.into(), input_encoding, job };
+            planning: planning.into(), native: native.into(), input_encoding, job, prefill: None };
         recipe.check_job_limits(job)?;
-        bounded_json(&recipe, RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
+        bounded_json(&recipe, SAMPLED_SENTIMENT_JOB_RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
         Ok(recipe)
     }
+    fn with_prefill(mut self, limits: Int4PrefillLimits) -> Result<Self, BatchFault> {
+        limits.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        let Int4PrefillLimits { max_batch_rows, max_extra_scratch_bytes } = limits;
+        self.prefill = Some(PrefillRecipe { execution: INT4_LAYER_MAJOR_PREFILL_VERSION,
+            max_batch_rows, max_extra_scratch_bytes });
+        bounded_json(&self, SAMPLED_SENTIMENT_JOB_RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
+        Ok(self)
+    }
+    fn prefill_limits(&self) -> Option<Int4PrefillLimits> {
+        self.prefill.as_ref().map(|prefill| Int4PrefillLimits { max_batch_rows: prefill.max_batch_rows,
+            max_extra_scratch_bytes: prefill.max_extra_scratch_bytes })
+    }
+    fn max_result_bytes(&self) -> u64 { self.task_budget.max_output_bytes.min(self.planning.max_result_bytes) }
     fn check_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> {
         limits.validate().map_err(|_| BatchCode::InvalidLimits)?;
-        if limits != self.job
+        if limits != self.job || limits.max_id_bytes > 256
+            || self.planning.max_input_bytes > limits.max_input_bytes_per_item
             || limits.max_work != JobWork::from_int4(self.native.max_model_work, self.native.max_mask_visits_per_run)
             || self.task_budget.max_output_bytes.min(self.planning.max_result_bytes) > limits.max_result_bytes as u64 {
             return Err(BatchCode::InvalidLimits.into());
@@ -136,29 +165,43 @@ impl SampledSentimentJobRecipe {
 }
 
 /// The actual model-bound resident compiler moves intact into this factory.
-/// Explicit resume reconstructs the same private recipe; no attempt, transport
-/// sequence, worker width or prompt schedule changes a sample's address.
+/// Explicit resume reconstructs the same private recipe. Attempt and delivery
+/// counters never change sample addresses. A chosen prompt schedule is frozen
+/// separately so a resumed job cannot mix unqualified physical execution paths.
 pub struct SampledSentimentJobPlanner {
     compiler: SampledSentimentBatchPlanner,
     identity: ExecutionIdentity,
     recipe: SampledSentimentJobRecipe,
     planning: SampledSentimentLimits,
+    preparation_bytes: u64,
 }
 impl SampledSentimentJobPlanner {
-    pub fn new(compiler: SampledSentimentBatchPlanner, limits: JobLimits) -> Result<Self, BatchFault> {
+    pub fn new(planner: SampledSentimentPlanner, vocabulary: Arc<SampledSentimentVocabulary>,
+        native: SampledSentimentBatchLimits, limits: JobLimits) -> Result<Self, BatchFault> {
+        let task = planner.task_budget();
+        let compiler = SampledSentimentBatchPlanner::new(planner, vocabulary, task, native)?;
         let (options, planning) = compiler.durable_configuration();
-        let recipe = SampledSentimentJobRecipe::new(compiler.group_width(), compiler.task_budget(),
-            options.clone(), planning, compiler.limits(), compiler.document_encoding().clone(), limits)?;
+        let recipe = SampledSentimentJobRecipe::new(compiler.group_width(), task,
+            options.clone(), planning, native, compiler.document_encoding().clone(), limits)?;
+        let preparation_bytes = sampled_sentiment_job_preparation_bytes(task, planning, compiler.document_encoding())?;
         let identity = compiler.base_execution_identity().clone();
-        Ok(Self { compiler, identity, recipe, planning })
+        Ok(Self { compiler, identity, recipe, planning, preparation_bytes })
     }
-    pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
+    /// Select before storage is opened; rows and workspace enter the private
+    /// recipe so changing either requires a distinct durable job.
+    pub fn with_layer_major_prefill(mut self, limits: Int4PrefillLimits) -> Result<Self, BatchFault> {
+        self.recipe = self.recipe.with_prefill(limits)?;
+        Ok(self)
+    }
+    pub fn base_execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn task_budget(&self) -> TaskBudget { self.compiler.task_budget() }
     pub fn native_limits(&self) -> SampledSentimentBatchLimits { self.compiler.limits() }
     pub fn planning_limits(&self) -> SampledSentimentLimits { self.planning }
     pub fn group_width(&self) -> usize { self.compiler.group_width() }
     pub fn document_encoding(&self) -> &UntrustedEncoding { self.compiler.document_encoding() }
-    pub fn preparation_requirement_bytes(&self) -> u64 { self.compiler.preparation_requirement_bytes() }
+    pub fn preparation_requirement_bytes(&self) -> u64 { self.preparation_bytes }
+    pub fn max_result_bytes(&self) -> u64 { self.recipe.max_result_bytes() }
+    pub fn prefill_limits(&self) -> Option<Int4PrefillLimits> { self.recipe.prefill_limits() }
     pub fn job_limits(&self) -> JobLimits { self.recipe.job }
     /// Private configuration for keyed commitment only; do not publish it.
     pub fn job_recipe(&self) -> &SampledSentimentJobRecipe { &self.recipe }
@@ -178,18 +221,8 @@ pub struct SampledSentimentJobProcessor<'e, 'w, A: SampledSentimentBatchAdmissio
 impl<'e, 'w, A: SampledSentimentBatchAdmission> SampledSentimentJobProcessor<'e, 'w, A> {
     pub fn new(planner: SampledSentimentJobPlanner, engine: &'e mut StrictInt4Engine<'w>, admission: A)
         -> Result<Self, BatchFault> {
-        Self::new_scheduled(planner, engine, admission, None)
-    }
-    /// The host admits the additional prefill workspace before construction.
-    /// This physical schedule changes neither the recipe nor lifetime debits.
-    pub fn new_layer_major(planner: SampledSentimentJobPlanner, engine: &'e mut StrictInt4Engine<'w>,
-        admission: A, prefill: Int4PrefillLimits) -> Result<Self, BatchFault> {
-        Self::new_scheduled(planner, engine, admission, Some(prefill))
-    }
-    fn new_scheduled(planner: SampledSentimentJobPlanner, engine: &'e mut StrictInt4Engine<'w>,
-        admission: A, prefill: Option<Int4PrefillLimits>) -> Result<Self, BatchFault> {
-        let SampledSentimentJobPlanner { compiler, identity, recipe, planning: _ } = planner;
-        let native = match prefill {
+        let SampledSentimentJobPlanner { compiler, identity, recipe, .. } = planner;
+        let native = match recipe.prefill_limits() {
             Some(prefill) => NativeSampledSentimentBatch::new_layer_major(compiler, engine, admission, prefill)?,
             None => NativeSampledSentimentBatch::new(compiler, engine, admission)?,
         };

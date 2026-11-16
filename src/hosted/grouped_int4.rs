@@ -22,6 +22,9 @@ pub use sentiment::{Int4SentimentHostLimits, Int4SentimentMapHostConfig,
     int4_sentiment_document_corpus_requirements};
 mod sampled_sentiment;
 pub use sampled_sentiment::SampledSentimentHostLimits;
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub use sampled_sentiment::{SampledSentimentJobRequirements, int4_sampled_sentiment_job_requirements};
 mod judge;
 pub use judge::{Int4JudgeHostLimits, Int4FaithfulnessMapHostConfig, int4_faithfulness_document_corpus_requirements,
     int4_faithfulness_document_corpus_requirements_with_max_heads};
