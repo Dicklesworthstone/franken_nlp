@@ -30,8 +30,10 @@ pub mod sparse;
 mod prefill;
 mod sampled;
 pub use sampled::{JsonSamplingOptions, INT4_JSON_SAMPLED_EXECUTION, JSON_SAMPLER_VERSION,
+    INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION,
     decode_json_int4_sampled, decode_json_int4_sampled_layer_major, json_sampling_workspace_bytes};
-pub(crate) use sampled::{decode_json_int4_sampled_with, decode_json_int4_sampled_layer_major_with};
+pub(crate) use sampled::{decode_json_int4_sampled_with, decode_json_int4_sampled_layer_major_with,
+    decode_json_int4_sampled_reusing_prefill_with};
 
 /// Group dots, MACs and attention pairs are additional to JSON/mask work.
 /// The KV ceiling prices the engine's complete resident capacity.
@@ -237,7 +239,12 @@ trait Driver {
         Ok(())
     }
     fn logits(&mut self) -> Result<Vec<f32>, Int4JsonError>;
-    fn work(&self) -> Int4Work;
+    fn work(&self) -> Result<Int4Work, Int4JsonError>;
+    /// Already-completed prompt positions retained inside this SAME session.
+    /// The default cold path performs every prompt position itself. A replay
+    /// adapter must independently restore its retained causal prefix and its
+    /// returned work counts only the new forwards/projections of this sample.
+    fn retained_prompt_positions(&self) -> usize { 0 }
     fn abort(&mut self);
 }
 impl<C: DecodeStepControl> Driver for Int4Session<'_, '_, C> {
@@ -245,7 +252,7 @@ impl<C: DecodeStepControl> Driver for Int4Session<'_, '_, C> {
     fn control(&mut self) -> &mut C { Int4Session::control(self) }
     fn append(&mut self, token: u32) -> Result<(), Int4JsonError> { Ok(Int4Session::append(self, token)?) }
     fn logits(&mut self) -> Result<Vec<f32>, Int4JsonError> { Ok(Int4Session::logits(self, LinearRows::All)?) }
-    fn work(&self) -> Int4Work { Int4Session::work(self) }
+    fn work(&self) -> Result<Int4Work, Int4JsonError> { Ok(Int4Session::work(self)) }
     fn abort(&mut self) { Int4Session::abort(self); }
 }
 trait Vocabulary {
@@ -331,6 +338,10 @@ where V: Vocabulary, D: Driver, S: Selection, E: From<Int4JsonError>, F: FnOnce(
 fn run<V: Vocabulary, D: Driver, S: Selection>(group_width: usize, prompt: &[u32], program: &JsonProgram, vocabulary: &V,
     options: &JsonDecodeOptions, budget: Int4JsonBudget, driver: &mut D, selection: &mut S) -> Result<Int4JsonRun, Int4JsonError> {
     preflight(group_width, prompt, vocabulary, options, budget)?;
+    let retained = driver.retained_prompt_positions();
+    if retained >= prompt.len() {
+        return Err(JsonDecodeError::InvalidRequest("replayed prompt must forward its final token").into());
+    }
     let mut tokens = Vec::new();
     tokens.try_reserve_exact(options.max_new_tokens).map_err(|_| JsonDecodeError::AllocationRefused)?;
     let mut bytes = Vec::new();
@@ -338,7 +349,7 @@ fn run<V: Vocabulary, D: Driver, S: Selection>(group_width: usize, prompt: &[u32
     driver.append_prompt(prompt)?;
     let mut logits = driver.logits()?;
     checked_logits(&logits, vocabulary.width())?;
-    let mut positions = prompt.len() as u64;
+    let mut positions = (prompt.len() - retained) as u64;
     let mut projected = vocabulary.width() as u64;
     let mut charged = 0_u64;
     let mut state = program.initial_state();
@@ -354,8 +365,8 @@ fn run<V: Vocabulary, D: Driver, S: Selection>(group_width: usize, prompt: &[u32
         if selected == options.eos_token_id {
             let json = String::from_utf8(bytes).map_err(|_| JsonDecodeError::IndependentValidation)?;
             program.validate_json(&json).map_err(|_| JsonDecodeError::IndependentValidation)?;
-            let model_work = driver.work();
-            if model_work != Int4Work::for_sequence(group_width, 0, positions as usize, projected as usize)? {
+            let model_work = driver.work()?;
+            if model_work != Int4Work::for_sequence(group_width, retained, positions as usize, projected as usize)? {
                 return Err(Int4JsonError::WorkMismatch);
             }
             if let Some(cause) = driver.control().checkpoint(step) { return Err(JsonDecodeError::Cancelled(cause).into()); }

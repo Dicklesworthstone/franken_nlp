@@ -12,12 +12,18 @@ use crate::native_engine::{
 };
 
 pub const INT4_JSON_SAMPLED_EXECUTION: &str = "grouped-int4-sampled-constrained-json-final-prefill-head-v1";
+/// Explicit physical schedule: only the first sample prefills the complete
+/// prompt. Later independent samples replay its final token from the retained
+/// same-session prefix. Draw addresses still use INT4_JSON_SAMPLED_EXECUTION.
+pub const INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION: &str =
+    "grouped-int4-sampled-constrained-json-reused-prefill-v1";
 /// Grammar legality precedes temperature, bounded top-k and exact nucleus.
 /// The addressed draw itself uses the pinned `fnlp-sampler-v1` primitive.
 pub const JSON_SAMPLER_VERSION: &str = "fnlp-json-mask-temperature-k-p-addressed-v1";
 
 const MAX_IDENTITY_TEXT_BYTES: usize = 4096;
 const IDENTITY_WORKSPACE_BYTES: u64 = 128 * 1024;
+const MAX_REUSED_PREFILL_SAMPLES: usize = 32;
 
 /// An explicit effective seed and semantic sample address. There is no global
 /// RNG, implicit entropy, retry, repetition penalty or physical-row address.
@@ -141,6 +147,195 @@ where C: DecodeStepControl, E: From<Int4JsonError>, F: FnOnce(Int4JsonRun) -> Re
         None => drive_selected(group_width, prompt, program, vocabulary, options, budget,
             &mut session, &mut selection, finalize),
     }
+}
+
+/// Execute independently addressed samples with one exclusive causal cache.
+/// Only this crate's sealed task composition may use the replay seam. Its
+/// complete cold-work admission remains a valid conservative ceiling; this
+/// function also checks the exact reused maximum before opening the session.
+///
+/// Every returned run reports ACTUAL work. The first sample forwards the full
+/// prompt, while later samples retain prompt_len-1 completed positions and
+/// reforward the final token before selecting anything. No hidden-state/KV
+/// copy, fork, new native budget, cross-axis cache or cross-request cache exists.
+/// All samples keep the exact original prompt/identity/address for sampling.
+/// The finalizer runs inside the live session, and any error poisons it before
+/// Drop clears all 44 slots. Already executed work is never refunded.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_json_int4_sampled_reusing_prefill_with<C, T, E, F>(
+    engine: &mut StrictInt4Engine<'_>, identity: &ExecutionIdentity, prompt: &[u32],
+    program: &JsonProgram, vocabulary: &VocabMaskOracle, options: &JsonDecodeOptions,
+    sampling: &[JsonSamplingOptions], budget: Int4JsonBudget, max_sampler_bytes: u64,
+    prefill: Option<Int4PrefillLimits>, control: &mut C, finalize: F,
+) -> Result<Vec<T>, E>
+where C: DecodeStepControl, E: From<Int4JsonError>,
+    F: FnMut(usize, Int4JsonRun) -> Result<T, E> {
+    if let Some(limits) = prefill { limits.validate().map_err(Int4JsonError::from).map_err(E::from)?; }
+    check_reused_sampling(sampling, max_sampler_bytes).map_err(E::from)?;
+    check_request(engine, identity, prompt, vocabulary, options, budget).map_err(E::from)?;
+    let group_width = engine.model_identity().group_width();
+    repeated_preflight(group_width, prompt, vocabulary, options, sampling.len(), budget)
+        .map_err(E::from)?;
+    if let Some(cause) = control.checkpoint(0) {
+        return Err(E::from(Int4JsonError::Decode(JsonDecodeError::Cancelled(cause))));
+    }
+    let mut session = engine.session(budget.native, control).map_err(Int4JsonError::from).map_err(E::from)?;
+    drive_reused_prefill(group_width, identity, prompt, program, vocabulary, options,
+        sampling, budget, max_sampler_bytes, prefill, &mut session, finalize)
+}
+
+fn check_reused_sampling(sampling: &[JsonSamplingOptions], max_sampler_bytes: u64)
+    -> Result<(), Int4JsonError> {
+    if sampling.is_empty() || sampling.len() > MAX_REUSED_PREFILL_SAMPLES {
+        return Err(JsonDecodeError::InvalidRequest("reused-prefill sample count").into());
+    }
+    for sample in sampling { sample.validate()?; }
+    check_sampler_budget(max_sampler_bytes)
+}
+
+fn repeated_preflight<V: Vocabulary>(group_width: usize, prompt: &[u32], vocabulary: &V,
+    options: &JsonDecodeOptions, samples: usize, budget: Int4JsonBudget)
+    -> Result<Int4Work, Int4JsonError> {
+    if samples == 0 || samples > MAX_REUSED_PREFILL_SAMPLES {
+        return Err(JsonDecodeError::InvalidRequest("reused-prefill sample count").into());
+    }
+    let cold = preflight(group_width, prompt, vocabulary, options, budget)?;
+    let projected = options.max_new_tokens.checked_mul(vocabulary.width()).ok_or(StrictInt4Error::Work)?;
+    // A later sample performs the final prompt position and each generated
+    // non-EOS token. Attention still sees every retained earlier position.
+    let warm = Int4Work::for_sequence(group_width, prompt.len() - 1, options.max_new_tokens, projected)?;
+    let mut complete = cold;
+    for _ in 1..samples { complete = complete.checked_add(warm)?; }
+    let mask_charge = (vocabulary.mask_charge(budget.json.mask_limits) as u64)
+        .checked_mul(options.max_new_tokens as u64)
+        .and_then(|one| one.checked_mul(samples as u64)).ok_or(StrictInt4Error::Work)?;
+    if complete.forward_positions > budget.native.max_forward_positions
+        || complete.attention_pairs > budget.native.max_attention_pairs
+        || !complete.projections.fits(budget.native.max_projection_work)
+        || complete.forward_positions > budget.json.max_forward_positions
+        || complete.projected_logits > budget.json.max_projected_logits
+        || mask_charge > budget.json.max_total_mask_node_visits {
+        return Err(JsonDecodeError::BudgetExceeded("complete reused-prefill work").into());
+    }
+    Ok(complete)
+}
+
+// This seam is private and cannot be implemented by a product caller. A real
+// session keeps its native ledger, model, controller and cache owner together.
+trait ReplayDriver: prefill::PrefillDriver {
+    fn rewind_for_replay(&mut self, retain: usize) -> Result<(), Int4JsonError>;
+}
+impl<C: DecodeStepControl> ReplayDriver for Int4Session<'_, '_, C> {
+    fn rewind_for_replay(&mut self, retain: usize) -> Result<(), Int4JsonError> {
+        Ok(Int4Session::rewind_for_replay(self, retain)?)
+    }
+}
+
+struct PromptReplay<'a, D> {
+    inner: &'a mut D, baseline: Int4Work, retained: usize, replay: bool,
+    prefill: Option<Int4PrefillLimits>,
+}
+impl<D: ReplayDriver> Driver for PromptReplay<'_, D> {
+    type Control = D::Control;
+    fn control(&mut self) -> &mut Self::Control { self.inner.control() }
+    fn append(&mut self, token: u32) -> Result<(), Int4JsonError> { self.inner.append(token) }
+    fn append_prompt(&mut self, prompt: &[u32]) -> Result<(), Int4JsonError> {
+        if self.retained >= prompt.len() || (!self.replay && self.retained != 0)
+            || (self.replay && self.retained + 1 != prompt.len()) {
+            return Err(Int4JsonError::WorkMismatch);
+        }
+        if self.replay {
+            self.inner.rewind_for_replay(self.retained)?;
+            if let Some(cause) = self.inner.control().prefill_checkpoint(self.retained) {
+                return Err(JsonDecodeError::Cancelled(cause).into());
+            }
+            self.inner.append(prompt[self.retained])
+        } else {
+            match self.prefill {
+                Some(limits) => self.inner.append_layer_major(prompt, limits),
+                None => self.inner.append_prompt(prompt),
+            }
+        }
+    }
+    fn logits(&mut self) -> Result<Vec<f32>, Int4JsonError> { self.inner.logits() }
+    fn work(&self) -> Result<Int4Work, Int4JsonError> { work_delta(self.inner.work()?, self.baseline) }
+    fn retained_prompt_positions(&self) -> usize { self.retained }
+    fn abort(&mut self) { self.inner.abort(); }
+}
+
+fn work_delta(total: Int4Work, before: Int4Work) -> Result<Int4Work, Int4JsonError> {
+    let sub = |a: u64, b: u64| a.checked_sub(b).ok_or(Int4JsonError::WorkMismatch);
+    Ok(Int4Work { forward_positions: sub(total.forward_positions, before.forward_positions)?,
+        projected_logits: sub(total.projected_logits, before.projected_logits)?,
+        attention_pairs: sub(total.attention_pairs, before.attention_pairs)?,
+        projections: super::super::portable_int8::ProjectionWork {
+            dot_products: sub(total.projections.dot_products, before.projections.dot_products)?,
+            multiply_accumulates: sub(total.projections.multiply_accumulates, before.projections.multiply_accumulates)?,
+        } })
+}
+
+struct ReusedSelection(Sampled);
+impl Selection for ReusedSelection {
+    fn select(&mut self, logits: &[f32], mask: &DenseTokenMask, accepting: bool,
+        options: &JsonDecodeOptions, step: usize) -> Result<u32, Int4JsonError> {
+        self.0.select(logits, mask, accepting, options, step)
+    }
+    fn execution(&self) -> &'static str { INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drive_reused_prefill<V, D, T, E, F>(group_width: usize, identity: &ExecutionIdentity,
+    prompt: &[u32], program: &JsonProgram, vocabulary: &V, options: &JsonDecodeOptions,
+    sampling: &[JsonSamplingOptions], budget: Int4JsonBudget, max_sampler_bytes: u64,
+    prefill: Option<Int4PrefillLimits>, driver: &mut D, mut finalize: F) -> Result<Vec<T>, E>
+where V: Vocabulary, D: ReplayDriver, E: From<Int4JsonError>,
+    F: FnMut(usize, Int4JsonRun) -> Result<T, E> {
+    // Validate the complete operation before the first forward, not one fresh
+    // independent allowance for every sample. The native driver never resets.
+    check_reused_sampling(sampling, max_sampler_bytes).map_err(E::from)?;
+    if let Some(limits) = prefill { limits.validate().map_err(Int4JsonError::from).map_err(E::from)?; }
+    let complete = repeated_preflight(group_width, prompt, vocabulary, options, sampling.len(), budget)
+        .map_err(E::from)?;
+    let result = (|| {
+        if driver.work().map_err(E::from)? != Int4Work::default() {
+            return Err(E::from(Int4JsonError::WorkMismatch));
+        }
+        let mut output = Vec::new();
+        output.try_reserve_exact(sampling.len())
+            .map_err(|_| E::from(Int4JsonError::Decode(JsonDecodeError::AllocationRefused)))?;
+        let mut work = Int4Work::default();
+        let mut masks = 0_u64;
+        for (index, sample) in sampling.iter().enumerate() {
+            if let Some(cause) = driver.control().checkpoint(0) {
+                return Err(E::from(Int4JsonError::Decode(JsonDecodeError::Cancelled(cause))));
+            }
+            let mut selection = ReusedSelection(Sampled::new(identity, prompt, program, options,
+                sample, max_sampler_bytes).map_err(E::from)?);
+            let baseline = driver.work().map_err(E::from)?;
+            let mut replay = PromptReplay { inner: &mut *driver, baseline,
+                retained: if index == 0 { 0 } else { prompt.len() - 1 }, replay: index != 0, prefill };
+            let checked = drive_selected(group_width, prompt, program, vocabulary, options,
+                budget, &mut replay, &mut selection, |run| {
+                    work = work.checked_add(run.model_work).map_err(Int4JsonError::from).map_err(E::from)?;
+                    masks = masks.checked_add(run.output.mask_node_visit_charge)
+                        .filter(|&charge| charge <= budget.json.max_total_mask_node_visits)
+                        .ok_or_else(|| E::from(Int4JsonError::WorkMismatch))?;
+                    finalize(index, run)
+                })?;
+            output.push(checked);
+        }
+        if driver.work().map_err(E::from)? != work || work.forward_positions > complete.forward_positions
+            || work.projected_logits > complete.projected_logits || work.attention_pairs > complete.attention_pairs
+            || !work.projections.fits(complete.projections) {
+            return Err(E::from(Int4JsonError::WorkMismatch));
+        }
+        if let Some(cause) = driver.control().checkpoint(0) {
+            return Err(E::from(Int4JsonError::Decode(JsonDecodeError::Cancelled(cause))));
+        }
+        Ok(output)
+    })();
+    if result.is_err() { driver.abort(); }
+    result
 }
 
 fn check_sampler_budget(max_sampler_bytes: u64) -> Result<(), Int4JsonError> {

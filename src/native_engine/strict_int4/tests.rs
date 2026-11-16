@@ -101,6 +101,82 @@ fn unwind_between_forwards_keeps_engine_poisoned_after_cleanup() {
 }
 
 #[test]
+fn replay_retains_all_44_prefixes_and_requires_a_new_hidden_state() {
+    let mut cache = KvCache::try_with_capacity(4).unwrap();
+    for position in 0..3 {
+        for slot in 0..KV_SLOT_COUNT {
+            cache.append(slot, position, &[(position * 100 + slot) as u16; K],
+                &[(position * 100 + slot + 1) as u16; K]).unwrap();
+        }
+    }
+    let pointers: Vec<_> = (0..KV_SLOT_COUNT)
+        .map(|slot| (cache.key_at(slot, 0).unwrap().as_ptr(), cache.value_at(slot, 0).unwrap().as_ptr())).collect();
+    let mut state = RunState::default(); state.open().unwrap();
+    let mut hidden = Some(vec![Bf16::from_f32(3.0); H]);
+    rewind_for_replay(&mut cache, &mut state, &mut hidden, 1, &mut Continue).unwrap();
+    assert!(hidden.is_none()); assert!(state.check().is_ok());
+    assert!(cache.all_slots_have_len(1)); assert_eq!(cache.capacity_positions(), 4);
+    for slot in 0..KV_SLOT_COUNT {
+        assert_eq!(cache.key_at(slot, 0).unwrap(), &[slot as u16; K]);
+        assert_eq!(cache.value_at(slot, 0).unwrap(), &[(slot + 1) as u16; K]);
+        assert!(cache.key_at(slot, 1).is_err()); assert!(cache.value_at(slot, 2).is_err());
+        assert_eq!(pointers[slot], (cache.key_at(slot, 0).unwrap().as_ptr(), cache.value_at(slot, 0).unwrap().as_ptr()));
+        cache.append(slot, 1, &[900; K], &[901; K]).unwrap();
+        assert_eq!(cache.key_at(slot, 1).unwrap(), &[900; K]);
+    }
+    rewind_for_replay(&mut cache, &mut state, &mut hidden, 0, &mut Continue).unwrap();
+    assert!(cache.all_slots_have_len(0)); assert!(hidden.is_none());
+    end_session(&mut cache, &mut state);
+    assert!(!state.active); assert!(!state.poisoned);
+}
+
+#[test]
+fn replay_refuses_future_and_incomplete_positions_without_mutation() {
+    let mut cache = KvCache::try_with_capacity(3).unwrap();
+    for slot in 0..KV_SLOT_COUNT { cache.append(slot, 0, &[1; K], &[2; K]).unwrap(); }
+    let mut state = RunState::default(); state.open().unwrap();
+    let mut hidden = Some(vec![Bf16::from_f32(1.0); H]);
+    let before = cache.clone(); let before_hidden = hidden.clone();
+    assert_eq!(rewind_for_replay(&mut cache, &mut state, &mut hidden, 2, &mut Continue), Err(StrictInt4Error::Cache));
+    assert_eq!(cache, before); assert_eq!(hidden, before_hidden);
+    cache.append(0, 1, &[3; K], &[4; K]).unwrap();
+    let before = cache.clone();
+    assert_eq!(rewind_for_replay(&mut cache, &mut state, &mut hidden, 0, &mut Continue), Err(StrictInt4Error::Cache));
+    assert_eq!(cache, before); assert_eq!(hidden, before_hidden);
+    end_session(&mut cache, &mut state); assert!(cache.all_slots_have_len(0));
+}
+
+#[test]
+fn replay_cancellation_before_or_after_truncation_keeps_cause_and_poison() {
+    use DecodeCancellationKind::*;
+    struct Cancel { at: usize, calls: usize, cause: DecodeCancellationKind }
+    impl DecodeStepControl for Cancel {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            let cancel = self.calls == self.at; self.calls += 1; cancel.then_some(self.cause)
+        }
+    }
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        for at in 0..2 {
+            let mut cache = KvCache::try_with_capacity(2).unwrap();
+            for position in 0..2 {
+                for slot in 0..KV_SLOT_COUNT { cache.append(slot, position, &[1; K], &[2; K]).unwrap(); }
+            }
+            let mut state = RunState::default(); state.open().unwrap();
+            let mut hidden = Some(vec![Bf16::from_f32(1.0); H]);
+            let mut cancel = Cancel { at, calls: 0, cause };
+            assert_eq!(rewind_for_replay(&mut cache, &mut state, &mut hidden, 1, &mut cancel),
+                Err(StrictInt4Error::Cancelled(cause)));
+            assert!(state.poisoned); assert!(state.check().is_err());
+            assert!(cache.all_slots_have_len(if at == 0 { 2 } else { 1 }));
+            assert_eq!(hidden.is_none(), at == 1);
+            end_session(&mut cache, &mut state);
+            assert!(cache.all_slots_have_len(0)); assert!(state.poisoned); assert!(state.open().is_err());
+        }
+    }
+}
+
+#[test]
 fn native_projection_preserves_group_scaling_and_charges_actual_group_dots() {
     use super::super::portable_int8::int4::convert::{Int4ConversionBudget, Int4ConversionRequirement};
     let source = [7.0, 7.0, 70.0, 70.0].map(Bf16::from_f32);
@@ -163,6 +239,32 @@ fn model_present_prefill_append_sparse_full_and_session_cleanup_agree() {
         assert_eq!(session.logits(rows).unwrap(), expected); assert_eq!(session.work(), work);
     }
     assert!(engine.kv_cache().all_slots_have_len(0));
+
+    // Retaining the completed first position and replaying the final prompt
+    // token must reproduce the cold logits exactly without returning any
+    // already spent attention, forward or projection authority.
+    {
+        let cold = Int4Work::for_sequence(128, 0, 2, 3).unwrap();
+        let replay = Int4Work::for_sequence(128, 1, 1, 3).unwrap();
+        let complete = cold.checked_add(replay).unwrap();
+        let mut session = engine.session(Int4RunBudget::exact(complete), &mut control).unwrap();
+        assert_eq!(session.prefill(&[1, 2], rows).unwrap(), expected);
+        assert_eq!(session.work(), cold);
+        let remaining = (session.remaining_positions, session.remaining_attention);
+        session.rewind_for_replay(1).unwrap();
+        assert_eq!(session.position().unwrap(), 1);
+        assert_eq!(session.work(), cold);
+        assert_eq!((session.remaining_positions, session.remaining_attention), remaining);
+        assert_eq!(session.logits(rows), Err(StrictInt4Error::EmptyHidden));
+        session.append(2).unwrap();
+        assert_eq!(session.logits(rows).unwrap(), expected);
+        assert_eq!(session.work(), complete);
+        session.rewind_for_replay(1).unwrap();
+        assert_eq!(session.work(), complete);
+        assert_eq!(session.append(2), Err(StrictInt4Error::Work));
+        assert_eq!(session.position().unwrap(), 1);
+    }
+    assert!(engine.kv_cache().all_slots_have_len(0)); assert!(!engine.is_poisoned());
 
     // Exact-token/source-backed generation integration, not tokenizer or task
     // quality. Only the real loaded model can enter this public execute path.

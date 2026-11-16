@@ -55,10 +55,10 @@ impl Driver for Script {
         self.seen.push(token); Ok(())
     }
     fn logits(&mut self) -> Result<Vec<f32>, Int4JsonError> { self.heads += 1; Ok(self.row.clone()) }
-    fn work(&self) -> Int4Work {
+    fn work(&self) -> Result<Int4Work, Int4JsonError> {
         let mut work = Int4Work::for_sequence(self.group, 0, self.seen.len(), self.heads * self.row.len()).unwrap();
         if self.corrupt_work { work.projections.dot_products += 1; }
-        work
+        Ok(work)
     }
     fn abort(&mut self) { self.aborted = true; }
 }

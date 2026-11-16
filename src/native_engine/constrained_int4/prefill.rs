@@ -20,7 +20,8 @@ impl<D: PrefillDriver> Driver for LayerMajor<'_, D> {
         self.inner.append_layer_major(prompt, self.limits)
     }
     fn logits(&mut self) -> Result<Vec<f32>, Int4JsonError> { self.inner.logits() }
-    fn work(&self) -> Int4Work { self.inner.work() }
+    fn work(&self) -> Result<Int4Work, Int4JsonError> { self.inner.work() }
+    fn retained_prompt_positions(&self) -> usize { self.inner.retained_prompt_positions() }
     fn abort(&mut self) { self.inner.abort(); }
 }
 

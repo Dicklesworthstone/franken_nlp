@@ -300,6 +300,34 @@ impl<C: DecodeStepControl> Int4Session<'_, '_, C> {
         for &token in tokens { self.append(token)?; }
         self.logits(rows)
     }
+
+    /// Retain a completed prefix in this exclusive session and invalidate its
+    /// descendant hidden state. A caller must append a new token before
+    /// projecting again. This is destructive in-session replay, never a saved
+    /// cache, a fork, or authority to reuse another request's private prefix.
+    /// Native work and every remaining budget stay monotone across the rewind.
+    pub(crate) fn rewind_for_replay(&mut self, positions: usize) -> Result<(), StrictInt4Error> {
+        rewind_for_replay(&mut self.engine.cache, &mut self.engine.state,
+            &mut self.hidden, positions, self.control)
+    }
+}
+
+fn rewind_for_replay<C: DecodeStepControl>(cache: &mut KvCache, state: &mut RunState,
+    hidden: &mut Option<Vec<Bf16>>, positions: usize, control: &mut C) -> Result<(), StrictInt4Error> {
+    state.check()?;
+    let completed = cache.len_for_slot(0).map_err(|_| StrictInt4Error::Cache)?;
+    if positions > completed || !cache.all_slots_have_len(completed) {
+        return Err(StrictInt4Error::Cache);
+    }
+    // Once a valid replay starts, cancellation may not turn the current
+    // descendant or a partially completed rewind into a reusable session.
+    state.poisoned = true;
+    poll(control)?;
+    cache.rewind_completed(positions).map_err(|_| StrictInt4Error::Cache)?;
+    *hidden = None;
+    poll(control)?;
+    state.poisoned = false;
+    Ok(())
 }
 impl<C: DecodeStepControl> Drop for Int4Session<'_, '_, C> {
     fn drop(&mut self) { end_session(&mut self.engine.cache, &mut self.engine.state); }

@@ -174,7 +174,7 @@ impl Driver for Single<'_> {
         self.driver.append_group(&[Int4CohortToken { sequence: self.slot, token }])
     }
     fn logits(&mut self) -> Result<Vec<f32>, Int4JsonError> { self.driver.logits_group(&[self.slot]) }
-    fn work(&self) -> Int4Work { GroupDriver::work(self.driver, self.slot).unwrap() }
+    fn work(&self) -> Result<Int4Work, Int4JsonError> { GroupDriver::work(self.driver, self.slot) }
     fn abort(&mut self) { self.driver.abort(); }
 }
 #[test]
