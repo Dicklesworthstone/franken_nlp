@@ -37,6 +37,7 @@ use super::{SentimentAxis, SentimentRequest};
 pub const SAMPLED_SENTIMENT_EXECUTION: &str = "grouped-int4-independent-sampled-sentiment-v1";
 pub const SAMPLED_SENTIMENT_PROMPT_VERSION: &str = "sentiment-sampled-score-justification-v1";
 pub const SAMPLED_SENTIMENT_AGGREGATION_VERSION: &str = "canonical-axis-sample-population-moments-v1";
+pub const SAMPLED_SENTIMENT_ITEM_ADDRESS_VERSION: &str = "sampled-sentiment-item-address-v1";
 pub const MAX_SENTIMENT_SAMPLES: usize = 32;
 const PROMPT_DATA: &str = include_str!("../presets/sentiment_sampled_v1.json");
 const DOCUMENT_SLOT: &str = "FNLP_INTERNAL_SAMPLED_SENTIMENT_DOCUMENT_61ed7a";
@@ -224,6 +225,11 @@ impl SampledSentimentPlanner {
     pub fn group_width(&self) -> usize { self.group_width }
     pub fn task_budget(&self) -> TaskBudget { self.ceiling }
     pub fn limits(&self) -> SampledSentimentLimits { self.limits }
+    /// Only the durable adapter may freeze the actual private sampling policy.
+    /// The seed remains inside the owned job's keyed recipe commitment.
+    #[cfg(all(feature = "metadata-store", target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(crate) fn durable_options(&self) -> &SampledSentimentOptions { &self.options }
     pub fn encoding_workspace_bytes(&self) -> Result<u64, SampledSentimentError> {
         self.compiler.encoding_workspace_bytes()
     }
@@ -835,7 +841,7 @@ fn item_address_digest(identity: &ExecutionIdentity, item_id: &str) -> Result<Sh
     // sampler key. This retains model, source, task, grammar, policy, seed and
     // group bindings. Neither this digest nor the ID is added to task output.
     let prior = identity.receipt_identity().map_err(|_| SampledSentimentError::Identity)?.to_hex();
-    let parts = [b"sampled-sentiment-item-address-v1".as_slice(), prior.as_bytes(), item_id.as_bytes()];
+    let parts = [SAMPLED_SENTIMENT_ITEM_ADDRESS_VERSION.as_bytes(), prior.as_bytes(), item_id.as_bytes()];
     let bytes = parts.iter().try_fold(0_usize, |size, part|
         size.checked_add(8).and_then(|size| size.checked_add(part.len())))
         .ok_or(SampledSentimentError::Accounting)?;

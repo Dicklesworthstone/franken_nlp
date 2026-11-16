@@ -119,6 +119,12 @@ impl SampledSentimentBatchPlanner {
     pub fn limits(&self) -> SampledSentimentBatchLimits { self.limits }
     pub fn document_encoding(&self) -> &UntrustedEncoding { self.planner.input_encoding() }
     pub fn preparation_requirement_bytes(&self) -> u64 { self.preparation_bytes }
+    #[cfg(all(feature = "metadata-store", target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(crate) fn durable_configuration(&self)
+        -> (&crate::tasks::sentiment::sampled::SampledSentimentOptions, SampledSentimentLimits) {
+        (self.planner.durable_options(), self.planner.limits())
+    }
 
     fn prepare<C: DecodeStepControl>(&self, document: BatchDocument<SampledSentimentBatchArgs>,
         control: &mut C) -> Result<PreparedSampledSentiment, BatchItemFailure> {
@@ -170,6 +176,7 @@ impl PreparedSampledSentimentRecord {
     pub fn execution_identity(&self) -> &ExecutionIdentity { self.record.plan.execution_identity() }
     pub fn model_work(&self) -> Int4Work { self.record.plan.planned_work() }
     pub fn mask_node_visits(&self) -> u64 { self.record.mask_node_visits }
+    pub fn max_result_bytes(&self) -> u64 { self.record.plan.max_result_bytes() }
 }
 
 /// One native engine serves every independently reset sample in every record.
