@@ -1,12 +1,14 @@
 //! Model-free failure/admission regressions on the actual process-owned host.
 #![cfg(feature = "asupersync-runtime")]
-use std::{path::PathBuf, sync::{Mutex, OnceLock}, time::Duration};
+use std::{fs::{self, OpenOptions}, io::Write, path::PathBuf,
+    sync::{Mutex, OnceLock, atomic::{AtomicU64, Ordering}}, time::Duration};
 use franken_nlp::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy,
     hosted::{HostedError, Int4HostError, RunLimits, CancellationToken},
     native_engine::{decode::DecodeCancellationKind, strict_int4::weights::snapshot::{
         Int4SnapshotBudget, Int4SnapshotPin, Int4SnapshotRequirements, Int4SnapshotError}}};
 static SERIAL: Mutex<()> = Mutex::new(());
 static ENGINE: OnceLock<NlpEngine> = OnceLock::new();
+static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 fn engine() -> &'static NlpEngine {
     ENGINE.get_or_init(|| NlpEngine::builder().resource_config(ResourceHostConfig {
         runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
@@ -25,6 +27,16 @@ fn run() -> RunLimits { RunLimits { max_elapsed: Duration::from_secs(120), max_c
 fn missing() -> PathBuf {
     let path = std::env::temp_dir().join(format!("fnlp-missing-int4-snapshot-{}", std::process::id()));
     assert!(!path.exists(), "test refuses to touch an existing snapshot"); path
+}
+fn fixture_dir() -> PathBuf {
+    let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("fnlp-hosted-snapshot-{}-{sequence}", std::process::id()));
+    fs::create_dir(&path).unwrap(); path
+}
+fn format_refusal(engine: &NlpEngine, path: PathBuf) {
+    let error = engine.load_int4_snapshot(path, pin(), budget(), 64 << 20, run(), CancellationToken::default()).err().unwrap();
+    assert!(matches!(error, HostedError::Int4(Int4HostError::Snapshot(Int4SnapshotError::Format))));
+    drained(engine);
 }
 fn drained(engine: &NlpEngine) {
     let memory = engine.resources().memory_snapshot();
@@ -67,4 +79,52 @@ fn reentry_refuses_snapshot_loading_without_an_extra_compute_domain() {
     let _serial = SERIAL.lock().unwrap(); let engine = engine(); let _entry = engine.enter_sync_call().unwrap();
     let error = engine.load_int4_snapshot(missing(), pin(), budget(), 64 << 20, run(), CancellationToken::default()).err().unwrap();
     assert!(matches!(error, HostedError::Reentrant)); drained(engine);
+}
+#[test]
+fn malformed_snapshot_paths_leave_the_process_host_available() {
+    let _serial = SERIAL.lock().unwrap(); let engine = engine(); let root = fixture_dir();
+    format_refusal(engine, root.clone());
+    let short = root.join("short");
+    let mut file = OpenOptions::new().write(true).create_new(true).open(&short).unwrap();
+    file.write_all(b"incomplete snapshot").unwrap(); drop(file);
+    format_refusal(engine, short.clone());
+    assert_eq!(fs::read(short).unwrap(), b"incomplete snapshot");
+    #[cfg(unix)]
+    {
+        let link = root.join("snapshot-link");
+        std::os::unix::fs::symlink(root.join("short"), &link).unwrap();
+        format_refusal(engine, link.clone());
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+    }
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn fifo_snapshot_is_refused_before_a_blocking_open_and_releases_host_charges() {
+    use std::os::unix::fs::FileTypeExt;
+    let _serial = SERIAL.lock().unwrap(); let engine = engine(); let path = fixture_dir().join("fifo");
+    assert!(std::process::Command::new("mkfifo").arg(&path).status().unwrap().success());
+    // Rescue the old blocking-open bug after a finite watchdog interval, so
+    // this regression fails instead of hanging the entire production suite.
+    // Linux opens a FIFO for read+write without waiting for another endpoint.
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let rescue_path = path.clone();
+        let watchdog = scope.spawn(move || {
+            match finished.recv_timeout(Duration::from_secs(5)) {
+                Ok(()) => false,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let _rescue = OpenOptions::new().read(true).write(true).open(&rescue_path).unwrap();
+                    let _ = finished.recv_timeout(Duration::from_secs(5));
+                    true
+                }
+                Err(error) => panic!("snapshot watchdog disconnected: {error}"),
+            }
+        });
+        format_refusal(engine, path.clone());
+        let _ = done.send(());
+        assert!(!watchdog.join().unwrap(), "snapshot load blocked opening a FIFO before regular-file validation");
+    });
+    assert!(fs::symlink_metadata(&path).unwrap().file_type().is_fifo());
+    // The process-owned compute domain is still usable after the rejection.
+    format_refusal(engine, path.parent().unwrap().to_owned());
 }
