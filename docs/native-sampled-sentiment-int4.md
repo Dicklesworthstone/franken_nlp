@@ -1,9 +1,10 @@
 # Native INT4 sampled sentiment
 
-The explicit candidate commands `fnlp candidate source-int4 sentiment-sampled`
-and `fnlp candidate source-int4 sentiment-sampled-batch` generate independent
-scores and explanations on the local grouped-INT4 candidate. The first accepts
-one document; the second serves a bounded ordered NDJSON stream with one resident
+The explicit candidate commands `fnlp candidate source-int4 sentiment-sampled`,
+`sentiment-sampled-batch` and `sentiment-sampled-job start|resume` generate
+independent scores and explanations on the local grouped-INT4 candidate. They
+accept one document, serve a bounded ordered NDJSON stream, or retain and resume
+an authenticated population, respectively. Population routes use one resident
 model. They implement the independent generation portion of plan §7.5,
 Mode B. Each axis and sample starts from an empty logical KV cache and its
 own semantic sample address. It does not sample the distribution-mode bins.
@@ -11,6 +12,7 @@ own semantic sample address. It does not sample the distribution-mode bins.
 This surface requires the `asupersync-runtime` implementation. The repository's
 controller production-build, native parity and task-quality gates still apply;
 this change does not promote the no-flag public sentiment command.
+Durable jobs additionally require `metadata-store` on Linux x86-64 or AArch64.
 
 ## Request and command
 
@@ -227,8 +229,8 @@ entire semantic bundle, including earlier successful samples.
 This route accepts the scalar or explicitly selected supported packed kernel,
 with serial scheduling and byte input encoding as defaults. It rejects text-generation
 processors, stops, token biases and logprobs.
-Focus-area presets, sampled durable jobs, statistical intervals
-and automatic default selection are outside this implementation slice.
+Focus-area presets, statistical intervals and automatic default selection are
+outside this implementation slice.
 
 ## Resident NDJSON populations
 
@@ -405,6 +407,163 @@ There is no implicit schedule fallback or renewal of native/mask work at
 worker, item or epoch boundaries. Memory reservations are modeled commitments,
 not measured RSS.
 
+## Durable sampled populations
+
+`fnlp candidate source-int4 sentiment-sampled-job start|resume` connects the
+same complete sampled bundles to the authenticated job runner. It retains each
+completed result, skips committed items on resume, and durably charges every
+attempt against the original job's five native counters and grammar-mask limit.
+The model, vocabulary and native engine are reused throughout an invocation.
+
+Use unique `{id,text,task_args?}` records, such as:
+
+```jsonl
+{"id":"review-1","text":"The support agent fixed the problem quickly.","task_args":{"axes":["valence","arousal"]}}
+{"id":"review-2","text":"The repeated failures were frustrating.","task_args":{"axes":["valence","arousal"]}}
+```
+
+IDs are unique across the entire frozen population. Flush controls are refused.
+The same closed `task_args` contract as the batch route accepts axes and a
+complete budget that can only tighten the invocation's task ceiling. Each item
+must fit one native context. Its entire requested sample bundle must validate
+before it can commit; a successful prefix of samples is never a successful item.
+
+Prepare an existing owner-only job directory, a protected regular key file
+containing exactly 32 random **raw bytes**, a random job ID represented by 32
+lowercase hexadecimal characters, and an immutable `JobLimits` file. These are
+the existing [owned job storage](owned-jobs.md) requirements. The command requires
+`--store-results` and creates neither the directory nor the key.
+
+For example, `sampled-job-limits.json` can declare these finite ceilings:
+
+```json
+{
+  "max_items": 100,
+  "max_id_bytes": 128,
+  "max_input_bytes_per_item": 8192,
+  "max_snapshot_bytes": 8388608,
+  "max_result_bytes": 1048576,
+  "max_spool_bytes": 268435456,
+  "max_materialized_bytes": 268435456,
+  "max_journal_bytes": 67108864,
+  "max_attempts": 120,
+  "max_work": {
+    "model": {
+      "forward_positions": 1310720,
+      "projected_logits": 10000000000,
+      "attention_pairs": 1000000000000,
+      "projections": {
+        "dot_products": 1000000000000,
+        "multiply_accumulates": 10000000000000000
+      }
+    },
+    "mask_node_visits": 320000000000
+  }
+}
+```
+
+These limits bound admitted work and storage; they do not predict how many
+documents will fit. All six per-item work ceilings must fit their corresponding
+lifetime ceiling. Unlike finite distribution scoring, sampled jobs require a
+positive mask budget.
+
+Start and explicitly retain both the completed results and the original inputs:
+
+```sh
+fnlp candidate source-int4 sentiment-sampled-job start sentiment-population.ndjson \
+  --snapshot /path/to/local-int4-snapshot \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --memory-mib 16384 --group-width 128 --max-input-bytes 8192 \
+  --seed 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --samples 4 --input-encoding safe-bpe-v1 --compute-threads 4 \
+  --store-results --job-dir /private/sampled-job \
+  --job-id "$JOB_ID" --key-file /private/sampled-job.key \
+  --limits sampled-job-limits.json \
+  --spool-input --max-retained-input-mib 64 --materialize
+```
+
+Resume without opening the original population or reading population stdin:
+
+```sh
+fnlp candidate source-int4 sentiment-sampled-job resume \
+  --snapshot /path/to/local-int4-snapshot \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --memory-mib 16384 --group-width 128 --max-input-bytes 8192 \
+  --seed 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --samples 4 --input-encoding safe-bpe-v1 --compute-threads 4 \
+  --store-results --job-dir /private/sampled-job \
+  --job-id "$JOB_ID" --key-file /private/sampled-job.key \
+  --limits sampled-job-limits.json \
+  --use-retained-input --max-retained-input-mib 64 --materialize
+```
+
+Use a population containing only unique document records, without the flush and
+duplicate-ID examples from the streaming section. Source conversion using
+`--source-dir` plus `--source-manifest`, with optional `--save-snapshot NEW_FILE`,
+is also available. The declared memory ceiling must cover the selected model,
+context, input mode and job buffers; there is no automatic admission fallback.
+
+Input retention is separate from result retention. Without `--spool-input`,
+supply the complete original population to every `resume`, including committed
+records. Retained replay instead authenticates the saved population with one
+record's payload in memory at a time. Its complete ordered identity index still
+obeys the original item and snapshot ceilings. See
+[retained input replay](retained-inputs.md) for exact storage and recovery rules.
+
+### Immutable replay and complete work charges
+
+Repeat the original effective seed, sample count, temperature, top-k/top-p,
+sample token and explanation bounds, grammar limits, task ceilings, encoding
+policy and all native/mask limits. The private recipe is derived from the actual
+owned planner and model, not caller-supplied replacement identity fields. It
+includes every sampled implementation version and the exact lifetime limits.
+Changing the original record bytes, IDs, order, model/group or recipe refuses
+resume before any permitted result-tail repair. Seed and recipe bytes are not
+copied into public metadata.
+
+The five native-work flags and `--max-mask-node-visits` bound **each item** on
+this route. `JobLimits.max_work` is the sole **whole-job lifetime authority**.
+Each prepared attempt reserves its complete maximum-token schedule, including
+every axis, sample, repeated prompt and grammar-mask allowance, before native
+execution. Early EOS, failed samples, interrupted attempts and later invocations
+do not refund that work. Actual complete result accounting remains in the
+private output; progress reports the durable reservation. Neither `max_items`
+nor `max_attempts` multiplies work authority.
+
+Results are synced to the spool before their journal pointer commits, with the
+output's resource guard retained through both operations. Uncommitted tails or
+output stages are refused by default. Explicit `resume --discard-uncommitted-tail`
+selects the existing recovery policy only after authenticating the original
+contract. Retained-input corruption is never repaired by that flag.
+
+Serial execution is the default. `--compute-threads 2..64` retains one numerical
+team for the invocation; alternatively, `--compute-threads 1 --prefill-rows 1..64`
+uses one admitted layer-major prompt workspace across every fresh sample. Both
+support compact input. The physical schedule can change on an authenticated
+resume without changing sample addresses or replenishing work. All workers join
+and native allocations drain before progress returns. Original cancellation and
+the absolute deadline are rechecked even for an already-completed job and during
+metadata publication. Source review alone establishes no cross-schedule parity
+or performance result.
+
+Stdout uses `fnlp-candidate-int4-sentiment-sampled-job-v1` and contains candidate
+provenance, optional physical schedule metadata, and authenticated progress.
+It omits documents, scores, explanations, raw seeds and private recipe bytes.
+`--materialize` publishes ordered `materialized.ndjson` only after every item
+commits. Existing `fnlp job status`, `verify` and `materialize` work without
+loading the model. A failure can follow durable progress; it does not imply
+rollback or authorize restarting as a fresh job.
+
+Library callers build `SampledSentimentJobPlanner` from the real
+`SampledSentimentBatchPlanner` and exact `JobLimits`, then use
+`NlpEngine::job_int4_sampled_sentiment`,
+`NlpEngine::job_int4_sampled_sentiment_with_threads`, or
+`NlpEngine::job_int4_sampled_sentiment_layer_major` with `SourceJobRequest` and
+`JobHostLimits`. Admission includes the selected input owner, caller and host
+preparation, journal and serializer buffers, model, full native KV, one sampler,
+physical workspace and complete guarded result. The existing job format and
+authentication protocol are reused.
+
 ## Verification status
 
 The change includes source regressions for grammar legality and actual-program
@@ -441,6 +600,18 @@ source/snapshot/save CLI routes and public schedule provenance.
 These are source definitions and independent review, not executed batch or
 real-model evidence. Batch parity, replay, failure and physical-drain evidence
 remain part of the controller's model-present gates.
+
+Durable-job regression definitions additionally cover planner-derived seed and
+policy authentication, exact lifetime limits, failed-attempt debits, committed
+item skipping, authentication before repair, guarded spool/journal publication,
+actual input-mode memory admission and CLI rejection before private IO.
+An explicitly ignored independently pinned real-snapshot fixture compares
+completed durable bundles, materialized bytes and reserved work across serial,
+four-worker and four-row prefill schedules within each encoding policy. It also
+checks retained replay without external input, completed-job cancellation,
+changed-seed refusal and physical drain. CLI runtime definitions cover private
+metadata exclusion and cancellation/deadline checks around final publication.
+These additions have source review only; their test bodies have not run.
 
 Rust compilation, executable fixtures, production DSR qualification, real-model
 replay/cancellation and human-label quality evaluation remain **UNRUN**. The

@@ -1163,6 +1163,15 @@ versioned prompt and sampler; existing distribution sentiment is unchanged.
 See [sampled sentiment usage and limits](docs/native-sampled-sentiment-int4.md)
 for commands, result fields, reproducibility, admission and validation status.
 
+`sentiment-sampled-job start|resume` adds explicit durable populations with the
+same native sampler. It authenticates the original seed, complete settings,
+model, ordered inputs and lifetime work before recovery; committed bundles are
+skipped and failed attempts remain charged. Results stay in the protected
+spool, with metadata-only stdout and optional retained-input replay. Serial,
+persistent-worker and layer-major prompt routes share this contract. See
+[durable sampled jobs](docs/native-sampled-sentiment-int4.md#durable-sampled-populations)
+for complete start/resume commands and required storage limits.
+
 ## Implemented candidate compact faithfulness maps
 
 `fnlp candidate source-int4 faithfulness-map` accepts
