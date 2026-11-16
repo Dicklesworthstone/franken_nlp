@@ -218,6 +218,15 @@ rows compose with the same fixed object policy. Provenance adds only policy
 versions and declared limits, without exposing schema contents or private
 schema commitments.
 
+Add `--input-encoding safe-bpe-v1` and the four tokenizer limits from the
+compact-input example to use the same bounded partial-schema/source encoding
+for each corpus document. It composes with selected rows and either chunk
+cohorts or the corpus route's persistent CPU team. The CLI and host quote one
+encoder beside the complete object frontier. Each complete preparation gets
+the same fixed allowance; flush controls and corpus size do not turn it into
+a lifetime tokenizer-work cap. Completed object records retain their compact
+policy and actual preparation work in the partial-map metadata.
+
 Whole-run native-work, mask and verification allowances cover every admitted
 attempt. Exact `{"flush":true}` controls reset the duplicate-ID epoch without
 renewing those allowances. Earlier completed documents remain valid if a later
@@ -251,6 +260,17 @@ Original schema bytes, object policy, prompt and derivation versions, every
 parts of the private recipe. Two original schemas with different required
 fields cannot share resume authority even if their partial chunk schemas
 coincide. Omitting object mode keeps existing ordinary-job recipes unchanged.
+
+Compact object jobs accept the same `--input-encoding safe-bpe-v1` option on
+start, resume and retained-input replay. The private recipe authenticates its
+four exact tokenizer ceilings in addition to the original schema and reducer
+settings. Preserve all four ceilings on resume even when a different cap would
+produce the same tokens. Byte and compact jobs, or compact jobs with different
+ceilings, cannot share resume authority. Reconstructed attempts each spend one
+fresh bounded preparation under that authenticated policy; native work and
+verification continue to follow the durable lifetime limits. Public progress
+adds the encoding policy without exposing source, schema, recipe commitments
+or retained results.
 
 Explicit input retention composes with object reconciliation. Add
 `--spool-input --max-retained-input-mib 512` on start to retain private input
@@ -306,12 +326,21 @@ binds the original schema, derived schema, original source, all actual chunk
 identities and reconciliation limits; completion verifies the exact retained
 chunk outputs and evidence against that binding.
 
-Library callers construct `Int4ObjectExtractionPlanner` from an unconfigured,
-model-bound `Int4ExtractionBatchPlanner`, then use
+Library callers construct `Int4ObjectExtractionPlanner` from a model-bound
+`Int4ExtractionBatchPlanner` without per-document defaults, then use
 `plan_document_with_control` with `Int4ObjectExtractionMapLimits`. Hosted callers
 use `NlpEngine::extract_int4_object_document` with
 `Int4ObjectExtractionMapConfig`, keeping the original request in its mapping
 config. No caller-supplied prompt hook is introduced.
+
+`with_document_encoding(UntrustedEncoding::SafeBpeV1(limits))` can configure
+either the base planner before wrapping it or the object planner afterward.
+Both orders produce the same fixed policy and preparation identity. Admit the
+encoder workspace before preparing input. Hosted callers include
+`config.mapping.input_bytes(source_capacity, planner.document_encoding())`
+alongside the existing object/native ownership quote; the host enforces the
+same charge. The object preflight exposes `document_encoding()` and
+`encoding_work()` for exact policy and cumulative preparation accounting.
 
 Library callers may configure the base planner with `with_selected_rows`
 before constructing `Int4ObjectExtractionPlanner`. Prepared object maps expose
@@ -345,6 +374,13 @@ workspace through output delivery. The pure
 supports callers without the hosted feature. Caller-owned factory preparation
 must also be covered by its explicit pre-IO reservation.
 
+For compact object streams, apply `with_document_encoding` before or after
+`with_root_object_reconciliation`. Quote with
+`int4_extraction_document_object_corpus_requirements_with_encoding` or the pure
+`requirements_with_root_object_and_encoding`, passing the exact encoding
+policy. These add one transient encoder independently of corpus size and
+cohort width, while retaining the original object schema/reducer reservation.
+
 `NativeInt4DocumentExtractionBatch` returns `Int4ExtractionDocumentRun`. Its
 `Map` variant preserves ordinary map JSON; its `Object` variant serializes the
 existing complete object envelope directly, without a new wrapper tag. The
@@ -374,6 +410,13 @@ factory to `NlpEngine::job_int4_extract_document` with the ordinary
 reconciliation ownership for hosted admission. The existing result guards
 survive spool synchronization and journal acknowledgement.
 
+Apply `with_document_encoding` to select compact object preparations. Its
+`encoding_workspace_bytes` quote and private recipe must agree exactly before
+preparation or recovery. Reapplying an identical policy preserves prepared
+ownership; selecting a different policy invalidates old preparations. The
+recipe retains the exact original schema even when different required sets
+would derive identical partial schemas and identical compact chunk prompts.
+
 ## Qualification status
 
 The implementation includes reducer, planner, hosted admission and CLI
@@ -385,8 +428,12 @@ physical counter tampering, underfunded native/decoder reservations and
 unchanged original-schema reconciliation. Population and durable regressions
 cover optional CLI modes, unchanged ordinary serialization, original-schema
 capacity beyond per-chunk caps, complete hosted memory, private recipe binding,
-retained replay, lifetime verification and public metadata privacy. Source
-review and diff hygiene do not establish compiled or executed behavior.
+retained replay, lifetime verification and public metadata privacy.
+Compact regressions cover exact source/schema decoding, template-control
+exclusion, all four cumulative preparation ceilings, rejected sizing probes,
+unchanged original evidence coordinates, policy drift, both builder orders,
+single-workspace memory quotes and authenticated object-job reconstruction.
+Source review and diff hygiene do not establish compiled or executed behavior.
 Compilation, executable regressions, model quality, numerical behavior and
 performance remain unrun pending the controller-owned DSR production checkpoint
 and model-present evaluation gates. There is no single-context equivalence or

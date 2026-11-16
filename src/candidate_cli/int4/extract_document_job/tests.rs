@@ -35,7 +35,8 @@ impl Write for NoIo {
 fn document_job_teams_preserve_semantic_and_lifetime_limits_across_resume() {
     for (operation, replay) in [("start", false), ("resume", false), ("resume", true)] {
         for mode in [&[][..], &["--root-array-union", "--source-membership", "--max-selected-rows", "32"][..],
-            &["--reconcile-root-object"][..], &["--input-encoding", "safe-bpe-v1"][..]] {
+            &["--reconcile-root-object"][..], &["--input-encoding", "safe-bpe-v1"][..],
+            &["--reconcile-root-object", "--input-encoding", "safe-bpe-v1"][..]] {
             let mut flags = mode.to_vec();
             if replay { flags.push("--use-retained-input"); }
             let (serial, serial_args) = command(operation, &flags);
@@ -89,8 +90,10 @@ fn document_job_teams_refuse_widths_and_mixed_schedules_before_storage_or_popula
 fn retained_compact_documents_bind_explicit_caps_on_start_resume_and_retained_replay() {
     use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
     for (operation, replay) in [("start", false), ("resume", false), ("resume", true)] {
+        for object in [false, true] {
         let mut flags = vec!["--cohort-chunks", "3", "--max-selected-rows", "32", "--source-membership"];
         if replay { flags.push("--use-retained-input"); }
+        if object { flags.push("--reconcile-root-object"); }
         let (plain, args) = command(operation, &flags);
         let before = plain.args.validate(&args).unwrap();
         flags.extend(["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "65536",
@@ -109,18 +112,24 @@ fn retained_compact_documents_bind_explicit_caps_on_start_resume_and_retained_re
         assert_eq!(after.mapping.verification, before.mapping.verification);
         let fixed = lifetime(&args, after);
         assert!(compact.args.lifetime_limits(&args, after, fixed).is_ok());
+        assert_eq!(compact.args.reconciliation.limits(compact.args.map.mapping).unwrap(),
+            plain.args.reconciliation.limits(plain.args.map.mapping).unwrap());
+        }
     }
 }
 
 #[test]
-fn retained_compact_policy_refuses_unsupported_object_mode_or_caps_before_private_io() {
+fn retained_compact_policy_refuses_invalid_caps_before_private_io() {
     for operation in ["start", "resume"] {
-        for flags in [vec!["--input-encoding", "safe-bpe-v1", "--reconcile-root-object"],
-            vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "0"],
+        for object in [false, true] {
+        for mut flags in [vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "0"],
             vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-output-tokens", "1048577"],
+            vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "0"],
             vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-bytes", "0"]] {
+            if object { flags.push("--reconcile-root-object"); }
             let (command, args) = command(operation, &flags);
             assert_eq!(command.execute_owned(args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+        }
         }
     }
 }

@@ -66,7 +66,7 @@ pub fn int4_extraction_document_object_corpus_requirements(width: usize, budget:
 
 /// The common pre-IO quote for the fixed document semantics and input policy.
 /// Compact exact-schema maps and root arrays are supported; compact partial
-/// root-object reconciliation is refused by both this quote and its compiler.
+/// root-object reconciliation retains the same bounded encoder workspace.
 #[allow(clippy::too_many_arguments)]
 pub fn int4_extraction_document_object_corpus_requirements_with_encoding(width: usize, budget: TaskBudget,
     document: Int4ExtractionMapLimits, limits: CorpusLimits, reduction_reserve_bytes: u64,

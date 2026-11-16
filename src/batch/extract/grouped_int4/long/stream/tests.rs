@@ -424,12 +424,34 @@ fn object_config() -> Int4ExtractionDocumentBatchConfig {
 }
 
 #[test]
-fn compact_partial_object_reconciliation_refuses_both_builder_orders_before_sources() {
+fn compact_partial_object_reconciliation_binds_both_builder_orders_and_every_policy_axis() {
     let compact = UntrustedEncoding::SafeBpeV1(compact_limits());
-    assert!(build(object_config()).unwrap().with_document_encoding(compact.clone()).unwrap()
-        .with_root_object_reconciliation(object_limits()).is_err());
-    let object = build(object_config()).unwrap().with_root_object_reconciliation(object_limits()).unwrap();
-    assert!(object.with_document_encoding(compact).is_err());
+    let before = build(object_config()).unwrap().with_document_encoding(compact.clone()).unwrap()
+        .with_root_object_reconciliation(object_limits()).unwrap();
+    let after = build(object_config()).unwrap().with_root_object_reconciliation(object_limits()).unwrap()
+        .with_document_encoding(compact.clone()).unwrap();
+    let prepared = snapshot(&before, SOURCE);
+    let repeated = snapshot(&after, SOURCE);
+    assert_eq!(before.document_encoding(), &compact);
+    assert_eq!(before.encoding_workspace_bytes().unwrap(), compact_limits().requirements().unwrap().workspace_bytes);
+    assert_eq!(before.request().schema, OBJECT);
+    assert_eq!(prepared.expected, repeated.expected);
+    assert_eq!(prepared.identities, repeated.identities);
+    assert_eq!(prepared.expected.mapped().document_encoding(), compact);
+    assert!(prepared.expected.mapped().encoding_work().unwrap().input_bytes() > SOURCE.len());
+    let plan = after.plan(SOURCE, &mut Continue, false).unwrap();
+    after.compare(&plan, &repeated, &mut Continue).unwrap();
+    for axis in 0..4 {
+        let mut changed = compact_limits();
+        match axis { 0 => changed.max_input_bytes -= 1, 1 => changed.max_output_tokens -= 1,
+            2 => changed.max_pair_checks -= 1, _ => changed.max_pair_bytes -= 1 }
+        let changed = build(object_config()).unwrap().with_root_object_reconciliation(object_limits()).unwrap()
+            .with_document_encoding(UntrustedEncoding::SafeBpeV1(changed)).unwrap();
+        let other = snapshot(&changed, SOURCE);
+        assert_ne!(other.expected, prepared.expected);
+        assert_ne!(other.identities, prepared.identities);
+        assert!(after.compare(&changed.plan(SOURCE, &mut Continue, false).unwrap(), &repeated, &mut Continue).is_err());
+    }
     let object = build(object_config()).unwrap().with_root_object_reconciliation(object_limits()).unwrap()
         .with_document_encoding(UntrustedEncoding::ByteFallback).unwrap();
     assert_eq!(object.document_encoding(), &UntrustedEncoding::ByteFallback);
@@ -438,7 +460,8 @@ fn compact_partial_object_reconciliation_refuses_both_builder_orders_before_sour
         let mut invalid = compact_limits();
         match axis { 0 => invalid.max_input_bytes = 0, 1 => invalid.max_output_tokens = 0,
             2 => invalid.max_pair_checks = 0, _ => invalid.max_pair_bytes = 0 }
-        assert!(factory(false).with_document_encoding(UntrustedEncoding::SafeBpeV1(invalid)).is_err());
+        let object = build(object_config()).unwrap().with_root_object_reconciliation(object_limits()).unwrap();
+        assert!(object.with_document_encoding(UntrustedEncoding::SafeBpeV1(invalid)).is_err());
     }
 }
 
@@ -500,6 +523,7 @@ fn original_required_fields_and_reconciliation_limits_remain_authority_after_par
 #[test]
 fn selected_rows_and_native_cohorts_preserve_object_semantics_in_both_builder_orders() {
     let selected = Int4JsonSparseLimits { max_rows_per_step: 65 };
+    for encoding in [UntrustedEncoding::ByteFallback, UntrustedEncoding::SafeBpeV1(compact_limits())] {
     for object_first in [false, true] {
         let mut cfg = object_config(); cfg.limits.mapping.reduction.map_batch_chunks = 3;
         let plain = build(cfg).unwrap();
@@ -508,7 +532,7 @@ fn selected_rows_and_native_cohorts_preserve_object_semantics_in_both_builder_or
             plain.with_root_object_reconciliation(object_limits()).unwrap().with_selected_rows(selected).unwrap()
         } else {
             plain.with_selected_rows(selected).unwrap().with_root_object_reconciliation(object_limits()).unwrap()
-        }.with_chunk_cohorts().unwrap();
+        }.with_chunk_cohorts().unwrap().with_document_encoding(encoding.clone()).unwrap();
         assert_eq!(object.selected_rows(), Some(selected));
         assert_eq!(object.root_object_reconciliation(), Some(object_limits()));
         assert!(object.uses_chunk_cohorts());
@@ -516,12 +540,14 @@ fn selected_rows_and_native_cohorts_preserve_object_semantics_in_both_builder_or
         let prepared = snapshot(&object, SOURCE);
         assert_eq!(prepared.expected.execution_version(), super::super::object::INT4_OBJECT_MAP_SELECTED_EXECUTION);
         assert_eq!(prepared.expected.selected_rows(), Some(selected));
+        assert_eq!(prepared.expected.mapped().document_encoding(), encoding);
         let plan = object.plan(SOURCE, &mut Continue, true).unwrap();
         object.compare(&plan, &prepared, &mut Continue).unwrap();
         let actual = plan.cohort_requirements(8192).unwrap();
         assert!(actual.native.kv_bytes <= peak.native.kv_bytes);
         assert!(actual.workspace_bytes <= peak.workspace_bytes);
         assert!(object.with_root_object_reconciliation(object_limits()).is_err());
+    }
     }
 }
 

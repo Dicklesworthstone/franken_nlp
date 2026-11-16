@@ -117,8 +117,8 @@ impl DocumentCompiler {
         crate::batch::extract::grouped_int4::memory::encoding_workspace_bytes(&policy)?;
         match self {
             Self::Map(planner) => Ok(Self::Map(planner.with_document_encoding(policy)?)),
-            object @ Self::Object { .. } if policy == UntrustedEncoding::ByteFallback => Ok(object),
-            Self::Object { .. } => Err(BatchCode::InvalidLimits.into()),
+            Self::Object { planner, limits } => Ok(Self::Object {
+                planner: planner.with_document_encoding(policy)?, limits }),
         }
     }
     pub(crate) fn with_selected_rows(self, limits: Int4JsonSparseLimits) -> Result<Self, BatchFault> {
@@ -132,7 +132,6 @@ impl DocumentCompiler {
         mapping: Int4ExtractionMapLimits, reconciliation: RootObjectLimits)
         -> Result<Self, Int4ObjectExtractionMapError> {
         let Self::Map(planner) = self else { return Err(Int4ObjectExtractionMapError::Admission); };
-        planner.require_byte_encoding().map_err(|_| Int4ObjectExtractionMapError::Admission)?;
         let limits = Int4ObjectExtractionMapLimits { mapping, reconciliation };
         limits.reconciliation_workspace_bytes()?;
         // This bounded schema-only check occurs before any population read.

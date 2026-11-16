@@ -10,6 +10,10 @@ fn caps() -> SafeBpeLimits {
 fn compact(grounded: bool) -> Int4DocumentExtractionJobPlanner {
     factory(grounded).with_document_encoding(UntrustedEncoding::SafeBpeV1(caps())).unwrap()
 }
+fn compact_object() -> Int4DocumentExtractionJobPlanner {
+    object_factory(OBJECT_SCHEMA, object_limits(), mapping(), lifetime()).unwrap()
+        .with_document_encoding(UntrustedEncoding::SafeBpeV1(caps())).unwrap()
+}
 
 #[test]
 fn explicit_byte_fallback_preserves_recipe_bytes_and_prepared_ownership() {
@@ -142,13 +146,93 @@ fn compact_policy_composes_with_selected_rows_and_chunk_cohorts_in_either_order(
 }
 
 #[test]
-fn compact_object_and_invalid_encoder_limits_refuse_at_factory_configuration() {
+fn compact_object_jobs_authenticate_original_schema_all_encoder_caps_and_reconstruction() {
     let object = object_factory(OBJECT_SCHEMA, object_limits(), mapping(), lifetime()).unwrap();
     let before = serde_json::to_vec(object.job_recipe()).unwrap();
     let object = object.with_document_encoding(UntrustedEncoding::ByteFallback).unwrap();
     assert_eq!(serde_json::to_vec(object.job_recipe()).unwrap(), before);
-    assert_eq!(object.with_document_encoding(UntrustedEncoding::SafeBpeV1(caps())).err().unwrap().code,
-        BatchCode::InvalidLimits);
+    let old = prepare(&object, SOURCE);
+    let baseline = serde_json::to_value(object.job_recipe()).unwrap();
+    let byte_frozen = freeze(&object);
+    let object = object.with_document_encoding(UntrustedEncoding::SafeBpeV1(caps())).unwrap();
+    assert_eq!(object.owns(&old).unwrap_err().fault.code, BatchCode::Admission);
+    object.check_job_limits(limits()).unwrap();
+    let mut recipe = serde_json::to_value(object.job_recipe()).unwrap();
+    assert_eq!(recipe["extraction"]["input_encoding"], serde_json::to_value(UntrustedEncoding::SafeBpeV1(caps())).unwrap());
+    recipe["extraction"].as_object_mut().unwrap().remove("input_encoding");
+    assert_eq!(recipe, baseline);
+    assert_eq!(object.request().schema, OBJECT_SCHEMA);
+    assert_eq!(object.root_object_reconciliation(), Some(object_limits()));
+    let frozen = freeze(&object);
+    assert_eq!(byte_frozen.binding.compare(&frozen.binding), Err(JobError::Mismatch(MismatchField::Recipe)));
+    let prepared = prepare(&object, SOURCE);
+    assert_eq!(prepared.expected.mapped().document_encoding(), UntrustedEncoding::SafeBpeV1(caps()));
+    assert!(prepared.expected.mapped().encoding_work().unwrap().input_bytes() > SOURCE.len());
+    assert!(prepared.work.model.forward_positions < old.work.model.forward_positions);
+    let plan = object.plan(SOURCE, &mut Continue).unwrap();
+    object.compare(&plan, &prepared, &mut Continue).unwrap();
+    drop(plan);
+    let same = object.with_document_encoding(UntrustedEncoding::SafeBpeV1(caps())).unwrap();
+    same.owns(&prepared).unwrap();
+    let repeated = prepare(&same, SOURCE);
+    assert_eq!(repeated.expected, prepared.expected);
+    assert_eq!(repeated.identities, prepared.identities);
+    frozen_equal(&same, &compact_object());
+    for axis in 0..4 {
+        let mut changed = caps();
+        match axis { 0 => changed.max_input_bytes += 1, 1 => changed.max_output_tokens += 1,
+            2 => changed.max_pair_checks += 1, _ => changed.max_pair_bytes += 1 }
+        let changed = object_factory(OBJECT_SCHEMA, object_limits(), mapping(), lifetime()).unwrap()
+            .with_document_encoding(UntrustedEncoding::SafeBpeV1(changed)).unwrap();
+        assert_eq!(frozen.binding.compare(&freeze(&changed).binding), Err(JobError::Mismatch(MismatchField::Recipe)), "axis {axis}");
+        let plan = changed.plan(SOURCE, &mut Continue).unwrap();
+        assert!(same.compare(&plan, &prepared, &mut Continue).is_err());
+    }
+    // Original required fields remain authenticated even though removing one
+    // leaves the derived partial schema and compact chunk prompts unchanged.
+    let changed_schema = OBJECT_SCHEMA.replace(r#""required":["amount","name"]"#, r#""required":["name"]"#);
+    let changed = object_factory(&changed_schema, object_limits(), mapping(), lifetime()).unwrap()
+        .with_document_encoding(UntrustedEncoding::SafeBpeV1(caps())).unwrap();
+    let changed_prepared = prepare(&changed, SOURCE);
+    assert_eq!(changed_prepared.identities, prepared.identities);
+    assert_ne!(changed_prepared.expected, prepared.expected);
+    assert_eq!(frozen.binding.compare(&freeze(&changed).binding), Err(JobError::Mismatch(MismatchField::Recipe)));
+}
+
+#[test]
+fn compact_object_selected_cohorts_and_exact_per_preparation_caps_preserve_resume_authority() {
+    let measured = prepare(&compact_object(), SOURCE).expected.mapped().encoding_work().unwrap();
+    let exact = SafeBpeLimits { max_input_bytes: measured.input_bytes(), max_output_tokens: measured.output_tokens(),
+        max_pair_checks: measured.pair_checks(), max_pair_bytes: measured.pair_bytes() };
+    let make = || object_factory(OBJECT_SCHEMA, object_limits(), mapping(), lifetime()).unwrap();
+    let admitted = make().with_document_encoding(UntrustedEncoding::SafeBpeV1(exact)).unwrap();
+    assert_eq!(prepare(&admitted, SOURCE).expected.mapped().encoding_work(), Some(measured));
+    assert_eq!(prepare(&admitted, SOURCE).expected.mapped().encoding_work(), Some(measured));
+    for axis in 0..4 {
+        let mut short = exact;
+        match axis { 0 => short.max_input_bytes -= 1, 1 => short.max_output_tokens -= 1,
+            2 => short.max_pair_checks -= 1, _ => short.max_pair_bytes -= 1 }
+        let short = make().with_document_encoding(UntrustedEncoding::SafeBpeV1(short)).unwrap();
+        let failure = short.prepare_with_control(document(SOURCE), &mut Continue).err().unwrap();
+        assert!(failure.stop); assert_eq!(failure.fault.cancellation, None);
+    }
+    let mut map = mapping(); map.mapping.reduction.map_batch_chunks = 3;
+    let make = || object_factory(OBJECT_SCHEMA, object_limits(), map, lifetime()).unwrap();
+    let rows = Int4JsonSparseLimits { max_rows_per_step: 32 };
+    let before = make().with_document_encoding(UntrustedEncoding::SafeBpeV1(caps())).unwrap()
+        .with_selected_rows(rows).unwrap().with_chunk_cohorts().unwrap();
+    let after = make().with_chunk_cohorts().unwrap().with_selected_rows(rows).unwrap()
+        .with_document_encoding(UntrustedEncoding::SafeBpeV1(caps())).unwrap();
+    before.check_job_limits(limits()).unwrap(); after.check_job_limits(limits()).unwrap();
+    frozen_equal(&before, &after);
+    let before = prepare(&before, SOURCE); let after = prepare(&after, SOURCE);
+    assert_eq!(before.expected, after.expected);
+    assert_eq!(before.identities, after.identities);
+    assert_eq!(before.work, after.work);
+}
+
+#[test]
+fn invalid_encoder_limits_refuse_at_both_map_and_object_factory_configuration() {
     for axis in 0..8 {
         let mut invalid = caps();
         match axis { 0 => invalid.max_input_bytes = 0, 1 => invalid.max_output_tokens = 0,
@@ -159,13 +243,20 @@ fn compact_object_and_invalid_encoder_limits_refuse_at_factory_configuration() {
             _ => invalid.max_pair_bytes = SafeBpeLimits::MAX_PAIR_BYTES + 1 }
         assert_eq!(factory(false).with_document_encoding(UntrustedEncoding::SafeBpeV1(invalid)).err().unwrap().code,
             BatchCode::InvalidLimits, "axis {axis}");
+        let object = object_factory(OBJECT_SCHEMA, object_limits(), mapping(), lifetime()).unwrap();
+        assert_eq!(object.with_document_encoding(UntrustedEncoding::SafeBpeV1(invalid)).err().unwrap().code,
+            BatchCode::InvalidLimits, "axis {axis}");
     }
 }
 
 #[test]
 fn compiler_recipe_policy_drift_refuses_before_recovery_or_preparation() {
+    for object in [false, true] {
     for axis in 0..6 {
-        let mut altered = if axis == 0 { factory(false) } else { compact(false) };
+        let mut altered = if object {
+            if axis == 0 { object_factory(OBJECT_SCHEMA, object_limits(), mapping(), lifetime()).unwrap() }
+            else { compact_object() }
+        } else if axis == 0 { factory(false) } else { compact(false) };
         match axis {
             0 => altered.recipe.extraction.input_encoding = Some(UntrustedEncoding::ByteFallback),
             1 => altered.recipe.extraction.input_encoding = None,
@@ -181,6 +272,7 @@ fn compiler_recipe_policy_drift_refuses_before_recovery_or_preparation() {
         let failure = altered.prepare_with_control(document(SOURCE), &mut Continue).err().unwrap();
         assert!(failure.stop); assert_eq!(failure.fault.code, BatchCode::Admission, "axis {axis}");
     }
+    }
 }
 
 #[test]
@@ -189,6 +281,8 @@ fn compact_preparation_preserves_typed_cancellation() {
     impl DecodeStepControl for Cancel {
         fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { Some(DecodeCancellationKind::Deadline) }
     }
-    let failure = compact(true).prepare_with_control(document(SOURCE), &mut Cancel).err().unwrap();
-    assert!(failure.stop); assert_eq!(failure.fault.cancellation, Some(DecodeCancellationKind::Deadline));
+    for factory in [compact(true), compact_object()] {
+        let failure = factory.prepare_with_control(document(SOURCE), &mut Cancel).err().unwrap();
+        assert!(failure.stop); assert_eq!(failure.fault.cancellation, Some(DecodeCancellationKind::Deadline));
+    }
 }

@@ -37,11 +37,15 @@ fn pure_host_quote_matches_cli_for_every_admitted_native_document_schedule() {
 #[test]
 fn compact_host_and_cli_quotes_charge_one_encoder_workspace_for_every_schedule() {
     for width in [32, 128] {
+        for object in [false, true] {
         for chunks in [None, Some(1), Some(3), Some(64)] {
-            let (mut plain, mut args) = arguments(&["--max-result-bytes", "65536"]);
-            let (mut compact, _) = arguments(&["--max-result-bytes", "65536", "--input-encoding", "safe-bpe-v1",
+            let mut flags = vec!["--max-result-bytes", "65536"];
+            if object { flags.push("--reconcile-root-object"); }
+            let (mut plain, mut args) = arguments(&flags);
+            flags.extend(["--input-encoding", "safe-bpe-v1",
                 "--max-tokenizer-input-bytes", "262144", "--max-tokenizer-output-tokens", "131072",
                 "--max-tokenizer-pair-checks", "8192", "--max-tokenizer-pair-bytes", "65536"]);
+            let (mut compact, _) = arguments(&flags);
             args.group_width = width; args.max_load_mib = 65_536;
             plain.document.cohort_chunks = chunks; compact.document.cohort_chunks = chunks;
             let before = plain.validate(&args).unwrap();
@@ -58,13 +62,14 @@ fn compact_host_and_cli_quotes_charge_one_encoder_workspace_for_every_schedule()
             assert_eq!(quote.input_bytes - before.memory.input_bytes, policy.requirements().unwrap().workspace_bytes);
             assert_eq!(quote.document_workspace_bytes, before.memory.document_workspace_bytes);
             assert_eq!(quote.document_workspace_bytes, after.document.workspace_bytes
-                + after.document.cohort.map_or(0, |cohort| cohort.workspace_bytes));
+                + after.document.cohort.map_or(0, |cohort| cohort.workspace_bytes) + after.object_preparation_bytes);
             assert_eq!(quote.native, before.memory.native);
             assert_eq!(quote.workspace_bytes, before.memory.workspace_bytes);
             assert_eq!(quote.output_reservation_bytes, before.memory.output_reservation_bytes);
             assert_eq!(quote.native.kv_bytes, budget.max_kv_bytes * chunks.unwrap_or(1) as u64);
             assert_eq!(after.cli_preparation_bytes, before.cli_preparation_bytes);
             assert_eq!(after.common.preparation_bytes, before.common.preparation_bytes);
+        }
         }
     }
 }

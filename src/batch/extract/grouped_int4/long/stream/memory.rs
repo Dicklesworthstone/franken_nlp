@@ -55,17 +55,14 @@ impl Int4ExtractionDocumentMemoryLimits {
         Ok(required)
     }
 
-    /// Root-object reconciliation currently preserves its byte encoding
-    /// contract. Reject compact object policies before population IO instead
-    /// of quoting an encoding the object compiler cannot execute.
+    /// One transient encoder coexists with both object schema declarations
+    /// and the complete reconciliation frontier. Compact encoding changes
+    /// neither the reducer's authority nor its independent memory charge.
     #[allow(clippy::too_many_arguments)]
     pub fn requirements_with_root_object_and_encoding(self, width: usize, budget: TaskBudget,
         document: Int4ExtractionMapLimits, transport: BatchLimits, compiler: CompileLimits,
         object: Option<RootObjectLimits>, encoding: &UntrustedEncoding)
         -> Result<Int4ExtractionDocumentMemoryRequirement, Int4ExtractionMapError> {
-        if object.is_some() && *encoding != UntrustedEncoding::ByteFallback {
-            return Err(Int4ExtractionMapError::InvalidLimits);
-        }
         let mut required = self.requirements_with_encoding(width, budget, document, transport, encoding)?;
         required.document_workspace_bytes = sum(&[required.document_workspace_bytes,
             root_object_workspace_bytes(document, compiler, object)?])?;

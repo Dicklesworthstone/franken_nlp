@@ -189,6 +189,11 @@ fn whole_document_progress_report_does_not_emit_schema_source_values_or_private_
     for private in ["private-schema", "private/job", "private/key", "schema_digest", "binding"] {
         assert!(!bytes.contains(private));
     }
+    response.input_encoding = input_encoding::reported_policy(&encoding);
+    let mut compact_object = serde_json::to_value(&response).unwrap();
+    assert_eq!(compact_object["input_encoding"], serde_json::to_value(&encoding).unwrap());
+    compact_object.as_object_mut().unwrap().remove("input_encoding");
+    assert_eq!(compact_object, object, "compact object provenance must preserve public progress and schema privacy");
     assert_eq!(object_args.group_width, args.group_width);
 }
 

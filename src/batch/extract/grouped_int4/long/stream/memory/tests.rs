@@ -240,6 +240,16 @@ fn root_object_quote_owns_original_partial_schemas_and_reconciliation_through_de
         assert_eq!(complete.input_bytes, plain.input_bytes);
         assert_eq!(complete.output_reservation_bytes, plain.output_reservation_bytes);
         assert_eq!(complete.max_output_bytes, plain.max_output_bytes);
+        let caps = crate::tokenizer::untrusted::SafeBpeLimits { max_input_bytes: 65536, max_output_tokens: 32768,
+            max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
+        let compact = memory.requirements_with_root_object_and_encoding(32, budget, document, transport,
+            compiler, Some(object), &UntrustedEncoding::SafeBpeV1(caps)).unwrap();
+        assert_eq!(compact.input_bytes, complete.input_bytes + caps.requirements().unwrap().workspace_bytes);
+        assert_eq!(compact.document_workspace_bytes, complete.document_workspace_bytes);
+        assert_eq!(compact.native, complete.native);
+        assert_eq!(compact.workspace_bytes, complete.workspace_bytes);
+        assert_eq!(compact.output_reservation_bytes, complete.output_reservation_bytes);
+        assert_eq!(compact.max_output_bytes, complete.max_output_bytes);
     }
 }
 

@@ -227,8 +227,8 @@ impl Int4DocumentExtractionJobPlanner {
     /// a separately bounded preparation under the same authenticated policy;
     /// tokenizer work is not a persisted lifetime debit. The private recipe
     /// authenticates every limit, and a previously prepared byte-fallback
-    /// attempt cannot acquire compact semantics. Root-object reconciliation
-    /// remains byte-fallback only.
+    /// attempt cannot acquire compact semantics. Object mode retains the
+    /// original schema and reducer policy beside the encoded partial schema.
     pub fn with_document_encoding(mut self, policy: UntrustedEncoding) -> Result<Self, BatchFault> {
         self.check_document_encoding()?;
         if self.document_encoding() == &policy { return Ok(self); }
@@ -255,8 +255,7 @@ impl Int4DocumentExtractionJobPlanner {
             Some(UntrustedEncoding::ByteFallback) => return Err(BatchCode::Admission.into()),
             Some(compact @ UntrustedEncoding::SafeBpeV1(_)) => compact,
         };
-        if self.document_encoding() != expected
-            || (self.root_object_reconciliation().is_some() && expected != &UntrustedEncoding::ByteFallback) {
+        if self.document_encoding() != expected {
             return Err(BatchCode::Admission.into());
         }
         self.compiler.encoding_workspace_bytes()?;

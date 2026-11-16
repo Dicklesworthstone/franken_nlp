@@ -119,9 +119,6 @@ impl CorpusArgs {
         let mut common = document.common;
         let root_object = self.reconciliation.limits(self.document.mapping)?;
         let encoding = self.document.encoding.policy()?;
-        if root_object.is_some() && encoding != crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback {
-            return Err(CandidateError::Arguments);
-        }
         let object_preparation_bytes = self.reconciliation.workspace_bytes(&self.document, document)?;
         let s = self.stream;
         let verification = s.verification();

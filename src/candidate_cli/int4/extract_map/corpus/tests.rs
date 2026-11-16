@@ -39,7 +39,8 @@ impl DecodeStepControl for Control {
 fn persistent_corpus_teams_charge_one_workspace_without_changing_document_authority() {
     for mode in [&[][..], &["--root-array-union", "--source-membership", "--max-selected-rows", "32"][..],
         &["--reconcile-root-object", "--source-membership"][..],
-        &["--input-encoding", "safe-bpe-v1", "--max-selected-rows", "65"][..]] {
+        &["--input-encoding", "safe-bpe-v1", "--max-selected-rows", "65"][..],
+        &["--reconcile-root-object", "--input-encoding", "safe-bpe-v1", "--max-selected-rows", "65"][..]] {
         let mut flags = vec!["--preparation-mib", "8192"];
         flags.extend_from_slice(mode);
         let (serial, args) = arguments(&flags);
@@ -90,7 +91,8 @@ fn corpus_worker_width_and_mixed_chunk_schedules_refuse_before_any_private_io() 
 #[test]
 fn compact_document_corpus_prices_one_workspace_for_serial_and_chunk_cohort_streams() {
     for flags in [&[][..], &["--cohort-chunks", "3", "--max-selected-rows", "32"][..],
-        &["--root-array-union", "--source-membership"][..]] {
+        &["--root-array-union", "--source-membership"][..], &["--reconcile-root-object"][..],
+        &["--reconcile-root-object", "--cohort-chunks", "3", "--max-selected-rows", "32", "--source-membership"][..]] {
         let (plain, args) = arguments(flags);
         let before = plain.validate(&args).unwrap();
         let mut compact_flags = flags.to_vec();
@@ -108,18 +110,23 @@ fn compact_document_corpus_prices_one_workspace_for_serial_and_chunk_cohort_stre
         assert_eq!(after.transport.max_work, before.transport.max_work);
         assert_eq!(after.max_run_mask_visits, before.max_run_mask_visits);
         assert_eq!(after.max_run_verification, before.max_run_verification);
+        assert_eq!(after.root_object, before.root_object);
+        assert_eq!(after.object_preparation_bytes, before.object_preparation_bytes);
         assert!(after.common.minimum_memory_bytes >= before.common.minimum_memory_bytes);
     }
 }
 
 #[test]
-fn compact_corpus_rejects_invalid_policy_and_unqualified_object_mode_before_io() {
-    for flags in [vec!["--input-encoding", "safe-bpe-v1", "--reconcile-root-object"],
-        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "0"],
+fn compact_corpus_rejects_invalid_policy_before_any_document_or_model_io() {
+    for object in [false, true] {
+    for mut flags in [vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "0"],
         vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-output-tokens", "1048577"],
-        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "0"]] {
+        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "0"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-bytes", "0"]] {
+        if object { flags.push("--reconcile-root-object"); }
         let (command, args) = arguments(&flags);
         assert_eq!(command.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
     }
 }
 
