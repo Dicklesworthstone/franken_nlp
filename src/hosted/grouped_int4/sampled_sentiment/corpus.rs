@@ -197,9 +197,20 @@ fn scheduled_requirements(width: usize, work: SampledSentimentBatchLimits, task:
     Ok(required)
 }
 
-struct Admission<'a> {
+pub(super) struct Admission<'a> {
     lease: &'a EngineLease, model: &'a Int4ModelIdentity, context: usize, kv_bytes: u64,
     work: SampledSentimentBatchLimits, preparation_bytes: u64, output_bytes: u64,
+}
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+impl<'a> Admission<'a> {
+    /// Durable callers retain the same sealed item admission and output guard
+    /// through spool synchronization and the journal's commit acknowledgement.
+    pub(super) fn for_job(lease: &'a EngineLease, model: &'a Int4ModelIdentity,
+        context: usize, kv_bytes: u64, work: SampledSentimentBatchLimits,
+        preparation_bytes: u64, output_bytes: u64) -> Self {
+        Self { lease, model, context, kv_bytes, work, preparation_bytes, output_bytes }
+    }
 }
 impl SampledSentimentBatchAdmission for Admission<'_> {
     type Guard = Pending;

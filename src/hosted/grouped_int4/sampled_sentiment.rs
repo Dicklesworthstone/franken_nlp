@@ -5,6 +5,9 @@
 //! the entire bundle; sample addressing and per-row reductions stay unchanged.
 
 mod corpus;
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod job;
 
 use super::*;
 use crate::{
