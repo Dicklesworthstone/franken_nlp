@@ -36,6 +36,28 @@ fn original_partial_schema_and_reducer_are_charged_once_beside_every_native_chun
 }
 
 #[test]
+fn compact_object_input_quote_adds_one_encoder_without_changing_schema_reducer_or_native_limits() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    let config = config();
+    let caps = SafeBpeLimits { max_input_bytes: 65536, max_output_tokens: 32768,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
+    let policy = UntrustedEncoding::SafeBpeV1(caps);
+    let compiler = CompileLimits::default();
+    for chunks in [1, 2, 16] {
+        let retained = config.workspace_bytes(chunks, compiler).unwrap();
+        let byte = config.mapping.input_bytes(65536, &UntrustedEncoding::ByteFallback).unwrap();
+        let compact = config.mapping.input_bytes(65536, &policy).unwrap();
+        assert_eq!(compact + retained, byte + retained + caps.requirements().unwrap().workspace_bytes);
+    }
+    for axis in 0..4 {
+        let mut invalid = caps;
+        match axis { 0 => invalid.max_input_bytes = 0, 1 => invalid.max_output_tokens = 0,
+            2 => invalid.max_pair_checks = 0, _ => invalid.max_pair_bytes = 0 }
+        assert!(config.mapping.input_bytes(65536, &UntrustedEncoding::SafeBpeV1(invalid)).is_err());
+    }
+}
+
+#[test]
 fn tiny_legal_output_cannot_hide_large_optional_schema_storage() {
     let mut config = config();
     config.reconciliation.max_input_bytes = 2;

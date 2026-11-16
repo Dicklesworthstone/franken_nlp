@@ -141,10 +141,47 @@ any later window still prevent a successful final object. The completed result
 binds the declared cohort width as well as the actual physical counters, so
 different schedules cannot be substituted when their batch counts coincide.
 
-Packed prefill, compute teams, Safe-BPE and root-array union remain outside
+Packed prefill, compute teams and root-array union remain outside
 this route's execution contract. Cohort grouping and selected projection have
 no measured throughput or task-quality claim yet. Population and durable
 execution use the explicit routes below.
+
+### Bounded compact input
+
+`extract-object-map` also accepts `--input-encoding safe-bpe-v1`, independently
+of selected rows and cohort scheduling. This explicitly changes prompt tokens.
+It preserves the exact bytes of every untrusted source chunk and the derived
+partial schema, while excluding template-control token IDs. The original
+schema remains the final required-field authority, and all original byte and
+Unicode-scalar evidence coordinates remain unchanged.
+
+```bash
+fnlp candidate source-int4 extract-object-map long-document.txt \
+  --schema record.schema.json --source-membership \
+  --snapshot nanbeige.int4.snapshot --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 32768 --input-encoding safe-bpe-v1 \
+  --max-tokenizer-input-bytes 1048576 --max-tokenizer-output-tokens 1048576 \
+  --max-tokenizer-pair-checks 67108864 --max-tokenizer-pair-bytes 536870912 \
+  --max-map-result-bytes 16777216 > complete-record.json
+```
+
+The four tokenizer ceilings cover one complete preparation: initial partial
+schema sizing, every accepted and rejected source-sizing probe, and repeated
+partial-schema/source encoding for all final chunk plans. They do not renew
+per chunk or cohort. Input bytes and output tokens here count cumulative
+tokenizer work; the complete source byte cap and each native context limit
+remain separate. Exhausting any ceiling refuses the document before native
+execution. One transient encoder workspace is admitted before private input
+or model IO beside the original/partial schemas and reconciliation storage.
+
+Preliminary CLI preflight and hosted recompilation each use a separately
+bounded preparation under the same exact policy. Compact results record that
+policy and actual hosted encoding work in `output.partial_map.input_encoding`
+and `output.partial_map.input_encoding_work`. All four policy ceilings bind
+preflight and result identity even if changing a ceiling leaves the generated
+tokens unchanged. Byte fallback remains the default and retains its existing
+output shape. Compact input has no claim of identical model output, tokenizer
+parity, extraction quality or measured speed.
 
 ## Streaming complete documents
 

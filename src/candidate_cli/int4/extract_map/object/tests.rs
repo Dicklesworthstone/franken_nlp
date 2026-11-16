@@ -32,7 +32,7 @@ fn actual_dispatcher_exposes_separate_object_contract_and_rejects_unbound_modes(
     assert!(limits.map.mapping.root_array_union.is_none());
     assert!(limits.map.cohort.is_none());
     assert_eq!(limits.map.mapping.mapping.reduction.map_batch_chunks, 1);
-    for flags in [vec!["--root-array-union"], vec!["--input-encoding", "safe-bpe-v1"],
+    for flags in [vec!["--root-array-union"],
         vec!["--compute-threads", "2"], vec!["--prefill-rows", "2"], vec!["--seed", "3"],
         vec!["--temperature-milli", "900"]] {
         let mut argv = vec!["candidate", "source-int4", "extract-object-map", "--schema", "schema.json",
@@ -41,6 +41,46 @@ fn actual_dispatcher_exposes_separate_object_contract_and_rejects_unbound_modes(
         if let Ok(matches) = crate::candidate_cli::definition().try_get_matches_from(argv) {
             assert!(CandidateCommand::from_matches(&matches).is_err(), "unsupported mode parsed into an executable command");
         }
+    }
+}
+
+#[test]
+fn compact_objects_admit_one_encoder_beside_the_original_schema_and_reducer_before_io() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    for width in [None, Some(1), Some(4)] {
+        let (mut byte, args) = fixture(&["--max-selected-rows", "65"]);
+        byte.map.cohort_chunks = width;
+        let baseline = byte.validate(&args).unwrap();
+        let (mut compact, args) = fixture(&["--input-encoding", "safe-bpe-v1", "--max-selected-rows", "65",
+            "--max-tokenizer-input-bytes", "65536", "--max-tokenizer-output-tokens", "32768",
+            "--max-tokenizer-pair-checks", "1048576", "--max-tokenizer-pair-bytes", "16777216"]);
+        compact.map.cohort_chunks = width;
+        let caps = SafeBpeLimits { max_input_bytes: 65536, max_output_tokens: 32768,
+            max_pair_checks: 1048576, max_pair_bytes: 16777216 };
+        assert_eq!(compact.map.encoding.policy().unwrap(), UntrustedEncoding::SafeBpeV1(caps));
+        let admitted = compact.validate(&args).unwrap();
+        assert_eq!(admitted.map.common.minimum_memory_bytes,
+            baseline.map.common.minimum_memory_bytes + caps.requirements().unwrap().workspace_bytes);
+        assert_eq!(admitted.object_workspace_bytes, baseline.object_workspace_bytes);
+        assert_eq!(admitted.object, baseline.object);
+        assert_eq!(admitted.map.cohort, baseline.map.cohort);
+        assert_eq!(admitted.map.mapping.mapping.max_model_work, baseline.map.mapping.mapping.max_model_work);
+        assert_eq!(admitted.map.mapping.mapping.max_mask_visits, baseline.map.mapping.mapping.max_mask_visits);
+        assert_eq!(admitted.map.mapping.verification, baseline.map.mapping.verification);
+        assert_eq!(compact.map.extraction.budget(&args, admitted.map.common),
+            byte.map.extraction.budget(&args, baseline.map.common));
+        let mut short = args;
+        short.memory_mib = admitted.map.common.minimum_memory_bytes.div_ceil(MIB) - 1;
+        assert_eq!(compact.execute(short, &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
+fn compact_object_encoder_caps_refuse_before_private_input_model_or_output_io() {
+    for (name, value) in [("--max-tokenizer-input-bytes", "0"), ("--max-tokenizer-output-tokens", "1048577"),
+        ("--max-tokenizer-pair-checks", "0"), ("--max-tokenizer-pair-bytes", "0")] {
+        let (options, args) = fixture(&["--input-encoding", "safe-bpe-v1", name, value]);
+        assert_eq!(options.execute(args, &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
     }
 }
 
@@ -117,7 +157,8 @@ fn invalid_cohort_and_selected_bounds_refuse_before_private_input_or_model_io() 
 #[test]
 fn configured_object_execution_still_requires_runtime_before_input() {
     for flags in [vec!["--cohort-chunks", "2"], vec!["--max-selected-rows", "32"],
-        vec!["--cohort-chunks", "2", "--max-selected-rows", "32"]] {
+        vec!["--cohort-chunks", "2", "--max-selected-rows", "32"],
+        vec!["--input-encoding", "safe-bpe-v1", "--cohort-chunks", "2", "--max-selected-rows", "32"]] {
         let (options, args) = fixture(&flags);
         assert_eq!(options.execute(args, &mut NoIo, &mut NoIo), Err(CandidateError::Unavailable));
     }

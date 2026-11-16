@@ -62,7 +62,7 @@ impl NlpEngine {
             return Err(object_error(Int4ObjectExtractionMapError::Admission));
         }
         let object_bytes = config.object_workspace_bytes(planner.compiler_limits())?;
-        let bytes = input_bytes(source.capacity(), base)?;
+        let bytes = base.input_bytes(source.capacity(), planner.document_encoding())?;
         let run = base.native.run;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
@@ -82,6 +82,7 @@ impl NlpEngine {
             let count = expected.chunk_count();
             if prepared.group_width() != width || expected.group_width() != width
                 || expected.selected_rows() != input.value.planner.selected_rows()
+                || &expected.document_encoding() != input.value.planner.document_encoding()
                 || prepared.execution_identities().len() != count || required.kv_bytes > prepared.max_kv_bytes() {
                 return Err(HostedError::ModelIdentity);
             }
@@ -153,7 +154,7 @@ impl NlpEngine {
         validate(base, identity, width, source.len(), row.kv_bytes)?;
         let ceiling = config.cohort_requirements(width)?;
         let object_bytes = config.object_workspace_bytes(planner.compiler_limits())?;
-        let bytes = input_bytes(source.capacity(), base)?;
+        let bytes = base.input_bytes(source.capacity(), planner.document_encoding())?;
         let run = base.native.run;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
@@ -172,6 +173,7 @@ impl NlpEngine {
             let count = expected.chunk_count();
             if prepared.group_width() != width || expected.group_width() != width
                 || expected.selected_rows() != input.value.planner.selected_rows()
+                || &expected.document_encoding() != input.value.planner.document_encoding()
                 || prepared.execution_identities().len() != count || row.kv_bytes > prepared.max_kv_bytes() {
                 return Err(HostedError::ModelIdentity);
             }

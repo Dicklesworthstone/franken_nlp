@@ -93,7 +93,8 @@ impl Int4ExtractionBatchPlanner {
     /// callers must admit its transient workspace before preparing any input.
     /// Exact-schema complete-document maps share one ledger through sizing,
     /// chunk probes and all final plans; their hosts admit this same workspace.
-    /// Partial-root-object composition remains a separate byte-only contract.
+    /// Partial-root-object maps retain that same ledger around their derived
+    /// schema and preserve the original schema as reconciliation authority.
     pub fn with_document_encoding(mut self, policy: UntrustedEncoding) -> Result<Self, BatchFault> {
         memory::encoding_workspace_bytes(&policy)?;
         self.require_byte_encoding()?;

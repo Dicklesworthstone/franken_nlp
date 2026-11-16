@@ -80,6 +80,12 @@ pub(super) fn execute(args: Int4Args, options: ObjectMapArgs, _admitted: ObjectM
     // preflight. Its later hosted replacement does not overlap this charge.
     let object_preparation = lease.reserve(MemoryClass::JobBuffers, limits.object_workspace_bytes)
         .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
+    let encoding = options.map.encoding.policy()?;
+    let encoding_bytes = options.map.encoding.workspace_bytes()?;
+    let encoding_preparation = if encoding_bytes == 0 { None } else {
+        Some(lease.reserve(MemoryClass::JobBuffers, encoding_bytes)
+            .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?)
+    };
     remaining()?;
     let schema = read_local(options.map.extraction.schema_path(), crate::candidate_cli::extract::SCHEMA_BYTES)?;
     let budget = options.map.extraction.budget(&args, common);
@@ -94,10 +100,11 @@ pub(super) fn execute(args: Int4Args, options: ObjectMapArgs, _admitted: ObjectM
     remaining()?;
     let base = Int4ExtractionBatchPlanner::for_model(model.model_identity(), budget,
         options.map.extraction.compiler(), options.map.extraction.source_limits(), None).map_err(|_| CandidateError::Planning)?;
-    let base = options.map.extraction.configure_planner(base)?;
+    let base = options.map.configure_planner(base)?;
     let planner = Int4ObjectExtractionPlanner::new(base).map_err(map_planning_error)?;
     let expected = preflight(&text, &request, &planner, limits, args.context_tokens,
         &mut DeadlineControl { started, deadline })?;
+    if expected.document_encoding() != encoding { return Err(CandidateError::Identity); }
     let controls = crate::tokenizer::pinned_controls::pinned().map_err(|_| CandidateError::Identity)?;
     let vocabulary = ExtractionVocabulary::pinned(controls.template_controls()).map(Arc::new).map_err(|_| CandidateError::Planning)?;
     let identity = planner.base_execution_identity().clone();
@@ -126,6 +133,9 @@ pub(super) fn execute(args: Int4Args, options: ObjectMapArgs, _admitted: ObjectM
     }
     config.mapping.native.run.max_elapsed = remaining()?;
     drop(object_preparation);
+    // The preliminary map has been dropped. The hosted input claim now owns
+    // the same encoder workspace through preparation, execution and drain.
+    drop(encoding_preparation);
     let content = identity.logical_model_digest.to_hex();
     let finish = |document: &Int4ObjectExtractionMapRun, cohort_schedule: Option<ObjectCohortSchedule<'_>>| {
         expected.verify_completed(document).map_err(|_| CandidateError::Execution)?;

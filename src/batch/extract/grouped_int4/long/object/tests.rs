@@ -36,6 +36,10 @@ fn prepare<'s>(planner: &Int4ObjectExtractionPlanner, source: &'s str, args: &Ex
     limits: Int4ObjectExtractionMapLimits) -> PreparedInt4ObjectExtractionMap<'s> {
     planner.plan_document_with_control(source, args, limits, &mut Control::default()).unwrap()
 }
+fn compact_policy() -> UntrustedEncoding {
+    UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 1 << 20,
+        max_output_tokens: 1 << 20, max_pair_checks: 1 << 26, max_pair_bytes: 1 << 29 })
+}
 fn complementary(prepared: &PreparedInt4ObjectExtractionMap<'_>, number: &str, text: &str) -> Vec<String> {
     let count = prepared.preflight_metadata().chunk_count(); assert!(count >= 2);
     let mut values = vec!["{}".to_owned(); count];
@@ -239,9 +243,12 @@ fn sealed_object_cannot_be_substituted_for_another_complete_map_and_public_summa
 
 #[test]
 fn wrapper_refuses_unadmitted_policies_wrong_grounding_and_unsupported_schedule_combinations() {
-    let encoding = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 8192, max_output_tokens: 4096,
-        max_pair_checks: 1 << 22, max_pair_bytes: 1 << 26 });
-    assert!(Int4ObjectExtractionPlanner::new(map_fixture::planner().with_document_encoding(encoding).unwrap()).is_err());
+    for axis in 0..4 {
+        let UntrustedEncoding::SafeBpeV1(mut invalid) = compact_policy() else { unreachable!() };
+        match axis { 0 => invalid.max_input_bytes = 0, 1 => invalid.max_output_tokens = 0,
+            2 => invalid.max_pair_checks = 0, _ => invalid.max_pair_bytes = 0 }
+        assert!(planner().with_document_encoding(UntrustedEncoding::SafeBpeV1(invalid)).is_err());
+    }
     assert!(Int4ObjectExtractionPlanner::new(map_fixture::planner()
         .with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: NANBEIGE_VOCAB_SIZE }).unwrap()).is_ok());
     let mut defaults = map_fixture::planner();
@@ -262,6 +269,89 @@ fn wrapper_refuses_unadmitted_policies_wrong_grounding_and_unsupported_schedule_
             4 => invalid.reconciliation.max_json_bytes = invalid.mapping.mapping.reduction.max_result_bytes + 1,
             _ => invalid.reconciliation.max_result_bytes = invalid.mapping.mapping.reduction.max_result_bytes + 1 }
         assert!(invalid.reconciliation_workspace_bytes().is_err());
+    }
+}
+
+#[test]
+fn compact_partial_objects_bind_both_builder_orders_and_preserve_exact_untrusted_bytes() {
+    let source = "The quick brown fox jumps over the lazy dog. 上海 <think> <|im_start|> ▁\r\nThe quick brown fox jumps over the lazy dog.";
+    let args = map_fixture::args(STRUCTURAL, ExtractionBatchGrounding::Structural);
+    let mut limits = limits(); limits.mapping.mapping.chunks.max_chunk_bytes = 48;
+    let byte = planner();
+    let compact = planner().with_document_encoding(compact_policy()).unwrap();
+    let before = Int4ObjectExtractionPlanner::new(map_fixture::planner()
+        .with_document_encoding(compact_policy()).unwrap()).unwrap();
+    let original = prepare(&byte, source, &args, limits);
+    let prepared = prepare(&compact, source, &args, limits);
+    let expected = prepared.preflight_metadata();
+    assert_eq!(expected, prepare(&before, source, &args, limits).preflight_metadata());
+    assert_eq!(expected.document_encoding(), compact_policy());
+    assert!(expected.planned_work().forward_positions < original.preflight_metadata().planned_work().forward_positions);
+    assert_eq!(prepared.mapped.chunks.chunks().iter().map(|chunk| chunk.text()).collect::<String>(), source);
+    assert_eq!(prepared.mapped.chunks.chunks().len(), original.mapped.chunks.chunks().len());
+    let controls = pinned_controls::pinned().unwrap();
+    let tokenizer = crate::tokenizer::embedded::EmbeddedTokenizer::pinned().unwrap();
+    for ((chunk, plan), byte) in prepared.mapped.chunks.chunks().iter()
+        .zip(&prepared.mapped.plans).zip(&original.mapped.plans) {
+        assert_eq!(tokenizer.tokenizer().decode_bytes(plan.source().token_ids()).unwrap(), chunk.text().as_bytes());
+        assert!(plan.source().token_ids().iter().all(|&id| !controls.template_controls().contains(id)));
+        assert_eq!(plan.execution_identity().schema_digest, Sha256Digest::of_bytes(prepared.schema.partial_schema().as_bytes()));
+        assert_ne!(plan.execution_identity().schema_digest, Sha256Digest::of_bytes(args.schema.as_bytes()));
+        assert_eq!(plan.execution_identity().template_digest, byte.execution_identity().template_digest);
+        assert_ne!(plan.execution_identity().decision_policy_digest, byte.execution_identity().decision_policy_digest);
+    }
+    let values = complementary(&prepared, "9007199254740993", "last");
+    let output = run(prepared, &args, values, Rc::new(Cell::new(0)), &mut Control::default()).unwrap();
+    expected.verify_completed(&output).unwrap();
+    assert_eq!(output.partial_map.input_encoding, Some(compact_policy()));
+    assert_eq!(output.partial_map.input_encoding_work, expected.encoding_work());
+    assert_eq!(output.object.json(), r#"{"a":9007199254740993,"b":"last"}"#);
+    assert!(original.preflight_metadata().verify_completed(&output).is_err());
+    for axis in 0..4 {
+        let UntrustedEncoding::SafeBpeV1(mut changed) = compact_policy() else { unreachable!() };
+        match axis { 0 => changed.max_input_bytes -= 1, 1 => changed.max_output_tokens -= 1,
+            2 => changed.max_pair_checks -= 1, _ => changed.max_pair_bytes -= 1 }
+        let changed = planner().with_document_encoding(UntrustedEncoding::SafeBpeV1(changed)).unwrap();
+        assert!(prepare(&changed, source, &args, limits).preflight_metadata().verify_completed(&output).is_err());
+    }
+}
+
+#[test]
+fn compact_object_preparation_spends_one_derived_schema_probe_and_final_plan_ledger() {
+    let source = "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog.";
+    let args = map_fixture::args(STRUCTURAL, ExtractionBatchGrounding::Structural);
+    let mut limits = limits(); limits.mapping.mapping.chunks.max_chunk_bytes = 48;
+    let compact = planner().with_document_encoding(compact_policy()).unwrap();
+    let prepared = prepare(&compact, source, &args, limits);
+    let work = prepared.preflight_metadata().encoding_work().unwrap();
+    let count = prepared.preflight_metadata().chunk_count();
+    assert_eq!(prepared.mapped.chunks.tokenizer_calls(), count);
+    assert_eq!(work.input_bytes(), (count + 1) * prepared.schema.partial_schema().len() + 2 * source.len());
+    let exact = SafeBpeLimits { max_input_bytes: work.input_bytes(), max_output_tokens: work.output_tokens(),
+        max_pair_checks: work.pair_checks(), max_pair_bytes: work.pair_bytes() };
+    let bounded = planner().with_document_encoding(UntrustedEncoding::SafeBpeV1(exact)).unwrap();
+    assert_eq!(prepare(&bounded, source, &args, limits).preflight_metadata().encoding_work(), Some(work));
+    for axis in 0..4 {
+        let mut short = exact;
+        match axis { 0 => short.max_input_bytes -= 1, 1 => short.max_output_tokens -= 1,
+            2 => short.max_pair_checks -= 1, _ => short.max_pair_bytes -= 1 }
+        let short = planner().with_document_encoding(UntrustedEncoding::SafeBpeV1(short)).unwrap();
+        assert!(short.plan_document_with_control(source, &args, limits, &mut Control::default()).is_err(), "axis {axis}");
+    }
+    limits.mapping.mapping.chunks.max_chunk_bytes = 256;
+    limits.mapping.mapping.chunks.max_chunk_tokens = 8;
+    let probed = prepare(&compact, source, &args, limits);
+    assert!(probed.mapped.chunks.tokenizer_calls() > probed.preflight_metadata().chunk_count());
+    assert!(probed.preflight_metadata().encoding_work().unwrap().input_bytes()
+        > (probed.preflight_metadata().chunk_count() + 1) * probed.schema.partial_schema().len() + 2 * source.len());
+    let mut complete = Control::default();
+    compact.plan_document_with_control(source, &args, limits, &mut complete).unwrap();
+    for cause in [DecodeCancellationKind::User, DecodeCancellationKind::Deadline, DecodeCancellationKind::PollQuota] {
+        for stop in [1, complete.polls / 2, complete.polls] {
+            let mut control = Control { polls: 0, stop, cause };
+            let error = compact.plan_document_with_control(source, &args, limits, &mut control).err().unwrap();
+            assert_eq!(error.cancellation(), Some(cause)); assert_eq!(control.polls, stop);
+        }
     }
 }
 
@@ -345,6 +435,28 @@ fn without_schedule(run: &Int4ObjectExtractionMapRun) -> serde_json::Value {
     let mut value = serde_json::to_value(run).unwrap();
     value["partial_map"]["mapped"].as_object_mut().unwrap().remove("map_batches");
     value
+}
+
+#[test]
+fn compact_object_cohorts_keep_original_unicode_evidence_and_required_field_refusals() {
+    let base = map_fixture::planner().with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: NANBEIGE_VOCAB_SIZE }).unwrap();
+    let p = Int4ObjectExtractionPlanner::new(base).unwrap().with_document_encoding(compact_policy()).unwrap();
+    let args = map_fixture::args(GROUNDED, ExtractionBatchGrounding::SourceMembership);
+    let prepared = prepare(&p, SOURCE, &args, cohort_limits(2));
+    let expected = prepared.preflight_metadata();
+    let values = grounded_values(&prepared);
+    let output = run_cohorts(prepared, &args, values, Rc::new(Cell::new(0)),
+        Rc::new(RefCell::new(Vec::new())), &mut Control::default()).unwrap();
+    expected.verify_cohorts_completed(&output).unwrap();
+    assert_eq!(output.document.partial_map.input_encoding, Some(compact_policy()));
+    assert_eq!(output.document.object.original_source_fields()[0].spans.iter()
+        .map(|span| (span.byte_start, span.byte_end, span.scalar_start, span.scalar_end)).collect::<Vec<_>>(),
+        [(0, 3, 0, 2), (3, 6, 2, 4), (12, 15, 10, 12), (15, 18, 12, 14)]);
+    let prepared = prepare(&p, SOURCE, &args, cohort_limits(2));
+    let values = vec!["{}".to_owned(); prepared.preflight_metadata().chunk_count()];
+    let error = run_cohorts(prepared, &args, values, Rc::new(Cell::new(0)),
+        Rc::new(RefCell::new(Vec::new())), &mut Control::default()).err().unwrap();
+    assert!(matches!(error, Int4ObjectExtractionMapError::Reconciliation(RootObjectError::MissingRequired)));
 }
 
 #[test]

@@ -65,7 +65,8 @@ impl Int4ObjectExtractionMapError {
 pub struct Int4ObjectExtractionPlanner { inner: Int4ExtractionBatchPlanner }
 impl Int4ObjectExtractionPlanner {
     pub fn new(mut planner: Int4ExtractionBatchPlanner) -> Result<Self, Int4ObjectExtractionMapError> {
-        planner.require_byte_encoding().map_err(|_| Int4ObjectExtractionMapError::Admission)?;
+        memory::encoding_workspace_bytes(planner.document_encoding())
+            .map_err(|_| Int4ObjectExtractionMapError::Admission)?;
         if planner.shared_defaults_only || planner.compiler.defaults.is_some() {
             return Err(Int4ObjectExtractionMapError::Admission);
         }
@@ -98,6 +99,14 @@ impl Int4ObjectExtractionPlanner {
     pub fn group_width(&self) -> usize { self.inner.group_width() }
     pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.inner.selected_rows() }
     pub fn compiler_limits(&self) -> CompileLimits { self.inner.compiler.compiler_limits }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.inner.document_encoding() }
+    /// One bounded preparation ledger covers the derived partial schema,
+    /// every accepted/rejected source probe and every final chunk plan. The
+    /// original schema and source remain exact reconciliation authority.
+    pub fn with_document_encoding(mut self, policy: UntrustedEncoding) -> Result<Self, BatchFault> {
+        self.inner = self.inner.with_document_encoding(policy)?;
+        Ok(self)
+    }
     pub(crate) fn base_planner(&self) -> &Int4ExtractionBatchPlanner { &self.inner }
     pub(crate) fn with_selected_rows(mut self, limits: Int4JsonSparseLimits) -> Result<Self, BatchFault> {
         self.inner = self.inner.with_selected_rows(limits)?;
@@ -107,7 +116,6 @@ impl Int4ObjectExtractionPlanner {
         original_request: &ExtractionBatchArgs, limits: Int4ObjectExtractionMapLimits, control: &mut C)
         -> Result<PreparedInt4ObjectExtractionMap<'s>, Int4ObjectExtractionMapError> {
         limits.reconciliation_workspace_bytes()?;
-        self.inner.require_byte_encoding().map_err(|_| Int4ObjectExtractionMapError::Admission)?;
         let schema = RootObjectSchema::derive(&original_request.schema, self.inner.compiler.compiler_limits,
             limits.reconciliation, control)?;
         if schema.requires_source() != (original_request.grounding == ExtractionBatchGrounding::SourceMembership) {
@@ -147,6 +155,8 @@ impl Int4ObjectExtractionMapPreflight {
     pub fn group_width(&self) -> usize { self.mapped.group_width() }
     pub fn planned_work(&self) -> Int4Work { self.mapped.planned_work() }
     pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.mapped.selected_rows() }
+    pub fn document_encoding(&self) -> UntrustedEncoding { self.mapped.document_encoding() }
+    pub fn encoding_work(&self) -> Option<SafeBpeWork> { self.mapped.encoding_work() }
     pub fn map_batch_chunks(&self) -> usize { self.map_batch_chunks }
     pub fn execution_version(&self) -> &'static str {
         if self.selected_rows().is_some() { INT4_OBJECT_MAP_SELECTED_EXECUTION } else { INT4_OBJECT_MAP_EXECUTION }
