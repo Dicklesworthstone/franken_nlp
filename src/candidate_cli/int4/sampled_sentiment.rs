@@ -24,6 +24,10 @@ const UNSUPPORTED: &[&str] = &[
 
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SampledArgs {
+    /// Prefill each axis once; retain its private causal prefix across samples.
+    /// One-off mode only. Receipts report actual work; cold admission is unchanged.
+    #[arg(long)]
+    reuse_prefill: bool,
     /// Independent addressed generations per axis. Every sample must complete.
     #[arg(long, default_value_t = 4)]
     samples: usize,
@@ -58,13 +62,13 @@ pub(super) struct SampledArgs {
 pub(super) fn definition() -> clap::Command {
     let mut command = Int4Args::augment_args(clap::Command::new("sentiment-sampled")
         .about("Generate independently sampled affect scores and explanations")
-        .long_about("For each requested valence, arousal, dominance or approach axis, generate --samples independent addressed JSON scores in [-100,100] with bounded explanations. --seed is required. Every generation is constrained and independently validated; one failure returns no bundle. Results retain all samples and descriptive aggregates, not calibrated confidence or psychological measurements. Input is {document,axes?}; omitted axes selects all four. Byte fallback remains the default. --input-encoding safe-bpe-v1 preserves the complete document bytes while excluding template controls and compacting ordinary text under one bounded encoding allowance; that token sequence may change model output. --compute-threads 2..64 uses one persistent numerical row team across every axis and independent sample. Alternatively, --prefill-rows 1..64 selects bounded layer-major prompt execution for each fresh sample; it cannot combine with multiple compute threads. Both schedules preserve fresh logical KV, the complete prompt and addressed sample seeds. Encoder, worker and prompt workspace are admitted before private IO. Work, masks and deadlines are shared across the whole bundle. Uses explicitly selected local sources or a digest-pinned snapshot. This candidate has no quality or speed certification, sampling of distribution-mode labels, parse-repair retry, thinking, tools or cohorts."))
+        .long_about("For each requested valence, arousal, dominance or approach axis, generate --samples independent addressed JSON scores in [-100,100] with bounded explanations. --seed is required. Every generation is constrained and independently validated; one failure returns no bundle. Results retain all samples and descriptive aggregates, not calibrated confidence or psychological measurements. Input is {document,axes?}; omitted axes selects all four. Byte fallback remains the default. --input-encoding safe-bpe-v1 preserves the complete document bytes while excluding template controls and compacting ordinary text under one bounded encoding allowance; that token sequence may change model output. --compute-threads 2..64 uses one persistent numerical row team across every axis and independent sample. Alternatively, --prefill-rows 1..64 selects bounded layer-major prompt execution; it cannot combine with multiple compute threads. --reuse-prefill explicitly retains only the current axis's private causal prompt prefix across samples, preserving the complete prompt and addressed seeds without copying KV. Default execution starts every sample with empty logical KV. Reuse works with serial, threaded or layer-major execution, reports actual native work and retains conservative cold-work admission. Encoder, worker and prompt workspace are admitted before private IO. Work, masks and deadlines are shared across the whole bundle. Uses explicitly selected local sources or a digest-pinned snapshot. This candidate has no quality or speed certification, sampling of distribution-mode labels, parse-repair retry, thinking, tools or cohorts."))
         .mut_arg("input", |arg| arg.help("Bounded sentiment JSON object; '-' reads stdin"))
         .mut_arg("seed", |arg| arg.required(true))
         .mut_arg("max_new_tokens", |arg| arg.default_value("256")
             .help("Per-sample constrained tokens INCLUDING terminal EOS"))
         .mut_arg("prefill_rows", |arg| arg.hide(false)
-            .help("Bounded layer-major prompt execution per independent sample, 1..=64 rows; full declared workspace is admitted once for the bundle, incompatible with --compute-threads greater than 1"))
+            .help("Bounded layer-major prompt execution, 1..=64 rows; with --reuse-prefill only the first sample per axis prefills; incompatible with --compute-threads greater than 1"))
         .mut_arg("preparation_mib", |arg| arg.default_value("1024"));
     for &id in UNSUPPORTED { command = command.mut_arg(id, |arg| arg.hide(true)); }
     SampledArgs::augment_args(command)

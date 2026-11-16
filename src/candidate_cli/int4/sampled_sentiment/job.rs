@@ -29,6 +29,7 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
                 .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population; omit with --use-retained-input; '-' reads stdin"))
                 .mut_arg("max_input_bytes", |arg| arg.help("Outer ceiling for each complete NDJSON envelope; immutable stored input ceiling must fit"))
                 .mut_arg("max_result_bytes", |arg| arg.help("Complete sample bundle cap per document; must fit JobLimits.max_result_bytes"))
+                .mut_arg("reuse_prefill", |arg| arg.hide(true))
                 .mut_arg("max_forward_positions", |arg| arg.help("Per-document forward ceiling across every requested axis and sample"))
                 .mut_arg("max_projected_logits", |arg| arg.help("Per-document full-vocabulary projection ceiling"))
                 .mut_arg("max_attention_pairs", |arg| arg.help("Per-document attention-pair ceiling"))
@@ -69,6 +70,9 @@ impl JobArgs {
     /// Settings and the complete one-engine geometry are checked before even
     /// the bounded limits file is opened. It alone supplies lifetime caps.
     fn validate(&self, args: &Int4Args) -> Result<Int4Limits, Failure> {
+        if self.sampled.reuse_prefill {
+            return Err(Failure::usage("sampled_sentiment_job_prefill_reuse_unavailable"));
+        }
         let storage = &self.storage;
         storage.input_retention.limits().map_err(storage_failure)?;
         let local = |path: &std::path::Path| !path.as_os_str().is_empty() && path.as_os_str() != "-";

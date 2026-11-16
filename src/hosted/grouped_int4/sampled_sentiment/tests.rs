@@ -276,11 +276,49 @@ fn native_sampled_bundles_keep_every_sample_across_physical_team_widths() {
             limits, PackedInt4Kernel::scalar(), CancellationToken::default()).unwrap();
         assert_eq!(scalar.result().dimensions.len(), 2);
         assert!(scalar.result().dimensions.iter().all(|dimension| dimension.samples.len() == 2));
+        let cold = scalar.result().clone();
         let expected = crate::canonjson::canonical_bytes(scalar.result()).unwrap();
         assert!(host.resources().memory_snapshot().committed_bytes > baseline.committed_bytes);
         drop(scalar);
         drained();
 
+        let check_reused = |run: &SampledSentimentRun| {
+            assert_eq!(run.execution, SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION);
+            assert!(run.model_work.forward_positions < cold.model_work.forward_positions);
+            assert!(run.model_work.attention_pairs < cold.model_work.attention_pairs);
+            assert!(run.model_work.projections.dot_products < cold.model_work.projections.dot_products);
+            assert_eq!(run.model_work.projected_logits, cold.model_work.projected_logits);
+            let mut semantic = run.clone();
+            semantic.execution.clone_from(&cold.execution);
+            semantic.model_work = cold.model_work;
+            for (dimension, original) in semantic.dimensions.iter_mut().zip(&cold.dimensions) {
+                for (index, (sample, original_sample)) in dimension.samples.iter_mut()
+                    .zip(&original.samples).enumerate() {
+                    let expected_work = if index == 0 { original_sample.model_work } else {
+                        let prefix = original_sample.model_work.forward_positions
+                            - original_sample.generated_tokens as u64;
+                        Int4Work::for_sequence(run.group_width, prefix as usize, sample.generated_tokens,
+                            sample.generated_tokens * crate::native_engine::lmhead::NANBEIGE_VOCAB_SIZE).unwrap()
+                    };
+                    assert_eq!(sample.model_work, expected_work);
+                    sample.model_work = original_sample.model_work;
+                }
+            }
+            // Only execution metadata and actual native counters may differ.
+            assert_eq!(semantic, cold);
+        };
+        for rows in [None, Some(1), Some(4)] {
+            let prefill = rows.map(|rows| Int4PrefillLimits { max_batch_rows: rows,
+                max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap() });
+            let reused = host.execute_int4_sampled_sentiment_reusing_prefill(&model, make(),
+                Arc::clone(&vocabulary), limits, PackedInt4Kernel::scalar(), prefill,
+                CancellationToken::default()).unwrap();
+            check_reused(reused.result());
+            assert_eq!(host.resources().memory_snapshot().reserved_bytes, 0);
+            assert_eq!(host.resources().outstanding_closure_snapshot().active_closures, 0);
+            drop(reused);
+            drained();
+        }
         for threads in [2, 4] {
             let team = host.execute_int4_sampled_sentiment_with_threads(&model, make(),
                 Arc::clone(&vocabulary), limits, PackedInt4Kernel::scalar(), threads,
@@ -293,6 +331,17 @@ fn native_sampled_bundles_keep_every_sample_across_physical_team_widths() {
             assert_eq!(host.resources().memory_snapshot().reserved_bytes, 0);
             assert_eq!(host.resources().outstanding_closure_snapshot().active_closures, 0);
             drop(team);
+            drained();
+
+            let reused = host.execute_int4_sampled_sentiment_reusing_prefill_with_threads(&model,
+                make(), Arc::clone(&vocabulary), limits, PackedInt4Kernel::scalar(), threads,
+                CancellationToken::default()).unwrap();
+            check_reused(reused.result());
+            assert_eq!(reused.compute().compute_threads, threads);
+            assert!(reused.compute().completed_worker_rows > 0);
+            assert_eq!(host.resources().memory_snapshot().reserved_bytes, 0);
+            assert_eq!(host.resources().outstanding_closure_snapshot().active_closures, 0);
+            drop(reused);
             drained();
         }
         for rows in [1, 4] {

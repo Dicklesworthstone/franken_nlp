@@ -11,7 +11,8 @@ use crate::{
         strict_int4::{Int4ModelError, StrictInt4Error,
             weights::snapshot::{Int4SnapshotError, INT4_SNAPSHOT_VERSION}}},
     tasks::sentiment::sampled::{SampledSentimentError, SampledSentimentPlanner,
-        SampledSentimentVocabulary},
+        SampledSentimentVocabulary, SAMPLED_SENTIMENT_EXECUTION,
+        SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION},
 };
 
 struct DeadlineControl { started: Instant, deadline: Duration }
@@ -163,9 +164,16 @@ pub(super) fn execute(args: Int4Args, command: SampledArgs, _admitted: Int4Limit
         mask_limits: command.masks(), max_mask_node_visits: command.max_mask_node_visits,
     };
     let result = if limits.compute.threads > 1 {
-        engine.execute_int4_sampled_sentiment_with_threads(&model, prepared, vocabulary,
-            host, limits.kernel, limits.compute.threads, cancellation)
-            .map(compute::Completion::Team)
+        if command.reuse_prefill {
+            engine.execute_int4_sampled_sentiment_reusing_prefill_with_threads(&model, prepared,
+                vocabulary, host, limits.kernel, limits.compute.threads, cancellation)
+        } else {
+            engine.execute_int4_sampled_sentiment_with_threads(&model, prepared, vocabulary,
+                host, limits.kernel, limits.compute.threads, cancellation)
+        }.map(compute::Completion::Team)
+    } else if command.reuse_prefill {
+        engine.execute_int4_sampled_sentiment_reusing_prefill(&model, prepared, vocabulary,
+            host, limits.kernel, limits.prefill, cancellation).map(compute::Completion::serial)
     } else {
         match limits.prefill {
             None => engine.execute_int4_sampled_sentiment(&model, prepared, vocabulary,
@@ -175,7 +183,9 @@ pub(super) fn execute(args: Int4Args, command: SampledArgs, _admitted: Int4Limit
         }.map(compute::Completion::serial)
     }.map_err(host_failure)?;
     let used = result.result().model_work;
-    if result.result().group_width != args.group_width
+    let execution = if command.reuse_prefill { SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION }
+        else { SAMPLED_SENTIMENT_EXECUTION };
+    if result.result().execution != execution || result.result().group_width != args.group_width
         || used.forward_positions > expected_work.forward_positions
         || used.projected_logits > expected_work.projected_logits
         || used.attention_pairs > expected_work.attention_pairs

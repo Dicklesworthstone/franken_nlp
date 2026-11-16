@@ -200,20 +200,71 @@ fn score_schema_rejects_off_grid_missing_duplicate_and_unbounded_outputs() {
 fn finalizer_rechecks_sample_language_eos_and_native_accounting() {
     let prepared = prepare(&request()).unwrap(); let axis = &prepared.axes[0];
     let good = synthetic(&prepared, axis, r#"{"score":45,"justification":"Helpful wording expresses approval."}"#);
-    let sample = prepared.finalize_sample(axis, 0, good.clone()).unwrap();
+    let sample = prepared.finalize_sample(axis, 0, good.clone(), false).unwrap();
     assert_eq!(sample.score, 45); assert_eq!(sample.sample_index, 0);
     assert_eq!(sample.model_work, good.model_work);
     let mut bad = good.clone(); bad.execution = constrained_int4::INT4_JSON_EXECUTION.to_owned();
-    assert!(prepared.finalize_sample(axis, 0, bad).is_err());
+    assert!(prepared.finalize_sample(axis, 0, bad, false).is_err());
     let mut bad = good.clone(); bad.model_work.projections.dot_products += 1;
-    assert!(prepared.finalize_sample(axis, 0, bad).is_err());
+    assert!(prepared.finalize_sample(axis, 0, bad, false).is_err());
     let mut bad = good.clone(); bad.output.token_ids.pop();
-    assert!(prepared.finalize_sample(axis, 0, bad).is_err());
+    assert!(prepared.finalize_sample(axis, 0, bad, false).is_err());
     let mut bad = good.clone(); bad.output.token_ids[0] = prepared.decode.eos_token_id;
-    assert!(prepared.finalize_sample(axis, 0, bad).is_err());
+    assert!(prepared.finalize_sample(axis, 0, bad, false).is_err());
     let mut bad = good.clone(); bad.output.token_ids[0] = NANBEIGE_VOCAB_SIZE as u32;
-    assert!(prepared.finalize_sample(axis, 0, bad).is_err());
-    assert!(prepared.finalize_sample(axis, prepared.options.samples, good).is_err());
+    assert!(prepared.finalize_sample(axis, 0, bad, false).is_err());
+    assert!(prepared.finalize_sample(axis, prepared.options.samples, good, false).is_err());
+}
+
+#[test]
+fn reused_prefill_finalizer_requires_actual_warm_geometry_and_explicit_execution() {
+    let prepared = prepare(&request()).unwrap(); let axis = &prepared.axes[0];
+    let cold = synthetic(&prepared, axis, r#"{"score":45,"justification":"Helpful wording."}"#);
+    let mut first = cold.clone();
+    first.execution = INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION.to_owned();
+    assert_eq!(prepared.finalize_sample(axis, 0, first.clone(), true).unwrap().model_work,
+        cold.model_work);
+    assert!(prepared.finalize_sample(axis, 0, cold.clone(), true).is_err());
+    assert!(prepared.finalize_sample(axis, 0, first.clone(), false).is_err());
+    assert!(prepared.finalize_sample(axis, 1, first, true).is_err());
+
+    let generated = cold.output.token_ids.len();
+    let mut warm = cold.clone();
+    warm.execution = INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION.to_owned();
+    warm.model_work = Int4Work::for_sequence(prepared.group_width, axis.prompt.len() - 1,
+        generated, generated * NANBEIGE_VOCAB_SIZE).unwrap();
+    warm.output.forward_positions = warm.model_work.forward_positions;
+    let checked = prepared.finalize_sample(axis, 1, warm.clone(), true).unwrap();
+    assert_eq!(checked.generated_tokens, generated);
+    assert_eq!(checked.model_work.forward_positions, generated as u64);
+    assert_eq!(checked.model_work.projected_logits, cold.model_work.projected_logits);
+    assert!(checked.model_work.attention_pairs < cold.model_work.attention_pairs);
+    assert!(checked.model_work.projections.dot_products < cold.model_work.projections.dot_products);
+    assert!(prepared.finalize_sample(axis, 0, warm.clone(), true).is_err());
+    let mut missing_prefix_attention = warm.clone();
+    missing_prefix_attention.model_work.attention_pairs = Int4Work::for_sequence(prepared.group_width,
+        0, generated, generated * NANBEIGE_VOCAB_SIZE).unwrap().attention_pairs;
+    assert!(prepared.finalize_sample(axis, 1, missing_prefix_attention, true).is_err());
+    warm.output.forward_positions = cold.output.forward_positions;
+    assert!(prepared.finalize_sample(axis, 1, warm, true).is_err());
+}
+
+#[test]
+fn reused_prefill_geometry_handles_single_token_prompts_without_underflow() {
+    let plan = prepare(&request()).unwrap();
+    let mut axis = PreparedAxis { axis: plan.axes[0].axis, prompt: vec![0],
+        identity: plan.axes[0].identity.clone(), work: plan.axes[0].work };
+    for generated in [1, options().max_sample_tokens] {
+        let cold = plan.sample_work(&axis, 0, generated, false).unwrap();
+        for index in 0..options().samples {
+            assert_eq!(plan.sample_work(&axis, index, generated, true).unwrap(), cold);
+        }
+    }
+    assert!(plan.sample_work(&axis, 1, 0, true).is_err());
+    assert!(plan.sample_work(&axis, options().samples, 1, true).is_err());
+    axis.prompt.clear();
+    assert!(plan.sample_work(&axis, 0, 1, true).is_err());
+    assert!(plan.sample_work(&axis, 1, 1, true).is_err());
 }
 
 #[test]
@@ -221,17 +272,17 @@ fn explanations_require_nonempty_text_and_bound_unicode_scalars_independently() 
     let prepared = prepare(&request()).unwrap(); let axis = &prepared.axes[0];
     for text in ["", " \t\r\n", &"x".repeat(options().max_justification_chars + 1)] {
         let json = serde_json::json!({"score":0,"justification":text}).to_string();
-        assert!(matches!(prepared.finalize_sample(axis, 0, synthetic(&prepared, axis, &json)),
+        assert!(matches!(prepared.finalize_sample(axis, 0, synthetic(&prepared, axis, &json), false),
             Err(SampledSentimentError::NoResult)));
     }
     for json in [r#"{"score":101,"justification":"outside"}"#,
         r#"{"score":0,"justification":"ok","extra":1}"#] {
-        assert!(matches!(prepared.finalize_sample(axis, 0, synthetic(&prepared, axis, json)),
+        assert!(matches!(prepared.finalize_sample(axis, 0, synthetic(&prepared, axis, json), false),
             Err(SampledSentimentError::NoResult)));
     }
     let unicode = "好".repeat(options().max_justification_chars);
     let json = serde_json::json!({"score":0,"justification":unicode}).to_string();
-    let sample = prepared.finalize_sample(axis, 0, synthetic(&prepared, axis, &json)).unwrap();
+    let sample = prepared.finalize_sample(axis, 0, synthetic(&prepared, axis, &json), false).unwrap();
     assert_eq!(sample.justification.chars().count(), options().max_justification_chars);
     assert_eq!(sample.justification.len(), 3 * options().max_justification_chars);
 }
@@ -589,6 +640,10 @@ fn population_ids_are_bounded_before_document_preparation() {
 const COMPLETE_MASK_CHARGE_PER_TOKEN: u64 = 17;
 
 fn complete_bundle(plan: &PreparedSampledSentiment) -> SampledSentimentRun {
+    complete_bundle_with_prefill(plan, false)
+}
+
+fn complete_bundle_with_prefill(plan: &PreparedSampledSentiment, reuse_prefill: bool) -> SampledSentimentRun {
     let mut dimensions = Vec::new();
     let mut model_work = Int4Work::default();
     let mut generated_tokens = 0_u64;
@@ -597,8 +652,13 @@ fn complete_bundle(plan: &PreparedSampledSentiment) -> SampledSentimentRun {
         let mut samples = Vec::new();
         for index in 0..plan.options.samples {
             let mut raw = synthetic(plan, axis, r#"{"score":45,"justification":"Helpful wording."}"#);
+            if reuse_prefill {
+                raw.execution = INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION.to_owned();
+                raw.model_work = plan.sample_work(axis, index, raw.output.token_ids.len(), true).unwrap();
+                raw.output.forward_positions = raw.model_work.forward_positions;
+            }
             raw.output.mask_node_visit_charge = raw.output.token_ids.len() as u64 * COMPLETE_MASK_CHARGE_PER_TOKEN;
-            let sample = plan.finalize_sample(axis, index, raw).unwrap();
+            let sample = plan.finalize_sample(axis, index, raw, reuse_prefill).unwrap();
             model_work = model_work.checked_add(sample.model_work).unwrap();
             generated_tokens += sample.generated_tokens as u64;
             mask_node_visit_charge += sample.mask_node_visit_charge;
@@ -607,7 +667,8 @@ fn complete_bundle(plan: &PreparedSampledSentiment) -> SampledSentimentRun {
         dimensions.push(aggregate(axis.axis, samples).unwrap());
     }
     SampledSentimentRun {
-        schema_version: 1, execution: SAMPLED_SENTIMENT_EXECUTION.to_owned(), task_spec: "sentiment-v1".to_owned(),
+        schema_version: 1, execution: if reuse_prefill { SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION }
+            else { SAMPLED_SENTIMENT_EXECUTION }.to_owned(), task_spec: "sentiment-v1".to_owned(),
         prompt_template_sha256: plan.identity.template_digest, numerics_profile: STRICT_INT4_PROFILE.to_owned(),
         group_width: plan.group_width, aggregation: SAMPLED_SENTIMENT_AGGREGATION_VERSION.to_owned(),
         interpretation: "generated_score_variation_not_calibrated_confidence".to_owned(),
@@ -618,11 +679,52 @@ fn complete_bundle(plan: &PreparedSampledSentiment) -> SampledSentimentRun {
 }
 
 #[test]
+fn reused_prefill_bundle_counts_each_axes_first_prefill_and_rejects_forged_savings() {
+    for encoding in [UntrustedEncoding::ByteFallback, UntrustedEncoding::SafeBpeV1(compact_limits())] {
+        let plan = encoding_planner(encoding).plan(&request()).unwrap();
+        let cold = complete_bundle(&plan);
+        let reused = complete_bundle_with_prefill(&plan, true);
+        plan.verify_completed_with_control(&reused, COMPLETE_MASK_CHARGE_PER_TOKEN,
+            reused.mask_node_visit_charge, true, &mut Continue).unwrap();
+        let saved_positions = plan.axes.iter().map(|axis|
+            (axis.prompt.len() - 1) as u64 * (plan.options.samples - 1) as u64).sum::<u64>();
+        assert_eq!(cold.model_work.forward_positions - reused.model_work.forward_positions, saved_positions);
+        assert!(reused.model_work.attention_pairs < cold.model_work.attention_pairs);
+        assert!(reused.model_work.projections.dot_products < cold.model_work.projections.dot_products);
+        assert!(reused.model_work.projections.multiply_accumulates < cold.model_work.projections.multiply_accumulates);
+        assert_eq!(reused.model_work.projected_logits, cold.model_work.projected_logits);
+        assert_eq!(reused.generated_tokens, cold.generated_tokens);
+        assert_eq!(reused.mask_node_visit_charge, cold.mask_node_visit_charge);
+        for (warm_axis, cold_axis) in reused.dimensions.iter().zip(&cold.dimensions) {
+            assert_eq!(warm_axis.samples[0], cold_axis.samples[0]);
+            for sample in &warm_axis.samples[1..] {
+                assert_eq!(sample.model_work.forward_positions, sample.generated_tokens as u64);
+            }
+        }
+        assert!(plan.verify_completed_with_control(&reused, COMPLETE_MASK_CHARGE_PER_TOKEN,
+            reused.mask_node_visit_charge, false, &mut Continue).is_err());
+        assert!(plan.verify_completed_with_control(&cold, COMPLETE_MASK_CHARGE_PER_TOKEN,
+            cold.mask_node_visit_charge, true, &mut Continue).is_err());
+        for index in [0, 1] {
+            let mut broken = reused.clone();
+            broken.dimensions[0].samples[index].model_work.forward_positions -= 1;
+            broken.model_work.forward_positions -= 1;
+            assert!(plan.verify_completed_with_control(&broken, COMPLETE_MASK_CHARGE_PER_TOKEN,
+                broken.mask_node_visit_charge, true, &mut Continue).is_err());
+        }
+        let mut mislabeled = cold;
+        mislabeled.execution = SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION.to_owned();
+        assert!(plan.verify_completed_with_control(&mislabeled, COMPLETE_MASK_CHARGE_PER_TOKEN,
+            mislabeled.mask_node_visit_charge, true, &mut Continue).is_err());
+    }
+}
+
+#[test]
 fn completed_bundles_revalidate_axes_ordinals_aggregates_and_exact_native_accounting() {
     let plan = prepare(&request()).unwrap();
     let original = complete_bundle(&plan);
     plan.verify_completed_with_control(&original, COMPLETE_MASK_CHARGE_PER_TOKEN,
-        original.mask_node_visit_charge, &mut Continue).unwrap();
+        original.mask_node_visit_charge, false, &mut Continue).unwrap();
     for case in 0..29 {
         let mut broken = original.clone();
         match case {
@@ -665,7 +767,7 @@ fn completed_bundles_revalidate_axes_ordinals_aggregates_and_exact_native_accoun
             }
         }
         assert!(plan.verify_completed_with_control(&broken, COMPLETE_MASK_CHARGE_PER_TOKEN,
-            u64::MAX, &mut Continue).is_err(), "case {case}");
+            u64::MAX, false, &mut Continue).is_err(), "case {case}");
     }
     for axis in 0..5 {
         let mut broken = original.clone();
@@ -674,7 +776,7 @@ fn completed_bundles_revalidate_axes_ordinals_aggregates_and_exact_native_accoun
             2 => work.attention_pairs -= 1, 3 => work.projections.dot_products -= 1,
             _ => work.projections.multiply_accumulates -= 1 }
         assert!(plan.verify_completed_with_control(&broken, COMPLETE_MASK_CHARGE_PER_TOKEN,
-            u64::MAX, &mut Continue).is_err(), "native axis {axis}");
+            u64::MAX, false, &mut Continue).is_err(), "native axis {axis}");
     }
 }
 
@@ -685,19 +787,19 @@ fn complete_validation_preserves_item_encoding_addresses_and_exact_output_and_ma
         let mut plan = planner.plan_for_item_with_control(&request(), "stable-record", &mut Continue).unwrap();
         let complete = complete_bundle(&plan);
         let masks = complete.mask_node_visit_charge;
-        plan.verify_completed_with_control(&complete, COMPLETE_MASK_CHARGE_PER_TOKEN, masks, &mut Continue).unwrap();
+        plan.verify_completed_with_control(&complete, COMPLETE_MASK_CHARGE_PER_TOKEN, masks, false, &mut Continue).unwrap();
         assert!(matches!(plan.verify_completed_with_control(&complete, COMPLETE_MASK_CHARGE_PER_TOKEN, masks - 1,
-            &mut Continue), Err(SampledSentimentError::Accounting)));
-        assert!(matches!(plan.verify_completed_with_control(&complete, 0, masks, &mut Continue),
+            false, &mut Continue), Err(SampledSentimentError::Accounting)));
+        assert!(matches!(plan.verify_completed_with_control(&complete, 0, masks, false, &mut Continue),
             Err(SampledSentimentError::Accounting)));
         assert!(matches!(plan.verify_completed_with_control(&complete, COMPLETE_MASK_CHARGE_PER_TOKEN + 1, masks,
-            &mut Continue), Err(SampledSentimentError::Accounting)));
+            false, &mut Continue), Err(SampledSentimentError::Accounting)));
         let bytes = canonjson::canonical_bytes(&complete).unwrap().len() as u64;
         plan.max_result_bytes = bytes;
-        plan.verify_completed_with_control(&complete, COMPLETE_MASK_CHARGE_PER_TOKEN, masks, &mut Continue).unwrap();
+        plan.verify_completed_with_control(&complete, COMPLETE_MASK_CHARGE_PER_TOKEN, masks, false, &mut Continue).unwrap();
         plan.max_result_bytes -= 1;
         assert!(matches!(plan.verify_completed_with_control(&complete, COMPLETE_MASK_CHARGE_PER_TOKEN, masks,
-            &mut Continue), Err(SampledSentimentError::OutputBudget)));
+            false, &mut Continue), Err(SampledSentimentError::OutputBudget)));
     }
 }
 
@@ -716,7 +818,7 @@ fn complete_validation_keeps_every_original_cancellation_cause_at_each_bundle_le
         DecodeCancellationKind::Shutdown, DecodeCancellationKind::LinkedExit] {
         for stop in [1, 2, 3] {
             let error = plan.verify_completed_with_control(&complete, COMPLETE_MASK_CHARGE_PER_TOKEN,
-                complete.mask_node_visit_charge, &mut DuringVerification { calls: 0, stop, cause }).err().unwrap();
+                complete.mask_node_visit_charge, false, &mut DuringVerification { calls: 0, stop, cause }).err().unwrap();
             assert_eq!(error.cancellation(), Some(cause));
         }
     }

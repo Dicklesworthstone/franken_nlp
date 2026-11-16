@@ -2,7 +2,8 @@
 //! score/justification object. No distribution-mode scores are sampled here.
 //!
 //! The complete axis × sample schedule is admitted before the first forward.
-//! One schema and one vocabulary serve every fresh, causal native session.
+//! One schema and one vocabulary serve every causal native session. An explicit
+//! reuse mode retains only the current axis's prompt prefix between samples.
 //! Descriptive spread measures variation between generated scores, never
 //! confidence, calibrated uncertainty, human agreement, or factual support.
 
@@ -15,7 +16,8 @@ use crate::{
     native_engine::{
         constrained::JsonDecodeOptions,
         constrained_int4::{self, Int4JsonBudget, Int4JsonError, Int4JsonRun, JsonSamplingOptions,
-            INT4_JSON_SAMPLED_EXECUTION, JSON_SAMPLER_VERSION, json_sampling_workspace_bytes},
+            INT4_JSON_SAMPLED_EXECUTION, INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION,
+            JSON_SAMPLER_VERSION, json_sampling_workspace_bytes},
         decode::{DecodeCancellationKind, DecodeStepControl},
         generation::grouped_int4::bind_candidate_model,
         lmhead::NANBEIGE_VOCAB_SIZE,
@@ -35,6 +37,7 @@ use crate::{
 use super::{SentimentAxis, SentimentRequest};
 
 pub const SAMPLED_SENTIMENT_EXECUTION: &str = "grouped-int4-independent-sampled-sentiment-v1";
+pub const SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION: &str = "grouped-int4-independent-sampled-sentiment-reused-prefill-v1";
 pub const SAMPLED_SENTIMENT_PROMPT_VERSION: &str = "sentiment-sampled-score-justification-v1";
 pub const SAMPLED_SENTIMENT_AGGREGATION_VERSION: &str = "canonical-axis-sample-population-moments-v1";
 pub const SAMPLED_SENTIMENT_ITEM_ADDRESS_VERSION: &str = "sampled-sentiment-item-address-v1";
@@ -314,7 +317,7 @@ impl PreparedSampledSentiment {
         admitted: &ExecutionIdentity, vocabulary: &SampledSentimentVocabulary,
         budget: Int4JsonBudget, max_sampler_bytes: u64, control: &mut C)
         -> Result<SampledSentimentRun, SampledSentimentError> {
-        self.execute_scheduled(engine, admitted, vocabulary, budget, max_sampler_bytes, None, control)
+        self.execute_scheduled(engine, admitted, vocabulary, budget, max_sampler_bytes, None, false, control)
     }
 
     /// Reuse one admitted causal prompt workspace across every independently
@@ -325,13 +328,27 @@ impl PreparedSampledSentiment {
         admitted: &ExecutionIdentity, vocabulary: &SampledSentimentVocabulary,
         budget: Int4JsonBudget, max_sampler_bytes: u64, prefill: Int4PrefillLimits, control: &mut C)
         -> Result<SampledSentimentRun, SampledSentimentError> {
-        self.execute_scheduled(engine, admitted, vocabulary, budget, max_sampler_bytes, Some(prefill), control)
+        self.execute_scheduled(engine, admitted, vocabulary, budget, max_sampler_bytes, Some(prefill), false, control)
+    }
+
+    /// Prefill each axis once, then rewind its private native session to the
+    /// prompt's penultimate position before each subsequent sample. Reappending
+    /// the final prompt token restores identical causal state without copying
+    /// KV or changing sample addresses. Receipts charge only executed work;
+    /// admission conservatively retains the complete cold-sample ceiling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_reusing_prefill_with_control<C: DecodeStepControl>(&self, engine: &mut StrictInt4Engine<'_>,
+        admitted: &ExecutionIdentity, vocabulary: &SampledSentimentVocabulary,
+        budget: Int4JsonBudget, max_sampler_bytes: u64, prefill: Option<Int4PrefillLimits>, control: &mut C)
+        -> Result<SampledSentimentRun, SampledSentimentError> {
+        self.execute_scheduled(engine, admitted, vocabulary, budget, max_sampler_bytes, prefill, true, control)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn execute_scheduled<C: DecodeStepControl>(&self, engine: &mut StrictInt4Engine<'_>,
         admitted: &ExecutionIdentity, vocabulary: &SampledSentimentVocabulary,
-        budget: Int4JsonBudget, max_sampler_bytes: u64, prefill: Option<Int4PrefillLimits>, control: &mut C)
+        budget: Int4JsonBudget, max_sampler_bytes: u64, prefill: Option<Int4PrefillLimits>,
+        reuse_prefill: bool, control: &mut C)
         -> Result<SampledSentimentRun, SampledSentimentError> {
         checkpoint(control)?;
         if let Some(limits) = prefill { limits.validate()?; }
@@ -354,42 +371,70 @@ impl PreparedSampledSentiment {
         let mut actual_tokens = 0_u64;
         let mut retained_sample_bytes = 0_u64;
         for axis in &self.axes {
-            let mut samples = reserved(self.options.samples)?;
-            for sample_index in 0..self.options.samples {
-                checkpoint(control)?;
-                let sampling = self.options.sampling(axis.axis, sample_index)?;
-                let sample_budget = Int4JsonBudget { native: Int4RunBudget::exact(axis.work),
-                    json: crate::native_engine::constrained::JsonWorkBudget {
-                        max_forward_positions: axis.work.forward_positions,
-                        max_projected_logits: axis.work.projected_logits,
-                        max_kv_bytes: budget.json.max_kv_bytes,
-                        max_total_mask_node_visits: mask_charge,
-                        mask_limits: budget.json.mask_limits } };
-                let finalize = |run| self.finalize_sample(axis, sample_index, run);
-                let checked = match prefill {
-                    None => constrained_int4::decode_json_int4_sampled_with(engine, &axis.identity,
-                        &axis.prompt, &self.program, &vocabulary.oracle, &self.decode, &sampling,
-                        sample_budget, max_sampler_bytes, control, finalize),
-                    Some(limits) => constrained_int4::decode_json_int4_sampled_layer_major_with(engine,
-                        &axis.identity, &axis.prompt, &self.program, &vocabulary.oracle, &self.decode,
-                        &sampling, sample_budget, max_sampler_bytes, limits, control, finalize),
-                }?;
-                // Check cumulative retained sample storage before committing
-                // this sample to the bundle; the final envelope is checked too.
+            // Finalize and bound retained results while the private native
+            // session is still live, so refusal follows its poison/cleanup path.
+            let mut finalize = |sample_index, run| -> Result<SampledSentimentSample, SampledSentimentError> {
+                let checked = self.finalize_sample(axis, sample_index, run, reuse_prefill)?;
                 let serialized = canonjson::canonical_bytes(&checked).map_err(|_| SampledSentimentError::Serialization)?;
                 retained_sample_bytes = retained_sample_bytes.checked_add(serialized.len() as u64)
                     .filter(|&bytes| bytes <= self.max_result_bytes).ok_or(SampledSentimentError::OutputBudget)?;
-                drop(serialized);
+                Ok(checked)
+            };
+            let samples = if reuse_prefill {
+                let mut sampling = reserved(self.options.samples)?;
+                let mut axis_work = Int4Work::default();
+                for sample_index in 0..self.options.samples {
+                    sampling.push(self.options.sampling(axis.axis, sample_index)?);
+                    axis_work = axis_work.checked_add(axis.work)?;
+                }
+                let axis_masks = mask_charge.checked_mul(self.options.samples as u64)
+                    .ok_or(SampledSentimentError::WorkBudget)?;
+                let axis_budget = Int4JsonBudget { native: Int4RunBudget::exact(axis_work),
+                    json: crate::native_engine::constrained::JsonWorkBudget {
+                        max_forward_positions: axis_work.forward_positions,
+                        max_projected_logits: axis_work.projected_logits,
+                        max_kv_bytes: budget.json.max_kv_bytes,
+                        max_total_mask_node_visits: axis_masks,
+                        mask_limits: budget.json.mask_limits } };
+                constrained_int4::decode_json_int4_sampled_reusing_prefill_with(engine, &axis.identity,
+                    &axis.prompt, &self.program, &vocabulary.oracle, &self.decode, &sampling,
+                    axis_budget, max_sampler_bytes, prefill, control, &mut finalize)?
+            } else {
+                let mut samples = reserved(self.options.samples)?;
+                for sample_index in 0..self.options.samples {
+                    checkpoint(control)?;
+                    let sampling = self.options.sampling(axis.axis, sample_index)?;
+                    let sample_budget = Int4JsonBudget { native: Int4RunBudget::exact(axis.work),
+                        json: crate::native_engine::constrained::JsonWorkBudget {
+                            max_forward_positions: axis.work.forward_positions,
+                            max_projected_logits: axis.work.projected_logits,
+                            max_kv_bytes: budget.json.max_kv_bytes,
+                            max_total_mask_node_visits: mask_charge,
+                            mask_limits: budget.json.mask_limits } };
+                    let checked = match prefill {
+                        None => constrained_int4::decode_json_int4_sampled_with(engine, &axis.identity,
+                            &axis.prompt, &self.program, &vocabulary.oracle, &self.decode, &sampling,
+                            sample_budget, max_sampler_bytes, control, |run| finalize(sample_index, run)),
+                        Some(limits) => constrained_int4::decode_json_int4_sampled_layer_major_with(engine,
+                            &axis.identity, &axis.prompt, &self.program, &vocabulary.oracle, &self.decode,
+                            &sampling, sample_budget, max_sampler_bytes, limits, control,
+                            |run| finalize(sample_index, run)),
+                    }?;
+                    samples.push(checked);
+                    checkpoint(control)?;
+                }
+                samples
+            };
+            for checked in &samples {
                 actual_work = actual_work.checked_add(checked.model_work)?;
                 actual_mask = actual_mask.checked_add(checked.mask_node_visit_charge).ok_or(SampledSentimentError::Accounting)?;
                 actual_tokens = actual_tokens.checked_add(checked.generated_tokens as u64).ok_or(SampledSentimentError::Accounting)?;
-                samples.push(checked);
-                checkpoint(control)?;
             }
             dimensions.push(aggregate(axis.axis, samples)?);
         }
         let result = SampledSentimentRun { schema_version: 1,
-            execution: SAMPLED_SENTIMENT_EXECUTION.to_owned(), task_spec: "sentiment-v1".to_owned(),
+            execution: if reuse_prefill { SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION }
+                else { SAMPLED_SENTIMENT_EXECUTION }.to_owned(), task_spec: "sentiment-v1".to_owned(),
             prompt_template_sha256: self.identity.template_digest,
             numerics_profile: STRICT_INT4_PROFILE.to_owned(), group_width: self.group_width,
             aggregation: SAMPLED_SENTIMENT_AGGREGATION_VERSION.to_owned(),
@@ -403,17 +448,20 @@ impl PreparedSampledSentiment {
         let mask_charge_per_token = vocabulary.oracle.trie().node_count()
             .min(budget.json.mask_limits.max_trie_node_visits) as u64;
         self.verify_completed_with_control(&result, mask_charge_per_token,
-            budget.json.max_total_mask_node_visits, control)?;
+            budget.json.max_total_mask_node_visits, reuse_prefill, control)?;
         Ok(result)
     }
 
     /// Recheck the complete bundle and every sample's native and mask charges.
     /// This is structural validation, not a claim that explanations are true.
     fn verify_completed_with_control<C: DecodeStepControl>(&self,
-        run: &SampledSentimentRun, mask_charge_per_token: u64, mask_ceiling: u64, control: &mut C)
+        run: &SampledSentimentRun, mask_charge_per_token: u64, mask_ceiling: u64,
+        reuse_prefill: bool, control: &mut C)
         -> Result<(), SampledSentimentError> {
         checkpoint(control)?;
-        if mask_charge_per_token == 0 || run.schema_version != 1 || run.execution != SAMPLED_SENTIMENT_EXECUTION
+        let execution = if reuse_prefill { SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION }
+            else { SAMPLED_SENTIMENT_EXECUTION };
+        if mask_charge_per_token == 0 || run.schema_version != 1 || run.execution != execution
             || run.task_spec != "sentiment-v1" || run.prompt_template_sha256 != self.identity.template_digest
             || run.numerics_profile != STRICT_INT4_PROFILE || run.group_width != self.group_width
             || run.aggregation != SAMPLED_SENTIMENT_AGGREGATION_VERSION
@@ -439,11 +487,7 @@ impl PreparedSampledSentiment {
                     || sample.generated_tokens == 0 || sample.generated_tokens > self.options.max_sample_tokens {
                     return Err(SampledSentimentError::Accounting);
                 }
-                let positions = axis.prompt.len().checked_add(sample.generated_tokens - 1)
-                    .ok_or(SampledSentimentError::Accounting)?;
-                let logits = sample.generated_tokens.checked_mul(NANBEIGE_VOCAB_SIZE)
-                    .ok_or(SampledSentimentError::Accounting)?;
-                let expected = Int4Work::for_sequence(self.group_width, 0, positions, logits)?;
+                let expected = self.sample_work(axis, index, sample.generated_tokens, reuse_prefill)?;
                 let expected_masks = (sample.generated_tokens as u64).checked_mul(mask_charge_per_token)
                     .ok_or(SampledSentimentError::Accounting)?;
                 if sample.model_work != expected || !fits_work(expected, axis.work)
@@ -494,11 +538,29 @@ impl PreparedSampledSentiment {
         if all > budget.json.max_total_mask_node_visits { return Err(SampledSentimentError::WorkBudget); }
         Ok(one)
     }
-    fn finalize_sample(&self, axis: &PreparedAxis, sample_index: usize, run: Int4JsonRun)
+    fn sample_work(&self, axis: &PreparedAxis, sample_index: usize, generated_tokens: usize,
+        reuse_prefill: bool) -> Result<Int4Work, SampledSentimentError> {
+        if sample_index >= self.options.samples || generated_tokens == 0 || axis.prompt.is_empty() {
+            return Err(SampledSentimentError::Accounting);
+        }
+        let (start, positions) = if reuse_prefill && sample_index > 0 {
+            (axis.prompt.len() - 1, generated_tokens)
+        } else {
+            (0, axis.prompt.len().checked_add(generated_tokens - 1)
+                .ok_or(SampledSentimentError::Accounting)?)
+        };
+        let logits = generated_tokens.checked_mul(NANBEIGE_VOCAB_SIZE)
+            .ok_or(SampledSentimentError::Accounting)?;
+        Ok(Int4Work::for_sequence(self.group_width, start, positions, logits)?)
+    }
+
+    fn finalize_sample(&self, axis: &PreparedAxis, sample_index: usize, run: Int4JsonRun, reuse_prefill: bool)
         -> Result<SampledSentimentSample, SampledSentimentError> {
         let output = &run.output;
+        let execution = if reuse_prefill { INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION }
+            else { INT4_JSON_SAMPLED_EXECUTION };
         if sample_index >= self.options.samples || run.schema_version != 1
-            || run.execution != INT4_JSON_SAMPLED_EXECUTION || run.group_width != self.group_width
+            || run.execution != execution || run.group_width != self.group_width
             || output.schema_version != 1 || output.numerics_profile != STRICT_INT4_PROFILE
             || output.token_ids.is_empty() || output.token_ids.len() > self.options.max_sample_tokens
             || output.token_ids.last() != Some(&self.decode.eos_token_id)
@@ -506,9 +568,7 @@ impl PreparedSampledSentiment {
                 *id as usize >= NANBEIGE_VOCAB_SIZE || self.decode.excluded_token_ids.contains(id)) {
             return Err(SampledSentimentError::Accounting);
         }
-        let positions = axis.prompt.len().checked_add(output.token_ids.len() - 1).ok_or(SampledSentimentError::Accounting)?;
-        let logits = output.token_ids.len().checked_mul(NANBEIGE_VOCAB_SIZE).ok_or(SampledSentimentError::Accounting)?;
-        let expected = Int4Work::for_sequence(self.group_width, 0, positions, logits)?;
+        let expected = self.sample_work(axis, sample_index, output.token_ids.len(), reuse_prefill)?;
         if expected != run.model_work || !fits_work(expected, axis.work)
             || output.forward_positions != expected.forward_positions || output.projected_logits != expected.projected_logits {
             return Err(SampledSentimentError::Accounting);

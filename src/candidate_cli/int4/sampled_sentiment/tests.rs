@@ -24,6 +24,39 @@ impl Read for NoRead {
 }
 
 #[test]
+fn prompt_reuse_is_explicit_and_preserves_cold_admission_and_sampling_policy() {
+    assert!(!command(&[]).1.reuse_prefill);
+    for flags in [
+        &["--reuse-prefill"][..],
+        &["--reuse-prefill", "--compute-threads", "4"][..],
+        &["--reuse-prefill", "--prefill-rows", "4"][..],
+        &["--reuse-prefill", "--input-encoding", "safe-bpe-v1", "--prefill-rows", "1"][..],
+    ] {
+        let (args, reused) = command(flags);
+        let (cold_args, cold) = command(&flags[1..]);
+        let limits = reused.validate(&args).unwrap();
+        let cold_limits = cold.validate(&cold_args).unwrap();
+        assert!(reused.reuse_prefill);
+        assert_eq!(reused.options(&args).unwrap(), cold.options(&cold_args).unwrap());
+        assert_eq!(reused.work_ceiling(), cold.work_ceiling());
+        assert_eq!(reused.budget(&args, limits, 4).unwrap(), cold.budget(&cold_args, cold_limits, 4).unwrap());
+        assert_eq!(limits.minimum_memory_bytes, cold_limits.minimum_memory_bytes);
+        assert_eq!(limits.compute.threads, cold_limits.compute.threads);
+        assert_eq!(limits.prefill.map(|limits| (limits.max_batch_rows, limits.max_extra_scratch_bytes)),
+            cold_limits.prefill.map(|limits| (limits.max_batch_rows, limits.max_extra_scratch_bytes)));
+        let mut short = args;
+        short.memory_mib = (limits.minimum_memory_bytes - 1) / MIB;
+        let mut output = Vec::new();
+        assert_eq!(reused.execute(short, &mut NoRead, &mut output).unwrap_err().exit, ErrorCode::Usage);
+        assert!(output.is_empty());
+    }
+    let (args, sampled) = command(&["--reuse-prefill", "--compute-threads", "2", "--prefill-rows", "4"]);
+    let mut output = Vec::new();
+    assert_eq!(sampled.execute(args, &mut NoRead, &mut output).unwrap_err().exit, ErrorCode::Usage);
+    assert!(output.is_empty());
+}
+
+#[test]
 fn sampled_mode_requires_seed_and_rejects_unsupported_generation_policies() {
     assert_eq!(command(&["sentiment-request.json"]).0.input, PathBuf::from("sentiment-request.json"));
     assert!(crate::candidate_cli::definition().try_get_matches_from([

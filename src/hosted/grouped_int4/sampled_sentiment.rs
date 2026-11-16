@@ -1,6 +1,7 @@
 //! Independent sampled sentiment generations under one admitted native call.
-//! Each sample starts with empty logical KV; the complete bundle shares one
-//! native allocation, sampler workspace, mask allowance and cancellation scope.
+//! The complete bundle shares one native allocation, sampler workspace, mask
+//! allowance and cancellation scope. Explicit prefill reuse retains only the
+//! current axis's causal prompt prefix between independently addressed samples.
 //! Explicit parallel execution keeps one fixed projection team alive across
 //! the entire bundle; sample addressing and per-row reductions stay unchanged.
 
@@ -21,7 +22,8 @@ use crate::{
         strict_int4::{Int4Work, prefill::Int4PrefillLimits},
     },
     tasks::{ir::TaskBudget, sentiment::sampled::{PreparedSampledSentiment,
-        SampledSentimentError, SampledSentimentRun, SampledSentimentVocabulary}},
+        SampledSentimentError, SampledSentimentRun, SampledSentimentVocabulary,
+        SAMPLED_SENTIMENT_EXECUTION, SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION}},
 };
 
 /// All work ceilings apply to the whole axis-by-sample bundle. Preparation
@@ -47,7 +49,7 @@ impl NlpEngine {
         limits: SampledSentimentHostLimits, kernel: PackedInt4Kernel,
         cancellation: CancellationToken) -> Result<HostedOutput<SampledSentimentRun>, HostedError> {
         self.execute_int4_sampled_sentiment_scheduled(model, prepared, vocabulary,
-            limits, kernel, None, cancellation)
+            limits, kernel, None, false, cancellation)
     }
 
     /// Admit the full declared causal prompt workspace once for the complete
@@ -60,14 +62,29 @@ impl NlpEngine {
         prefill: Int4PrefillLimits, cancellation: CancellationToken)
         -> Result<HostedOutput<SampledSentimentRun>, HostedError> {
         self.execute_int4_sampled_sentiment_scheduled(model, prepared, vocabulary,
-            limits, kernel, Some(prefill), cancellation)
+            limits, kernel, Some(prefill), false, cancellation)
+    }
+
+    /// Reuse the current axis's private causal prompt prefix between samples.
+    /// The first sample may use layer-major prefill; subsequent samples execute
+    /// only the final prompt token and their own generated continuation. The
+    /// complete cold-work ceiling remains reserved, while receipts report the
+    /// actual work. Prefix state never survives an axis or request boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_int4_sampled_sentiment_reusing_prefill(&self, model: &ResidentInt4,
+        prepared: PreparedSampledSentiment, vocabulary: Arc<SampledSentimentVocabulary>,
+        limits: SampledSentimentHostLimits, kernel: PackedInt4Kernel,
+        prefill: Option<Int4PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedOutput<SampledSentimentRun>, HostedError> {
+        self.execute_int4_sampled_sentiment_scheduled(model, prepared, vocabulary,
+            limits, kernel, prefill, true, cancellation)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn execute_int4_sampled_sentiment_scheduled(&self, model: &ResidentInt4,
         prepared: PreparedSampledSentiment, vocabulary: Arc<SampledSentimentVocabulary>,
         limits: SampledSentimentHostLimits, kernel: PackedInt4Kernel,
-        prefill: Option<Int4PrefillLimits>, cancellation: CancellationToken)
+        prefill: Option<Int4PrefillLimits>, reuse_prefill: bool, cancellation: CancellationToken)
         -> Result<HostedOutput<SampledSentimentRun>, HostedError> {
         dispatch::preflight(self, limits.native.run)?;
         if !Arc::ptr_eq(self.resources(), model.resources()) {
@@ -106,7 +123,7 @@ impl NlpEngine {
             let result = allocate(output, || {
                 let (prepared, vocabulary) = &input.value;
                 execute_prepared(prepared, vocabulary, &mut engine.value, limits,
-                    required.kv_bytes, work, prefill, control)
+                    required.kv_bytes, work, prefill, reuse_prefill, control)
             })?;
             drop(engine);
             drop(input);
@@ -125,6 +142,28 @@ impl NlpEngine {
         prepared: PreparedSampledSentiment, vocabulary: Arc<SampledSentimentVocabulary>,
         limits: SampledSentimentHostLimits, kernel: PackedInt4Kernel, compute_threads: usize,
         cancellation: CancellationToken) -> Result<HostedInt4TeamResult<SampledSentimentRun>, HostedError> {
+        self.execute_int4_sampled_sentiment_threads_scheduled(model, prepared, vocabulary,
+            limits, kernel, compute_threads, false, cancellation)
+    }
+
+    /// Keep one numerical row team and one axis-local causal prompt prefix
+    /// across the independent sample schedule. Admission and complete-result
+    /// cleanup are identical to the cold parallel path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_int4_sampled_sentiment_reusing_prefill_with_threads(&self, model: &ResidentInt4,
+        prepared: PreparedSampledSentiment, vocabulary: Arc<SampledSentimentVocabulary>,
+        limits: SampledSentimentHostLimits, kernel: PackedInt4Kernel, compute_threads: usize,
+        cancellation: CancellationToken) -> Result<HostedInt4TeamResult<SampledSentimentRun>, HostedError> {
+        self.execute_int4_sampled_sentiment_threads_scheduled(model, prepared, vocabulary,
+            limits, kernel, compute_threads, true, cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_int4_sampled_sentiment_threads_scheduled(&self, model: &ResidentInt4,
+        prepared: PreparedSampledSentiment, vocabulary: Arc<SampledSentimentVocabulary>,
+        limits: SampledSentimentHostLimits, kernel: PackedInt4Kernel, compute_threads: usize,
+        reuse_prefill: bool, cancellation: CancellationToken)
+        -> Result<HostedInt4TeamResult<SampledSentimentRun>, HostedError> {
         dispatch::preflight_int4_team(self, limits.native.run, compute_threads)?;
         if !Arc::ptr_eq(self.resources(), model.resources()) {
             return Err(HostedError::ResourceDomain);
@@ -148,7 +187,8 @@ impl NlpEngine {
         };
         parallel::execute_task(self, model, (prepared, vocabulary), limits.native,
             kernel, compute_threads, memory, cancellation, move |input, engine, control| {
-                execute_prepared(&input.0, &input.1, engine, limits, required.kv_bytes, work, None, control)
+                execute_prepared(&input.0, &input.1, engine, limits, required.kv_bytes, work, None,
+                    reuse_prefill, control)
             })
     }
 }
@@ -158,16 +198,23 @@ impl NlpEngine {
 #[allow(clippy::too_many_arguments)]
 fn execute_prepared(prepared: &PreparedSampledSentiment, vocabulary: &SampledSentimentVocabulary,
     engine: &mut StrictInt4Engine<'_>, limits: SampledSentimentHostLimits, kv_bytes: u64,
-    work: Int4Work, prefill: Option<Int4PrefillLimits>, control: &mut RunControl)
+    work: Int4Work, prefill: Option<Int4PrefillLimits>, reuse_prefill: bool, control: &mut RunControl)
     -> Result<SampledSentimentRun, HostedError> {
     let budget = execution_budget(work, kv_bytes, limits);
-    let run = match prefill {
-        None => prepared.execute_with_control(engine, prepared.execution_identity(), vocabulary,
-            budget, limits.max_sampler_bytes, control),
-        Some(prefill) => prepared.execute_layer_major_with_control(engine, prepared.execution_identity(),
-            vocabulary, budget, limits.max_sampler_bytes, prefill, control),
+    let run = if reuse_prefill {
+        prepared.execute_reusing_prefill_with_control(engine, prepared.execution_identity(), vocabulary,
+            budget, limits.max_sampler_bytes, prefill, control)
+    } else {
+        match prefill {
+            None => prepared.execute_with_control(engine, prepared.execution_identity(), vocabulary,
+                budget, limits.max_sampler_bytes, control),
+            Some(prefill) => prepared.execute_layer_major_with_control(engine, prepared.execution_identity(),
+                vocabulary, budget, limits.max_sampler_bytes, prefill, control),
+        }
     }.map_err(task_error)?;
-    if !fits(run.model_work, work) || run.group_width != prepared.group_width()
+    let execution = if reuse_prefill { SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION }
+        else { SAMPLED_SENTIMENT_EXECUTION };
+    if run.execution != execution || !fits(run.model_work, work) || run.group_width != prepared.group_width()
         || engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) {
         return Err(HostedError::Limits("sampled sentiment completion accounting"));
     }

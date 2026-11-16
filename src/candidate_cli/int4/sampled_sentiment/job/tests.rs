@@ -45,6 +45,18 @@ impl Write for NoIo {
 }
 
 #[test]
+fn one_off_prefill_reuse_is_refused_before_job_limits_key_or_population_io() {
+    for route in 0..3 { for operation in ["start", "resume"] {
+        let (c, args) = command(operation, route, &["--reuse-prefill"]);
+        assert!(c.args.sampled.reuse_prefill);
+        assert_eq!(c.args.validate(&args).unwrap_err().code,
+            "sampled_sentiment_job_prefill_reuse_unavailable");
+        assert_eq!(c.execute_owned(args, NoIo, &mut NoIo).unwrap_err().code,
+            "sampled_sentiment_job_prefill_reuse_unavailable");
+    } }
+}
+
+#[test]
 fn source_snapshot_and_save_keep_exact_sampler_and_owned_dispatch() {
     for route in 0..3 {
         for operation in ["start", "resume"] {

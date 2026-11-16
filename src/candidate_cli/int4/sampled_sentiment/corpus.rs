@@ -44,6 +44,7 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
         .mut_arg("input", |arg| arg.help("NDJSON file, or '-' for stdin; one bounded record at a time"))
         .mut_arg("max_input_bytes", |arg| arg.help("Maximum decoded UTF-8 document bytes per record"))
         .mut_arg("max_result_bytes", |arg| arg.help("Maximum complete sample bundle per record; candidate framing is additional"))
+        .mut_arg("reuse_prefill", |arg| arg.hide(true))
         .mut_arg("prefill_rows", |arg| arg.hide(false).help("Layer-major prompt morsels per fresh sample, 1..=64 rows; one admitted workspace for the stream, incompatible with multiple compute threads"))
         .mut_arg("max_checkpoints", |arg| arg.help("Nonrenewable cooperative checkpoints for the ENTIRE stream"))
         .mut_arg("max_forward_positions", |arg| arg.help("Whole-stream forward ceiling across all records, axes and samples"))
@@ -70,6 +71,7 @@ impl BatchArgs {
     }
 
     fn validate(self, args: &Int4Args) -> Result<BatchLimits, CandidateError> {
+        if self.sampled.reuse_prefill { return Err(CandidateError::Arguments); }
         let stream = self.stream;
         if !(1..=MAX_REQUESTS).contains(&stream.max_requests)
             || stream.max_line_bytes < args.max_input_bytes

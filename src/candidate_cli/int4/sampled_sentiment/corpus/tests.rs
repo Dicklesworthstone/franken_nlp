@@ -39,6 +39,16 @@ impl Write for NoWrite {
 }
 
 #[test]
+fn one_off_prefill_reuse_is_refused_before_resident_population_io() {
+    for route in 0..3 {
+        let (args, batch) = command_for_route(&["--reuse-prefill"], route);
+        assert!(batch.sampled.reuse_prefill);
+        assert!(matches!(batch.validate(&args), Err(CandidateError::Arguments)));
+        assert_eq!(batch.execute_owned(args, NoRead, NoWrite).unwrap_err().exit, ErrorCode::Usage);
+    }
+}
+
+#[test]
 fn resident_command_keeps_the_explicit_sampler_and_encoding_controls() {
     let (args, batch) = command(&["population.ndjson", "--samples", "7", "--compute-threads", "4",
         "--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "123456",

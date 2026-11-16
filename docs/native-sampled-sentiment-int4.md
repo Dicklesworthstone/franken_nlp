@@ -6,8 +6,10 @@ independent scores and explanations on the local grouped-INT4 candidate. They
 serve one document, a bounded ordered NDJSON stream, or an explicitly retained
 authenticated population with durable resume, respectively. Each invocation
 uses one resident model. They implement the independent generation portion of plan §7.5,
-Mode B. Each axis and sample starts from an empty logical KV cache and its
-own semantic sample address. It does not sample the distribution-mode bins.
+Mode B. Every sample has its own semantic address. By default each sample
+starts from an empty logical KV cache; the single-document command also offers
+explicit axis-local prompt reuse with `--reuse-prefill`. It does not sample the
+distribution-mode bins.
 
 These surfaces require the `asupersync-runtime` implementation; durable jobs
 additionally require `metadata-store` on Linux x86-64/AArch64. The repository's
@@ -80,8 +82,9 @@ not certify model quality or performance.
 document. It preserves exact source bytes, including Unicode, whitespace and
 marker-shaped text, while excluding every template-control token. The document
 is encoded once and its token sequence is reused across all axes and samples.
-Actual token counts govern context admission, and every independent sample
-still pays for its complete model prompt. There is no truncation, retry with a
+Actual token counts govern context admission, and admission conservatively
+reserves the complete model prompt for every sample, including when prompt
+reuse is selected. There is no truncation, retry with a
 renewed tokenizer budget, or implicit byte fallback when encoding is exhausted.
 
 The complete encoding policy, including its limits, is bound to the template
@@ -93,8 +96,8 @@ compact policy; byte-default responses retain their existing shape.
 `--compute-threads N` selects the coordinator plus persistent numerical row
 workers, with an allowed range of 1–64. One means serial execution. Larger
 widths use one supervised team for the whole axis-by-sample bundle, including
-all decoder projections and output heads. Each sample still starts with empty
-logical KV and retains its original semantic seed address; worker count does
+all decoder projections and output heads. Each sample retains its original
+semantic seed address; worker count does
 not become part of the semantic request identity. The optional top-level
 `compute` receipt reports the actual physical schedule. The runtime has one
 additional thread, and unsupported or over-budget widths are refused before
@@ -110,7 +113,8 @@ assumed result of source inspection.
 ## Layer-major prompt prefill
 
 For both single-document and resident-population commands, `--prefill-rows N`
-selects bounded layer-major prompt execution for every independent sample.
+selects bounded layer-major prompt execution. By default this runs for every
+independent sample; single-document `--reuse-prefill` runs it once per axis.
 N is an explicit maximum morsel width from 1 through 64.
 Use this option with serial compute (`--compute-threads 1`, the default); a
 larger compute team and prompt morsels are mutually exclusive schedules.
@@ -122,8 +126,8 @@ with `--prefill-rows 4`. The host reserves the full declared prompt workspace
 once for the entire invocation, even if a prompt contains fewer than four rows.
 In the corpus route, the reservation remains in place across every record and
 flush; it does not multiply by document, axis or sample count.
-Each sample still starts with empty logical KV, and each attention row sees
-only its own causal prefix. The two model passes, final-prefill output head,
+Each attention row sees only its own causal prefix. The default starts every
+sample with empty logical KV. The two model passes, final-prefill output head,
 grammar mask, sample address and scored terminal EOS use the same contracts.
 Generation after the prompt remains sequential.
 
@@ -133,6 +137,45 @@ expose `execute_layer_major_with_control`; the hosted entry point is
 semantic identity are unchanged. The corpus wrapper reports the selected
 prompt schedule separately. Exact same-recipe result parity and performance
 remain controller model gates; no speedup is claimed from source inspection.
+
+## Reuse the prompt across independent samples
+
+For the single-document command, add `--reuse-prefill` to avoid repeatedly
+forwarding the same axis prompt. This works with byte fallback or compact BPE,
+source conversion or pinned snapshots, and either serial compute, one persistent
+numerical team, or serial layer-major prefill. The existing restriction against
+combining multiple compute threads with `--prefill-rows` still applies. Batch
+and retained-job commands reject `--reuse-prefill` before opening private input,
+model, key or limits files.
+
+The first sample of each axis executes its complete prompt. Before a later
+sample, the private native session rewinds to the position immediately before
+the prompt's final token. It reappends that token, then generates the new
+continuation. All generated continuation KV from the prior sample is removed
+from the logical context. The session retains no previous sample's generated
+tokens in the next sample's attention prefix. No KV copy or shared cache is
+created; the prefix is dropped at the end of the axis and never crosses a
+request boundary. The full prompt, model identity, grammar, seed and addressed
+sample ordinal still determine the same private sampling address.
+
+The result's `execution` field is
+`grouped-int4-independent-sampled-sentiment-reused-prefill-v1` in reuse mode.
+Per-sample and complete-bundle `model_work` report executed work. For a prompt
+of P tokens and a completed sample of G generated tokens, including EOS, the
+first sample forwards P + G − 1 positions; every later sample forwards G
+positions starting at logical position P − 1. Attention accounting includes
+the retained prompt prefix. Full-vocabulary output projections and mask
+charges still occur for every generated token, including the scored EOS.
+For N samples this avoids (N − 1) × (P − 1) forward positions per axis. This is
+work accounting, not a measured latency or quality claim.
+
+Admission retains the existing complete cold-sample work ceiling and context,
+sampler and output reservations. A failed sample still withholds the complete
+bundle; cancellation retains its original cause and poisons and clears the
+private session. Default execution and its result identity are unchanged.
+Prepared-task embedders can use `execute_reusing_prefill_with_control`, and
+hosted callers can use `execute_int4_sampled_sentiment_reusing_prefill` or
+`execute_int4_sampled_sentiment_reusing_prefill_with_threads`.
 
 ## Sampling and complete results
 
@@ -159,6 +202,7 @@ contains the following fields:
 | `mean`, `median`, `minimum`, `maximum` | Descriptive statistics within each dimension |
 | `population_stddev` | Square root of mean squared deviation, dividing by N |
 | `samples_per_axis` | Requested N, identical for every included axis |
+| `execution` | Distinguishes default cold execution from explicit prompt reuse |
 | `model_work`, `generated_tokens`, `mask_node_visit_charge` | Actual complete bundle accounting |
 | `prompt_template_sha256`, `sampler_version`, `aggregation` | Versioned implementation identities |
 | `interpretation` | `generated_score_variation_not_calibrated_confidence` |
@@ -194,6 +238,7 @@ The seed and document-dependent identity hashes are omitted from normal output.
 | `--max-tokenizer-pair-bytes` | 67108864 examined bytes for that same encoding; compact mode only |
 | `--compute-threads` | 1; explicit coordinator-plus-worker width 1–64 |
 | `--prefill-rows` | Omitted; explicit layer-major prompt morsels of 1–64 rows, with serial compute |
+| `--reuse-prefill` | Off; one-off axis-local prompt reuse, preserving conservative cold-work admission |
 
 For the single-document command, all five native-work flags—`--max-forward-positions`,
 `--max-projected-logits`, `--max-attention-pairs`, `--max-dot-products` and
@@ -202,8 +247,10 @@ and durable-job sections below specify their population and lifetime scopes. Pre
 prices the complete maximum-token schedule before its first native forward;
 completing a short sample does not renew a budget for another sample. The task
 token budget is N × requested axes × per-sample token cap. One admitted native
-allocation and sampler allowance serve sequential samples, with logical KV
-cleared between them. Native buffers and result ownership remain charged
+allocation and sampler allowance serve sequential samples. Default execution
+clears logical KV between samples; explicit reuse clears generated continuations
+between samples and clears the complete prefix at each axis boundary.
+Native buffers and result ownership remain charged
 through physical completion and publication.
 
 The invocation deadline spans input, model preparation, planning, native work
@@ -637,6 +684,14 @@ numeric/source-bound/Unicode grammars, native and mask limits, all cancellation
 causes and finalizer refusal. CLI admission fixtures cover the complete declared
 prompt workspace, short inputs, source/snapshot/save paths and incompatible
 physical schedules.
+
+Prompt-reuse regression definitions cover exact first-versus-later-sample work,
+retained-prefix attention accounting, unchanged generated-token and mask
+charges, refusal of mislabeled or forged savings, single-token prompt bounds,
+explicit CLI admission, and rejection before population/job IO. The existing
+ignored model fixture also compares cold and reused results under serial,
+threaded and layer-major schedules and checks physical resource drain. These
+definitions have not been executed in this change.
 
 Resident batch regression definitions cover strict record arguments, all five
 native counters plus mask debit, failed admission, clean and poisoned failure
