@@ -16,6 +16,13 @@ additionally require `metadata-store` on Linux x86-64/AArch64. The repository's
 controller production-build, native parity and task-quality gates still apply;
 this change does not promote the no-flag public sentiment command.
 
+For a complete source that exceeds one context, use the separate
+[`sentiment-sampled-map` route](native-sampled-sentiment-map-int4.md). It retains
+the full sample bundle for every lossless chunk and reduces ordinal-paired
+scores using exact original-scalar weights. It has a distinct address domain
+and an explicit document estimator; the single-context commands described
+here retain their existing behavior.
+
 ## Request and command
 
 Create a UTF-8 JSON input such as `sentiment-request.json`:

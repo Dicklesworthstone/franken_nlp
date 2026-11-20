@@ -136,6 +136,7 @@ enum Int4Task {
     Semantic(semantic::SemanticArgs),
     Sentiment(sentiment::SentimentArgs),
     SampledSentiment(sampled_sentiment::SampledArgs),
+    SampledSentimentMap(sampled_sentiment::map::MapArgs),
     SampledSentimentBatch(sampled_sentiment::corpus::BatchArgs),
     SampledSentimentJob,
     SentimentMap(sentiment_map::MapArgs),
@@ -206,7 +207,7 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("prefill_rows", |arg| arg.help("Explicit grouped-INT4 layer-major prompt execution, 1..=64 rows; extra workspace is process-admitted"));
     clap::Command::new("source-int4")
         .about("Run candidate INT4 tasks from pinned sources or a digest-pinned local snapshot")
-        .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Sequential native execution defaults to scalar; --kernel explicitly selects an existing hardware-checked integer leaf. Text tasks and one-off classify, sentiment, judge, extract, ner, keyphrases, summarize and answer can opt in to bounded layer-major prompt execution with --prefill-rows. Retained text-job generate/chat, finite score-batch and score-job populations, and sampled sentiment, including sentiment-sampled-batch and sentiment-sampled-job, also support this explicit prompt schedule; other structured batch, map, job, redaction and semantic workflows retain their existing prompt schedules. stream generate/chat emits bounded provisional token NDJSON and requires a final run_complete after native drain. text-batch runs one finite NDJSON cohort and emits one completed aggregate JSON object. text-corpus processes bounded windows with one resident model and cumulative budgets, emitting completed-window NDJSON with a required corpus_complete footer. extract-batch streams documents under one shared schema through one resident model and engine. ner, keyphrases, summarize and answer preserve their source-task semantics; their -batch commands run ordered typed source-task NDJSON. Every ordered batch requires run_complete plus exit 0 for whole-run success. ner-map and keyphrases-map process every chunk of a complete document with original-coordinate evidence; summarize-map produces a deterministic exact cited bullet union. sentiment-map scores every original source chunk with complete independent dimension distributions and explicit scalar-weighted aggregation, optionally using real chunk cohorts. classify-map retains every chunk's exact classification scores and reports a separate scalar-weighted exclusive or independent multi-label mixture. All map commands preflight the complete document and publish one completed result. extract-job start/resume retains ordered extraction results in an explicit protected spool. ner-job, keyphrases-job, summarize-job and answer-job provide the same opt-in durable start/resume contract for source tasks. sentiment-sampled-job start/resume retains every independent score/explanation bundle under the original private seed and exact sampler recipe, with lifetime native/mask work and optional retained-input replay. redact-job start/resume retains complete-document edits under one authenticated detector, action and key scope, with metadata-only stdout. Resume authenticates the complete original population, exact task configuration, model/group identity and immutable lifetime limits. No automatic selection, fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Other routes publish completed task or corpus results.")
+        .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Sequential native execution defaults to scalar; --kernel explicitly selects an existing hardware-checked integer leaf. Text tasks and one-off classify, sentiment, judge, extract, ner, keyphrases, summarize and answer can opt in to bounded layer-major prompt execution with --prefill-rows. Retained text-job generate/chat, finite score-batch and score-job populations, and sampled sentiment, including sentiment-sampled-batch, sentiment-sampled-map and sentiment-sampled-job, also support this explicit prompt schedule; other structured batch, map, job, redaction and semantic workflows retain their existing prompt schedules. stream generate/chat emits bounded provisional token NDJSON and requires a final run_complete after native drain. text-batch runs one finite NDJSON cohort and emits one completed aggregate JSON object. text-corpus processes bounded windows with one resident model and cumulative budgets, emitting completed-window NDJSON with a required corpus_complete footer. extract-batch streams documents under one shared schema through one resident model and engine. ner, keyphrases, summarize and answer preserve their source-task semantics; their -batch commands run ordered typed source-task NDJSON. Every ordered batch requires run_complete plus exit 0 for whole-run success. ner-map and keyphrases-map process every chunk of a complete document with original-coordinate evidence; summarize-map produces a deterministic exact cited bullet union. sentiment-map scores every original source chunk with complete independent dimension distributions and explicit scalar-weighted aggregation, optionally using real chunk cohorts. sentiment-sampled-map generates every chunk's independent score/explanation bundle and reports explicit ordinal-paired scalar-weighted document replicates. classify-map retains every chunk's exact classification scores and reports a separate scalar-weighted exclusive or independent multi-label mixture. All map commands preflight the complete document and publish one completed result. extract-job start/resume retains ordered extraction results in an explicit protected spool. ner-job, keyphrases-job, summarize-job and answer-job provide the same opt-in durable start/resume contract for source tasks. sentiment-sampled-job start/resume retains every independent score/explanation bundle under the original private seed and exact sampler recipe, with lifetime native/mask work and optional retained-input replay. redact-job start/resume retains complete-document edits under one authenticated detector, action and key scope, with metadata-only stdout. Resume authenticates the complete original population, exact task configuration, model/group identity and immutable lifetime limits. No automatic selection, fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Other routes publish completed task or corpus results.")
         .after_long_help("Complete-document classification defaults to serial execution. classify-map --cohort-chunks N processes complete independent chunks together; requested chunks times actual heads must be at most 64 (one head for exclusive mode, one per label for multi_label). Physical cohort statistics remain separate from the semantic output. classify-corpus applies the complete-document map to ordered NDJSON with one resident model. Its explicit --cohort-chunks schedule shares native layers within each document; --max-labels bounds every default and replacement and can reduce admitted cohort memory. sentiment-corpus provides complete-document affect distributions and their scalar-weighted aggregate on the same ordered resident stream pattern; --max-axes bounds defaults and replacements, and --cohort-chunks shares layers within each document. Both corpus routes keep all five work ceilings across the entire run without renewal at chunk cohorts or flushes. source-corpus ner/keyphrases/summarize/answer applies the existing complete-document source pipelines to a live resident stream with fixed options and, for answer, one fixed question file. It includes exact reducers, explicit neural synthesis and hierarchies, and independent discovery/hierarchy cohort schedules. ner-corpus, keyphrases-corpus and summarize-corpus are short forms. Require run_complete plus exit 0.")
         .subcommand_required(true)
         .subcommand(compute::definition(input_encoding::definition(task("generate", "Generate from a bounded UTF-8 prompt using the pinned template"))))
@@ -217,6 +218,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(classify_map::corpus::definition())
         .subcommand(compute::definition(input_encoding::definition(sentiment::definition())))
         .subcommand(compute::definition(input_encoding::definition(sampled_sentiment::definition())))
+        .subcommand(sampled_sentiment::map::definition())
         .subcommand(compute::definition(input_encoding::definition(sampled_sentiment::corpus::definition())))
         .subcommand(sampled_sentiment::job::definition())
         .subcommand(sentiment_map::threaded_definition())
@@ -350,6 +352,7 @@ impl Int4Command {
             "classify-corpus" => Int4Task::ClassifyCorpus(classify_map::corpus::CorpusArgs::from_matches(matches)?),
             "sentiment" => Int4Task::Sentiment(sentiment::SentimentArgs::from_matches(matches)?),
             "sentiment-sampled" => Int4Task::SampledSentiment(sampled_sentiment::SampledArgs::from_matches(matches)?),
+            "sentiment-sampled-map" => Int4Task::SampledSentimentMap(sampled_sentiment::map::MapArgs::from_matches(matches)?),
             "sentiment-sampled-batch" => Int4Task::SampledSentimentBatch(sampled_sentiment::corpus::BatchArgs::from_matches(matches)?),
             "sentiment-map" => Int4Task::SentimentMap(sentiment_map::MapArgs::from_matches(matches)?),
             "sentiment-corpus" => Int4Task::SentimentCorpus(sentiment_map::corpus::CorpusArgs::from_matches(matches)?),
@@ -395,14 +398,14 @@ impl Int4Command {
             _ => return Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source-int4 task refused")),
         };
         let mut args = Int4Args::from_arg_matches(matches)?;
-        if matches!(name, "generate" | "chat" | "classify" | "classify-map" | "classify-corpus" | "sentiment" | "sentiment-sampled" | "sentiment-sampled-batch" | "sentiment-map" | "sentiment-corpus" | "judge" | "faithfulness-map" | "faithfulness-corpus" | "extract" | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch"
+        if matches!(name, "generate" | "chat" | "classify" | "classify-map" | "classify-corpus" | "sentiment" | "sentiment-sampled" | "sentiment-sampled-map" | "sentiment-sampled-batch" | "sentiment-map" | "sentiment-corpus" | "judge" | "faithfulness-map" | "faithfulness-corpus" | "extract" | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch"
             | "redact" | "redact-document" | "redact-corpus" | "resolve" | "resolve-corpus"
             | "extract-batch" | "ner-batch" | "keyphrases-batch" | "summarize-batch" | "answer-batch"
             | "ner-map" | "keyphrases-map" | "summarize-map" | "answer-map"
             | "ner-corpus" | "keyphrases-corpus" | "summarize-corpus" | "answer-corpus") {
             args.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
         }
-        if matches!(name, "generate" | "chat" | "classify" | "sentiment" | "sentiment-sampled" | "sentiment-sampled-batch" | "judge" | "extract"
+        if matches!(name, "generate" | "chat" | "classify" | "sentiment" | "sentiment-sampled" | "sentiment-sampled-map" | "sentiment-sampled-batch" | "judge" | "extract"
             | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch" | "extract-batch"
             | "ner-batch" | "keyphrases-batch" | "summarize-batch" | "answer-batch"
             | "classify-map" | "classify-corpus" | "sentiment-map" | "sentiment-corpus" | "extract-map" | "extract-corpus"
@@ -420,6 +423,8 @@ impl Int4Command {
     ) -> ExitCode {
         let result = match self {
             Self { task: Int4Task::SampledSentiment(options), args, batch: None, job: None } =>
+                return options.run(args, &mut input, &mut output, diagnostics),
+            Self { task: Int4Task::SampledSentimentMap(options), args, batch: None, job: None } =>
                 return options.run(args, &mut input, &mut output, diagnostics),
             Self { task: Int4Task::SampledSentimentBatch(options), args, batch: None, job: None } =>
                 return options.run_owned(args, input, output, diagnostics),
@@ -488,7 +493,7 @@ impl Int4Command {
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
         // The executable uses the typed sampled-task failure boundary above.
-        if matches!(self.task, Int4Task::SampledSentiment(_) | Int4Task::SampledSentimentBatch(_) | Int4Task::SampledSentimentJob) {
+        if matches!(self.task, Int4Task::SampledSentiment(_) | Int4Task::SampledSentimentMap(_) | Int4Task::SampledSentimentBatch(_) | Int4Task::SampledSentimentJob) {
             return Err(CandidateError::Arguments);
         }
         if self.job.is_some() || matches!(self.task, Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::ClassificationDocumentJob | Int4Task::SentimentDocumentJob | Int4Task::FaithfulnessDocumentJob | Int4Task::QuestionDocumentJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob) {
@@ -538,7 +543,7 @@ impl Int4Command {
             return options.execute(self.args, input, output);
         }
         let limits = match &self.task {
-            Int4Task::SampledSentiment(_) | Int4Task::SampledSentimentBatch(_) | Int4Task::SampledSentimentJob => return Err(CandidateError::Arguments),
+            Int4Task::SampledSentiment(_) | Int4Task::SampledSentimentMap(_) | Int4Task::SampledSentimentBatch(_) | Int4Task::SampledSentimentJob => return Err(CandidateError::Arguments),
             Int4Task::Text(_) => self.args.validate_text_compute()?,
             Int4Task::Classify(scoring) => scoring.validate_one_off_with_prefill(&self.args)?,
             Int4Task::Extract(extraction) => extraction.validate_one_off_with_prefill(&self.args)?,

@@ -1174,6 +1174,19 @@ versioned prompt and sampler; existing distribution sentiment is unchanged.
 See [sampled sentiment usage and limits](docs/native-sampled-sentiment-int4.md)
 for commands, result fields, reproducibility, admission and validation status.
 
+`sentiment-sampled-map` extends independent sampled scoring to complete
+documents that exceed one native context. It prepares every lossless source
+chunk before inference, gives repeated equal-text chunks distinct private draw
+addresses, and retains every complete score/explanation bundle with original
+byte/scalar spans. Document replicate `j` is the exact scalar-weighted sum of
+the chunks' `j`-th integer scores divided by the complete source scalar count.
+Its mean, median, range and population standard deviation describe those
+replicates; they do not establish full-context equivalence or calibrated
+confidence. One native/mask/tokenizer allowance covers the complete map, with
+serial, persistent-worker, layer-major and within-chunk prompt-reuse routes.
+See [complete sampled documents](docs/native-sampled-sentiment-map-int4.md)
+for invocation, estimator semantics, ownership and validation limits.
+
 The one-document command, resident `sentiment-sampled-batch` stream, and durable
 `sentiment-sampled-job` accept `--reuse-prefill`. Each document/axis prefills once, then later independent
 samples recompute the final prompt token using the retained causal prefix.

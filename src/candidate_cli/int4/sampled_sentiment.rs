@@ -13,6 +13,7 @@ use crate::{
 mod runtime;
 pub(super) mod corpus;
 pub(super) mod job;
+pub(super) mod map;
 #[cfg(test)]
 mod tests;
 
