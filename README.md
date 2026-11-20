@@ -1163,6 +1163,15 @@ versioned prompt and sampler; existing distribution sentiment is unchanged.
 See [sampled sentiment usage and limits](docs/native-sampled-sentiment-int4.md)
 for commands, result fields, reproducibility, admission and validation status.
 
+The one-document command, resident `sentiment-sampled-batch` stream, and durable
+`sentiment-sampled-job` accept `--reuse-prefill`. Each document/axis prefills once, then later independent
+samples recompute the final prompt token using the retained causal prefix.
+Reuse works with serial execution, a persistent CPU team, or serial layer-major
+prefill. Sample addresses and conservative cold-work reservations stay fixed;
+complete results report actual executed work. No prefix crosses a document or
+axis boundary. Durable jobs authenticate this policy and require the same flag
+on resume; measured speedup remains a separate validation gate.
+
 `sentiment-sampled-job start|resume` adds explicit durable populations with the
 same native sampler. It authenticates the original seed, complete settings,
 model, ordered inputs and lifetime work before recovery; committed bundles are

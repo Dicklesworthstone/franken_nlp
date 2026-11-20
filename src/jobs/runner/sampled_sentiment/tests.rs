@@ -380,6 +380,7 @@ fn changing_reuse_policy_refuses_before_uncommitted_tail_repair_or_execution() {
             retention, &input, make(reuse), &mut control).unwrap();
         assert_eq!(error(run.step(&mut control)),
             JobRunError::Storage(JobError::Cancelled(DecodeCancellationKind::PollQuota)));
+        assert_eq!(run.progress().reserved_work, JobWork::from_int4(work(1), 5));
         assert_eq!(run.progress().committed, 0); drop(run);
         assert_eq!(error(JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([9; 16]), limits(cap),
             retention, make(!reuse), TailPolicy::DiscardUncommitted, &mut Continue)),
@@ -394,6 +395,8 @@ fn changing_reuse_policy_refuses_before_uncommitted_tail_repair_or_execution() {
         let done = resumed.run(&mut Continue).unwrap();
         assert_eq!((done.committed, done.attempts), (2, 3));
         assert_eq!(done.reserved_work, JobWork::from_int4(work(3), 15));
+        assert_eq!(events.executions.get(), 3); assert_eq!(events.releases.get(), 3);
+        resumed.verify(&mut Continue).unwrap();
     }
 }
 
@@ -480,6 +483,22 @@ fn prompt_schedule_rows_workspace_and_backend_version_are_authenticated() {
 }
 
 #[test]
+fn paired_execution_versions_reject_mixed_cold_and_reused_schedules() {
+    let cold = recipe(native());
+    let reused = recipe(native()).with_reused_prefill().unwrap();
+    cold.check_job_limits(cold.job).unwrap(); reused.check_job_limits(reused.job).unwrap();
+    assert_eq!(cold.version, 2); assert_eq!(reused.version, cold.version);
+    for (execution, native_execution) in [
+        (SAMPLED_SENTIMENT_EXECUTION, INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION),
+        (SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION, INT4_JSON_SAMPLED_EXECUTION),
+    ] {
+        let mut mixed = recipe(native());
+        mixed.execution = execution; mixed.native_execution = native_execution;
+        assert!(mixed.check_job_limits(mixed.job).is_err(), "mixed schedules cannot authorize a processor");
+    }
+}
+
+#[test]
 fn storage_limits_and_record_bounds_are_part_of_the_immutable_recipe() {
     for axis in 0..10 {
         let mut changed = limits(native());
@@ -520,6 +539,7 @@ fn actual_model_bound_factory_quotes_recipe_and_uses_the_same_native_compiler() 
     assert_eq!(byte.group_width(), 32); assert_eq!(byte.task_budget(), task());
     assert_eq!(byte.job_limits(), limits(native())); byte.check_job_limits(limits(native())).unwrap();
     assert!(byte.prefill_limits().is_none());
+    assert!(!byte.reuses_prefill());
     let compact = make(compact());
     assert_eq!(compact.document_encoding(), &self::compact());
     assert_eq!(compact.preparation_requirement_bytes(),
@@ -533,13 +553,16 @@ fn actual_model_bound_factory_quotes_recipe_and_uses_the_same_native_compiler() 
     assert_ne!(canonjson::canonical_bytes(selected.job_recipe()).unwrap(), before);
     assert_eq!(selected.prefill_limits().unwrap().max_batch_rows, 4);
     assert!(!selected.reuses_prefill());
-    let preparation = selected.preparation_requirement_bytes();
-    let selected = selected.with_reused_prefill().unwrap();
-    assert!(selected.reuses_prefill());
-    assert_eq!(selected.base_execution_identity(), &identity);
-    assert_eq!(selected.preparation_requirement_bytes(), preparation);
-    assert_eq!(selected.prefill_limits().unwrap().max_batch_rows, 4);
-    selected.check_job_limits(limits(native())).unwrap();
+    let original_task = selected.task_budget(); let original_work = selected.native_limits();
+    let original_preparation = selected.preparation_requirement_bytes();
+    let reused = selected.with_reused_prefill().unwrap();
+    assert!(reused.reuses_prefill()); assert_eq!(reused.prefill_limits().unwrap().max_batch_rows, 4);
+    assert_eq!(reused.base_execution_identity(), &identity);
+    assert_eq!(reused.task_budget(), original_task);
+    assert_eq!(canonjson::canonical_bytes(&NativeRecipe::from(reused.native_limits())).unwrap(),
+        canonjson::canonical_bytes(&NativeRecipe::from(original_work)).unwrap());
+    assert_eq!(reused.preparation_requirement_bytes(), original_preparation);
+    assert_eq!(reused.job_limits(), limits(native())); reused.check_job_limits(limits(native())).unwrap();
 }
 
 #[test]

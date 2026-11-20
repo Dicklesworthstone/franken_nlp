@@ -41,40 +41,61 @@ impl Write for NoWrite {
 #[test]
 fn resident_prefill_reuse_preserves_cold_work_memory_and_sampler_admission() {
     assert!(!command(&[]).1.sampled.reuse_prefill);
-    for route in 0..3 { for flags in [
-        &["--reuse-prefill"][..],
-        &["--reuse-prefill", "--compute-threads", "4"][..],
-        &["--reuse-prefill", "--prefill-rows", "4"][..],
-        &["--reuse-prefill", "--input-encoding", "safe-bpe-v1", "--prefill-rows", "1"][..],
+    for route in 0..3 {
+        for schedule in [&[][..], &["--compute-threads", "4"][..], &["--prefill-rows", "1"][..],
+            &["--prefill-rows", "64", "--input-encoding", "safe-bpe-v1"][..],
+            &["--compute-threads", "4", "--input-encoding", "safe-bpe-v1"][..]] {
+            let (cold_args, cold) = command_for_route(schedule, route);
+            let before = cold.validate(&cold_args).unwrap();
+            let mut flags = schedule.to_vec(); flags.push("--reuse-prefill");
+            let (args, batch) = command_for_route(&flags, route);
+            assert!(batch.sampled.reuse_prefill);
+            let after = batch.validate(&args).unwrap();
+            assert_eq!(after.common.minimum_memory_bytes, before.common.minimum_memory_bytes);
+            assert_eq!(after.common.native, before.common.native);
+            let schedule = |limits: Option<Int4PrefillLimits>| limits.map(|prefill|
+                (prefill.max_batch_rows, prefill.max_extra_scratch_bytes));
+            assert_eq!(schedule(after.common.prefill), schedule(before.common.prefill));
+            assert_eq!(after.common.compute.threads, before.common.compute.threads);
+            assert_eq!(after.common.compute.workspace_bytes, before.common.compute.workspace_bytes);
+            assert_eq!(after.preparation_reserve_bytes, before.preparation_reserve_bytes);
+            assert_eq!(after.native.max_item_work, before.native.max_item_work);
+            assert_eq!(after.native.max_model_work, before.native.max_model_work);
+            assert_eq!(after.native.max_sampler_bytes, before.native.max_sampler_bytes);
+            assert_eq!(after.native.masks.per_mask, before.native.masks.per_mask);
+            assert_eq!(after.native.masks.max_visits_per_item, before.native.masks.max_visits_per_item);
+            assert_eq!(after.native.masks.max_visits_per_run, before.native.masks.max_visits_per_run);
+            assert_eq!(after.transport.max_work, before.transport.max_work);
+            assert_eq!(after.transport.max_output_bytes, before.transport.max_output_bytes);
+            assert_eq!(after.output_bytes, before.output_bytes);
+            assert_eq!(batch.sampled.options(&args).unwrap(), cold.sampled.options(&cold_args).unwrap());
+            assert_eq!(batch.sampled.budget(&args, after.common, SentimentAxis::ALL.len()).unwrap(),
+                cold.sampled.budget(&cold_args, before.common, SentimentAxis::ALL.len()).unwrap());
+            assert_eq!(args.input_encoding.policy(args.max_input_bytes, after.common.max_prompt_tokens).unwrap(),
+                cold_args.input_encoding.policy(cold_args.max_input_bytes, before.common.max_prompt_tokens).unwrap());
+            // Savings are physical work receipts, never authority to under-admit
+            // the resident engine, output or declared prompt/team workspace.
+            let mut short = args;
+            short.memory_mib = (after.common.minimum_memory_bytes - 1) / MIB;
+            assert_eq!(batch.execute_owned(short, NoRead, NoWrite).unwrap_err().exit, ErrorCode::Usage);
+        }
+    }
+    assert!(definition().render_long_help().to_string().contains("--reuse-prefill"));
+}
+
+#[test]
+fn reuse_does_not_bypass_invalid_schedules_or_native_budgets_before_population_io() {
+    for flags in [
+        &["--reuse-prefill", "--prefill-rows", "4", "--compute-threads", "2"][..],
+        &["--reuse-prefill", "--prefill-rows", "0"][..],
+        &["--reuse-prefill", "--compute-threads", "65"][..],
+        &["--reuse-prefill", "--samples", "0"][..],
+        &["--reuse-prefill", "--max-forward-positions", "0"][..],
+        &["--reuse-prefill", "--max-mask-node-visits", "0"][..],
     ] {
-        let (args, batch) = command_for_route(flags, route);
-        let (cold_args, cold) = command_for_route(&flags[1..], route);
-        let limits = batch.validate(&args).unwrap();
-        let cold_limits = cold.validate(&cold_args).unwrap();
-        assert!(batch.sampled.reuse_prefill);
-        assert_eq!(batch.sampled.options(&args).unwrap(), cold.sampled.options(&cold_args).unwrap());
-        assert_eq!(limits.native.max_item_work, cold_limits.native.max_item_work);
-        assert_eq!(limits.native.max_model_work, cold_limits.native.max_model_work);
-        assert_eq!(limits.native.max_sampler_bytes, cold_limits.native.max_sampler_bytes);
-        assert_eq!(limits.native.masks.max_visits_per_item, cold_limits.native.masks.max_visits_per_item);
-        assert_eq!(limits.native.masks.max_visits_per_run, cold_limits.native.masks.max_visits_per_run);
-        assert_eq!(limits.native.masks.per_mask.max_trie_node_visits,
-            cold_limits.native.masks.per_mask.max_trie_node_visits);
-        assert_eq!(limits.native.masks.per_mask.checkpoint_interval_nodes,
-            cold_limits.native.masks.per_mask.checkpoint_interval_nodes);
-        assert_eq!(limits.transport.max_work, cold_limits.transport.max_work);
-        assert_eq!(limits.output_bytes, cold_limits.output_bytes);
-        assert_eq!(limits.common.minimum_memory_bytes, cold_limits.common.minimum_memory_bytes);
-        assert_eq!(limits.common.native, cold_limits.common.native);
-        assert_eq!(limits.common.compute.threads, cold_limits.common.compute.threads);
-        assert_eq!(limits.common.prefill.map(|p| (p.max_batch_rows, p.max_extra_scratch_bytes)),
-            cold_limits.common.prefill.map(|p| (p.max_batch_rows, p.max_extra_scratch_bytes)));
-        let mut short = args;
-        short.memory_mib = (limits.common.minimum_memory_bytes - 1) / MIB;
-        assert_eq!(batch.execute_owned(short, NoRead, NoWrite).unwrap_err().exit, ErrorCode::Usage);
-    } }
-    let (args, batch) = command(&["--reuse-prefill", "--compute-threads", "2", "--prefill-rows", "4"]);
-    assert_eq!(batch.execute_owned(args, NoRead, NoWrite).unwrap_err().exit, ErrorCode::Usage);
+        let (args, batch) = command(flags);
+        assert_eq!(batch.execute_owned(args, NoRead, NoWrite).unwrap_err().exit, ErrorCode::Usage, "{flags:?}");
+    }
 }
 
 #[test]
@@ -191,7 +212,9 @@ fn a_drained_stream_with_rejected_items_has_nonzero_process_status() {
 fn an_unavailable_runtime_never_reads_or_publishes_the_population() {
     for route in 0..3 {
         for flags in [&[][..], &["--compute-threads", "4", "--input-encoding", "safe-bpe-v1"][..],
-            &["--prefill-rows", "4"][..], &["--prefill-rows", "64", "--input-encoding", "safe-bpe-v1"][..]] {
+            &["--prefill-rows", "4"][..], &["--prefill-rows", "64", "--input-encoding", "safe-bpe-v1"][..],
+            &["--reuse-prefill"][..], &["--reuse-prefill", "--compute-threads", "4"][..],
+            &["--reuse-prefill", "--prefill-rows", "4", "--input-encoding", "safe-bpe-v1"][..]] {
             let (args, batch) = command_for_route(flags, route);
             let error = batch.execute_owned(args, NoRead, NoWrite).unwrap_err();
             assert_eq!(error.code, "sampled_sentiment_batch_profile_unavailable");

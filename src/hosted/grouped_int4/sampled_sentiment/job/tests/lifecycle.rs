@@ -76,7 +76,8 @@ fn drained(host: &NlpEngine, baseline: &crate::MemorySnapshot) {
 fn execute(host: &NlpEngine, model: &ResidentInt4, planner: SampledSentimentJobPlanner,
     request: SourceJobRequest, limits: JobHostLimits, schedule: usize,
     reader: Reader, stop: CancellationToken) -> Result<JobProgress, HostedJobError> {
-    match schedule {
+    let planner = if schedule >= 3 { planner.with_reused_prefill().unwrap() } else { planner };
+    match schedule % 3 {
         0 => host.job_int4_sampled_sentiment(model, planner, request, limits,
             PackedInt4Kernel::scalar(), reader, stop),
         1 => host.job_int4_sampled_sentiment_with_threads(model, planner, request, limits,
@@ -107,7 +108,9 @@ fn original_cancellation_and_owned_input_charges_survive_every_physical_schedule
     let vocabulary = Arc::new(SampledSentimentVocabulary::pinned().unwrap());
     let baseline = host.resources().memory_snapshot();
     use DecodeCancellationKind::*;
-    for schedule in 0..3 {
+    // Repeat every physical-lifetime path with and without axis-local reuse.
+    // A saved prefix never weakens pre-IO cancellation or charged ownership.
+    for schedule in 0..6 {
         for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
             ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
             let (planner, request, limits) = planner(&model, &vocabulary);

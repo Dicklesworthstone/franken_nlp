@@ -114,7 +114,7 @@ assumed result of source inspection.
 
 For both single-document and resident-population commands, `--prefill-rows N`
 selects bounded layer-major prompt execution. By default this runs for every
-independent sample; `--reuse-prefill` runs it once per axis in each document.
+independent sample; `--reuse-prefill` runs it once per document and axis.
 N is an explicit maximum morsel width from 1 through 64.
 Use this option with serial compute (`--compute-threads 1`, the default); a
 larger compute team and prompt morsels are mutually exclusive schedules.
@@ -344,6 +344,15 @@ reuse prefills every independent sample. Widths 1–64 are supported; the prompt
 cannot combine with a larger compute team. Compact input and source,
 snapshot-load and snapshot-save routes remain available.
 
+Adding `--reuse-prefill` applies the same exact prompt reuse within every
+document and axis. It works with either prompt morsels or persistent numerical
+workers. Every record starts and ends with empty logical KV, including repeated
+IDs after a flush; there is no cross-document cache or reuse across attempts.
+The first sample per axis still executes the complete prompt. Later samples
+execute its final token and their own independently addressed continuation.
+Lower actual work does not relax the full cold work/mask debit or admit extra
+records under the same invocation budget.
+
 ### Records and epochs
 
 Every document is a closed `{id,text,task_args?}` object. `task_args` accepts
@@ -404,6 +413,7 @@ reveal the seed or document-dependent identity digests.
 | `--max-mask-node-visits` | One cumulative mask allowance for every document, axis, sample and EOS |
 | Tokenizer pair limits | One bounded complete source encoding per record, reused across all its axes and samples |
 | `--prefill-rows` | Omitted by default; 1–64 causal prompt rows with one admitted workspace for the entire stream, using serial compute |
+| `--reuse-prefill` | Off by default; reuse only the current document/axis prompt, without refunding cold work reservations |
 
 Before a document enters native execution, the processor charges its full
 maximum-token schedule on all five native counters and its complete mask
@@ -420,7 +430,10 @@ Every output line is a candidate provenance wrapper with protocol
 actual-model provenance. With layer-major prompts, its optional
 `prefill_schedule` records the native execution version, declared maximum rows
 and admitted workspace bytes. The field is omitted by default; it reports the
-selected schedule without claiming a measured speedup. Its `record` retains the canonical
+selected schedule without claiming a measured speedup. With `--reuse-prefill`,
+the optional `prefill_reuse` field names
+`grouped-int4-independent-sampled-sentiment-reused-prefill-v1` on every event,
+including failures and flushes; it is absent by default. Its `record` retains the canonical
 `fnlp-item-local-batch-v1` event. Events are `run_start`, `doc`, `doc_error`,
 `flush` and terminal `run_complete` or `run_error`. A successful `doc` contains
 the entire validated sampled result under `record.result`, including every
@@ -458,10 +471,16 @@ The hosted methods
 `NlpEngine::batch_int4_sampled_sentiment_with_threads` and
 `NlpEngine::batch_int4_sampled_sentiment_layer_major` own the reader, writer,
 compiler and vocabulary through physical completion and delivery under one
-blocking invocation and one run controller. Their explicit
-`batch_int4_sampled_sentiment_reusing_prefill` and
-`batch_int4_sampled_sentiment_reusing_prefill_with_threads` alternatives use
-the same ownership and work limits with private per-axis prompt reuse.
+blocking invocation and one run controller.
+
+For explicit prompt reuse, construct the sealed adapter with
+`NativeSampledSentimentBatch::new_reusing_prefill`, optionally supplying an
+admitted layer-major prefill limit. Hosted callers can use
+`NlpEngine::batch_int4_sampled_sentiment_reusing_prefill` or
+`NlpEngine::batch_int4_sampled_sentiment_reusing_prefill_with_threads`. These
+entry points share the existing admission and physical-drain paths. The
+processor requires the selected schedule's execution marker before accepting a
+result; task finalization independently checks complete sample work and values.
 
 The CLI defaults to byte fallback and `--compute-threads 1`. Compact encoding
 and explicit widths 2–64 use the same admitted source/snapshot routes as the
@@ -728,6 +747,10 @@ Additional regression definitions cover per-record budget tightening without
 native debit on rejected records, exact complete-bundle accounting, bounded
 corpus prefill admission, unchanged stream work across prompt schedules,
 source/snapshot/save CLI routes and public schedule provenance.
+Prompt-reuse additions cover cold/reused marker mismatches, unchanged sample
+policy and full cold admission, lower actual work without refunds, fresh
+record boundaries, poisoned/cancelled completion, and explicit provenance on
+every stream event. These regression definitions have not been executed.
 These are source definitions and independent review, not executed batch or
 real-model evidence. Batch parity, replay, failure and physical-drain evidence
 remain part of the controller's model-present gates.

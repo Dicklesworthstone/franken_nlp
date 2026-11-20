@@ -32,17 +32,30 @@ impl Drop for NeverRead {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Schedule { Serial, Team, Prefill }
+enum Schedule { Serial, Team, Prefill, ReusedSerial, ReusedTeam, ReusedPrefill }
+impl Schedule {
+    fn reuses_prefill(self) -> bool {
+        matches!(self, Self::ReusedSerial | Self::ReusedTeam | Self::ReusedPrefill)
+    }
+    fn opposite_reuse(self) -> Self {
+        match self {
+            Self::Serial => Self::ReusedSerial, Self::Team => Self::ReusedTeam,
+            Self::Prefill => Self::ReusedPrefill, Self::ReusedSerial => Self::Serial,
+            Self::ReusedTeam => Self::Team, Self::ReusedPrefill => Self::Prefill,
+        }
+    }
+}
 #[allow(clippy::too_many_arguments)]
 fn execute<R: BufRead + Send + 'static>(engine: &NlpEngine, model: &ResidentInt4,
     planner: SampledSentimentJobPlanner, request: SourceJobRequest, host: JobHostLimits,
     schedule: Schedule, reader: R, stop: CancellationToken) -> Result<JobProgress, HostedJobError> {
+    let planner = if schedule.reuses_prefill() { planner.with_reused_prefill().unwrap() } else { planner };
     match schedule {
-        Schedule::Serial => engine.job_int4_sampled_sentiment(model, planner, request, host,
+        Schedule::Serial | Schedule::ReusedSerial => engine.job_int4_sampled_sentiment(model, planner, request, host,
             PackedInt4Kernel::scalar(), reader, stop),
-        Schedule::Team => engine.job_int4_sampled_sentiment_with_threads(model, planner, request, host,
+        Schedule::Team | Schedule::ReusedTeam => engine.job_int4_sampled_sentiment_with_threads(model, planner, request, host,
             PackedInt4Kernel::scalar(), 4, reader, stop),
-        Schedule::Prefill => engine.job_int4_sampled_sentiment_layer_major(model, planner, request, host,
+        Schedule::Prefill | Schedule::ReusedPrefill => engine.job_int4_sampled_sentiment_layer_major(model, planner, request, host,
             PackedInt4Kernel::scalar(), Int4PrefillLimits { max_batch_rows: 4,
                 max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(4).unwrap() },
             reader, stop),
@@ -82,6 +95,42 @@ fn complete_bundles(bytes: &[u8]) {
     }
     assert_eq!(records, 2);
     assert!(bytes.ends_with(b"\n"));
+}
+
+fn same_samples_with_less_native_work(cold: &[u8], reused: &[u8]) {
+    use crate::tasks::sentiment::sampled::{SAMPLED_SENTIMENT_EXECUTION,
+        SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION};
+    let decode = |bytes: &[u8]| bytes.split(|&byte| byte == b'\n').filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<SampledSentimentRun>(line).unwrap()).collect::<Vec<_>>();
+    let cold = decode(cold); let reused = decode(reused);
+    assert_eq!(cold.len(), reused.len());
+    for (mut cold, mut reused) in cold.into_iter().zip(reused) {
+        assert_eq!(cold.execution, SAMPLED_SENTIMENT_EXECUTION);
+        assert_eq!(reused.execution, SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION);
+        assert!(reused.model_work.forward_positions < cold.model_work.forward_positions);
+        assert!(reused.model_work.attention_pairs < cold.model_work.attention_pairs);
+        assert!(reused.model_work.projections.dot_products < cold.model_work.projections.dot_products);
+        assert!(reused.model_work.projections.multiply_accumulates < cold.model_work.projections.multiply_accumulates);
+        assert_eq!(reused.model_work.projected_logits, cold.model_work.projected_logits);
+        assert_eq!(cold.dimensions.len(), reused.dimensions.len());
+        for (cold_axis, reused_axis) in cold.dimensions.iter_mut().zip(&mut reused.dimensions) {
+            assert_eq!(cold_axis.samples.len(), reused_axis.samples.len());
+            for (cold_sample, reused_sample) in cold_axis.samples.iter_mut().zip(&mut reused_axis.samples) {
+                if cold_sample.sample_index == 0 {
+                    assert_eq!(cold_sample.model_work, reused_sample.model_work);
+                } else {
+                    assert!(reused_sample.model_work.forward_positions < cold_sample.model_work.forward_positions);
+                }
+                cold_sample.model_work = Int4Work::default();
+                reused_sample.model_work = Int4Work::default();
+            }
+        }
+        // Only physical execution tags/work may differ: every generated
+        // explanation, score, sample index, aggregate and mask charge is exact.
+        cold.execution.clear(); reused.execution.clear();
+        cold.model_work = Int4Work::default(); reused.model_work = Int4Work::default();
+        assert_eq!(cold, reused);
+    }
 }
 
 #[test]
@@ -168,8 +217,9 @@ fn real_sampled_jobs_keep_committed_bytes_and_lifetime_work_across_physical_sche
             assert!(planner.preparation_requirement_bytes() <= host.preparation_reserve_bytes);
             planner
         };
-        let mut expected = None;
-        for (ordinal, schedule) in [Schedule::Serial, Schedule::Team, Schedule::Prefill].into_iter().enumerate() {
+        let mut expected = [None, None];
+        for (ordinal, schedule) in [Schedule::Serial, Schedule::Team, Schedule::Prefill,
+            Schedule::ReusedSerial, Schedule::ReusedTeam, Schedule::ReusedPrefill].into_iter().enumerate() {
             let root = parent.join(format!("{name}-{ordinal}"));
             fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
             let progress = execute(&engine, &model, make(options.clone()),
@@ -181,15 +231,23 @@ fn real_sampled_jobs_keep_committed_bytes_and_lifetime_work_across_physical_sche
             assert!(progress.reserved_work.mask_node_visits > 0);
             let bytes = fs::read(root.join("materialized.ndjson")).unwrap();
             complete_bundles(&bytes);
-            if let Some((output, reserved)) = &expected {
+            let variant = usize::from(schedule.reuses_prefill());
+            if let Some((output, reserved)) = &expected[variant] {
                 assert_eq!(output, &bytes, "{name} {schedule:?}");
                 assert_eq!(*reserved, progress.reserved_work);
-            } else { expected = Some((bytes.clone(), progress.reserved_work)); }
+            } else { expected[variant] = Some((bytes.clone(), progress.reserved_work)); }
+            if schedule.reuses_prefill() {
+                let (cold, reserved) = expected[0].as_ref().unwrap();
+                same_samples_with_less_native_work(cold, &bytes);
+                assert_eq!(*reserved, progress.reserved_work, "reuse cannot discount durable cold-work debits");
+            }
             drained(&engine, &baseline);
             // Team width is a physical execution choice. Prefill geometry is
             // committed in the private recipe and must remain unchanged.
             let next = match schedule { Schedule::Serial => Schedule::Team,
-                Schedule::Team => Schedule::Serial, Schedule::Prefill => Schedule::Prefill };
+                Schedule::Team => Schedule::Serial, Schedule::Prefill => Schedule::Prefill,
+                Schedule::ReusedSerial => Schedule::ReusedTeam, Schedule::ReusedTeam => Schedule::ReusedSerial,
+                Schedule::ReusedPrefill => Schedule::ReusedPrefill };
             let mode = JobOpenMode::ResumeRetained { tail: TailPolicy::Refuse, retention };
             let drops = Arc::new(AtomicUsize::new(0));
             let replay = execute(&engine, &model, make(options.clone()), request(&root, job, mode), host, next,
@@ -232,6 +290,8 @@ fn real_sampled_jobs_keep_committed_bytes_and_lifetime_work_across_physical_sche
             let changed_schedule = match schedule {
                 Schedule::Prefill => Schedule::Serial,
                 Schedule::Serial | Schedule::Team => Schedule::Prefill,
+                Schedule::ReusedPrefill => Schedule::ReusedSerial,
+                Schedule::ReusedSerial | Schedule::ReusedTeam => Schedule::ReusedPrefill,
             };
             let error = execute(&engine, &model, make(options.clone()), request(&root, job, mode),
                 host, changed_schedule, NeverRead(Arc::clone(&drops)), CancellationToken::default())
@@ -239,6 +299,14 @@ fn real_sampled_jobs_keep_committed_bytes_and_lifetime_work_across_physical_sche
             assert!(matches!(error, HostedJobError::Job(JobRunError::Storage(
                 JobError::Mismatch(MismatchField::Recipe)))));
             assert_eq!(drops.load(Ordering::SeqCst), 5);
+            assert_eq!(fs::read(root.join("materialized.ndjson")).unwrap(), bytes);
+            drained(&engine, &baseline);
+            let error = execute(&engine, &model, make(options.clone()), request(&root, job, mode),
+                host, next.opposite_reuse(), NeverRead(Arc::clone(&drops)), CancellationToken::default())
+                .err().expect("reuse execution versions must refuse altered completed replay");
+            assert!(matches!(error, HostedJobError::Job(JobRunError::Storage(
+                JobError::Mismatch(MismatchField::Recipe)))));
+            assert_eq!(drops.load(Ordering::SeqCst), 6);
             assert_eq!(fs::read(root.join("materialized.ndjson")).unwrap(), bytes);
             drained(&engine, &baseline);
         }

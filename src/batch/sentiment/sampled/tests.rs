@@ -374,6 +374,49 @@ fn real_transport_flushes_ids_without_refunding_native_or_mask_work() {
 }
 
 #[test]
+fn reused_prefill_same_item_after_flush_keeps_cold_debits_despite_smaller_actual_receipts() {
+    let prefill = |rows| Int4PrefillLimits { max_batch_rows: rows,
+        max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap() };
+    for schedule in [None, Some(prefill(1)), Some(prefill(4)), Some(prefill(64))] {
+        let probe = Rc::new(Probe::default()); let mut processor = Harness::new(&probe, 2);
+        processor.driver.reuse_prefill = true;
+        processor.driver.prefill = schedule;
+        // Synthetic receipt slack tests ID-epoch/accounting composition;
+        // native fixtures separately own the causal prefix-reuse proof.
+        processor.driver.actual_work = Int4Work { forward_positions: 20, attention_pairs: 30,
+            projections: ProjectionWork { dot_products: 35, multiply_accumulates: 40 }, ..work(1) };
+        let input = b"{\"id\":\"same\",\"text\":\"ok\"}\n{\"flush\":true}\n{\"id\":\"same\",\"text\":\"ok\"}\n{\"id\":\"third\",\"text\":\"unfunded\"}\n";
+        let mut reader = Cursor::new(input);
+        let mut sink = Sink { bytes: Vec::new(), probe: Rc::clone(&probe),
+            delivering_result: false, fail_result: false };
+        let summary = run_ndjson(&mut reader, &mut sink, &mut processor, transport(), &mut Continue).unwrap();
+        assert_eq!((summary.succeeded, summary.failed), (2, 1));
+        assert_eq!(summary.reserved_work, transport_work(work(2)));
+        assert_eq!(processor.run.remaining, work(0)); assert_eq!(processor.run.remaining_masks, 0);
+        assert_eq!(probe.admissions.get(), 2); assert_eq!(probe.calls.get(), 2);
+        assert_eq!(probe.drops.get(), 2); assert!(!probe.live.get()); assert!(!probe.running.get());
+        let events = frames(&sink.bytes);
+        assert_eq!(events.last().unwrap()["event"], "run_complete");
+        assert!(events.iter().any(|event| event["error"]["code"] == "work_limit"));
+        let results = events.iter().filter(|event| event["event"] == "doc")
+            .map(|event| &event["result"]).collect::<Vec<_>>();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], results[1]);
+        for result in results {
+            assert_eq!(result["execution"], SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION);
+            let actual: Int4Work = serde_json::from_value(result["model_work"].clone()).unwrap();
+            assert!(actual.forward_positions < work(1).forward_positions);
+            assert!(actual.attention_pairs < work(1).attention_pairs);
+            assert!(actual.projections.dot_products < work(1).projections.dot_products);
+            assert!(actual.projections.multiply_accumulates < work(1).projections.multiply_accumulates);
+            assert_eq!(actual.projected_logits, work(1).projected_logits);
+            assert_eq!(result["generated_tokens"], 2);
+            assert_eq!(result["mask_node_visit_charge"], 3);
+        }
+    }
+}
+
+#[test]
 fn failed_delivery_never_retries_or_emits_terminal_success() {
     let probe = Rc::new(Probe::default()); let mut processor = Harness::new(&probe, 2);
     let mut reader = Cursor::new(b"{\"id\":\"one\",\"text\":\"ok\"}\n{\"id\":\"two\",\"text\":\"ok\"}\n");
@@ -455,6 +498,7 @@ fn widened_record_budgets_reject_before_admission_without_spending_work_or_break
 #[test]
 fn invalid_prefill_schedules_stop_before_admission_and_native_work() {
     let required = Int4PrefillLimits::required_extra_scratch_bytes(4).unwrap();
+    for reuse_prefill in [false, true] {
     for prefill in [
         Int4PrefillLimits { max_batch_rows: 0, max_extra_scratch_bytes: u64::MAX },
         Int4PrefillLimits { max_batch_rows: 65, max_extra_scratch_bytes: u64::MAX },
@@ -463,6 +507,7 @@ fn invalid_prefill_schedules_stop_before_admission_and_native_work() {
     ] {
         let probe = Rc::new(Probe::default()); let mut processor = Harness::new(&probe, 1);
         processor.driver.prefill = Some(prefill);
+        processor.driver.reuse_prefill = reuse_prefill;
         let mut reader = Cursor::new(b"{\"id\":\"one\",\"text\":\"ok\"}\n");
         let mut sink = Sink { bytes: Vec::new(), probe: Rc::clone(&probe),
             delivering_result: false, fail_result: false };
@@ -474,6 +519,7 @@ fn invalid_prefill_schedules_stop_before_admission_and_native_work() {
         assert_eq!(processor.run.remaining, work(1)); assert_eq!(processor.run.remaining_masks, 5);
         assert!(!frames(&sink.bytes).iter().any(|event|
             event["event"] == "doc" || event["event"] == "run_complete"));
+    }
     }
 }
 

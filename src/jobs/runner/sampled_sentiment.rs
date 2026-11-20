@@ -165,7 +165,10 @@ impl SampledSentimentJobRecipe {
     fn max_result_bytes(&self) -> u64 { self.task_budget.max_output_bytes.min(self.planning.max_result_bytes) }
     fn check_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> {
         limits.validate().map_err(|_| BatchCode::InvalidLimits)?;
-        if limits != self.job || limits.max_id_bytes > 256
+        let valid_execution = matches!((self.execution, self.native_execution),
+            (SAMPLED_SENTIMENT_EXECUTION, INT4_JSON_SAMPLED_EXECUTION)
+                | (SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION, INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION));
+        if !valid_execution || limits != self.job || limits.max_id_bytes > 256
             || self.planning.max_input_bytes > limits.max_input_bytes_per_item
             || limits.max_work != JobWork::from_int4(self.native.max_model_work, self.native.max_mask_visits_per_run)
             || self.task_budget.max_output_bytes.min(self.planning.max_result_bytes) > limits.max_result_bytes as u64 {
@@ -242,6 +245,7 @@ impl<'e, 'w, A: SampledSentimentBatchAdmission> SampledSentimentJobProcessor<'e,
     pub fn new(planner: SampledSentimentJobPlanner, engine: &'e mut StrictInt4Engine<'w>, admission: A)
         -> Result<Self, BatchFault> {
         let SampledSentimentJobPlanner { compiler, identity, recipe, .. } = planner;
+        recipe.check_job_limits(recipe.job)?;
         let native = if recipe.reuses_prefill() {
             NativeSampledSentimentBatch::new_reusing_prefill(compiler, engine, admission,
                 recipe.prefill_limits())?

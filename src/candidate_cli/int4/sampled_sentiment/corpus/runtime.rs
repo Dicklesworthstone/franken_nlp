@@ -186,6 +186,7 @@ struct Provenance<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tasks::sentiment::sampled::SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION;
     #[test]
     fn batch_cancellation_keeps_every_typed_cause() {
         use DecodeCancellationKind::*;
@@ -215,8 +216,7 @@ mod tests {
             source_root_sha256: "public-root", model_content_sha256: "public-content",
             candidate_format: "candidate", quant_recipe: "recipe", group_width: 128,
             integer_kernel: "s_scalar_i32", snapshot: None,
-            compute_schedule: compute::Schedule::for_threads(4), prefill_schedule: None,
-            prefill_reuse: None,
+            compute_schedule: compute::Schedule::for_threads(4), prefill_schedule: None, prefill_reuse: None,
             input_encoding: input_encoding::reported_policy(&encoding) };
         let mut output = Vec::new();
         {
@@ -242,10 +242,10 @@ mod tests {
     }
 
     #[test]
-    fn physical_prefill_provenance_is_explicit_on_every_event_and_absent_on_default() {
+    fn physical_prefill_and_reuse_provenance_are_explicit_on_every_event_and_absent_on_default() {
         use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
         for rows in [None, Some(1), Some(4), Some(64)] {
-            for (compact, reuse) in [(false, false), (true, false), (false, true), (true, true)] {
+            for (compact, reuse) in [(false, false), (false, true), (true, false), (true, true)] {
                 let encoding = if compact { UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
                     max_input_bytes: 32, max_output_tokens: 64, max_pair_checks: 1024, max_pair_bytes: 16384,
                 }) } else { UntrustedEncoding::ByteFallback };
@@ -261,27 +261,27 @@ mod tests {
                     integer_kernel: "s_scalar_i32", snapshot: None,
                     compute_schedule: compute::Schedule::for_threads(1),
                     prefill_schedule: prefill.map(PrefillSchedule::new).transpose().unwrap(),
-                    prefill_reuse: reuse.then_some(
-                        crate::tasks::sentiment::sampled::SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION),
+                    prefill_reuse: reuse.then_some(SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION),
                     input_encoding: input_encoding::reported_policy(&encoding) };
                 let mut output = Vec::new();
                 {
                     let mut writer = CandidateWriter::new(&mut output, &provenance, 4096, 16384).unwrap();
                     for record in [b"{\"event\":\"run_start\"}\n".as_slice(),
-                        b"{\"event\":\"doc\",\"result\":{\"fixture\":true}}\n", b"{\"event\":\"run_complete\"}\n"] {
+                        b"{\"event\":\"doc\",\"result\":{\"fixture\":true}}\n",
+                        b"{\"event\":\"doc_error\",\"error\":{\"code\":\"planning\"}}\n",
+                        b"{\"event\":\"flush\"}\n", b"{\"event\":\"run_complete\"}\n"] {
                         writer.write_all(record).unwrap(); writer.flush().unwrap();
                     }
                 }
                 let text = String::from_utf8(output).unwrap();
-                assert_eq!(text.lines().count(), 3);
+                assert_eq!(text.lines().count(), 5);
                 for line in text.lines() {
                     let value: serde_json::Value = serde_json::from_str(line).unwrap();
                     assert_eq!(value["evidence"], "non_authoritative");
                     assert!(value.get("compute_schedule").is_none());
                     assert_eq!(value.get("input_encoding").is_some(), compact);
                     if reuse {
-                        assert_eq!(value["prefill_reuse"],
-                            crate::tasks::sentiment::sampled::SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION);
+                        assert_eq!(value["prefill_reuse"], SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION);
                     } else { assert!(value.get("prefill_reuse").is_none()); }
                     if let Some(prefill) = prefill {
                         assert_eq!(value["prefill_schedule"]["execution"], INT4_LAYER_MAJOR_PREFILL_VERSION);
