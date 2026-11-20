@@ -96,15 +96,86 @@ fn storage_consent_paths_and_transport_bounds_refuse_before_any_private_io() {
 }
 
 #[test]
-fn retained_route_never_accepts_ignored_prefill_cohort_or_per_record_policy_flags() {
-    for task in ["generate", "chat"] {
-        let (c, args) = command("start", task, &["--prefill-rows", "1"]);
-        assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().code, "text_job_serial_schedule");
-    }
+fn retained_route_never_accepts_ignored_cohort_or_per_record_policy_flags() {
     for extra in [vec!["--cohort-rows", "2"], vec!["--active-rows", "1"], vec!["--task", "generate"],
         vec!["--defaults", "private.json"], vec!["--schema", "private.json"], vec!["--thinking"], vec!["--tools", "tools.json"]] {
         let mut words = argv("start", "generate"); words.extend(extra.into_iter().map(str::to_owned));
         assert!(parse(words).is_err());
+    }
+}
+
+#[test]
+fn retained_prefill_preserves_model_routes_and_native_lifetime_authority() {
+    for operation in ["start", "resume"] { for task in ["generate", "chat"] { for route in 0..3 {
+        let mut words = argv(operation, task);
+        match route {
+            0 => (),
+            1 => {
+                let source = words.iter().position(|s| s == "--source-dir").unwrap();
+                words.drain(source..source + 4);
+                words.extend(["--snapshot".to_owned(), "private-model.int4".to_owned(),
+                    "--expected-model-sha256".to_owned(), "ab".repeat(32)]);
+            }
+            _ => words.extend(["--save-snapshot".to_owned(), "private-new-model.int4".to_owned()]),
+        }
+        let (serial, args) = parse(words.clone()).unwrap();
+        let common = serial.args.validate(&args).unwrap();
+        assert!(common.prefill.is_none());
+        let job = lifetime(&args, common);
+        let baseline = serial.args.lifetime_limits(&args, common, job).unwrap();
+        let generation = args.options(166_101).unwrap();
+        for rows in [1, 4, 64] {
+            let mut selected = words.clone();
+            selected.extend(["--prefill-rows".to_owned(), rows.to_string(),
+                "--compute-threads".to_owned(), "1".to_owned()]);
+            let (c, args) = parse(selected).unwrap();
+            let common = c.args.validate(&args).unwrap();
+            let prefill = common.prefill.unwrap();
+            let workspace = Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+            assert_eq!(prefill.max_batch_rows, rows);
+            assert_eq!(prefill.validate().unwrap(), workspace);
+            assert_eq!(common.compute, compute::Admission { threads: 1, workspace_bytes: 0 });
+            assert_eq!(common.snapshot_pin, baseline.common.snapshot_pin);
+            assert_eq!(common.load, baseline.common.load);
+            assert_eq!(common.native, baseline.common.native);
+            assert!(args.options(166_101).unwrap() == generation);
+            let scheduled = c.args.lifetime_limits(&args, common, job).unwrap();
+            assert_eq!(scheduled.buffer_bytes, baseline.buffer_bytes);
+            assert_eq!(scheduled.native.native.max_forward_positions, baseline.native.native.max_forward_positions);
+            assert_eq!(scheduled.native.native.max_attention_pairs, baseline.native.native.max_attention_pairs);
+            assert_eq!(scheduled.native.native.max_projection_work, baseline.native.native.max_projection_work);
+            assert_eq!(scheduled.native.max_kv_bytes, baseline.native.max_kv_bytes);
+            assert_eq!(scheduled.native.max_sampler_bytes, baseline.native.max_sampler_bytes);
+            // Only simultaneously live execution scratch enters the load/save/run peak.
+            let load = if common.snapshot_pin.is_some() { common.snapshot_need.scratch_bytes }
+                else { common.source_preparation_bytes + common.load.scratch_payload_bytes };
+            let save = if args.save_snapshot.is_some() { common.snapshot_need.scratch_bytes } else { 0 };
+            let execute = common.native.kv_bytes + common.native.rope_bytes + common.native.scratch_payload_bound
+                + SAMPLER_BYTES + ALLOCATOR_BYTES + common.result_bytes as u64 * 4
+                + args.max_new_tokens as u64 * 8 + 4096 + workspace;
+            assert_eq!(scheduled.common.minimum_memory_bytes, common.preparation_bytes
+                + common.load.weight_payload_bytes + ALLOCATOR_BYTES + load.max(save).max(execute)
+                + CLEANUP_BYTES + scheduled.buffer_bytes);
+        }
+    } } }
+}
+
+#[test]
+fn invalid_prefill_mixed_teams_and_small_memory_refuse_before_private_io() {
+    for task in ["generate", "chat"] {
+        for extra in [vec!["--prefill-rows", "0"], vec!["--prefill-rows", "65"],
+            vec!["--prefill-rows", "18446744073709551615"],
+            vec!["--prefill-rows", "1", "--compute-threads", "2"],
+            vec!["--prefill-rows", "64", "--compute-threads", "64"]] {
+            let (c, args) = command("resume", task, &extra);
+            assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().exit, ErrorCode::Usage);
+        }
+        let (c, mut args) = command("start", task, &["--prefill-rows", "64"]);
+        let common = c.args.validate(&args).unwrap();
+        args.memory_mib = common.minimum_memory_bytes.div_ceil(MIB);
+        c.args.validate(&args).unwrap();
+        args.memory_mib -= 1;
+        assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().exit, ErrorCode::Usage);
     }
 }
 
@@ -389,5 +460,34 @@ fn compact_workspaces_are_admitted_without_changing_native_lifetime_or_input_own
         assert_eq!(compact.args.lifetime_limits(&args, short, job).unwrap_err().code, "job_population_memory");
         short.memory_bytes += 1;
         assert!(compact.args.lifetime_limits(&args, short, job).is_ok());
+    }
+}
+
+#[test]
+fn compact_prefill_retained_replay_keeps_one_record_and_the_exact_job_memory_boundary() {
+    for task in ["generate", "chat"] {
+        let (start, args) = command("start", task, &["--input-encoding", "safe-bpe-v1",
+            "--prefill-rows", "4", "--spool-input", "--max-retained-input-mib", "8"]);
+        let common = start.args.validate(&args).unwrap();
+        let job = lifetime(&args, common);
+        let full = start.args.lifetime_limits(&args, common, job).unwrap();
+        let encoding = args.input_encoding.policy(args.max_input_bytes, common.max_prompt_tokens).unwrap();
+        let work = start.args.encoding.limits(&args).unwrap();
+        let (resume, args) = command("resume", task, &["--input-encoding", "safe-bpe-v1",
+            "--prefill-rows", "4", "--use-retained-input", "--max-retained-input-mib", "8"]);
+        let common = resume.args.validate(&args).unwrap();
+        let replay = resume.args.lifetime_limits(&args, common, job).unwrap();
+        assert!(replay.encoding_workspace_bytes > 0);
+        assert_eq!(replay.encoding_workspace_bytes, full.encoding_workspace_bytes);
+        assert_eq!(args.input_encoding.policy(args.max_input_bytes, common.max_prompt_tokens).unwrap(), encoding);
+        assert_eq!(resume.args.encoding.limits(&args).unwrap(), work);
+        assert_eq!(replay.buffer_bytes + 2 * job.max_snapshot_bytes, full.buffer_bytes);
+        assert_eq!(replay.common.minimum_memory_bytes + 2 * job.max_snapshot_bytes, full.common.minimum_memory_bytes);
+        assert_eq!(replay.common.minimum_memory_bytes,
+            common.minimum_memory_bytes + replay.buffer_bytes + replay.encoding_workspace_bytes);
+        let mut short = common; short.memory_bytes = replay.common.minimum_memory_bytes - 1;
+        assert_eq!(resume.args.lifetime_limits(&args, short, job).unwrap_err().code, "job_population_memory");
+        short.memory_bytes += 1;
+        resume.args.lifetime_limits(&args, short, job).unwrap();
     }
 }

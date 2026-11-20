@@ -42,11 +42,51 @@ and the CLI and host reserve the extra scratch once. See
 [structured cohort packing](int4-structured-cohorts.md#packed-prompt-and-feedback-passes)
 for the schedule, memory quote and ordered delivery contract.
 
-Serial structured batches, maps, retained jobs, resolution, redaction and
+Serial structured batches, maps, other retained structured jobs, resolution, redaction and
 semantic extraction keep their existing prompt schedules and reject this option,
 including programmatically constructed requests. Their independent
 document/head/chunk cohort options remain separate. Generation/chat retain
 their existing packed batch and corpus interfaces.
+
+### Retained generation and chat
+
+`fnlp candidate source-int4 text-job start|resume generate|chat` also accepts
+`--prefill-rows N`. Add it to the existing retained-job command, for example:
+
+```sh
+fnlp candidate source-int4 text-job resume generate prompts.ndjson \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256_FROM_TRUSTED_CONVERSION" \
+  --memory-mib 8192 --context-tokens 512 --max-new-tokens 32 \
+  --max-output-bytes 4096 --prefill-rows 4 \
+  --store-results --job-dir /private/text-job \
+  --job-id "$JOB_ID" --key-file /private/text-job.key \
+  --limits text-job-limits.json --materialize
+```
+
+The job must already exist with the same model, inputs, task settings, key and
+immutable lifetime limits. See the [retained generation/chat contract](../README.md#implemented-candidate-int4-generation-and-chat-jobs)
+for creation and an example limits file. These jobs additionally require
+`metadata-store` and the supported native storage platform.
+
+The row declaration is a physical invocation schedule. It may change on resume,
+including switching to or from sequential prefill, without changing the
+authenticated recipe or original addressed samples. Every pending item still
+reserves its full cold native work before execution; earlier attempts and
+committed results never renew that allowance. Committed items are skipped, and
+pending items restart from their own empty logical KV. No KV is persisted.
+
+Use serial compute with prompt morsels; `--compute-threads` greater than one
+cannot be combined with `--prefill-rows`. Extra prompt workspace is admitted
+with the full job envelope before input access, including source/snapshot/save,
+compact BPE, and retained-input replay routes. The completion report adds an
+optional `prefill_schedule` containing `grouped-int4-layer-major-causal-prefill-v1`,
+the maximum row count and admitted workspace bytes. Sequential reports omit
+that field; private stored results keep their existing schema.
+
+The [sampled-sentiment commands](native-sampled-sentiment-int4.md) have their own
+explicit prompt schedule. Their durable recipe freezes that choice; the
+generation/chat rule allowing physical row changes does not alter it.
 
 The separate [scoring-cohort mode](int4-scoring-cohorts.md) groups independent
 heads with `--cohort-heads N`. It cannot be combined with `--prefill-rows` and
@@ -167,6 +207,10 @@ The explicit alternatives are:
 - `Int4GenerationPlan::execute_layer_major` / `execute_layer_major_with_sink`.
 - `PreparedInt4Chat::execute_layer_major` / `execute_layer_major_with_sink`.
 - `NlpEngine::execute_int4_chat_layer_major` for charged hosted execution.
+- `Int4GenerationJobProcessor::new_layer_major` for a durable generation/chat
+  adapter with separately admitted prompt workspace.
+- `NlpEngine::job_int4_generation_layer_major` for charged retained execution,
+  authenticated original or retained inputs, and complete-item commits.
 - `Int4CandidatePlan::execute_layer_major` for exact finite-language scoring.
 - `PreparedInt4Classification`, `PreparedInt4Sentiment` and `PreparedInt4Judge`
   expose `execute_layer_major_with_control`.
@@ -218,6 +262,13 @@ Model-free regression source additionally covers ragged prompts, numeric
 continuation, UTF-8 fragments, source masks, semantic refusal and cancellation,
 static scratch admission, all model-loading routes and unsupported workflow
 boundaries. These are source fixtures, not executed proof.
+
+Retained generation/chat additions cover unchanged recipes and native lifetime
+work, exact extra workspace for complete and retained inputs, invalid or mixed
+schedules before IO, cancellation and physical drain, all model-input routes,
+and optional metadata without private content. These regression definitions
+remain unexecuted; durable real-model replay across prompt schedules is a
+separate controller gate.
 
 Compilation, Rust tests, full-model parity and performance remain unrun pending
 the repository's controller-selected immutable-SHA DSR checkpoint. Source review,

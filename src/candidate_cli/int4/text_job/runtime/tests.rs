@@ -142,6 +142,74 @@ fn persistent_team_scratch_and_process_threads_are_priced_without_changing_the_r
 }
 
 #[test]
+fn prefill_scratch_is_simultaneous_while_resumed_task_and_work_authority_stay_fixed() {
+    let seed = "cd".repeat(32);
+    for task in ["generate", "chat"] {
+        let (serial, args) = command("start", task, &["--seed", &seed, "--input-encoding", "safe-bpe-v1"]);
+        let common = serial.args.validate(&args).unwrap();
+        let job = lifetime(&args, common);
+        let limits = serial.args.lifetime_limits(&args, common, job).unwrap();
+        let baseline = configuration(&serial.args, &args, limits, 166_101).unwrap();
+        let host = host_limits(&args, limits, Duration::from_secs(30));
+        for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
+            let serial_bytes = simultaneous_memory(args.group_width, baseline.native,
+                baseline.budget, host, job, common, input).unwrap();
+            for rows in [1, 4, 64] {
+                let (selected, args) = command("resume", task, &["--seed", &seed,
+                    "--input-encoding", "safe-bpe-v1", "--prefill-rows", &rows.to_string()]);
+                let common = selected.args.validate(&args).unwrap();
+                let limits = selected.args.lifetime_limits(&args, common, job).unwrap();
+                let config = configuration(&selected.args, &args, limits, 166_101).unwrap();
+                let host = host_limits(&args, limits, Duration::from_secs(30));
+                assert_eq!(config.task, baseline.task);
+                assert!(config.generation == baseline.generation);
+                assert_eq!(config.budget, baseline.budget);
+                assert_eq!(config.context_tokens, baseline.context_tokens);
+                assert_eq!(config.planning.max_messages, baseline.planning.max_messages);
+                assert_eq!(config.planning.max_message_bytes, baseline.planning.max_message_bytes);
+                assert_eq!(config.planning.max_total_message_bytes, baseline.planning.max_total_message_bytes);
+                assert_eq!(config.native.native.max_forward_positions, baseline.native.native.max_forward_positions);
+                assert_eq!(config.native.native.max_attention_pairs, baseline.native.native.max_attention_pairs);
+                assert_eq!(config.native.native.max_projection_work, baseline.native.native.max_projection_work);
+                assert_eq!(config.native.max_sampler_bytes, baseline.native.max_sampler_bytes);
+                let required = Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+                let selected_bytes = simultaneous_memory(args.group_width, config.native,
+                    config.budget, host, job, common, input).unwrap();
+                assert_eq!(selected_bytes, serial_bytes + required);
+                assert!(selected_bytes + limits.encoding_workspace_bytes <= limits.common.minimum_memory_bytes);
+                let threads = compute::resource_config(common);
+                assert_eq!(threads.scoped_cpu_children_per_coordinator, 0);
+                assert_eq!(threads.thread_ceiling, 2);
+            }
+        }
+    }
+}
+
+#[test]
+fn native_quote_refuses_invalid_prefill_workspace_and_mixed_execution_teams() {
+    let (c, args) = command("resume", "generate", &["--prefill-rows", "4"]);
+    let common = c.args.validate(&args).unwrap();
+    let job = lifetime(&args, common);
+    let limits = c.args.lifetime_limits(&args, common, job).unwrap();
+    let config = configuration(&c.args, &args, limits, 166_101).unwrap();
+    let host = host_limits(&args, limits, Duration::from_secs(30));
+    for invalid in [Int4PrefillLimits { max_batch_rows: 0, ..common.prefill.unwrap() },
+        Int4PrefillLimits { max_batch_rows: 65, ..common.prefill.unwrap() },
+        Int4PrefillLimits { max_extra_scratch_bytes: common.prefill.unwrap().max_extra_scratch_bytes - 1,
+            ..common.prefill.unwrap() }] {
+        assert!(matches!(PrefillSchedule::new(invalid), Err(CandidateError::Arguments)));
+        let mut altered = common; altered.prefill = Some(invalid);
+        assert_eq!(simultaneous_memory(args.group_width, config.native, config.budget, host,
+            job, altered, JobInputMemory::CompletePopulation).unwrap_err().code, "text_job_native_quote");
+    }
+    let mut mixed = common;
+    mixed.compute = compute::Admission { threads: 2, workspace_bytes:
+        crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(2, args.group_width).unwrap() };
+    assert_eq!(simultaneous_memory(args.group_width, config.native, config.budget, host,
+        job, mixed, JobInputMemory::RetainedRecord).unwrap_err().code, "text_job_native_quote");
+}
+
+#[test]
 fn complete_envelope_publishes_only_public_model_identity_and_authenticated_progress() {
     let (c, args) = command("resume", "chat", &[]);
     let common = c.args.validate(&args).unwrap();
@@ -161,7 +229,8 @@ fn complete_envelope_publishes_only_public_model_identity_and_authenticated_prog
         candidate_format: "fixture-candidate-format", quant_recipe: "fixture-grouped-int4",
         group_width: args.group_width, integer_kernel: common.kernel.kind().id(),
         snapshot: Some(SnapshotRecord::new("loaded", common.snapshot_need)),
-        input_encoding: None, encoding_work_limits: None, compute_schedule: None, output: &report,
+        input_encoding: None, encoding_work_limits: None, compute_schedule: None,
+        prefill_schedule: None, output: &report,
     };
     let mut bytes = Vec::new(); publish(&response, job_cli::REPORT_BYTES, &mut bytes).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -170,6 +239,7 @@ fn complete_envelope_publishes_only_public_model_identity_and_authenticated_prog
     assert_eq!(value["model_content_sha256"], content);
     assert_eq!(value["group_width"], args.group_width);
     assert!(value.get("compute_schedule").is_none());
+    assert!(value.get("prefill_schedule").is_none());
     assert!(value.get("input_encoding").is_none());
     assert!(value.get("encoding_work_limits").is_none());
     assert_eq!(value["snapshot"]["format"], INT4_SNAPSHOT_VERSION);
@@ -192,14 +262,26 @@ fn complete_envelope_publishes_only_public_model_identity_and_authenticated_prog
     assert_eq!(selected["compute_schedule"]["declared_compute_threads"], 4);
     assert_eq!(selected["output"], value["output"]);
     assert!(selected.get("compute").is_none());
+    let (_, prefill_args) = command("resume", "chat", &["--prefill-rows", "4"]);
+    let prefill = prefill_args.prefill().unwrap().unwrap();
+    let grouped = Response { compute_schedule: None, prefill_schedule: Some(PrefillSchedule::new(prefill).unwrap()),
+        ..scheduled };
+    let mut bytes = Vec::new(); publish(&grouped, job_cli::REPORT_BYTES, &mut bytes).unwrap();
+    let mut grouped_value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let schedule = grouped_value.as_object_mut().unwrap().remove("prefill_schedule").unwrap();
+    assert_eq!(schedule, serde_json::json!({"execution": INT4_LAYER_MAJOR_PREFILL_VERSION,
+        "max_batch_rows": 4, "admitted_workspace_bytes": prefill.validate().unwrap()}));
+    assert_eq!(grouped_value, value);
     let (compact_command, compact_args) = command("resume", "chat", &["--input-encoding", "safe-bpe-v1"]);
     let policy = compact_args.input_encoding.policy(compact_args.max_input_bytes, common.max_prompt_tokens).unwrap();
     let total = compact_command.args.encoding.limits(&compact_args).unwrap();
-    let compact = Response { input_encoding: Some(&policy), encoding_work_limits: total, ..scheduled };
+    let compact = Response { input_encoding: Some(&policy), encoding_work_limits: total, ..grouped };
     let mut bytes = Vec::new(); publish(&compact, job_cli::REPORT_BYTES, &mut bytes).unwrap();
     let compact_value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(compact_value["input_encoding"], serde_json::to_value(policy).unwrap());
     assert_eq!(compact_value["encoding_work_limits"], serde_json::to_value(total).unwrap());
+    assert_eq!(compact_value["prefill_schedule"], schedule);
+    assert!(compact_value.get("compute_schedule").is_none());
     assert_eq!(compact_value["output"], value["output"]);
 }
 

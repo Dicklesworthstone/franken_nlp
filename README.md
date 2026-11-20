@@ -4709,6 +4709,15 @@ item and token while preserving ordered whole-item commits. Width is a physical
 schedule, so it may change on resume without changing the authenticated task
 recipe, original sample addresses or lifetime work allowances.
 
+Alternatively, `--prefill-rows 1..64` processes each prompt in bounded causal
+layer-major morsels with serial compute. It uses the existing complete-result
+decoder and keeps every native lifetime debit unchanged. Prompt rows may change
+on resume, including switching between sequential and layer-major prompts;
+they are a physical schedule, like compute width, and do not change the private
+task recipe. This option cannot combine with `--compute-threads` greater than
+one. Source conversion, pinned snapshots, compact BPE and retained-input replay
+all use the same admission and recovery paths.
+
 Explicit `--input-encoding safe-bpe-v1` also supports these retained jobs.
 It compacts untrusted prompt/history bytes losslessly without admitting template
 control IDs. Byte fallback remains the default, with its existing recipe and
@@ -4839,15 +4848,24 @@ their worker buffers before private IO and install one coordinator plus
 `N - 1` scoped workers and one runtime thread. The final progress report follows
 physical worker drain and adds `compute_schedule` with the declared width;
 stored semantic results and their identities do not include that width.
-The adapter rejects `--prefill-rows` and cohort scheduling. It uses the existing
+Layer-major execution separately reserves its declared prompt-row workspace
+before private IO and reports `prefill_schedule` with the execution version,
+maximum rows and admitted bytes. The field is absent for sequential prompts;
+the stored semantic results do not contain physical schedule metadata.
+The adapter rejects cohort scheduling and uses the existing
 pinned no-thinking/no-tools generation contract. Library callers construct
 `Int4GenerationJobPlanner::for_model` with the actual model identity,
 `Int4GenerationJobConfig` and exact `JobLimits`; explicit compact input uses
 `for_model_with_document_encoding` with a fixed policy and `SafeBpeWorkLimits`.
-Then call `NlpEngine::job_int4_generation` or `job_int4_generation_with_threads` with
+Then call `NlpEngine::job_int4_generation`, `job_int4_generation_with_threads`,
+or `job_int4_generation_layer_major` with
 `SourceJobRequest` and `JobHostLimits`. The threaded method requires a compatible
 installed resource-host thread envelope. Cancellation or report failure may
 follow committed progress; authenticate and resume the job to reconcile it.
+The layer-major method also takes an `Int4PrefillLimits` declaration and admits
+its validated extra scratch alongside the full job envelope. Lower-level
+callers can use `Int4GenerationJobProcessor::new_layer_major` after reserving
+that workspace themselves.
 This is source-inventoried candidate functionality; build, model-present
 correctness, crash recovery, determinism and quality gates remain pending.
 

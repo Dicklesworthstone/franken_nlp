@@ -8,7 +8,8 @@ use crate::{
     hosted::{CancellationToken, NativeLimits, ResidentInt4, RunLimits,
         corpus::jobs::{JobHostLimits, SourceJobRequest}},
     jobs::{JobError, JobSecret, runner::generation::grouped_int4::{Int4GenerationJobConfig, Int4GenerationJobPlanner}},
-    native_engine::strict_int4::weights::snapshot::INT4_SNAPSHOT_VERSION,
+    native_engine::strict_int4::{prefill::INT4_LAYER_MAJOR_PREFILL_VERSION,
+        weights::snapshot::INT4_SNAPSHOT_VERSION},
     tasks::{chat::{ChatLimits, grouped_int4::Int4ChatPlanner}, ir::TaskBudget},
     tokenizer::untrusted::UntrustedEncoding,
 };
@@ -65,7 +66,10 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         mode: open_mode(mode, job.storage.input_retention)?, materialize };
     // The host authenticates the complete population and exact recipe before
     // replay/repair, executes only pending whole items and drains physically.
-    let progress = if common.compute.threads == 1 {
+    let progress = if let Some(prefill) = common.prefill {
+        engine.job_int4_generation_layer_major(&model, planner, request, host,
+            common.kernel, prefill, reader, cancellation.clone())
+    } else if common.compute.threads == 1 {
         engine.job_int4_generation(&model, planner, request, host, common.kernel, reader, cancellation.clone())
     } else {
         engine.job_int4_generation_with_threads(&model, planner, request, host,
@@ -86,7 +90,8 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         quant_recipe: &identity.quant_recipe, group_width: model.model_identity().group_width(),
         integer_kernel: common.kernel.kind().id(), snapshot,
         input_encoding: input_encoding::reported_policy(&encoding), encoding_work_limits,
-        compute_schedule: compute::Schedule::for_threads(common.compute.threads), output: &report,
+        compute_schedule: compute::Schedule::for_threads(common.compute.threads),
+        prefill_schedule: common.prefill.map(PrefillSchedule::new).transpose()?, output: &report,
     };
     // No prompts, histories, seeds, tokens, generated text or scores on stdout.
     // Report delivery failure can follow committed progress and is not rollback.
@@ -166,7 +171,8 @@ fn check_native_quote(planner: &Int4GenerationJobPlanner, args: &Int4Args,
     let (task, _) = task_limits(args, limits.common)?;
     let native = planner.native_limits();
     let work = job.max_work.int4_model_work();
-    if planner.document_encoding() != &args.input_encoding.policy(args.max_input_bytes, limits.common.max_prompt_tokens)?
+    if !super::super::prefill::matches(args, limits.common)?
+        || planner.document_encoding() != &args.input_encoding.policy(args.max_input_bytes, limits.common.max_prompt_tokens)?
         || planner.encoding_workspace_bytes() != limits.encoding_workspace_bytes
         || planner.context_tokens() != host.native.context_tokens || planner.context_tokens() != args.context_tokens
         || planner.group_width() != args.group_width || planner.task_budget() != task
@@ -194,13 +200,16 @@ fn simultaneous_memory(width: usize, native: Int4GenerationBudget, task: TaskBud
     host: JobHostLimits, job: JobLimits, common: Int4Limits, input: JobInputMemory) -> Result<u64, Failure> {
     let need = Int4MemoryRequirement::for_context(host.native.context_tokens, width)
         .map_err(|_| Failure::usage("text_job_native_quote"))?;
-    if need != common.native || native.max_kv_bytes != need.kv_bytes || task.max_kv_bytes != need.kv_bytes
+    if (common.prefill.is_some() && common.compute.threads != 1)
+        || need != common.native || native.max_kv_bytes != need.kv_bytes || task.max_kv_bytes != need.kv_bytes
         || native.max_sampler_bytes == 0 || host.native.allocator_reserve_bytes == 0 {
         return Err(Failure::usage("text_job_native_quote"));
     }
+    let prefill_bytes = common.prefill.map(Int4PrefillLimits::validate).transpose()
+        .map_err(|_| Failure::usage("text_job_native_quote"))?.unwrap_or(0);
     sum(&[common.preparation_bytes, common.load.weight_payload_bytes, ALLOCATOR_BYTES,
         host.required_buffer_bytes_for_input(job, input).map_err(host_failure)?,
-        need.kv_bytes, need.rope_bytes, need.scratch_payload_bound, common.compute.workspace_bytes,
+        need.kv_bytes, need.rope_bytes, need.scratch_payload_bound, common.compute.workspace_bytes, prefill_bytes,
         host.native.allocator_reserve_bytes, native.max_sampler_bytes,
         product(task.max_output_bytes, 4)?, product(u64::from(task.max_output_tokens), 8)?, 4096,
         host.native.run.cleanup_reserve_bytes])
@@ -212,6 +221,14 @@ struct SnapshotRecord { operation: &'static str, format: &'static str, file_byte
 impl SnapshotRecord {
     fn new(operation: &'static str, need: Int4SnapshotRequirements) -> Self {
         Self { operation, format: INT4_SNAPSHOT_VERSION, file_bytes: need.file_bytes }
+    }
+}
+#[derive(Serialize)]
+struct PrefillSchedule { execution: &'static str, max_batch_rows: usize, admitted_workspace_bytes: u64 }
+impl PrefillSchedule {
+    fn new(limits: Int4PrefillLimits) -> Result<Self, CandidateError> {
+        Ok(Self { execution: INT4_LAYER_MAJOR_PREFILL_VERSION, max_batch_rows: limits.max_batch_rows,
+            admitted_workspace_bytes: limits.validate().map_err(|_| CandidateError::Arguments)? })
     }
 }
 #[derive(Serialize)]
@@ -228,6 +245,8 @@ struct Response<'a, T: Serialize> {
     encoding_work_limits: Option<SafeBpeWorkLimits>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compute_schedule: Option<compute::Schedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefill_schedule: Option<PrefillSchedule>,
     output: &'a T,
 }
 
