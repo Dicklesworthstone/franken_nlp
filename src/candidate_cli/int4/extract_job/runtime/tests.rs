@@ -99,7 +99,8 @@ fn completion_envelope_contains_candidate_identity_and_authenticated_progress_on
         candidate_format: "fixture-candidate-format", quant_recipe: "fixture-grouped-int4",
         group_width: args.group_width, integer_kernel: common.kernel.kind().id(),
         snapshot: Some(SnapshotRecord::new("loaded", common.snapshot_need)),
-        compute_schedule: None, input_encoding: None, encoding_work_limits: None, output: &report,
+        compute_schedule: None, max_selected_rows: None,
+        input_encoding: None, encoding_work_limits: None, output: &report,
     };
     let mut bytes = Vec::new();
     publish(&response, job_cli::REPORT_BYTES, &mut bytes).unwrap();
@@ -121,6 +122,7 @@ fn completion_envelope_contains_candidate_identity_and_authenticated_progress_on
     assert!(value.get("compute_schedule").is_none());
     assert!(value.get("input_encoding").is_none());
     assert!(value.get("encoding_work_limits").is_none());
+    assert!(value.get("max_selected_rows").is_none());
     let mut threaded = response;
     threaded.compute_schedule = compute::Schedule::for_threads(4);
     let mut threaded_value = serde_json::to_value(&threaded).unwrap();
@@ -141,6 +143,14 @@ fn completion_envelope_contains_candidate_identity_and_authenticated_progress_on
         Some(serde_json::to_value(total).unwrap()));
     compact_value.as_object_mut().unwrap().remove("compute_schedule");
     assert_eq!(compact_value, value);
+    threaded.max_selected_rows = Some(4096);
+    let mut selected_value = serde_json::to_value(&threaded).unwrap();
+    assert_eq!(selected_value.as_object_mut().unwrap().remove("max_selected_rows"),
+        Some(serde_json::json!(4096)));
+    selected_value.as_object_mut().unwrap().remove("compute_schedule");
+    selected_value.as_object_mut().unwrap().remove("input_encoding");
+    selected_value.as_object_mut().unwrap().remove("encoding_work_limits");
+    assert_eq!(selected_value, value);
     assert_eq!(publish(&threaded, 1, &mut NoWrite), Err(CandidateError::Output));
 }
 

@@ -43,7 +43,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     remaining()?;
     let schema = read_config(job.extraction.schema_path(), SCHEMA_BYTES, &remaining)?;
     let budget = job.extraction.budget(&args, common);
-    let defaults = job.extraction.shared_defaults(schema, budget)?;
+    let defaults = job.extraction.shared_defaults_with_projection(schema, budget)?;
     remaining()?;
     let reader = job_cli::population_reader(mode, job.storage.input_retention, &args.input, input, IO_BUFFER_BYTES)?;
     let cancellation = CancellationToken::default();
@@ -53,7 +53,12 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         job.extraction.compiler(), job.extraction.source_limits(), defaults, limits.native)
         .and_then(|planner| planner.with_document_encoding(encoding.clone(), limits.encoding_work_limits))
         .map_err(|_| CandidateError::Planning)?;
+    let planner = match job.extraction.selected_rows()? {
+        Some(rows) => planner.with_selected_rows(rows).map_err(|_| CandidateError::Planning)?,
+        None => planner,
+    };
     planner.check_job_limits(lifetime).map_err(|_| CandidateError::Planning)?;
+    let max_selected_rows = planner.selected_rows().map(|rows| rows.max_rows_per_step);
     if planner.encoding_workspace_bytes().map_err(|_| CandidateError::Memory)? != limits.encoding_workspace_bytes {
         return Err(Failure::usage("job_host_memory_quote"));
     }
@@ -100,6 +105,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         quant_recipe: &identity.quant_recipe, group_width: model.model_identity().group_width(),
         integer_kernel: common.kernel.kind().id(), snapshot,
         compute_schedule: compute::Schedule::for_threads(common.compute.threads),
+        max_selected_rows,
         input_encoding: input_encoding::reported_policy(&encoding),
         encoding_work_limits: limits.encoding_work_limits, output: &report,
     };
@@ -187,6 +193,8 @@ struct Response<'a, T: Serialize> {
     snapshot: Option<SnapshotRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compute_schedule: Option<compute::Schedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_selected_rows: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     input_encoding: Option<&'a crate::tokenizer::untrusted::UntrustedEncoding>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -101,7 +101,6 @@ fn invalid_worker_widths_and_unsupported_schedules_refuse_before_private_io() {
     for extra in [
         vec!["--compute-threads", "2", "--prefill-rows", "2"],
         vec!["--compute-threads", "2", "--cohort-documents", "2"],
-        vec!["--compute-threads", "2", "--max-selected-rows", "8"],
     ] {
         let mut words = argv("resume");
         words.extend(extra.into_iter().map(str::to_owned));
@@ -446,4 +445,93 @@ fn compact_limits_and_missing_encoder_memory_refuse_before_private_job_io() {
         "--compute-threads", "4", "--preparation-mib", "1024"]);
     args.memory_mib = 1;
     assert!(c.execute_owned(args, NoRead, &mut NoWrite).is_err());
+}
+
+#[test]
+fn selected_rows_compose_with_job_owners_workers_and_encoding_without_renewing_work() {
+    for operation in ["start", "resume"] {
+        for compact in [false, true] {
+            for snapshot in [false, true] {
+                let mut extra = vec!["--compute-threads", "4", "--preparation-mib", "1024",
+                    if operation == "start" { "--spool-input" } else { "--use-retained-input" },
+                    "--max-retained-input-mib", "16"];
+                if compact { extra.extend(["--input-encoding", "safe-bpe-v1"]); }
+                let (dense, mut dense_args) = command(operation, &extra);
+                extra.extend(["--max-selected-rows", "4096"]);
+                let (selected, mut args) = command(operation, &extra);
+                if snapshot {
+                    for native in [&mut dense_args, &mut args] {
+                        native.source_dir = None;
+                        native.source_manifest = None;
+                        native.snapshot = Some(PathBuf::from("model.int4"));
+                        native.expected_model_sha256 = Some("a".repeat(64));
+                    }
+                }
+                selected.args.storage.input_retention.validate(selected.mode, &args.input).unwrap();
+                let dense_common = dense.args.validate(&dense_args).unwrap();
+                let common = selected.args.validate(&args).unwrap();
+                assert_eq!(dense.args.extraction.selected_rows().unwrap(), None);
+                assert_eq!(selected.args.extraction.selected_rows().unwrap().unwrap().max_rows_per_step, 4096);
+                assert_eq!(common.native, dense_common.native);
+                assert_eq!(common.minimum_memory_bytes, dense_common.minimum_memory_bytes);
+                assert_eq!(common.compute, dense_common.compute);
+                let fixed = lifetime(&dense.args, &dense_args, dense_common);
+                let baseline = dense.args.lifetime_limits(&dense_args, dense_common, fixed).unwrap();
+                let admitted = selected.args.lifetime_limits(&args, common, fixed).unwrap();
+                assert_eq!(admitted.native.max_model_work, fixed.max_work.int4_model_work());
+                assert_eq!(admitted.native.masks.max_visits_per_run, fixed.max_work.mask_node_visits);
+                assert_eq!(admitted.native.masks.max_visits_per_item, baseline.native.masks.max_visits_per_item);
+                assert_eq!(admitted.buffer_bytes, baseline.buffer_bytes);
+                assert_eq!(admitted.encoding_workspace_bytes, baseline.encoding_workspace_bytes);
+                assert_eq!(admitted.encoding_work_limits, baseline.encoding_work_limits);
+                assert_eq!(admitted.common.minimum_memory_bytes, baseline.common.minimum_memory_bytes);
+                let mut short = common; short.memory_bytes = admitted.common.minimum_memory_bytes - 1;
+                assert_eq!(selected.args.lifetime_limits(&args, short, fixed).unwrap_err().code,
+                    "job_population_memory");
+            }
+        }
+    }
+}
+
+#[test]
+fn selected_row_caps_are_explicit_and_invalid_caps_refuse_before_private_io() {
+    for operation in ["start", "resume"] {
+        for cap in ["1", "166144"] {
+            let (c, args) = command(operation, &["--max-selected-rows", cap]);
+            assert!(c.args.validate(&args).is_ok());
+            assert_eq!(c.args.extraction.selected_rows().unwrap().unwrap().max_rows_per_step,
+                cap.parse::<usize>().unwrap());
+        }
+        for cap in ["0", "166145", "18446744073709551615"] {
+            let mut words = argv(operation);
+            words.extend(["--max-selected-rows".to_owned(), cap.to_owned()]);
+            if let Ok((c, args)) = parse(words) {
+                assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().exit,
+                    ErrorCode::Usage);
+            }
+        }
+        for unsupported in [
+            vec!["--prefill-rows", "1"],
+            vec!["--cohort-documents", "2"],
+            vec!["--temperature-milli", "0"],
+        ] {
+            let mut words = argv(operation);
+            words.extend(["--max-selected-rows".to_owned(), "4096".to_owned()]);
+            words.extend(unsupported.into_iter().map(str::to_owned));
+            assert!(parse(words).is_err());
+        }
+    }
+}
+
+#[test]
+fn selected_job_defaults_preserve_exact_schema_and_source_policy() {
+    let (c, args) = command("start", &["--max-selected-rows", "4096", "--source-membership"]);
+    let common = c.args.validate(&args).unwrap();
+    let budget = c.args.extraction.budget(&args, common);
+    let schema = r#"{"type":"object","properties":{"value":{"type":"string","maxLength":32,"x-fnlp-source":"verbatim"},"n":{"type":"number","const":12345678901234567890123456789012345678}},"required":["value","n"],"additionalProperties":false}"#;
+    let defaults = c.args.extraction.shared_defaults_with_projection(schema.to_owned(), budget).unwrap();
+    assert_eq!(defaults.schema, schema);
+    assert_eq!(defaults.grounding, ExtractionBatchGrounding::SourceMembership);
+    assert!(c.args.extraction.shared_defaults_with_projection(
+        r#"{"type":"object","type":"object"}"#.to_owned(), budget).is_err());
 }

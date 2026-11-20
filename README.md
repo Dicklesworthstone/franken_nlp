@@ -901,7 +901,18 @@ the coordinator; one keeps the serial path. The admitted team spans the
 complete invocation, pending items, durable commits and optional
 materialization. Worker scratch and the process thread envelope are included
 in admission before private IO, and all workers join before progress returns.
-This route retains its full-projection, sequential-prompt contract.
+Prompt execution remains sequential.
+
+Add `--max-selected-rows N` to project every grammar-legal output row, including
+accepting EOS, under a fixed cap of 1 through 166144. A step whose complete
+legal set exceeds the cap refuses without pruning or falling back. The
+selected strategy and exact cap enter the authenticated job recipe; repeat
+the original option on resume. Existing full-head job recipes remain unchanged
+when it is omitted. Selection composes with the admitted CPU team, compact
+schema/source input and retained-input replay, while keeping full KV/workspace
+reservations and nonrenewable lifetime budgets. Selected completion metadata
+adds only the public row cap. See [selected-row extraction](docs/int4-selected-rows.md)
+for the CLI and `Int4ExtractionJobPlanner::with_selected_rows` library surface.
 
 Worker width is physical scheduling metadata. An authenticated resume may
 change it without changing the private recipe or renewing native work, mask

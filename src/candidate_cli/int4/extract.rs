@@ -34,8 +34,8 @@ pub(super) struct ExtractionArgs {
     max_mask_node_visits: u64,
     #[arg(long, default_value_t = 2_000_000)]
     mask_step_node_visits: u64,
-    // Only the one-off command installs this argument. Shared definitions
-    // cannot accidentally expose an execution strategy they do not implement.
+    // Each supporting command explicitly installs this argument. Shared
+    // definitions cannot expose an execution strategy they do not bind.
     #[arg(skip)]
     max_selected_rows: Option<usize>,
 }
@@ -56,7 +56,7 @@ pub(super) fn definition() -> clap::Command {
 
 pub(super) fn one_off_definition() -> clap::Command {
     definition()
-        .long_about("Compile a bounded local schema against the exact UTF-8 document before model access. Full-vocabulary greedy grammar decoding is the default. Explicit --max-selected-rows N selects every legal grammar row and refuses a step whose complete legal set exceeds N, including EOS when accepting. This is a bounded head projection strategy, never top-k pruning; it checks requested logits and does not certify parity with unrequested full-head rows. The strategy and exact row ceiling enter execution identity before hosted admission. --source-membership preserves all original occurrences of annotated verbatim fields. JSON remains exact text and the complete result is independently validated. Schema validity and source membership do not certify semantic accuracy. No sampling or repair retry. --prefill-rows independently selects bounded layer-major prompt execution. Batch streams expose their own fixed selected-row option, including document cohorts and packed prompt passes. Complete-document maps, corpora and retained document jobs accept a fixed selected-row policy for all chunks. Single-context extract-job and semantic workflows retain full-vocabulary execution.")
+        .long_about("Compile a bounded local schema against the exact UTF-8 document before model access. Full-vocabulary greedy grammar decoding is the default. Explicit --max-selected-rows N selects every legal grammar row and refuses a step whose complete legal set exceeds N, including EOS when accepting. This is a bounded head projection strategy, never top-k pruning; it checks requested logits and does not certify parity with unrequested full-head rows. The strategy and exact row ceiling enter execution identity before hosted admission. --source-membership preserves all original occurrences of annotated verbatim fields. JSON remains exact text and the complete result is independently validated. Schema validity and source membership do not certify semantic accuracy. No sampling or repair retry. --prefill-rows independently selects bounded layer-major prompt execution. Batch streams expose their own fixed selected-row option, including document cohorts and packed prompt passes. Complete-document maps, corpora and retained document jobs accept a fixed selected-row policy for all chunks. Single-context extract-job also authenticates a fixed selected-row policy across resume. Semantic workflows retain full-vocabulary execution.")
         .arg(selected_rows_argument())
 }
 pub(super) fn selected_rows_argument() -> clap::Arg {

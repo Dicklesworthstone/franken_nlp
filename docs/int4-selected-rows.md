@@ -32,8 +32,10 @@ promise that an arbitrary schema fits.
 document cohorts and packed prompt passes. Complete-document extraction also
 supports it on `extract-map`, `extract-corpus` and
 `extract-document-job start|resume`, with serial or cohort chunk execution.
-Other source-task maps/corpora, single-context durable extraction, redaction
-and the semantic second-reader route retain their full-vocabulary contracts.
+Single-context retained extraction also supports it on `extract-job start|resume`,
+including persistent CPU teams and compact input encoding. Other source-task
+maps/corpora, redaction and the semantic second-reader route retain their
+full-vocabulary contracts.
 Without the option, these tasks retain full-vocabulary execution and their
 existing identity. Native work in the result reports actual projected rows;
 grammar-mask, task, source and complete-result limits are unchanged.
@@ -165,6 +167,47 @@ ordered complete-document stream, and
 document job. Each consuming document-factory setter invalidates previously
 prepared documents; reconstruction checks every original chunk identity.
 These routes do not expose packed prompt prefill through this option.
+
+### Retained single-context extraction
+
+`extract-job start` and `resume` accept `--max-selected-rows N` for an exact
+shared schema over the retained population. Each record must still fit the
+single-context task ceiling. For example:
+
+```sh
+fnlp candidate source-int4 extract-job start documents.ndjson \
+  --schema records.schema.json --source-membership \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --group-width 128 --memory-mib "$MEMORY_MIB" \
+  --max-new-tokens 128 --max-selected-rows 4096 --compute-threads 4 \
+  --store-results --job-dir /private/extraction-job --job-id "$JOB_ID" \
+  --key-file /private/extraction-job.key --limits extraction-job-limits.json
+```
+
+Repeat the row cap and all other authenticated semantic settings on resume.
+The private recipe binds the selected task/native execution versions and exact
+cap. Adding, removing or changing the policy refuses before tail repair or
+pending execution; a full-vocabulary-sized selected cap is still a distinct
+policy. Omitting the option preserves the serialized recipe of existing
+full-head jobs. The completion metadata exposes only the public
+`max_selected_rows` cap and omits that field for the default.
+
+Library callers use `Int4ExtractionJobPlanner::with_selected_rows` before
+passing the planner to `NlpEngine::job_int4_extract` or
+`job_int4_extract_with_threads`. The factory, each prepared item and native
+processor must agree on the exact policy before durable work is reserved.
+The immutable job limits remain the sole lifetime authority: selecting rows
+does not multiply, reset or refund native work, mask allowances or attempts.
+All legal rows, including accepting EOS, must fit; an over-cap step refuses
+without pruning, fallback or a committed partial result.
+
+Selected decoding composes with source-converted and independently pinned
+snapshot models, the admitted persistent CPU team, `safe-bpe-v1` and explicit
+retained-input replay. Compact schema/source encoding retains its per-record
+and cumulative invocation budgets. KV, decoder, worker, input-owner and encoder
+memory remain fully reserved. This job family retains sequential prompt
+execution and does not expose document cohorts or `--prefill-rows`.
 
 ### Persistent CPU teams for a complete extraction document
 
@@ -352,10 +395,10 @@ per-row identities and result markers, with separate outer markers:
 `group_steps` counts forward passes. Selected `projection_groups` counts
 physical head invocations for the bounded row chunks and can exceed the
 forward-pass count. Both are checked against the completed per-document work;
-neither is a speed measurement. Single-context durable jobs continue to refuse
-injected selected plans before durable work journaling. Complete-document
+neither is a speed measurement. Single-context and complete-document durable
 jobs require their immutable factory and authenticated recipe to select the
-strategy before any durable attempt is admitted.
+strategy before any durable attempt is admitted. Injected full-head, selected
+or mismatched-cap preparations refuse before durable work journaling.
 
 Independent JSON validation, exact-number preservation, source-membership
 evidence, complete result-size checks and the final cancellation check remain
@@ -372,16 +415,22 @@ They have not been executed in this session.
 
 Additional serial-stream definitions cover fixed policy propagation, injection
 refusal, exact output-token reservation, failure poisoning and KV cleanup,
-selected completion verification, parser scope, and early map/durable refusal.
+selected completion verification, parser scope, and policy refusal before
+unsupported workflows or durable admission.
 New cohort definitions cover independent caps and identities, original source
 finalizers, selected chunk counts, rejection of mixed strategies and wrong
 markers, complete output-token reservation, packed scratch charged once, and
 all five CLI combinations at exact process-memory boundaries. These
 definitions are also **UNRUN**.
 
-Complete-document definitions also cover authenticated resume, retained-input
-replay, fixed memory and lifetime limits, and full-vocabulary-cap identity
-separation despite equal planned work. These definitions remain **UNRUN**.
+Complete-document and single-context retained-job definitions also cover
+authenticated resume, retained-input replay, fixed memory and lifetime limits,
+and full-vocabulary-cap identity separation despite equal planned work.
+Single-context CLI definitions cover source/snapshot selection, compact input,
+worker teams, invalid-cap refusal before private IO and metadata omission for
+legacy full-head jobs. These definitions remain **UNRUN**. The executor and
+controller DSR are unavailable for this code-first checkpoint; source review
+does not establish compilation, model parity or measured performance.
 
 Compilation and regression execution await the repository's controller-owned
 DSR checkpoint on the named production graph. Actual-model equality against
