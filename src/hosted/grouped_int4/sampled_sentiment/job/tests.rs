@@ -101,7 +101,7 @@ fn compact_workspace_is_in_the_planner_quote_and_does_not_renew_per_sample_or_at
         max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
     let base = sampled_sentiment_job_preparation_bytes(task, limits, &UntrustedEncoding::ByteFallback).unwrap();
     assert_eq!(base, sampled_sentiment_batch_preparation_bytes(task, limits,
-        &UntrustedEncoding::ByteFallback).unwrap() + SAMPLED_SENTIMENT_JOB_RECIPE_BYTES);
+        &UntrustedEncoding::ByteFallback).unwrap() + SAMPLED_SENTIMENT_JOB_RECIPE_BYTES as u64);
     let compact = sampled_sentiment_job_preparation_bytes(task, limits,
         &UntrustedEncoding::SafeBpeV1(encoding)).unwrap();
     assert_eq!(compact - base, encoding.requirements().unwrap().workspace_bytes);
@@ -195,6 +195,7 @@ fn owned_types_cross_serial_team_and_prefill_host_boundaries() {
     let _serial = NlpEngine::job_int4_sampled_sentiment::<std::io::Cursor<Vec<u8>>>;
     let _team = NlpEngine::job_int4_sampled_sentiment_with_threads::<std::io::Cursor<Vec<u8>>>;
     let _prefill = NlpEngine::job_int4_sampled_sentiment_layer_major::<std::io::Cursor<Vec<u8>>>;
+    let _reused = SampledSentimentJobPlanner::with_reused_prefill;
     for width in [0, 1, 65, usize::MAX] { assert!(int4_task_team_workspace_bytes(width, 32).is_err()); }
     for width in [2, 4, 64] { assert!(int4_task_team_workspace_bytes(width, 32).unwrap() > 0); }
 }

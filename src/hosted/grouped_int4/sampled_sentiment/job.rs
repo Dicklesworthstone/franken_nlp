@@ -116,6 +116,10 @@ impl NlpEngine {
     /// retention mode separately controls whether original documents are saved.
     /// The caller supplies the protected key and ID; this method never invents
     /// a seed, retries, falls back to another model, or writes results to stdout.
+    /// `SampledSentimentJobPlanner::with_reused_prefill` explicitly freezes
+    /// per-axis prompt reuse into the authenticated recipe. Reuse is local to
+    /// each item and its returned bundle records actual work; the durable
+    /// ledger still reserves the complete cold attempt before execution.
     #[allow(clippy::too_many_arguments)]
     pub fn job_int4_sampled_sentiment<R>(&self, model: &ResidentInt4,
         planner: SampledSentimentJobPlanner, request: SourceJobRequest,
@@ -128,7 +132,9 @@ impl NlpEngine {
 
     /// Freeze one admitted causal prompt workspace into the private recipe.
     /// Its rows and declared capacity must match on authenticated resume.
-    /// Each sample retains a fresh native session and independent address.
+    /// Each sample retains an independent address. If the planner explicitly
+    /// enables reuse, only the current axis's first prompt pays prefill work;
+    /// every subsequent sample resumes that exact prompt in the same session.
     #[allow(clippy::too_many_arguments)]
     pub fn job_int4_sampled_sentiment_layer_major<R>(&self, model: &ResidentInt4,
         planner: SampledSentimentJobPlanner, request: SourceJobRequest,

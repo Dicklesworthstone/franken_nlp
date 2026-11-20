@@ -7,8 +7,8 @@ serve one document, a bounded ordered NDJSON stream, or an explicitly retained
 authenticated population with durable resume, respectively. Each invocation
 uses one resident model. They implement the independent generation portion of plan §7.5,
 Mode B. Every sample has its own semantic address. By default each sample
-starts from an empty logical KV cache; the single-document command also offers
-explicit axis-local prompt reuse with `--reuse-prefill`. It does not sample the
+starts from an empty logical KV cache; all three commands also offer
+explicit document-and-axis-local prompt reuse with `--reuse-prefill`. It does not sample the
 distribution-mode bins.
 
 These surfaces require the `asupersync-runtime` implementation; durable jobs
@@ -114,7 +114,7 @@ assumed result of source inspection.
 
 For both single-document and resident-population commands, `--prefill-rows N`
 selects bounded layer-major prompt execution. By default this runs for every
-independent sample; single-document `--reuse-prefill` runs it once per axis.
+independent sample; `--reuse-prefill` runs it once per axis in each document.
 N is an explicit maximum morsel width from 1 through 64.
 Use this option with serial compute (`--compute-threads 1`, the default); a
 larger compute team and prompt morsels are mutually exclusive schedules.
@@ -140,13 +140,13 @@ remain controller model gates; no speedup is claimed from source inspection.
 
 ## Reuse the prompt across independent samples
 
-For the single-document command, add `--reuse-prefill` to avoid repeatedly
+For any of the three commands, add `--reuse-prefill` to avoid repeatedly
 forwarding the same axis prompt. This works with byte fallback or compact BPE,
 source conversion or pinned snapshots, and either serial compute, one persistent
 numerical team, or serial layer-major prefill. The existing restriction against
 combining multiple compute threads with `--prefill-rows` still applies. Batch
-and retained-job commands reject `--reuse-prefill` before opening private input,
-model, key or limits files.
+execution fixes this policy for the invocation. Retained jobs authenticate it
+at creation and require the same choice on every resume.
 
 The first sample of each axis executes its complete prompt. Before a later
 sample, the private native session rewinds to the position immediately before
@@ -176,6 +176,23 @@ private session. Default execution and its result identity are unchanged.
 Prepared-task embedders can use `execute_reusing_prefill_with_control`, and
 hosted callers can use `execute_int4_sampled_sentiment_reusing_prefill` or
 `execute_int4_sampled_sentiment_reusing_prefill_with_threads`.
+
+For a resident corpus, use
+`batch_int4_sampled_sentiment_reusing_prefill` (with optional layer-major
+prefill) or `batch_int4_sampled_sentiment_reusing_prefill_with_threads`.
+Every record finishes and clears its private native state before another
+record is admitted. No prefix is shared between documents or preserved by a
+flush. Every output frame, including empty-run and terminal frames, carries
+an optional `prefill_reuse` execution version when selected. The default
+wrappers omit this field.
+
+For retained jobs, `SampledSentimentJobPlanner::with_reused_prefill` freezes
+both sampled-task and native execution versions in the existing private
+authenticated recipe. Changing the flag in either direction refuses resume
+before uncommitted-tail repair or new inference. A pending item starts its own
+fresh axis sessions after restart; model KV is never persisted. An already
+committed item needs no new samples or work debit. Actual bundle work remains
+separate from the complete cold attempt charge in the durable ledger.
 
 ## Sampling and complete results
 
@@ -238,7 +255,7 @@ The seed and document-dependent identity hashes are omitted from normal output.
 | `--max-tokenizer-pair-bytes` | 67108864 examined bytes for that same encoding; compact mode only |
 | `--compute-threads` | 1; explicit coordinator-plus-worker width 1–64 |
 | `--prefill-rows` | Omitted; explicit layer-major prompt morsels of 1–64 rows, with serial compute |
-| `--reuse-prefill` | Off; one-off axis-local prompt reuse, preserving conservative cold-work admission |
+| `--reuse-prefill` | Off; document-and-axis-local prompt reuse in one-off, batch and durable modes, preserving conservative cold-work admission |
 
 For the single-document command, all five native-work flags—`--max-forward-positions`,
 `--max-projected-logits`, `--max-attention-pairs`, `--max-dot-products` and
@@ -307,6 +324,7 @@ fnlp candidate source-int4 sentiment-sampled-batch sentiment-population.ndjson \
   --samples 4 \
   --input-encoding safe-bpe-v1 \
   --compute-threads 4 \
+  --reuse-prefill \
   --max-requests 1000 \
   --max-total-input-bytes 67108864 \
   --max-total-output-bytes 67108864
@@ -320,8 +338,9 @@ invocation. Work defaults may exhaust before the request limit; the command
 does not multiply compute authority by `--max-requests`.
 
 For layer-major prompt execution, use `--compute-threads 1 --prefill-rows 4`
-in the same command. This selects bounded causal prompt morsels for every
-fresh sample in every document. Widths 1–64 are supported; the prompt schedule
+in the same command. With `--reuse-prefill`, this selects bounded causal
+prompt morsels for the first sample of each axis in every document. Omitting
+reuse prefills every independent sample. Widths 1–64 are supported; the prompt schedule
 cannot combine with a larger compute team. Compact input and source,
 snapshot-load and snapshot-save routes remain available.
 
@@ -439,7 +458,10 @@ The hosted methods
 `NlpEngine::batch_int4_sampled_sentiment_with_threads` and
 `NlpEngine::batch_int4_sampled_sentiment_layer_major` own the reader, writer,
 compiler and vocabulary through physical completion and delivery under one
-blocking invocation and one run controller.
+blocking invocation and one run controller. Their explicit
+`batch_int4_sampled_sentiment_reusing_prefill` and
+`batch_int4_sampled_sentiment_reusing_prefill_with_threads` alternatives use
+the same ownership and work limits with private per-axis prompt reuse.
 
 The CLI defaults to byte fallback and `--compute-threads 1`. Compact encoding
 and explicit widths 2–64 use the same admitted source/snapshot routes as the
@@ -499,9 +521,9 @@ job ID and authentication key should be independently generated random values.
 
 The authenticated recipe includes the effective seed, sampling policy,
 task/grammar/encoding ceilings, model and group identity, per-item work
-ceilings, and the complete immutable job limits. Repeat them on resume.
+ceilings, reuse execution policy, and the complete immutable job limits. Repeat them on resume.
 Selecting `--prefill-rows` also freezes its row and workspace configuration;
-changing that choice requires a different job. A legal compute-team width is
+changing that choice or `--reuse-prefill` requires a different job. A legal compute-team width is
 a physical execution choice and does not replenish any durable work allowance.
 
 ### Lifetime work and storage limits
@@ -570,6 +592,7 @@ sampled_job_args=(
   --memory-mib 8192
   --seed "$SAMPLING_SEED"
   --samples 2
+  --reuse-prefill
   --max-input-bytes 8192
   --max-result-bytes 1048576
   --store-results
@@ -616,7 +639,7 @@ encoding policy is authenticated.
 
 To select the compact, persistent-team route in the example, add
 `--input-encoding safe-bpe-v1 --compute-threads 4` to both invocations. A legal
-compute width can change on resume; the chosen encoding and prefill recipe
+compute width can change on resume; the chosen encoding, prefill and reuse recipe
 must remain identical. No cross-schedule parity or speedup follows from source
 inspection.
 
@@ -625,6 +648,8 @@ inspection.
 `SampledSentimentJobPlanner::new` accepts the actual model-bound task planner,
 the pinned vocabulary, native per-item/lifetime ceilings, and immutable
 `JobLimits`. `with_layer_major_prefill` freezes an optional prompt schedule.
+`with_reused_prefill` selects private prompt reuse and may be combined with
+that schedule in either builder order; both choices remain authenticated.
 `sampled_sentiment_job_preparation_bytes` is available without the optional
 storage backend, and `int4_sampled_sentiment_job_requirements` quotes the
 complete hosted execution envelope. Pass the sealed planner and explicit

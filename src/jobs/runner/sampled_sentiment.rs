@@ -16,12 +16,14 @@ use crate::{
     execution_identity::ExecutionIdentity,
     grammar::{CompileLimits, mask::MaskWorkLimits, runtime::JSON_RUNTIME_VERSION},
     jobs::{JobLimits, JobWork, manifest::bounded_json, runner::DurableBatchProcessor},
-    native_engine::{constrained_int4::{INT4_JSON_SAMPLED_EXECUTION, JSON_SAMPLER_VERSION},
+    native_engine::{constrained_int4::{INT4_JSON_SAMPLED_EXECUTION,
+            INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION, JSON_SAMPLER_VERSION},
         decode::DecodeStepControl, strict_int4::{Int4MemoryRequirement, Int4Work, StrictInt4Engine,
             prefill::{Int4PrefillLimits, INT4_LAYER_MAJOR_PREFILL_VERSION}}},
     tasks::{ir::TaskBudget, sentiment::{SentimentAxis, sampled::{SampledSentimentLimits, SampledSentimentOptions,
         SampledSentimentPlanner, SampledSentimentRun, SampledSentimentVocabulary, MAX_SENTIMENT_SAMPLES,
         SAMPLED_SENTIMENT_AGGREGATION_VERSION, SAMPLED_SENTIMENT_EXECUTION,
+        SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION,
         SAMPLED_SENTIMENT_ITEM_ADDRESS_VERSION, SAMPLED_SENTIMENT_PROMPT_VERSION}}},
     tokenizer::untrusted::UntrustedEncoding,
 };
@@ -147,6 +149,15 @@ impl SampledSentimentJobRecipe {
         bounded_json(&self, SAMPLED_SENTIMENT_JOB_RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
         Ok(self)
     }
+    fn with_reused_prefill(mut self) -> Result<Self, BatchFault> {
+        // These existing fields bind the physical execution policy without
+        // changing the canonical recipe of an already retained cold job.
+        self.execution = SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION;
+        self.native_execution = INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION;
+        bounded_json(&self, SAMPLED_SENTIMENT_JOB_RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
+        Ok(self)
+    }
+    fn reuses_prefill(&self) -> bool { self.execution == SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION }
     fn prefill_limits(&self) -> Option<Int4PrefillLimits> {
         self.prefill.as_ref().map(|prefill| Int4PrefillLimits { max_batch_rows: prefill.max_batch_rows,
             max_extra_scratch_bytes: prefill.max_extra_scratch_bytes })
@@ -193,6 +204,14 @@ impl SampledSentimentJobPlanner {
         self.recipe = self.recipe.with_prefill(limits)?;
         Ok(self)
     }
+    /// Reuse only the current axis's prompt within each complete document.
+    /// The explicit policy is authenticated before any durable execution, so
+    /// resume cannot switch between cold and reused-prefill results. Every
+    /// attempt still reserves the full cold native and mask work allowance.
+    pub fn with_reused_prefill(mut self) -> Result<Self, BatchFault> {
+        self.recipe = self.recipe.with_reused_prefill()?;
+        Ok(self)
+    }
     pub fn base_execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn task_budget(&self) -> TaskBudget { self.compiler.task_budget() }
     pub fn native_limits(&self) -> SampledSentimentBatchLimits { self.compiler.limits() }
@@ -202,6 +221,7 @@ impl SampledSentimentJobPlanner {
     pub fn preparation_requirement_bytes(&self) -> u64 { self.preparation_bytes }
     pub fn max_result_bytes(&self) -> u64 { self.recipe.max_result_bytes() }
     pub fn prefill_limits(&self) -> Option<Int4PrefillLimits> { self.recipe.prefill_limits() }
+    pub fn reuses_prefill(&self) -> bool { self.recipe.reuses_prefill() }
     pub fn job_limits(&self) -> JobLimits { self.recipe.job }
     /// Private configuration for keyed commitment only; do not publish it.
     pub fn job_recipe(&self) -> &SampledSentimentJobRecipe { &self.recipe }
@@ -222,10 +242,13 @@ impl<'e, 'w, A: SampledSentimentBatchAdmission> SampledSentimentJobProcessor<'e,
     pub fn new(planner: SampledSentimentJobPlanner, engine: &'e mut StrictInt4Engine<'w>, admission: A)
         -> Result<Self, BatchFault> {
         let SampledSentimentJobPlanner { compiler, identity, recipe, .. } = planner;
-        let native = match recipe.prefill_limits() {
+        let native = if recipe.reuses_prefill() {
+            NativeSampledSentimentBatch::new_reusing_prefill(compiler, engine, admission,
+                recipe.prefill_limits())?
+        } else { match recipe.prefill_limits() {
             Some(prefill) => NativeSampledSentimentBatch::new_layer_major(compiler, engine, admission, prefill)?,
             None => NativeSampledSentimentBatch::new(compiler, engine, admission)?,
-        };
+        } };
         Ok(Self { native, identity, recipe })
     }
 }

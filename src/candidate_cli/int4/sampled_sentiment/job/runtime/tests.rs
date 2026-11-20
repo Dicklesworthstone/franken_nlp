@@ -213,7 +213,8 @@ fn completion_metadata_binds_candidate_and_all_six_spent_axes_without_private_sa
         candidate_format: "fixture-candidate-format", quant_recipe: "fixture-grouped-int4",
         group_width: args.group_width, integer_kernel: common.kernel.kind().id(),
         snapshot: Some(SnapshotRecord::new("loaded", common.snapshot_need)),
-        input_encoding: None, compute_schedule: None, prefill_schedule: None, output: &report,
+        input_encoding: None, compute_schedule: None, prefill_schedule: None,
+        prefill_reuse: None, output: &report,
     };
     let mut bytes = Vec::new();
     publish_report(&response, &mut bytes, &|| Ok(Duration::from_secs(1)),
@@ -249,7 +250,7 @@ fn completion_metadata_binds_candidate_and_all_six_spent_axes_without_private_sa
     assert!(!std::str::from_utf8(&bytes).unwrap().contains("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
     assert!(bytes.ends_with(b"\n"));
     assert_eq!(publish(&response, 1, &mut NoIo), Err(CandidateError::Output));
-    for key in ["input_encoding", "compute_schedule", "prefill_schedule"] {
+    for key in ["input_encoding", "compute_schedule", "prefill_schedule", "prefill_reuse"] {
         assert!(value.get(key).is_none());
     }
     let encoding = crate::tokenizer::untrusted::UntrustedEncoding::SafeBpeV1(
@@ -275,6 +276,14 @@ fn completion_metadata_binds_candidate_and_all_six_spent_axes_without_private_sa
         "admitted_workspace_bytes": prefill.validate().unwrap(),
     })));
     assert_eq!(layer_major, value);
+    let (reused, reused_args) = command("resume", 0, &["--reuse-prefill"]);
+    reused.args.validate(&reused_args).unwrap();
+    response.prefill_schedule = None;
+    response.prefill_reuse = reused.args.sampled.prefill_reuse_execution();
+    let mut reused_value = serde_json::to_value(&response).unwrap();
+    assert_eq!(reused_value.as_object_mut().unwrap().remove("prefill_reuse"),
+        Some(serde_json::json!(crate::tasks::sentiment::sampled::SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION)));
+    assert_eq!(reused_value, value);
 }
 
 fn cancellations() -> [(DecodeCancellationKind, ErrorCode, &'static str); 11] {

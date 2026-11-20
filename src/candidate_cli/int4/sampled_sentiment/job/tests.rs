@@ -45,15 +45,46 @@ impl Write for NoIo {
 }
 
 #[test]
-fn one_off_prefill_reuse_is_refused_before_job_limits_key_or_population_io() {
+fn job_prefill_reuse_preserves_cold_lifetime_debits_and_admission_on_every_route() {
     for route in 0..3 { for operation in ["start", "resume"] {
-        let (c, args) = command(operation, route, &["--reuse-prefill"]);
+      for flags in [
+        &["--reuse-prefill"][..],
+        &["--reuse-prefill", "--compute-threads", "4"][..],
+        &["--reuse-prefill", "--prefill-rows", "4"][..],
+        &["--reuse-prefill", "--input-encoding", "safe-bpe-v1", "--prefill-rows", "1"][..],
+      ] {
+        let (c, args) = command(operation, route, flags);
+        let (cold, cold_args) = command(operation, route, &flags[1..]);
         assert!(c.args.sampled.reuse_prefill);
-        assert_eq!(c.args.validate(&args).unwrap_err().code,
-            "sampled_sentiment_job_prefill_reuse_unavailable");
-        assert_eq!(c.execute_owned(args, NoIo, &mut NoIo).unwrap_err().code,
-            "sampled_sentiment_job_prefill_reuse_unavailable");
+        assert!(!cold.args.sampled.reuse_prefill);
+        let common = c.args.validate(&args).unwrap();
+        let cold_common = cold.args.validate(&cold_args).unwrap();
+        let job = lifetime(&args, &c, common);
+        let limits = c.args.lifetime_limits(&args, common, job).unwrap();
+        let cold_limits = cold.args.lifetime_limits(&cold_args, cold_common, job).unwrap();
+        assert_eq!(c.args.sampled.options(&args).unwrap(), cold.args.sampled.options(&cold_args).unwrap());
+        assert_eq!(limits.native.max_item_work, cold_limits.native.max_item_work);
+        assert_eq!(limits.native.max_model_work, cold_limits.native.max_model_work);
+        assert_eq!(limits.native.max_sampler_bytes, cold_limits.native.max_sampler_bytes);
+        assert_eq!(limits.native.masks.max_visits_per_item, cold_limits.native.masks.max_visits_per_item);
+        assert_eq!(limits.native.masks.max_visits_per_run, cold_limits.native.masks.max_visits_per_run);
+        assert_eq!(limits.native.masks.per_mask.max_trie_node_visits,
+            cold_limits.native.masks.per_mask.max_trie_node_visits);
+        assert_eq!(limits.native.masks.per_mask.checkpoint_interval_nodes,
+            cold_limits.native.masks.per_mask.checkpoint_interval_nodes);
+        assert_eq!(limits.task, cold_limits.task);
+        assert_eq!(limits.buffer_bytes, cold_limits.buffer_bytes);
+        assert_eq!(limits.execution_bytes, cold_limits.execution_bytes);
+        assert_eq!(limits.common.minimum_memory_bytes, cold_limits.common.minimum_memory_bytes);
+        assert_eq!(limits.common.native, cold_limits.common.native);
+        assert_eq!(common.minimum_memory_bytes, cold_common.minimum_memory_bytes);
+        let mut short = args;
+        short.memory_mib = (common.minimum_memory_bytes - 1) / MIB;
+        assert_eq!(c.execute_owned(short, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+      }
     } }
+    let (c, args) = command("start", 0, &["--reuse-prefill", "--compute-threads", "2", "--prefill-rows", "4"]);
+    assert_eq!(c.execute_owned(args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
 }
 
 #[test]

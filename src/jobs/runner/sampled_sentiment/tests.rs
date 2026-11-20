@@ -204,6 +204,7 @@ fn public_adapter_is_owned_send_and_implements_the_existing_durable_boundary() {
     let _constructor = SampledSentimentJobPlanner::new;
     let _serial = SampledSentimentJobProcessor::<RefuseAdmission>::new;
     let _layer_major = SampledSentimentJobPlanner::with_layer_major_prefill;
+    let _reused = SampledSentimentJobPlanner::with_reused_prefill;
 }
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -235,6 +236,10 @@ struct Processor { identity: ExecutionIdentity, recipe: SampledSentimentJobRecip
 impl Processor {
     fn new(cap: SampledSentimentBatchLimits, events: Rc<Events>) -> Self {
         Self { identity: identity(), recipe: recipe(cap), events, fail: None }
+    }
+    fn with_reused_prefill(mut self) -> Self {
+        self.recipe = self.recipe.with_reused_prefill().unwrap();
+        self
     }
 }
 impl BatchProcessor for Processor {
@@ -302,6 +307,7 @@ fn retained_resume_skips_committed_items_preserves_draws_and_holds_results_throu
 
 #[test]
 fn failed_and_cancelled_generations_retain_all_six_lifetime_debits_on_resume() {
+    for reuse in [false, true] {
     for axis in 0..6 {
         let mut cap = native(); cap.max_item_work = work(1); cap.masks.max_visits_per_item = 5;
         if axis < 5 { *work_axis(&mut cap.max_model_work, axis) = *work_axis(&mut work(1), axis); }
@@ -309,16 +315,21 @@ fn failed_and_cancelled_generations_retain_all_six_lifetime_debits_on_resume() {
         let root = Root::new(); let input = inputs(); let events = Rc::new(Events::default());
         let expected = if axis % 2 == 0 { BatchCode::Execution.into() }
             else { BatchFault::cancelled(DecodeCancellationKind::CostBudget) };
-        let mut p = Processor::new(cap, Rc::clone(&events)); p.fail = Some(expected);
+        let make = || {
+            let processor = Processor::new(cap, Rc::clone(&events));
+            if reuse { processor.with_reused_prefill() } else { processor }
+        };
+        let mut p = make(); p.fail = Some(expected);
         let mut run = JobRunner::create(&root.0, key(), JobId([9; 16]), limits(cap), &input, p, &mut Continue).unwrap();
         assert_eq!(error(run.step(&mut Continue)), JobRunError::Processor(expected));
         assert_eq!(run.progress().committed, 0);
         assert_eq!(run.progress().reserved_work, JobWork::from_int4(work(1), 5)); drop(run);
         let mut resumed = JobRunner::resume(&root.0, key(), JobId([9; 16]), limits(cap), &input,
-            Processor::new(cap, Rc::clone(&events)), TailPolicy::Refuse, &mut Continue).unwrap();
+            make(), TailPolicy::Refuse, &mut Continue).unwrap();
         assert_eq!(error(resumed.step(&mut Continue)), JobRunError::Storage(JobError::WorkLimit));
         assert_eq!(events.executions.get(), 1); assert_eq!(resumed.progress().attempts, 1);
         assert_eq!(resumed.progress().reserved_work, JobWork::from_int4(work(1), 5));
+    }
     }
 }
 
@@ -352,6 +363,94 @@ fn changed_seed_refuses_retained_resume_before_repair_and_original_seed_recovers
     let done = resumed.run(&mut Continue).unwrap();
     assert_eq!((done.committed, done.attempts), (2, 3));
     assert_eq!(done.reserved_work, JobWork::from_int4(work(3), 15));
+}
+
+#[test]
+fn changing_reuse_policy_refuses_before_uncommitted_tail_repair_or_execution() {
+    for reuse in [false, true] {
+        let root = Root::new(); let input = inputs(); let cap = native();
+        let retention = InputRetentionLimits { max_spool_bytes: 65536 };
+        let events = Rc::new(Events::default());
+        let make = |selected| {
+            let processor = Processor::new(cap, Rc::clone(&events));
+            if selected { processor.with_reused_prefill() } else { processor }
+        };
+        let mut control = CancelAfterSync(Rc::clone(&events));
+        let mut run = JobRunner::create_with_retained_inputs(&root.0, key(), JobId([9; 16]), limits(cap),
+            retention, &input, make(reuse), &mut control).unwrap();
+        assert_eq!(error(run.step(&mut control)),
+            JobRunError::Storage(JobError::Cancelled(DecodeCancellationKind::PollQuota)));
+        assert_eq!(run.progress().committed, 0); drop(run);
+        assert_eq!(error(JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([9; 16]), limits(cap),
+            retention, make(!reuse), TailPolicy::DiscardUncommitted, &mut Continue)),
+            JobRunError::Storage(JobError::Mismatch(MismatchField::Recipe)));
+        assert_eq!(events.executions.get(), 1);
+        // A rejected policy change cannot repair the original job's spool.
+        assert_eq!(error(JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([9; 16]), limits(cap),
+            retention, make(reuse), TailPolicy::Refuse, &mut Continue)),
+            JobRunError::Storage(JobError::UncommittedTail));
+        let mut resumed = JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([9; 16]), limits(cap),
+            retention, make(reuse), TailPolicy::DiscardUncommitted, &mut Continue).unwrap();
+        let done = resumed.run(&mut Continue).unwrap();
+        assert_eq!((done.committed, done.attempts), (2, 3));
+        assert_eq!(done.reserved_work, JobWork::from_int4(work(3), 15));
+    }
+}
+
+#[test]
+fn completed_reused_job_resume_performs_no_new_draws_or_work_debits() {
+    let root = Root::new(); let full = Root::new(); let input = inputs(); let cap = native();
+    let retention = InputRetentionLimits { max_spool_bytes: 65536 };
+    let events = Rc::new(Events::default());
+    let make = || Processor::new(cap, Rc::clone(&events)).with_reused_prefill();
+    let mut run = JobRunner::create_with_retained_inputs(&root.0, key(), JobId([9; 16]), limits(cap),
+        retention, &input, make(), &mut Continue).unwrap();
+    assert_eq!(run.step(&mut Continue).unwrap().unwrap().committed, 1); drop(run);
+    let mut resumed = JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([9; 16]), limits(cap),
+        retention, make(), TailPolicy::Refuse, &mut Continue).unwrap();
+    let complete = resumed.run(&mut Continue).unwrap();
+    assert_eq!((complete.committed, complete.attempts), (2, 2));
+    assert_eq!(complete.reserved_work, JobWork::from_int4(work(2), 10));
+    resumed.materialize_ordered(&mut Continue).unwrap(); drop(resumed);
+    let mut completed = JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([9; 16]), limits(cap),
+        retention, make(), TailPolicy::Refuse, &mut Continue).unwrap();
+    let unchanged = completed.run(&mut Continue).unwrap();
+    assert_eq!((unchanged.committed, unchanged.attempts), (2, 2));
+    assert_eq!(unchanged.reserved_work, complete.reserved_work);
+    assert_eq!(events.executions.get(), 2); assert_eq!(events.releases.get(), 2);
+    completed.verify(&mut Continue).unwrap(); drop(completed);
+    let mut baseline = JobRunner::create(&full.0, key(), JobId([9; 16]), limits(cap), &input,
+        Processor::new(cap, Rc::new(Events::default())).with_reused_prefill(), &mut Continue).unwrap();
+    baseline.run(&mut Continue).unwrap(); baseline.materialize_ordered(&mut Continue).unwrap();
+    assert_eq!(fs::read(root.0.join("materialized.ndjson")).unwrap(),
+        fs::read(full.0.join("materialized.ndjson")).unwrap());
+}
+
+#[test]
+fn reuse_versions_are_authenticated_without_changing_cold_recipe_shape_or_seed() {
+    let cold = recipe(native());
+    let reused = recipe(native()).with_reused_prefill().unwrap();
+    assert!(!cold.reuses_prefill()); assert!(reused.reuses_prefill());
+    distinct(&reused);
+    let mut expected = serde_json::to_value(&cold).unwrap();
+    expected["execution"] = serde_json::json!(SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION);
+    expected["native_execution"] = serde_json::json!(INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION);
+    assert_eq!(serde_json::to_value(&reused).unwrap(), expected);
+    assert_eq!(canonjson::canonical_bytes(&reused).unwrap(),
+        canonjson::canonical_bytes(&recipe(native()).with_reused_prefill().unwrap().with_reused_prefill().unwrap()).unwrap());
+    for rows in [1, 4, 64] {
+        let prefill = Int4PrefillLimits { max_batch_rows: rows,
+            max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap() };
+        let first = recipe(native()).with_prefill(prefill).unwrap().with_reused_prefill().unwrap();
+        let second = recipe(native()).with_reused_prefill().unwrap().with_prefill(prefill).unwrap();
+        assert_eq!(canonjson::canonical_bytes(&first).unwrap(), canonjson::canonical_bytes(&second).unwrap());
+        assert_eq!(freeze(&first).binding.compare(&freeze(&recipe(native()).with_prefill(prefill).unwrap()).binding),
+            Err(JobError::Mismatch(MismatchField::Recipe)));
+        let changed = Int4PrefillLimits { max_extra_scratch_bytes: prefill.max_extra_scratch_bytes + 1, ..prefill };
+        let changed = recipe(native()).with_reused_prefill().unwrap().with_prefill(changed).unwrap();
+        assert_eq!(freeze(&first).binding.compare(&freeze(&changed).binding),
+            Err(JobError::Mismatch(MismatchField::Recipe)));
+    }
 }
 
 #[test]
@@ -433,6 +532,14 @@ fn actual_model_bound_factory_quotes_recipe_and_uses_the_same_native_compiler() 
     assert_eq!(selected.base_execution_identity(), &identity);
     assert_ne!(canonjson::canonical_bytes(selected.job_recipe()).unwrap(), before);
     assert_eq!(selected.prefill_limits().unwrap().max_batch_rows, 4);
+    assert!(!selected.reuses_prefill());
+    let preparation = selected.preparation_requirement_bytes();
+    let selected = selected.with_reused_prefill().unwrap();
+    assert!(selected.reuses_prefill());
+    assert_eq!(selected.base_execution_identity(), &identity);
+    assert_eq!(selected.preparation_requirement_bytes(), preparation);
+    assert_eq!(selected.prefill_limits().unwrap().max_batch_rows, 4);
+    selected.check_job_limits(limits(native())).unwrap();
 }
 
 #[test]

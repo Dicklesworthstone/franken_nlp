@@ -25,11 +25,11 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
         let command = compute::definition(input_encoding::definition(StorageArgs::augment_args(
             super::definition().name(name).about(about)
                 .long_about("Retain and resume independent sampled sentiment for a frozen {id,text,task_args?} NDJSON population. task_args accepts axes and an optional complete tighter task budget; omitted axes selects all four affect dimensions. --seed and the complete sampling, grammar, encoding, prefill and per-item work policies must match on resume. Every axis and sample must complete and validate before one document is committed. Requires --store-results, an existing protected --job-dir, --key-file, --job-id and immutable --limits. All five native work counters and mask_node_visits in JobLimits.max_work are lifetime allowances, including failed attempts; item count, attempts and restart never replenish them. CLI work and mask flags cap ONE complete document, including every independent sample. Resume skips committed records and uses the same item-addressed draws for pending records. By default, repeat the complete original population; --spool-input and --use-retained-input explicitly enable authenticated private input retention. Stdout contains metadata only. --materialize publishes verified results after every record commits. One resident model, vocabulary and native allocation serve the invocation. --compute-threads 2..64 retains one numerical team; alternatively --prefill-rows 1..64 uses bounded layer-major prompts with serial compute. Compact safe-bpe-v1 input is supported. Memory is admitted before key/model/population IO, and cancellation keeps its original cause. No automatic retry, partial sample bundle, input truncation, calibrated confidence or default sentiment promotion. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
-                .after_help(job_cli::INPUT_RETENTION_HELP)
+                .after_help(format!("With --reuse-prefill, prompt KV is private to the current document and axis; no KV is persisted. Repeat this flag on resume: the authenticated recipe refuses a cold/reused policy change before tail repair or inference. Pending documents restart their own private prefixes. Actual result work and conservative lifetime attempt debits remain separate.\n\n{}", job_cli::INPUT_RETENTION_HELP))
                 .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population; omit with --use-retained-input; '-' reads stdin"))
                 .mut_arg("max_input_bytes", |arg| arg.help("Outer ceiling for each complete NDJSON envelope; immutable stored input ceiling must fit"))
                 .mut_arg("max_result_bytes", |arg| arg.help("Complete sample bundle cap per document; must fit JobLimits.max_result_bytes"))
-                .mut_arg("reuse_prefill", |arg| arg.hide(true))
+                .mut_arg("reuse_prefill", |arg| arg.hide(false).help("Reuse only the current document/axis prompt across independent samples; authenticated policy must match on resume, lifetime cold-work debits are unchanged"))
                 .mut_arg("max_forward_positions", |arg| arg.help("Per-document forward ceiling across every requested axis and sample"))
                 .mut_arg("max_projected_logits", |arg| arg.help("Per-document full-vocabulary projection ceiling"))
                 .mut_arg("max_attention_pairs", |arg| arg.help("Per-document attention-pair ceiling"))
@@ -70,9 +70,6 @@ impl JobArgs {
     /// Settings and the complete one-engine geometry are checked before even
     /// the bounded limits file is opened. It alone supplies lifetime caps.
     fn validate(&self, args: &Int4Args) -> Result<Int4Limits, Failure> {
-        if self.sampled.reuse_prefill {
-            return Err(Failure::usage("sampled_sentiment_job_prefill_reuse_unavailable"));
-        }
         let storage = &self.storage;
         storage.input_retention.limits().map_err(storage_failure)?;
         let local = |path: &std::path::Path| !path.as_os_str().is_empty() && path.as_os_str() != "-";

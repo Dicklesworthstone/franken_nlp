@@ -69,6 +69,9 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         Some(prefill) => planner.with_layer_major_prefill(prefill).map_err(batch_failure)?,
         None => planner,
     };
+    let planner = if job.sampled.reuse_prefill {
+        planner.with_reused_prefill().map_err(batch_failure)?
+    } else { planner };
     planner.check_job_limits(lifetime).map_err(batch_failure)?;
     if planner.preparation_requirement_bytes() != preparation
         || planner.max_result_bytes() != common.result_bytes as u64
@@ -115,6 +118,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         input_encoding: input_encoding::reported_policy(&encoding),
         compute_schedule: compute::Schedule::for_threads(common.compute.threads),
         prefill_schedule: common.prefill.map(PrefillSchedule::new).transpose()?,
+        prefill_reuse: job.sampled.prefill_reuse_execution(),
         output: &report,
     };
     // Staging/deadline failure can follow durable progress. Publish only one
@@ -224,6 +228,8 @@ struct Response<'a, T: Serialize> {
     compute_schedule: Option<compute::Schedule>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefill_schedule: Option<PrefillSchedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefill_reuse: Option<&'static str>,
     output: &'a T,
 }
 
