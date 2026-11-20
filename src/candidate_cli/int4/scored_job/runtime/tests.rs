@@ -55,6 +55,17 @@ fn runtime_revalidates_the_owned_request_before_runtime_or_private_file_access()
         "explicit_scored_job_storage");
 }
 #[test]
+fn invalid_prompt_schedule_refuses_before_runtime_and_any_private_job_io() {
+    for rows in [0, 65, usize::MAX] {
+        let (c, mut args) = parts();
+        let common = c.args.validate(&args).unwrap();
+        args.prefill_rows = Some(rows);
+        assert_eq!(execute(c.mode, args, c.args, common, NoIo, &mut NoIo).unwrap_err().code,
+            "invalid_job_options");
+    }
+}
+
+#[test]
 fn cli_quote_matches_the_host_population_reservation_and_preserves_the_invocation_budget() {
     let (c, args) = parts(); let common = c.args.validate(&args).unwrap();
     let fixed = lifetime(&c.args, &args, common); let limits = c.args.lifetime_limits(&args, common, fixed).unwrap();
@@ -88,7 +99,7 @@ fn completion_metadata_is_task_and_candidate_bound_without_private_scores_or_rec
             candidate_format: "fixture-candidate-format", quant_recipe: "fixture-grouped-int4",
             group_width: args.group_width, integer_kernel: common.kernel.kind().id(),
             snapshot: Some(SnapshotRecord::new("loaded", common.snapshot_need)), input_encoding: None,
-            compute_schedule: None, output: &report,
+            compute_schedule: None, prefill_schedule: None, output: &report,
         };
         let mut bytes = Vec::new(); publish(&response, job_cli::REPORT_BYTES, &mut bytes).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -122,6 +133,16 @@ fn completion_metadata_is_task_and_candidate_bound_without_private_scores_or_rec
             compute::Schedule::for_threads(4).map(serde_json::to_value).transpose().unwrap());
         threaded.as_object_mut().unwrap().remove("input_encoding");
         assert_eq!(threaded, value);
+        assert!(value.get("prefill_schedule").is_none());
+        compact.compute_schedule = None;
+        let prompt = Int4PrefillLimits { max_batch_rows: 3,
+            max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(3).unwrap() };
+        compact.prefill_schedule = Some(PrefillSchedule::new(prompt).unwrap());
+        let mut grouped = serde_json::to_value(&compact).unwrap();
+        assert_eq!(grouped.as_object_mut().unwrap().remove("prefill_schedule"),
+            Some(serde_json::to_value(PrefillSchedule::new(prompt).unwrap()).unwrap()));
+        grouped.as_object_mut().unwrap().remove("input_encoding");
+        assert_eq!(grouped, value, "prompt schedule does not alter authenticated durable metadata");
     }
 }
 

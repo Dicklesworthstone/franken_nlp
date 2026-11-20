@@ -9,7 +9,7 @@ use crate::{
     hosted::{CancellationToken, HostedError, Int4ScoredCohortHostLimits,
         NativeLimits, ResidentInt4, RunLimits, corpus::CorpusLimits},
     native_engine::{decode::DecodeCancellationKind, lmhead::scoring::ScoringMode,
-        strict_int4::weights::snapshot::INT4_SNAPSHOT_VERSION},
+        strict_int4::{prefill::INT4_LAYER_MAJOR_PREFILL_VERSION, weights::snapshot::INT4_SNAPSHOT_VERSION}},
     tasks::{classify::grouped_int4::Int4ClassificationPlanner,
         judge::grouped_int4::Int4JudgePlanner,
         sentiment::{SentimentOptions, SentimentPolicy, grouped_int4::Int4SentimentPlanner}},
@@ -113,7 +113,8 @@ fn stream<P: Int4ScoredTask + Send + 'static, W: Write + Send + 'static>(engine:
     remaining()?;
     let common = limits.common;
     let identity = planner.base_execution_identity().clone();
-    if planner.group_width() != model.model_identity().group_width()
+    if !super::super::prefill::matches(args, common)?
+        || planner.group_width() != model.model_identity().group_width()
         || planner.document_encoding() != &encoding
         || planner.encoding_workspace_bytes() != limits.encoding_workspace_bytes {
         return Err(CandidateError::Identity);
@@ -139,6 +140,7 @@ fn stream<P: Int4ScoredTask + Send + 'static, W: Write + Send + 'static>(engine:
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(), snapshot,
         cohort_schedule: limits.cohort.map(CohortSchedule::from),
         compute_schedule: ComputeSchedule::for_threads(common.compute.threads),
+        prefill_schedule: common.prefill.map(PrefillSchedule::new).transpose()?,
         input_encoding: input_encoding::reported_policy(&encoding),
     };
     let writer = CandidateWriter::new(output, &provenance, limits.transport.max_output_line_bytes, limits.output_bytes)?;
@@ -153,6 +155,9 @@ fn stream<P: Int4ScoredTask + Send + 'static, W: Write + Send + 'static>(engine:
         engine.batch_int4_scored_cohorts(model, planner, corpus,
             Int4ScoredCohortHostLimits { max_documents: cohort.max_documents, max_heads: cohort.max_heads },
             common.kernel, reader, writer, cancellation).map_err(execution_error)?.summary
+    } else if let Some(prefill) = common.prefill {
+        engine.batch_int4_scored_layer_major(model, planner, corpus, common.kernel,
+            prefill, reader, writer, cancellation).map_err(execution_error)?
     } else if common.compute.threads > 1 {
         engine.batch_int4_scored_with_threads(model, planner, corpus, common.kernel,
             common.compute.threads, reader, writer, cancellation).map_err(execution_error)?
@@ -184,7 +189,23 @@ struct Provenance<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     compute_schedule: Option<ComputeSchedule>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    prefill_schedule: Option<PrefillSchedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     input_encoding: Option<&'a crate::tokenizer::untrusted::UntrustedEncoding>,
+}
+
+/// Declared physical prompt schedule, never an observed performance receipt.
+#[derive(Serialize)]
+pub(in crate::candidate_cli::int4) struct PrefillSchedule {
+    execution: &'static str,
+    max_batch_rows: usize,
+    admitted_workspace_bytes: u64,
+}
+impl PrefillSchedule {
+    pub(in crate::candidate_cli::int4) fn new(limits: Int4PrefillLimits) -> Result<Self, CandidateError> {
+        Ok(Self { execution: INT4_LAYER_MAJOR_PREFILL_VERSION, max_batch_rows: limits.max_batch_rows,
+            admitted_workspace_bytes: limits.validate().map_err(|_| CandidateError::Arguments)? })
+    }
 }
 
 #[derive(Serialize)]

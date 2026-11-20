@@ -414,22 +414,26 @@ fn parsed_job(operation: &str, task: &str, flags: &[&str]) -> Result<Int4Command
     Ok(command)
 }
 #[test]
-fn unsupported_scored_workflows_refuse_prefill_at_parser_and_programmatic_boundaries() {
+fn scored_populations_accept_bounded_prefill_while_resolution_keeps_its_existing_schedule() {
     for rows in [1, 4, 64] {
         let row = rows.to_string();
         for task in ["classify", "sentiment", "judge"] {
-            assert!(parsed("score-batch", &["--task", task, "--prefill-rows", &row]).is_err());
+            let command = parsed("score-batch", &["--task", task, "--prefill-rows", &row]).unwrap();
+            let Int4Task::ScoredBatch(options) = command.task else { panic!("scored batch required"); };
+            let selected = options.validate(&command.args).unwrap().common.prefill.unwrap();
+            assert_eq!(selected.max_batch_rows, rows);
+            assert_eq!(selected.validate().unwrap(), Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap());
             let mut command = parsed("score-batch", &["--task", task]).unwrap();
             let Int4Task::ScoredBatch(options) = command.task else { panic!("scored batch required"); };
-            options.validate(&command.args).unwrap();
             command.args.policy = parsed("generate", &["--prefill-rows", &row]).unwrap().args.policy;
-            assert_eq!(options.execute_owned(command.args, NoRead, NoWrite), Err(CandidateError::Arguments));
+            assert_eq!(options.validate(&command.args).unwrap().common.prefill.unwrap().max_batch_rows, rows);
             for operation in ["start", "resume"] {
-                assert!(parsed_job(operation, task, &["--prefill-rows", &row]).is_err());
-                let mut job = parsed_job(operation, task, &[]).unwrap();
+                let job = parsed_job(operation, task, &["--prefill-rows", &row]).unwrap();
+                assert_eq!(job.args.prefill().unwrap().unwrap().max_batch_rows, rows);
+                // Combining a supported prompt width with a CPU team still
+                // fails at the actual owned route before private job IO.
+                let mut job = parsed_job(operation, task, &["--compute-threads", "2"]).unwrap();
                 job.args.policy = parsed("generate", &["--prefill-rows", &row]).unwrap().args.policy;
-                // Use the actual owned job route, not Int4Command::execute,
-                // which rejects every retained job regardless of its options.
                 let mut diagnostics = Vec::new();
                 assert_ne!(job.run_owned(NoRead, NoWrite, &mut diagnostics), ExitCode::SUCCESS);
                 let report: serde_json::Value = serde_json::from_slice(&diagnostics).unwrap();

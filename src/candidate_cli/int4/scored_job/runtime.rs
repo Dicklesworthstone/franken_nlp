@@ -12,7 +12,7 @@ use crate::{
     tasks::{classify::grouped_int4::Int4ClassificationPlanner,
         sentiment::grouped_int4::Int4SentimentPlanner, judge::grouped_int4::Int4JudgePlanner},
 };
-use super::super::scored_batch::runtime::sentiment_options;
+use super::super::scored_batch::runtime::{sentiment_options, PrefillSchedule};
 
 pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     job: JobArgs, _admitted: Int4Limits, input: R, output: &mut impl Write) -> Result<(), Failure> {
@@ -86,6 +86,9 @@ fn run<P: Int4ScoredJobTask>(engine: &NlpEngine, model: &ResidentInt4, planner: 
     started: Instant, deadline: Duration, cancellation: CancellationToken) -> Result<(), Failure> {
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
+    if !super::super::prefill::matches(args, limits.common)? {
+        return Err(CandidateError::Arguments.into());
+    }
     planner.check_job_limits(lifetime).map_err(|_| CandidateError::Planning)?;
     let encoding = job.input_encoding(args, limits.common)?;
     check_planner_quote(&planner, &encoding, limits.encoding_workspace_bytes)?;
@@ -107,7 +110,10 @@ fn run<P: Int4ScoredJobTask>(engine: &NlpEngine, model: &ResidentInt4, planner: 
     let materialize = job.storage.materialize;
     let request = SourceJobRequest { root: job.storage.job_dir, key, job_id, limits: lifetime,
         mode: open_mode(mode, job.storage.input_retention)?, materialize };
-    let progress = if common.compute.threads == 1 {
+    let progress = if let Some(prefill) = common.prefill {
+        engine.job_int4_scored_layer_major(model, planner, request, host, common.kernel,
+            prefill, reader, cancellation.clone())
+    } else if common.compute.threads == 1 {
         engine.job_int4_scored(model, planner, request, host, common.kernel, reader, cancellation.clone())
     } else {
         engine.job_int4_scored_with_threads(model, planner, request, host, common.kernel,
@@ -128,7 +134,8 @@ fn run<P: Int4ScoredJobTask>(engine: &NlpEngine, model: &ResidentInt4, planner: 
         quant_recipe: &identity.quant_recipe, group_width: model.model_identity().group_width(),
         integer_kernel: common.kernel.kind().id(), snapshot,
         input_encoding: input_encoding::reported_policy(&encoding),
-        compute_schedule: compute::Schedule::for_threads(common.compute.threads), output: &report,
+        compute_schedule: compute::Schedule::for_threads(common.compute.threads),
+        prefill_schedule: common.prefill.map(PrefillSchedule::new).transpose()?, output: &report,
     };
     // A report-write error can follow durable commits. No private scores,
     // labels, documents, paths or keys are included, and rollback is not implied.
@@ -212,6 +219,8 @@ struct Response<'a, T: Serialize> {
     input_encoding: Option<&'a crate::tokenizer::untrusted::UntrustedEncoding>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compute_schedule: Option<compute::Schedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefill_schedule: Option<PrefillSchedule>,
     output: &'a T,
 }
 

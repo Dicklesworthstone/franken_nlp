@@ -103,10 +103,10 @@ fn every_native_transport_and_preparation_ceiling_refuses_before_io() {
 }
 
 #[test]
-fn compact_scored_tasks_admit_serial_and_cohort_streams_with_one_encoder() {
+fn compact_scored_tasks_admit_serial_prefill_and_cohort_streams_with_one_encoder() {
     use crate::tokenizer::untrusted::UntrustedEncoding;
     for task in ["classify", "sentiment", "judge"] {
-        for schedule in [&[][..], &["--cohort-heads", "8", "--cohort-documents", "3"][..]] {
+        for schedule in [&[][..], &["--prefill-rows", "3"][..], &["--cohort-heads", "8", "--cohort-documents", "3"][..]] {
             let mut flags = schedule.to_vec();
             flags.extend(["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "123456",
                 "--max-tokenizer-pair-bytes", "2345678"]);
@@ -172,10 +172,38 @@ fn invalid_encoder_policy_refuses_before_private_io() {
 }
 
 #[test]
-fn compact_stream_policy_does_not_enable_prefill_by_injection() {
+fn layer_major_streams_preserve_semantic_limits_and_admit_the_exact_prompt_workspace() {
     for task in ["classify", "sentiment", "judge"] {
-        let (batch, mut args) = arguments(task, &["--input-encoding", "safe-bpe-v1"]);
-        args.prefill_rows = Some(2);
+        for encoding in ["byte-fallback", "safe-bpe-v1"] {
+            let (serial, serial_args) = arguments(task, &["--input-encoding", encoding]);
+            let baseline = serial.validate(&serial_args).unwrap();
+            for rows in [1, 3, 64] {
+                let row = rows.to_string();
+                let (batch, mut args) = arguments(task, &["--input-encoding", encoding, "--prefill-rows", &row]);
+                let limits = batch.validate(&args).unwrap();
+                let selected = limits.common.prefill.unwrap();
+                assert_eq!(selected.max_batch_rows, rows);
+                assert_eq!(selected.validate().unwrap(), Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap());
+                assert_eq!(limits.common.native, baseline.common.native);
+                assert_eq!(limits.native, baseline.native);
+                assert_eq!(limits.transport, baseline.transport);
+                assert_eq!(limits.encoding_workspace_bytes, baseline.encoding_workspace_bytes);
+                assert_eq!(batch.scoring.budget(limits.common), serial.scoring.budget(baseline.common));
+                assert_eq!(limits.common.compute.threads, 1);
+                assert!(limits.cohort.is_none());
+                assert!(super::super::prefill::matches(&args, limits.common).unwrap());
+                args.memory_mib = limits.common.minimum_memory_bytes.saturating_sub(1) / MIB;
+                assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+            }
+        }
+        // Bypass clap to cover the actual programmatic admission boundary.
+        for rows in [0, 65, usize::MAX] {
+            let (batch, mut args) = arguments(task, &["--defaults", "never-open.json"]);
+            args.prefill_rows = Some(rows);
+            assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+        }
+        let (batch, mut args) = arguments(task, &["--cohort-heads", "3", "--defaults", "never-open.json"]);
+        args.prefill_rows = Some(3);
         assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
     }
 }
@@ -244,11 +272,11 @@ fn snapshot_compaction_keeps_the_same_work_transport_and_encoding_limits() {
 }
 
 #[test]
-fn explicit_generation_or_prefill_controls_are_never_silently_ignored() {
+fn explicit_generation_controls_are_never_silently_ignored() {
     for flags in [vec!["--max-new-tokens", "128"], vec!["--max-output-bytes", "65536"],
         vec!["--min-new-tokens", "0"], vec!["--temperature-milli", "1000"],
         vec!["--top-k", "0"], vec!["--top-p-ppm", "1000000"],
-        vec!["--prefill-rows", "1"], vec!["--logprobs"]] {
+        vec!["--logprobs"]] {
         let mut argv = vec!["candidate", "source-int4", "score-batch", "--task", "judge",
             "--source-dir", "source", "--source-manifest", "manifest", "--memory-mib", "8192"];
         argv.extend(flags);
@@ -464,6 +492,9 @@ fn disabled_runtime_refuses_without_opening_defaults_or_touching_streams() {
         let (batch, args) = arguments(task, &["--defaults", "never-open-private-defaults.json",
             "--compute-threads", "2"]);
         assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Unavailable));
+        let (batch, args) = arguments(task, &["--defaults", "never-open-private-defaults.json",
+            "--prefill-rows", "3"]);
+        assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Unavailable));
         let (batch, mut args) = arguments(task, &["--defaults", "never-open-private-defaults.json",
             "--cohort-heads", "8", "--cohort-documents", "2"]);
         args.memory_mib = 262_144;
@@ -475,7 +506,7 @@ fn disabled_runtime_refuses_without_opening_defaults_or_touching_streams() {
 fn explicit_record_tokenizer_caps_are_separate_from_context_and_transport() {
     use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
     for task in ["classify", "sentiment", "judge"] {
-        for schedule in [&[][..], &["--cohort-heads", "4"][..], &["--compute-threads", "3"][..]] {
+        for schedule in [&[][..], &["--prefill-rows", "3"][..], &["--cohort-heads", "4"][..], &["--compute-threads", "3"][..]] {
             let mut flags = schedule.to_vec();
             flags.extend(["--input-encoding", "safe-bpe-v1",
                 "--max-tokenizer-input-bytes", "1048576", "--max-tokenizer-output-tokens", "524288",

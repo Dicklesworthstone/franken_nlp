@@ -1465,8 +1465,12 @@ persistent output-row team with `N - 1` workers and one coordinator, for widths
 flush. Complete row arithmetic and within-row order remain the serial kernel's;
 causal state, full-vocabulary scoring and task finalization stay on the
 coordinator. Compact classification and sentiment work with all three routes.
-Team and cohort schedules cannot be combined. Generation, sampling and
-`--prefill-rows` controls are refused.
+Alternatively, `--prefill-rows 1..64` processes each head's prompt in bounded
+layer-major morsels with one admitted workspace reused across records and
+heads. The prompt, team and cohort schedules are separate choices; mixed
+schedules refuse before private IO. Finite candidate scores and EOS remain
+unchanged, with the same cumulative native work authority. Generation and
+sampling controls are refused.
 
 ```bash
 fnlp candidate source-int4 score-batch documents.ndjson \
@@ -1836,8 +1840,18 @@ The accepted range is 1 through 64, including the coordinator; one preserves
 the serial route. Larger widths keep one admitted numerical row team across
 the complete authenticated invocation, every record and scoring head, durable
 attempts and commits, and optional materialization. The team works with both
-byte fallback and explicit safe-BPE input. Native cohort and prompt-prefill
-options remain refused on this job route.
+byte fallback and explicit safe-BPE input. Native cohorts remain unavailable
+on this job route.
+
+As a separate schedule, add `--prefill-rows N` with serial compute for bounded
+layer-major prompt execution in `score-job start` or `resume`. The host
+reserves one additional prompt workspace before private input and keeps it
+through native completion and durable storage. Prompt row width is physical
+scheduling: it may change on authenticated resume without changing the recipe,
+replaying committed records or renewing any attempt/native-work allowance.
+Nondefault completion reports include only public `prefill_schedule` metadata;
+default reports and stored scoring results retain their existing shapes.
+See [retained scored jobs](docs/candidate-scored-jobs.md) for details.
 
 Worker scratch and the process thread envelope are priced alongside the
 existing population, model, native state and guarded storage. Threads join

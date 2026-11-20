@@ -49,8 +49,8 @@ pub(super) fn definition() -> clap::Command {
     ScoringArgs::augment_args(command)
 }
 /// Reveal scheduling only on tasks wired to grouped native scoring.
-/// Ordered scored streams expose their own bounded cross-document policy;
-/// retained jobs and resolution keep serial execution.
+/// Scored populations expose their own supported schedules; composed maps
+/// and resolution retain their explicit independent scheduling contracts.
 pub(super) fn prefill_definition(command: clap::Command) -> clap::Command {
     command.mut_arg("prefill_rows", |arg| arg.hide(false)
         .help("Explicit INT4 layer-major prompt execution, 1..=64 rows; extra workspace is admitted once and reused between scoring heads"))
@@ -73,13 +73,6 @@ impl ScoringArgs {
                 "INT4 finite-candidate tasks do not accept generation controls"));
         }
         Self::from_arg_matches(matches)
-    }
-    pub(super) fn from_batch_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-        if matches.value_source("prefill_rows") == Some(clap::parser::ValueSource::CommandLine) {
-            return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
-                "INT4 scored streams do not accept prompt-prefill scheduling"));
-        }
-        Self::from_matches_with_prefill(matches)
     }
     pub(super) fn cohort_head_limit(self) -> Option<usize> { self.cohort_heads }
     pub(super) fn validate(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {

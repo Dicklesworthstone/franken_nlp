@@ -64,6 +64,7 @@ fn every_scored_task_keeps_exact_native_records_and_explicit_snapshot_provenance
             snapshot: Some(SnapshotRecord::new("loaded", need)),
             cohort_schedule: None,
             compute_schedule: None,
+            prefill_schedule: None,
             input_encoding: None,
         };
         // Publication fixture only; these synthetic bytes assert no model result.
@@ -87,6 +88,7 @@ fn every_scored_task_keeps_exact_native_records_and_explicit_snapshot_provenance
         assert_eq!(value["snapshot"]["file_bytes"], need.file_bytes);
         assert!(value.get("cohort_schedule").is_none());
         assert!(value.get("compute_schedule").is_none());
+        assert!(value.get("prefill_schedule").is_none());
         assert!(value.get("input_encoding").is_none());
         for absent in ["document", "prompt", "source_dir", "source_manifest", "snapshot_path",
             "defaults_path", "prompt_digest", "taskir_digest"] {
@@ -142,7 +144,23 @@ fn changed_team_schedule_is_revalidated_before_owned_defaults_model_or_stream_io
 }
 
 #[test]
-fn compact_policy_is_reported_on_records_flush_and_empty_completion_without_rewriting_inner_json() {
+fn prompt_schedule_metadata_uses_validated_workspace_without_claiming_execution() {
+    for rows in [1, 3, 64] {
+        let required = Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+        let schedule = PrefillSchedule::new(Int4PrefillLimits {
+            max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX }).unwrap();
+        assert_eq!(serde_json::to_value(schedule).unwrap(), serde_json::json!({
+            "execution": INT4_LAYER_MAJOR_PREFILL_VERSION,
+            "max_batch_rows": rows,
+            "admitted_workspace_bytes": required,
+        }));
+        assert!(PrefillSchedule::new(Int4PrefillLimits {
+            max_batch_rows: rows, max_extra_scratch_bytes: required - 1 }).is_err());
+    }
+}
+
+#[test]
+fn compact_policy_and_prompt_schedule_cover_records_flush_and_empty_completion_without_rewriting_inner_json() {
     use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
     let encoding = UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
         max_input_bytes: 4096, max_output_tokens: 1024, max_pair_checks: 123456, max_pair_bytes: 2345678,
@@ -153,7 +171,10 @@ fn compact_policy_is_reported_on_records_flush_and_empty_completion_without_rewr
         model_id: "Nanbeige4.2-3B", source_revision: "fixture-revision", source_root_sha256: "fixture-source",
         model_content_sha256: "fixture-content", candidate_format: "fnlp-int4-source-candidate-v1",
         quant_recipe: "fixture:group=128", group_width: 128, integer_kernel: "s_scalar_i32",
-        snapshot: None, cohort_schedule: None, compute_schedule: None, input_encoding: Some(&encoding),
+        snapshot: None, cohort_schedule: None, compute_schedule: None,
+        prefill_schedule: Some(PrefillSchedule::new(Int4PrefillLimits { max_batch_rows: 3,
+            max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(3).unwrap() }).unwrap()),
+        input_encoding: Some(&encoding),
     };
     for records in [
         "{\"event\":\"doc\",\"fixture_decimal\":12345678901234567890123456789012345678}\n{\"event\":\"flush\"}\n{\"event\":\"run_complete\"}\n",
@@ -172,6 +193,10 @@ fn compact_policy_is_reported_on_records_flush_and_empty_completion_without_rewr
             assert!(line.ends_with(&format!("\"record\":{original}}}")));
             let value: serde_json::Value = serde_json::from_str(line).unwrap();
             assert_eq!(value["input_encoding"], serde_json::to_value(&encoding).unwrap());
+            assert_eq!(value["prefill_schedule"]["execution"], INT4_LAYER_MAJOR_PREFILL_VERSION);
+            assert_eq!(value["prefill_schedule"]["max_batch_rows"], 3);
+            assert_eq!(value["prefill_schedule"]["admitted_workspace_bytes"],
+                Int4PrefillLimits::required_extra_scratch_bytes(3).unwrap());
         }
     }
 }
@@ -228,7 +253,7 @@ fn model_stream_input(task: &str, budget: TaskBudget) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "requires controller-admitted independently pinned snapshot and full-model serial/cohort NDJSON parity"]
+#[ignore = "requires controller-admitted independently pinned snapshot and full-model serial/prefill/cohort NDJSON parity"]
 fn model_present_cross_document_streams_preserve_complete_serial_records_and_flushes() {
     const CHILD: &str = "FNLP_INT4_SCORE_STREAM_PARITY_CHILD";
     const COMPLETE: &str = "FNLP_INT4_SCORE_STREAM_PARITY_COMPLETE";
@@ -259,7 +284,8 @@ fn model_present_cross_document_streams_preserve_complete_serial_records_and_flu
     for task in ["classify", "sentiment"] {
         let mut input = None;
         let mut expected = None;
-        for flags in [&[][..], &["--cohort-heads", "3", "--cohort-documents", "3"][..],
+        for flags in [&[][..], &["--prefill-rows", "3"][..], &["--prefill-rows", "64"][..],
+            &["--cohort-heads", "3", "--cohort-documents", "3"][..],
             &["--cohort-heads", "8", "--cohort-documents", "3"][..]] {
             let mut flags = flags.to_vec();
             flags.extend(["--input-encoding", encoding]);
@@ -289,6 +315,9 @@ fn model_present_cross_document_streams_preserve_complete_serial_records_and_flu
                 assert_eq!(value["model_content_sha256"], pin);
                 assert_eq!(value.get("input_encoding"), input_encoding::reported_policy(&policy)
                     .map(serde_json::to_value).transpose().unwrap().as_ref());
+                let prompt_schedule = value.as_object_mut().unwrap().remove("prefill_schedule");
+                assert_eq!(prompt_schedule, limits.common.prefill.map(PrefillSchedule::new).transpose().unwrap()
+                    .map(serde_json::to_value).transpose().unwrap());
                 let schedule = value.as_object_mut().unwrap().remove("cohort_schedule");
                 if let Some(window) = limits.cohort {
                     assert_eq!(schedule, Some(serde_json::to_value(CohortSchedule::from(window)).unwrap()));

@@ -84,9 +84,9 @@ fn consent_and_all_private_paths_are_checked_before_any_io() {
     }
 }
 #[test]
-fn generation_prefill_and_live_stream_controls_are_refused() {
+fn generation_and_live_stream_controls_are_refused() {
     for extra in [vec!["--max-new-tokens", "128"], vec!["--max-output-bytes", "65536"],
-        vec!["--prefill-rows", "1"], vec!["--min-new-tokens", "0"], vec!["--logprobs"],
+        vec!["--min-new-tokens", "0"], vec!["--logprobs"],
         vec!["--temperature-milli", "1000"], vec!["--max-requests", "3"],
         vec!["--max-total-output-bytes", "65536"], vec!["--schema", "schema.json"]] {
         let mut words = argv("start", "judge"); words.extend(extra.into_iter().map(str::to_owned));
@@ -338,6 +338,41 @@ fn complete_job_team_width_keeps_semantic_limits_and_compact_policy_unchanged() 
 }
 
 #[test]
+fn prompt_width_is_physical_while_item_lifetime_and_tokenizer_limits_stay_fixed() {
+    for task in ["classify", "sentiment", "judge"] {
+        for encoding in ["byte-fallback", "safe-bpe-v1"] {
+            let (serial, args) = command("start", task, &["--input-encoding", encoding]);
+            let common = serial.args.validate(&args).unwrap();
+            let fixed = lifetime(&serial.args, &args, common);
+            let baseline = serial.args.lifetime_limits(&args, common, fixed).unwrap();
+            for operation in ["start", "resume"] { for rows in [1, 3, 64] {
+                let row = rows.to_string();
+                let (c, args) = command(operation, task, &["--input-encoding", encoding, "--prefill-rows", &row]);
+                let common = c.args.validate(&args).unwrap();
+                let limits = c.args.lifetime_limits(&args, common, fixed).unwrap();
+                let selected = common.prefill.unwrap();
+                assert_eq!(selected.max_batch_rows, rows);
+                assert_eq!(selected.validate().unwrap(), Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap());
+                assert_eq!(limits.native, baseline.native);
+                assert_eq!(limits.common.native, baseline.common.native);
+                assert_eq!(limits.buffer_bytes, baseline.buffer_bytes);
+                assert_eq!(limits.encoding_workspace_bytes, baseline.encoding_workspace_bytes);
+                assert_eq!(c.args.scoring.budget(common), serial.args.scoring.budget(baseline.common));
+                assert_eq!(common.compute.threads, 1);
+                assert!(super::super::prefill::matches(&args, common).unwrap());
+                let mut tight = common; tight.memory_bytes = limits.common.minimum_memory_bytes - 1;
+                assert_eq!(c.args.lifetime_limits(&args, tight, fixed).unwrap_err().code, "job_population_memory");
+            } }
+        }
+        for rows in [0, 65, usize::MAX] {
+            let (c, mut args) = command("resume", task, &[]);
+            args.prefill_rows = Some(rows);
+            assert!(c.execute_owned(args, NoIo, &mut NoIo).is_err());
+        }
+    }
+}
+
+#[test]
 fn invalid_worker_widths_and_incompatible_native_schedules_refuse_before_job_io() {
     for task in ["classify", "sentiment", "judge"] {
         for width in ["0", "65", "18446744073709551615"] {
@@ -350,7 +385,9 @@ fn invalid_worker_widths_and_incompatible_native_schedules_refuse_before_job_io(
         for schedule in ["--cohort-heads", "--prefill-rows"] {
             let mut words = argv("start", task);
             words.extend(["--compute-threads", "4", schedule, "1"].into_iter().map(str::to_owned));
-            assert!(parse(words).is_err());
+            if let Ok((c, args)) = parse(words) {
+                assert!(c.execute_owned(args, NoIo, &mut NoIo).is_err());
+            }
         }
         let (c, mut args) = command("resume", task, &["--compute-threads", "4"]);
         args.memory_mib = 1;

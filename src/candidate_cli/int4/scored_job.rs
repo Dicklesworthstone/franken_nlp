@@ -41,6 +41,8 @@ pub(super) fn definition() -> clap::Command {
         let command = StorageArgs::augment_args(ScoreArgs::augment_args(classify::definition().name(name).about(about)
             .long_about("Retain and resume complete classification, sentiment or judgment results with one resident source-converted or independently pinned snapshot INT4 model. Requires --store-results, an existing protected --job-dir, original --job-id and --key-file, and immutable --limits. By default, supply the COMPLETE original NDJSON {id,text,task_args?} population on every invocation; explicit retained-input replay is available. --task is fixed; --defaults has the same typed settings as score-batch. Supplied task_args replaces the complete shared arguments. Sentiment scoring mode, EOS and policy stay fixed for the run. Every native head preflights before execution. Resume authenticates original input bytes, defaults, planner limits and model/group identity before any repair or native forward. Five scoring flags bound EACH ITEM; JobLimits.max_work is the sole lifetime authority, including failed attempts, and its mask_node_visits must be zero. Neither population size nor resume renews that work. Flush controls are refused. Stdout is metadata only; private scores remain in the explicitly retained spool. --materialize publishes only after all items commit. Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. No automatic retry, key/directory creation, release activation or semantic-accuracy claim.")
             .after_help(job_cli::INPUT_RETENTION_HELP)
+            .mut_arg("prefill_rows", |arg| arg.hide(false)
+                .help("Bounded layer-major scoring prompts, 1..=64 rows with serial compute; physical width may change on resume without renewing work"))
             .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population; omit with --use-retained-input; '-' reads stdin"))
             .mut_arg("max_input_bytes", |arg| arg.help("Outer cap on each complete NDJSON record; immutable JobLimits.max_input_bytes_per_item must fit"))
             .mut_arg("max_result_bytes", |arg| arg.help("Complete per-item scored result ceiling; must fit immutable JobLimits.max_result_bytes"))
@@ -55,7 +57,7 @@ pub(super) fn definition() -> clap::Command {
         compute::definition(judge::encoding_definition(command))
             .mut_arg("max_tokenizer_input_bytes", |arg| arg.help("Cumulative untrusted bytes encoded per complete scored record; safe-bpe-v1 only, default --max-input-bytes"))
             .mut_arg("max_tokenizer_output_tokens", |arg| arg.help("Cumulative untrusted tokens produced per complete scored record; safe-bpe-v1 only, default per-head prompt capacity"))
-            .after_long_help("All three tasks accept --input-encoding safe-bpe-v1 with explicit byte, token, pair-check and pair-byte ceilings. One tokenizer ledger covers every untrusted segment in a record, including label metadata, both pairwise orders, rubric criteria and independently encoded faithfulness evidence windows. These per-record planning ceilings are authenticated in the immutable job recipe and cannot change on resume, including --use-retained-input. One transient encoder workspace is admitted beside the population and prepared heads. Native work and attempts remain nonrenewable lifetime debits; tokenizer work is bounded per preparation, including a new preparation on explicit resume. Original source bytes and evidence coordinates remain unchanged. Byte fallback remains the default. Compact prompts are a distinct input profile with no output-parity, task-quality or speed claim. --compute-threads 1..=64 selects one persistent numerical team for the complete authenticated invocation; one is the existing serial path. All records, scoring heads, durable attempts and optional materialization share that team. Worker scratch and process thread capacity are admitted before private IO. Width is physical metadata and may change on explicit resume without changing recipes or refunding work. Native cohorts and prompt-prefill schedules remain refused. Metadata is published only after every worker joins.")
+            .after_long_help("All three tasks accept --input-encoding safe-bpe-v1 with explicit byte, token, pair-check and pair-byte ceilings. One tokenizer ledger covers every untrusted segment in a record, including label metadata, both pairwise orders, rubric criteria and independently encoded faithfulness evidence windows. These per-record planning ceilings are authenticated in the immutable job recipe and cannot change on resume, including --use-retained-input. One transient encoder workspace is admitted beside the population and prepared heads. Native work and attempts remain nonrenewable lifetime debits; tokenizer work is bounded per preparation, including a new preparation on explicit resume. Original source bytes and evidence coordinates remain unchanged. Byte fallback remains the default. Compact prompts are a distinct input profile with no output-parity, task-quality or speed claim. --compute-threads 1..=64 selects one persistent numerical team for the complete authenticated invocation; one is the existing serial path. All records, scoring heads, durable attempts and optional materialization share that team. Worker scratch and process thread capacity are admitted before private IO. Width is physical metadata and may change on explicit resume without changing recipes or refunding work. Alternatively, --prefill-rows 1..64 selects bounded layer-major prompt morsels with --compute-threads 1. One additional workspace is admitted before private IO and reused across all scoring heads and pending items. Row width is physical scheduling and may change on explicit resume without changing the recipe, committed results or conservative lifetime work. The completion envelope reports prefill_schedule only when selected. This schedule makes no output-parity, quality or speed claim. Native cohorts remain refused. Metadata is published only after every worker joins.")
     };
     let start = operation("start", "Create an explicitly retained INT4 scoring job");
     let resume = operation("resume", "Authenticate the original population and run pending INT4 scoring items")
@@ -95,7 +97,7 @@ impl JobArgs {
             || s.journal_memory_mib == 0 || s.serialization_memory_mib == 0 {
             return Err(Failure::usage("explicit_scored_job_storage"));
         }
-        if args.prefill()?.is_some() || self.scoring.cohort_head_limit().is_some() {
+        if self.scoring.cohort_head_limit().is_some() {
             return Err(CandidateError::Arguments.into());
         }
         let mut native_args = args.clone();
@@ -170,7 +172,12 @@ impl JobCommand {
             "resume" => RunMode::Resume { discard_uncommitted: matches.get_flag("discard_uncommitted_tail") },
             _ => return Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "score-job operation refused")),
         };
-        let args = JobArgs { scoring: classify::ScoringArgs::from_matches(matches)?,
+        let scoring = classify::ScoringArgs::from_matches_with_prefill(matches)?;
+        if scoring.cohort_head_limit().is_some() {
+            return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
+                "INT4 scored jobs do not accept simultaneous-head cohorts"));
+        }
+        let args = JobArgs { scoring,
             score: ScoreArgs::from_arg_matches(matches)?, storage: StorageArgs::from_arg_matches(matches)?,
             encoding: judge::EncodingArgs::from_arg_matches(matches)? };
         let mut native = Int4Args::from_arg_matches(matches)?;
