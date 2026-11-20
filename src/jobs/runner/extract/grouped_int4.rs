@@ -12,9 +12,10 @@ use crate::{
     grammar::{CompileLimits, mask::MaskWorkLimits,
         runtime::{SourceRuntimeLimits, JSON_RUNTIME_VERSION, SOURCE_JSON_RUNTIME_VERSION}},
     jobs::{JobLimits, JobWork, manifest::bounded_json},
-    native_engine::{decode::DecodeStepControl,
-        strict_int4::{Int4ModelIdentity, Int4Work, StrictInt4Engine}},
-    tasks::{extract::{ExtractionVocabulary, grouped_int4::{Int4ExtractRun, INT4_EXTRACT_VERSION}},
+    native_engine::{constrained_int4::sparse::{Int4JsonSparseLimits, INT4_SPARSE_JSON_EXECUTION},
+        decode::DecodeStepControl, strict_int4::{Int4ModelIdentity, Int4Work, StrictInt4Engine}},
+    tasks::{extract::{ExtractionVocabulary,
+        grouped_int4::{Int4ExtractRun, INT4_EXTRACT_VERSION, INT4_SPARSE_EXTRACT_VERSION}},
         ir::TaskBudget},
     tokenizer::untrusted::{SafeBpeWork, SafeBpeWorkLimits, UntrustedEncoding},
 };
@@ -52,6 +53,16 @@ pub struct Int4ExtractionJobRecipe {
     /// separately authenticated complete-document preparation contract.
     #[serde(skip_serializing_if = "Option::is_none")]
     encoding_work_limits: Option<SafeBpeWorkLimits>,
+    /// The complete legal-row strategy and its refusal ceiling are immutable
+    /// resume authority. Omission preserves every existing full-head recipe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_rows: Option<SelectedRowsRecipe>,
+}
+#[derive(Serialize)]
+struct SelectedRowsRecipe {
+    execution: &'static str,
+    native_execution: &'static str,
+    max_rows_per_step: usize,
 }
 #[derive(Serialize)]
 struct NativeRecipe {
@@ -91,11 +102,26 @@ impl Int4ExtractionJobRecipe {
                 max_output_bytes, max_states, max_transitions, max_mask_bytes }, source,
             native: NativeRecipe { max_model_work, max_trie_node_visits, checkpoint_interval_nodes,
                 max_visits_per_item, max_visits_per_run }, defaults, input_encoding: None,
-            encoding_work_limits: None };
+            encoding_work_limits: None, selected_rows: None };
         // Bound before cloning exact schema bytes into the native compiler.
         // Keep room for JobRunner's protocol/input-profile wrapper.
         bounded_json(&recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
         Ok(recipe)
+    }
+    // Only the single-context adapter calls this check. Complete-document
+    // recipes authenticate their selected strategy in their outer map recipe.
+    fn checked_selected_rows(&self) -> Result<Option<Int4JsonSparseLimits>, BatchFault> {
+        match &self.selected_rows {
+            None if self.execution == INT4_EXTRACT_VERSION => Ok(None),
+            Some(selected) if self.execution == INT4_SPARSE_EXTRACT_VERSION
+                && selected.execution == INT4_SPARSE_EXTRACT_VERSION
+                && selected.native_execution == INT4_SPARSE_JSON_EXECUTION => {
+                let limits = Int4JsonSparseLimits { max_rows_per_step: selected.max_rows_per_step };
+                limits.validate().map_err(|_| BatchCode::Admission)?;
+                Ok(Some(limits))
+            }
+            _ => Err(BatchCode::Admission.into()),
+        }
     }
 }
 
@@ -135,6 +161,31 @@ impl Int4ExtractionJobPlanner {
             compiler_limits, source_limits, Some(recipe.defaults.clone()))?.require_shared_defaults()?;
         let identity = compiler.base_execution_identity().clone();
         Ok(Self { compiler, identity, recipe, native, encoding_work: SafeBpeWork::default() })
+    }
+
+    /// Project every legal grammar row under one fixed per-step ceiling.
+    /// Exceeding the ceiling refuses the attempt; it never truncates the legal
+    /// set or retries with the full head. Resume authenticates the strategy,
+    /// ceiling and both execution contracts before repairing any retained tail.
+    pub fn with_selected_rows(mut self, limits: Int4JsonSparseLimits) -> Result<Self, BatchFault> {
+        self.check_selected_rows()?;
+        self.compiler = self.compiler.with_selected_rows(limits)?;
+        self.recipe.execution = INT4_SPARSE_EXTRACT_VERSION;
+        self.recipe.selected_rows = Some(SelectedRowsRecipe {
+            execution: INT4_SPARSE_EXTRACT_VERSION,
+            native_execution: INT4_SPARSE_JSON_EXECUTION,
+            max_rows_per_step: limits.max_rows_per_step,
+        });
+        self.check_selected_rows()?;
+        bounded_json(&self.recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
+        Ok(self)
+    }
+    pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.compiler.selected_rows() }
+    fn check_selected_rows(&self) -> Result<(), BatchFault> {
+        if self.selected_rows() != self.recipe.checked_selected_rows()? {
+            return Err(BatchCode::Admission.into());
+        }
+        Ok(())
     }
 
     /// Select compact schema/source preparation before opening any job files.
@@ -183,6 +234,7 @@ impl Int4ExtractionJobPlanner {
     pub fn native_limits(&self) -> Int4ExtractionBatchLimits { self.native }
     pub fn check_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> {
         self.check_document_encoding()?;
+        self.check_selected_rows()?;
         check_job_limits(&self.recipe, limits)
     }
 }
@@ -219,6 +271,7 @@ impl<'e, 'weights, 'v, A: Int4ExtractionBatchAdmission> Int4ExtractionJobProcess
     pub fn new(planner: Int4ExtractionJobPlanner, engine: &'e mut StrictInt4Engine<'weights>,
         vocabulary: &'v ExtractionVocabulary, admission: A) -> Result<Self, BatchFault> {
         planner.check_document_encoding()?;
+        planner.check_selected_rows()?;
         let Int4ExtractionJobPlanner { compiler, identity, recipe, native, encoding_work } = planner;
         let native = NativeInt4ExtractionBatch::new_with_document_encoding(
             compiler, engine, vocabulary, admission, native)?;
@@ -257,26 +310,29 @@ impl<A: Int4ExtractionBatchAdmission> DurableBatchProcessor for Int4ExtractionJo
     fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     fn job_recipe(&self) -> &Self::Recipe { &self.recipe }
     fn validate_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> {
+        self.recipe.checked_selected_rows()?;
         check_job_limits(&self.recipe, limits)
     }
     fn durable_work(&self, prepared: &Self::Prepared) -> Result<JobWork, BatchItemFailure> {
         if self.native.is_poisoned() { return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)); }
-        durable_plan_work(prepared, self.recipe.native.max_visits_per_item,
-            self.recipe.input_encoding.as_ref().unwrap_or(&UntrustedEncoding::ByteFallback))
+        durable_plan_work(prepared, &self.recipe)
     }
     fn max_result_bytes(&self, prepared: &Self::Prepared) -> u64 { prepared.extraction_plan().max_result_bytes() }
 }
-fn durable_plan_work(prepared: &PreparedInt4BatchExtraction, masks: u64, encoding: &UntrustedEncoding)
+fn durable_plan_work(prepared: &PreparedInt4BatchExtraction, recipe: &Int4ExtractionJobRecipe)
     -> Result<JobWork, BatchItemFailure> {
-    // Public processor traits can receive a foreign prepared plan. Strategy
-    // and exact encoder policy must match the fixed recipe before journaling.
-    if prepared.extraction_plan().selected_rows().is_some()
+    let selected_rows = recipe.checked_selected_rows().map_err(BatchItemFailure::fatal)?;
+    let encoding = recipe.input_encoding.as_ref().unwrap_or(&UntrustedEncoding::ByteFallback);
+    // Public processor traits can receive a foreign prepared plan. Strategy,
+    // exact row ceiling and encoder policy must match before durable accounting.
+    if prepared.extraction_plan().selected_rows() != selected_rows
+        || prepared.extraction_plan().execution_version() != recipe.execution
         || prepared.source().document_encoding() != encoding {
         return Err(BatchItemFailure::fatal(BatchCode::Admission));
     }
-    // Copy the already group-aware quote. Recomputing it with INT8
-    // formulas would undercharge group dots and corrupt durable authority.
-    Ok(JobWork::from_int4(prepared.planned_work(), masks))
+    // Copy the already group-aware quote, including the complete selected-row
+    // ceiling and unchanged mask allowance. Actual row use never refunds work.
+    Ok(JobWork::from_int4(prepared.planned_work(), recipe.native.max_visits_per_item))
 }
 fn shared_document(document: BatchDocument<()>) -> Result<BatchDocument<ExtractionBatchArgs>, BatchItemFailure> {
     if document.task_args.is_some() { return Err(BatchItemFailure::fatal(BatchCode::InvalidEnvelope)); }

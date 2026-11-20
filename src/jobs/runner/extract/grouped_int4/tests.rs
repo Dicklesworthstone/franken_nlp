@@ -84,20 +84,7 @@ fn freeze(planner: &Int4ExtractionJobPlanner) -> FrozenManifest {
         recipe: &planner.recipe, limits: job_limits(planner.native_limits()) }, inputs(), &mut Continue).unwrap()
 }
 
-#[test]
-fn injected_selected_plans_refuse_before_durable_work_is_journalable() {
-    let p = planner();
-    let dense = p.compiler.prepare(shared_document(document("Alice")).unwrap()).unwrap();
-    let masks = p.recipe.native.max_visits_per_item;
-    assert_eq!(durable_plan_work(&dense, masks, &UntrustedEncoding::ByteFallback).unwrap(), JobWork::from_int4(dense.planned_work(), masks));
-    for max_rows_per_step in [7, NANBEIGE_VOCAB_SIZE] {
-        let selected = planner().compiler.with_selected_rows(
-            crate::native_engine::constrained_int4::sparse::Int4JsonSparseLimits { max_rows_per_step }).unwrap();
-        let prepared = selected.prepare(shared_document(document("Alice")).unwrap()).unwrap();
-        let failure = durable_plan_work(&prepared, masks, &UntrustedEncoding::ByteFallback).unwrap_err();
-        assert!(failure.stop); assert_eq!(failure.fault.code, BatchCode::Admission);
-    }
-}
+mod selected;
 
 #[test]
 fn exact_schema_and_source_bytes_are_bound_without_privileged_marker_tokens() {
@@ -301,8 +288,7 @@ impl DurableBatchProcessor for Processor {
     fn job_recipe(&self) -> &Self::Recipe { &self.planner.recipe }
     fn validate_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> { self.planner.check_job_limits(limits) }
     fn durable_work(&self, prepared: &Self::Prepared) -> Result<JobWork, BatchItemFailure> {
-        durable_plan_work(prepared, self.planner.native_limits().masks.max_visits_per_item,
-            self.planner.document_encoding())
+        durable_plan_work(prepared, &self.planner.recipe)
     }
     fn max_result_bytes(&self, prepared: &Self::Prepared) -> u64 { prepared.extraction_plan().max_result_bytes() }
 }
@@ -395,22 +381,30 @@ fn post_sync_cancellation_keeps_grouped_work_spent_and_requires_explicit_tail_re
 
 #[test]
 fn all_grouped_work_axes_stay_spent_when_a_new_native_ledger_is_created() {
+    for selected in [None, Some(Int4JsonSparseLimits { max_rows_per_step: 7 })] {
+        all_work_axes_stay_spent(selected);
+    }
+}
+fn all_work_axes_stay_spent(selected: Option<Int4JsonSparseLimits>) {
+    let make = |cap| {
+        let p = configured(WIDTH, CompileLimits::default(), SourceRuntimeLimits::default(), defaults(), cap).unwrap();
+        match selected { Some(rows) => p.with_selected_rows(rows).unwrap(), None => p }
+    };
     for axis in 0..6 {
-        let p = planner();
+        let p = make(native(WIDTH));
         let prepared = p.compiler.prepare(shared_document(document("Alice private source")).unwrap()).unwrap();
         let quote = JobWork::from_int4(prepared.planned_work(), p.native_limits().masks.max_visits_per_item);
         let mut cap = native(WIDTH); let mut durable = JobWork::from_int4(cap.max_model_work, cap.masks.max_visits_per_run);
         let mut quote_axis = quote;
         *axis_mut(&mut durable, axis) = *axis_mut(&mut quote_axis, axis);
         cap.max_model_work = durable.int4_model_work(); cap.masks.max_visits_per_run = durable.mask_node_visits;
-        let make = || configured(WIDTH, CompileLimits::default(), SourceRuntimeLimits::default(), defaults(), cap).unwrap();
         let root = Root::new(); let inputs = inputs(); let limits = job_limits(cap); let events = Rc::new(Events::default());
-        let mut processor = Processor::new(make(), Rc::clone(&events)); processor.fail = true;
+        let mut processor = Processor::new(make(cap), Rc::clone(&events)); processor.fail = true;
         let mut run = JobRunner::create(&root.0, key(), JobId([9; 16]), limits, &inputs, processor, &mut Continue).unwrap();
         assert_eq!(error(run.step(&mut Continue)), JobRunError::Processor(BatchCode::Execution.into()));
         assert_eq!(run.progress().reserved_work, quote); drop(run);
         let mut resumed = JobRunner::resume(&root.0, key(), JobId([9; 16]), limits, &inputs,
-            Processor::new(make(), Rc::clone(&events)), TailPolicy::Refuse, &mut Continue).unwrap();
+            Processor::new(make(cap), Rc::clone(&events)), TailPolicy::Refuse, &mut Continue).unwrap();
         assert_eq!(error(resumed.step(&mut Continue)), JobRunError::Storage(JobError::WorkLimit));
         assert_eq!(*events.executed.borrow(), vec![1]); assert_eq!(resumed.progress().reserved_work, quote);
         assert_eq!(resumed.progress().attempts, 1);
@@ -510,10 +504,8 @@ mod encoding {
         assert!(failure.stop); assert_eq!(failure.fault.code, BatchCode::WorkLimit);
         assert_eq!(moved.encoding_work, spent);
         let byte = planner().compiler.prepare(shared_document(document(SOURCE)).unwrap()).unwrap();
-        assert!(durable_plan_work(&byte, native(WIDTH).masks.max_visits_per_item,
-            moved.document_encoding()).is_err());
-        assert!(durable_plan_work(&first, native(WIDTH).masks.max_visits_per_item,
-            &UntrustedEncoding::ByteFallback).is_err());
+        assert!(durable_plan_work(&byte, &moved.recipe).is_err());
+        assert!(durable_plan_work(&first, &planner().recipe).is_err());
         let mut processor = Processor::new(moved, Rc::new(Events::default()));
         let failure = processor.prepare(document(SOURCE)).err().unwrap();
         assert_eq!(failure.fault.code, BatchCode::WorkLimit);

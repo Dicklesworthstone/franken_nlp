@@ -50,6 +50,8 @@ impl NlpEngine {
     /// authenticated resume, native execution, spool/journal commits and optional
     /// materialization complete inside one owned blocking invocation. Stored
     /// results remain protected and no result text is written to stdout here.
+    /// An explicitly selected legal-row policy keeps its exact cap throughout
+    /// admission, native execution and authenticated resume, including teams.
     #[allow(clippy::too_many_arguments)]
     pub fn job_int4_extract<R>(&self, model: &ResidentInt4, planner: Int4ExtractionJobPlanner,
         vocabulary: Arc<ExtractionVocabulary>, request: SourceJobRequest,
@@ -137,6 +139,7 @@ impl<R: BufRead> ExtractionJobExecution<R> {
         let (planner, vocabulary, request) = input.value.preparation.take()
             .ok_or(HostedError::CompletionMissing)?;
         let native_work = planner.native_limits();
+        let selected_rows = planner.selected_rows();
         let population = match read_population(&mut input.value.reader, &request,
             limits.transport, control) {
             Ok(population) => population,
@@ -158,7 +161,7 @@ impl<R: BufRead> ExtractionJobExecution<R> {
         })?;
         let admission = CorpusAdmission { lease: &lease, model: weights.identity(),
             kv_bytes: required.native.kv_bytes, masks: native_work.masks,
-            output_bytes: request.limits.max_result_bytes as u64, selected_rows: None };
+            output_bytes: request.limits.max_result_bytes as u64, selected_rows };
         let result = (|| {
             let processor = Int4ExtractionJobProcessor::new(planner, &mut engine.value, &vocabulary, admission)
                 .map_err(JobRunError::Processor)?;
