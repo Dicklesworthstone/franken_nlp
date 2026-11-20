@@ -3,7 +3,7 @@
 use std::{path::PathBuf, sync::{Mutex, OnceLock}, time::Duration};
 use franken_nlp::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy,
     hosted::{HostedError, Int4HostError, Int4LoadLimits, RunLimits, CancellationToken},
-    native_engine::{decode::DecodeCancellationKind, strict_int4::{Int4ModelLoadRequirement, Int4ModelLoadBudget}}};
+    native_engine::{decode::DecodeCancellationKind, strict_int4::{Int4ModelError, Int4ModelLoadRequirement, Int4ModelLoadBudget}}};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 static ENGINE: OnceLock<NlpEngine> = OnceLock::new();
@@ -76,4 +76,32 @@ fn reentry_is_refused_without_replenishing_execution_or_model_allowances() {
     let _entry = engine.enter_sync_call().unwrap();
     let error = engine.load_source_candidate_int4(root, manifest, 128, limits(), CancellationToken::default()).err().unwrap();
     assert!(matches!(error, HostedError::Reentrant)); assert_drained(engine);
+}
+
+#[test]
+fn manifest_chunk_poll_exhaustion_returns_the_typed_stop_and_drains_before_retry() {
+    use std::{fs::{self, OpenOptions}, io::Write};
+    let _serial = SERIAL.lock().unwrap(); let engine = engine();
+    let root = std::env::temp_dir().join(format!("fnlp-int4-manifest-poll-{}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let manifest = root.join("manifest.json");
+    let mut file = OpenOptions::new().write(true).create_new(true).open(&manifest).unwrap();
+    file.write_all(&vec![b' '; 3 * 65_536]).unwrap(); drop(file);
+    let mut limited = limits(); limited.run.max_checkpoints = 4;
+    let error = engine.load_source_candidate_int4(root, manifest, 128, limited,
+        CancellationToken::default()).err().unwrap();
+    match error {
+        HostedError::Stopped { stop, task_error: Some(error) } => {
+            assert_eq!(stop.kind, DecodeCancellationKind::PollQuota);
+            assert!(matches!(*error,
+                HostedError::Int4(Int4HostError::Model(Int4ModelError::Cancelled(DecodeCancellationKind::PollQuota)))),
+                "source work must return its stop, not continue to a later parse or digest failure");
+        }
+        other => panic!("wrong failure category: {other}"),
+    }
+    assert_drained(engine);
+    let (root, manifest) = missing();
+    assert!(matches!(engine.load_source_candidate_int4(root, manifest, 128, limits(),
+        CancellationToken::default()), Err(HostedError::Int4(Int4HostError::Source(_)))));
+    assert_drained(engine);
 }

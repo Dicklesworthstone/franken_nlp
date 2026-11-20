@@ -68,7 +68,7 @@ pub use stream::HostedInt4ChatStream;
 pub mod batch;
 use crate::tasks::classify::grouped_int4::Int4ClassificationError;
 use crate::{
-    artifact::converter::{ConversionSourceManifest, ConverterError, prepare_nanbeige42_input},
+    artifact::converter::{ConversionSourceManifest, ConverterError, prepare_nanbeige42_input_with_checkpoint},
     native_engine::{
         decode::DecodeStepControl,
         generation::grouped_int4::{Int4GenerationBudget, bind_candidate_model},
@@ -191,7 +191,12 @@ impl Error for Int4HostError {
             Self::SourceMap(e) => Some(e), Self::SourceSummary(e) => Some(e), Self::SourceKeyphrases(e) => Some(e) }
     }
 }
-fn source_error(error: ConverterError) -> HostedError { HostedError::Int4(Int4HostError::Source(error)) }
+fn source_error(error: ConverterError) -> HostedError {
+    match error.cancellation_kind() {
+        Some(cause) => model_error(Int4ModelError::Cancelled(cause)),
+        None => HostedError::Int4(Int4HostError::Source(error)),
+    }
+}
 fn model_error(error: Int4ModelError) -> HostedError { HostedError::Int4(Int4HostError::Model(error)) }
 fn native_error(error: StrictInt4Error) -> HostedError { HostedError::Int4(Int4HostError::Native(error)) }
 fn chat_error(error: Int4ChatError) -> HostedError { HostedError::Int4(Int4HostError::Chat(error)) }
@@ -214,8 +219,9 @@ impl NlpEngine {
     /// Verify the pinned source closure and convert it on the real blocking
     /// coordinator. All reservations precede source access. The strict source
     /// directory is never searched for alternate weights, and no output file
-    /// or canonical artifact is created. Preparation/hash/read calls remain
-    /// synchronous; cancellation waits for actual physical cleanup.
+    /// or canonical artifact is created. All source hash passes poll the same
+    /// control between bounded chunks; individual filesystem calls remain
+    /// synchronous and ownership lasts through actual physical cleanup.
     pub fn load_source_candidate_int4(&self, source_dir: PathBuf, source_manifest: PathBuf,
         group_width: usize, limits: Int4LoadLimits, cancellation: CancellationToken)
         -> Result<ResidentInt4, HostedError> {
@@ -229,9 +235,14 @@ impl NlpEngine {
         let staging = Pending::reserve(&lease, MemoryClass::Staging, needed.staging_bytes)?;
         dispatch::run(self, limits.run, cancellation, move |control| {
             let source = allocate(staging, || {
-                let manifest = ConversionSourceManifest::load_pinned(&source_manifest).map_err(source_error)?;
+                let manifest = ConversionSourceManifest::load_pinned_with_checkpoint(
+                    &source_manifest, || control.prefill_checkpoint(0),
+                ).map_err(source_error)?;
                 checkpoint(control)?;
-                prepare_nanbeige42_input(&source_dir, manifest, true, (2 * MAX_MODEL_K) as u64).map_err(source_error)
+                prepare_nanbeige42_input_with_checkpoint(
+                    &source_dir, manifest, true, (2 * MAX_MODEL_K) as u64,
+                    || control.prefill_checkpoint(0),
+                ).map_err(source_error)
             })?;
             checkpoint(control)?;
             let assets = source.value.materialized_sources();

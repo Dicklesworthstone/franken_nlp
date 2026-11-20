@@ -4,7 +4,7 @@
 use std::{error::Error, fmt};
 use sha2::{Digest, Sha256};
 use crate::artifact::{
-    converter::{PreparedConversionInput, PINNED_REVISION, validate_nanbeige42_census},
+    converter::{ConverterError, PreparedConversionInput, PINNED_REVISION, validate_nanbeige42_census},
     safetensors::{RowPanel, PINNED_SHARD_BYTES},
 };
 use crate::native_engine::{
@@ -137,15 +137,17 @@ impl Int4ModelWeights {
     /// ceilings are checked before rehash, source reads or weight allocation.
     /// The prepared source must not be mutated concurrently. Retained-handle
     /// checks detect persistent changes, not an adversarial mutate/restore race.
-    /// Shard rehash and each read are synchronous and not preemptible; polls
-    /// occur around these calls and throughout row/group conversion.
+    /// Shard rehash polls the same control between at most 64-KiB chunks.
+    /// Individual reads remain synchronous; row/group conversion and both
+    /// complete retained-shard passes share the original checkpoint allowance.
     pub fn from_prepared<C: DecodeStepControl>(source: &PreparedConversionInput, group_width: usize,
         budget: Int4ModelLoadBudget, control: &mut C) -> Result<Self, Int4ModelError> {
         Int4ModelLoadRequirement::for_group_width(group_width)?.check(budget)?;
         let (census, _, _) = source.checked_plan_parts().map_err(|_| Int4ModelError::Contract)?;
         validate_nanbeige42_census(census).map_err(|_| Int4ModelError::Contract)?;
         checkpoint(control)?;
-        source.revalidate_retained_shards().map_err(|_| Int4ModelError::Source)?;
+        source.revalidate_retained_shards_with_checkpoint(|| control.prefill_checkpoint(0))
+            .map_err(source_error)?;
         checkpoint(control)?;
         let embeddings = Bf16Matrix::new(V, H, read_bf16(source, "model.embed_tokens.weight", V, H, false, control)?)
             .map_err(|_| Int4ModelError::Contract)?;
@@ -173,7 +175,8 @@ impl Int4ModelWeights {
                 content_sha256: [0; 32], group_width } };
         model.identity.content_sha256 = model.digest(control)?;
         checkpoint(control)?;
-        source.revalidate_retained_shards().map_err(|_| Int4ModelError::Source)?;
+        source.revalidate_retained_shards_with_checkpoint(|| control.prefill_checkpoint(0))
+            .map_err(source_error)?;
         checkpoint(control)?;
         Ok(model)
     }
@@ -203,6 +206,13 @@ impl Int4ModelWeights {
         Ok(hash.finalize().into())
     }
 }
+fn source_error(error: ConverterError) -> Int4ModelError {
+    match error.cancellation_kind() {
+        Some(cause) => Int4ModelError::Cancelled(cause),
+        None => Int4ModelError::Source,
+    }
+}
+
 fn identity_prefix(source_root: &str, width: usize) -> Sha256 {
     let mut hash = Sha256::new();
     for field in ["fnlp-candidate-int4-model-content-v1", "Nanbeige4.2-3B", PINNED_REVISION,
@@ -321,6 +331,21 @@ pub(crate) fn projection_fixture(group_width: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_source_cancellation_reaches_the_native_model_boundary_unchanged() {
+        use crate::artifact::safetensors::SafetensorsError;
+        use DecodeCancellationKind::*;
+        for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+            ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+            for error in [ConverterError::Cancelled(cause),
+                ConverterError::Safetensors(SafetensorsError::Cancelled(cause))] {
+                assert!(matches!(source_error(error), Int4ModelError::Cancelled(observed) if observed == cause));
+            }
+        }
+        assert!(matches!(source_error(ConverterError::Arithmetic { invariant: "fixture" }), Int4ModelError::Source));
+    }
+
     #[test]
     fn complete_census_work_and_memory_are_admitted_together() {
         let need = Int4ModelLoadRequirement::for_group_width(128).unwrap();

@@ -18,6 +18,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::canonjson::{self, CanonJsonError, ParseLimits};
+use crate::native_engine::decode::DecodeCancellationKind;
+
+/// Maximum source bytes read or hashed between verification checkpoints.
+/// Individual filesystem calls remain synchronous and are not preemptible.
+pub const SOURCE_VERIFICATION_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Largest authority-bearing safetensors JSON header accepted by the range
 /// path.  The pinned shards use only 23,312 bytes of container headers total.
@@ -523,11 +528,24 @@ impl SafetensorsRangeIndex {
     /// digest verification, this path requires the 201 BF16 tensor/payload
     /// contract before making any range available.
     pub fn open_pinned_nanbeige42(root: impl AsRef<Path>) -> Result<Self, SafetensorsError> {
+        Self::open_pinned_nanbeige42_with_checkpoint(root, || None)
+    }
+
+    /// Verify the pinned closure with caller-owned cancellation and poll budget.
+    /// No range is exposed until all source digests and the census pass.
+    pub fn open_pinned_nanbeige42_with_checkpoint(
+        root: impl AsRef<Path>,
+        mut checkpoint: impl FnMut() -> Option<DecodeCancellationKind>,
+    ) -> Result<Self, SafetensorsError> {
+        verification_checkpoint(&mut checkpoint)?;
         let options = RangeIndexOptions {
             required_dtype: Some(SafetensorDtype::Bf16),
             ..RangeIndexOptions::default()
         };
-        let index = Self::open_with_options(root, SourceClosure::pinned_nanbeige42()?, options)?;
+        let index = Self::open_with_options_and_checkpoint(
+            root, SourceClosure::pinned_nanbeige42()?, options, &mut checkpoint,
+        )?;
+        verification_checkpoint(&mut checkpoint)?;
         if index.tensor_to_shard.len() != PINNED_TENSOR_COUNT {
             return Err(SafetensorsError::PinnedTensorCount {
                 expected: PINNED_TENSOR_COUNT,
@@ -568,6 +586,7 @@ impl SafetensorsRangeIndex {
                 expected_metadata_bytes: PINNED_CONTAINER_HEADER_BYTES,
             });
         }
+        verification_checkpoint(&mut checkpoint)?;
         Ok(index)
     }
 
@@ -577,9 +596,22 @@ impl SafetensorsRangeIndex {
         closure: SourceClosure,
         options: RangeIndexOptions,
     ) -> Result<Self, SafetensorsError> {
+        Self::open_with_options_and_checkpoint(root, closure, options, || None)
+    }
+
+    /// Build a range index while polling before IO, between bounded source
+    /// chunks and before exposing the complete authenticated index.
+    /// The caller must keep source contents stable for the operation.
+    pub fn open_with_options_and_checkpoint(
+        root: impl AsRef<Path>,
+        closure: SourceClosure,
+        options: RangeIndexOptions,
+        mut checkpoint: impl FnMut() -> Option<DecodeCancellationKind>,
+    ) -> Result<Self, SafetensorsError> {
         if options.max_header_bytes == 0 || options.max_range_bytes == 0 {
             return Err(SafetensorsError::InvalidOptions);
         }
+        verification_checkpoint(&mut checkpoint)?;
         let root = root.as_ref();
         let mut verified_files = BTreeMap::new();
         let mut receipts = Vec::with_capacity(closure.shards.len() + 1);
@@ -587,13 +619,10 @@ impl SafetensorsRangeIndex {
         // Deliberately hash the complete closure before parsing index/header
         // JSON.  A failure leaves no range-index object to expose.
         for source in std::iter::once(closure.index()).chain(closure.shards().iter()) {
+            verification_checkpoint(&mut checkpoint)?;
             let path = source_path(root, source)?;
-            let mut file = File::open(&path).map_err(|error| SafetensorsError::Io {
-                source: source.file_name.clone(),
-                operation: "open verified source",
-                detail: error.to_string(),
-            })?;
-            let receipt = verify_source_file(source, &mut file)?;
+            let mut file = open_source_file(&path, source)?;
+            let receipt = verify_source_file(source, &mut file, &mut checkpoint)?;
             receipts.push(receipt);
             verified_files.insert(source.file_name.clone(), file);
         }
@@ -603,16 +632,17 @@ impl SafetensorsRangeIndex {
                 source: closure.index.file_name.clone(),
             },
         )?;
-        let index_bytes = read_verified_index(closure.index(), &mut index_file)?;
+        let index_bytes = read_verified_index(closure.index(), &mut index_file, &mut checkpoint)?;
         let mut headers = BTreeMap::new();
         let mut shards = BTreeMap::new();
         for source in closure.shards() {
+            verification_checkpoint(&mut checkpoint)?;
             let mut file = verified_files.remove(source.file_name()).ok_or_else(|| {
                 SafetensorsError::MissingVerifiedSource {
                     source: source.file_name.clone(),
                 }
             })?;
-            let header = parse_file_header(source, &mut file, options.max_header_bytes)?;
+            let header = parse_file_header(source, &mut file, options.max_header_bytes, &mut checkpoint)?;
             if let Some(required_dtype) = options.required_dtype {
                 for tensor in header.census() {
                     if tensor.dtype != required_dtype {
@@ -638,6 +668,7 @@ impl SafetensorsRangeIndex {
         let tensor_to_shard =
             validate_index_mapping(closure.index.file_name(), &index_bytes, &headers)?;
         reject_oq1_tripwires(tensor_to_shard.keys())?;
+        verification_checkpoint(&mut checkpoint)?;
         Ok(Self {
             shards,
             tensor_to_shard,
@@ -701,16 +732,27 @@ impl SafetensorsRangeIndex {
     /// traversal, so a same-inode change after preparation cannot inherit the
     /// earlier source-root assertion.
     pub fn revalidate_retained_shards(&self) -> Result<(), SafetensorsError> {
+        self.revalidate_retained_shards_with_checkpoint(|| None)
+    }
+
+    /// Rehash the same retained descriptors without renewing the caller's
+    /// cancellation, deadline or checkpoint allowance.
+    pub fn revalidate_retained_shards_with_checkpoint(
+        &self,
+        mut checkpoint: impl FnMut() -> Option<DecodeCancellationKind>,
+    ) -> Result<(), SafetensorsError> {
+        verification_checkpoint(&mut checkpoint)?;
         for shard in self.shards.values() {
+            verification_checkpoint(&mut checkpoint)?;
             let mut file = shard
                 .file
                 .lock()
                 .map_err(|_| SafetensorsError::FileHandlePoisoned {
                     source: shard.source.file_name.clone(),
                 })?;
-            verify_source_file(&shard.source, &mut file)?;
+            verify_source_file(&shard.source, &mut file, &mut checkpoint)?;
         }
-        Ok(())
+        verification_checkpoint(&mut checkpoint)
     }
 
     /// Enumerate source `(name, dtype, shape, len)` facts in name order.
@@ -900,6 +942,8 @@ pub fn validate_index_mapping(
 /// Typed malformed-header, source, and bounded-range failures.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SafetensorsError {
+    /// Caller-owned cancellation stopped verification before exposing ranges.
+    Cancelled(DecodeCancellationKind),
     /// A closure file name escaped the source root or was not one component.
     UnsafeSourceName { file_name: String },
     /// A source requirement contained non-canonical SHA-256 text.
@@ -1109,7 +1153,9 @@ fn parse_file_header(
     source: &SourceDigest,
     file: &mut File,
     max_header_bytes: u64,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
 ) -> Result<CheckedShard, SafetensorsError> {
+    verification_checkpoint(checkpoint)?;
     file.seek(SeekFrom::Start(0))
         .map_err(|error| SafetensorsError::Io {
             source: source.file_name.clone(),
@@ -1123,12 +1169,9 @@ fn parse_file_header(
         });
     }
     let mut prefix = [0_u8; 8];
-    file.read_exact(&mut prefix)
-        .map_err(|error| SafetensorsError::Io {
-            source: source.file_name.clone(),
-            operation: "read header length",
-            detail: error.to_string(),
-        })?;
+    read_exact_with_checkpoint(
+        file, &mut prefix, source.file_name(), "read header length", checkpoint,
+    )?;
     let header_len = u64::from_le_bytes(prefix);
     if header_len > max_header_bytes {
         return Err(SafetensorsError::HeaderTooLarge {
@@ -1151,18 +1194,17 @@ fn parse_file_header(
             tensor: None,
         })?;
     let mut header_bytes = vec![0_u8; header_len_usize];
-    file.read_exact(&mut header_bytes)
-        .map_err(|error| SafetensorsError::Io {
-            source: source.file_name.clone(),
-            operation: "read bounded header",
-            detail: error.to_string(),
-        })?;
-    parse_header(
+    read_exact_with_checkpoint(
+        file, &mut header_bytes, source.file_name(), "read bounded header", checkpoint,
+    )?;
+    let header = parse_header(
         source.file_name(),
         source.expected_bytes,
         header_len,
         &header_bytes,
-    )
+    )?;
+    verification_checkpoint(checkpoint)?;
+    Ok(header)
 }
 
 fn parse_header(
@@ -1460,73 +1502,145 @@ fn parse_json(source: &str, text: &str) -> Result<Value, SafetensorsError> {
     })
 }
 
+fn verification_checkpoint(
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
+) -> Result<(), SafetensorsError> {
+    match checkpoint() {
+        Some(cause) => Err(SafetensorsError::Cancelled(cause)),
+        None => Ok(()),
+    }
+}
+
+/// Stable-path source preflight, separate from hostile model-root authority.
+/// Refuse special files before opening them; the opened handle is checked again
+/// by verification. Concurrent pathname or inode mutation remains unsupported.
+fn open_source_file(path: &Path, source: &SourceDigest) -> Result<File, SafetensorsError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| SafetensorsError::Io {
+        source: source.file_name.clone(), operation: "inspect source path", detail: error.to_string(),
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(SafetensorsError::Io {
+            source: source.file_name.clone(), operation: "regular-file check",
+            detail: "source must be a non-symlink regular file".to_owned(),
+        });
+    }
+    if metadata.len() != source.expected_bytes {
+        return Err(SafetensorsError::SourceLength {
+            source: source.file_name.clone(), expected: source.expected_bytes, actual: metadata.len(),
+        });
+    }
+    File::open(path).map_err(|error| SafetensorsError::Io {
+        source: source.file_name.clone(), operation: "open verified source", detail: error.to_string(),
+    })
+}
+
 fn verify_source_file(
     source: &SourceDigest,
     file: &mut File,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
 ) -> Result<HashReceipt, SafetensorsError> {
-    let length = file
-        .metadata()
-        .map_err(|error| SafetensorsError::Io {
-            source: source.file_name.clone(),
-            operation: "stat verified source",
-            detail: error.to_string(),
-        })?
-        .len();
-    if length != source.expected_bytes {
-        return Err(SafetensorsError::SourceLength {
-            source: source.file_name.clone(),
-            expected: source.expected_bytes,
-            actual: length,
+    verification_checkpoint(checkpoint)?;
+    let metadata = file.metadata().map_err(|error| SafetensorsError::Io {
+        source: source.file_name.clone(), operation: "stat verified source", detail: error.to_string(),
+    })?;
+    if !metadata.is_file() {
+        return Err(SafetensorsError::Io {
+            source: source.file_name.clone(), operation: "regular-file check",
+            detail: "opened source must be a regular file".to_owned(),
         });
     }
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| SafetensorsError::Io {
-            source: source.file_name.clone(),
-            operation: "rewind source hash",
-            detail: error.to_string(),
-        })?;
+    if metadata.len() != source.expected_bytes {
+        return Err(SafetensorsError::SourceLength {
+            source: source.file_name.clone(), expected: source.expected_bytes, actual: metadata.len(),
+        });
+    }
+    file.seek(SeekFrom::Start(0)).map_err(|error| SafetensorsError::Io {
+        source: source.file_name.clone(), operation: "rewind source hash", detail: error.to_string(),
+    })?;
+    let receipt = verify_source_reader(source, file, checkpoint)?;
+    let after = file.metadata().map_err(|error| SafetensorsError::Io {
+        source: source.file_name.clone(), operation: "stat source after hash", detail: error.to_string(),
+    })?;
+    if after.len() != source.expected_bytes {
+        return Err(SafetensorsError::SourceLength {
+            source: source.file_name.clone(), expected: source.expected_bytes, actual: after.len(),
+        });
+    }
+    file.seek(SeekFrom::Start(0)).map_err(|error| SafetensorsError::Io {
+        source: source.file_name.clone(), operation: "rewind verified source", detail: error.to_string(),
+    })?;
+    verification_checkpoint(checkpoint)?;
+    Ok(receipt)
+}
+
+/// Hash at most the declared length plus one EOF probe. A growing file cannot
+/// turn a pinned source verification into an unbounded read-to-EOF operation.
+fn verify_source_reader<R: Read>(
+    source: &SourceDigest,
+    reader: &mut R,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
+) -> Result<HashReceipt, SafetensorsError> {
     let started = Instant::now();
     let mut hasher = Sha256::new();
     let mut hashed_bytes = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = [0_u8; SOURCE_VERIFICATION_CHUNK_BYTES];
     loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| SafetensorsError::Io {
-                source: source.file_name.clone(),
-                operation: "stream source hash",
-                detail: error.to_string(),
-            })?;
-        if read == 0 {
-            break;
-        }
-        let chunk = buffer
-            .get(..read)
-            .ok_or_else(|| SafetensorsError::Arithmetic {
-                invariant: "streaming read within hash buffer",
-                tensor: None,
-            })?;
-        hasher.update(chunk);
-        hashed_bytes = checked_add(
-            hashed_bytes,
-            u64::try_from(read).map_err(|_| SafetensorsError::Arithmetic {
-                invariant: "streaming read length to u64",
-                tensor: None,
-            })?,
-            "streaming hash byte count",
-            None,
-        )?;
-    }
-    let digest = hasher.finalize();
-    let actual_sha256 = hex_digest(&digest);
-    let receipt = verify_observed_source(source, hashed_bytes, actual_sha256, started.elapsed())?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| SafetensorsError::Io {
-            source: source.file_name.clone(),
-            operation: "rewind verified source",
-            detail: error.to_string(),
+        verification_checkpoint(checkpoint)?;
+        let remaining = source.expected_bytes - hashed_bytes;
+        let requested = if remaining == 0 { 1 } else {
+            remaining.min(SOURCE_VERIFICATION_CHUNK_BYTES as u64) as usize
+        };
+        let chunk = &mut buffer[..requested];
+        let read = match reader.read(chunk) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(SafetensorsError::Io {
+                source: source.file_name.clone(), operation: "stream source hash", detail: error.to_string(),
+            }),
+        };
+        let bytes = chunk.get(..read).ok_or_else(|| SafetensorsError::Arithmetic {
+            invariant: "streaming read within hash buffer", tensor: None,
         })?;
-    Ok(receipt)
+        if read == 0 { break; }
+        hashed_bytes = checked_add(hashed_bytes, read as u64, "streaming hash byte count", None)?;
+        if hashed_bytes > source.expected_bytes {
+            return Err(SafetensorsError::SourceLength {
+                source: source.file_name.clone(), expected: source.expected_bytes, actual: hashed_bytes,
+            });
+        }
+        hasher.update(bytes);
+    }
+    verification_checkpoint(checkpoint)?;
+    verify_observed_source(source, hashed_bytes, hex_digest(&hasher.finalize()), started.elapsed())
+}
+
+fn read_exact_with_checkpoint<R: Read>(
+    reader: &mut R,
+    output: &mut [u8],
+    source: &str,
+    operation: &'static str,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
+) -> Result<(), SafetensorsError> {
+    let mut filled = 0;
+    while filled < output.len() {
+        verification_checkpoint(checkpoint)?;
+        let end = filled + (output.len() - filled).min(SOURCE_VERIFICATION_CHUNK_BYTES);
+        let read = match reader.read(&mut output[filled..end]) {
+            Ok(0) => return Err(SafetensorsError::Io {
+                source: source.to_owned(), operation, detail: "unexpected end of source".to_owned(),
+            }),
+            Ok(read) if read <= end - filled => read,
+            Ok(_) => return Err(SafetensorsError::Arithmetic {
+                invariant: "source metadata read within buffer", tensor: None,
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(SafetensorsError::Io {
+                source: source.to_owned(), operation, detail: error.to_string(),
+            }),
+        };
+        filled += read;
+    }
+    verification_checkpoint(checkpoint)
 }
 
 fn verify_observed_source(
@@ -1560,7 +1674,9 @@ fn verify_observed_source(
 fn read_verified_index(
     source: &SourceDigest,
     file: &mut File,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
 ) -> Result<Vec<u8>, SafetensorsError> {
+    verification_checkpoint(checkpoint)?;
     if source.expected_bytes > MAX_INDEX_BYTES {
         return Err(SafetensorsError::IndexTooLarge {
             index: source.file_name.clone(),
@@ -1579,12 +1695,9 @@ fn read_verified_index(
             operation: "rewind verified index",
             detail: error.to_string(),
         })?;
-    file.read_exact(&mut bytes)
-        .map_err(|error| SafetensorsError::Io {
-            source: source.file_name.clone(),
-            operation: "read verified index",
-            detail: error.to_string(),
-        })?;
+    read_exact_with_checkpoint(
+        file, &mut bytes, source.file_name(), "read verified index", checkpoint,
+    )?;
     Ok(bytes)
 }
 
@@ -1693,3 +1806,6 @@ fn checked_mul(
             tensor: tensor.map(str::to_owned),
         })
 }
+
+#[cfg(test)]
+mod tests;

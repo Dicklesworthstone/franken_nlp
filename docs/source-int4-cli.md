@@ -333,8 +333,25 @@ These are modeled allowances, not measured peak RSS or per-tensor loopholes.
 separate finite source-conversion, snapshot-save-or-reload, and execution
 budgets. Neither persistence nor loading replenishes execution.
 `--timeout-seconds` is one cooperative deadline across input, model loading,
-planning, optional persistence and execution. Blocking file reads, hashing and output writes cannot
-be preempted; the remaining deadline is checked between stages.
+planning, optional persistence and execution. Source preparation and both
+retained-shard verification passes now consult that original control between
+read/hash chunks of at most 65,536 bytes. All complete source digests remain
+mandatory, including the rechecks before and after INT4 conversion; cancellation
+does not skip a verification or return a partially loaded model. A source hash
+reads at most its declared length plus one EOF-probe byte, so appended data
+cannot turn verification into an unbounded read-to-EOF operation. Interrupted
+reads also spend the same checkpoint allowance before retrying.
+
+The plain and pinned source-manifest readers enforce a one-MiB cap during the
+read, including when a file grows after its initial metadata check. Existing
+special files and symlinks are refused before opening, and opened descriptors
+are rechecked. This is the existing stable-source workspace contract:
+concurrent pathname/inode changes and hostile shared roots remain unsupported.
+An individual filesystem call cannot be preempted; its cancellation is observed
+at the next checkpoint. These bounded loops do not promise a wall-clock latency
+on a stalled filesystem. Callers choosing a small `--load-checkpoints` allowance
+must fund the verification chunks as well as row/group conversion. No stage
+renews that allowance, deadline, or the existing physical resource ownership.
 
 Finite options and raw input/JSON/role structure are checked before loading.
 Exact token planning follows conversion or verified restoration of the actual
@@ -455,3 +472,10 @@ source-save/reload/generation comparison also requires `FNLP_INT4_TEST_SNAPSHOT`
 (an explicit new path preserved after testing). These Rust tests and full-model
 runs remain unexecuted; independent Python byte/layout checks and source hash
 checks do not constitute Rust, task-quality or performance validation.
+
+Source-startup regression definitions additionally exercise exact length/EOF
+bounds, short and interrupted reads, post-open manifest growth/shrink, all eleven
+typed cancellation causes at bounded hash and metadata checkpoints, retained
+descriptor revalidation, and real-host poll exhaustion with complete reservation
+drain before retry. Their Rust execution and full-source/model acceptance remain
+UNRUN pending the controller-selected DSR checkpoint.

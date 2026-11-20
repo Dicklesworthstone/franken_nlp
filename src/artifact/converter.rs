@@ -22,9 +22,13 @@ use crate::artifact::format::{digest_domain, source_root_sha256};
 use crate::artifact::quantize::{GenericPanelBytes, QuantizeError, encode_generic_panel};
 use crate::artifact::safetensors::{
     CensusDiff, RowPanel, SafetensorDtype, SafetensorsError, SafetensorsRangeIndex, SourceClosure,
-    SourceDigest, TensorCensusEntry, TensorExpectation, diff_census_entries,
+    SourceDigest, TensorCensusEntry, TensorExpectation, SOURCE_VERIFICATION_CHUNK_BYTES, diff_census_entries,
 };
 use crate::canonjson::{self, ParseLimits};
+use crate::native_engine::decode::DecodeCancellationKind;
+
+/// Hard input ceiling for either public source-manifest loader.
+pub const MAX_SOURCE_MANIFEST_BYTES: usize = 1024 * 1024;
 
 /// The complete source closure, including tokenizer/configuration files.
 pub const PINNED_SOURCE_CLOSURE_BYTES: u64 = 8_360_887_509;
@@ -229,48 +233,44 @@ impl ConversionSourceManifest {
     /// Read a bounded manifest without giving a hostile input an unbounded
     /// allocation path.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConverterError> {
+        Self::load_with_checkpoint(path, || None)
+    }
+
+    /// Read a regular bounded manifest under the caller's original control.
+    pub fn load_with_checkpoint(
+        path: impl AsRef<Path>,
+        mut checkpoint: impl FnMut() -> Option<DecodeCancellationKind>,
+    ) -> Result<Self, ConverterError> {
         let path = path.as_ref();
-        let metadata = fs::metadata(path).map_err(|error| ConverterError::Io {
-            path: path.to_path_buf(),
-            operation: "stat source manifest",
-            detail: error.to_string(),
+        let bytes = read_source_manifest(path, &mut checkpoint)?;
+        let input = std::str::from_utf8(&bytes).map_err(|error| ConverterError::Io {
+            path: path.to_path_buf(), operation: "read source manifest", detail: error.to_string(),
         })?;
-        if metadata.len() > 1024 * 1024 {
-            return Err(ConverterError::ManifestTooLarge {
-                path: path.to_path_buf(),
-                observed: metadata.len(),
-                cap: 1024 * 1024,
-            });
-        }
-        let input = fs::read_to_string(path).map_err(|error| ConverterError::Io {
-            path: path.to_path_buf(),
-            operation: "read source manifest",
-            detail: error.to_string(),
-        })?;
-        Self::parse(&input)
+        let manifest = Self::parse(input)?;
+        source_checkpoint(&mut checkpoint)?;
+        Ok(manifest)
     }
 
     /// Read and authenticate the only accepted pinned ten-file manifest.
     pub fn load_pinned(path: impl AsRef<Path>) -> Result<Self, ConverterError> {
+        Self::load_pinned_with_checkpoint(path, || None)
+    }
+
+    /// Authenticate the pinned manifest without unbounded reads or a renewed
+    /// checkpoint allowance. Special files are refused before data opening.
+    pub fn load_pinned_with_checkpoint(
+        path: impl AsRef<Path>,
+        mut checkpoint: impl FnMut() -> Option<DecodeCancellationKind>,
+    ) -> Result<Self, ConverterError> {
         let path = path.as_ref();
-        let metadata = fs::metadata(path).map_err(|error| ConverterError::Io {
-            path: path.to_path_buf(),
-            operation: "stat pinned source manifest",
-            detail: error.to_string(),
-        })?;
-        if metadata.len() > 1024 * 1024 {
-            return Err(ConverterError::ManifestTooLarge {
-                path: path.to_path_buf(),
-                observed: metadata.len(),
-                cap: 1024 * 1024,
-            });
+        let bytes = read_source_manifest(path, &mut checkpoint)?;
+        let mut hash = Sha256::new();
+        for chunk in bytes.chunks(SOURCE_VERIFICATION_CHUNK_BYTES) {
+            source_checkpoint(&mut checkpoint)?;
+            hash.update(chunk);
         }
-        let bytes = fs::read(path).map_err(|error| ConverterError::Io {
-            path: path.to_path_buf(),
-            operation: "read pinned source manifest",
-            detail: error.to_string(),
-        })?;
-        let actual = sha256_hex(&bytes);
+        source_checkpoint(&mut checkpoint)?;
+        let actual = hex_lower(&hash.finalize());
         if actual != PINNED_SOURCE_MANIFEST_SHA256 {
             return Err(ConverterError::PinnedManifestDigest {
                 path: path.to_path_buf(),
@@ -285,6 +285,7 @@ impl ConversionSourceManifest {
             })?;
         let manifest = Self::parse(input)?;
         manifest.validate_pinned()?;
+        source_checkpoint(&mut checkpoint)?;
         Ok(manifest)
     }
 
@@ -429,14 +430,28 @@ pub fn verify_source_closure(
     manifest: ConversionSourceManifest,
     strict_source_dir: bool,
 ) -> Result<VerifiedSourceClosure, ConverterError> {
+    verify_source_closure_with_checkpoint(source_dir, manifest, strict_source_dir, || None)
+}
+
+/// Verify the complete closure while polling between at most 64-KiB source
+/// chunks. No digest check is skipped, including on already prepared sources.
+pub fn verify_source_closure_with_checkpoint(
+    source_dir: impl AsRef<Path>,
+    manifest: ConversionSourceManifest,
+    strict_source_dir: bool,
+    mut checkpoint: impl FnMut() -> Option<DecodeCancellationKind>,
+) -> Result<VerifiedSourceClosure, ConverterError> {
+    source_checkpoint(&mut checkpoint)?;
     manifest.validate()?;
     let source_dir = source_dir.as_ref();
-    verify_source_directory(source_dir, &manifest, strict_source_dir)?;
+    verify_source_directory(source_dir, &manifest, strict_source_dir, &mut checkpoint)?;
     let mut files = Vec::with_capacity(manifest.files.len());
     for expected in &manifest.files {
-        files.push(verify_source_member(source_dir, expected)?);
+        source_checkpoint(&mut checkpoint)?;
+        files.push(verify_source_member(source_dir, expected, &mut checkpoint)?);
     }
     let source_root_sha256 = source_root_digest(&manifest)?;
+    source_checkpoint(&mut checkpoint)?;
     Ok(VerifiedSourceClosure {
         manifest,
         files,
@@ -448,7 +463,9 @@ fn verify_source_directory(
     source_dir: &Path,
     manifest: &ConversionSourceManifest,
     strict_source_dir: bool,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
 ) -> Result<(), ConverterError> {
+    source_checkpoint(checkpoint)?;
     let expected: BTreeSet<_> = manifest
         .files
         .iter()
@@ -460,6 +477,7 @@ fn verify_source_directory(
         detail: error.to_string(),
     })?;
     for entry in entries {
+        source_checkpoint(checkpoint)?;
         let entry = entry.map_err(|error| ConverterError::Io {
             path: source_dir.to_path_buf(),
             operation: "read source directory entry",
@@ -492,7 +510,9 @@ fn verify_source_directory(
 fn verify_source_member(
     source_dir: &Path,
     expected: &SourceFileSpec,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
 ) -> Result<VerifiedSourceFile, ConverterError> {
+    source_checkpoint(checkpoint)?;
     let path = source_dir.join(&expected.name);
     let link_metadata =
         fs::symlink_metadata(&path).map_err(|error| ConverterError::SourceMissing {
@@ -530,7 +550,17 @@ fn verify_source_member(
             next_command: "restore the pinned source closure and rerun fnlp convert".to_owned(),
         });
     }
-    let actual = stream_sha256(&mut file, &path)?;
+    let actual = stream_sha256(&mut file, &path, expected.bytes, checkpoint)?;
+    let after = file.metadata().map_err(|error| ConverterError::Io {
+        path: path.clone(), operation: "inspect source after hash", detail: error.to_string(),
+    })?;
+    if after.len() != expected.bytes {
+        return Err(ConverterError::SourceLength {
+            path, expected: expected.bytes, actual: after.len(),
+            next_command: "restore the pinned source closure and rerun fnlp convert".to_owned(),
+        });
+    }
+    source_checkpoint(checkpoint)?;
     if actual != expected.sha256 {
         return Err(ConverterError::SourceDigest {
             path,
@@ -555,11 +585,13 @@ fn verify_source_member(
 fn snapshot_materialized_sources(
     source_dir: &Path,
     source: &VerifiedSourceClosure,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
 ) -> Result<VerifiedMaterializedSources, ConverterError> {
-    let model_config = read_materialized_source_member(source_dir, source, "config.json")?;
-    let tokenizer_model = read_materialized_source_member(source_dir, source, "tokenizer.model")?;
+    source_checkpoint(checkpoint)?;
+    let model_config = read_materialized_source_member(source_dir, source, "config.json", checkpoint)?;
+    let tokenizer_model = read_materialized_source_member(source_dir, source, "tokenizer.model", checkpoint)?;
     let tokenizer_config =
-        read_materialized_source_member(source_dir, source, "tokenizer_config.json")?;
+        read_materialized_source_member(source_dir, source, "tokenizer_config.json", checkpoint)?;
     let parsed: Value = serde_json::from_slice(&tokenizer_config).map_err(|error| {
         ConverterError::SourceMaterialization {
             name: "tokenizer_config.json".to_owned(),
@@ -575,6 +607,7 @@ fn snapshot_materialized_sources(
         })?
         .as_bytes()
         .to_vec();
+    source_checkpoint(checkpoint)?;
     Ok(VerifiedMaterializedSources {
         model_config,
         tokenizer_model,
@@ -587,7 +620,9 @@ fn read_materialized_source_member(
     source_dir: &Path,
     source: &VerifiedSourceClosure,
     name: &str,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
 ) -> Result<Vec<u8>, ConverterError> {
+    source_checkpoint(checkpoint)?;
     let expected = source
         .files
         .iter()
@@ -648,32 +683,31 @@ fn read_materialized_source_member(
     let mut hasher = Sha256::new();
     let mut read_len = 0_usize;
     while read_len != expected_len {
-        let read = file
-            .read(&mut bytes[read_len..])
-            .map_err(|error| ConverterError::Io {
-                path: path.clone(),
-                operation: "read bounded materialized source",
-                detail: error.to_string(),
-            })?;
+        source_checkpoint(checkpoint)?;
+        let end = read_len + (expected_len - read_len).min(SOURCE_VERIFICATION_CHUNK_BYTES);
+        let read = match file.read(&mut bytes[read_len..end]) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(ConverterError::Io {
+                path: path.clone(), operation: "read bounded materialized source", detail: error.to_string(),
+            }),
+        };
         if read == 0 {
-            let actual = u64::try_from(read_len).map_err(|_| ConverterError::Arithmetic {
-                invariant: "materialized source read bytes to u64",
-            })?;
             return Err(ConverterError::SourceLength {
-                path,
-                expected: expected.bytes,
-                actual,
+                path, expected: expected.bytes, actual: read_len as u64,
                 next_command: "restore the pinned source closure and rerun fnlp convert".to_owned(),
             });
         }
-        let next_len = read_len
-            .checked_add(read)
-            .ok_or(ConverterError::Arithmetic {
-                invariant: "materialized source bounded read length",
-            })?;
+        if read > end - read_len {
+            return Err(ConverterError::Arithmetic {
+                invariant: "materialized source read within buffer",
+            });
+        }
+        let next_len = read_len + read;
         hasher.update(&bytes[read_len..next_len]);
         read_len = next_len;
     }
+    source_checkpoint(checkpoint)?;
     let final_metadata = file.metadata().map_err(|error| ConverterError::Io {
         path: path.clone(),
         operation: "inspect materialized source after bounded read",
@@ -1091,10 +1125,23 @@ pub fn prepare_nanbeige42_input(
     strict_source_dir: bool,
     panel_cap: u64,
 ) -> Result<PreparedConversionInput, ConverterError> {
+    prepare_nanbeige42_input_with_checkpoint(source_dir, manifest, strict_source_dir, panel_cap, || None)
+}
+
+/// Prepare the same sealed source/census plan under one caller-owned control.
+/// Both complete source hash passes remain mandatory and poll between chunks.
+pub fn prepare_nanbeige42_input_with_checkpoint(
+    source_dir: impl AsRef<Path>,
+    manifest: ConversionSourceManifest,
+    strict_source_dir: bool,
+    panel_cap: u64,
+    mut checkpoint: impl FnMut() -> Option<DecodeCancellationKind>,
+) -> Result<PreparedConversionInput, ConverterError> {
+    source_checkpoint(&mut checkpoint)?;
     let source_dir = source_dir.as_ref();
-    let source = verify_source_closure(source_dir, manifest, strict_source_dir)?;
-    let materialized_sources = snapshot_materialized_sources(source_dir, &source)?;
-    let range_index = SafetensorsRangeIndex::open_pinned_nanbeige42(source_dir)
+    let source = verify_source_closure_with_checkpoint(source_dir, manifest, strict_source_dir, &mut checkpoint)?;
+    let materialized_sources = snapshot_materialized_sources(source_dir, &source, &mut checkpoint)?;
+    let range_index = SafetensorsRangeIndex::open_pinned_nanbeige42_with_checkpoint(source_dir, &mut checkpoint)
         .map_err(ConverterError::Safetensors)?;
     let census = range_index.census();
     validate_nanbeige42_census(&census)?;
@@ -1108,6 +1155,7 @@ pub fn prepare_nanbeige42_input(
         .collect::<Result<Vec<_>, _>>()?;
     let logical_payload_bytes = validate_pinned_logical_payload_bytes(&census)?;
     let census_sha256 = census_digest(&census)?;
+    source_checkpoint(&mut checkpoint)?;
     Ok(PreparedConversionInput {
         source,
         census,
@@ -1133,13 +1181,24 @@ pub fn prepare_convert_request(
     request: &ConvertRequest,
     panel_cap: u64,
 ) -> Result<PreparedConversionInput, ConverterError> {
+    prepare_convert_request_with_checkpoint(request, panel_cap, || None)
+}
+
+/// Controlled counterpart retaining the same argument-before-IO admission.
+pub fn prepare_convert_request_with_checkpoint(
+    request: &ConvertRequest,
+    panel_cap: u64,
+    mut checkpoint: impl FnMut() -> Option<DecodeCancellationKind>,
+) -> Result<PreparedConversionInput, ConverterError> {
     request.validate()?;
-    let manifest = ConversionSourceManifest::load_pinned(&request.source_manifest)?;
-    prepare_nanbeige42_input(
+    source_checkpoint(&mut checkpoint)?;
+    let manifest = ConversionSourceManifest::load_pinned_with_checkpoint(&request.source_manifest, &mut checkpoint)?;
+    prepare_nanbeige42_input_with_checkpoint(
         &request.source_dir,
         manifest,
         request.strict_source_dir,
         panel_cap,
+        &mut checkpoint,
     )
 }
 
@@ -1191,8 +1250,15 @@ impl PreparedConversionInput {
     /// This catches same-inode mutation that occurred after preparation while
     /// preserving the sealed range-index session for all reads.
     pub(crate) fn revalidate_retained_shards(&self) -> Result<(), ConverterError> {
+        self.revalidate_retained_shards_with_checkpoint(|| None)
+    }
+
+    pub(crate) fn revalidate_retained_shards_with_checkpoint(
+        &self,
+        checkpoint: impl FnMut() -> Option<DecodeCancellationKind>,
+    ) -> Result<(), ConverterError> {
         self.range_index
-            .revalidate_retained_shards()
+            .revalidate_retained_shards_with_checkpoint(checkpoint)
             .map_err(ConverterError::Safetensors)
     }
 
@@ -2228,6 +2294,8 @@ impl fmt::Display for ConversionProgress {
 /// and expected values plus a next command where an operator can act.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConverterError {
+    /// Caller-owned cancellation stopped source preparation.
+    Cancelled(DecodeCancellationKind),
     /// `fnlp convert` was invoked outside its one-recipe/Generic contract.
     InvalidConvertArgument {
         argument: &'static str,
@@ -2382,9 +2450,20 @@ pub enum ConverterError {
     ReceiptParse { detail: String },
 }
 
+impl ConverterError {
+    /// Preserve the original cause across closure and retained-shard stages.
+    pub fn cancellation_kind(&self) -> Option<DecodeCancellationKind> {
+        match self {
+            Self::Cancelled(cause) | Self::Safetensors(SafetensorsError::Cancelled(cause)) => Some(*cause),
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for ConverterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled(cause) => write!(formatter, "source preparation cancelled: {cause:?}"),
             Self::InvalidConvertArgument {
                 argument,
                 expected,
@@ -2743,20 +2822,137 @@ fn is_lower_git_commit(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn stream_sha256(file: &mut File, path: &Path) -> Result<String, ConverterError> {
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+fn source_checkpoint(
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
+) -> Result<(), ConverterError> {
+    match checkpoint() {
+        Some(cause) => Err(ConverterError::Cancelled(cause)),
+        None => Ok(()),
+    }
+}
+
+/// Preflight and recheck the held regular file, then read no more than the
+/// manifest cap plus one byte. This retains the stable-source workspace
+/// contract; it does not grant hostile-root or activation authority.
+fn read_source_manifest(
+    path: &Path,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
+) -> Result<Vec<u8>, ConverterError> {
+    source_checkpoint(checkpoint)?;
+    let metadata = fs::symlink_metadata(path).map_err(|error| ConverterError::Io {
+        path: path.to_path_buf(), operation: "stat source manifest", detail: error.to_string(),
+    })?;
+    check_source_manifest_metadata(path, &metadata)?;
+    let mut file = File::open(path).map_err(|error| ConverterError::Io {
+        path: path.to_path_buf(), operation: "open source manifest", detail: error.to_string(),
+    })?;
+    source_checkpoint(checkpoint)?;
+    let opened = file.metadata().map_err(|error| ConverterError::Io {
+        path: path.to_path_buf(), operation: "inspect source manifest", detail: error.to_string(),
+    })?;
+    check_source_manifest_metadata(path, &opened)?;
+    let bytes = read_source_manifest_bytes(&mut file, path, checkpoint)?;
+    let after = file.metadata().map_err(|error| ConverterError::Io {
+        path: path.to_path_buf(), operation: "inspect source manifest after read", detail: error.to_string(),
+    })?;
+    check_source_manifest_metadata(path, &after)?;
+    if opened.len() != bytes.len() as u64 || after.len() != opened.len() {
+        return Err(ConverterError::Io {
+            path: path.to_path_buf(), operation: "source manifest length check",
+            detail: "source manifest changed length during bounded read".to_owned(),
+        });
+    }
+    source_checkpoint(checkpoint)?;
+    Ok(bytes)
+}
+
+fn check_source_manifest_metadata(path: &Path, metadata: &fs::Metadata) -> Result<(), ConverterError> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ConverterError::SourceNotRegular {
+            path: path.to_path_buf(), expected: "source manifest".to_owned(),
+        });
+    }
+    if metadata.len() > MAX_SOURCE_MANIFEST_BYTES as u64 {
+        return Err(ConverterError::ManifestTooLarge {
+            path: path.to_path_buf(), observed: metadata.len(), cap: MAX_SOURCE_MANIFEST_BYTES as u64,
+        });
+    }
+    Ok(())
+}
+
+fn read_source_manifest_bytes<R: Read>(
+    reader: &mut R,
+    path: &Path,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
+) -> Result<Vec<u8>, ConverterError> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; SOURCE_VERIFICATION_CHUNK_BYTES];
     loop {
-        let read = file.read(&mut buffer).map_err(|error| ConverterError::Io {
-            path: path.to_path_buf(),
-            operation: "stream-hash source member",
-            detail: error.to_string(),
+        source_checkpoint(checkpoint)?;
+        let requested = (MAX_SOURCE_MANIFEST_BYTES + 1 - bytes.len()).min(buffer.len());
+        let read = match reader.read(&mut buffer[..requested]) {
+            Ok(read) if read <= requested => read,
+            Ok(_) => return Err(ConverterError::Arithmetic { invariant: "manifest read within buffer" }),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(ConverterError::Io {
+                path: path.to_path_buf(), operation: "read bounded source manifest", detail: error.to_string(),
+            }),
+        };
+        if read == 0 { break; }
+        let observed = bytes.len() + read;
+        if observed > MAX_SOURCE_MANIFEST_BYTES {
+            return Err(ConverterError::ManifestTooLarge {
+                path: path.to_path_buf(), observed: observed as u64, cap: MAX_SOURCE_MANIFEST_BYTES as u64,
+            });
+        }
+        bytes.try_reserve(read).map_err(|error| ConverterError::Io {
+            path: path.to_path_buf(), operation: "reserve bounded source manifest", detail: error.to_string(),
         })?;
-        if read == 0 {
-            break;
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    source_checkpoint(checkpoint)?;
+    Ok(bytes)
+}
+
+fn stream_sha256<R: Read>(
+    reader: &mut R,
+    path: &Path,
+    expected_bytes: u64,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
+) -> Result<String, ConverterError> {
+    let mut hasher = Sha256::new();
+    let mut hashed = 0_u64;
+    let mut buffer = [0_u8; SOURCE_VERIFICATION_CHUNK_BYTES];
+    loop {
+        source_checkpoint(checkpoint)?;
+        let remaining = expected_bytes - hashed;
+        let requested = if remaining == 0 { 1 } else { remaining.min(buffer.len() as u64) as usize };
+        let read = match reader.read(&mut buffer[..requested]) {
+            Ok(read) if read <= requested => read,
+            Ok(_) => return Err(ConverterError::Arithmetic { invariant: "source hash read within buffer" }),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(ConverterError::Io {
+                path: path.to_path_buf(), operation: "stream-hash source member", detail: error.to_string(),
+            }),
+        };
+        if read == 0 { break; }
+        hashed = hashed.checked_add(read as u64)
+            .ok_or(ConverterError::Arithmetic { invariant: "source hash byte count" })?;
+        if hashed > expected_bytes {
+            return Err(ConverterError::SourceLength {
+                path: path.to_path_buf(), expected: expected_bytes, actual: hashed,
+                next_command: "restore the pinned source closure and rerun fnlp convert".to_owned(),
+            });
         }
         hasher.update(&buffer[..read]);
     }
+    if hashed != expected_bytes {
+        return Err(ConverterError::SourceLength {
+            path: path.to_path_buf(), expected: expected_bytes, actual: hashed,
+            next_command: "restore the pinned source closure and rerun fnlp convert".to_owned(),
+        });
+    }
+    source_checkpoint(checkpoint)?;
     Ok(hex_lower(&hasher.finalize()))
 }
 
@@ -3179,3 +3375,6 @@ mod tests {
         assert!(line.contains("running-peak-RSS=128"));
     }
 }
+
+#[cfg(test)]
+mod source_tests;

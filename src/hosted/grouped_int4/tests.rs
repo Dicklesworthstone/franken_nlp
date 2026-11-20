@@ -68,3 +68,21 @@ fn all_supported_partitions_use_the_same_aggregate_memory_formula() {
             need.peak_payload_bytes().unwrap() + limits.source_preparation_bytes + limits.allocator_reserve_bytes);
     }
 }
+
+#[test]
+fn source_verification_stops_retain_all_causes_at_existing_host_failure_boundaries() {
+    use crate::{artifact::safetensors::SafetensorsError, native_engine::decode::DecodeCancellationKind::*};
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        for error in [ConverterError::Cancelled(cause),
+            ConverterError::Safetensors(SafetensorsError::Cancelled(cause))] {
+            assert!(matches!(source_error(error),
+                HostedError::Int4(Int4HostError::Model(Int4ModelError::Cancelled(observed))) if observed == cause));
+        }
+    }
+    let error = source_error(ConverterError::Io {
+        path: "PRIVATE_SOURCE_PATH".into(), operation: "fixture", detail: "PRIVATE_DETAIL".to_owned(),
+    });
+    assert!(matches!(error, HostedError::Int4(Int4HostError::Source(_))));
+    assert!(!format!("{error:?} {error}").contains("PRIVATE_"));
+}
