@@ -112,6 +112,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         integer_kernel: common.kernel.kind().id(), snapshot,
         compute_schedule: compute::Schedule::for_threads(common.compute.threads),
         prefill_schedule: common.prefill.map(PrefillSchedule::new).transpose()?,
+        prefill_reuse: batch.sampled.prefill_reuse_execution(),
         input_encoding: input_encoding::reported_policy(&encoding),
     };
     // Only this framing sink owns stdout. The host's terminal event is final;
@@ -125,7 +126,13 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         transport: limits.transport, preparation_reserve_bytes: limits.preparation_reserve_bytes,
         io_reserve_bytes: limits.io_bytes,
     };
-    let summary = if common.compute.threads > 1 {
+    let summary = if batch.sampled.reuse_prefill && common.compute.threads > 1 {
+        engine.batch_int4_sampled_sentiment_reusing_prefill_with_threads(&model,
+            planner, corpus, common.kernel, common.compute.threads, reader, writer, cancellation)
+    } else if batch.sampled.reuse_prefill {
+        engine.batch_int4_sampled_sentiment_reusing_prefill(&model, planner, corpus,
+            common.kernel, common.prefill, reader, writer, cancellation)
+    } else if common.compute.threads > 1 {
         engine.batch_int4_sampled_sentiment_with_threads(&model, planner, corpus, common.kernel,
             common.compute.threads, reader, writer, cancellation)
     } else {
@@ -171,6 +178,8 @@ struct Provenance<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     prefill_schedule: Option<PrefillSchedule>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    prefill_reuse: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     input_encoding: Option<&'a crate::tokenizer::untrusted::UntrustedEncoding>,
 }
 
@@ -207,6 +216,7 @@ mod tests {
             candidate_format: "candidate", quant_recipe: "recipe", group_width: 128,
             integer_kernel: "s_scalar_i32", snapshot: None,
             compute_schedule: compute::Schedule::for_threads(4), prefill_schedule: None,
+            prefill_reuse: None,
             input_encoding: input_encoding::reported_policy(&encoding) };
         let mut output = Vec::new();
         {
@@ -226,6 +236,7 @@ mod tests {
             assert_eq!(value["compute_schedule"]["declared_compute_threads"], 4);
             assert!(value.get("input_encoding").is_none());
             assert!(value.get("prefill_schedule").is_none());
+            assert!(value.get("prefill_reuse").is_none());
             assert!(value.get("effective_seed").is_none());
         }
     }
@@ -234,7 +245,7 @@ mod tests {
     fn physical_prefill_provenance_is_explicit_on_every_event_and_absent_on_default() {
         use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
         for rows in [None, Some(1), Some(4), Some(64)] {
-            for compact in [false, true] {
+            for (compact, reuse) in [(false, false), (true, false), (false, true), (true, true)] {
                 let encoding = if compact { UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
                     max_input_bytes: 32, max_output_tokens: 64, max_pair_checks: 1024, max_pair_bytes: 16384,
                 }) } else { UntrustedEncoding::ByteFallback };
@@ -250,6 +261,8 @@ mod tests {
                     integer_kernel: "s_scalar_i32", snapshot: None,
                     compute_schedule: compute::Schedule::for_threads(1),
                     prefill_schedule: prefill.map(PrefillSchedule::new).transpose().unwrap(),
+                    prefill_reuse: reuse.then_some(
+                        crate::tasks::sentiment::sampled::SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION),
                     input_encoding: input_encoding::reported_policy(&encoding) };
                 let mut output = Vec::new();
                 {
@@ -266,6 +279,10 @@ mod tests {
                     assert_eq!(value["evidence"], "non_authoritative");
                     assert!(value.get("compute_schedule").is_none());
                     assert_eq!(value.get("input_encoding").is_some(), compact);
+                    if reuse {
+                        assert_eq!(value["prefill_reuse"],
+                            crate::tasks::sentiment::sampled::SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION);
+                    } else { assert!(value.get("prefill_reuse").is_none()); }
                     if let Some(prefill) = prefill {
                         assert_eq!(value["prefill_schedule"]["execution"], INT4_LAYER_MAJOR_PREFILL_VERSION);
                         assert_eq!(value["prefill_schedule"]["max_batch_rows"], prefill.max_batch_rows);

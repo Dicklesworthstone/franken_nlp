@@ -44,8 +44,9 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
         .mut_arg("input", |arg| arg.help("NDJSON file, or '-' for stdin; one bounded record at a time"))
         .mut_arg("max_input_bytes", |arg| arg.help("Maximum decoded UTF-8 document bytes per record"))
         .mut_arg("max_result_bytes", |arg| arg.help("Maximum complete sample bundle per record; candidate framing is additional"))
-        .mut_arg("reuse_prefill", |arg| arg.hide(true))
-        .mut_arg("prefill_rows", |arg| arg.hide(false).help("Layer-major prompt morsels per fresh sample, 1..=64 rows; one admitted workspace for the stream, incompatible with multiple compute threads"))
+        .mut_arg("reuse_prefill", |arg| arg.hide(false).help("Reuse only the current document/axis prompt across its independent samples; actual work is reported, cold admission and whole-run ceilings are unchanged"))
+        .mut_arg("prefill_rows", |arg| arg.hide(false).help("Layer-major prompt morsels, 1..=64 rows; with --reuse-prefill only the first sample per axis prefills; one admitted workspace for the stream, incompatible with multiple compute threads"))
+        .after_help("With --reuse-prefill, only the current record and axis retain private prompt KV. Every later sample replays the final prompt token with its original independent sample address. No prefix crosses an axis, document or flush boundary. Actual work is reported in each result; conservative cold native/mask debits and whole-run limits never renew or refund. Every event names the selected reuse execution in prefill_reuse.")
         .mut_arg("max_checkpoints", |arg| arg.help("Nonrenewable cooperative checkpoints for the ENTIRE stream"))
         .mut_arg("max_forward_positions", |arg| arg.help("Whole-stream forward ceiling across all records, axes and samples"))
         .mut_arg("max_projected_logits", |arg| arg.help("Whole-stream full-vocabulary projection ceiling"))
@@ -71,7 +72,6 @@ impl BatchArgs {
     }
 
     fn validate(self, args: &Int4Args) -> Result<BatchLimits, CandidateError> {
-        if self.sampled.reuse_prefill { return Err(CandidateError::Arguments); }
         let stream = self.stream;
         if !(1..=MAX_REQUESTS).contains(&stream.max_requests)
             || stream.max_line_bytes < args.max_input_bytes

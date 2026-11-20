@@ -25,7 +25,7 @@ const UNSUPPORTED: &[&str] = &[
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SampledArgs {
     /// Prefill each axis once; retain its private causal prefix across samples.
-    /// One-off mode only. Receipts report actual work; cold admission is unchanged.
+    /// Private to one document and axis. Cold work admission is unchanged.
     #[arg(long)]
     reuse_prefill: bool,
     /// Independent addressed generations per axis. Every sample must complete.
@@ -75,6 +75,11 @@ pub(super) fn definition() -> clap::Command {
 }
 
 impl SampledArgs {
+    fn prefill_reuse_execution(self) -> Option<&'static str> {
+        self.reuse_prefill.then_some(
+            crate::tasks::sentiment::sampled::SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION)
+    }
+
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         if UNSUPPORTED.iter().any(|id| matches.value_source(id)
             == Some(clap::parser::ValueSource::CommandLine)) {

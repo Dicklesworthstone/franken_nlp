@@ -39,13 +39,42 @@ impl Write for NoWrite {
 }
 
 #[test]
-fn one_off_prefill_reuse_is_refused_before_resident_population_io() {
-    for route in 0..3 {
-        let (args, batch) = command_for_route(&["--reuse-prefill"], route);
+fn resident_prefill_reuse_preserves_cold_work_memory_and_sampler_admission() {
+    assert!(!command(&[]).1.sampled.reuse_prefill);
+    for route in 0..3 { for flags in [
+        &["--reuse-prefill"][..],
+        &["--reuse-prefill", "--compute-threads", "4"][..],
+        &["--reuse-prefill", "--prefill-rows", "4"][..],
+        &["--reuse-prefill", "--input-encoding", "safe-bpe-v1", "--prefill-rows", "1"][..],
+    ] {
+        let (args, batch) = command_for_route(flags, route);
+        let (cold_args, cold) = command_for_route(&flags[1..], route);
+        let limits = batch.validate(&args).unwrap();
+        let cold_limits = cold.validate(&cold_args).unwrap();
         assert!(batch.sampled.reuse_prefill);
-        assert!(matches!(batch.validate(&args), Err(CandidateError::Arguments)));
-        assert_eq!(batch.execute_owned(args, NoRead, NoWrite).unwrap_err().exit, ErrorCode::Usage);
-    }
+        assert_eq!(batch.sampled.options(&args).unwrap(), cold.sampled.options(&cold_args).unwrap());
+        assert_eq!(limits.native.max_item_work, cold_limits.native.max_item_work);
+        assert_eq!(limits.native.max_model_work, cold_limits.native.max_model_work);
+        assert_eq!(limits.native.max_sampler_bytes, cold_limits.native.max_sampler_bytes);
+        assert_eq!(limits.native.masks.max_visits_per_item, cold_limits.native.masks.max_visits_per_item);
+        assert_eq!(limits.native.masks.max_visits_per_run, cold_limits.native.masks.max_visits_per_run);
+        assert_eq!(limits.native.masks.per_mask.max_trie_node_visits,
+            cold_limits.native.masks.per_mask.max_trie_node_visits);
+        assert_eq!(limits.native.masks.per_mask.checkpoint_interval_nodes,
+            cold_limits.native.masks.per_mask.checkpoint_interval_nodes);
+        assert_eq!(limits.transport.max_work, cold_limits.transport.max_work);
+        assert_eq!(limits.output_bytes, cold_limits.output_bytes);
+        assert_eq!(limits.common.minimum_memory_bytes, cold_limits.common.minimum_memory_bytes);
+        assert_eq!(limits.common.native, cold_limits.common.native);
+        assert_eq!(limits.common.compute.threads, cold_limits.common.compute.threads);
+        assert_eq!(limits.common.prefill.map(|p| (p.max_batch_rows, p.max_extra_scratch_bytes)),
+            cold_limits.common.prefill.map(|p| (p.max_batch_rows, p.max_extra_scratch_bytes)));
+        let mut short = args;
+        short.memory_mib = (limits.common.minimum_memory_bytes - 1) / MIB;
+        assert_eq!(batch.execute_owned(short, NoRead, NoWrite).unwrap_err().exit, ErrorCode::Usage);
+    } }
+    let (args, batch) = command(&["--reuse-prefill", "--compute-threads", "2", "--prefill-rows", "4"]);
+    assert_eq!(batch.execute_owned(args, NoRead, NoWrite).unwrap_err().exit, ErrorCode::Usage);
 }
 
 #[test]

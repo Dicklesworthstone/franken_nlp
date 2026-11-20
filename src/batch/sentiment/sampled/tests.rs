@@ -54,7 +54,7 @@ impl DecodeStepControl for StopAt {
     }
 }
 #[derive(Clone, Copy)]
-enum Mode { Success, NoResult, Dirty, Cancel, WrongWork, Panic }
+enum Mode { Success, NoResult, Dirty, Cancel, WrongWork, WrongSchedule, Panic }
 struct FixturePlan { identity: ExecutionIdentity, mode: Mode, required_context: usize }
 fn plan(mode: Mode) -> FixturePlan { FixturePlan { identity: identity(), mode, required_context: 8 } }
 impl Plan for FixturePlan {
@@ -98,9 +98,11 @@ impl SampledSentimentBatchAdmission for Admission {
 }
 struct Engine {
     probe: Rc<Probe>, clean: bool, capacity: usize, masks: u64, prefill: Option<Int4PrefillLimits>,
+    reuse_prefill: bool, actual_work: Int4Work,
 }
 impl Driver<FixturePlan> for Engine {
     fn prefill(&self) -> Option<Int4PrefillLimits> { self.prefill }
+    fn reuse_prefill(&self) -> bool { self.reuse_prefill }
     fn clean(&self) -> bool { self.clean }
     fn capacity(&self) -> usize { self.capacity }
     fn group_width(&self) -> usize { 32 }
@@ -124,8 +126,11 @@ impl Driver<FixturePlan> for Engine {
         }
         let sample = SampledSentimentSample { sample_index: 0, score: 0,
             justification: "Synthetic lifecycle fixture.".to_owned(), generated_tokens: 2,
-            model_work: work(1), mask_node_visit_charge: 3 };
-        let mut output = SampledSentimentRun { schema_version: 1, execution: SAMPLED_SENTIMENT_EXECUTION.to_owned(),
+            model_work: self.actual_work, mask_node_visit_charge: 3 };
+        let reuse_prefill = self.reuse_prefill ^ matches!(plan.mode, Mode::WrongSchedule);
+        let execution = if reuse_prefill { SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION }
+            else { SAMPLED_SENTIMENT_EXECUTION };
+        let mut output = SampledSentimentRun { schema_version: 1, execution: execution.to_owned(),
             task_spec: "sentiment-v1".to_owned(), prompt_template_sha256: identity.template_digest,
             numerics_profile: STRICT_INT4_PROFILE.to_owned(), group_width: 32,
             aggregation: SAMPLED_SENTIMENT_AGGREGATION_VERSION.to_owned(),
@@ -135,13 +140,14 @@ impl Driver<FixturePlan> for Engine {
             dimensions: vec![SampledSentimentDimension { axis: SentimentAxis::Valence,
                 low_anchor: "negative".to_owned(), high_anchor: "positive".to_owned(),
                 mean: 0.0, median: 0.0, minimum: 0, maximum: 0, population_stddev: 0.0, samples: vec![sample] }],
-            model_work: work(1), generated_tokens: 2, mask_node_visit_charge: 3 };
+            model_work: self.actual_work, generated_tokens: 2, mask_node_visit_charge: 3 };
         if matches!(plan.mode, Mode::WrongWork) { output.model_work.projections.multiply_accumulates += 1; }
         Ok(output)
     }
 }
 fn host(probe: &Rc<Probe>, total: u64) -> (Engine, Admission, RunState) {
-    (Engine { probe: Rc::clone(probe), clean: true, capacity: 32, masks: 5, prefill: None },
+    (Engine { probe: Rc::clone(probe), clean: true, capacity: 32, masks: 5, prefill: None,
+        reuse_prefill: false, actual_work: work(1) },
         Admission { probe: Rc::clone(probe), refuse: false, wrong_identity: false, cancel_as_rejection: false },
         RunState::new(limits(total)))
 }
@@ -165,7 +171,7 @@ fn record_arguments_allow_axes_and_tighter_budgets_with_complete_defaults() {
     assert_eq!(selected.budget, Some(task()));
     for bad in [r#"{"seed":"secret"}"#, r#"{"samples":1}"#, r#"{"budget":{}}"#,
         r#"{"axes":null}"#, r#"{"axes":["unknown"]}"#, r#"{"document":"replace"}"#,
-        r#"{"id":"replace-semantic-address"}"#] {
+        r#"{"id":"replace-semantic-address"}"#, r#"{"reuse_prefill":true}"#] {
         assert!(serde_json::from_str::<SampledSentimentBatchArgs>(bad).is_err());
     }
 }
@@ -498,6 +504,101 @@ fn admitted_prefill_widths_preserve_stream_identity_and_nonrenewable_work() {
         assert_eq!(results.len(), 2);
         if let Some(expected) = &expected_results { assert_eq!(&results, expected); }
         else { expected_results = Some(results); }
+    }
+}
+
+#[test]
+fn reused_schedules_report_actual_work_without_refunding_cold_admission_across_flushes() {
+    let prefill = |rows| Int4PrefillLimits { max_batch_rows: rows,
+        max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap() };
+    // This lifecycle driver supplies a bounded observed-work receipt. The
+    // task/native differential fixtures own the causal-replay arithmetic and
+    // exact seeded-token proof; no model execution is claimed by this fixture.
+    let actual = Int4Work { forward_positions: 30, projected_logits: 50, attention_pairs: 40,
+        projections: ProjectionWork { dot_products: 50, multiply_accumulates: 60 } };
+    for schedule in [None, Some(prefill(1)), Some(prefill(4)), Some(prefill(64))] {
+        let probe = Rc::new(Probe::default()); let mut processor = Harness::new(&probe, 2);
+        processor.driver.prefill = schedule;
+        processor.driver.reuse_prefill = true;
+        processor.driver.actual_work = actual;
+        let input = b"{\"id\":\"one\",\"text\":\"ok\"}\n{\"flush\":true}\n{\"id\":\"two\",\"text\":\"ok\"}\n{\"id\":\"three\",\"text\":\"unfunded\"}\n";
+        let mut reader = Cursor::new(input);
+        let mut sink = Sink { bytes: Vec::new(), probe: Rc::clone(&probe),
+            delivering_result: false, fail_result: false };
+        let summary = run_ndjson(&mut reader, &mut sink, &mut processor, transport(), &mut Continue).unwrap();
+        assert_eq!((summary.succeeded, summary.failed), (2, 1));
+        assert_eq!(summary.reserved_work, transport_work(work(2)));
+        assert_eq!(processor.run.remaining, work(0)); assert_eq!(processor.run.remaining_masks, 0);
+        assert_eq!(probe.calls.get(), 2); assert_eq!(probe.admissions.get(), 2);
+        assert_eq!(probe.drops.get(), 2); assert!(!probe.live.get());
+        let events = frames(&sink.bytes);
+        let results = events.iter().filter(|event| event["event"] == "doc")
+            .map(|event| &event["result"]).collect::<Vec<_>>();
+        assert_eq!(results.len(), 2);
+        for result in results {
+            assert_eq!(result["execution"], SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION);
+            assert_eq!(result["model_work"], serde_json::to_value(actual).unwrap());
+            assert_eq!(result["dimensions"][0]["samples"][0]["model_work"],
+                serde_json::to_value(actual).unwrap());
+            assert_eq!(result["dimensions"][0]["samples"][0]["score"], 0);
+            assert_eq!(result["dimensions"][0]["samples"][0]["justification"],
+                "Synthetic lifecycle fixture.");
+        }
+        assert!(events.iter().any(|event| event["error"]["code"] == "work_limit"));
+        assert_eq!(events.last().unwrap()["event"], "run_complete");
+    }
+}
+
+#[test]
+fn completed_schedule_substitution_is_fatal_for_both_cold_and_reused_streams() {
+    for reuse_prefill in [false, true] {
+        let probe = Rc::new(Probe::default()); let seal = Arc::new(());
+        let (mut driver, mut admission, mut run) = host(&probe, 2);
+        driver.reuse_prefill = reuse_prefill;
+        let record = prepared(Mode::WrongSchedule, &seal, &driver);
+        let error = execute_owned(record, &seal, &mut driver, &mut admission,
+            &mut run, context(1, 1), &mut Continue).err().unwrap();
+        assert!(error.stop); assert_eq!(error.fault.code, BatchCode::InvalidExecution);
+        assert_eq!(run.state, State::Failed); assert_eq!(run.remaining, work(1));
+        assert_eq!(run.remaining_masks, 5); assert_eq!(probe.calls.get(), 1);
+        assert_eq!(probe.drops.get(), 1); assert!(!probe.live.get());
+        assert!(run.enter().is_err());
+    }
+}
+
+#[test]
+fn reused_streams_never_carry_dirty_native_state_into_another_record() {
+    let probe = Rc::new(Probe::default()); let seal = Arc::new(());
+    let (mut driver, mut admission, mut run) = host(&probe, 2);
+    driver.reuse_prefill = true;
+    let error = execute_owned(prepared(Mode::Dirty, &seal, &driver), &seal, &mut driver,
+        &mut admission, &mut run, context(1, 1), &mut Continue).err().unwrap();
+    assert!(error.stop); assert_eq!(error.fault.code, BatchCode::InvalidExecution);
+    assert_eq!(run.state, State::Failed); assert_eq!(run.remaining, work(1));
+    assert_eq!(run.remaining_masks, 5); assert_eq!(probe.drops.get(), 1);
+    assert!(prepare_checked(plan(Mode::Success), &seal, &driver, limits(2), 1024, &mut Continue)
+        .err().unwrap().stop);
+    assert!(run.enter().is_err()); assert_eq!(probe.calls.get(), 1);
+    assert_eq!(probe.admissions.get(), 1); assert!(!probe.live.get());
+}
+
+#[test]
+fn every_original_cancellation_withholds_reused_output_and_keeps_cold_debits() {
+    for cause in [DecodeCancellationKind::User, DecodeCancellationKind::Timeout,
+        DecodeCancellationKind::Deadline, DecodeCancellationKind::PollQuota, DecodeCancellationKind::CostBudget,
+        DecodeCancellationKind::FailFast, DecodeCancellationKind::RaceLost, DecodeCancellationKind::ParentCancelled,
+        DecodeCancellationKind::ResourceUnavailable, DecodeCancellationKind::Shutdown, DecodeCancellationKind::LinkedExit] {
+        let probe = Rc::new(Probe::default()); let seal = Arc::new(());
+        let (mut driver, mut admission, mut run) = host(&probe, 2);
+        driver.reuse_prefill = true;
+        let record = prepared(Mode::Success, &seal, &driver);
+        let mut control = StopAt { calls: 0, stop: 3, cause };
+        let error = execute_owned(record, &seal, &mut driver, &mut admission, &mut run,
+            context(1, 1), &mut control).err().unwrap();
+        assert_eq!(error.fault.cancellation, Some(cause)); assert!(error.stop);
+        assert_eq!(run.state, State::Failed); assert_eq!(probe.calls.get(), 1);
+        assert_eq!(probe.drops.get(), 1); assert!(!probe.live.get());
+        assert_eq!(run.remaining, work(1)); assert_eq!(run.remaining_masks, 5);
     }
 }
 

@@ -35,7 +35,8 @@ impl NlpEngine {
         planner: SampledSentimentBatchPlanner, limits: CorpusLimits, kernel: PackedInt4Kernel,
         reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        self.run_int4_sampled_sentiment_corpus(model, planner, limits, kernel, None, None, reader, writer, cancellation)
+        self.run_int4_sampled_sentiment_corpus(model, planner, limits, kernel,
+            None, None, false, reader, writer, cancellation)
     }
 
     /// Execute each fresh sample prompt in bounded causal layer-major morsels.
@@ -49,7 +50,23 @@ impl NlpEngine {
         -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
         self.run_int4_sampled_sentiment_corpus(model, planner, limits, kernel,
-            None, Some(prefill), reader, writer, cancellation)
+            None, Some(prefill), false, reader, writer, cancellation)
+    }
+
+    /// Retain only the current document axis's causal prompt between its
+    /// independently addressed samples. Sample continuations are discarded
+    /// before the next draw; no prefix crosses an axis or document boundary.
+    /// Cold worst-case native/mask allowances still cover every admitted
+    /// attempt. Each completed bundle reports the work actually performed.
+    /// An optional prompt morsel applies to each axis's first prefill only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int4_sampled_sentiment_reusing_prefill<R, W>(&self, model: &ResidentInt4,
+        planner: SampledSentimentBatchPlanner, limits: CorpusLimits, kernel: PackedInt4Kernel,
+        prefill: Option<Int4PrefillLimits>, reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        self.run_int4_sampled_sentiment_corpus(model, planner, limits, kernel,
+            None, prefill, true, reader, writer, cancellation)
     }
 
     /// Preserve the identical item semantics with one persistent numerical
@@ -63,13 +80,26 @@ impl NlpEngine {
         -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
         self.run_int4_sampled_sentiment_corpus(model, planner, limits, kernel,
-            Some(compute_threads), None, reader, writer, cancellation)
+            Some(compute_threads), None, false, reader, writer, cancellation)
+    }
+
+    /// Combine per-axis prompt reuse with one persistent bounded projection
+    /// team. Native cleanup and the team's join precede terminal publication;
+    /// reuse changes no admission, cancellation or output ownership boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int4_sampled_sentiment_reusing_prefill_with_threads<R, W>(&self, model: &ResidentInt4,
+        planner: SampledSentimentBatchPlanner, limits: CorpusLimits, kernel: PackedInt4Kernel,
+        compute_threads: usize, reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        self.run_int4_sampled_sentiment_corpus(model, planner, limits, kernel,
+            Some(compute_threads), None, true, reader, writer, cancellation)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn run_int4_sampled_sentiment_corpus<R, W>(&self, model: &ResidentInt4,
         planner: SampledSentimentBatchPlanner, limits: CorpusLimits, kernel: PackedInt4Kernel,
-        compute_threads: Option<usize>, prefill: Option<Int4PrefillLimits>,
+        compute_threads: Option<usize>, prefill: Option<Int4PrefillLimits>, reuse_prefill: bool,
         reader: R, writer: W, cancellation: CancellationToken)
         -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
@@ -116,11 +146,13 @@ impl NlpEngine {
                 work, preparation_bytes: limits.preparation_reserve_bytes,
                 output_bytes: limits.transport.max_output_line_bytes as u64 };
             let completion = {
-                let mut processor = match prefill {
+                let mut processor = if reuse_prefill {
+                    NativeSampledSentimentBatch::new_reusing_prefill(planner, &mut engine.value, admission, prefill)
+                } else { match prefill {
                     None => NativeSampledSentimentBatch::new(planner, &mut engine.value, admission),
                     Some(prefill) => NativeSampledSentimentBatch::new_layer_major(
                         planner, &mut engine.value, admission, prefill),
-                }.map_err(HostedError::BatchSetup)?;
+                } }.map_err(HostedError::BatchSetup)?;
                 stream::deferred::run_ndjson_deferred(&mut input.value.reader, &mut input.value.writer,
                     &mut processor, limits.transport, control).map_err(HostedError::Batch)?
             };
@@ -150,8 +182,10 @@ impl NlpEngine {
                     work, preparation_bytes: limits.preparation_reserve_bytes,
                     output_bytes: limits.transport.max_output_line_bytes as u64 };
                 let completion = {
-                    let mut processor = NativeSampledSentimentBatch::new(planner, &mut engine.value, admission)
-                        .map_err(HostedError::BatchSetup)?;
+                    let mut processor = if reuse_prefill {
+                        NativeSampledSentimentBatch::new_reusing_prefill(planner, &mut engine.value, admission, None)
+                    } else { NativeSampledSentimentBatch::new(planner, &mut engine.value, admission) }
+                    .map_err(HostedError::BatchSetup)?;
                     stream::deferred::run_ndjson_deferred(&mut input.value.reader, &mut input.value.writer,
                         &mut processor, limits.transport, control).map_err(HostedError::Batch)?
                 };

@@ -144,6 +144,8 @@ fn owned_planner_and_io_cross_one_physical_serial_or_team_boundary() {
     let _serial = NlpEngine::batch_int4_sampled_sentiment::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
     let _team = NlpEngine::batch_int4_sampled_sentiment_with_threads::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
     let _prefill = NlpEngine::batch_int4_sampled_sentiment_layer_major::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    let _reused = NlpEngine::batch_int4_sampled_sentiment_reusing_prefill::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    let _reused_team = NlpEngine::batch_int4_sampled_sentiment_reusing_prefill_with_threads::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
     for width in [0, 1, 65, usize::MAX] { assert!(int4_task_team_workspace_bytes(width, 32).is_err()); }
     for width in [2, 4, 64] {
         let worker = int4_task_team_workspace_bytes(width, 32).unwrap();

@@ -1,7 +1,8 @@
 //! Ordered sampled-sentiment bundles on one resident grouped-INT4 engine.
 //!
-//! The existing task owns sampling, complete JSON validation and per-sample
-//! session cleanup. This adapter reserves the whole axis-by-sample schedule
+//! The existing task owns sampling, complete JSON validation and private
+//! session cleanup. Explicit prompt reuse stays inside one axis of one record.
+//! This adapter reserves the whole cold axis-by-sample schedule
 //! before execution, including failed attempts. Flush never renews any native
 //! or mask allowance, and delivery retains the embedding host's output guard.
 
@@ -22,7 +23,7 @@ use crate::{
     tasks::{ir::TaskBudget, sentiment::{SentimentAxis, SentimentRequest,
         sampled::{PreparedSampledSentiment, SampledSentimentError, SampledSentimentLimits,
             SampledSentimentPlanner, SampledSentimentRun, SampledSentimentVocabulary,
-            SAMPLED_SENTIMENT_EXECUTION}}},
+            SAMPLED_SENTIMENT_EXECUTION, SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION}}},
     tokenizer::untrusted::UntrustedEncoding,
 };
 
@@ -193,7 +194,8 @@ impl PreparedSampledSentimentRecord {
     pub fn max_result_bytes(&self) -> u64 { self.record.plan.max_result_bytes() }
 }
 
-/// One native engine serves every independently reset sample in every record.
+/// One native engine serves every independently addressed sample in every record.
+/// A reused prompt never survives its axis, record or session boundary.
 /// Unwind, cancellation or an unclean engine permanently closes the adapter.
 pub struct NativeSampledSentimentBatch<'e, 'w, A: SampledSentimentBatchAdmission> {
     compiler: SampledSentimentBatchPlanner,
@@ -204,17 +206,28 @@ pub struct NativeSampledSentimentBatch<'e, 'w, A: SampledSentimentBatchAdmission
 impl<'e, 'w, A: SampledSentimentBatchAdmission> NativeSampledSentimentBatch<'e, 'w, A> {
     pub fn new(compiler: SampledSentimentBatchPlanner, engine: &'e mut StrictInt4Engine<'w>,
         admission: A) -> Result<Self, BatchFault> {
-        Self::new_scheduled(compiler, engine, admission, None)
+        Self::new_scheduled(compiler, engine, admission, None, false)
     }
     /// Reuse one admitted layer-major prompt workspace across the whole stream.
     /// The caller must reserve its additional payload before constructing this
     /// adapter. Sample addresses, task budgets and run work remain unchanged.
     pub fn new_layer_major(compiler: SampledSentimentBatchPlanner, engine: &'e mut StrictInt4Engine<'w>,
         admission: A, prefill: Int4PrefillLimits) -> Result<Self, BatchFault> {
-        Self::new_scheduled(compiler, engine, admission, Some(prefill))
+        Self::new_scheduled(compiler, engine, admission, Some(prefill), false)
+    }
+    /// Reuse only the current record and axis's private causal prompt prefix
+    /// between independently addressed samples. The first sample may use
+    /// bounded layer-major prefill. Native sessions still clear all 44 KV
+    /// slots before the next axis or record, and actual work is retained in
+    /// each result. Admission debits the complete cold-work and mask ceilings;
+    /// saved work, early EOS and flushes never refund that reservation.
+    pub fn new_reusing_prefill(compiler: SampledSentimentBatchPlanner,
+        engine: &'e mut StrictInt4Engine<'w>, admission: A, prefill: Option<Int4PrefillLimits>)
+        -> Result<Self, BatchFault> {
+        Self::new_scheduled(compiler, engine, admission, prefill, true)
     }
     fn new_scheduled(compiler: SampledSentimentBatchPlanner, engine: &'e mut StrictInt4Engine<'w>,
-        admission: A, prefill: Option<Int4PrefillLimits>) -> Result<Self, BatchFault> {
+        admission: A, prefill: Option<Int4PrefillLimits>, reuse_prefill: bool) -> Result<Self, BatchFault> {
         compiler.limits.validate()?;
         validate_prefill(prefill)?;
         constrained_int4::check_model(compiler.base_execution_identity(), engine.model_identity())
@@ -224,7 +237,7 @@ impl<'e, 'w, A: SampledSentimentBatchAdmission> NativeSampledSentimentBatch<'e, 
         }
         let run = RunState::new(compiler.limits);
         let vocabulary = Arc::clone(&compiler.vocabulary);
-        Ok(Self { compiler, driver: NativeDriver { engine, vocabulary, prefill }, admission, run })
+        Ok(Self { compiler, driver: NativeDriver { engine, vocabulary, prefill, reuse_prefill }, admission, run })
     }
     pub fn remaining_model_work(&self) -> Int4Work { self.run.remaining }
     pub fn remaining_mask_visits(&self) -> u64 { self.run.remaining_masks }
@@ -284,6 +297,7 @@ impl Plan for PreparedSampledSentiment {
 }
 trait Driver<P: Plan> {
     fn prefill(&self) -> Option<Int4PrefillLimits> { None }
+    fn reuse_prefill(&self) -> bool { false }
     fn clean(&self) -> bool;
     fn capacity(&self) -> usize;
     fn group_width(&self) -> usize;
@@ -293,7 +307,7 @@ trait Driver<P: Plan> {
 }
 struct NativeDriver<'e, 'w> {
     engine: &'e mut StrictInt4Engine<'w>, vocabulary: Arc<SampledSentimentVocabulary>,
-    prefill: Option<Int4PrefillLimits>,
+    prefill: Option<Int4PrefillLimits>, reuse_prefill: bool,
 }
 fn validate_prefill(prefill: Option<Int4PrefillLimits>) -> Result<(), BatchFault> {
     if let Some(limits) = prefill {
@@ -304,6 +318,7 @@ fn validate_prefill(prefill: Option<Int4PrefillLimits>) -> Result<(), BatchFault
 fn clean(engine: &StrictInt4Engine<'_>) -> bool { !engine.is_poisoned() && engine.kv_cache().all_slots_have_len(0) }
 impl Driver<PreparedSampledSentiment> for NativeDriver<'_, '_> {
     fn prefill(&self) -> Option<Int4PrefillLimits> { self.prefill }
+    fn reuse_prefill(&self) -> bool { self.reuse_prefill }
     fn clean(&self) -> bool { clean(self.engine) }
     fn capacity(&self) -> usize { self.engine.kv_cache().capacity_positions() }
     fn group_width(&self) -> usize { self.engine.model_identity().group_width() }
@@ -313,11 +328,16 @@ impl Driver<PreparedSampledSentiment> for NativeDriver<'_, '_> {
     }
     fn execute<C: DecodeStepControl>(&mut self, plan: &PreparedSampledSentiment, identity: &ExecutionIdentity,
         budget: Int4JsonBudget, sampler_bytes: u64, control: &mut C) -> Result<SampledSentimentRun, BatchItemFailure> {
-        match self.prefill {
-            Some(prefill) => plan.execute_layer_major_with_control(self.engine, identity, &self.vocabulary,
-                budget, sampler_bytes, prefill, control),
-            None => plan.execute_with_control(self.engine, identity, &self.vocabulary,
-                budget, sampler_bytes, control),
+        if self.reuse_prefill {
+            plan.execute_reusing_prefill_with_control(self.engine, identity, &self.vocabulary,
+                budget, sampler_bytes, self.prefill, control)
+        } else {
+            match self.prefill {
+                Some(prefill) => plan.execute_layer_major_with_control(self.engine, identity, &self.vocabulary,
+                    budget, sampler_bytes, prefill, control),
+                None => plan.execute_with_control(self.engine, identity, &self.vocabulary,
+                    budget, sampler_bytes, control),
+            }
         }.map_err(task_failure)
     }
 }
@@ -383,7 +403,7 @@ fn execute_owned<P: Plan, D: Driver<P>, A: SampledSentimentBatchAdmission, C: De
         checkpoint(control)?;
         let output = driver.execute(&prepared.plan, &identity,
             native_budget(work, kv_bytes, mask_node_visits, run.limits), run.limits.max_sampler_bytes, control)?;
-        if !valid_result(&prepared.plan, &output, mask_node_visits) {
+        if !valid_result(&prepared.plan, &output, mask_node_visits, driver.reuse_prefill()) {
             return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
         }
         checkpoint(control)?;
@@ -396,10 +416,12 @@ fn native_budget(work: Int4Work, kv_bytes: u64, masks: u64, limits: SampledSenti
         max_forward_positions: work.forward_positions, max_projected_logits: work.projected_logits,
         max_kv_bytes: kv_bytes, max_total_mask_node_visits: masks, mask_limits: limits.masks.per_mask } }
 }
-fn valid_result<P: Plan>(plan: &P, output: &SampledSentimentRun, masks: u64) -> bool {
+fn valid_result<P: Plan>(plan: &P, output: &SampledSentimentRun, masks: u64, reuse_prefill: bool) -> bool {
     let facts = plan.facts();
     let samples = output.dimensions.iter().try_fold(0_usize, |count, axis| count.checked_add(axis.samples.len()));
-    output.schema_version == 1 && output.execution == SAMPLED_SENTIMENT_EXECUTION
+    let execution = if reuse_prefill { SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION }
+        else { SAMPLED_SENTIMENT_EXECUTION };
+    output.schema_version == 1 && output.execution == execution
         && output.task_spec == "sentiment-v1" && output.sampler_version == JSON_SAMPLER_VERSION
         && output.prompt_template_sha256 == facts.identity.template_digest
         && output.numerics_profile == STRICT_INT4_PROFILE && output.group_width == facts.group_width
