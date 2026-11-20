@@ -67,6 +67,46 @@ fn each_group_partition_prices_one_full_native_context_and_owned_stream() {
 }
 
 #[test]
+fn prompt_workspace_is_once_per_stream_and_does_not_multiply_native_or_output_claims() {
+    for width in [1, 3, 32, 128, MAX_MODEL_K] {
+        let base = requirements(width, work_limits(width), limits()).unwrap();
+        assert_eq!(base.with_prefill_workspace(None).unwrap(), base);
+        for rows in [1, 3, 64] {
+            let extra = Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+            // A permissive caller cap is not a license to charge arbitrary
+            // payload or to allocate one workspace for every head/document.
+            let prefill = Int4PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX };
+            let grouped = base.with_prefill_workspace(Some(prefill)).unwrap();
+            assert_eq!(grouped.native, base.native);
+            assert_eq!(grouped.input_bytes, base.input_bytes);
+            assert_eq!(grouped.workspace_bytes - base.workspace_bytes, extra);
+            let mut many = limits(); many.transport.max_requests *= 2;
+            let larger = requirements(width, work_limits(width), many).unwrap()
+                .with_prefill_workspace(Some(prefill)).unwrap();
+            assert_eq!(larger.workspace_bytes, grouped.workspace_bytes);
+        }
+    }
+}
+
+#[test]
+fn invalid_prompt_workspace_and_joint_overflow_refuse_before_stream_io() {
+    let base = requirements(32, work_limits(32), limits()).unwrap();
+    let exact = Int4PrefillLimits::required_extra_scratch_bytes(3).unwrap();
+    for prefill in [
+        Int4PrefillLimits { max_batch_rows: 0, max_extra_scratch_bytes: u64::MAX },
+        Int4PrefillLimits { max_batch_rows: 65, max_extra_scratch_bytes: u64::MAX },
+        Int4PrefillLimits { max_batch_rows: 3, max_extra_scratch_bytes: exact - 1 },
+    ] {
+        assert!(base.with_prefill_workspace(Some(prefill)).is_err());
+    }
+    let prefill = Int4PrefillLimits { max_batch_rows: 3, max_extra_scratch_bytes: exact };
+    let mut full = base;
+    full.workspace_bytes = u64::MAX - exact;
+    assert!(full.with_prefill_workspace(Some(prefill)).is_err(),
+        "representable scratch must still fit beside input and KV");
+}
+
+#[test]
 fn complete_multihead_work_can_exceed_reused_context_capacity() {
     for task in ["classify-v1", "sentiment-v1", "judge-v1"] {
         let id = identity(task, 32); let request = request(&id, 32);
@@ -183,4 +223,7 @@ fn all_three_closed_planners_and_owned_io_fit_the_existing_host_boundary() {
     let _classify_team = NlpEngine::batch_int4_scored_with_threads::<Int4ClassificationPlanner, std::io::Cursor<Vec<u8>>, Vec<u8>>;
     let _sentiment_team = NlpEngine::batch_int4_scored_with_threads::<Int4SentimentPlanner, std::io::Cursor<Vec<u8>>, Vec<u8>>;
     let _judge_team = NlpEngine::batch_int4_scored_with_threads::<Int4JudgePlanner, std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    let _classify_prefill = NlpEngine::batch_int4_scored_layer_major::<Int4ClassificationPlanner, std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    let _sentiment_prefill = NlpEngine::batch_int4_scored_layer_major::<Int4SentimentPlanner, std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    let _judge_prefill = NlpEngine::batch_int4_scored_layer_major::<Int4JudgePlanner, std::io::Cursor<Vec<u8>>, Vec<u8>>;
 }

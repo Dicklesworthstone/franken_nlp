@@ -8,7 +8,7 @@ use crate::{
     native_engine::{constrained_int4,
         decode::DecodeStepControl, portable_int8::ProjectionWork,
         strict_int4::{Int4MemoryRequirement, Int4RunBudget, Int4Work, StrictInt4Engine,
-            scoring::Int4ScoringBudget}},
+            prefill::Int4PrefillLimits, scoring::Int4ScoringBudget}},
     tasks::ir::TaskBudget,
     tokenizer::untrusted::UntrustedEncoding,
 };
@@ -142,7 +142,18 @@ impl<'e, 'w, P: Int4ScoredTask, A: Int4ScoredBatchAdmission> NativeInt4ScoredBat
             return Err(BatchCode::InvalidExecution.into());
         }
         let run = RunState::new(compiler.limits.max_model_work);
-        Ok(Self { compiler, driver: NativeDriver(engine), admission, run })
+        Ok(Self { compiler, driver: NativeDriver(engine, None), admission, run })
+    }
+    /// Use bounded layer-major prompt morsels for every scoring head. The
+    /// embedding host must admit the validated additional workspace once and
+    /// retain it through the complete stream. Candidate traversal, EOS scores,
+    /// result identity and all five nonrenewable work counters stay unchanged.
+    pub fn new_layer_major(compiler: Int4ScoredBatchPlanner<P>, engine: &'e mut StrictInt4Engine<'w>,
+        admission: A, prefill: Int4PrefillLimits) -> Result<Self, BatchFault> {
+        prefill.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        let mut processor = Self::new(compiler, engine, admission)?;
+        processor.driver.1 = Some(prefill);
+        Ok(processor)
     }
     pub fn remaining_work(&self) -> Int4Work { self.run.remaining }
     pub fn is_poisoned(&self) -> bool { self.run.state != State::Ready || !clean(self.driver.0) }
@@ -184,7 +195,7 @@ trait Driver<P: Int4ScoredTask> {
     fn execute<C: DecodeStepControl>(&mut self, plan: &P::Plan, admitted: &ExecutionIdentity,
         budget: Int4ScoringBudget, control: &mut C) -> Result<P::Output, BatchItemFailure>;
 }
-struct NativeDriver<'e, 'w>(&'e mut StrictInt4Engine<'w>);
+struct NativeDriver<'e, 'w>(&'e mut StrictInt4Engine<'w>, Option<Int4PrefillLimits>);
 fn clean(engine: &StrictInt4Engine<'_>) -> bool { !engine.is_poisoned() && engine.kv_cache().all_slots_have_len(0) }
 impl<P: Int4ScoredTask> Driver<P> for NativeDriver<'_, '_> {
     fn clean(&self) -> bool { clean(self.0) }
@@ -195,7 +206,10 @@ impl<P: Int4ScoredTask> Driver<P> for NativeDriver<'_, '_> {
     }
     fn execute<C: DecodeStepControl>(&mut self, plan: &P::Plan, admitted: &ExecutionIdentity,
         budget: Int4ScoringBudget, control: &mut C) -> Result<P::Output, BatchItemFailure> {
-        P::execute(plan, admitted, self.0, budget, control)
+        match self.1 {
+            None => P::execute(plan, admitted, self.0, budget, control),
+            Some(prefill) => P::execute_layer_major(plan, admitted, self.0, budget, prefill, control),
+        }
     }
 }
 fn preflight<P: Int4ScoredTask, D: Driver<P>>(plan: &P::Plan, driver: &D) -> Result<u64, BatchItemFailure> {

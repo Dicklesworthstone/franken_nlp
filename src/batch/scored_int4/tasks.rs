@@ -40,6 +40,9 @@ pub trait Int4ScoredTask: sealed::Sealed + Send + 'static {
     fn execute<C: DecodeStepControl>(plan: &Self::Plan, admitted: &ExecutionIdentity,
         engine: &mut StrictInt4Engine<'_>, budget: Int4ScoringBudget, control: &mut C)
         -> Result<Self::Output, BatchItemFailure>;
+    fn execute_layer_major<C: DecodeStepControl>(plan: &Self::Plan, admitted: &ExecutionIdentity,
+        engine: &mut StrictInt4Engine<'_>, budget: Int4ScoringBudget, prefill: Int4PrefillLimits,
+        control: &mut C) -> Result<Self::Output, BatchItemFailure>;
     fn completed(plan: &Self::Plan, output: &Self::Output) -> bool;
     fn cohort_contexts(plan: &Self::Plan) -> Result<Vec<usize>, BatchItemFailure>;
     fn execute_document_cohort<C: DecodeStepControl>(documents: &[(&Self::Plan, &ExecutionIdentity)],
@@ -71,6 +74,12 @@ macro_rules! native_plan_methods {
             engine: &mut StrictInt4Engine<'_>, budget: Int4ScoringBudget, control: &mut C)
             -> Result<Self::Output, BatchItemFailure> {
             plan.execute_with_control(admitted, engine, budget, control).map_err(|e| $error(e, true))
+        }
+        fn execute_layer_major<C: DecodeStepControl>(plan: &Self::Plan, admitted: &ExecutionIdentity,
+            engine: &mut StrictInt4Engine<'_>, budget: Int4ScoringBudget, prefill: Int4PrefillLimits,
+            control: &mut C) -> Result<Self::Output, BatchItemFailure> {
+            plan.execute_layer_major_with_control(admitted, engine, budget, prefill, control)
+                .map_err(|e| $error(e, true))
         }
         fn completed(plan: &Self::Plan, output: &Self::Output) -> bool {
             output.schema_version == 1 && output.execution == $execution

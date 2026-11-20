@@ -70,6 +70,10 @@ impl Int4ScoredTask for Planner {
     fn preflight(_: &Plan, _: &StrictInt4Engine<'_>, _: Int4ScoringBudget) -> Result<(), BatchItemFailure> { unreachable!() }
     fn execute<C: DecodeStepControl>(_: &Plan, _: &ExecutionIdentity, _: &mut StrictInt4Engine<'_>,
         _: Int4ScoringBudget, _: &mut C) -> Result<Output, BatchItemFailure> { unreachable!() }
+    fn execute_layer_major<C: DecodeStepControl>(_: &Plan, _: &ExecutionIdentity, _: &mut StrictInt4Engine<'_>,
+        _: Int4ScoringBudget, _: Int4PrefillLimits, _: &mut C) -> Result<Output, BatchItemFailure> {
+        unreachable!("synthetic lifecycle fixtures never replace the native prompt kernel")
+    }
     fn completed(plan: &Plan, output: &Output) -> bool {
         plan.units == output.units && plan.heads == output.heads && plan.work == output.work
     }

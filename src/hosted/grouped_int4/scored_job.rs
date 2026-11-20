@@ -9,7 +9,7 @@ use crate::{
     jobs::{JobInputMemory, JobLimits, JobProgress,
         runner::{JobRunError, scored::grouped_int4::{Int4ScoredJobPlanner,
             Int4ScoredJobProcessor, Int4ScoredJobTask}}},
-    native_engine::{constrained_int4, strict_int4::projection::Int4ProjectionExecutor},
+    native_engine::{constrained_int4, strict_int4::{prefill::Int4PrefillLimits, projection::Int4ProjectionExecutor}},
     tasks::ir::TaskBudget,
 };
 use super::scored_batch::ScoredAdmission;
@@ -28,11 +28,16 @@ impl Requirements {
         sum(&[self.input_bytes, self.native.kv_bytes, self.workspace_bytes])?;
         Ok(self)
     }
+    fn with_prefill_workspace(mut self, prefill: Option<Int4PrefillLimits>) -> Result<Self, HostedError> {
+        self.workspace_bytes = super::prefill::with_extra_workspace(self.workspace_bytes, prefill)?;
+        sum(&[self.input_bytes, self.native.kv_bytes, self.workspace_bytes])?;
+        Ok(self)
+    }
 }
 
 struct ScoredJobExecution<P: Int4ScoredJobTask, R> {
     input: Charged<JobInput<P, R>>, kv: Pending, scratch: Pending,
-    limits: JobHostLimits, required: Requirements, lease: EngineLease,
+    prefill: Option<Int4PrefillLimits>, limits: JobHostLimits, required: Requirements, lease: EngineLease,
 }
 
 impl NlpEngine {
@@ -56,7 +61,25 @@ impl NlpEngine {
         limits: JobHostLimits, kernel: PackedInt4Kernel, reader: R,
         cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
     where P: Int4ScoredJobTask, R: BufRead + Send + 'static {
-        self.run_int4_scored_job(model, planner, request, limits, kernel, None, reader, cancellation)
+        self.run_int4_scored_job(model, planner, request, limits, kernel, None, None, reader, cancellation)
+    }
+
+    /// Start or resume the same scoring population with bounded layer-major
+    /// prompt morsels. One additional workspace is admitted before input and
+    /// stays charged beside population, KV, journal and complete outputs.
+    /// Candidate traversal and every lifetime work debit remain unchanged.
+    ///
+    /// Prompt row width is physical scheduling only, so explicit resume may
+    /// change it without changing the authenticated recipe or committed items.
+    /// This route uses one coordinator and cannot combine with a CPU team.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int4_scored_layer_major<P, R>(&self, model: &ResidentInt4,
+        planner: Int4ScoredJobPlanner<P>, request: SourceJobRequest,
+        limits: JobHostLimits, kernel: PackedInt4Kernel, prefill: Int4PrefillLimits, reader: R,
+        cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where P: Int4ScoredJobTask, R: BufRead + Send + 'static {
+        self.run_int4_scored_job(model, planner, request, limits, kernel,
+            Some(prefill), None, reader, cancellation)
     }
 
     /// Keep one fixed numerical team across authenticated population loading,
@@ -70,15 +93,19 @@ impl NlpEngine {
         limits: JobHostLimits, kernel: PackedInt4Kernel, compute_threads: usize, reader: R,
         cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
     where P: Int4ScoredJobTask, R: BufRead + Send + 'static {
-        self.run_int4_scored_job(model, planner, request, limits, kernel, Some(compute_threads), reader, cancellation)
+        self.run_int4_scored_job(model, planner, request, limits, kernel, None, Some(compute_threads), reader, cancellation)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn run_int4_scored_job<P, R>(&self, model: &ResidentInt4,
         planner: Int4ScoredJobPlanner<P>, request: SourceJobRequest,
-        limits: JobHostLimits, kernel: PackedInt4Kernel, compute_threads: Option<usize>, reader: R,
-        cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+        limits: JobHostLimits, kernel: PackedInt4Kernel, prefill: Option<Int4PrefillLimits>,
+        compute_threads: Option<usize>, reader: R, cancellation: CancellationToken)
+        -> Result<JobProgress, HostedJobError>
     where P: Int4ScoredJobTask, R: BufRead + Send + 'static {
+        if prefill.is_some() && compute_threads.is_some() {
+            return Err(HostedError::Limits("INT4 scored job team/prefill schedule").into());
+        }
         match compute_threads {
             Some(width) => dispatch::preflight_int4_team(self, limits.native.run, width)?,
             None => dispatch::preflight(self, limits.native.run)?,
@@ -95,7 +122,8 @@ impl NlpEngine {
         let work = planner.native_limits();
         let required = requirements(model.model_identity().group_width(), planner.task_ceiling(),
             work, request.limits, limits, request.mode.input_memory())?
-            .with_encoding_workspace(planner.encoding_workspace_bytes())?;
+            .with_encoding_workspace(planner.encoding_workspace_bytes())?
+            .with_prefill_workspace(prefill)?;
         let team_scratch = compute_threads.map(|width|
             int4_task_team_workspace_bytes(width, model.model_identity().group_width())).transpose()?.unwrap_or(0);
         sum(&[required.input_bytes, required.native.kv_bytes, required.workspace_bytes, team_scratch])?;
@@ -104,7 +132,7 @@ impl NlpEngine {
             || Ok(JobInput { preparation: Some((planner, request)), reader }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes)?;
-        let execution = ScoredJobExecution { input, kv, scratch, limits, required, lease };
+        let execution = ScoredJobExecution { input, kv, scratch, prefill, limits, required, lease };
         let model = model.clone();
         let completed = match compute_threads {
             None => dispatch::run(self, limits.native.run, cancellation, move |control|
@@ -125,7 +153,7 @@ impl<P: Int4ScoredJobTask, R: BufRead> ScoredJobExecution<P, R> {
         control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
         // Keep the transferred aggregate whole: its reader, private settings
         // and key drop before their charge, including queued cancellation.
-        let Self { mut input, kv, scratch, limits, required, lease } = self;
+        let Self { mut input, kv, scratch, prefill, limits, required, lease } = self;
         checkpoint(control)?;
         let (planner, request) = input.value.preparation.take()
             .ok_or(HostedError::CompletionMissing)?;
@@ -151,8 +179,11 @@ impl<P: Int4ScoredJobTask, R: BufRead> ScoredJobExecution<P, R> {
             limits.native.context_tokens, required.native.kv_bytes,
             work.max_item_work, P::TASK, request.limits.max_result_bytes as u64);
         let result = (|| {
-            let processor = Int4ScoredJobProcessor::new(planner, &mut engine.value, admission)
-                .map_err(JobRunError::Processor)?;
+            let processor = match prefill {
+                None => Int4ScoredJobProcessor::new(planner, &mut engine.value, admission),
+                Some(prefill) => Int4ScoredJobProcessor::new_layer_major(
+                    planner, &mut engine.value, admission, prefill),
+            }.map_err(JobRunError::Processor)?;
             // The runner authenticates the frozen recipe before recovery,
             // persists work before execution and holds each output guard
             // through spool sync and journal acknowledgement.

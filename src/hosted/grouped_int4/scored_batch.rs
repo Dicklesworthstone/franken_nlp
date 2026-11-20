@@ -6,7 +6,7 @@ use crate::{
         scored_int4::{Int4ScoredAdmission, Int4ScoredBatchAdmission, Int4ScoredBatchLimits,
             Int4ScoredBatchPlanner, Int4ScoredTask, NativeInt4ScoredBatch}},
     hosted::corpus::CorpusLimits,
-    native_engine::{constrained_int4, strict_int4::Int4Work},
+    native_engine::{constrained_int4, strict_int4::{Int4Work, prefill::Int4PrefillLimits}},
 };
 mod cohort;
 pub use cohort::{Int4ScoredCohortHostLimits, Int4ScoredCohortBatchResult};
@@ -22,6 +22,13 @@ struct DeferredScoredStream<P: Int4ScoredTask, R, W> {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Requirements { native: Int4MemoryRequirement, workspace_bytes: u64, input_bytes: u64 }
+impl Requirements {
+    fn with_prefill_workspace(mut self, prefill: Option<Int4PrefillLimits>) -> Result<Self, HostedError> {
+        self.workspace_bytes = super::prefill::with_extra_workspace(self.workspace_bytes, prefill)?;
+        sum(&[self.input_bytes, self.native.kv_bytes, self.workspace_bytes])?;
+        Ok(self)
+    }
+}
 
 impl NlpEngine {
     /// Run one fixed scoring task over the existing bounded NDJSON transport.
@@ -37,7 +44,23 @@ impl NlpEngine {
         planner: Int4ScoredBatchPlanner<P>, limits: CorpusLimits, kernel: PackedInt4Kernel,
         reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where P: Int4ScoredTask, R: BufRead + Send + 'static, W: Write + Send + 'static {
-        self.run_int4_scored(model, planner, limits, kernel, None, reader, writer, cancellation)
+        self.run_int4_scored(model, planner, limits, kernel, None, None, reader, writer, cancellation)
+    }
+
+    /// Run every scoring head with bounded layer-major prompt morsels. One
+    /// extra prompt workspace is admitted before input and held with the
+    /// native engine through the stream, including flushes and final delivery.
+    /// Documents and heads remain ordered; finite candidate traversal, EOS,
+    /// complete results and conservative invocation-wide work are unchanged.
+    /// This route uses one coordinator and cannot combine with a CPU team or
+    /// simultaneous-document cohorts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int4_scored_layer_major<P, R, W>(&self, model: &ResidentInt4,
+        planner: Int4ScoredBatchPlanner<P>, limits: CorpusLimits, kernel: PackedInt4Kernel,
+        prefill: Int4PrefillLimits, reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<BatchSummary, HostedError>
+    where P: Int4ScoredTask, R: BufRead + Send + 'static, W: Write + Send + 'static {
+        self.run_int4_scored(model, planner, limits, kernel, Some(prefill), None, reader, writer, cancellation)
     }
 
     /// Run the same ordered stream on one persistent team of 2..=64 compute
@@ -56,15 +79,18 @@ impl NlpEngine {
         compute_threads: usize, reader: R, writer: W, cancellation: CancellationToken)
         -> Result<BatchSummary, HostedError>
     where P: Int4ScoredTask, R: BufRead + Send + 'static, W: Write + Send + 'static {
-        self.run_int4_scored(model, planner, limits, kernel, Some(compute_threads), reader, writer, cancellation)
+        self.run_int4_scored(model, planner, limits, kernel, None, Some(compute_threads), reader, writer, cancellation)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn run_int4_scored<P, R, W>(&self, model: &ResidentInt4,
         planner: Int4ScoredBatchPlanner<P>, limits: CorpusLimits, kernel: PackedInt4Kernel,
-        compute_threads: Option<usize>, reader: R, writer: W, cancellation: CancellationToken)
-        -> Result<BatchSummary, HostedError>
+        prefill: Option<Int4PrefillLimits>, compute_threads: Option<usize>, reader: R, writer: W,
+        cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where P: Int4ScoredTask, R: BufRead + Send + 'static, W: Write + Send + 'static {
+        if prefill.is_some() && compute_threads.is_some() {
+            return Err(HostedError::Limits("INT4 scored stream team/prefill schedule"));
+        }
         match compute_threads {
             Some(width) => dispatch::preflight_int4_team(self, limits.native.run, width)?,
             None => dispatch::preflight(self, limits.native.run)?,
@@ -77,14 +103,15 @@ impl NlpEngine {
             return Err(HostedError::ModelIdentity);
         }
         let work = planner.limits();
-        let mut required = requirements(model.model_identity().group_width(), work, limits)?;
+        let mut required = requirements(model.model_identity().group_width(), work, limits)?
+            .with_prefill_workspace(prefill)?;
         // One compiler call is active at a time. Retained plans and transport
         // stay charged while this additional bounded encoder workspace is used.
         required.input_bytes = sum(&[required.input_bytes, planner.encoding_workspace_bytes()])?;
         let team_scratch = compute_threads.map(|width|
             int4_task_team_workspace_bytes(width, model.model_identity().group_width()))
             .transpose()?.unwrap_or(0);
-        sum(&[required.workspace_bytes, team_scratch])?;
+        sum(&[required.input_bytes, required.native.kv_bytes, required.workspace_bytes, team_scratch])?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(StreamInput { planner: Some(planner), reader, writer }))?;
@@ -108,8 +135,11 @@ impl NlpEngine {
                 max_item_work: work.max_item_work, task_spec: P::TASK,
                 output_bytes: limits.transport.max_output_line_bytes as u64 };
             let result = {
-                let mut processor = NativeInt4ScoredBatch::new(planner, &mut engine.value, admission)
-                    .map_err(HostedError::BatchSetup)?;
+                let mut processor = match prefill {
+                    None => NativeInt4ScoredBatch::new(planner, &mut engine.value, admission),
+                    Some(prefill) => NativeInt4ScoredBatch::new_layer_major(
+                        planner, &mut engine.value, admission, prefill),
+                }.map_err(HostedError::BatchSetup)?;
                 stream::run_ndjson(&mut input.value.reader, &mut input.value.writer,
                     &mut processor, limits.transport, control).map_err(HostedError::Batch)
             };

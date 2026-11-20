@@ -10,7 +10,7 @@ use crate::{
             Int4ScoredTask, NativeInt4ScoredBatch, PreparedInt4Scored}},
     execution_identity::ExecutionIdentity,
     jobs::{JobLimits, JobWork, runner::DurableBatchProcessor},
-    native_engine::{decode::DecodeStepControl, strict_int4::StrictInt4Engine},
+    native_engine::{decode::DecodeStepControl, strict_int4::{StrictInt4Engine, prefill::Int4PrefillLimits}},
     tasks::ir::TaskBudget,
     tokenizer::untrusted::UntrustedEncoding,
 };
@@ -82,6 +82,16 @@ impl<'e, 'w, P: Int4ScoredJobTask, A: Int4ScoredBatchAdmission> Int4ScoredJobPro
         -> Result<Self, BatchFault> {
         let Int4ScoredJobPlanner { compiler, identity, recipe } = planner;
         let native = NativeInt4ScoredBatch::new(compiler, engine, admission)?;
+        Ok(Self { native, identity, recipe })
+    }
+    /// Reuse one admitted prompt workspace across the original pending items
+    /// and all their scoring heads. Row width is physical scheduling, as for
+    /// the CPU team, and does not enter the immutable recipe. Authenticated
+    /// resume retains every prior attempt and conservative native work debit.
+    pub fn new_layer_major(planner: Int4ScoredJobPlanner<P>, engine: &'e mut StrictInt4Engine<'w>,
+        admission: A, prefill: Int4PrefillLimits) -> Result<Self, BatchFault> {
+        let Int4ScoredJobPlanner { compiler, identity, recipe } = planner;
+        let native = NativeInt4ScoredBatch::new_layer_major(compiler, engine, admission, prefill)?;
         Ok(Self { native, identity, recipe })
     }
 }

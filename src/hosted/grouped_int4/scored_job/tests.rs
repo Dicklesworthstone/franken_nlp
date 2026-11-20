@@ -147,6 +147,7 @@ fn all_three_real_task_factories_cross_the_existing_owned_host_boundary() {
         send::<JobInput<P, std::io::Cursor<Vec<u8>>>>();
         let _entrypoint = NlpEngine::job_int4_scored::<P, std::io::Cursor<Vec<u8>>>;
         let _threaded = NlpEngine::job_int4_scored_with_threads::<P, std::io::Cursor<Vec<u8>>>;
+        let _prefill = NlpEngine::job_int4_scored_layer_major::<P, std::io::Cursor<Vec<u8>>>;
         send::<ScoredJobExecution<P, std::io::Cursor<Vec<u8>>>>();
     }
     binding::<Int4ClassificationPlanner>();
@@ -175,6 +176,35 @@ fn compact_encoder_workspace_is_charged_once_for_each_input_ownership_mode() {
         job.max_items = 100; job.max_attempts = 1000;
         let larger = requirements(128, task, work, job, host, input).unwrap();
         assert_eq!(larger.with_encoding_workspace(workspace).unwrap().input_bytes - larger.input_bytes, workspace);
+    }
+}
+
+#[test]
+fn one_prompt_workspace_coexists_with_encoder_input_and_all_lifetime_attempts() {
+    for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
+        let (task, work, mut job, host) = fixture(128);
+        let base = requirements(128, task, work, job, host, input).unwrap()
+            .with_encoding_workspace(8192).unwrap();
+        assert_eq!(base.with_prefill_workspace(None).unwrap(), base);
+        for rows in [1, 3, 64] {
+            let extra = Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+            let prefill = Int4PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX };
+            let grouped = base.with_prefill_workspace(Some(prefill)).unwrap();
+            assert_eq!(grouped.native, base.native);
+            assert_eq!(grouped.input_bytes, base.input_bytes);
+            assert_eq!(grouped.workspace_bytes - base.workspace_bytes, extra);
+            job.max_items = 100; job.max_attempts = 1000;
+            let larger = requirements(128, task, work, job, host, input).unwrap()
+                .with_encoding_workspace(8192).unwrap().with_prefill_workspace(Some(prefill)).unwrap();
+            assert_eq!(larger.workspace_bytes, grouped.workspace_bytes);
+        }
+        let extra = Int4PrefillLimits::required_extra_scratch_bytes(3).unwrap();
+        assert!(base.with_prefill_workspace(Some(Int4PrefillLimits {
+            max_batch_rows: 3, max_extra_scratch_bytes: extra - 1 })).is_err());
+        let mut overflowing = base;
+        overflowing.workspace_bytes = u64::MAX - extra;
+        assert!(overflowing.with_prefill_workspace(Some(Int4PrefillLimits {
+            max_batch_rows: 3, max_extra_scratch_bytes: extra })).is_err());
     }
 }
 
@@ -256,6 +286,83 @@ mod team {
         let closures = host.resources().outstanding_closure_snapshot();
         assert_eq!(closures.active_closures, 0); assert_eq!(closures.wrapper_cancelled_closures, 0);
     }
+    #[test]
+    #[ignore = "controller-only fresh runtime: prefill admission and cancellation, no model-output evidence"]
+    fn scored_job_prefill_admits_workspace_before_private_io_and_preserves_typed_stops() {
+        assert!(crate::installed_process_resources().is_none());
+        let host = NlpEngine::builder().resource_config(ResourceHostConfig {
+            runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
+            max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
+            helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: 1024 << 20,
+            leak_response_policy: LeakResponsePolicy::PanicInLabOrCi,
+        }).build().unwrap();
+        let idle = host.resources().memory_snapshot();
+        let lease = host.resources().acquire_lease();
+        let preparation = Pending::reserve(&lease, MemoryClass::JobBuffers, PREPARATION).unwrap().commit().unwrap();
+        let loaded = allocate(Pending::reserve(&lease, MemoryClass::Weights, 1 << 20).unwrap(),
+            || Ok(projection_fixture(32).0)).unwrap();
+        let model = ResidentInt4 { inner: Arc::new(ResidentModel { loaded, lease }) };
+        let baseline = host.resources().memory_snapshot();
+        let extra = Int4PrefillLimits::required_extra_scratch_bytes(3).unwrap();
+        let prefill = Int4PrefillLimits { max_batch_rows: 3, max_extra_scratch_bytes: extra };
+        use DecodeCancellationKind::*;
+        for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+            ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+            let (planner, request, limits) = planner(&model, true);
+            let stop = CancellationToken::default(); stop.cancel(cause);
+            let observed = Arc::new(Observation::default());
+            let reader = Reader { resources: Arc::clone(host.resources()), observed: Arc::clone(&observed),
+                action: Action::Refuse, stop: stop.clone() };
+            let error = host.job_int4_scored_layer_major(&model, planner, request, limits,
+                PackedInt4Kernel::scalar(), prefill, reader, stop).err().unwrap();
+            let HostedJobError::Host(HostedError::Stopped { stop, .. }) = error
+                else { panic!("layer-major scoring lost original cancellation"); };
+            assert_eq!(stop.kind, cause);
+            assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
+            assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+            drained(&host, &baseline);
+        }
+        for invalid in [
+            Int4PrefillLimits { max_batch_rows: 0, max_extra_scratch_bytes: u64::MAX },
+            Int4PrefillLimits { max_batch_rows: 65, max_extra_scratch_bytes: u64::MAX },
+            Int4PrefillLimits { max_batch_rows: 3, max_extra_scratch_bytes: extra - 1 },
+        ] {
+            let (planner, request, limits) = planner(&model, false);
+            let observed = Arc::new(Observation::default());
+            let stop = CancellationToken::default();
+            let reader = Reader { resources: Arc::clone(host.resources()), observed: Arc::clone(&observed),
+                action: Action::Refuse, stop: stop.clone() };
+            assert!(host.job_int4_scored_layer_major(&model, planner, request, limits,
+                PackedInt4Kernel::scalar(), invalid, reader, stop).is_err());
+            assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
+            assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+            drained(&host, &baseline);
+        }
+        let (planner, request, limits) = planner(&model, true);
+        let required = requirements(32, planner.task_ceiling(), planner.native_limits(), request.limits,
+            limits, request.mode.input_memory()).unwrap()
+            .with_encoding_workspace(planner.encoding_workspace_bytes()).unwrap()
+            .with_prefill_workspace(Some(prefill)).unwrap();
+        let room = sum(&[required.input_bytes, required.native.kv_bytes, required.workspace_bytes]).unwrap() - 1;
+        let held_bytes = host.resources().config().memory_ceiling_bytes
+            .checked_sub(baseline.committed_bytes + baseline.reserved_bytes).unwrap().checked_sub(room).unwrap();
+        let lease = host.resources().acquire_lease();
+        let held = Pending::reserve(&lease, MemoryClass::JobBuffers, held_bytes).unwrap().commit().unwrap();
+        let observed = Arc::new(Observation::default());
+        let stop = CancellationToken::default();
+        let reader = Reader { resources: Arc::clone(host.resources()), observed: Arc::clone(&observed),
+            action: Action::Refuse, stop: stop.clone() };
+        let error = host.job_int4_scored_layer_major(&model, planner, request, limits,
+            PackedInt4Kernel::scalar(), prefill, reader, stop).err().unwrap();
+        assert!(matches!(error, HostedJobError::Host(HostedError::Reservation(_))));
+        assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+        drop(held); drop(lease);
+        drained(&host, &baseline);
+        drop(model); drop(preparation);
+        drained(&host, &idle);
+    }
+
     #[test]
     #[ignore = "controller-only fresh runtime: tiny weights prove admission and drain, never native or durable-result parity"]
     fn scored_job_teams_preserve_original_cancellation_and_charged_input_through_join() {
@@ -402,12 +509,20 @@ mod native_team {
         let baseline = engine.resources().memory_snapshot();
         let retention = InputRetentionLimits { max_spool_bytes: 1 << 20 };
         let mut expected = None;
-        for width in [1, 2, 4] {
-            let root = parent.join(format!("{name}-{width}"));
+        for (schedule, width, rows) in [
+            ("serial", 1, 0), ("team2", 2, 0), ("team4", 4, 0),
+            ("prefill3", 1, 3), ("prefill64", 1, 64),
+        ] {
+            let root = parent.join(format!("{name}-{schedule}"));
             fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
             let req = request(&root, job, JobOpenMode::CreateRetainingInputs(retention));
             let reader = Cursor::new(input.as_bytes().to_vec());
-            let progress = if width == 1 {
+            let progress = if rows != 0 {
+                let prefill = Int4PrefillLimits { max_batch_rows: rows,
+                    max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap() };
+                engine.job_int4_scored_layer_major(model, make(), req, host, PackedInt4Kernel::scalar(),
+                    prefill, reader, CancellationToken::default())
+            } else if width == 1 {
                 engine.job_int4_scored(model, make(), req, host, PackedInt4Kernel::scalar(),
                     reader, CancellationToken::default())
             } else {
@@ -418,19 +533,21 @@ mod native_team {
             assert!(progress.materialized);
             let bytes = fs::read(root.join("materialized.ndjson")).unwrap();
             if let Some((output, work)) = &expected {
-                assert_eq!(output, &bytes, "{name} width={width}");
+                assert_eq!(output, &bytes, "{name} schedule={schedule}");
                 assert_eq!(*work, progress.reserved_work);
             } else { expected = Some((bytes.clone(), progress.reserved_work)); }
             drained(engine, &baseline);
-            // Change only the physical width while replaying authenticated
-            // retained input. Completed records must consume no new attempts.
-            let next = if width == 1 { 4 } else { 1 };
+            // Cross the serial/team versus layer-major boundary on retained
+            // replay. Physical schedules do not change the frozen recipe or
+            // charge completed records for another attempt.
+            let next = Int4PrefillLimits { max_batch_rows: 3,
+                max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(3).unwrap() };
             let req = request(&root, job, JobOpenMode::ResumeRetained { tail: TailPolicy::Refuse, retention });
-            let replay = if next == 1 {
+            let replay = if rows != 0 {
                 engine.job_int4_scored(model, make(), req, host, PackedInt4Kernel::scalar(),
                     NeverRead, CancellationToken::default())
             } else {
-                engine.job_int4_scored_with_threads(model, make(), req, host, PackedInt4Kernel::scalar(),
+                engine.job_int4_scored_layer_major(model, make(), req, host, PackedInt4Kernel::scalar(),
                     next, NeverRead, CancellationToken::default())
             }.unwrap();
             assert_eq!(replay, progress);
@@ -440,7 +557,7 @@ mod native_team {
     }
 
     #[test]
-    #[ignore = "controller-only pinned model: complete scoring, compact inputs and retained replay across serial/2/4 worker schedules"]
+    #[ignore = "controller-only pinned model: complete scoring, compact inputs and retained replay across serial, CPU-team and layer-major prompt schedules"]
     fn all_scored_jobs_keep_exact_results_and_lifetime_work_across_physical_width_changes() {
         assert!(crate::installed_process_resources().is_none(), "requires a fresh process");
         let source = PathBuf::from(std::env::var("FNLP_INT4_TEST_SOURCE_DIR").expect("explicit pinned source"));
