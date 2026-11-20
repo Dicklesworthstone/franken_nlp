@@ -72,6 +72,48 @@ fn full_population_context_and_sampler_coexist_in_the_same_admission() {
     assert!(envelope.result_bytes < job.max_result_bytes as u64);
 }
 
+fn prefill(rows: usize) -> Int4PrefillLimits {
+    Int4PrefillLimits { max_batch_rows: rows,
+        max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap() }
+}
+
+#[test]
+fn prompt_morsels_add_workspace_without_changing_kv_or_input_ownership() {
+    let (task, envelope, job, host) = fixture();
+    for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
+        let plain = requirements(WIDTH, task, envelope, job, host, input).unwrap();
+        for rows in [1, 3, 4, 64] {
+            let prefill = prefill(rows);
+            let selected = with_prefill_workspace(
+                requirements(WIDTH, task, envelope, job, host, input).unwrap(), Some(prefill)).unwrap();
+            assert_eq!(selected.workspace_bytes, plain.workspace_bytes + prefill.max_extra_scratch_bytes);
+            assert_eq!(selected.native, plain.native);
+            assert_eq!(selected.input_bytes, plain.input_bytes);
+        }
+        let selected = with_prefill_workspace(
+            requirements(WIDTH, task, envelope, job, host, input).unwrap(), None).unwrap();
+        assert_eq!(selected.workspace_bytes, plain.workspace_bytes);
+    }
+}
+
+#[test]
+fn invalid_prompt_rows_underfunded_payload_and_combined_overflow_refuse_the_quote() {
+    let (task, envelope, job, host) = fixture();
+    let base = || requirements(WIDTH, task, envelope, job, host, JobInputMemory::RetainedRecord).unwrap();
+    for rows in [0, 65, usize::MAX] {
+        assert!(with_prefill_workspace(base(), Some(Int4PrefillLimits {
+            max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX })).is_err());
+    }
+    let mut short = prefill(4); short.max_extra_scratch_bytes -= 1;
+    assert!(with_prefill_workspace(base(), Some(short)).is_err());
+    for axis in 0..3 {
+        let mut excess = base();
+        match axis { 0 => excess.workspace_bytes = u64::MAX,
+            1 => excess.input_bytes = u64::MAX, _ => excess.native.kv_bytes = u64::MAX }
+        assert!(with_prefill_workspace(excess, Some(prefill(4))).is_err());
+    }
+}
+
 #[test]
 fn looser_or_tighter_context_and_kv_cannot_change_the_frozen_recipe() {
     for axis in 0..6 {
@@ -195,6 +237,7 @@ fn owned_population_factory_and_native_result_fit_the_existing_blocking_boundary
     send::<GenerationCompletion<Cursor<Vec<u8>>>>();
     send::<crate::tasks::chat::grouped_int4::Int4ChatResult>();
     let _entry = NlpEngine::job_int4_generation::<Cursor<Vec<u8>>>;
+    let _prefill_entry = NlpEngine::job_int4_generation_layer_major::<Cursor<Vec<u8>>>;
     let _team_entry = NlpEngine::job_int4_generation_with_threads::<Cursor<Vec<u8>>>;
 }
 
@@ -220,6 +263,7 @@ mod team {
     struct Observation {
         reads: AtomicUsize, drops: AtomicUsize,
         input_bytes_at_drop: AtomicU64, worker_bytes_at_read: AtomicU64,
+        scratch_bytes_at_read: AtomicU64, scratch_bytes_at_drop: AtomicU64,
     }
     struct Reader {
         resources: Arc<EngineResources>, observation: Arc<Observation>,
@@ -231,6 +275,9 @@ mod team {
             let bytes = snapshot.by_class.get(&MemoryClass::JobBuffers)
                 .map_or(0, |value| value.committed_bytes + value.reserved_bytes);
             self.observation.input_bytes_at_drop.store(bytes, Ordering::SeqCst);
+            let scratch = snapshot.by_class.get(&MemoryClass::ActivationScratch)
+                .map_or(0, |value| value.committed_bytes + value.reserved_bytes);
+            self.observation.scratch_bytes_at_drop.store(scratch, Ordering::SeqCst);
             self.observation.drops.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -246,6 +293,9 @@ mod team {
             let bytes = snapshot.by_class.get(&MemoryClass::ActivationScratch)
                 .map_or(0, |value| value.committed_bytes);
             self.observation.worker_bytes_at_read.store(bytes, Ordering::SeqCst);
+            let scratch = snapshot.by_class.get(&MemoryClass::ActivationScratch)
+                .map_or(0, |value| value.committed_bytes + value.reserved_bytes);
+            self.observation.scratch_bytes_at_read.store(scratch, Ordering::SeqCst);
             match self.action {
                 ReadAction::Refuse => panic!("refused job read private input"),
                 ReadAction::Panic => panic!("synthetic input panic"),
@@ -292,9 +342,21 @@ mod team {
         assert_eq!(closures.wrapper_cancelled_closures, 0);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn execute(host: &NlpEngine, model: &ResidentInt4, planner: Int4GenerationJobPlanner,
+        request: SourceJobRequest, limits: JobHostLimits, reader: Reader,
+        stop: CancellationToken, prefill: Option<Int4PrefillLimits>) -> Result<JobProgress, HostedJobError> {
+        match prefill {
+            None => host.job_int4_generation_with_threads(model, planner, request, limits,
+                PackedInt4Kernel::scalar(), 3, reader, stop),
+            Some(prefill) => host.job_int4_generation_layer_major(model, planner, request, limits,
+                PackedInt4Kernel::scalar(), prefill, reader, stop),
+        }
+    }
+
     #[test]
     #[ignore = "controller-only real runtime: tiny weights test admission/ownership/drain, never model or durable-result parity"]
-    fn durable_text_team_rejects_before_input_and_drains_cancelled_or_panicked_readers() {
+    fn durable_text_schedules_reject_before_input_and_drain_cancelled_or_panicked_readers() {
         let host = NlpEngine::builder().resource_config(ResourceHostConfig {
             runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
             max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 2,
@@ -310,24 +372,28 @@ mod team {
         let model = ResidentInt4 { inner: Arc::new(ResidentModel { loaded, lease: model_lease }) };
         let baseline = host.resources().memory_snapshot();
         use DecodeCancellationKind::*;
-        for task in [GenerationJobTask::Generate, GenerationJobTask::Chat] {
+        for prefill in [None, Some(prefill(4))] { for task in [GenerationJobTask::Generate, GenerationJobTask::Chat] {
             for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
                 ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
                 let (planner, request, limits) = planner(&model, task);
                 let charge = limits.required_buffer_bytes(request.limits).unwrap();
                 let stop = CancellationToken::default(); stop.cancel(cause);
                 let (reader, observed) = reader(&host, ReadAction::Refuse, stop.clone());
-                let error = host.job_int4_generation_with_threads(&model, planner, request, limits,
-                    PackedInt4Kernel::scalar(), 3, reader, stop).err().unwrap();
+                let error = execute(&host, &model, planner, request, limits,
+                    reader, stop, prefill).err().unwrap();
                 let HostedJobError::Host(HostedError::Stopped { stop, .. }) = error
                     else { panic!("job pre-cancellation lost its typed cause"); };
                 assert_eq!(stop.kind, cause);
                 assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
                 assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
                 assert!(observed.input_bytes_at_drop.load(Ordering::SeqCst) >= PREPARATION + charge);
+                if let Some(prefill) = prefill {
+                    assert!(observed.scratch_bytes_at_drop.load(Ordering::SeqCst)
+                        >= prefill.max_extra_scratch_bytes);
+                }
                 drained(&host, &baseline);
             }
-        }
+        } }
         for width in [0, 1, 4, 65, usize::MAX] {
             let (planner, request, limits) = planner(&model, GenerationJobTask::Generate);
             let stop = CancellationToken::default();
@@ -339,13 +405,38 @@ mod team {
             assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
             drained(&host, &baseline);
         }
-        for action in [ReadAction::Cancel(Deadline), ReadAction::Panic, ReadAction::Empty] {
+        for invalid in [Int4PrefillLimits { max_batch_rows: 0, max_extra_scratch_bytes: u64::MAX },
+            Int4PrefillLimits { max_batch_rows: 65, max_extra_scratch_bytes: u64::MAX },
+            Int4PrefillLimits { max_batch_rows: 4, max_extra_scratch_bytes: prefill(4).max_extra_scratch_bytes - 1 }] {
+            let (planner, request, limits) = planner(&model, GenerationJobTask::Generate);
+            let stop = CancellationToken::default();
+            let (reader, observed) = reader(&host, ReadAction::Refuse, stop.clone());
+            assert!(host.job_int4_generation_layer_major(&model, planner, request, limits,
+                PackedInt4Kernel::scalar(), invalid, reader, stop).is_err());
+            assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
+            assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+            drained(&host, &baseline);
+        }
+        // The shared runner also refuses the combination before reservations,
+        // even though no public entrypoint exposes a team+prefill schedule.
+        {
+            let (planner, request, limits) = planner(&model, GenerationJobTask::Generate);
+            let stop = CancellationToken::default();
+            let (reader, observed) = reader(&host, ReadAction::Refuse, stop.clone());
+            let error = host.run_int4_generation_job(&model, planner, request, limits,
+                PackedInt4Kernel::scalar(), Some(prefill(4)), Some(3), reader, stop).err().unwrap();
+            assert!(matches!(error, HostedJobError::Host(HostedError::Limits(_))));
+            assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
+            assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+            drained(&host, &baseline);
+        }
+        for prefill in [None, Some(prefill(4))] { for action in [ReadAction::Cancel(Deadline), ReadAction::Panic, ReadAction::Empty] {
             let (planner, request, limits) = planner(&model, GenerationJobTask::Chat);
             let charge = limits.required_buffer_bytes(request.limits).unwrap();
             let stop = CancellationToken::default();
             let (reader, observed) = reader(&host, action, stop.clone());
-            let error = host.job_int4_generation_with_threads(&model, planner, request, limits,
-                PackedInt4Kernel::scalar(), 3, reader, stop).err().unwrap();
+            let error = execute(&host, &model, planner, request, limits,
+                reader, stop, prefill).err().unwrap();
             match action {
                 ReadAction::Cancel(cause) => {
                     let HostedJobError::Host(HostedError::Stopped { stop, .. }) = error
@@ -360,11 +451,24 @@ mod team {
             }
             assert_eq!(observed.reads.load(Ordering::SeqCst), 1);
             assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
-            assert!(observed.worker_bytes_at_read.load(Ordering::SeqCst)
-                >= int4_task_team_workspace_bytes(3, 4).unwrap());
+            match prefill {
+                None => assert!(observed.worker_bytes_at_read.load(Ordering::SeqCst)
+                    >= int4_task_team_workspace_bytes(3, 4).unwrap()),
+                Some(prefill) => {
+                    assert!(observed.scratch_bytes_at_read.load(Ordering::SeqCst)
+                        >= prefill.max_extra_scratch_bytes);
+                    // Ordinary completion retains pending native claims until
+                    // after input drops. A pre-native reader panic can unwind
+                    // those pending claims first; no native buffer exists yet.
+                    if !matches!(action, ReadAction::Panic) {
+                        assert!(observed.scratch_bytes_at_drop.load(Ordering::SeqCst)
+                            >= prefill.max_extra_scratch_bytes);
+                    }
+                }
+            }
             assert!(observed.input_bytes_at_drop.load(Ordering::SeqCst) >= PREPARATION + charge);
             drained(&host, &baseline);
-        }
+        } }
         drop(model); drop(preparation); drop(lease);
         drained(&host, &idle);
     }

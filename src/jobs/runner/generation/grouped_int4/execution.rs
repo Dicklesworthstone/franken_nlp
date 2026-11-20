@@ -1,5 +1,6 @@
 //! One resident engine, complete guarded result and nonrefundable work debit.
 use super::*;
+use crate::native_engine::strict_int4::prefill::Int4PrefillLimits;
 
 pub struct Int4GenerationAdmission<'a> {
     pub identity: &'a ExecutionIdentity,
@@ -19,13 +20,26 @@ pub struct Int4GenerationJobProcessor<'p, 'e, 'w, A: Int4GenerationBatchAdmissio
     planner: &'p Int4GenerationJobPlanner,
     engine: &'e mut StrictInt4Engine<'w>,
     admission: A,
+    prefill: Option<Int4PrefillLimits>,
     ledger: Ledger,
 }
 impl<'p, 'e, 'w, A: Int4GenerationBatchAdmission> Int4GenerationJobProcessor<'p, 'e, 'w, A> {
     pub fn new(planner: &'p Int4GenerationJobPlanner, engine: &'e mut StrictInt4Engine<'w>, admission: A)
         -> Result<Self, BatchFault> {
         check_capacity(planner, engine).map_err(|error| error.fault)?;
-        Ok(Self { planner, engine, admission, ledger: Ledger::default() })
+        Ok(Self { planner, engine, admission, prefill: None, ledger: Ledger::default() })
+    }
+    /// Use bounded layer-major prompt morsels with the same addressed decode,
+    /// complete-result finalizer and nonrefundable durable work reservation.
+    /// The caller must separately admit the validated extra prompt workspace.
+    /// This physical schedule is not part of the immutable semantic recipe.
+    pub fn new_layer_major(planner: &'p Int4GenerationJobPlanner,
+        engine: &'e mut StrictInt4Engine<'w>, admission: A, prefill: Int4PrefillLimits)
+        -> Result<Self, BatchFault> {
+        prefill.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        let mut processor = Self::new(planner, engine, admission)?;
+        processor.prefill = Some(prefill);
+        Ok(processor)
     }
 }
 impl<A: Int4GenerationBatchAdmission> BatchProcessor for Int4GenerationJobProcessor<'_, '_, '_, A> {
@@ -72,8 +86,12 @@ impl<A: Int4GenerationBatchAdmission> BatchProcessor for Int4GenerationJobProces
         prepared.native.verify_identity(&admitted).map_err(|error| failure(error, BatchCode::Admission))?;
         // Delivery uses the ORIGINAL job ordinal. Native addressed draws use
         // the unchanged original item ID, sample index and fixed effective seed.
-        let output = prepared.native.execute(&admitted, self.engine, context.request_seq,
-            self.planner.native_limits(), control).map_err(|error| failure(error, BatchCode::Execution))?;
+        let output = match self.prefill {
+            None => prepared.native.execute(&admitted, self.engine, context.request_seq,
+                self.planner.native_limits(), control),
+            Some(prefill) => prepared.native.execute_layer_major(&admitted, self.engine,
+                context.request_seq, self.planner.native_limits(), prefill, control),
+        }.map_err(|error| failure(error, BatchCode::Execution))?;
         if output.schema_version != 1 || output.result.schema_version != 1
             || output.result.task != self.planner.recipe.task.identity()
             || output.result.request_seq != context.request_seq || output.result.sample_index != prepared.sample_index

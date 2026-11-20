@@ -4,7 +4,7 @@ use crate::{
     jobs::{JobWork, runner::generation::grouped_int4::{Int4GenerationAdmission,
         Int4GenerationBatchAdmission, Int4GenerationJobPlanner, Int4GenerationJobProcessor}},
     native_engine::{generation::grouped_int4::Int4GenerationBudget,
-        strict_int4::projection::Int4ProjectionExecutor},
+        strict_int4::{prefill::Int4PrefillLimits, projection::Int4ProjectionExecutor}},
 };
 
 struct GenerationInput<R> {
@@ -29,6 +29,7 @@ struct GenerationExecution<R> {
     kv: Pending,
     scratch: Pending,
     envelope: GenerationEnvelope,
+    prefill: Option<Int4PrefillLimits>,
     limits: JobHostLimits,
     required: Int4MemoryRequirement,
     lease: EngineLease,
@@ -61,7 +62,26 @@ impl NlpEngine {
         request: SourceJobRequest, limits: JobHostLimits, kernel: PackedInt4Kernel,
         reader: R, cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        self.run_int4_generation_job(model, planner, request, limits, kernel, None, reader, cancellation)
+        self.run_int4_generation_job(model, planner, request, limits, kernel, None, None, reader, cancellation)
+    }
+
+    /// Start or resume the same authenticated generation/chat job with bounded
+    /// layer-major prompt morsels. Additional prompt workspace is charged
+    /// alongside the complete input, KV, sampler and journal envelope before
+    /// reading private input. Decode and complete-result publication retain
+    /// their original addressed samples, native work and delivery ordinals.
+    ///
+    /// Prompt row width is physical scheduling only and may change on resume;
+    /// it neither changes the frozen recipe nor refunds lifetime work. This
+    /// route uses one coordinator and does not combine prefill with a CPU team.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int4_generation_layer_major<R>(&self, model: &ResidentInt4,
+        planner: Int4GenerationJobPlanner, request: SourceJobRequest, limits: JobHostLimits,
+        kernel: PackedInt4Kernel, prefill: Int4PrefillLimits, reader: R,
+        cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        self.run_int4_generation_job(model, planner, request, limits, kernel,
+            Some(prefill), None, reader, cancellation)
     }
 
     /// Run the same durable generation/chat job on one persistent team of
@@ -82,15 +102,19 @@ impl NlpEngine {
         cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
         self.run_int4_generation_job(model, planner, request, limits, kernel,
-            Some(compute_threads), reader, cancellation)
+            None, Some(compute_threads), reader, cancellation)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn run_int4_generation_job<R>(&self, model: &ResidentInt4, planner: Int4GenerationJobPlanner,
         request: SourceJobRequest, limits: JobHostLimits, kernel: PackedInt4Kernel,
-        compute_threads: Option<usize>, reader: R, cancellation: CancellationToken)
+        prefill: Option<Int4PrefillLimits>, compute_threads: Option<usize>, reader: R,
+        cancellation: CancellationToken)
         -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
+        if prefill.is_some() && compute_threads.is_some() {
+            return Err(HostedError::Limits("INT4 generation job team/prefill schedule").into());
+        }
         match compute_threads {
             Some(width) => dispatch::preflight_int4_team(self, limits.native.run, width)?,
             None => dispatch::preflight(self, limits.native.run)?,
@@ -110,10 +134,10 @@ impl NlpEngine {
             native: planner.native_limits(), lifetime: request.limits.max_work,
             result_bytes: planner.max_result_bytes(), output_tokens: planner.output_token_ceiling(),
         };
-        let required = with_encoding_workspace(
+        let required = with_prefill_workspace(with_encoding_workspace(
             requirements(planner.group_width(), planner.task_budget(), envelope,
                 request.limits, limits, request.mode.input_memory())?,
-            planner.encoding_workspace_bytes())?;
+            planner.encoding_workspace_bytes())?, prefill)?;
         // The dispatcher owns and charges this additional worker storage.
         // Check the simultaneous quote before reserving or reading input.
         let team_scratch = compute_threads.map(|width|
@@ -125,7 +149,7 @@ impl NlpEngine {
             || Ok(GenerationInput { preparation: Some((planner, request)), reader }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes)?;
-        let execution = GenerationExecution { input, kv, scratch, envelope, limits,
+        let execution = GenerationExecution { input, kv, scratch, envelope, prefill, limits,
             required: required.native, lease };
         let model = model.clone();
         let completed = match compute_threads {
@@ -151,7 +175,7 @@ impl<R: BufRead> GenerationExecution<R> {
     fn run<'weights>(self, weights: &'weights Int4ModelWeights, kernel: PackedInt4Kernel,
         projection: Option<&'weights mut (dyn Int4ProjectionExecutor + 'weights)>,
         control: &mut RunControl) -> Result<GenerationCompletion<R>, HostedError> {
-        let Self { mut input, kv, scratch, envelope, limits, required, lease } = self;
+        let Self { mut input, kv, scratch, envelope, prefill, limits, required, lease } = self;
         checkpoint(control)?;
         let (planner, request) = input.value.preparation.take()
             .ok_or(HostedError::CompletionMissing)?;
@@ -178,8 +202,11 @@ impl<R: BufRead> GenerationExecution<R> {
         let admission = GenerationAdmission { lease: &lease, model: weights.identity(),
             base: planner.execution_identity(), envelope };
         let result = (|| {
-            let processor = Int4GenerationJobProcessor::new(&planner, &mut engine.value, admission)
-                .map_err(JobRunError::Processor)?;
+            let processor = match prefill {
+                None => Int4GenerationJobProcessor::new(&planner, &mut engine.value, admission),
+                Some(prefill) => Int4GenerationJobProcessor::new_layer_major(
+                    &planner, &mut engine.value, admission, prefill),
+            }.map_err(JobRunError::Processor)?;
             run_population(request, &population, processor, control)
         })();
         let ChargedNative { value, _kv, _scratch } = engine;
@@ -196,6 +223,14 @@ impl<R: BufRead> GenerationExecution<R> {
 fn with_encoding_workspace(mut required: Requirements, workspace: u64)
     -> Result<Requirements, HostedError> {
     required.input_bytes = sum(&[required.input_bytes, workspace])?;
+    sum(&[required.input_bytes, required.native.kv_bytes, required.workspace_bytes])?;
+    Ok(required)
+}
+
+fn with_prefill_workspace(mut required: Requirements, prefill: Option<Int4PrefillLimits>)
+    -> Result<Requirements, HostedError> {
+    required.workspace_bytes = super::super::super::prefill::with_extra_workspace(
+        required.workspace_bytes, prefill)?;
     sum(&[required.input_bytes, required.native.kv_bytes, required.workspace_bytes])?;
     Ok(required)
 }
