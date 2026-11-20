@@ -36,6 +36,8 @@ use crate::{
 };
 use super::{SentimentAxis, SentimentRequest};
 
+pub mod long;
+
 pub const SAMPLED_SENTIMENT_EXECUTION: &str = "grouped-int4-independent-sampled-sentiment-v1";
 pub const SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION: &str = "grouped-int4-independent-sampled-sentiment-reused-prefill-v1";
 pub const SAMPLED_SENTIMENT_PROMPT_VERSION: &str = "sentiment-sampled-score-justification-v1";
