@@ -130,13 +130,49 @@ reuse remains inside the current chunk and axis; no KV crosses a chunk
 boundary. Original typed cancellation causes propagate through partitioning,
 hashing, generation, reduction and result verification.
 
+## Owned runtime API
+
+With `asupersync-runtime`, `NlpEngine` exposes:
+
+- `map_int4_sampled_sentiment`
+- `map_int4_sampled_sentiment_with_encoding`
+- `map_int4_sampled_sentiment_with_threads`
+- `map_int4_sampled_sentiment_with_encoding_and_threads`
+
+Each method takes one owned request and `SampledSentimentMapHostConfig` beside
+the resident candidate, checked integer kernel and cancellation token. The
+config contains the native context/deadline, per-chunk planning and sampling
+settings, complete map limits, preparation and sampler reserves, complete
+mask ceiling, optional `Int4PrefillLimits`, and explicit `reuse_prefill`.
+`requirements` and `requirements_with_encoding` quote the complete host
+envelope without opening a model or source.
+
+The host owns the complete request before constructing the pinned planner and
+vocabulary. It prepares and admits every chunk, then allocates one native
+engine for the whole document. Serial execution and layer-major prompts use
+that same engine. A persistent numerical team instead remains attached across
+every chunk, axis and sample. Team execution and layer-major prompt rows are
+separate schedules and cannot be combined. Same-axis prompt reuse is supported
+on either schedule, always isolated to the current chunk and axis.
+
+Input, KV and workspace charges remain alive through physical dispatcher
+completion and worker join. Only then does the host release those owners and
+return a guarded complete output; its output reservation remains live with
+the result. Every successful return verifies the complete private result seal
+and all 44 empty KV slots. A cancellation or failure returns no partial
+document, and the original cancellation cause survives the host boundary.
+
 ## Validation status
 
 Regression definitions cover complete Unicode/CRLF source coverage, canonical
 axes, repeated-text address separation, each complete native-work ceiling,
 all-chunk mask admission, cumulative compact-tokenizer work, exact scalar
 weighting, incomplete and inconsistent chunk bundles, all eleven cancellation
-causes, memory bounds and private completion seals.
+causes, memory bounds and private completion seals. Hosted regression sources
+also cover excess retained request capacity, shared sampler/encoder/prefill
+storage, exact complete output reservations, public API ownership, and an
+ignored fresh-runtime fixture for cancellation and full physical drain under
+six serial/team/prefill/reuse combinations.
 
 These are authored test definitions and source review, not executed test or
 native-model evidence. Compilation, controller production DSR validation,

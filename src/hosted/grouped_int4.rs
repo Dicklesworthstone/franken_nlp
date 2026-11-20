@@ -21,7 +21,7 @@ mod sentiment;
 pub use sentiment::{Int4SentimentHostLimits, Int4SentimentMapHostConfig,
     int4_sentiment_document_corpus_requirements};
 mod sampled_sentiment;
-pub use sampled_sentiment::SampledSentimentHostLimits;
+pub use sampled_sentiment::{SampledSentimentHostLimits, SampledSentimentMapHostConfig};
 #[cfg(all(feature = "metadata-store", target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub use sampled_sentiment::{SampledSentimentJobRequirements, int4_sampled_sentiment_job_requirements};
@@ -126,6 +126,7 @@ pub enum Int4HostError {
     ClassificationMap(crate::tasks::classify::grouped_int4::long::Int4ClassificationMapError),
     Sentiment(crate::tasks::sentiment::grouped_int4::Int4SentimentError),
     SampledSentiment(crate::tasks::sentiment::sampled::SampledSentimentError),
+    SampledSentimentMap(crate::tasks::sentiment::sampled::long::SampledSentimentMapError),
     SentimentMap(crate::tasks::sentiment::grouped_int4::long::Int4SentimentMapError),
     Judge(crate::tasks::judge::grouped_int4::Int4JudgeError),
     FaithfulnessMap(crate::tasks::judge::grouped_int4::faithfulness_map::Int4FaithfulnessMapError),
@@ -154,6 +155,7 @@ impl fmt::Display for Int4HostError {
             Self::ClassificationMap(_) => "INT4 complete-document classification mapping or aggregation refused",
             Self::Sentiment(_) => "INT4 sentiment execution or finalization refused",
             Self::SampledSentiment(_) => "INT4 sampled sentiment execution or finalization refused",
+            Self::SampledSentimentMap(_) => "INT4 complete-document sampled sentiment mapping or aggregation refused",
             Self::SentimentMap(_) => "INT4 complete-document sentiment mapping or aggregation refused",
             Self::Judge(_) => "INT4 complete judgment execution or finalization refused",
             Self::FaithfulnessMap(_) => "INT4 complete-source faithfulness mapping or evidence reduction refused",
@@ -182,6 +184,7 @@ impl Error for Int4HostError {
             Self::ClassificationMap(e) => Some(e),
             Self::Sentiment(e) => Some(e), Self::SentimentMap(e) => Some(e),
             Self::SampledSentiment(e) => Some(e),
+            Self::SampledSentimentMap(e) => Some(e),
             Self::Judge(e) => Some(e), Self::FaithfulnessMap(e) => Some(e), Self::Resolution(e) => Some(e),
             Self::Entities(e) => Some(e), Self::Redaction(e) => Some(e),
             Self::Extraction(e) => Some(e), Self::ExtractionMap(e) => Some(e), Self::SourceTask(e) => Some(e),
