@@ -40,6 +40,7 @@ impl NlpEngine {
         -> Result<HostedOutput<Int8ExtractionMapRun>, HostedError> {
         dispatch::preflight(self, config.native.run)?;
         self.check_resident_domain(model)?;
+        planner.require_byte_encoding().map_err(HostedError::BatchSetup)?;
         let identity = planner.base_execution_identity();
         check_model_identity(model.artifact_identity(), identity)?;
         let required = requirements(config.native)?;

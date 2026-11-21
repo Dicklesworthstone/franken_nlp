@@ -51,9 +51,9 @@ fn stream_work_is_the_sum_of_independent_contexts_and_never_a_long_context() {
 }
 
 #[test]
-fn compact_source_corpora_preserve_whole_run_native_and_mask_ceilings() {
+fn compact_schema_and_source_corpora_preserve_whole_run_native_and_mask_ceilings() {
     use crate::tokenizer::untrusted::UntrustedEncoding;
-    for task in ["ner", "keyphrases", "summarize", "answer"] {
+    for task in ["ner", "keyphrases", "summarize", "answer", "extract"] {
         let byte = command(task, &["--max-requests", "3"]);
         let compact = command(task, &["--max-requests", "3", "--input-encoding", "safe-bpe-v1"]);
         let (_, _, original) = byte.validate().unwrap();
@@ -78,11 +78,33 @@ fn invalid_compact_corpus_policies_refuse_before_owned_stream_access() {
     for (task, flags) in [
         ("ner", vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "0"]),
         ("answer", vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-bytes", "0"]),
-        ("extract", vec!["--input-encoding", "safe-bpe-v1"]),
+        ("extract", vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "0"]),
+        ("extract", vec!["--input-encoding", "safe-bpe-v1", "--max-input-bytes", "851968"]),
         ("extract", vec!["--chunked", "--schema", "must-not-open.json", "--input-encoding", "safe-bpe-v1"]),
     ] {
         assert_eq!(command(task, &flags).execute_owned(NoIo, NoIo), Err(CandidateError::Arguments));
     }
+}
+
+#[test]
+fn compact_extraction_admits_schema_and_source_together_before_private_io() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    let cmd = command("extract", &["--input-encoding", "safe-bpe-v1", "--schema", "must-not-open"]);
+    let (_, limits, _) = cmd.validate().unwrap();
+    let UntrustedEncoding::SafeBpeV1(policy) = cmd.encoding_policy(limits).unwrap() else { panic!("wrong encoding"); };
+    assert_eq!(policy.max_input_bytes, cmd.host.max_input_bytes + extract::SCHEMA_BYTES);
+    assert_eq!(policy.max_output_tokens, limits.max_prompt_tokens);
+    let mut large = command("extract", &["--input-encoding", "safe-bpe-v1",
+        "--max-input-bytes", "1048576", "--preparation-mib", "1024"]);
+    let (_, limits, _) = large.validate().unwrap();
+    let UntrustedEncoding::SafeBpeV1(policy) = large.encoding_policy(limits).unwrap() else { panic!("wrong encoding"); };
+    assert_eq!(policy.max_input_bytes, SafeBpeLimits::MAX_INPUT_BYTES);
+    large.host.max_input_bytes = 851968;
+    large.host.preparation_mib = 512;
+    // Document-only admission fits. The complete schema/source quote must
+    // still reject before either a shared schema or the NDJSON stream opens.
+    assert!(large.host.common_with_encoding(large.input.clone(), &large.encoding).is_ok());
+    assert!(large.validate().is_err());
 }
 #[test]
 fn every_native_work_axis_uses_checked_scaling() {

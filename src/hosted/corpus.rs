@@ -132,7 +132,9 @@ impl NlpEngine {
         }
         let required = requirements(limits.native)?;
         let lease = self.resources().acquire_lease();
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, limits.reservation_bytes()?)?,
+        let buffers = sum(&[limits.reservation_bytes()?,
+            planner.encoding_workspace_bytes().map_err(HostedError::BatchSetup)?])?;
+        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, buffers)?,
             || Ok(StreamInput { planner: Some((planner, vocabulary)), reader, writer }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
         let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch,

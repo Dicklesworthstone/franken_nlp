@@ -67,14 +67,48 @@ No fabricated empty/example source stands in for a future record, and setup
 success never certifies a schema's source membership. Per-record overrides
 undergo the same actual native preparation and admission checks.
 
+## Compact schema and source input
+
+```sh
+fnlp candidate batch corpus.ndjson --task extract --schema schema.json \
+  --model ./model.fnlpq --memory-mib 8192 --max-requests 1000 \
+  --input-encoding safe-bpe-v1 \
+  --max-tokenizer-pair-checks 4194304 --max-tokenizer-pair-bytes 67108864
+```
+
+This explicit policy uses the existing byte-preserving, control-excluding
+encoder for both schema and source. One allowance covers their combined input
+bytes, produced tokens, pair comparisons and examined pair bytes in each
+record. The combined byte ceiling is `--max-input-bytes` plus the 64-KiB schema
+allowance, capped at 1 MiB; the separate schema and document ceilings still
+apply. Shared defaults and complete per-record overrides use the same policy.
+Exact schema numbers, source bytes and original citation coordinates survive
+encoding. A refusal does not renew the allowance between segments or retry
+with another encoder.
+
+The complete encoder workspace and original schema storage are priced before
+private schema/corpus/model IO. The hosted corpus additionally reserves the
+configured encoder workspace through physical completion. Record count bounds
+repeated preparation; native work and masks retain the whole-stream ledger.
+Every compact frame reports the policy in `input_encoding`, including errors,
+flush and terminal events. The policy and all four limits also enter the
+prepared extraction identity, even when a limit change leaves token IDs equal.
+
+Byte fallback remains the default and keeps its existing frame shape. Compact
+encoding changes prompt tokens and may change model output; it makes no
+quality, parity or measured-speed claim. `--chunked` still rejects this
+per-record compact policy before IO because complete-document probes and
+replanning need a separate cumulative accounting contract.
+
 ## Lifetime, budgets and output
 
 The command transfers owned buffered IO into one existing hosted corpus call.
 The CLI holds no stdin/stdout locks while waiting for that worker. Preparation,
 IO, weights, KV, workspace and output remain charged through physical completion
-and delivery. Preparation now checkpoints the same corpus controller around
-bounded tokenizer/grammar work; it does not reset a deadline or claim to preempt
-blocking IO or an in-progress compiler operation.
+and delivery. Preparation uses the same corpus controller during tokenizer
+work, source-index construction and final identity sealing. All cancellation
+causes remain terminal with their original attribution. This does not reset
+a deadline or claim to preempt arbitrary blocking IO.
 
 All five model-work counters, grammar-mask visits, input/output bytes and
 request counts retain their existing nonrenewable corpus ceilings. Flush resets
@@ -95,8 +129,10 @@ no retry or extra terminal frame is appended to an unknown output prefix.
 
 Added regression sources exercise task routing, conflicting flags, exact schema
 bytes and decimals, configuration/schema rejection, every budget axis, full KV
-pricing, per-record overrides, actual per-document source binding, feature-off
-no-IO behavior and unchanged aggregate/framing accounting. They do not simulate
+pricing, per-record overrides, actual per-document source binding, compact
+schema/source allowances, fixed policy identities, invocation-work refusal,
+source-index cancellation, feature-off no-IO behavior and unchanged aggregate/
+framing accounting. They do not simulate
 successful native model inference. Compilation, Rust tests, real-model runs,
 quality/performance and controller DSR qualification were not executed in this
 session. Existing artifact, numerical and release gates remain independent.

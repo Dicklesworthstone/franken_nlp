@@ -68,8 +68,10 @@ and reused within the existing preparation reservation. Work-limit exhaustion
 is a failed document, without automatic byte fallback. Every compact wrapper,
 including empty-input and terminal frames, reports the exact `input_encoding`
 policy; the actual source planner binds it into each prepared identity. Default
-byte-fallback frames remain unchanged. The extraction and chunked routes still
-require byte fallback and reject compact options before IO. Compact prompt
+byte-fallback frames remain unchanged. Single-context extraction also accepts
+compact input, with one combined schema/source allowance as documented in
+[schema extraction corpora](candidate-extraction-batch-cli.md). Chunked
+extraction still requires byte fallback and rejects compact options before IO. Compact prompt
 tokens may change model output; this is not a parity, quality or speed claim.
 
 ## Output and exit status

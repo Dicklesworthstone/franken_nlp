@@ -57,6 +57,7 @@ impl<'p, 'e, 'w, 'v, A: ExtractionDocumentBatchAdmission>
     pub fn new(planner: &'p Int8ExtractionBatchPlanner, config: ExtractionDocumentBatchConfig,
         engine: &'e mut StrictInt8Engine<'w>, vocabulary: &'v ExtractionVocabulary, admission: A)
         -> Result<Self, BatchFault> {
+        planner.require_byte_encoding()?;
         config.validate()?;
         let driver = NativeDriver { engine, vocabulary };
         capacity(&driver, &config).map_err(|e| e.fault)?;

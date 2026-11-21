@@ -45,27 +45,12 @@ impl ExtractCommand {
         self.head.limits()?;
         check_schema_path(&self.schema)?;
         let (args, limits) = self.host.common_with_encoding(self.input.clone(), &self.encoding)?;
-        let encoder_bytes = match self.encoding_policy(limits)? {
-            crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback => 0,
-            crate::tokenizer::untrusted::UntrustedEncoding::SafeBpeV1(policy) => policy.requirements()
-                .map_err(|_| CandidateError::Arguments)?.workspace_bytes,
-        };
-        // The source host prices the document-only encoder. Its complete
-        // replacement quote and the original schema coexist with retained
-        // source, grammar and result storage until output delivery finishes.
-        let floor = (256 * MIB).checked_add(self.host.max_input_bytes as u64 * 32)
-            .and_then(|n| n.checked_add(SCHEMA_BYTES as u64 * 32))
-            .and_then(|n| n.checked_add(self.host.max_result_bytes as u64 * 16))
-            .and_then(|n| n.checked_add(encoder_bytes)).ok_or(CandidateError::Arguments)?;
-        if limits.preparation_bytes < floor { return Err(CandidateError::Arguments); }
+        validate_preparation(&self.host, &self.encoding_policy(limits)?, limits)?;
         Ok((args, limits))
     }
     pub(super) fn encoding_policy(&self, limits: Limits)
         -> Result<crate::tokenizer::untrusted::UntrustedEncoding, CandidateError> {
-        let bytes = self.host.max_input_bytes.checked_add(SCHEMA_BYTES)
-            .ok_or(CandidateError::Arguments)?
-            .min(crate::tokenizer::untrusted::SafeBpeLimits::MAX_INPUT_BYTES);
-        self.encoding.policy(bytes, limits.max_prompt_tokens)
+        encoding_policy(&self.host, &self.encoding, limits)
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
         let (args, limits) = self.validate()?;
@@ -74,6 +59,34 @@ impl ExtractCommand {
         #[cfg(not(feature = "asupersync-runtime"))]
         { let _ = (self, args, limits, input, output); Err(CandidateError::Unavailable) }
     }
+}
+
+/// The same complete schema/source allowance applies to a single request,
+/// each corpus record, and the per-attempt bound inside an owned job.
+pub(super) fn encoding_policy(host: &SourceHostArgs, encoding: &input_encoding::InputEncodingArgs,
+    limits: Limits) -> Result<crate::tokenizer::untrusted::UntrustedEncoding, CandidateError> {
+    let bytes = host.max_input_bytes.checked_add(SCHEMA_BYTES).ok_or(CandidateError::Arguments)?
+        .min(crate::tokenizer::untrusted::SafeBpeLimits::MAX_INPUT_BYTES);
+    encoding.policy(bytes, limits.max_prompt_tokens)
+}
+
+pub(super) fn validate_preparation(host: &SourceHostArgs,
+    encoding: &crate::tokenizer::untrusted::UntrustedEncoding, limits: Limits) -> Result<(), CandidateError> {
+    let encoder_bytes = match encoding {
+        crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback => 0,
+        crate::tokenizer::untrusted::UntrustedEncoding::SafeBpeV1(policy) => policy.requirements()
+            .map_err(|_| CandidateError::Arguments)?.workspace_bytes,
+    };
+    // The source host prices a document-only encoder. The complete replacement
+    // quote also retains the exact original schema beside source, grammar and
+    // output allocations, before opening any private file or stream.
+    let floor = (256 * MIB).checked_add((host.max_input_bytes as u64).checked_mul(32)
+        .ok_or(CandidateError::Arguments)?)
+        .and_then(|n| n.checked_add(SCHEMA_BYTES as u64 * 32))
+        .and_then(|n| n.checked_add((host.max_result_bytes as u64).checked_mul(16)?))
+        .and_then(|n| n.checked_add(encoder_bytes)).ok_or(CandidateError::Arguments)?;
+    if limits.preparation_bytes < floor { return Err(CandidateError::Arguments); }
+    Ok(())
 }
 
 pub(super) fn check_schema_path(path: &std::path::Path) -> Result<(), CandidateError> {

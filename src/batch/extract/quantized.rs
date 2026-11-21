@@ -12,6 +12,7 @@ use crate::{
         strict_int8::{Int8RunBudget, Int8Work, StrictInt8Engine, StrictInt8Error, STRICT_INT8_PROFILE},
     },
     tasks::extract::quantized::{Int8ExtractError, Int8ExtractPlan, Int8ExtractRun, INT8_EXTRACT_VERSION},
+    tokenizer::untrusted::SafeBpeWorkLimits,
 };
 
 /// Complete-document schema extraction with shared native and reduction budgets.
@@ -19,7 +20,10 @@ pub mod long;
 
 /// Owns the shared prompt compiler privately; no eager planner/plan conversion
 /// or Deref can route a quantized identity through BF16 execution.
-pub struct Int8ExtractionBatchPlanner { compiler: ExtractionBatchPlanner }
+pub struct Int8ExtractionBatchPlanner {
+    compiler: ExtractionBatchPlanner,
+    document_encoding: UntrustedEncoding,
+}
 pub struct PreparedInt8BatchExtraction {
     plan: Int8ExtractPlan,
     task: TaskPlan,
@@ -33,40 +37,96 @@ impl Int8ExtractionBatchPlanner {
         ceiling: TaskBudget, compiler_limits: CompileLimits, source_limits: SourceRuntimeLimits,
         defaults: Option<ExtractionBatchArgs>) -> Result<Self, BatchFault> {
         Ok(Self { compiler: ExtractionBatchPlanner::pinned_for_backend(controls, eos, identity,
-            ceiling, compiler_limits, source_limits, defaults, ExtractionBackend::Int8)? })
+            ceiling, compiler_limits, source_limits, defaults, ExtractionBackend::Int8)?,
+            document_encoding: UntrustedEncoding::ByteFallback })
+    }
+    /// Fix one schema/source encoding for an ordered resident stream. Every
+    /// record spends one allowance across BOTH untrusted segments. The host
+    /// admits its transient workspace before reading or preparing any record.
+    /// Complete-document chunk planners retain their separate byte contract.
+    pub fn with_document_encoding(mut self, policy: UntrustedEncoding) -> Result<Self, BatchFault> {
+        policy.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        self.require_byte_encoding()?;
+        self.document_encoding = policy;
+        Ok(self)
+    }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { &self.document_encoding }
+    pub fn encoding_workspace_bytes(&self) -> Result<u64, BatchFault> {
+        match &self.document_encoding {
+            UntrustedEncoding::ByteFallback => Ok(0),
+            UntrustedEncoding::SafeBpeV1(limits) => limits.requirements()
+                .map(|required| required.workspace_bytes).map_err(|_| BatchCode::InvalidLimits.into()),
+        }
+    }
+    pub(crate) fn require_byte_encoding(&self) -> Result<(), BatchFault> {
+        if self.document_encoding != UntrustedEncoding::ByteFallback {
+            return Err(BatchCode::Admission.into());
+        }
+        Ok(())
     }
     /// Observe the caller's SAME control before and after bounded schema/source
-    /// preparation. No fresh quota/deadline or no-op control is constructed.
-    /// Tokenizer/compiler calls themselves are not internally preemptible.
+    /// preparation, through encoding and source-index construction. No fresh
+    /// quota/deadline or no-op control is constructed.
     pub fn prepare_with_control<C: DecodeStepControl>(&self, document: BatchDocument<ExtractionBatchArgs>,
         control: &mut C) -> Result<PreparedInt8BatchExtraction, BatchItemFailure> {
-        preparation_checkpoint(control)?;
-        let result = self.prepare(document);
-        preparation_checkpoint(control)?;
-        result
+        self.prepare_with_document_encoding(document, &self.document_encoding, control)
     }
     pub fn prepare(&self, document: BatchDocument<ExtractionBatchArgs>) -> Result<PreparedInt8BatchExtraction, BatchItemFailure> {
+        self.require_byte_encoding().map_err(BatchItemFailure::reject)?;
         let input = self.compiler.prepare_input(document).map_err(planning_fault)?;
-        self.prepare_from_input(input)
+        self.prepare_from_input(input, &mut || None)
     }
     /// Explicit one-request encoding; schema and document spend one cumulative
     /// tokenizer allowance and actual tokens determine the native work bound.
-    /// The caller admits the policy's workspace before preparation. Reusing
-    /// this planner for a stream, map or retained job keeps byte-fallback input.
+    /// The caller admits the policy's workspace before preparation. A configured
+    /// stream cannot substitute another policy or renew budgets between segments.
     pub fn prepare_with_document_encoding<C: DecodeStepControl>(&self,
         document: BatchDocument<ExtractionBatchArgs>, policy: &UntrustedEncoding, control: &mut C,
     ) -> Result<PreparedInt8BatchExtraction, BatchItemFailure> {
+        preparation_checkpoint(control)?;
+        if self.document_encoding != UntrustedEncoding::ByteFallback && policy != self.document_encoding() {
+            return Err(BatchItemFailure::reject(BatchCode::Admission));
+        }
         let input = self.compiler.prepare_input_with_encoding(document, policy,
             &mut || control.prefill_checkpoint(0)).map_err(planning_fault)?;
-        let result = self.prepare_from_input(input);
+        let result = self.prepare_from_input(input, &mut || control.prefill_checkpoint(0))?;
         preparation_checkpoint(control)?;
-        result
+        Ok(result)
     }
-    fn prepare_from_input(&self, input: ExtractionInput) -> Result<PreparedInt8BatchExtraction, BatchItemFailure> {
+    /// Retained execution owns one invocation ledger across all preparation,
+    /// including rejected records and reconstruction. Tightened remaining work
+    /// governs admission without changing the fixed policy in successful plans.
+    pub(crate) fn prepare_with_invocation_encoding_work<C: DecodeStepControl>(&self,
+        document: BatchDocument<ExtractionBatchArgs>, used: &mut SafeBpeWork,
+        total: Option<SafeBpeWorkLimits>, control: &mut C,
+    ) -> Result<PreparedInt8BatchExtraction, BatchItemFailure> {
+        let effective = match (self.document_encoding(), total) {
+            (UntrustedEncoding::ByteFallback, None) if *used == SafeBpeWork::default() =>
+                return self.prepare_with_control(document, control),
+            (UntrustedEncoding::SafeBpeV1(call), Some(total)) => {
+                preparation_checkpoint(control)?;
+                UntrustedEncoding::SafeBpeV1(total.remaining_call(*used, *call)
+                    .map_err(|_| BatchItemFailure::fatal(BatchCode::WorkLimit))?)
+            }
+            _ => return Err(BatchItemFailure::fatal(BatchCode::Admission)),
+        };
+        let mut work = SafeBpeWork::default();
+        let input = self.compiler.prepare_input_with_encoding_budget(document,
+            self.document_encoding(), &effective, &mut work, &mut || control.prefill_checkpoint(0));
+        // Failed/cancelled preparation still consumes every completed unit.
+        *used = used.checked_add(work).ok_or_else(|| BatchItemFailure::fatal(BatchCode::WorkLimit))?;
+        let input = input.map_err(planning_fault)?;
+        let result = self.prepare_from_input(input, &mut || control.prefill_checkpoint(0))?;
+        preparation_checkpoint(control)?;
+        Ok(result)
+    }
+    fn prepare_from_input<F: FnMut() -> Option<DecodeCancellationKind>>(&self,
+        input: ExtractionInput, checkpoint: &mut F) -> Result<PreparedInt8BatchExtraction, BatchItemFailure> {
         let ExtractionInput { task, source, schema, options, grounded, encoding, .. } = input;
         let c = &self.compiler;
-        let plan = Int8ExtractPlan::from_builtin_with_encoding(&task, &schema, options, c.compiler_limits,
-            &c.controls, grounded.then_some((&source, c.source_limits)), "extract-v1", c.identity.clone(), &encoding)
+        let plan = Int8ExtractPlan::from_builtin_with_encoding_control(&task, &schema, options, c.compiler_limits,
+            &c.controls, grounded.then_some((&source, c.source_limits)), "extract-v1", c.identity.clone(),
+            &encoding, checkpoint)
             .map_err(planning_failure)?;
         Ok(PreparedInt8BatchExtraction { plan, task, source })
     }
@@ -147,6 +207,20 @@ impl<'e, 'weights, 'v, A: Int8ExtractionBatchAdmission> NativeInt8ExtractionBatc
     pub fn reserved_model_work(&self) -> Int8Work { self.run.reserved }
     pub fn reserved_mask_visits(&self) -> u64 { self.run.mask_visits }
     pub fn is_poisoned(&self) -> bool { self.run.failed || !self.driver.clean() }
+    pub(crate) fn prepare_with_invocation_encoding_work<C: DecodeStepControl>(&mut self,
+        document: BatchDocument<ExtractionBatchArgs>, used: &mut SafeBpeWork,
+        total: Option<SafeBpeWorkLimits>, control: &mut C,
+    ) -> Result<PreparedInt8BatchExtraction, BatchItemFailure> {
+        self.run.ready()?;
+        self.run.failed = true;
+        let result = (|| {
+            let prepared = self.compiler.prepare_with_invocation_encoding_work(document, used, total, control)?;
+            preflight(&prepared, &self.driver)?;
+            Ok(prepared)
+        })();
+        if !result.as_ref().is_err_and(|e: &BatchItemFailure| e.stop) { self.run.failed = false; }
+        result
+    }
 }
 impl<A: Int8ExtractionBatchAdmission> BatchProcessor for NativeInt8ExtractionBatch<'_, '_, '_, A> {
     type Args = ExtractionBatchArgs;
@@ -319,6 +393,7 @@ fn planning_fault(fault: BatchFault) -> BatchItemFailure {
     } else { BatchItemFailure::reject(fault) }
 }
 fn planning_failure(error: Int8ExtractError) -> BatchItemFailure {
+    if let Some(cause) = error.cancellation() { return BatchItemFailure::fatal(BatchFault::cancelled(cause)); }
     match error {
         Int8ExtractError::Identity | Int8ExtractError::Native(Int8JsonError::ModelIdentity) => BatchItemFailure::fatal(BatchCode::Admission),
         Int8ExtractError::Extraction(ExtractError::AllocationRefused)

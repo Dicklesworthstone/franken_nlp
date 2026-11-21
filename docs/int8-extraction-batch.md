@@ -16,6 +16,18 @@ shared private compiler preserves the existing role scaffold, exact schema
 bytes and separately encoded source. Defaults are bounded before per-item
 cloning; per-document arguments replace them for that document only.
 
+`with_document_encoding(UntrustedEncoding::SafeBpeV1(limits))` fixes a bounded
+compact policy for every stream record. Use `prepare_with_control` so the
+original request control covers schema/source encoding, source-index
+construction and identity sealing; control-free `prepare` refuses a configured
+compact planner. Schema and source share one allowance, and an explicit
+one-request override cannot replace the stream policy. The host must admit
+`encoding_workspace_bytes()` before preparing records; the process-hosted
+`batch_int8_extract` path charges this storage with its owned stream buffers.
+The unchanged byte policy remains the default. Complete-document maps refuse
+a configured compact record policy until their own cumulative probing contract
+supports it.
+
 `PreparedInt8BatchExtraction` retains the exact source, TaskPlan and sealed
 INT8 extraction plan. It exposes their borrowed views and complete planned
 model work for admission. Schema input remains a JSON string, not a floating-

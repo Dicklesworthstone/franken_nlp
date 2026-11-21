@@ -132,6 +132,63 @@ fn source_swap_extra_context_and_missing_source_postcondition_fail_before_execut
 }
 
 #[test]
+fn controlled_compilation_preserves_source_identity_and_native_work() {
+    let r = registry(); let encoder = SourceDocumentEncoder::pinned(r.template_controls()).unwrap();
+    let document = encoder.encode("Alice saw 上海. Alice left.", 1024, 1024).unwrap();
+    let task = task(SOURCE, vec![document.token_ids().to_vec()], true, 16384);
+    let plain = Int8ExtractPlan::from_task_plan_with_source(&task, SOURCE, options(),
+        CompileLimits::default(), r.template_controls(), &document, SourceRuntimeLimits::default(), identity()).unwrap();
+    let mut polls = 0;
+    let controlled = Int8ExtractPlan::from_builtin_with_encoding_control(&task, SOURCE, options(),
+        CompileLimits::default(), r.template_controls(), Some((&document, SourceRuntimeLimits::default())),
+        "extract-v1", identity(), document.document_encoding(), &mut || { polls += 1; None }).unwrap();
+    assert!(polls > 4, "source-index work must use the caller's control");
+    assert_eq!(controlled.execution_identity(), plain.execution_identity());
+    assert_eq!(controlled.planned_work(), plain.planned_work());
+    assert_eq!(controlled.prompt_tokens(), plain.prompt_tokens());
+    assert_eq!(controlled.finalize(raw(&controlled, r#""Alice""#)).unwrap(),
+        plain.finalize(raw(&plain, r#""Alice""#)).unwrap());
+}
+
+#[test]
+fn controlled_source_compilation_retains_every_cancellation_kind_at_every_checkpoint() {
+    let r = registry(); let encoder = SourceDocumentEncoder::pinned(r.template_controls()).unwrap();
+    let document = encoder.encode("Alice saw 上海. Alice left.", 1024, 1024).unwrap();
+    let task = task(SOURCE, vec![document.token_ids().to_vec()], true, 16384);
+    let compile = |checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>| {
+        Int8ExtractPlan::from_builtin_with_encoding_control(&task, SOURCE, options(),
+            CompileLimits::default(), r.template_controls(), Some((&document, SourceRuntimeLimits::default())),
+            "extract-v1", identity(), document.document_encoding(), &mut || checkpoint())
+    };
+    let mut total = 0;
+    compile(&mut || { total += 1; None }).unwrap();
+    assert!(total > 4);
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        for at in 1..=total {
+            let mut polls = 0;
+            let error = compile(&mut || { polls += 1; (polls == at).then_some(cause) }).err().unwrap();
+            assert_eq!(error.cancellation(), Some(cause));
+            assert!(matches!(error, Int8ExtractError::Extraction(
+                ExtractError::Decode(JsonDecodeError::Cancelled(observed))) if observed == cause));
+            assert_eq!(polls, at);
+        }
+    }
+}
+
+#[test]
+fn controlled_compilation_refuses_profile_and_task_mismatch_before_source_work() {
+    let r = registry(); let task = task(BOOLEAN, vec![vec![7]], false, 16384);
+    let mut wrong_task = identity(); wrong_task.task_spec = "ner-v1".to_owned();
+    for identity in [eager_identity(), wrong_task] {
+        assert!(Int8ExtractPlan::from_builtin_with_encoding_control(&task, BOOLEAN, options(),
+            CompileLimits::default(), r.template_controls(), None, "extract-v1", identity,
+            &UntrustedEncoding::ByteFallback, &mut || panic!("invalid identity reached source work")).is_err());
+    }
+}
+
+#[test]
 fn repeated_unicode_source_evidence_keeps_all_original_coordinates() {
     let p = source_plan("é Alice 上海 Alice", &[]);
     let out = p.finalize(raw(&p, r#""Alice""#)).unwrap();

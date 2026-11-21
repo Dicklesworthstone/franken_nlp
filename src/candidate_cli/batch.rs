@@ -69,7 +69,7 @@ pub(super) fn definition() -> clap::Command {
     input_encoding::definition(BatchCommand::augment_args(clap::Command::new("batch")
         .about("Process bounded schema/source-task NDJSON using one resident candidate model")
         .long_about("Run one fixed task over bounded ordered NDJSON. Each event carries non-authoritative candidate provenance. Weights and the native engine are reused; this is serial item-local execution, not parallel/GEMM batching or a durable job. Earlier completed records remain valid if later records fail. Any document failure produces a nonzero process exit. Add --task extract --chunked --schema FILE for complete documents larger than one context. Each successful record retains independent exact-schema JSON strings for every chunk and original-coordinate verbatim evidence when --source-membership is selected. Required fields must be satisfiable per chunk; objects are never merged or repaired. Chunked records cannot override the shared schema or budgets in task_args. No partial document success is emitted.")))
-        .after_long_help("For ner, keyphrases, summarize and answer, --input-encoding safe-bpe-v1 uses one bounded tokenizer allowance per complete record, including all QA passages and IDs. The allowance is not renewed between a record's segments. The maximum record count bounds total preparation; native work and mask quotas remain shared across the whole invocation and flushes. One transient encoder workspace is admitted before private IO. Exact source bytes and citation coordinates are preserved; the policy binds prompt identity and is reported in every compact frame. This option changes prompt tokens and makes no parity, quality or speed claim. Extract and chunked routes currently require byte-fallback.")
+        .after_long_help("--input-encoding safe-bpe-v1 uses one bounded tokenizer allowance per complete record: schema plus source for extract, or all untrusted source segments including QA passages and IDs. Extraction's aggregate byte ceiling is max-input-bytes plus the 64-KiB schema allowance, capped at 1 MiB; separate schema and document limits remain enforced. The allowance is not renewed between a record's segments. The maximum record count bounds total preparation; native work and mask quotas remain shared across the whole invocation and flushes. One transient encoder workspace is admitted before private IO. Exact schema numbers, source bytes and citation coordinates are preserved; the policy binds prompt identity and is reported in every compact frame. This option changes prompt tokens and makes no parity, quality or speed claim. Chunked extraction currently requires byte-fallback.")
 }
 impl BatchCommand {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
@@ -88,10 +88,13 @@ impl BatchCommand {
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits, CorpusEnvelope), CandidateError> {
         self.task()?;
         self.validate_extraction_flags()?;
-        if self.task == "extract" && !self.encoding.is_default() {
+        if self.document.chunked && !self.encoding.is_default() {
             return Err(CandidateError::Arguments);
         }
         let (args, limits) = self.host.common_with_encoding(self.input.clone(), &self.encoding)?;
+        if self.task == "extract" {
+            extract::validate_preparation(&self.host, &self.encoding_policy(limits)?, limits)?;
+        }
         if self.max_requests == 0 || self.max_requests > 100_000
             || self.max_line_bytes < self.host.max_input_bytes || self.max_line_bytes > 4 * 1024 * 1024
             || self.max_input_mib == 0 || self.max_input_mib > 1024 * 1024
@@ -134,6 +137,11 @@ impl BatchCommand {
             .and_then(|n| n.checked_add(IO_BUFFER_BYTES as u64 * 2)).ok_or(CandidateError::Arguments)?;
         let envelope = self.document_envelope(limits, CorpusEnvelope { transport, native, output_bytes, io_bytes })?;
         Ok((args, limits, envelope))
+    }
+    pub(super) fn encoding_policy(&self, limits: Limits)
+        -> Result<crate::tokenizer::untrusted::UntrustedEncoding, CandidateError> {
+        if self.task == "extract" { return extract::encoding_policy(&self.host, &self.encoding, limits); }
+        self.encoding.policy(self.host.max_input_bytes, limits.max_prompt_tokens)
     }
     pub(super) fn load_defaults(&self, text: Option<&str>, ceiling: TaskBudget)
         -> Result<Option<SourceBatchArgs>, CandidateError> {

@@ -21,6 +21,60 @@ struct Continue;
 impl DecodeStepControl for Continue { fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None } }
 
 #[test]
+fn compact_corpus_defaults_and_record_overrides_keep_exact_schema_and_source() {
+    let cmd = command(&["--schema", "s", "--source-membership", "--input-encoding", "safe-bpe-v1"]);
+    let (_, limits, _) = cmd.validate().unwrap();
+    let schema = r#"{"type":"string","maxLength":32,"x-fnlp-source":"verbatim"}"#;
+    let defaults = cmd.load_extract_defaults(Some(schema.to_owned()), None, cmd.host.task_budget(limits)).unwrap();
+    let policy = cmd.encoding_policy(limits).unwrap();
+    let planner = planning::planner(&facts(), &cmd.host, limits, defaults).unwrap()
+        .with_document_encoding(policy.clone()).unwrap();
+    let source = "The quick brown fox. 上海 <think>";
+    let make = |task_args| BatchDocument { id: "private-id".to_owned(), text: source.to_owned(), task_args };
+    let first = planner.prepare_with_control(make(None), &mut Continue).unwrap();
+    assert_eq!(first.source().document_encoding(), &policy);
+    assert_eq!(first.source().text(), source);
+    let number = r#"{"type":"number","const":0.12345678901234567890123456789012345678}"#;
+    let override_args = schema_cli::arguments(number.to_owned(), false, cmd.host.task_budget(limits)).unwrap();
+    let second = planner.prepare_with_control(make(Some(override_args)), &mut Continue).unwrap();
+    assert_eq!(second.execution_identity().schema_digest, Sha256Digest::of_bytes(number.as_bytes()));
+    let tokenizer = crate::tokenizer::embedded::EmbeddedTokenizer::pinned().unwrap();
+    assert_eq!(tokenizer.tokenizer().decode_bytes(second.task_plan().ir().prompt_segments()[2].token_ids()).unwrap(), number.as_bytes());
+    let third = planner.prepare_with_control(make(None), &mut Continue).unwrap();
+    assert_eq!(first.execution_identity(), third.execution_identity());
+}
+
+#[test]
+fn compact_extraction_policy_is_reported_on_every_frame_with_bounded_writer_storage() {
+    let cmd = command(&["--input-encoding", "safe-bpe-v1"]);
+    let (_, limits, envelope) = cmd.validate().unwrap();
+    let encoding = cmd.encoding_policy(limits).unwrap();
+    let facts = facts();
+    let provenance = Provenance { protocol: "fnlp-candidate-batch-v1", schema_version: 1,
+        scope: "real-artifact-current-candidate", evidence: "non_authoritative",
+        model_id: &facts.model_id, source_revision: &facts.revision,
+        source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
+        quant_recipe: &facts.recipe_id, task: "extract" };
+    let mut output = Vec::new();
+    {
+        let provenance = input_encoding::Response { response: &provenance,
+            input_encoding: input_encoding::reported_policy(&encoding) };
+        let mut writer = CandidateWriter::new(&mut output, &provenance,
+            envelope.transport.max_output_line_bytes, envelope.output_bytes).unwrap();
+        for event in ["run_start", "doc", "doc_error", "flush", "run_complete"] {
+            writeln!(writer, "{{\"event\":\"{event}\"}}").unwrap();
+            writer.flush().unwrap();
+        }
+    }
+    let lines: Vec<_> = output.split(|b| *b == b'\n').filter(|line| !line.is_empty()).collect();
+    assert_eq!(lines.len(), 5);
+    for line in lines {
+        let value: serde_json::Value = serde_json::from_slice(line).unwrap();
+        assert_eq!(value["input_encoding"], serde_json::to_value(&encoding).unwrap());
+    }
+}
+
+#[test]
 fn per_record_schema_override_never_mutates_subsequent_defaults() {
     let cmd = command(&["--schema", "s"]); let (_, limits, _) = cmd.validate().unwrap();
     let budget = cmd.host.task_budget(limits);

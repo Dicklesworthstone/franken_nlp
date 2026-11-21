@@ -94,11 +94,24 @@ impl Int8ExtractPlan {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_builtin_with_encoding(task: &TaskPlan, schema: &str, options: JsonDecodeOptions,
         limits: CompileLimits, controls: &TemplateControlIds, source: Option<(&SourceDocument, SourceRuntimeLimits)>,
-        task_identity: &'static str, mut identity: ExecutionIdentity, encoding: &UntrustedEncoding) -> Result<Self, Int8ExtractError> {
+        task_identity: &'static str, identity: ExecutionIdentity, encoding: &UntrustedEncoding) -> Result<Self, Int8ExtractError> {
+        Self::from_builtin_with_encoding_control(task, schema, options, limits, controls, source,
+            task_identity, identity, encoding, &mut || None)
+    }
+
+    /// Source-index construction and the final identity seal share the
+    /// caller's request control; neither creates a fresh cancellation budget.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_builtin_with_encoding_control<F: FnMut() -> Option<DecodeCancellationKind>>(
+        task: &TaskPlan, schema: &str, options: JsonDecodeOptions,
+        limits: CompileLimits, controls: &TemplateControlIds, source: Option<(&SourceDocument, SourceRuntimeLimits)>,
+        task_identity: &'static str, mut identity: ExecutionIdentity, encoding: &UntrustedEncoding,
+        checkpoint: &mut F) -> Result<Self, Int8ExtractError> {
         // Refuse wrong profiles before source copies or grammar allocation.
         constrained_int8::check_profile(&identity)?;
         if identity.task_spec != task_identity { return Err(Int8ExtractError::Identity); }
-        let extraction = ExtractPlan::from_builtin_with_encoding(task, schema, options, limits, controls, source, task_identity, encoding)?;
+        let extraction = ExtractPlan::from_builtin_with_encoding_control(task, schema, options, limits,
+            controls, source, task_identity, encoding, checkpoint)?;
         let work = constrained_int8::planned_work(extraction.prompt.len(), extraction.options.max_new_tokens)?;
         identity.taskir_digest = extraction.taskir_digest;
         identity.prompt_digest = extraction.prompt_digest;
@@ -110,6 +123,7 @@ impl Int8ExtractPlan {
             INT8_EXTRACT_VERSION, INT8_JSON_EXECUTION, extraction.policy_digest,
         )).map_err(|_| ExtractError::Serialization)?);
         identity.validate().map_err(|_| Int8ExtractError::Identity)?;
+        if let Some(cause) = checkpoint() { return Err(ExtractError::Decode(JsonDecodeError::Cancelled(cause)).into()); }
         Ok(Self { extraction, identity, work, selected_rows: None })
     }
 

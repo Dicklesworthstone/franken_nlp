@@ -37,6 +37,17 @@ fn limits() -> Int8ExtractionMapLimits {
         mask_limits: MaskWorkLimits::default(), mask_visits_per_chunk: 1000, max_mask_visits: 256_000 },
         verification: GroundingBudget::default() }
 }
+
+#[test]
+fn compact_record_policy_cannot_enter_byte_sized_complete_document_maps() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    let planner = planner().with_document_encoding(UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 8192, max_output_tokens: 8192, max_pair_checks: 1 << 22,
+        max_pair_bytes: 1 << 26,
+    })).unwrap();
+    assert!(matches!(planner.plan_document_with_control("Alice", &source_args(), limits(), &mut Continue),
+        Err(Int8SourceMapError::InvalidLimits)));
+}
 fn prepare<'s>(planner: &Int8ExtractionBatchPlanner, source: &'s str, args: &ExtractionBatchArgs,
     limits: Int8ExtractionMapLimits) -> PreparedInt8ExtractionMap<'s> {
     planner.plan_document_with_control(source, args, limits, &mut Continue).unwrap()

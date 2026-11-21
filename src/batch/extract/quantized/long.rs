@@ -121,6 +121,10 @@ impl Int8ExtractionBatchPlanner {
         args: &ExtractionBatchArgs, limits: Int8ExtractionMapLimits, control: &mut C)
         -> Result<PreparedInt8ExtractionMap<'s>, Int8SourceMapError> {
         step(control)?;
+        // Chunk sizing currently uses the byte-fallback token geometry. A
+        // configured compact record planner cannot silently change that map
+        // or renew a compact allowance for every probe/chunk.
+        self.require_byte_encoding().map_err(|_| Int8SourceMapError::InvalidLimits)?;
         if source.is_empty() { return Err(Int8SourceMapError::EmptySource); }
         let b = args.budget; let c = &self.compiler; let m = limits.mapping; let v = limits.verification;
         b.validate().map_err(|_| Int8SourceMapError::InvalidLimits)?;

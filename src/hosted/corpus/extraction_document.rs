@@ -25,6 +25,7 @@ impl NlpEngine {
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
         dispatch::preflight(self, limits.native.run)?;
         self.check_resident_domain(model)?;
+        planner.require_byte_encoding().map_err(HostedError::BatchSetup)?;
         check_model_identity(model.artifact_identity(), planner.base_execution_identity())?;
         config.batch.validate().map_err(HostedError::BatchSetup)?;
         let required = requirements(limits.native)?;

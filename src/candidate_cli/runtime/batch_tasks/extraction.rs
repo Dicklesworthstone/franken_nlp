@@ -9,6 +9,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     command: BatchCommand, args: CandidateArgs, limits: Limits, envelope: CorpusEnvelope,
     mut input: R, output: W,
 ) -> Result<(), CandidateError> {
+    let encoding = command.encoding_policy(limits)?;
     let session = Session::new(&args, limits)?;
     let schema = command.schema.as_ref().map(|path| session.read(path, &mut input, SCHEMA_BYTES)).transpose()?;
     let raw_defaults = command.defaults.as_ref()
@@ -25,7 +26,8 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     } else { (defaults, None) };
     session.remaining()?;
     let facts = session.facts(&args)?;
-    let compiler = planning::planner(&facts, &command.host, limits, defaults)?;
+    let compiler = planning::planner(&facts, &command.host, limits, defaults)?
+        .with_document_encoding(encoding.clone()).map_err(|_| CandidateError::Planning)?;
     session.remaining()?;
     let vocabulary = planning::vocabulary()?;
     session.remaining()?;
@@ -34,6 +36,8 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         model_id: &facts.model_id, source_revision: &facts.revision,
         source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
         quant_recipe: &facts.recipe_id, task: &command.task };
+    let provenance = input_encoding::Response { response: &provenance,
+        input_encoding: input_encoding::reported_policy(&encoding) };
     let writer = CandidateWriter::new(output, &provenance, envelope.transport.max_output_line_bytes,
         envelope.output_bytes)?;
     let reader: Box<dyn BufRead + Send> = if command.input.as_os_str() == "-" {
