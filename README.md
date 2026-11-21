@@ -5112,6 +5112,59 @@ thinking, tool execution, durable checkpoints, or inference network access.
 Compilation, fixtures, model-present behavior and incremental error-catching
 value remain unverified until their separate controller/evaluation gates run.
 
+### Resident extraction and review populations
+
+`extract-semantic-batch` applies the same fixed schema and explicitly selected
+review policy to ordered `{id,text}` NDJSON. One model, extraction compiler, judge,
+vocabulary and native workspace serve the whole stream. Every successful record
+contains the original extraction and its complete correlated review; a failed
+field judgment publishes no combined result for that record. Non-null
+`task_args` is refused, so a document cannot replace the shared schema, claims,
+budgets or diagnostic scope. Exact `{"flush":true}` controls drain an ID epoch.
+
+The options file's `max_model_work` remains the five-axis ceiling for one
+complete document, and `--max-mask-node-visits` caps its extraction masks.
+The six optional `--max-total-*` work flags independently declare the whole
+stream's allowance. Each defaults to the corresponding one-document cap and
+must cover a complete attempt; increasing `--max-requests` does not multiply
+these budgets. An admitted document reserves its full conservative attempt
+before inference, including all potentially requested reviews. Failed attempts
+remain charged, and records, fields and flushes never renew the run ledger.
+
+For example, with the illustrative options above, the following explicitly
+reserves at most 100 complete document attempts:
+
+```bash
+fnlp candidate source-int4 extract-semantic-batch documents.ndjson \
+  --snapshot /private/model.snapshot --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 32768 --schema ./amount.schema.json \
+  --semantic-options ./amount-semantic.json --compute-threads 4 \
+  --max-requests 100 --max-total-output-bytes 536870912 \
+  --max-total-forward-positions 10000000 \
+  --max-total-projected-logits 10000000000 \
+  --max-total-attention-pairs 100000000000000 \
+  --max-total-dot-products 1000000000000000 \
+  --max-total-multiply-accumulates 100000000000000000 \
+  --max-total-mask-node-visits 200000000000
+```
+
+`--input-encoding safe-bpe-v1` keeps one tokenizer allowance per document
+across its schema/source and every review prompt. `--source-membership`
+binds annotated verbatim fields separately to each real source. All dynamic
+reviews still use the complete original source within the declared context;
+this command does not chunk or truncate it. Source conversion, pinned snapshot
+reload and optional snapshot saving share the route. Serial execution and one
+persistent numerical team are supported.
+
+Every stdout frame carries candidate provenance and the explicit uncalibrated,
+same-model diagnostic scope. Earlier complete results remain valid after a
+later failure; whole-run success requires both `run_complete` and exit zero.
+Stderr errors retain the original cancellation cause without schema, claim,
+source or local-path content. Combined result staging and the complete
+transport/plan/native/team peak are admitted before schema, population or
+model IO; only the bounded fixed options file is read first. Runtime and
+model-present gates remain pending.
+
 ## Native INT4 faithfulness evaluation and comparison
 
 `fnlp eval native-faithfulness-int4` executes the real native faithfulness
