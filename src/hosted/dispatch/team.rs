@@ -150,7 +150,22 @@ where T: Send + 'static, U: Send + 'static,
     F: FnOnce(&Int4ModelWeights, &mut RunControl, &mut dyn Int4ProjectionExecutor)
         -> Result<T, HostedError> + Send + 'static,
     G: FnOnce(T, &mut RunControl) -> Result<U, HostedError> + Send + 'static {
-    run_int4_team_then(engine, limits, cancellation, model, width, kernel, 1, work,
+    run_int4_prefill_team_with_finalize(engine, limits, cancellation, model, width, kernel,
+        1, work, finalize)
+}
+
+/// Admit one fixed batch capacity for prompt and single-row projections, then
+/// publish the terminal result only after every worker joins. The finalizer
+/// retains the original invocation's cancellation and checkpoint authority.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::hosted) fn run_int4_prefill_team_with_finalize<T, U, F, G>(engine: &NlpEngine,
+    limits: RunLimits, cancellation: CancellationToken, model: ResidentInt4, width: usize,
+    kernel: PackedInt4Kernel, max_batch_rows: usize, work: F, finalize: G) -> Result<U, HostedError>
+where T: Send + 'static, U: Send + 'static,
+    F: FnOnce(&Int4ModelWeights, &mut RunControl, &mut dyn Int4ProjectionExecutor)
+        -> Result<T, HostedError> + Send + 'static,
+    G: FnOnce(T, &mut RunControl) -> Result<U, HostedError> + Send + 'static {
+    run_int4_team_then(engine, limits, cancellation, model, width, kernel, max_batch_rows, work,
         move |value, cx, shared| finalize_after_join(cx, shared, value, finalize))
 }
 

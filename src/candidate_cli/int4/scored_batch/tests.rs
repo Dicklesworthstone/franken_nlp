@@ -18,6 +18,12 @@ fn arguments(task: &str, extra: &[&str]) -> (BatchArgs, Int4Args) {
     let Int4Task::ScoredBatch(batch) = command.task else { panic!("wrong scored stream task"); };
     (batch, command.args)
 }
+pub(super) fn set_prefill_rows(args: &mut Int4Args, rows: usize) {
+    let row = rows.to_string();
+    let matches = <generation_policy::GenerationPolicyArgs as clap::Args>::augment_args(
+        clap::Command::new("policy")).try_get_matches_from(["policy", "--prefill-rows", &row]).unwrap();
+    args.policy = <generation_policy::GenerationPolicyArgs as clap::FromArgMatches>::from_arg_matches(&matches).unwrap();
+}
 fn budget(batch: &BatchArgs, args: &Int4Args) -> TaskBudget {
     batch.scoring.budget(batch.validate(args).unwrap().common)
 }
@@ -106,7 +112,9 @@ fn every_native_transport_and_preparation_ceiling_refuses_before_io() {
 fn compact_scored_tasks_admit_serial_prefill_and_cohort_streams_with_one_encoder() {
     use crate::tokenizer::untrusted::UntrustedEncoding;
     for task in ["classify", "sentiment", "judge"] {
-        for schedule in [&[][..], &["--prefill-rows", "3"][..], &["--cohort-heads", "8", "--cohort-documents", "3"][..]] {
+        for schedule in [&[][..], &["--prefill-rows", "3"][..],
+            &["--prefill-rows", "3", "--compute-threads", "3"][..],
+            &["--cohort-heads", "8", "--cohort-documents", "3"][..]] {
             let mut flags = schedule.to_vec();
             flags.extend(["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "123456",
                 "--max-tokenizer-pair-bytes", "2345678"]);
@@ -135,7 +143,9 @@ fn compact_scored_tasks_admit_serial_prefill_and_cohort_streams_with_one_encoder
                     + compact.output_reservation_bytes;
                 assert_eq!(limits.common.minimum_memory_bytes, grouped_memory_floor(&args, limits.common, peak).unwrap());
             } else {
-                let common = batch.scoring.validate_one_off_with_prefill(&args).unwrap();
+                let mut native_args = args.clone();
+                native_args.input_encoding = input_encoding::InputEncodingArgs::default();
+                let common = batch.scoring.validate_batch_with_threaded_prefill(&native_args).unwrap();
                 let t = limits.transport;
                 let corpus = 8 * t.max_line_bytes as u64 + 4 * t.max_output_line_bytes as u64
                     + 128 * t.max_epoch_ids as u64 + t.max_epoch_id_bytes as u64
@@ -199,11 +209,11 @@ fn layer_major_streams_preserve_semantic_limits_and_admit_the_exact_prompt_works
         // Bypass clap to cover the actual programmatic admission boundary.
         for rows in [0, 65, usize::MAX] {
             let (batch, mut args) = arguments(task, &["--defaults", "never-open.json"]);
-            args.prefill_rows = Some(rows);
+            set_prefill_rows(&mut args, rows);
             assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
         }
         let (batch, mut args) = arguments(task, &["--cohort-heads", "3", "--defaults", "never-open.json"]);
-        args.prefill_rows = Some(3);
+        set_prefill_rows(&mut args, 3);
         assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
     }
 }
@@ -240,7 +250,7 @@ fn persistent_team_admission_preserves_all_stream_budgets_and_prices_worker_scra
 }
 
 #[test]
-fn unsupported_team_widths_and_combined_schedules_refuse_before_private_io() {
+fn unsupported_team_widths_and_cohort_schedules_refuse_before_private_io() {
     let maximum = usize::MAX.to_string();
     for task in ["classify", "sentiment", "judge"] {
         for width in ["0", "65", maximum.as_str()] {
@@ -251,8 +261,54 @@ fn unsupported_team_widths_and_combined_schedules_refuse_before_private_io() {
             "--defaults", "never-open.json"]);
         assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
         let (batch, mut args) = arguments(task, &["--compute-threads", "2", "--defaults", "never-open.json"]);
-        args.prefill_rows = Some(2);
+        set_prefill_rows(&mut args, 65);
         assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
+fn joint_prefill_teams_admit_fixed_capacity_without_renewing_native_or_transport_work() {
+    use crate::native_engine::strict_int4::projection::{int4_prefill_team_workspace_bytes,
+        int4_team_workspace_bytes};
+    for task in ["classify", "sentiment", "judge"] {
+        for encoding in ["byte-fallback", "safe-bpe-v1"] {
+            let (serial, serial_args) = arguments(task, &["--input-encoding", encoding]);
+            let baseline = serial.validate(&serial_args).unwrap();
+            for (threads, rows) in [(2, 1), (3, 3), (64, 64)] {
+                let width = threads.to_string(); let row = rows.to_string();
+                let (batch, mut args) = arguments(task, &["--compute-threads", &width,
+                    "--prefill-rows", &row, "--input-encoding", encoding]);
+                args.memory_mib = 262_144;
+                let selected = batch.validate(&args).unwrap();
+                assert_eq!(selected.common.compute.threads, threads);
+                assert_eq!(selected.common.prefill.unwrap().max_batch_rows, rows);
+                assert_eq!(selected.common.compute.workspace_bytes,
+                    int4_prefill_team_workspace_bytes(threads, args.group_width, rows).unwrap());
+                let single_row = int4_team_workspace_bytes(threads, args.group_width).unwrap();
+                if rows == 1 { assert_eq!(selected.common.compute.workspace_bytes, single_row); }
+                else { assert!(selected.common.compute.workspace_bytes > single_row); }
+                assert_eq!(selected.common.native, baseline.common.native);
+                assert_eq!(selected.native, baseline.native);
+                assert_eq!(selected.transport, baseline.transport);
+                assert_eq!(selected.encoding_workspace_bytes, baseline.encoding_workspace_bytes);
+                assert_eq!(batch.scoring.budget(selected.common), serial.scoring.budget(baseline.common));
+                assert!(selected.cohort.is_none());
+                assert!(batch.scoring.validate_one_off_with_prefill(&args).is_err(),
+                    "other scored workflows must retain their explicit schedule boundary");
+                let source = selected;
+                args.source_dir = None; args.source_manifest = None;
+                args.snapshot = Some(PathBuf::from("never-open.snapshot"));
+                args.expected_model_sha256 = Some("ab".repeat(32));
+                let snapshot = batch.validate(&args).unwrap();
+                assert_eq!(snapshot.native, source.native);
+                assert_eq!(snapshot.transport, source.transport);
+                assert_eq!(snapshot.common.compute, source.common.compute);
+                let facts = |value: Int4PrefillLimits| (value.max_batch_rows, value.max_extra_scratch_bytes);
+                assert_eq!(snapshot.common.prefill.map(facts), source.common.prefill.map(facts));
+                args.memory_mib = snapshot.common.minimum_memory_bytes.div_ceil(MIB) - 1;
+                assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+            }
+        }
     }
 }
 

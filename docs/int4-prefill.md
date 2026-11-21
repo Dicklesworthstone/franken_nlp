@@ -62,8 +62,14 @@ Library callers use `NlpEngine::execute_int4_chat_layer_major_with_threads` and
 completed JSON includes the existing `compute` receipt; `completed_rows` counts
 completed output scalars across all prompt rows, while `completed_projections`
 counts successfully completed batch or single-row operations. These counters
-do not establish speed or model quality. Streaming, structured, population and
-retained-job routes keep their existing schedule restrictions.
+do not establish speed or model quality. Resident `score-batch` also composes
+prompt morsels with one persistent CPU team across all classification,
+sentiment or judgment heads, records and flushes. Its hosted entry is
+`NlpEngine::batch_int4_scored_layer_major_with_threads`; the terminal footer
+uses the original run control after every worker joins. See the
+[scoring stream contract](candidate-scored-batch-cli.md#grouped-int4-scoring-streams)
+for combined memory admission and per-frame schedule metadata. Streaming,
+structured and retained-job routes keep their existing schedule restrictions.
 
 ### Other task routes
 

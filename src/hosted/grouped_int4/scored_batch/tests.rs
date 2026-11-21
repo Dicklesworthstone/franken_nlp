@@ -226,4 +226,7 @@ fn all_three_closed_planners_and_owned_io_fit_the_existing_host_boundary() {
     let _classify_prefill = NlpEngine::batch_int4_scored_layer_major::<Int4ClassificationPlanner, std::io::Cursor<Vec<u8>>, Vec<u8>>;
     let _sentiment_prefill = NlpEngine::batch_int4_scored_layer_major::<Int4SentimentPlanner, std::io::Cursor<Vec<u8>>, Vec<u8>>;
     let _judge_prefill = NlpEngine::batch_int4_scored_layer_major::<Int4JudgePlanner, std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    let _classify_prefill_team = NlpEngine::batch_int4_scored_layer_major_with_threads::<Int4ClassificationPlanner, std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    let _sentiment_prefill_team = NlpEngine::batch_int4_scored_layer_major_with_threads::<Int4SentimentPlanner, std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    let _judge_prefill_team = NlpEngine::batch_int4_scored_layer_major_with_threads::<Int4JudgePlanner, std::io::Cursor<Vec<u8>>, Vec<u8>>;
 }

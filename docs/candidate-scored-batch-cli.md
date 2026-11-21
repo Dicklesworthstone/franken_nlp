@@ -163,13 +163,14 @@ existing strict schemas. This command accepts byte fallback and explicit
 `--input-encoding safe-bpe-v1`; compact input keeps its own bounded per-record
 tokenizer ledger.
 
-Serial execution remains the default. Three explicit physical choices are
-available: `--compute-threads N` for a persistent output-row team,
-`--cohort-heads N` for simultaneous scoring heads from complete documents, or
-`--prefill-rows N` for bounded layer-major processing within each prompt.
-Prompt rows must be between 1 and 64 and require `--compute-threads 1`.
-Prefill, a nonserial team and a head cohort cannot be combined. Invalid row
-counts or incompatible schedules fail before defaults, input or model IO.
+Serial execution remains the default. `--compute-threads N` selects a
+persistent output-row team, and `--prefill-rows M` selects bounded layer-major
+processing within each prompt. These options can be combined: one team serves
+all prompt morsels, candidate continuations, documents and flushes. Thread and
+prompt-row counts are each bounded by 1 through 64. The separate
+`--cohort-heads N` schedule groups simultaneous scoring heads from complete
+documents and cannot combine with prompt morsels or a nonserial team. Invalid
+row counts or incompatible schedules fail before defaults, input or model IO.
 
 For example:
 
@@ -179,7 +180,7 @@ fnlp candidate source-int4 score-batch reviews.ndjson \
   --snapshot ./model.int4.snapshot \
   --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
   --memory-mib 16384 --group-width 128 \
-  --prefill-rows 32 --compute-threads 1
+  --prefill-rows 32 --compute-threads 4
 ```
 
 This uses the existing strict INT4 prompt executor for every independently
@@ -192,12 +193,18 @@ reservations are unchanged by the physical row count.
 
 The host admits one validated extra prompt workspace alongside resident weights,
 the full live KV context, ordinary scratch, prepared inputs, optional encoder
-workspace and complete guarded output. That prompt workspace is reused across
-heads, records and flushes; increasing the population does not multiply it or
-grant more compute. All five `--max-*` native work flags still bound the entire
-stream. Cancellation uses the original invocation controller. A failed head
-cannot publish a partial scored bundle or turn a native failure into an
-abstention. Output guards continue through ordered writes and flushes.
+workspace and complete guarded output. With a team, it additionally reserves
+every worker's fixed input/output capacity for the declared prompt-row count.
+The team and all these buffers are reused across heads, records and flushes;
+increasing the population does not multiply them or grant more compute. A short
+final prompt morsel does not reduce the declared capacity, and single-row
+candidate continuations use the same team without growing its buffers. All five
+`--max-*` native work flags still bound the entire stream. Cancellation uses the
+original invocation controller. A failed head cannot publish a partial scored
+bundle or turn a native failure into an abstention. Output guards continue
+through ordered writes and flushes. The terminal `run_complete` is published
+only after every worker physically joins, with the original cancellation and
+checkpoint allowance still authoritative.
 
 All events, including errors, flushes and an empty `run_complete`, use the
 `fnlp-candidate-int4-score-batch-v1` candidate wrapper. An explicit prompt
@@ -210,6 +217,8 @@ schedule adds `prefill_schedule` with:
 | `admitted_workspace_bytes` | The exact validated additional prompt payload reservation |
 
 Omitting `--prefill-rows` omits this field and preserves the default wire shape.
+When a CPU team is selected, the existing `compute_schedule` appears alongside
+`prefill_schedule`; the two declarations retain their independent meanings.
 The metadata describes selected physical configuration; it is not measured
 execution, parity or speed evidence. Complete semantic records retain their
 original contents. Require the terminal `run_complete` and exit status zero for
@@ -218,13 +227,18 @@ whole-stream success.
 Library callers use
 `NlpEngine::batch_int4_scored_layer_major(model, planner, limits, kernel, prefill, reader, writer, cancellation)`
 with the existing sealed `Int4ScoredBatchPlanner` for any of the three tasks.
+To share a persistent team, use
+`NlpEngine::batch_int4_scored_layer_major_with_threads(model, planner, limits, kernel, compute_threads, prefill, reader, writer, cancellation)`.
 The lower-level `NativeInt4ScoredBatch::new_layer_major` requires its embedding
 caller to admit the additional validated workspace. Existing serial and CPU-team
 constructors preserve their behavior.
 
-Regression source definitions cover exact scratch quotes, invalid and combined
-schedules, per-record tokenizer coexistence, metadata compatibility, and
-controller-only full-model comparisons across flush epochs. They have not been
+Regression source definitions cover exact combined scratch quotes, invalid
+schedules and memory refusal before IO, per-record tokenizer coexistence,
+metadata compatibility, and mixed prompt-batch/single-row worker lifetimes with
+post-join publication under the original quota. Controller-only full-model
+fixtures compare serial, team, prefill and combined schedules across all three
+tasks, both encodings and flush epochs. These definitions have not been
 executed in this editing session. Kernel parity, model quality and target-host
 performance remain separate qualification requirements.
 

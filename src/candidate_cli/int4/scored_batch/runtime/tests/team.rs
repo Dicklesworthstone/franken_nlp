@@ -1,7 +1,8 @@
 //! Controller-only full-model serial/team parity, not execution evidence.
 use super::*;
 
-fn command(task: &str, threads: usize, encoding: &str, snapshot: &str, pin: &str,
+#[allow(clippy::too_many_arguments)]
+fn command(task: &str, threads: usize, prefill_rows: Option<usize>, encoding: &str, snapshot: &str, pin: &str,
     memory: u64, kernel: Int8KernelKind) -> (BatchArgs, Int4Args, BatchLimits) {
     let width = threads.to_string();
     let command = super::super::super::tests::command(task, &["--compute-threads", &width,
@@ -12,6 +13,7 @@ fn command(task: &str, threads: usize, encoding: &str, snapshot: &str, pin: &str
     args.source_dir = None; args.source_manifest = None;
     args.snapshot = Some(PathBuf::from(snapshot)); args.expected_model_sha256 = Some(pin.to_owned());
     args.memory_mib = memory; args.kernel = kernel; args.context_tokens = 2048;
+    if let Some(rows) = prefill_rows { super::super::super::tests::set_prefill_rows(&mut args, rows); }
     args.timeout_seconds = 86_400;
     let limits = batch.validate(&args).expect("explicit memory must admit the complete stream and team");
     (batch, args, limits)
@@ -49,8 +51,8 @@ fn execute_stream(engine: &NlpEngine, model: &ResidentInt4, batch: &BatchArgs, a
 }
 
 #[test]
-#[ignore = "run alone with controller-admitted snapshot, independent pin and real multi-document serial/team INT4 inference"]
-fn snapshot_score_stream_teams_match_every_semantic_record_work_and_flush_and_release_charges() {
+#[ignore = "run alone with controller-admitted snapshot, independent pin and real multi-document serial/prefill/team INT4 inference"]
+fn snapshot_score_stream_teams_and_prompt_morsels_match_semantic_records_work_flush_and_release() {
     assert!(crate::installed_process_resources().is_none(), "fixture requires a fresh process");
     let snapshot = std::env::var("FNLP_INT4_PREFILL_SNAPSHOT").expect("explicit existing snapshot required");
     let pin = std::env::var("FNLP_INT4_PREFILL_MODEL_SHA256").expect("independent model-content pin required");
@@ -61,8 +63,8 @@ fn snapshot_score_stream_teams_match_every_semantic_record_work_and_flush_and_re
         ("sentiment", "byte-fallback"), ("sentiment", "safe-bpe-v1"),
         ("judge", "byte-fallback"), ("judge", "safe-bpe-v1")];
     let preparation_bytes = cases.iter().map(|&(task, encoding)|
-        command(task, 4, encoding, &snapshot, &pin, memory, kernel).2.common.preparation_bytes).max().unwrap();
-    let (_, base_args, base_limits) = command("classify", 4, "safe-bpe-v1", &snapshot, &pin, memory, kernel);
+        command(task, 4, None, encoding, &snapshot, &pin, memory, kernel).2.common.preparation_bytes).max().unwrap();
+    let (_, base_args, base_limits) = command("classify", 4, None, "safe-bpe-v1", &snapshot, &pin, memory, kernel);
     let engine = NlpEngine::builder().resource_config(resource_config(base_limits.common)).build().unwrap();
     let idle = engine.resources().memory_snapshot();
     let lease = engine.resources().acquire_lease();
@@ -75,8 +77,9 @@ fn snapshot_score_stream_teams_match_every_semantic_record_work_and_flush_and_re
     for (task, encoding) in cases {
         let mut input = None;
         let mut expected = None;
-        for threads in [1, 2, 4] {
-            let (batch, args, limits) = command(task, threads, encoding, &snapshot, &pin, memory, kernel);
+        for (threads, prefill_rows) in [(1, None), (2, None), (4, None),
+            (1, Some(3)), (2, Some(3)), (4, Some(64))] {
+            let (batch, args, limits) = command(task, threads, prefill_rows, encoding, &snapshot, &pin, memory, kernel);
             let input = input.get_or_insert_with(|| model_stream_input(task, batch.scoring.budget(limits.common)));
             let output = CapturedStream::default();
             execute_stream(&engine, &model, &batch, &args, limits, task, input.clone(), output.clone());
@@ -86,6 +89,9 @@ fn snapshot_score_stream_teams_match_every_semantic_record_work_and_flush_and_re
                 let mut record: serde_json::Value = serde_json::from_slice(line).unwrap();
                 let schedule = record.as_object_mut().unwrap().remove("compute_schedule");
                 assert_eq!(schedule, ComputeSchedule::for_threads(threads).map(serde_json::to_value).transpose().unwrap());
+                let prompt = record.as_object_mut().unwrap().remove("prefill_schedule");
+                assert_eq!(prompt, limits.common.prefill.map(PrefillSchedule::new).transpose().unwrap()
+                    .map(serde_json::to_value).transpose().unwrap());
                 assert!(record.get("cohort_schedule").is_none());
                 records.push(record);
             }
@@ -94,7 +100,8 @@ fn snapshot_score_stream_teams_match_every_semantic_record_work_and_flush_and_re
             assert_eq!(footer["summary"]["succeeded"], 5);
             assert_eq!(footer["summary"]["failed"], 0);
             assert_eq!(footer["summary"]["flushes"], 2);
-            if let Some(expected) = &expected { assert_eq!(&records, expected, "{task} {encoding} threads={threads}"); }
+            if let Some(expected) = &expected { assert_eq!(&records, expected,
+                "{task} {encoding} threads={threads} prompt_rows={prefill_rows:?}"); }
             else { expected = Some(records); }
             assert_eq!(engine.resources().memory_snapshot(), resident);
             let closures = engine.resources().outstanding_closure_snapshot();

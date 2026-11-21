@@ -6,7 +6,8 @@ use crate::{BlockingClosureGuard, native_engine::decode::{DecodeCancellationKind
 
 mod team;
 pub(super) use team::{int4_team_workspace_bytes, int4_prefill_team_workspace_bytes,
-    preflight_int4_team, run_int4_team, run_int4_prefill_team, run_int4_team_with_finalize};
+    preflight_int4_team, run_int4_team, run_int4_prefill_team, run_int4_team_with_finalize,
+    run_int4_prefill_team_with_finalize};
 
 thread_local! { static INSIDE_NATIVE: Cell<bool> = const { Cell::new(false) }; }
 struct NativeEntry;

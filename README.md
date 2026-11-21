@@ -388,6 +388,16 @@ declared prompt width before IO. Library callers use
 `int4_chat_prefill_team_workspace_bytes` for this combined route, in addition
 to the ordinary native and prefill workspace reservations.
 
+Resident `score-batch --task classify|sentiment|judge` also combines
+`--prefill-rows 1..=64` with `--compute-threads 2..=64`. One fixed team spans
+prompt morsels, finite candidate scoring, records and flushes. Admission
+includes both coordinator prompt workspace and the workers' declared batch
+capacity; all five native work limits remain whole-stream allowances.
+`batch_int4_scored_layer_major_with_threads` exposes the same library route.
+Both physical schedules appear in event provenance, and terminal completion
+remains deferred until every worker joins. See the
+[resident scoring documentation](docs/candidate-scored-batch-cli.md#grouped-int4-scoring-streams).
+
 Other routes retain their existing restriction on combining worker teams with
 `--prefill-rows`. Worker teams cannot combine with `--cohort-heads`,
 `--cohort-documents` or `--cohort-chunks`. The task sections below describe
@@ -1581,11 +1591,13 @@ persistent output-row team with `N - 1` workers and one coordinator, for widths
 2 through 64. That team and native engine span every document, scoring head and
 flush. Complete row arithmetic and within-row order remain the serial kernel's;
 causal state, full-vocabulary scoring and task finalization stay on the
-coordinator. Compact classification and sentiment work with all three routes.
-Alternatively, `--prefill-rows 1..64` processes each head's prompt in bounded
+coordinator. Compact classification, sentiment and judgment work with these routes.
+`--prefill-rows 1..64` processes each head's prompt in bounded
 layer-major morsels with one admitted workspace reused across records and
-heads. The prompt, team and cohort schedules are separate choices; mixed
-schedules refuse before private IO. Finite candidate scores and EOS remain
+heads. Prompt morsels can share the persistent CPU team; every worker's fixed
+batch capacity is admitted alongside the coordinator's prompt workspace.
+Cross-document cohorts remain separate and refuse either combination before
+private IO. Finite candidate scores and EOS remain
 unchanged, with the same cumulative native work authority. Generation and
 sampling controls are refused.
 
@@ -1593,7 +1605,8 @@ sampling controls are refused.
 fnlp candidate source-int4 score-batch documents.ndjson \
   --task classify --defaults labels.json \
   --snapshot nanbeige.int4.snapshot --expected-model-sha256 "$MODEL_SHA256" \
-  --memory-mib 8192 --compute-threads 4 --input-encoding safe-bpe-v1
+  --memory-mib 8192 --compute-threads 4 --prefill-rows 4 \
+  --input-encoding safe-bpe-v1
 ```
 
 The selected workers and reusable row buffers are included in the process
@@ -1601,7 +1614,9 @@ thread envelope and memory admission before private IO. Worker buffers add to
 the ordinary scoring-stream quote; they do not replace resident model, KV,
 preparation or transport charges. OS thread stacks and RSS remain outside the
 modeled payload quote. Library callers use `batch_int4_scored_with_threads`
-with a compatible installed child-thread envelope.
+or `batch_int4_scored_layer_major_with_threads` with a compatible installed
+child-thread envelope. Row count and thread count change the physical
+schedule, not the task identity, candidate language or native work allowance.
 
 Team streams stage the terminal `run_complete` within the existing cumulative
 output ceiling and publish it only after every worker joins. The final write

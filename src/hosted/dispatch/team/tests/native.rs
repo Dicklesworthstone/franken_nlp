@@ -318,6 +318,40 @@ fn terminal_publication_waits_for_real_workers_and_keeps_native_reentry_guard() 
 }
 
 #[test]
+fn batched_projection_completion_reuses_original_control_and_joins_before_finalization() {
+    let _entry = NativeEntry::enter().unwrap();
+    let (weights, input) = projection_fixture(4);
+    let width = 3;
+    let mut workspace = Workspace::with_batch_rows(width, 4, 3).unwrap();
+    let dropped = track_children(&mut workspace);
+    let cx = Cx::for_testing();
+    let shared = RunShared::new(limits(100_000), CancellationToken::default()).unwrap();
+    let result = run_scope(&cx, &weights, &mut workspace, width, PackedInt4Kernel::scalar(),
+        Arc::clone(&shared), |_, control, executor| {
+            let mut prompt = vec![Bf16::default(); 30];
+            executor.project_batch_bf16_into(Int4ProjectionOp::Head, &batch_inputs(3),
+                LinearRows::All, &mut prompt, control).map_err(native_error)?;
+            let mut candidate = vec![0.0; 10];
+            executor.project_f32_into(Int4ProjectionOp::Head, &input, LinearRows::All,
+                &mut candidate, control).map_err(native_error)?;
+            assert_eq!(dropped.load(Ordering::SeqCst), 0);
+            assert_eq!(executor.stats().completed_projections, 2);
+            Ok((prompt, candidate))
+        }).unwrap();
+    let remaining = shared.state.lock().unwrap().remaining;
+    let deadline = shared.deadline;
+    let (prompt, candidate) = finalize_after_join(&cx, &shared, result, |result, control| {
+        assert_eq!(dropped.load(Ordering::SeqCst), width - 1);
+        assert!(matches!(NativeEntry::enter(), Err(HostedError::Reentrant)));
+        assert_eq!(control.shared.deadline, deadline);
+        assert_eq!(control.shared.state.lock().unwrap().remaining, remaining - 1);
+        Ok(result)
+    }).unwrap();
+    assert_eq!(prompt.len(), 30); assert_eq!(candidate.len(), 10);
+    assert_eq!(shared.state.lock().unwrap().remaining, remaining - 2);
+}
+
+#[test]
 fn cancellation_before_post_join_publication_drops_owned_value_without_calling_writer() {
     struct Owned(Arc<AtomicUsize>);
     impl Drop for Owned { fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); } }

@@ -91,6 +91,15 @@ impl ScoringArgs {
         self.validate_one_off_with_prefill(args)
     }
     pub(super) fn validate_one_off_with_prefill(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
+        self.validate_scored_storage(args, false)
+    }
+    /// Only the resident scored-stream host installs a batch-capable row team
+    /// here. Other composed workflows keep their existing scheduling contract.
+    pub(super) fn validate_batch_with_threaded_prefill(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
+        self.validate_scored_storage(args, true)
+    }
+    fn validate_scored_storage(self, args: &Int4Args, allow_threaded_prefill: bool)
+        -> Result<Int4Limits, CandidateError> {
         if !(2..=64).contains(&self.max_candidate_tokens) || self.max_candidate_tokens >= args.context_tokens
             || !(1..=MAX_CONTENT_BYTES).contains(&self.max_result_bytes)
             || !(1..=16 * 1024 * 1024).contains(&self.max_forward_positions)
@@ -107,8 +116,9 @@ impl ScoringArgs {
         // Bound repeated document/prompt/IR storage by the aggregate forward
         // ceiling, not by input bytes or just the longest live native context.
         let extra = sum(&[128 * MIB, self.max_forward_positions * 32, self.max_result_bytes as u64 * 16])?;
-        args.validate_storage_admission(self.max_result_bytes, self.max_candidate_tokens,
-            args.context_tokens - self.max_candidate_tokens + 1, 0, extra, self.cohort_admission()?)
+        args.validate_storage_with_team_prefill(self.max_result_bytes, self.max_candidate_tokens,
+            args.context_tokens - self.max_candidate_tokens + 1, 0, extra, self.cohort_admission()?,
+            allow_threaded_prefill)
     }
     pub(super) fn cohort_admission(self) -> Result<Option<cohort::Admission>, CandidateError> {
         self.cohort_heads.map(|heads| cohort::Admission::new(heads, self.work_ceiling(),

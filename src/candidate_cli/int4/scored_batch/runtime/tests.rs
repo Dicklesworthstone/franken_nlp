@@ -132,13 +132,13 @@ fn team_provenance_and_host_inventory_match_the_admitted_whole_stream_width() {
 }
 
 #[test]
-fn changed_team_schedule_is_revalidated_before_owned_defaults_model_or_stream_io() {
+fn invalid_changed_team_schedule_is_revalidated_before_owned_defaults_model_or_stream_io() {
     for task in ["classify", "sentiment", "judge"] {
         let command = super::super::tests::command(task, &["--compute-threads", "2", "--defaults", "never-open.json"]);
         let Int4Command { task: Int4Task::ScoredBatch(batch), mut args, batch: None, job: None } = command
             else { panic!("wrong scored stream task"); };
         let quote = batch.validate(&args).unwrap();
-        args.prefill_rows = Some(2);
+        super::super::tests::set_prefill_rows(&mut args, 65);
         assert_eq!(execute(args, batch, quote, NoIo, NoIo), Err(CandidateError::Arguments));
     }
 }

@@ -52,8 +52,8 @@ impl NlpEngine {
     /// native engine through the stream, including flushes and final delivery.
     /// Documents and heads remain ordered; finite candidate traversal, EOS,
     /// complete results and conservative invocation-wide work are unchanged.
-    /// This route uses one coordinator and cannot combine with a CPU team or
-    /// simultaneous-document cohorts.
+    /// This entry uses one coordinator; the explicit threaded variant reuses
+    /// one fixed team through both prompt morsels and candidate scoring.
     #[allow(clippy::too_many_arguments)]
     pub fn batch_int4_scored_layer_major<P, R, W>(&self, model: &ResidentInt4,
         planner: Int4ScoredBatchPlanner<P>, limits: CorpusLimits, kernel: PackedInt4Kernel,
@@ -71,8 +71,8 @@ impl NlpEngine {
     /// Complete item records remain ordered. The terminal run_complete is
     /// published only after every worker joins, under the original run control
     /// and with the owned reader/writer and output staging still charged.
-    /// Blocking IO stays cooperative. This schedule does not combine with
-    /// layer-major prefill or cross-document cohorts.
+    /// Blocking IO stays cooperative. This entry uses single-row prompts;
+    /// the layer-major variant separately admits bounded prompt row storage.
     #[allow(clippy::too_many_arguments)]
     pub fn batch_int4_scored_with_threads<P, R, W>(&self, model: &ResidentInt4,
         planner: Int4ScoredBatchPlanner<P>, limits: CorpusLimits, kernel: PackedInt4Kernel,
@@ -82,15 +82,28 @@ impl NlpEngine {
         self.run_int4_scored(model, planner, limits, kernel, None, Some(compute_threads), reader, writer, cancellation)
     }
 
+    /// Reuse one persistent output-row team across bounded layer-major prompts,
+    /// finite candidate traversal and every complete document in the stream.
+    /// The team has one immutable batch capacity, with worker buffers and the
+    /// coordinator's prompt workspace admitted before input. Head ordering,
+    /// full-vocabulary scoring, EOS and invocation-wide work are unchanged.
+    /// The terminal footer remains deferred until every worker has joined.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int4_scored_layer_major_with_threads<P, R, W>(&self, model: &ResidentInt4,
+        planner: Int4ScoredBatchPlanner<P>, limits: CorpusLimits, kernel: PackedInt4Kernel,
+        compute_threads: usize, prefill: Int4PrefillLimits, reader: R, writer: W,
+        cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where P: Int4ScoredTask, R: BufRead + Send + 'static, W: Write + Send + 'static {
+        self.run_int4_scored(model, planner, limits, kernel, Some(prefill), Some(compute_threads),
+            reader, writer, cancellation)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_int4_scored<P, R, W>(&self, model: &ResidentInt4,
         planner: Int4ScoredBatchPlanner<P>, limits: CorpusLimits, kernel: PackedInt4Kernel,
         prefill: Option<Int4PrefillLimits>, compute_threads: Option<usize>, reader: R, writer: W,
         cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where P: Int4ScoredTask, R: BufRead + Send + 'static, W: Write + Send + 'static {
-        if prefill.is_some() && compute_threads.is_some() {
-            return Err(HostedError::Limits("INT4 scored stream team/prefill schedule"));
-        }
         match compute_threads {
             Some(width) => dispatch::preflight_int4_team(self, limits.native.run, width)?,
             None => dispatch::preflight(self, limits.native.run)?,
@@ -108,8 +121,9 @@ impl NlpEngine {
         // One compiler call is active at a time. Retained plans and transport
         // stay charged while this additional bounded encoder workspace is used.
         required.input_bytes = sum(&[required.input_bytes, planner.encoding_workspace_bytes()])?;
+        let max_batch_rows = prefill.map_or(1, |limits| limits.max_batch_rows);
         let team_scratch = compute_threads.map(|width|
-            int4_task_team_workspace_bytes(width, model.model_identity().group_width()))
+            dispatch::int4_prefill_team_workspace_bytes(width, model.model_identity().group_width(), max_batch_rows))
             .transpose()?.unwrap_or(0);
         sum(&[required.input_bytes, required.native.kv_bytes, required.workspace_bytes, team_scratch])?;
         let lease = self.resources().acquire_lease();
@@ -148,8 +162,8 @@ impl NlpEngine {
             drop(lease);
             result
         }),
-        Some(width) => dispatch::run_int4_team_with_finalize(self, limits.native.run, cancellation,
-            model, width, kernel, move |weights, control, team| {
+        Some(width) => dispatch::run_int4_prefill_team_with_finalize(self, limits.native.run, cancellation,
+            model, width, kernel, max_batch_rows, move |weights, control, team| {
                 let mut input = input;
                 checkpoint(control)?;
                 let planner = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
@@ -166,8 +180,11 @@ impl NlpEngine {
                     max_item_work: work.max_item_work, task_spec: P::TASK,
                     output_bytes: limits.transport.max_output_line_bytes as u64 };
                 let completion = {
-                    let mut processor = NativeInt4ScoredBatch::new(planner, &mut engine.value, admission)
-                        .map_err(HostedError::BatchSetup)?;
+                    let mut processor = match prefill {
+                        None => NativeInt4ScoredBatch::new(planner, &mut engine.value, admission),
+                        Some(prefill) => NativeInt4ScoredBatch::new_layer_major(
+                            planner, &mut engine.value, admission, prefill),
+                    }.map_err(HostedError::BatchSetup)?;
                     stream::deferred::run_ndjson_deferred(&mut input.value.reader, &mut input.value.writer,
                         &mut processor, limits.transport, control).map_err(HostedError::Batch)?
                 };

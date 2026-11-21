@@ -114,6 +114,7 @@ fn stream<P: Int4ScoredTask + Send + 'static, W: Write + Send + 'static>(engine:
     let common = limits.common;
     let identity = planner.base_execution_identity().clone();
     if !super::super::prefill::matches(args, common)?
+        || common.compute != args.compute.admit_with_prefill(args.group_width, common.prefill)?
         || planner.group_width() != model.model_identity().group_width()
         || planner.document_encoding() != &encoding
         || planner.encoding_workspace_bytes() != limits.encoding_workspace_bytes {
@@ -156,8 +157,13 @@ fn stream<P: Int4ScoredTask + Send + 'static, W: Write + Send + 'static>(engine:
             Int4ScoredCohortHostLimits { max_documents: cohort.max_documents, max_heads: cohort.max_heads },
             common.kernel, reader, writer, cancellation).map_err(execution_error)?.summary
     } else if let Some(prefill) = common.prefill {
-        engine.batch_int4_scored_layer_major(model, planner, corpus, common.kernel,
-            prefill, reader, writer, cancellation).map_err(execution_error)?
+        if common.compute.threads > 1 {
+            engine.batch_int4_scored_layer_major_with_threads(model, planner, corpus, common.kernel,
+                common.compute.threads, prefill, reader, writer, cancellation).map_err(execution_error)?
+        } else {
+            engine.batch_int4_scored_layer_major(model, planner, corpus, common.kernel,
+                prefill, reader, writer, cancellation).map_err(execution_error)?
+        }
     } else if common.compute.threads > 1 {
         engine.batch_int4_scored_with_threads(model, planner, corpus, common.kernel,
             common.compute.threads, reader, writer, cancellation).map_err(execution_error)?
