@@ -54,6 +54,38 @@ fn candidate_framing_and_owned_buffers_are_priced_separately() {
     assert_eq!(e.transport.max_document_bytes, c.host.max_input_bytes);
 }
 #[test]
+fn compact_score_streams_keep_whole_run_authority_and_reserve_encoder_memory() {
+    for name in ["classify", "sentiment"] {
+        let byte = command(name, &[]);
+        let compact = command(name, &["--input-encoding", "safe-bpe-v1"]);
+        let (common, _, envelope) = compact.validate().unwrap();
+        assert_eq!(common.input_encoding, compact.encoding);
+        assert_eq!(compact.host.work_ceiling(), byte.host.work_ceiling());
+        assert_eq!(envelope.transport.max_work, byte.validate().unwrap().2.transport.max_work);
+        let mut larger = command(name, &["--input-encoding", "safe-bpe-v1", "--max-input-bytes", "1048576"]);
+        assert!(larger.validate().is_err());
+        larger.host.preparation_mib = 768;
+        assert!(larger.validate().is_ok());
+    }
+}
+#[test]
+fn compact_judgment_and_invalid_tokenizer_work_refuse_before_any_io() {
+    struct Never;
+    impl Read for Never { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("input read") } }
+    impl Write for Never {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("output write") }
+        fn flush(&mut self) -> io::Result<()> { panic!("output flush") }
+    }
+    let c = command("judge", &["--input-encoding", "safe-bpe-v1", "--defaults", "never-open.json"]);
+    assert_eq!(c.execute_owned(Never, Never), Err(CandidateError::Arguments));
+    for name in ["classify", "sentiment"] {
+        for flag in ["--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
+            let c = command(name, &["--input-encoding", "safe-bpe-v1", flag, "0"]);
+            assert_eq!(c.execute_owned(Never, Never), Err(CandidateError::Arguments));
+        }
+    }
+}
+#[test]
 fn classification_defaults_keep_exact_labels_and_host_owned_budget() {
     let c = command("classify", &[]); let budget = task(&c);
     let Defaults::Classify(Some(d)) = c.parse_defaults(Some(LABELS), budget).unwrap() else { panic!("wrong settings") };

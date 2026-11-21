@@ -156,6 +156,38 @@ fn task_and_scorer_ceilings_reserve_candidate_depth_and_entire_kv() {
     assert_eq!(c.args.sentiment_limits().max_total_projected_logits, c.args.max_projected_logits);
     assert_eq!(c.args.classification_limits().max_work.forward_positions, c.args.max_forward_positions);
 }
+#[test]
+fn compact_scoring_is_explicit_and_prices_its_derived_workspace() {
+    use crate::tokenizer::untrusted::UntrustedEncoding;
+    for name in ["classify", "sentiment"] {
+        let byte = command(name, &[]);
+        assert_eq!(byte.args.encoding_policy(&byte.encoding).unwrap(), UntrustedEncoding::ByteFallback);
+        let mut compact = command(name, &["--input-encoding", "safe-bpe-v1", "--max-input-bytes", "1048576"]);
+        assert!(compact.args.common().is_ok());
+        assert!(compact.args.common_with_encoding(&compact.encoding).is_err());
+        compact.args.preparation_mib = 768;
+        let (common, _) = compact.args.common_with_encoding(&compact.encoding).unwrap();
+        assert_eq!(common.input_encoding, compact.encoding);
+        let UntrustedEncoding::SafeBpeV1(limits) = compact.args.encoding_policy(&compact.encoding).unwrap()
+            else { panic!("compact policy lost") };
+        assert_eq!(limits.max_input_bytes, compact.args.max_input_bytes);
+        assert_eq!(limits.max_output_tokens + compact.args.max_candidate_tokens, compact.args.context_tokens);
+        assert!(limits.requirements().unwrap().workspace_bytes > 256 * MIB);
+        assert_eq!(byte.args.work_ceiling(), compact.args.work_ceiling());
+    }
+}
+#[test]
+fn tokenizer_options_cannot_grant_work_to_byte_mode_or_use_invalid_caps() {
+    for name in ["classify", "sentiment"] {
+        for flag in ["--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
+            let matches = super::super::definition().try_get_matches_from([
+                "candidate", name, "--model", "m", "--memory-mib", "8192", flag, "1"]).unwrap();
+            assert!(CandidateCommand::from_matches(&matches).is_err());
+            let c = command(name, &["--input-encoding", "safe-bpe-v1", flag, "0"]);
+            assert!(c.args.common_with_encoding(&c.encoding).is_err());
+        }
+    }
+}
 #[cfg(not(feature = "asupersync-runtime"))]
 #[test]
 fn disabled_build_refuses_both_scored_commands_without_reading_any_input() {

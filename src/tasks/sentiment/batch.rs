@@ -46,6 +46,10 @@ impl SentimentBatchConfig {
         if planner.document_encoding() != &crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback {
             return Err(BatchCode::Admission.into());
         }
+        self.validate_with_document_encoding(planner)
+    }
+    pub(crate) fn validate_with_document_encoding(&self, planner: &SentimentPlanner) -> Result<(), BatchFault> {
+        planner.document_encoding().validate().map_err(|_| BatchCode::InvalidLimits)?;
         constrained_int8::check_profile(&self.identity).map_err(|_| BatchCode::Admission)?;
         if self.identity.task_spec != "sentiment-v1"
             || self.identity.template_digest != *planner.template_digest()
@@ -88,6 +92,14 @@ impl PreparedInt8BatchSentiment {
 impl<'p> Int8SentimentBatchPlanner<'p> {
     pub fn new(planner: &'p SentimentPlanner, config: SentimentBatchConfig) -> Result<Self, BatchFault> {
         config.validate(planner)?;
+        Self::new_with_document_encoding(planner, config)
+    }
+    /// Explicit compact-input construction. Every record retains one shared
+    /// tokenizer ledger across its axes and the exact policy-bound identity.
+    /// The host prices one derived encoder workspace beside retained plans.
+    pub fn new_with_document_encoding(planner: &'p SentimentPlanner, config: SentimentBatchConfig)
+        -> Result<Self, BatchFault> {
+        config.validate_with_document_encoding(planner)?;
         let l = config.planning; let s = l.per_axis;
         let limits = (s.max_candidates, s.max_total_tokens, s.max_nodes, s.max_depth,
             s.max_candidate_id_bytes, s.max_projected_logits, l.max_total_prompt_tokens,

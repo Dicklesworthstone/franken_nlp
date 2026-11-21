@@ -11,9 +11,11 @@ use crate::{
         sentiment::{SentimentPlanner, SentimentOptions, quantized::PreparedInt8Sentiment}},
 };
 use crate::native_engine::lmhead::scoring::ScoringMode;
+use crate::tokenizer::untrusted::UntrustedEncoding;
 
 enum Prepared { Classify(PreparedInt8Classification), Sentiment(PreparedInt8Sentiment) }
-fn prepare(request: &Request, facts: &ArtifactIdentity, args: &ScoredArgs, control: &mut impl DecodeStepControl)
+fn prepare(request: &Request, facts: &ArtifactIdentity, args: &ScoredArgs,
+    encoding: &UntrustedEncoding, control: &mut impl DecodeStepControl)
     -> Result<Prepared, CandidateError> {
     if control.prefill_checkpoint(0).is_some() { return Err(CandidateError::Planning); }
     let mut identity = candidate_identity(facts)?;
@@ -23,7 +25,9 @@ fn prepare(request: &Request, facts: &ArtifactIdentity, args: &ScoredArgs, contr
         .map(|e| e.id).ok_or(CandidateError::Identity)?;
     let prepared = match request {
         Request::Classify(request) => {
-            let planner = ClassificationPlanner::pinned(controls, eos).map_err(|_| CandidateError::Planning)?;
+            let planner = ClassificationPlanner::pinned(controls, eos)
+                .and_then(|planner| planner.with_document_encoding(encoding.clone()))
+                .map_err(|_| CandidateError::Planning)?;
             identity.task_spec = "classify-v1".to_owned();
             identity.template_digest = *planner.template_digest();
             identity.tokenizer_digest = planner.tokenizer_digest();
@@ -36,7 +40,8 @@ fn prepare(request: &Request, facts: &ArtifactIdentity, args: &ScoredArgs, contr
         Request::Sentiment { request, policy } => {
             let planner = SentimentPlanner::pinned(controls, SentimentOptions {
                 mode: ScoringMode::FullVocabulary, eos_token_id: eos, policy: *policy,
-            }).map_err(|_| CandidateError::Planning)?;
+            }).and_then(|planner| planner.with_document_encoding(encoding.clone()))
+                .map_err(|_| CandidateError::Planning)?;
             identity.task_spec = "sentiment-v1".to_owned();
             identity.template_digest = *planner.template_digest();
             identity.tokenizer_digest = planner.tokenizer_digest();
@@ -54,6 +59,7 @@ fn prepare(request: &Request, facts: &ArtifactIdentity, args: &ScoredArgs, contr
 pub(in crate::candidate_cli) fn execute(command: ScoredCommand, common: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
     let prefill = command.prefill.limits()?;
+    let encoding = command.args.encoding_policy(&command.encoding)?;
     // Session precedes every input, planner and output allocation. Its modeled
     // preparation charge survives all returned failures and final delivery.
     let session = Session::new(&common, limits)?;
@@ -61,7 +67,7 @@ pub(in crate::candidate_cli) fn execute(command: ScoredCommand, common: Candidat
     let request = command::request(command.kind, &text, command.args.budget(limits), common.max_input_bytes)?;
     session.remaining()?;
     let facts = session.facts(&common)?;
-    let prepared = prepare(&request, &facts, &command.args, &mut session.control())?;
+    let prepared = prepare(&request, &facts, &command.args, &encoding, &mut session.control())?;
     session.remaining()?;
     // Only a complete bound plan with ALL work axes admitted can load weights.
     let cancellation = CancellationToken::default();
@@ -74,7 +80,7 @@ pub(in crate::candidate_cli) fn execute(command: ScoredCommand, common: Candidat
                 Some(prefill) => session.engine.execute_int8_classify_layer_major(&model, plan, native, prefill, cancellation),
                 None => session.engine.execute_int8_classify(&model, plan, native, cancellation),
             }.map_err(|_| CandidateError::Execution)?;
-            deliver(&session, &facts, &result, cap, output)
+            deliver(&session, &facts, &result, &encoding, cap, output)
         }
         Prepared::Sentiment(plan) => {
             let host = SentimentHostLimits {
@@ -85,12 +91,12 @@ pub(in crate::candidate_cli) fn execute(command: ScoredCommand, common: Candidat
                 Some(prefill) => session.engine.execute_int8_sentiment_layer_major(&model, plan, host, prefill, cancellation),
                 None => session.engine.execute_int8_sentiment(&model, plan, host, cancellation),
             }.map_err(|_| CandidateError::Execution)?;
-            deliver(&session, &facts, &result, cap, output)
+            deliver(&session, &facts, &result, &encoding, cap, output)
         }
     }
 }
 fn deliver<T: Serialize>(session: &Session, facts: &ArtifactIdentity, guarded: &T,
-    cap: usize, output: &mut impl Write) -> Result<(), CandidateError> {
+    encoding: &UntrustedEncoding, cap: usize, output: &mut impl Write) -> Result<(), CandidateError> {
     session.remaining()?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
         evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
@@ -98,6 +104,8 @@ fn deliver<T: Serialize>(session: &Session, facts: &ArtifactIdentity, guarded: &
         quant_recipe: &facts.recipe_id, output: guarded };
     // guarded is the caller's HostedOutput; it and Session are still alive
     // through serialization, external write and flush. No partial head output.
+    let response = input_encoding::Response { response: &response,
+        input_encoding: input_encoding::reported_policy(encoding) };
     publish_checked(&response, cap, output, &|| session.remaining().map(|_| ()))
 }
 

@@ -70,3 +70,76 @@ fn an_item_allowance_cannot_exceed_the_whole_sentiment_stream_allowance() {
     cfg.max_item_work.projections.multiply_accumulates += 1;
     assert!(cfg.validate(&p).is_err());
 }
+
+#[test]
+fn compact_classification_stream_uses_explicit_bound_plans_for_each_record() {
+    let c = command("classify", &["--input-encoding", "safe-bpe-v1"]);
+    let (_, limits, _) = c.validate().unwrap(); let budget = c.host.budget(limits);
+    let defaults = c.parse_defaults(Some(r#"{"labels":[{"id":"happy"},{"id":"sad"}],"mode":"multi_label"}"#), budget).unwrap();
+    let Corpus::Classify(planner, cfg) = configure(&c, &facts(), limits, defaults).unwrap() else { panic!("wrong task") };
+    assert_eq!(planner.document_encoding(), &c.host.encoding_policy(&c.encoding).unwrap());
+    assert_eq!(cfg.max_model_work, c.host.work_ceiling());
+    assert!(Int8ClassificationBatchPlanner::new(&planner, cfg.identity.clone(), budget,
+        cfg.planning, cfg.defaults.clone()).is_err());
+    let mut wrong = cfg.identity.clone(); wrong.template_digest = Sha256Digest::of_bytes(b"other policy");
+    assert!(Int8ClassificationBatchPlanner::new_with_document_encoding(&planner, wrong, budget,
+        cfg.planning, cfg.defaults.clone()).is_err());
+    let compiler = Int8ClassificationBatchPlanner::new_with_document_encoding(&planner, cfg.identity,
+        budget, cfg.planning, cfg.defaults).unwrap();
+    let first = compiler.prepare_with_control(doc::<ClassificationBatchArgs>(), &mut Continue).unwrap();
+    let second = compiler.prepare_with_control(doc::<ClassificationBatchArgs>(), &mut Continue).unwrap();
+    assert_eq!(first.head_count(), 2);
+    assert_eq!(first.execution_identity(), second.execution_identity());
+    assert_eq!(first.model_work(), second.model_work());
+}
+
+#[test]
+fn compact_sentiment_stream_keeps_one_policy_for_every_axis_and_record() {
+    let c = command("sentiment", &["--input-encoding", "safe-bpe-v1"]);
+    let (_, limits, _) = c.validate().unwrap(); let budget = c.host.budget(limits);
+    let Corpus::Sentiment(planner, mut cfg) = configure(&c, &facts(), limits,
+        c.parse_defaults(None, budget).unwrap()).unwrap() else { panic!("wrong task") };
+    assert_eq!(planner.document_encoding(), &c.host.encoding_policy(&c.encoding).unwrap());
+    assert!(cfg.validate(&planner).is_err());
+    let digest = cfg.identity.template_digest;
+    cfg.identity.template_digest = Sha256Digest::of_bytes(b"other policy");
+    assert!(cfg.validate_with_document_encoding(&planner).is_err());
+    cfg.identity.template_digest = digest;
+    let compiler = Int8SentimentBatchPlanner::new_with_document_encoding(&planner, cfg).unwrap();
+    let first = compiler.prepare_with_control(doc::<SentimentBatchArgs>(), &mut Continue).unwrap();
+    let second = compiler.prepare_with_control(doc::<SentimentBatchArgs>(), &mut Continue).unwrap();
+    assert_eq!(first.head_count(), 4);
+    assert_eq!(first.execution_identity(), second.execution_identity());
+    assert_eq!(first.model_work(), second.model_work());
+}
+
+#[test]
+fn exact_compact_policy_is_reported_on_flush_and_empty_terminal_frames_only_when_selected() {
+    use std::io::Write;
+    for extra in [&[][..], &["--input-encoding", "safe-bpe-v1"][..]] {
+        let c = command("sentiment", extra);
+        let encoding = c.host.encoding_policy(&c.encoding).unwrap(); let facts = facts();
+        let provenance = Provenance { protocol: "fnlp-candidate-batch-v1", schema_version: 1,
+            scope: "real-artifact-current-candidate", evidence: "non_authoritative",
+            model_id: &facts.model_id, source_revision: &facts.revision, source_root_sha256: &facts.source_root_sha256,
+            logical_model_sha256: &facts.logical_model_sha256, quant_recipe: &facts.recipe_id, task: "sentiment",
+            input_encoding: input_encoding::reported_policy(&encoding) };
+        let mut output = Vec::new();
+        {
+            let mut writer = CandidateWriter::new(&mut output, &provenance, 1024, 16 * 1024).unwrap();
+            // Transport framing only: these fixtures do not invent scored results.
+            for kind in ["flush", "run_complete"] {
+                writeln!(writer, "{}", serde_json::json!({"kind":kind})).unwrap();
+                writer.flush().unwrap();
+            }
+        }
+        let frames = serde_json::Deserializer::from_slice(&output).into_iter::<serde_json::Value>()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(frames.len(), 2);
+        for (frame, kind) in frames.iter().zip(["flush", "run_complete"]) {
+            assert_eq!(frame["record"], serde_json::json!({"kind":kind}));
+            if extra.is_empty() { assert!(frame.get("input_encoding").is_none()); }
+            else { assert_eq!(frame["input_encoding"], serde_json::to_value(&encoding).unwrap()); }
+        }
+    }
+}

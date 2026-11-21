@@ -74,6 +74,50 @@ documents, while the resident model and native allocations remain shared.
 
 ## Compute, memory and transport bounds
 
+### Compact classification and sentiment records
+
+The INT8 stream accepts `--input-encoding safe-bpe-v1` for `--task classify` and
+`--task sentiment`:
+
+```sh
+fnlp candidate score-batch reviews.ndjson --task sentiment \
+  --model ./model.fnlpq --memory-mib 8192 --input-encoding safe-bpe-v1
+```
+
+The default remains `byte-fallback`. Compact input preserves exact untrusted
+bytes and excludes template-control token IDs. It can fit more ordinary source
+text into the selected context; it does not truncate documents or imply the same
+model output, quality or measured speed. INT8 `--task judge` rejects compact input
+before defaults, source or model IO. Retained INT8 `score-job` commands continue
+to use their existing byte-only recipes and do not accept these options.
+
+Each record gets one bounded tokenizer ledger shared by its document and every
+canonical label-metadata segment across all scoring heads. Sentiment reuses the
+one encoded document for all requested axes. `--max-input-bytes` bounds the
+cumulative untrusted bytes within a record, and context minus reserved candidate
+depth bounds its cumulative untrusted output tokens. The per-record work caps
+are `--max-tokenizer-pair-checks` (default 4194304) and
+`--max-tokenizer-pair-bytes` (default 67108864). Exhaustion fails that record;
+there is no per-head renewal or silent byte fallback. Native work remains one
+whole-run allowance across all records and flushes.
+
+Preparation admission includes the selected encoder's derived workspace beside
+retained prompt and stream storage. The hosted INT8 classification and sentiment
+APIs independently reserve that workspace from the explicit planner policy.
+Library callers select it with `ClassificationPlanner::with_document_encoding`
+or `SentimentPlanner::with_document_encoding` and use the existing hosted corpus
+methods. Lower-level embeddings use the named
+`Int8ClassificationBatchPlanner::new_with_document_encoding` or
+`Int8SentimentBatchPlanner::new_with_document_encoding` constructors and must
+admit the policy's workspace themselves. Legacy constructors remain byte-only.
+
+The exact policy binds every prepared identity and appears as `input_encoding`
+on every compact-stream event, including failures, flushes and an empty terminal
+`run_complete`. Omitting the option preserves the prior wire shape. Source and
+label content remains untrusted even when marker tokens are excluded.
+
+### Whole-run bounds
+
 The command reuses the single-request scored options for context, candidate
 length, result size, memory and time. It exposes no generation, schema or mask
 options. All FIVE native work flags are WHOLE-RUN totals:

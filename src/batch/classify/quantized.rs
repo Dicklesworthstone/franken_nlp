@@ -41,6 +41,16 @@ impl<'p> Int8ClassificationBatchPlanner<'p> {
         if planner.document_encoding() != &crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback {
             return Err(BatchCode::Admission.into());
         }
+        Self::new_with_document_encoding(planner, identity, ceiling, limits, defaults)
+    }
+    /// Explicit bounded input policy. One shared tokenizer ledger covers the
+    /// complete document and label metadata; no allowance renews per head.
+    /// Hosts must reserve the policy's derived transient workspace alongside
+    /// retained task/transport state before preparing any record.
+    pub fn new_with_document_encoding(planner: &'p ClassificationPlanner, identity: ExecutionIdentity,
+        ceiling: TaskBudget, limits: ClassificationLimits, defaults: Option<ClassificationBatchArgs>)
+        -> Result<Self, BatchFault> {
+        planner.document_encoding().validate().map_err(|_| BatchCode::InvalidLimits)?;
         identity.validate().map_err(|_| BatchCode::Admission)?;
         ceiling.validate().map_err(|_| BatchCode::InvalidLimits)?;
         if identity.task_spec != "classify-v1" || identity.template_digest != *planner.template_digest()

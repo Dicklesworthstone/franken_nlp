@@ -36,13 +36,15 @@ impl NlpEngine {
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), &config.identity)?;
         validate_work(config.max_model_work)?;
+        let encoder_bytes = encoding_workspace_bytes(planner.document_encoding())?;
         let output_bytes = output_ceiling(config.task_ceiling, limits.transport.max_output_line_bytes)?;
         let required = requirements(limits.native)?;
         if required.kv_bytes > config.task_ceiling.max_kv_bytes {
             return Err(HostedError::Limits("classification corpus whole KV allocation"));
         }
         let lease = self.resources().acquire_lease();
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, limits.reservation_bytes()?)?,
+        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers,
+            sum(&[limits.reservation_bytes()?, encoder_bytes])?)?,
             || Ok(StreamInput { planner: Some((planner, config)), reader, writer }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
         let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch,
@@ -53,7 +55,7 @@ impl NlpEngine {
             // work is discarded before it runs; do not capture its fields alone.
             let mut input = input;
             let (planner, config) = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
-            let compiler = Int8ClassificationBatchPlanner::new(&planner, config.identity,
+            let compiler = Int8ClassificationBatchPlanner::new_with_document_encoding(&planner, config.identity,
                 config.task_ceiling, config.planning, config.defaults).map_err(HostedError::BatchSetup)?;
             let mut engine = allocate_native(kv, workspace, || model.inner.loaded.value
                 .engine(limits.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
@@ -72,6 +74,20 @@ impl NlpEngine {
             drop(lease);
             result
         })
+    }
+}
+
+/// Transient tokenization is charged in addition to the caller's retained
+/// prompt, transport and output buffers; a compact planner cannot discount it.
+pub(super) fn encoding_workspace_bytes(encoding: &crate::tokenizer::untrusted::UntrustedEncoding)
+    -> Result<u64, HostedError> {
+    use crate::tokenizer::untrusted::UntrustedEncoding;
+    encoding.validate().map_err(|_| HostedError::Limits("scored corpus input encoding"))?;
+    match encoding {
+        UntrustedEncoding::ByteFallback => Ok(0),
+        UntrustedEncoding::SafeBpeV1(limits) => limits.requirements()
+            .map(|required| required.workspace_bytes)
+            .map_err(|_| HostedError::Limits("scored corpus tokenizer workspace")),
     }
 }
 

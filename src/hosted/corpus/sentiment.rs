@@ -18,11 +18,13 @@ impl NlpEngine {
         dispatch::preflight(self, limits.native.run)?;
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), &config.identity)?;
-        config.validate(&planner).map_err(HostedError::BatchSetup)?;
+        config.validate_with_document_encoding(&planner).map_err(HostedError::BatchSetup)?;
+        let encoder_bytes = super::classify::encoding_workspace_bytes(planner.document_encoding())?;
         let required = requirements(limits.native)?;
         validate_capacity(config.task_ceiling, required.kv_bytes, limits.transport.max_output_line_bytes)?;
         let lease = self.resources().acquire_lease();
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, limits.reservation_bytes()?)?,
+        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers,
+            sum(&[limits.reservation_bytes()?, encoder_bytes])?)?,
             || Ok(StreamInput { planner: Some((planner, config)), reader, writer }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch,
@@ -33,7 +35,7 @@ impl NlpEngine {
             // drops stored planner/IO before their charge and completion signal.
             let mut input = input;
             let (planner, config) = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
-            let compiler = Int8SentimentBatchPlanner::new(&planner, config).map_err(HostedError::BatchSetup)?;
+            let compiler = Int8SentimentBatchPlanner::new_with_document_encoding(&planner, config).map_err(HostedError::BatchSetup)?;
             let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value
                 .engine(limits.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
             let admission = CorpusAdmission { lease: &lease, model: model.artifact_identity(),

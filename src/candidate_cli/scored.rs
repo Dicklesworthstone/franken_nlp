@@ -70,6 +70,10 @@ pub(super) struct ScoredArgs {
 }
 impl ScoredArgs {
     pub(super) fn common(&self) -> Result<(CandidateArgs, Limits), CandidateError> {
+        self.common_with_encoding(&input_encoding::InputEncodingArgs::default())
+    }
+    pub(super) fn common_with_encoding(&self, encoding: &input_encoding::InputEncodingArgs)
+        -> Result<(CandidateArgs, Limits), CandidateError> {
         if !(2..=64).contains(&self.max_candidate_tokens) || self.max_candidate_tokens >= self.context_tokens
             || self.preparation_mib < 512 || self.max_forward_positions == 0
             || self.max_forward_positions > 16 * 1024 * 1024 || self.max_projected_logits == 0
@@ -84,14 +88,17 @@ impl ScoredArgs {
             timeout_seconds: self.timeout_seconds, max_checkpoints: self.max_checkpoints,
             seed: None, temperature_milli: None, top_k: None, top_p_ppm: None, logprobs: false,
             policy: generation_policy::GenerationPolicyArgs::default(),
-            input_encoding: input_encoding::InputEncodingArgs::default() };
+            input_encoding: encoding.clone() };
         let limits = common.validate()?;
         // In addition to the shared floor, price the worst permitted repeated
         // exact prompt/IR copies; user input cannot buy an uncharged head set.
         let prompt_bytes = self.max_forward_positions.checked_mul(32).ok_or(CandidateError::Arguments)?;
+        let encoder_bytes = encoding.workspace_bytes(self.max_input_bytes,
+            self.context_tokens - self.max_candidate_tokens)?;
         let floor = (256 * MIB).checked_add(prompt_bytes)
             .and_then(|n| n.checked_add(self.max_input_bytes as u64 * 32))
             .and_then(|n| n.checked_add(self.max_result_bytes as u64 * 16))
+            .and_then(|n| n.checked_add(encoder_bytes))
             .ok_or(CandidateError::Arguments)?;
         if limits.preparation_bytes < floor { return Err(CandidateError::Arguments); }
         Ok((common, limits))
@@ -100,6 +107,12 @@ impl ScoredArgs {
         TaskBudget { max_input_tokens: (self.context_tokens - self.max_candidate_tokens) as u32,
             max_output_tokens: self.max_candidate_tokens as u32, max_output_bytes: self.max_result_bytes as u64,
             max_grammar_states: SCORING_NODES as u32, max_kv_bytes: limits.kv_bytes }
+    }
+    pub(super) fn encoding_policy(&self, encoding: &input_encoding::InputEncodingArgs)
+        -> Result<crate::tokenizer::untrusted::UntrustedEncoding, CandidateError> {
+        let tokens = self.context_tokens.checked_sub(self.max_candidate_tokens)
+            .ok_or(CandidateError::Arguments)?;
+        encoding.policy(self.max_input_bytes, tokens)
     }
     pub(super) fn work_ceiling(&self) -> Int8Work {
         Int8Work { forward_positions: self.max_forward_positions, projected_logits: self.max_projected_logits,
@@ -136,21 +149,24 @@ pub(crate) struct ScoredCommand {
     pub(super) kind: Kind,
     pub(super) args: ScoredArgs,
     pub(super) prefill: prefill::ScoringPrefillArgs,
+    pub(super) encoding: input_encoding::InputEncodingArgs,
 }
 pub(super) fn definitions() -> Vec<clap::Command> {
     [("classify", "Score every label exactly; exclusive or independent multi-label decisions"),
         ("sentiment", "Score independent affect dimensions; uncalibrated, not psychological measurements")]
-        .into_iter().map(|(name, about)| prefill::ScoringPrefillArgs::augment_args(
-            ScoredArgs::augment_args(clap::Command::new(name).about(about)))).collect()
+        .into_iter().map(|(name, about)| input_encoding::definition(prefill::ScoringPrefillArgs::augment_args(
+            ScoredArgs::augment_args(clap::Command::new(name).about(about))))
+            .after_long_help("--input-encoding safe-bpe-v1 explicitly compacts exact untrusted document and label bytes without template-control tokens. One tokenizer allowance covers the complete request, including every label metadata segment; it is not renewed per head. Pair checks and examined bytes have separate finite caps. One transient encoder workspace is admitted before input/model IO. The exact policy binds prompt identity and appears on compact results. The default remains byte-fallback. Compact input changes prompt tokens and makes no model-output, quality or speed equivalence claim.")).collect()
 }
 impl ScoredCommand {
     pub(super) fn from_matches(kind: Kind, matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         Ok(Self { kind, args: ScoredArgs::from_arg_matches(matches)?,
-            prefill: prefill::ScoringPrefillArgs::from_arg_matches(matches)? })
+            prefill: prefill::ScoringPrefillArgs::from_arg_matches(matches)?,
+            encoding: input_encoding::InputEncodingArgs::from_matches(matches)? })
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
         self.prefill.limits()?;
-        let (common, limits) = self.args.common()?;
+        let (common, limits) = self.args.common_with_encoding(&self.encoding)?;
         #[cfg(feature = "asupersync-runtime")]
         { runtime::scored_tasks::execute(self, common, limits, input, output) }
         #[cfg(not(feature = "asupersync-runtime"))]

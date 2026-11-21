@@ -68,6 +68,46 @@ inferences about hidden mental states.
 
 ## Input, budgets and output
 
+### Compact untrusted input
+
+Both commands accept explicit compact input:
+
+```sh
+fnlp candidate classify request.json --model ./model.fnlpq --memory-mib 8192 \
+  --input-encoding safe-bpe-v1
+fnlp candidate sentiment request.json --model ./model.fnlpq --memory-mib 8192 \
+  --input-encoding safe-bpe-v1
+```
+
+The default remains `byte-fallback`. `safe-bpe-v1` preserves the original UTF-8
+bytes, including whitespace, Unicode spelling and marker-shaped strings, while
+excluding template-control token IDs from untrusted text. Ordinary language can
+use fewer prompt tokens and fit a longer document into the same context. The
+whole prompt must still fit: the command never truncates a source or falls back
+to another encoding when a limit is exhausted. This policy changes prompt token
+sequences and does not promise identical model output, quality or measured speed.
+
+One finite tokenizer ledger covers the complete scored request. Classification
+charges the document once and every canonical label-metadata record, including
+all independent multi-label heads. Sentiment encodes the document once for all
+requested axes. `--max-input-bytes` also bounds cumulative untrusted bytes and
+the available prompt-token allowance bounds cumulative untrusted tokens.
+`--max-tokenizer-pair-checks` defaults to 4194304 and
+`--max-tokenizer-pair-bytes` to 67108864. These options require compact input;
+zero or excessive limits reject before IO. Tokenizer work is separate from the
+five native-scoring work ceilings below.
+
+The selected limits determine an additional transient encoder workspace. The
+command includes that workspace in preparation admission before reading input
+or opening model metadata. A larger byte ceiling may require a larger
+`--preparation-mib`; for example, compact input with a 1 MiB input ceiling needs
+more than the default 512 MiB preparation reservation. The complete policy is
+bound into the execution identity and appears as `input_encoding` on the result
+envelope. Byte-default responses retain their existing shape. Marker containment
+does not prevent a model from reacting to instruction-shaped document prose.
+
+### Shared request bounds
+
 Both commands accept a file or `-`/omitted path for stdin. Input is bounded while
 reading, with a 65536-byte default and 1 MiB hard maximum. UTF-8 source bytes are
 preserved. Duplicate keys (including escaped aliases), unknown fields, malformed
@@ -112,8 +152,9 @@ The response carries `scope=real-artifact-current-candidate`,
 No private prompt-derived identity digest is exported as telemetry.
 
 The default cooperative deadline is 3600 seconds and follows input, preparation,
-loading and execution without a fresh duration per stage. Blocking input/file
-calls and bounded tokenizer/compiler operations are not internally preempted.
+loading and execution without a fresh duration per stage. Compact tokenization
+uses the original preparation controller's cooperative checkpoints. Blocking
+input/file calls cannot be forcibly interrupted.
 Native checkpoint allowance is separate from the loader's finite allowance.
 Without `asupersync-runtime`, commands expose help but refuse before reading
 input or opening a model. Existing generate/chat/source/batch commands remain

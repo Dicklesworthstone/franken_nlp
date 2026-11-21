@@ -30,6 +30,8 @@ pub(crate) struct ScoreBatchCommand {
     pub(super) host: ScoredArgs,
     #[command(flatten)]
     pub(super) prefill: ScoringPrefillArgs,
+    #[arg(skip)]
+    pub(super) encoding: input_encoding::InputEncodingArgs,
     /// Local task settings, without document, budget, model or execution identity.
     #[arg(long, value_name = "FILE")]
     pub(super) defaults: Option<PathBuf>,
@@ -50,12 +52,18 @@ pub(super) struct ScoreEnvelope {
     pub io_bytes: u64,
 }
 pub(super) fn definition() -> clap::Command {
-    ScoreBatchCommand::augment_args(clap::Command::new("score-batch")
+    input_encoding::definition(ScoreBatchCommand::augment_args(clap::Command::new("score-batch")
         .about("Classify, score sentiment or judge with one resident candidate INT8 model")
         .long_about("Run a fixed finite-scoring task over bounded ordered NDJSON. All five model-work limits are WHOLE-RUN ceilings, not renewed per document or flush. Full-vocabulary candidate/EOS scoring, no generated-label shortcut, no network and no calibrated-confidence claim. Judge mode supports pairwise, rubric and whole-source faithfulness; text supplies A, the document or the complete source. --prefill-rows is an explicit judge-only grouped-prompt schedule; omitted preserves serial execution. Every event retains non-authoritative candidate provenance; any failed document causes a nonzero exit."))
-        .mut_arg("input", |arg| arg.help("NDJSON {id,text,task_args?} records; '-' reads stdin without whole-file buffering"))
+        .mut_arg("input", |arg| arg.help("NDJSON {id,text,task_args?} records; '-' reads stdin without whole-file buffering")))
+        .after_long_help("Classification and sentiment accept --input-encoding safe-bpe-v1. Every record gets one bounded tokenizer allowance shared by all document/label segments and scoring heads. Pair limits are per record; native work and transport ceilings remain whole-run limits across every record and flush. One transient encoder workspace is reserved beside retained plans and stream buffers. The exact policy binds every prompt and appears on all compact-stream events, including flush and run_complete. Byte-fallback remains the default; compact input changes prompt tokens without a quality, speed or identical-output claim. Judge mode remains byte-fallback and rejects compact input before any IO. Retained score-job commands do not accept these options.")
 }
 impl ScoreBatchCommand {
+    pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let mut command = Self::from_arg_matches(matches)?;
+        command.encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+        Ok(command)
+    }
     pub(super) fn kind(&self) -> Result<ScoreTask, CandidateError> {
         ScoreTask::named(&self.task).ok_or(CandidateError::Arguments)
     }
@@ -64,7 +72,10 @@ impl ScoreBatchCommand {
     }
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits, ScoreEnvelope), CandidateError> {
         self.prefill_limits()?;
-        let (args, limits) = self.host.common()?;
+        if self.kind()? == ScoreTask::Judge && !self.encoding.is_default() {
+            return Err(CandidateError::Arguments);
+        }
+        let (args, limits) = self.host.common_with_encoding(&self.encoding)?;
         if !(1..=100_000).contains(&self.max_requests)
             || self.max_line_bytes < self.host.max_input_bytes || self.max_line_bytes > 4 * 1024 * 1024
             || !(1..=1024 * 1024).contains(&self.max_input_mib)

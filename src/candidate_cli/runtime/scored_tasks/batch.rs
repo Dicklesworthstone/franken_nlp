@@ -16,11 +16,21 @@ pub(in crate::candidate_cli) enum Corpus {
 }
 fn configure(command: &ScoreBatchCommand, facts: &ArtifactIdentity, limits: Limits, defaults: Defaults)
     -> Result<Corpus, CandidateError> {
-    configure_scored(command.kind()?, &command.host, facts, limits, defaults)
+    let encoding = command.host.encoding_policy(&command.encoding)?;
+    configure_scored_with_encoding(command.kind()?, &command.host, facts, limits, defaults, &encoding)
 }
 /// Identical pinned compiler and score-space selection for streams and jobs.
 pub(in crate::candidate_cli) fn configure_scored(kind: ScoreTask, host: &ScoredArgs,
     facts: &ArtifactIdentity, limits: Limits, defaults: Defaults) -> Result<Corpus, CandidateError> {
+    configure_scored_with_encoding(kind, host, facts, limits, defaults, &UntrustedEncoding::ByteFallback)
+}
+fn configure_scored_with_encoding(kind: ScoreTask, host: &ScoredArgs,
+    facts: &ArtifactIdentity, limits: Limits, defaults: Defaults, encoding: &UntrustedEncoding)
+    -> Result<Corpus, CandidateError> {
+    encoding.validate().map_err(|_| CandidateError::Arguments)?;
+    if kind == ScoreTask::Judge && *encoding != UntrustedEncoding::ByteFallback {
+        return Err(CandidateError::Arguments);
+    }
     let mut identity = candidate_identity(facts)?;
     let registry = pinned_controls::pinned().map_err(|_| CandidateError::Identity)?;
     let controls = registry.template_controls();
@@ -30,13 +40,15 @@ pub(in crate::candidate_cli) fn configure_scored(kind: ScoreTask, host: &ScoredA
     let work = host.work_ceiling();
     match (kind, defaults) {
         (ScoreTask::Classify, Defaults::Classify(defaults)) => {
-            let planner = Arc::new(ClassificationPlanner::pinned(controls, eos).map_err(|_| CandidateError::Planning)?);
+            let planner = Arc::new(ClassificationPlanner::pinned(controls, eos)
+                .and_then(|planner| planner.with_document_encoding(encoding.clone()))
+                .map_err(|_| CandidateError::Planning)?);
             identity.task_spec = "classify-v1".to_owned();
             identity.template_digest = *planner.template_digest(); identity.tokenizer_digest = planner.tokenizer_digest();
             let planning = host.classification_limits();
             // Fixed configuration checks only: no invented document stands in
             // for future records. Actual prompt plans compile per item.
-            Int8ClassificationBatchPlanner::new(&planner, identity.clone(), ceiling, planning, defaults.clone())
+            Int8ClassificationBatchPlanner::new_with_document_encoding(&planner, identity.clone(), ceiling, planning, defaults.clone())
                 .map_err(|_| CandidateError::Planning)?;
             Ok(Corpus::Classify(planner, ClassificationCorpusConfig {
                 identity, task_ceiling: ceiling, planning, defaults, max_model_work: work,
@@ -45,13 +57,14 @@ pub(in crate::candidate_cli) fn configure_scored(kind: ScoreTask, host: &ScoredA
         (ScoreTask::Sentiment, Defaults::Sentiment { args, policy }) => {
             let planner = Arc::new(SentimentPlanner::pinned(controls, SentimentOptions {
                 mode: ScoringMode::FullVocabulary, eos_token_id: eos, policy,
-            }).map_err(|_| CandidateError::Planning)?);
+            }).and_then(|planner| planner.with_document_encoding(encoding.clone()))
+                .map_err(|_| CandidateError::Planning)?);
             identity.task_spec = "sentiment-v1".to_owned();
             identity.template_digest = *planner.template_digest(); identity.tokenizer_digest = planner.tokenizer_digest();
             let config = SentimentCorpusConfig { identity, task_ceiling: ceiling,
                 planning: host.sentiment_limits(), defaults: Some(args),
                 max_item_work: work, max_model_work: work };
-            config.validate(&planner).map_err(|_| CandidateError::Planning)?;
+            config.validate_with_document_encoding(&planner).map_err(|_| CandidateError::Planning)?;
             Ok(Corpus::Sentiment(planner, config))
         }
         (ScoreTask::Judge, Defaults::Judge(defaults)) => {
@@ -71,6 +84,8 @@ struct Provenance<'a> {
     protocol: &'static str, schema_version: u32, scope: &'static str, evidence: &'static str,
     model_id: &'a str, source_revision: &'a str, source_root_sha256: &'a str,
     logical_model_sha256: &'a str, quant_recipe: &'a str, task: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<&'a UntrustedEncoding>,
 }
 pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     command: ScoreBatchCommand, args: CandidateArgs, limits: Limits, envelope: ScoreEnvelope,
@@ -79,6 +94,7 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Sen
     // Session is the first owning local: preparation authority outlives every
     // setting, planner, source metadata, input buffer and output staging value.
     let prefill = command.prefill_limits()?;
+    let encoding = command.host.encoding_policy(&command.encoding)?;
     let session = Session::new(&args, limits)?;
     let raw_defaults = command.defaults.as_ref()
         .map(|path| session.read(path, &mut input, DEFAULTS_BYTES)).transpose()?;
@@ -89,7 +105,8 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Sen
     let provenance = Provenance { protocol: "fnlp-candidate-batch-v1", schema_version: 1,
         scope: "real-artifact-current-candidate", evidence: "non_authoritative",
         model_id: &facts.model_id, source_revision: &facts.revision, source_root_sha256: &facts.source_root_sha256,
-        logical_model_sha256: &facts.logical_model_sha256, quant_recipe: &facts.recipe_id, task: &command.task };
+        logical_model_sha256: &facts.logical_model_sha256, quant_recipe: &facts.recipe_id, task: &command.task,
+        input_encoding: input_encoding::reported_policy(&encoding) };
     let writer = CandidateWriter::new(output, &provenance, envelope.transport.max_output_line_bytes, envelope.output_bytes)?;
     let reader: Box<dyn BufRead + Send> = if args.input.as_os_str() == "-" {
         Box::new(BufReader::with_capacity(IO_BUFFER_BYTES, input))
