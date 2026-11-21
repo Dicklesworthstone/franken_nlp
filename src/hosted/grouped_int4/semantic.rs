@@ -1,5 +1,8 @@
 //! One charged native extraction and explicitly requested correlated review.
 use super::*;
+mod document;
+pub use document::{Int4SemanticObjectDocumentHostLimits, Int4SemanticObjectDocumentRequirements,
+    int4_semantic_object_document_requirements};
 mod corpus;
 pub use corpus::{Int4SemanticCorpusConfig, Int4SemanticCorpusRequirements,
     int4_semantic_corpus_requirements};

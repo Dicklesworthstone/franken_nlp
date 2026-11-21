@@ -39,7 +39,9 @@ mod extract;
 mod structured_cohort;
 mod semantic;
 pub use semantic::{Int4SemanticHostLimits, Int4SemanticHostRequirements,
-    Int4SemanticCorpusConfig, Int4SemanticCorpusRequirements, int4_semantic_corpus_requirements};
+    Int4SemanticCorpusConfig, Int4SemanticCorpusRequirements, int4_semantic_corpus_requirements,
+    Int4SemanticObjectDocumentHostLimits, Int4SemanticObjectDocumentRequirements,
+    int4_semantic_object_document_requirements};
 #[cfg(all(feature = "metadata-store", target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub use semantic::{Int4SemanticJobRequirements, int4_semantic_job_requirements};
@@ -143,6 +145,7 @@ pub enum Int4HostError {
     Redaction(crate::tasks::redact::grouped_int4::Int4RedactionError),
     Extraction(crate::tasks::extract::grouped_int4::Int4ExtractError),
     SemanticExtraction(crate::tasks::extract::semantic::grouped_int4::Int4SemanticError),
+    SemanticObjectDocument(crate::tasks::extract::semantic::grouped_int4::document::Int4SemanticObjectDocumentError),
     SourceSemantic(crate::tasks::source_planning::grouped_int4::semantic::Int4SourceSemanticError),
     ExtractionMap(crate::batch::extract::grouped_int4::long::Int4ExtractionMapError),
     ObjectExtractionMap(crate::batch::extract::grouped_int4::long::object::Int4ObjectExtractionMapError),
@@ -172,6 +175,7 @@ impl fmt::Display for Int4HostError {
             Self::Redaction(_) => "INT4 redaction detection, editing or verification refused",
             Self::Extraction(_) => "INT4 schema extraction execution or finalization refused",
             Self::SemanticExtraction(_) => "INT4 extraction second-reader execution or finalization refused",
+            Self::SemanticObjectDocument(_) => "INT4 complete-object extraction or full-source field review refused",
             Self::SourceSemantic(_) => "INT4 summary or answer second-reader execution or finalization refused",
             Self::ExtractionMap(_) => "INT4 complete-document extraction or reduction refused",
             Self::ObjectExtractionMap(_) => "INT4 complete-document root-object reconciliation refused",
@@ -198,6 +202,7 @@ impl Error for Int4HostError {
             Self::Extraction(e) => Some(e), Self::ExtractionMap(e) => Some(e), Self::SourceTask(e) => Some(e),
             Self::ObjectExtractionMap(e) => Some(e),
             Self::SemanticExtraction(e) => Some(e),
+            Self::SemanticObjectDocument(e) => Some(e),
             Self::SourceSemantic(e) => Some(e),
             Self::SourceMap(e) => Some(e), Self::SourceSummary(e) => Some(e), Self::SourceKeyphrases(e) => Some(e) }
     }
