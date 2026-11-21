@@ -3,6 +3,12 @@ use super::*;
 mod corpus;
 pub use corpus::{Int4SemanticCorpusConfig, Int4SemanticCorpusRequirements,
     int4_semantic_corpus_requirements};
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod jobs;
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub use jobs::{Int4SemanticJobRequirements, int4_semantic_job_requirements};
 use crate::{
     grammar::mask::MaskWorkLimits,
     native_engine::{constrained_int4, strict_int4::{Int4Work, STRICT_INT4_PROFILE}},

@@ -40,6 +40,9 @@ mod structured_cohort;
 mod semantic;
 pub use semantic::{Int4SemanticHostLimits, Int4SemanticHostRequirements,
     Int4SemanticCorpusConfig, Int4SemanticCorpusRequirements, int4_semantic_corpus_requirements};
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub use semantic::{Int4SemanticJobRequirements, int4_semantic_job_requirements};
 mod source_semantic;
 pub use source_semantic::{Int4SourceSemanticHostLimits, Int4SourceSemanticHostRequirements};
 mod extraction_map;

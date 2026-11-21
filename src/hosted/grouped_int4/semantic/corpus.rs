@@ -121,7 +121,7 @@ fn semantic_host(work: Int4SemanticExtractionBatchLimits, limits: CorpusLimits) 
         max_mask_node_visits: work.masks.max_visits_per_item,
         preparation_reserve_bytes: limits.preparation_reserve_bytes }
 }
-fn validate_judge_planning(limits: JudgeLimits) -> Result<(), HostedError> {
+pub(super) fn validate_judge_planning(limits: JudgeLimits) -> Result<(), HostedError> {
     if limits.max_total_prompt_tokens == 0 || limits.max_total_candidate_tokens == 0
         || limits.max_total_projected_logits == 0 || limits.max_output_bytes == 0
         || limits.per_head.max_candidates == 0 || limits.per_head.max_total_tokens == 0
@@ -360,7 +360,7 @@ fn nonzero(work: Int4Work) -> bool {
     work.forward_positions != 0 && work.projected_logits != 0 && work.attention_pairs != 0
         && work.projections.dot_products != 0 && work.projections.multiply_accumulates != 0
 }
-fn same_planning(a: JudgeLimits, b: JudgeLimits) -> bool {
+pub(super) fn same_planning(a: JudgeLimits, b: JudgeLimits) -> bool {
     a.max_total_prompt_tokens == b.max_total_prompt_tokens
         && a.max_total_candidate_tokens == b.max_total_candidate_tokens
         && a.max_total_projected_logits == b.max_total_projected_logits
