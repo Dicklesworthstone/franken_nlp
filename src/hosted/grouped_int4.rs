@@ -49,6 +49,9 @@ mod source_semantic;
 pub use source_semantic::{Int4SourceSemanticHostLimits, Int4SourceSemanticHostRequirements,
     Int4SourceSemanticCorpusConfig, Int4SourceSemanticCorpusRequirements,
     int4_source_semantic_corpus_requirements};
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub use source_semantic::{Int4SourceSemanticJobRequirements, int4_source_semantic_job_requirements};
 mod extraction_map;
 pub use extraction_map::{Int4ExtractionMapConfig, Int4ObjectExtractionMapConfig,
     int4_extraction_document_corpus_requirements, int4_extraction_document_object_corpus_requirements,

@@ -32,6 +32,7 @@ mod grouped_int4;
     any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub use grouped_int4::{int4_question_document_job_requirements,
     Int4SemanticJobRequirements, int4_semantic_job_requirements,
+    Int4SourceSemanticJobRequirements, int4_source_semantic_job_requirements,
     SampledSentimentJobRequirements, int4_sampled_sentiment_job_requirements,
     SampledSentimentDocumentJobRequirements, int4_sampled_sentiment_document_job_requirements};
 pub use grouped_int4::{Int4HostError, Int4LoadLimits, Int4LoadRequirements, Int4ExtractionMapConfig, Int4ObjectExtractionMapConfig,

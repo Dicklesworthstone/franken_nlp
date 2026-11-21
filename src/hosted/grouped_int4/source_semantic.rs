@@ -17,6 +17,12 @@ use crate::{
 mod corpus;
 pub use corpus::{Int4SourceSemanticCorpusConfig, Int4SourceSemanticCorpusRequirements,
     int4_source_semantic_corpus_requirements};
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod jobs;
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub use jobs::{Int4SourceSemanticJobRequirements, int4_source_semantic_job_requirements};
 
 /// Admission for generation, every full-source judge and complete publication.
 /// These are modeled storage floors, not an allocator or operating-system cap.
