@@ -5182,6 +5182,24 @@ transport/plan/native/team peak are admitted before schema, population or
 model IO; only the bounded fixed options file is read first. Runtime and
 model-present gates remain pending.
 
+### Retained extraction and review jobs
+
+`extract-semantic-job start|resume` persists each original extraction together
+with its complete configured field review. Resume authenticates the exact
+population, schema, both model-bound compiler identities, review and tokenizer
+policies, and immutable lifetime limits; only pending items run. A failed
+review commits no partial extraction, and every failed attempt retains its
+full native and mask debit. Original-population and explicitly retained-input
+replay, ordered materialization, source conversion, pinned snapshots, compact
+input and persistent CPU teams share the existing native implementation.
+
+Stdout is metadata only; private combined results use the protected job spool.
+The complete preparation, population, native, output and team peak is admitted
+before private job/model IO. See the
+[durable semantic extraction guide](docs/int4-semantic-jobs.md) for complete
+start/resume examples, lifetime limits and recovery behavior. Compilation,
+executable tests and independently pinned model gates remain unrun.
+
 ## Native INT4 faithfulness evaluation and comparison
 
 `fnlp eval native-faithfulness-int4` executes the real native faithfulness

@@ -135,6 +135,7 @@ enum Int4Task {
     Stream(Task, stream::StreamArgs),
     Semantic(semantic::SemanticArgs),
     SemanticBatch(semantic::corpus::BatchArgs),
+    SemanticJob,
     Sentiment(sentiment::SentimentArgs),
     SampledSentiment(sampled_sentiment::SampledArgs),
     SampledSentimentMap(sampled_sentiment::map::MapArgs),
@@ -189,6 +190,7 @@ impl Int4BatchCommand {
 enum Int4JobCommand {
     Generation(text_job::JobCommand),
     Extraction(extract_job::JobCommand),
+    Semantic(semantic::jobs::JobCommand),
     ExtractionDocument(extract_document_job::JobCommand),
     Scored(scored_job::JobCommand),
     ClassificationDocument(classify_document_job::JobCommand),
@@ -247,6 +249,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(compute::definition(input_encoding::definition(prefill::definition(extract::one_off_definition()))))
         .subcommand(semantic::definition())
         .subcommand(semantic::corpus::definition())
+        .subcommand(semantic::jobs::definition())
         .subcommands(source_semantic::definitions())
         .subcommand(compute::definition(extract_batch::definition()))
         .subcommand(extract_job::definition())
@@ -296,6 +299,11 @@ impl Int4Command {
         if name == "extract-job" {
             let (job, args) = extract_job::JobCommand::from_matches(matches)?;
             return Ok(Self { task: Int4Task::ExtractJob, args, batch: None, job: Some(Int4JobCommand::Extraction(job)) });
+        }
+        if name == "extract-semantic-job" {
+            let (job, args) = semantic::jobs::JobCommand::from_matches(matches)?;
+            return Ok(Self { task: Int4Task::SemanticJob, args, batch: None,
+                job: Some(Int4JobCommand::Semantic(job)) });
         }
         if name == "extract-document-job" {
             let (job, args) = extract_document_job::JobCommand::from_matches(matches)?;
@@ -458,6 +466,8 @@ impl Int4Command {
                 return job.run_owned(args, input, &mut output, diagnostics),
             Self { task: Int4Task::ExtractJob, args, batch: None, job: Some(Int4JobCommand::Extraction(job)) } =>
                 return job.run_owned(args, input, &mut output, diagnostics),
+            Self { task: Int4Task::SemanticJob, args, batch: None, job: Some(Int4JobCommand::Semantic(job)) } =>
+                return job.run_owned(args, input, &mut output, diagnostics),
             Self { task: Int4Task::ExtractDocumentJob, args, batch: None, job: Some(Int4JobCommand::ExtractionDocument(job)) } =>
                 return job.run_owned(args, input, &mut output, diagnostics),
             Self { task: Int4Task::ScoredJob, args, batch: None, job: Some(Int4JobCommand::Scored(job)) } =>
@@ -564,6 +574,7 @@ impl Int4Command {
             return options.execute(self.args, input, output);
         }
         let limits = match &self.task {
+            Int4Task::SemanticJob => return Err(CandidateError::Arguments),
             Int4Task::SampledSentiment(_) | Int4Task::SampledSentimentMap(_) | Int4Task::SampledSentimentCorpus(_) | Int4Task::SampledSentimentBatch(_) | Int4Task::SampledSentimentJob | Int4Task::SampledSentimentDocumentJob => return Err(CandidateError::Arguments),
             Int4Task::Text(_) => self.args.validate_text_compute()?,
             Int4Task::Classify(scoring) => scoring.validate_one_off_with_prefill(&self.args)?,

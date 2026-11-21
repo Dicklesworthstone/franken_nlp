@@ -12,6 +12,7 @@ const OPTIONS_BYTES: usize = 1024 * 1024;
 #[cfg(feature = "asupersync-runtime")]
 mod runtime;
 pub(in crate::candidate_cli::int4) mod corpus;
+pub(in crate::candidate_cli::int4) mod jobs;
 #[cfg(test)]
 mod tests;
 
