@@ -58,6 +58,47 @@ fn runtime_revalidates_mutated_transport_before_runtime_and_private_io() {
 }
 
 #[test]
+fn distinct_document_and_run_limits_reach_every_host_schedule_with_exact_memory() {
+    for snapshot in [false, true] {
+        for flags in [
+            &[][..], &["--reuse-prefill"][..], &["--prefill-rows", "4"][..],
+            &["--prefill-rows", "4", "--reuse-prefill"][..], &["--compute-threads", "4"][..],
+            &["--input-encoding", "safe-bpe-v1", "--reuse-prefill", "--compute-threads", "4"][..],
+        ] {
+            let mut flags = flags.to_vec();
+            flags.extend(["--max-forward-positions", "67108864", "--max-mask-node-visits", "64000000000000",
+                "--max-document-forward-positions", "32768",
+                "--max-document-projected-logits", "1000000000",
+                "--max-document-attention-pairs", "100000000000",
+                "--max-document-dot-products", "100000000000000",
+                "--max-document-multiply-accumulates", "1000000000000000",
+                "--max-document-mask-node-visits", "32000000000"]);
+            let (args, options) = command(&flags, snapshot);
+            let limits = options.validate(&args).unwrap();
+            let config = host_config(&args, options, limits, Duration::from_secs(19)).unwrap();
+            check_host_quote(&args, limits, &config).unwrap();
+            assert_eq!(config.document.mapping.max_model_work, limits.native.max_item_work);
+            assert_eq!(config.max_model_work, limits.native.max_model_work);
+            assert_eq!(config.document.max_mask_node_visits, limits.native.masks.max_visits_per_item);
+            assert_eq!(config.max_mask_node_visits, limits.native.masks.max_visits_per_run);
+            assert_ne!(config.document.mapping.max_model_work, config.max_model_work);
+            assert_ne!(config.document.max_mask_node_visits, config.max_mask_node_visits);
+            assert_eq!(config.document.planning.max_total_prompt_tokens, 32768);
+            assert_eq!(config.document.options, options.document.sampled.options(&args).unwrap());
+            assert_eq!(config.transport.max_work, limits.transport.max_work);
+        }
+    }
+}
+
+#[test]
+fn runtime_rechecks_document_limits_even_when_given_a_previous_admission() {
+    let (args, mut options) = command(&[], false);
+    let limits = options.validate(&args).unwrap();
+    options.work.max_document_mask_node_visits = Some(0);
+    assert_eq!(execute(args, options, limits, NoRead, NoWrite).unwrap_err().exit, ErrorCode::Usage);
+}
+
+#[test]
 fn every_cancellation_cause_survives_batch_and_map_failure_wrapping() {
     use DecodeCancellationKind::*;
     for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,

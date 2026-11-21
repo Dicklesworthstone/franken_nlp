@@ -61,14 +61,16 @@ fn host_config(args: &Int4Args, options: CorpusArgs, limits: CorpusLimits, remai
                     cleanup_reserve_bytes: CLEANUP_BYTES } },
             planning: limits.document.planning, mapping: limits.document.mapping,
             options: sampled.options(args)?, preparation_reserve_bytes: limits.common.preparation_bytes,
-            max_sampler_bytes: json_sampling_workspace_bytes().map_err(|_| CandidateError::Arguments)?,
-            mask_limits: sampled.masks(), max_mask_node_visits: sampled.max_mask_node_visits,
+            max_sampler_bytes: limits.native.max_sampler_bytes,
+            mask_limits: limits.native.masks.per_mask,
+            max_mask_node_visits: limits.native.masks.max_visits_per_item,
             prefill: limits.common.prefill, reuse_prefill: sampled.reuse_prefill,
         },
         task: sampled.budget(args, limits.common, SentimentAxis::ALL.len())?,
         encoding: options.document.input_encoding(args)?,
         transport: limits.transport, io_reserve_bytes: limits.io_bytes,
-        max_model_work: sampled.work_ceiling(), max_mask_node_visits: sampled.max_mask_node_visits,
+        max_model_work: limits.native.max_model_work,
+        max_mask_node_visits: limits.native.masks.max_visits_per_run,
     })
 }
 

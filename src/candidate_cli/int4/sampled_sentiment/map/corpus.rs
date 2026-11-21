@@ -1,7 +1,8 @@
 //! Complete sampled documents over one bounded resident NDJSON invocation.
 use super::*;
 use crate::{
-    batch::{BatchLimits as TransportLimits, BatchSummary, BatchWork},
+    batch::{BatchLimits as TransportLimits, BatchSummary, BatchWork,
+        extract::ExtractionMaskBudget, sentiment::sampled::SampledSentimentBatchLimits},
     candidate_cli::batch::{FRAME_ALLOWANCE, IO_BUFFER_BYTES},
 };
 
@@ -13,7 +14,53 @@ mod tests;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::candidate_cli::int4) struct CorpusArgs {
     document: MapArgs,
+    work: DocumentWorkArgs,
     stream: StreamArgs,
+}
+
+#[derive(Args, Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DocumentWorkArgs {
+    /// One complete document's cold forwards; defaults to --max-forward-positions.
+    #[arg(long)]
+    max_document_forward_positions: Option<u64>,
+    /// One complete document's projected logits; defaults to --max-projected-logits.
+    #[arg(long)]
+    max_document_projected_logits: Option<u64>,
+    /// One complete document's attention pairs; defaults to --max-attention-pairs.
+    #[arg(long)]
+    max_document_attention_pairs: Option<u64>,
+    /// One complete document's grouped dot products; defaults to --max-dot-products.
+    #[arg(long)]
+    max_document_dot_products: Option<u64>,
+    /// One complete document's multiply-accumulates; defaults to --max-multiply-accumulates.
+    #[arg(long)]
+    max_document_multiply_accumulates: Option<u64>,
+    /// One complete document's mask visits; defaults to --max-mask-node-visits.
+    #[arg(long)]
+    max_document_mask_node_visits: Option<u64>,
+}
+impl DocumentWorkArgs {
+    fn apply(self, mut sampled: SampledArgs) -> Result<SampledArgs, CandidateError> {
+        let bounded = |selected: Option<u64>, total: u64| {
+            let per_document = selected.unwrap_or(total);
+            if per_document == 0 || per_document > total { Err(CandidateError::Arguments) }
+            else { Ok(per_document) }
+        };
+        sampled.max_forward_positions = bounded(self.max_document_forward_positions, sampled.max_forward_positions)?;
+        sampled.max_projected_logits = bounded(self.max_document_projected_logits, sampled.max_projected_logits)?;
+        sampled.max_attention_pairs = bounded(self.max_document_attention_pairs, sampled.max_attention_pairs)?;
+        sampled.max_dot_products = bounded(self.max_document_dot_products, sampled.max_dot_products)?;
+        sampled.max_multiply_accumulates = bounded(self.max_document_multiply_accumulates, sampled.max_multiply_accumulates)?;
+        sampled.max_mask_node_visits = bounded(self.max_document_mask_node_visits, sampled.max_mask_node_visits)?;
+        // Preserve the sampled planner's per-document bounds before its
+        // forward limit becomes a usize prompt-planning capacity. Large run
+        // totals require explicit bounded document overrides.
+        if sampled.max_forward_positions > 16 * 1024 * 1024
+            || sampled.max_mask_node_visits > 1_000_000_000_000 {
+            return Err(CandidateError::Arguments);
+        }
+        Ok(sampled)
+    }
 }
 
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,7 +80,7 @@ struct StreamArgs {
 }
 
 pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
-    StreamArgs::augment_args(super::definition().name("sentiment-sampled-corpus")
+    DocumentWorkArgs::augment_args(StreamArgs::augment_args(super::definition().name("sentiment-sampled-corpus")
         .about("Sample every chunk of ordered complete documents using one resident INT4 model")
         .long_about("Stream bounded ordered {id,text,task_args?} NDJSON and exact {\"flush\":true} controls. Each document is losslessly partitioned and every chunk's complete independent score/explanation bundle is preflighted before its first native forward. Results retain all original byte/scalar spans and exact scalar-weighted document replicates. Omitted task_args selects all four axes; task_args accepts axes and an optional complete task budget that may only tighten the invocation ceiling. Seed, sample count, sampler, chunk policy and model identity are fixed for the run. Distinct item IDs receive distinct private draws; reorder and drained flushes do not change the same semantic item's draws. Weights, vocabulary and native buffers remain resident across documents. --compute-threads 2..64 keeps one numerical team across the entire stream; alternatively --prefill-rows 1..64 uses serial layer-major prompts. --reuse-prefill retains only the current chunk/axis prefix across its independent samples. All five native work flags and --max-mask-node-visits cover the ENTIRE RUN, including failed admitted documents, and never renew at records, chunks, samples or flushes. --input-encoding safe-bpe-v1 gives each complete document one bounded tokenizer allowance shared by chunk probes and actual plans. Every successful record contains a complete document; earlier completed records remain valid after a later failure. Require run_complete AND exit 0 for whole-run success. Source conversion and independently pinned snapshots share the route. No snapshot saving, retained jobs, cross-document cohorts, partial document success, calibrated confidence, full-context equivalence, thinking or tools. Blocking IO observes cancellation cooperatively.")
         .mut_arg("input", |arg| arg.help("NDJSON file or '-' for stdin; one bounded complete document per record"))
@@ -46,13 +93,15 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
         .mut_arg("max_attention_pairs", |arg| arg.help("Whole-stream attention-pair ceiling"))
         .mut_arg("max_dot_products", |arg| arg.help("Whole-stream grouped dot-product ceiling"))
         .mut_arg("max_multiply_accumulates", |arg| arg.help("Whole-stream multiply-accumulate ceiling"))
-        .mut_arg("max_mask_node_visits", |arg| arg.help("One whole-stream mask allowance across all documents, chunks, samples and EOS")))
+        .mut_arg("max_mask_node_visits", |arg| arg.help("One whole-stream mask allowance across all documents, chunks, samples and EOS"))
+        .after_help("Optional --max-document-forward-positions, --max-document-projected-logits, --max-document-attention-pairs, --max-document-dot-products, --max-document-multiply-accumulates and --max-document-mask-node-visits independently limit one complete document across every chunk, axis and sample. Each must be positive and no larger than its corresponding whole-stream ceiling; omission uses that whole-stream value. Document admission uses these tighter bounds, so raising a corpus total need not enlarge each document's planning reserve. Whole-stream work never renews after a refused document or a flush.")))
 }
 
 #[derive(Clone, Copy, Debug)]
 struct CorpusLimits {
     common: Int4Limits,
     document: MapLimits,
+    native: SampledSentimentBatchLimits,
     transport: TransportLimits,
     memory: SampledSentimentMapMemoryRequirement,
     cli_preparation_bytes: u64,
@@ -63,7 +112,8 @@ struct CorpusLimits {
 impl CorpusArgs {
     pub(in crate::candidate_cli::int4) fn from_matches(matches: &clap::ArgMatches)
         -> Result<Self, clap::Error> {
-        Ok(Self { document: MapArgs::from_matches(matches)?, stream: StreamArgs::from_arg_matches(matches)? })
+        Ok(Self { document: MapArgs::from_matches(matches)?, work: DocumentWorkArgs::from_arg_matches(matches)?,
+            stream: StreamArgs::from_arg_matches(matches)? })
     }
 
     fn validate(self, args: &Int4Args) -> Result<CorpusLimits, CandidateError> {
@@ -75,9 +125,20 @@ impl CorpusArgs {
             || !(1..=16 * 1024 * MIB).contains(&stream.max_total_output_bytes) {
             return Err(CandidateError::Arguments);
         }
-        let document = self.document.validate(args)?;
+        let mut document_options = self.document;
+        document_options.sampled = self.work.apply(document_options.sampled)?;
+        let document = document_options.validate(args)?;
         let mut common = document.common;
-        let work = document.mapping.max_model_work;
+        let native = SampledSentimentBatchLimits {
+            max_item_work: document.mapping.max_model_work,
+            max_model_work: self.document.sampled.work_ceiling(),
+            masks: ExtractionMaskBudget { per_mask: self.document.sampled.masks(),
+                max_visits_per_item: document_options.sampled.max_mask_node_visits,
+                max_visits_per_run: self.document.sampled.max_mask_node_visits },
+            max_sampler_bytes: json_sampling_workspace_bytes().map_err(|_| CandidateError::Arguments)?,
+        };
+        native.validate().map_err(|_| CandidateError::Arguments)?;
+        let work = native.max_model_work;
         let framing = stream.max_requests.checked_add(4)
             .and_then(|n| n.checked_mul(FRAME_ALLOWANCE)).ok_or(CandidateError::Arguments)?;
         let transport = TransportLimits {
@@ -110,7 +171,7 @@ impl CorpusArgs {
         common.minimum_memory_bytes = sum(&[cli_preparation_bytes, resident,
             loading.max(execution), CLEANUP_BYTES])?;
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
-        Ok(CorpusLimits { common, document, transport, memory, cli_preparation_bytes,
+        Ok(CorpusLimits { common, document, native, transport, memory, cli_preparation_bytes,
             output_bytes: stream.max_total_output_bytes, io_bytes })
     }
 

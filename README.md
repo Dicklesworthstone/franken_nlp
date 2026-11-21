@@ -1201,12 +1201,25 @@ explicit options. Require `run_complete` and exit status zero for whole-run
 success. This route is a candidate and has no measured throughput or quality
 qualification.
 
+The optional `--max-document-forward-positions`,
+`--max-document-projected-logits`, `--max-document-attention-pairs`,
+`--max-document-dot-products`, `--max-document-multiply-accumulates` and
+`--max-document-mask-node-visits` separately bound one complete document,
+including all of its chunks, axes and samples. Each value must be positive
+and fit the corresponding whole-stream ceiling; omitted values use that
+ceiling. This lets a large corpus reserve work for many documents while
+refusing an individual document that would consume too much of the run.
+Prompt-planning memory follows the document limit, so increasing a run total
+with an explicit document limit keeps the same per-document reserve.
+Neither failed documents nor flush controls replenish the whole-run ledger.
+
 ```bash
 fnlp candidate source-int4 sentiment-sampled-corpus documents.ndjson \
   --snapshot /private/model.snapshot --expected-model-sha256 "$MODEL_SHA256" \
   --memory-mib 32768 --seed "$SEED_HEX" --samples 4 \
   --max-chunks 64 --max-chunk-bytes 4096 --input-encoding safe-bpe-v1 \
   --compute-threads 4 --reuse-prefill --max-requests 1000 \
+  --max-document-forward-positions 131072 --max-document-mask-node-visits 32000000000 \
   --max-total-input-bytes 67108864 --max-total-output-bytes 268435456
 ```
 
