@@ -75,7 +75,7 @@ impl Int4SemanticObjectDocumentCorpusConfig {
         // Public callers may move a short string with a much larger capacity.
         // The original allocation stays alive beside the compiler's copy.
         let excess = self.extraction.schema.capacity()
-            .saturating_sub(self.host.compiler.max_schema_bytes) as u64;
+            .saturating_sub(self.host.compiler.max_schema_bytes).saturating_sub(1) as u64;
         quote.preparation_bytes = sum(&[quote.preparation_bytes, excess])?;
         quote.input_bytes = sum(&[quote.input_bytes, excess])?;
         quote.total_bytes()?;
@@ -112,9 +112,10 @@ pub fn int4_semantic_object_document_corpus_requirements(width: usize, extractio
     let document = int4_semantic_object_document_requirements(width, extraction,
         options, encoding, host, compute_threads)?;
     // The run keeps the original raw request and an immutable factory copy.
-    // Include their overlap independently of output/result limits.
+    // Include their overlap independently of output/result limits. The
+    // original schema slot also covers one bounded-reader sentinel byte.
     let preparation = sum(&[document.preparation_bytes,
-        host.compiler.max_schema_bytes as u64, options_storage_bytes(options)?])?;
+        host.compiler.max_schema_bytes as u64, options_storage_bytes(options)?, 1])?;
     let quote = Int4SemanticObjectDocumentCorpusRequirements {
         native: document.native, workspace_bytes: document.workspace_bytes,
         preparation_bytes: preparation, input_bytes: sum(&[preparation, staging])?,

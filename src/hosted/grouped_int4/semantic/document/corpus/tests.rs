@@ -87,9 +87,14 @@ fn actual_moved_schema_capacity_cannot_hide_behind_a_short_value() {
     let mut c = config();
     let baseline = c.requirements(WIDTH).unwrap();
     let declared = c.host.compiler.max_schema_bytes;
+    let mut bounded = String::with_capacity(declared + 1);
+    bounded.push_str(&c.extraction.schema);
+    c.extraction.schema = bounded;
+    assert_eq!(c.requirements(WIDTH).unwrap(), baseline,
+        "bounded reader sentinel fits the pre-IO quote");
     let mut large = String::with_capacity(declared + 65_536);
     large.push_str(&c.extraction.schema);
-    let excess = large.capacity() - declared;
+    let excess = large.capacity() - declared - 1;
     c.extraction.schema = large;
     let priced = c.requirements(WIDTH).unwrap();
     assert_eq!(priced.input_bytes - baseline.input_bytes, excess as u64);

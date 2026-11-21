@@ -4,6 +4,10 @@ mod document;
 pub use document::{Int4SemanticObjectDocumentHostLimits, Int4SemanticObjectDocumentRequirements,
     int4_semantic_object_document_requirements, Int4SemanticObjectDocumentCorpusConfig,
     Int4SemanticObjectDocumentCorpusRequirements, int4_semantic_object_document_corpus_requirements};
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub use document::{Int4SemanticObjectDocumentJobHostLimits, Int4SemanticObjectDocumentJobRequirements,
+    int4_semantic_object_job_requirements};
 mod corpus;
 pub use corpus::{Int4SemanticCorpusConfig, Int4SemanticCorpusRequirements,
     int4_semantic_corpus_requirements};

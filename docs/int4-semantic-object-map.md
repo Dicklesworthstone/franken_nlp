@@ -424,10 +424,13 @@ This initial route uses full-vocabulary constrained extraction and
 full-vocabulary reviewer scoring, serial chunks and optional numerical CPU
 teams. Selected-row projection, chunk cohorts, packed prefill, sampling,
 thinking and tools are refused. The resident corpus route above explicitly
-selects the complete-document composition. A retained-job variant is not yet
-part of this increment. The existing `extract-semantic-batch` and
-`extract-semantic-job` have their own single-context contracts; they do not
-implicitly select this document map.
+selects the complete-document composition.
+`extract-semantic-document-job start|resume` adds authenticated retained
+populations, lifetime work across retries, complete result storage and optional
+retained-input replay; see the
+[whole-document job guide](int4-semantic-object-jobs.md) for complete commands.
+The existing `extract-semantic-batch` and `extract-semantic-job` have their own
+single-context contracts; they do not implicitly select this document map.
 
 Library users can pre-admit with
 `int4_semantic_object_document_requirements` and call
@@ -438,7 +441,7 @@ and a real model-bound judge; no public execution API accepts substituted
 native outputs, source text or schema authority.
 
 The original one-shot implementation received source/API review, Rust syntax
-parsing and whitespace checks. The resident-corpus increment received
+parsing and whitespace checks. The resident-corpus and retained-job increments received
 independent source/API review and static delimiter, string, comment,
 conflict-marker and whitespace checks; its execution environment was
 unavailable. New regression definitions cover exact original-schema/source

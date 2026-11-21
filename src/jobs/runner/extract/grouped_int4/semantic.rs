@@ -28,6 +28,9 @@ use crate::{
     tokenizer::untrusted::UntrustedEncoding,
 };
 
+/// Reconciled whole-document extraction with complete-source semantic reviews.
+pub mod document;
+
 /// Bound for the exact existing private recipe and its serialization workspace.
 pub(crate) const SEMANTIC_EXTRACTION_JOB_RECIPE_BYTES: usize = 1024 * 1024 - 1024;
 const INPUT_POLICY: &str = "fixed-schema-and-semantic-review-no-record-overrides-v1";

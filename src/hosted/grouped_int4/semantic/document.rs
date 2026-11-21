@@ -5,6 +5,13 @@
 
 use super::*;
 mod corpus;
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod jobs;
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub use jobs::{Int4SemanticObjectDocumentJobHostLimits, Int4SemanticObjectDocumentJobRequirements,
+    int4_semantic_object_job_requirements};
 pub use corpus::{Int4SemanticObjectDocumentCorpusConfig, Int4SemanticObjectDocumentCorpusRequirements,
     int4_semantic_object_document_corpus_requirements};
 use std::{panic::{catch_unwind, AssertUnwindSafe}, sync::Mutex};

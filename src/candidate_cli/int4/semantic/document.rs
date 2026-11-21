@@ -1,6 +1,7 @@
 //! Reconciled root-object extraction followed by complete-source field review.
 use super::*;
 pub(in crate::candidate_cli::int4) mod corpus;
+pub(in crate::candidate_cli::int4) mod jobs;
 use crate::{
     candidate_cli::stream::Failure,
     tasks::{judge::{FaithfulnessAggregationPolicy,

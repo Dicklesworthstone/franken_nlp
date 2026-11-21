@@ -5328,6 +5328,15 @@ original extraction beside all full-source reviews; whole-run success requires
 `run_complete` and exit zero after worker join. Explicit `--max-run-*` limits
 fund the desired number of documents; defaults fund one complete attempt.
 
+`extract-semantic-document-job start|resume` persists the complete combined
+object and all full-source reviews, authenticates the original population and
+immutable recipe on resume, and runs only pending documents. Lifetime native
+and mask work survive interruption; checked grounding declarations fund every
+permitted attempt. Protected result storage, explicit retained-input replay,
+source/snapshot loading and one persistent CPU team use the same native path.
+See the [whole-document retained-job guide](docs/int4-semantic-object-jobs.md)
+for complete start/resume commands, fixed limits and recovery behavior.
+
 See the [complete-document semantic object guide](docs/int4-semantic-object-map.md)
 for a complete supported schema, explicit options, bounded command and result
 paths and resident-corpus commands. Source review and static checks are

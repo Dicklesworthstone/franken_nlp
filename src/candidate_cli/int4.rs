@@ -136,6 +136,7 @@ enum Int4Task {
     Semantic(semantic::SemanticArgs),
     SemanticObjectMap(semantic::document::SemanticObjectArgs),
     SemanticObjectCorpus(semantic::document::corpus::CorpusArgs),
+    SemanticObjectDocumentJob,
     SemanticBatch(semantic::corpus::BatchArgs),
     SemanticJob,
     Sentiment(sentiment::SentimentArgs),
@@ -195,6 +196,7 @@ enum Int4JobCommand {
     Generation(text_job::JobCommand),
     Extraction(extract_job::JobCommand),
     Semantic(semantic::jobs::JobCommand),
+    SemanticObjectDocument(semantic::document::jobs::JobCommand),
     SourceSemantic(source_semantic::jobs::JobCommand),
     ExtractionDocument(extract_document_job::JobCommand),
     Scored(scored_job::JobCommand),
@@ -255,6 +257,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(semantic::one_off_definition())
         .subcommand(semantic::document::definition())
         .subcommand(semantic::document::corpus::definition())
+        .subcommand(semantic::document::jobs::definition())
         .subcommand(semantic::corpus::definition())
         .subcommand(semantic::jobs::definition())
         .subcommands(source_semantic::definitions())
@@ -313,6 +316,11 @@ impl Int4Command {
             let (job, args) = semantic::jobs::JobCommand::from_matches(matches)?;
             return Ok(Self { task: Int4Task::SemanticJob, args, batch: None,
                 job: Some(Int4JobCommand::Semantic(job)) });
+        }
+        if name == "extract-semantic-document-job" {
+            let (job, args) = semantic::document::jobs::JobCommand::from_matches(matches)?;
+            return Ok(Self { task: Int4Task::SemanticObjectDocumentJob, args, batch: None,
+                job: Some(Int4JobCommand::SemanticObjectDocument(job)) });
         }
         if matches!(name, "summarize-semantic-job" | "answer-semantic-job") {
             let kind = crate::candidate_cli::source::Kind::named(name.trim_end_matches("-semantic-job"))
@@ -497,6 +505,9 @@ impl Int4Command {
                 return job.run_owned(args, input, &mut output, diagnostics),
             Self { task: Int4Task::SemanticJob, args, batch: None, job: Some(Int4JobCommand::Semantic(job)) } =>
                 return job.run_owned(args, input, &mut output, diagnostics),
+            Self { task: Int4Task::SemanticObjectDocumentJob, args, batch: None,
+                job: Some(Int4JobCommand::SemanticObjectDocument(job)) } =>
+                return job.run_owned(args, input, &mut output, diagnostics),
             Self { task: Int4Task::SourceSemanticJob, args, batch: None,
                 job: Some(Int4JobCommand::SourceSemantic(job)) } =>
                 return job.run_owned(args, input, &mut output, diagnostics),
@@ -558,7 +569,8 @@ impl Int4Command {
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
         // These executable routes use the typed task failure boundary above.
-        if matches!(self.task, Int4Task::SemanticObjectMap(_) | Int4Task::SemanticObjectCorpus(_)) {
+        if matches!(self.task, Int4Task::SemanticObjectMap(_) | Int4Task::SemanticObjectCorpus(_)
+            | Int4Task::SemanticObjectDocumentJob) {
             return Err(CandidateError::Arguments);
         }
         if matches!(self.task, Int4Task::SampledSentiment(_) | Int4Task::SampledSentimentMap(_) | Int4Task::SampledSentimentCorpus(_) | Int4Task::SampledSentimentBatch(_) | Int4Task::SampledSentimentJob | Int4Task::SampledSentimentDocumentJob) {
@@ -612,7 +624,7 @@ impl Int4Command {
         }
         let limits = match &self.task {
             Int4Task::SemanticJob | Int4Task::SourceSemanticJob | Int4Task::SemanticObjectMap(_)
-                | Int4Task::SemanticObjectCorpus(_) => return Err(CandidateError::Arguments),
+                | Int4Task::SemanticObjectCorpus(_) | Int4Task::SemanticObjectDocumentJob => return Err(CandidateError::Arguments),
             Int4Task::SampledSentiment(_) | Int4Task::SampledSentimentMap(_) | Int4Task::SampledSentimentCorpus(_) | Int4Task::SampledSentimentBatch(_) | Int4Task::SampledSentimentJob | Int4Task::SampledSentimentDocumentJob => return Err(CandidateError::Arguments),
             Int4Task::Text(_) => self.args.validate_text_compute()?,
             Int4Task::Classify(scoring) => scoring.validate_one_off_with_prefill(&self.args)?,
