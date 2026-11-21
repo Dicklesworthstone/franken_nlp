@@ -28,6 +28,7 @@ use serde::Serialize;
 use std::sync::Arc;
 pub mod document;
 pub mod question_document;
+pub mod semantic;
 
 const INPUT_POLICY: &str = "typed-source-records-fixed-task-full-resident-kv-v1";
 

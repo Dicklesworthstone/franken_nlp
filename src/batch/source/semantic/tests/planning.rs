@@ -94,6 +94,37 @@ fn prepared_sources_share_one_judge_and_equal_direct_original_request_plans() {
 }
 
 #[test]
+fn owned_compiler_retains_the_real_source_and_preserves_borrowed_planning() {
+    let source = Arc::new(source(UntrustedEncoding::ByteFallback));
+    let weak = Arc::downgrade(&source);
+    for answer in [false, true] {
+        let judge = judge(UntrustedEncoding::ByteFallback);
+        let identity = base(&source, task(answer), &judge);
+        let borrowed = Int4SemanticSourceBatchPlanner::new(&source, identity.clone(), task_budget(),
+            SourcePlanningLimits::default(), task(answer), Arc::clone(&judge), options(), run_limits()).unwrap();
+        let owned = Int4SemanticSourceBatchPlanner::new_owned(Arc::clone(&source), identity, task_budget(),
+            SourcePlanningLimits::default(), task(answer), judge, options(), run_limits()).unwrap();
+        let input = || if answer { question() } else { document() };
+        let a = borrowed.prepare(input(), &mut Control::default()).unwrap();
+        let b = owned.prepare(input(), &mut Control::default()).unwrap();
+        assert_eq!(a.execution_identity(), b.execution_identity());
+        assert_eq!(a.source_reserved_work(), b.source_reserved_work());
+        assert_eq!(a.input_facts(), b.input_facts());
+        assert_eq!(a.policy_digest(), b.policy_digest());
+        assert_eq!(Arc::strong_count(&source), 2);
+    }
+    let judge = judge(UntrustedEncoding::ByteFallback);
+    let owned = Int4SemanticSourceBatchPlanner::new_owned(Arc::clone(&source), base(&source, task(false), &judge),
+        task_budget(), SourcePlanningLimits::default(), task(false), judge, options(), run_limits()).unwrap();
+    drop(source);
+    assert!(weak.upgrade().is_some(), "the actual source compiler must remain owned");
+    let prepared = owned.prepare(document(), &mut Control::default()).unwrap();
+    drop(owned);
+    assert!(weak.upgrade().is_none(), "a completed plan need not retain the whole source compiler");
+    assert_eq!(prepared.input_facts().source_bytes, document().text.len());
+}
+
+#[test]
 fn task_and_review_policy_are_fixed_before_any_private_record() {
     let planner = source(UntrustedEncoding::ByteFallback);
     for axis in 0..7 {

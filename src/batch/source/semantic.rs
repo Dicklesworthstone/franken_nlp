@@ -5,7 +5,7 @@
 //! spends its full declared native and mask ceiling before execution because
 //! complete-statement review plans depend on the generated source result.
 
-use std::sync::Arc;
+use std::{ops::Deref, sync::Arc};
 use serde::{Deserialize, Serialize};
 use crate::{
     batch::{BatchCode, BatchDocument, BatchFault, BatchItemFailure, BatchProcessor,
@@ -87,8 +87,19 @@ impl Int4SemanticSourceBatchTask {
 #[serde(deny_unknown_fields)]
 pub struct Int4SemanticSourceBatchArgs { pub passages: Vec<AnswerPassage> }
 
+enum SourceCompiler<'p> {
+    Borrowed(&'p SourceTaskPlanner),
+    Owned(Arc<SourceTaskPlanner>),
+}
+impl Deref for SourceCompiler<'_> {
+    type Target = SourceTaskPlanner;
+    fn deref(&self) -> &Self::Target {
+        match self { Self::Borrowed(planner) => planner, Self::Owned(planner) => planner }
+    }
+}
+
 pub struct Int4SemanticSourceBatchPlanner<'p> {
-    planner: &'p SourceTaskPlanner,
+    planner: SourceCompiler<'p>,
     identity: ExecutionIdentity,
     ceiling: TaskBudget,
     planning: SourcePlanningLimits,
@@ -98,14 +109,31 @@ pub struct Int4SemanticSourceBatchPlanner<'p> {
     limits: Int4SemanticSourceBatchLimits,
     seal: Arc<()>,
 }
+impl Int4SemanticSourceBatchPlanner<'static> {
+    /// Own the genuine pinned source compiler with the shared judge. A host
+    /// may retain this immutable factory beyond a worker's processor lifetime
+    /// without duplicating tokenizers or constructing a self reference.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_owned(planner: Arc<SourceTaskPlanner>, identity: ExecutionIdentity, ceiling: TaskBudget,
+        planning: SourcePlanningLimits, task: Int4SemanticSourceBatchTask, judge: Arc<Int4JudgePlanner>,
+        options: Int4SourceSemanticOptions, limits: Int4SemanticSourceBatchLimits) -> Result<Self, BatchFault> {
+        Self::configured(SourceCompiler::Owned(planner), identity, ceiling, planning, task, judge, options, limits)
+    }
+}
 impl<'p> Int4SemanticSourceBatchPlanner<'p> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(planner: &'p SourceTaskPlanner, identity: ExecutionIdentity, ceiling: TaskBudget,
         planning: SourcePlanningLimits, task: Int4SemanticSourceBatchTask, judge: Arc<Int4JudgePlanner>,
         options: Int4SourceSemanticOptions, limits: Int4SemanticSourceBatchLimits) -> Result<Self, BatchFault> {
+        Self::configured(SourceCompiler::Borrowed(planner), identity, ceiling, planning, task, judge, options, limits)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn configured(planner: SourceCompiler<'p>, identity: ExecutionIdentity, ceiling: TaskBudget,
+        planning: SourcePlanningLimits, task: Int4SemanticSourceBatchTask, judge: Arc<Int4JudgePlanner>,
+        options: Int4SourceSemanticOptions, limits: Int4SemanticSourceBatchLimits) -> Result<Self, BatchFault> {
         task.validate_semantic(&options)?;
         limits.validate_item(options.max_model_work)?;
-        super::grouped_int4::check_configuration_with_document_encoding(planner, &identity,
+        super::grouped_int4::check_configuration_with_document_encoding(&planner, &identity,
             ceiling, planning, None, judge.group_width())?;
         if identity.task_spec != task.built_in().spec().identity()
             || judge.execution_identity().task_spec != "judge-v1"
@@ -193,13 +221,20 @@ impl PreparedInt4SemanticBatchSource {
 }
 
 pub struct NativeInt4SemanticSourceBatch<'p, 'e, 'w, 'v, A: Int4SemanticSourceBatchAdmission> {
-    compiler: Int4SemanticSourceBatchPlanner<'p>,
+    compiler: Arc<Int4SemanticSourceBatchPlanner<'p>>,
     driver: NativeDriver<'e, 'w, 'v>,
     admission: A,
     run: RunState,
 }
 impl<'p, 'e, 'w, 'v, A: Int4SemanticSourceBatchAdmission> NativeInt4SemanticSourceBatch<'p, 'e, 'w, 'v, A> {
     pub fn new(compiler: Int4SemanticSourceBatchPlanner<'p>, engine: &'e mut StrictInt4Engine<'w>,
+        vocabulary: &'v ExtractionVocabulary, admission: A) -> Result<Self, BatchFault> {
+        Self::new_shared(Arc::new(compiler), engine, vocabulary, admission)
+    }
+    /// Retain the actual compiler assets until the embedding invocation has
+    /// physically joined its workers; each processor still owns fresh native
+    /// state, work counters and sealed prepared records.
+    pub fn new_shared(compiler: Arc<Int4SemanticSourceBatchPlanner<'p>>, engine: &'e mut StrictInt4Engine<'w>,
         vocabulary: &'v ExtractionVocabulary, admission: A) -> Result<Self, BatchFault> {
         compiler.limits.validate_item(compiler.options.max_model_work)?;
         if !clean(engine) || compiler.group_width() != engine.model_identity().group_width() {
@@ -214,6 +249,16 @@ impl<'p, 'e, 'w, 'v, A: Int4SemanticSourceBatchAdmission> NativeInt4SemanticSour
     pub fn reserved_model_work(&self) -> Int4Work { self.run.reserved }
     pub fn reserved_mask_visits(&self) -> u64 { self.run.masks }
     pub fn is_poisoned(&self) -> bool { self.run.failed || !self.driver.clean() }
+    /// Authenticate the exact factory before a durable attempt is charged.
+    /// Equal visible limits never authorize a foreign source/review plan.
+    pub(crate) fn verify_prepared(&self, prepared: &PreparedInt4SemanticBatchSource)
+        -> Result<(), BatchItemFailure> {
+        self.run.ready()?;
+        if !self.driver.clean() || !Arc::ptr_eq(&prepared.seal, &self.compiler.seal) {
+            return Err(BatchItemFailure::fatal(BatchCode::Admission));
+        }
+        Ok(())
+    }
 }
 impl<A: Int4SemanticSourceBatchAdmission> BatchProcessor for NativeInt4SemanticSourceBatch<'_, '_, '_, '_, A> {
     type Args = Int4SemanticSourceBatchArgs;
