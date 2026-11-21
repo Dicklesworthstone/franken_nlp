@@ -25,6 +25,14 @@ pub(super) fn chunk_address<C: DecodeStepControl>(document: [u8; 32], id: usize,
     writer.checkpoint()?;
     Ok(Sha256Digest::of_bytes(&writer.finish().0).to_hex())
 }
+pub(super) fn item_document<C: DecodeStepControl>(document: [u8; 32], item_id: &str,
+    control: &mut C) -> Result<[u8; 32], SampledSentimentMapError> {
+    let mut writer = Writer::new(SAMPLED_SENTIMENT_MAP_ITEM_ADDRESS_VERSION.as_bytes(), u64::MAX, control);
+    // A JSON tuple frames the caller ID separately from the private complete
+    // request commitment. Neither the raw ID nor the commitment is emitted.
+    writer.value(&(document, item_id))?;
+    writer.checkpoint()?; Ok(writer.finish().0)
+}
 pub(super) fn geometry<C: DecodeStepControl>(chunks: &[PreparedChunk], control: &mut C)
     -> Result<[u8; 32], SampledSentimentMapError> {
     geometry_values(chunks.iter().map(|chunk| (chunk.id, chunk.span, chunk.tokens)), control)

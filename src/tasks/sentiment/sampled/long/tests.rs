@@ -86,6 +86,57 @@ fn repeated_equal_chunks_get_distinct_addresses_and_axis_order_is_canonical() {
 }
 
 #[test]
+fn stable_population_item_ids_bind_the_complete_document_and_every_original_chunk() {
+    let source = request("abcdefghabcdefgh");
+    let one_shot = prepare(&source.document);
+    let first = planner().plan_document_for_item_with_control(&source, limits(), "item-é", &mut Continue).unwrap();
+    let second = planner().plan_document_for_item_with_control(&source, limits(), "item-好", &mut Continue).unwrap();
+    let replay = planner().plan_document_for_item_with_control(&source, limits(), "item-é", &mut Continue).unwrap();
+    assert_eq!(first.expected.request_binding, replay.expected.request_binding);
+    assert_ne!(first.expected.request_binding, second.expected.request_binding);
+    assert_ne!(first.expected.request_binding, one_shot.expected.request_binding);
+    assert_eq!(first.planned_work(), one_shot.planned_work());
+    assert_eq!(first.preparation_requirement_bytes(), one_shot.preparation_requirement_bytes());
+    for ((a, b), cold) in first.chunks.iter().zip(&second.chunks).zip(&one_shot.chunks) {
+        assert_eq!(a.span, b.span); assert_eq!(a.tokens, b.tokens);
+        assert_ne!(a.plan.identity.decision_policy_digest, b.plan.identity.decision_policy_digest);
+        assert_ne!(a.plan.identity.decision_policy_digest, cold.plan.identity.decision_policy_digest);
+        for ((left, right), original) in a.plan.axes.iter().zip(&b.plan.axes).zip(&cold.plan.axes) {
+            assert_eq!(left.prompt, right.prompt); assert_eq!(left.prompt, original.prompt);
+            assert_ne!(left.identity.decision_policy_digest, right.identity.decision_policy_digest);
+            assert_ne!(left.identity.decision_policy_digest, original.identity.decision_policy_digest);
+        }
+    }
+    // The final source chunk belongs to the same complete-document address,
+    // so changing it also changes the unchanged first chunk's sample stream.
+    let changed = planner().plan_document_for_item_with_control(&request("abcdefghabcdefgi"),
+        limits(), "item-é", &mut Continue).unwrap();
+    assert_eq!(first.chunks[0].plan.axes[0].prompt, changed.chunks[0].plan.axes[0].prompt);
+    assert_ne!(first.chunks[0].plan.axes[0].identity.decision_policy_digest,
+        changed.chunks[0].plan.axes[0].identity.decision_policy_digest);
+    let mut reordered_axes = source; reordered_axes.axes.reverse();
+    let reordered = planner().plan_document_for_item_with_control(&reordered_axes,
+        limits(), "item-é", &mut Continue).unwrap();
+    assert_eq!(first.expected.request_binding, reordered.expected.request_binding);
+}
+
+#[test]
+fn population_item_ids_refuse_before_source_encoding_and_keep_one_shot_identity_unchanged() {
+    let source = request("abcdefghabcdefgh");
+    let baseline = prepare(&source.document);
+    for item in [String::new(), "a\n".to_owned(), "a\0b".to_owned(), "x".repeat(257)] {
+        let mut work = SafeBpeWork::default();
+        assert!(matches!(planner().plan_document_for_item_with_encoding_work(&source, limits(),
+            &item, &mut Continue, &mut work), Err(SampledSentimentMapError::Limits)));
+        assert_eq!(work, SafeBpeWork::default());
+    }
+    planner().plan_document_for_item_with_control(&source, limits(), &"x".repeat(256), &mut Continue).unwrap();
+    let after = prepare(&source.document);
+    assert_eq!(baseline.expected.request_binding, after.expected.request_binding);
+    assert_eq!(baseline.chunks[0].plan.identity, after.chunks[0].plan.identity);
+}
+
+#[test]
 fn every_whole_document_work_axis_refuses_one_unit_short_without_truncation() {
     let map = prepare("abcdefghabcdefgh");
     let source = request("abcdefghabcdefgh");

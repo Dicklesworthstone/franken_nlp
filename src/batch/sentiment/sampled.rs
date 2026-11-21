@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 use serde::Deserialize;
+pub mod long;
 use crate::{
     batch::{BatchCode, BatchDocument, BatchFault, BatchItemFailure, BatchProcessor,
         BatchRequestContext, BatchWork, extract::ExtractionMaskBudget, output::GuardedOutput},

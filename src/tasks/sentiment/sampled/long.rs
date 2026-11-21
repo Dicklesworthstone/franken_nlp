@@ -19,6 +19,10 @@ pub use reduction::{SampledSentimentMapAggregate, SampledSentimentMapAggregateDi
 pub const SAMPLED_SENTIMENT_MAP_EXECUTION: &str = "grouped-int4-complete-sampled-sentiment-map-v1";
 pub const SAMPLED_SENTIMENT_MAP_REUSED_PREFILL_EXECUTION: &str =
     "grouped-int4-complete-sampled-sentiment-map-reused-prefill-v1";
+/// Stable population item addressing. Transport order, request sequence and
+/// flush epochs never enter the private complete-document or chunk keys.
+pub const SAMPLED_SENTIMENT_MAP_ITEM_ADDRESS_VERSION: &str =
+    "sampled-sentiment-complete-document-item-address-v1";
 pub const MAX_SAMPLED_SENTIMENT_MAP_CHUNKS: usize = 256;
 const MAX_BYTES: u64 = 64 * MIB;
 const SEMANTICS: &str = "independent-chunks-ordinal-paired-scalar-weighted-document-replicates-v1";
@@ -181,6 +185,10 @@ pub struct PreparedSampledSentimentMap {
     preparation_bytes: u64,
 }
 impl SampledSentimentPlanner {
+    /// Admission-only access to the actual immutable sampling policy. The
+    /// private seed is never added to a public result or diagnostic envelope.
+    pub(crate) fn sampling_options(&self) -> &SampledSentimentOptions { &self.options }
+
     pub fn plan_document_with_control<C: DecodeStepControl>(&self, request: &SentimentRequest,
         limits: SampledSentimentMapLimits, control: &mut C)
         -> Result<PreparedSampledSentimentMap, SampledSentimentMapError> {
@@ -191,6 +199,35 @@ impl SampledSentimentPlanner {
     /// Failed preparation retains its debit in the caller-owned ledger.
     pub fn plan_document_with_encoding_work<C: DecodeStepControl>(&self, request: &SentimentRequest,
         limits: SampledSentimentMapLimits, control: &mut C, work: &mut SafeBpeWork)
+        -> Result<PreparedSampledSentimentMap, SampledSentimentMapError> {
+        self.plan_document_addressed_with_encoding_work(request, limits, None, control, work)
+    }
+
+    /// Bind a complete population document to its caller-owned stable item ID.
+    /// Identical source under different IDs receives independent sample
+    /// addresses; a reordered or resumed item keeps its original addresses.
+    /// The one-shot document methods retain their existing identities.
+    pub fn plan_document_for_item_with_control<C: DecodeStepControl>(&self, request: &SentimentRequest,
+        limits: SampledSentimentMapLimits, item_id: &str, control: &mut C)
+        -> Result<PreparedSampledSentimentMap, SampledSentimentMapError> {
+        self.plan_document_for_item_with_encoding_work(request, limits, item_id,
+            control, &mut SafeBpeWork::default())
+    }
+
+    /// Retain failed preparation debits in one caller-owned compact-tokenizer
+    /// ledger while binding every original chunk to this population item.
+    pub fn plan_document_for_item_with_encoding_work<C: DecodeStepControl>(&self, request: &SentimentRequest,
+        limits: SampledSentimentMapLimits, item_id: &str, control: &mut C, work: &mut SafeBpeWork)
+        -> Result<PreparedSampledSentimentMap, SampledSentimentMapError> {
+        checkpoint(control)?;
+        if item_id.is_empty() || item_id.len() > 256 || item_id.chars().any(char::is_control) {
+            return Err(SampledSentimentMapError::Limits);
+        }
+        self.plan_document_addressed_with_encoding_work(request, limits, Some(item_id), control, work)
+    }
+
+    fn plan_document_addressed_with_encoding_work<C: DecodeStepControl>(&self, request: &SentimentRequest,
+        limits: SampledSentimentMapLimits, item_id: Option<&str>, control: &mut C, work: &mut SafeBpeWork)
         -> Result<PreparedSampledSentimentMap, SampledSentimentMapError> {
         checkpoint(control)?;
         limits.validate(request.budget)?;
@@ -228,6 +265,10 @@ impl SampledSentimentPlanner {
         // Hash the complete source once, never once per chunk. The private
         // binding also names the aggregate contract and immutable task caps.
         let document_binding = binding::document(request, self, limits, control)?;
+        let document_binding = match item_id {
+            Some(item_id) => binding::item_document(document_binding, item_id, control)?,
+            None => document_binding,
+        };
         let mut plans = map_reserved(chunks.chunks().len())?;
         let mut total_work = Int4Work::default();
         let mut total_output = 0_u64;
