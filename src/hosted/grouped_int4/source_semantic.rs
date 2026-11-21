@@ -14,6 +14,10 @@ use crate::{
             SOURCE_SEMANTIC_SCOPE, SOURCE_SEMANTIC_CALIBRATION}}}},
 };
 
+mod corpus;
+pub use corpus::{Int4SourceSemanticCorpusConfig, Int4SourceSemanticCorpusRequirements,
+    int4_source_semantic_corpus_requirements};
+
 /// Admission for generation, every full-source judge and complete publication.
 /// These are modeled storage floors, not an allocator or operating-system cap.
 #[derive(Clone, Copy, Debug)]

@@ -51,6 +51,8 @@ pub use grouped_int4::{Int4HostError, Int4LoadLimits, Int4LoadRequirements, Int4
     Int4SemanticHostLimits, Int4SemanticHostRequirements,
     Int4SemanticCorpusConfig, Int4SemanticCorpusRequirements, int4_semantic_corpus_requirements,
     Int4SourceSemanticHostLimits, Int4SourceSemanticHostRequirements,
+    Int4SourceSemanticCorpusConfig, Int4SourceSemanticCorpusRequirements,
+    int4_source_semantic_corpus_requirements,
     Int4ScoredCohortHostLimits, Int4ScoredCohortBatchResult,
     Int4AssayHostLimits, Int4AssayHostRequirements, Int4AssayOperation,
     Int4NerAssayHostLimits, Int4NerAssayHostRequirements,
