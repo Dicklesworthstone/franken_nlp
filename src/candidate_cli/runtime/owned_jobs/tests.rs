@@ -42,6 +42,41 @@ fn extraction_factory_is_sealed_before_native_handoff_and_uses_lifetime_work() {
     assert_eq!(planner.native_limits().max_model_work, lifetime().max_work.model);
 }
 #[test]
+fn compact_job_factories_match_the_exact_policy_totals_and_pre_io_workspace_quote() {
+    for task in ["ner", "keyphrases", "summarize", "answer", "extract"] {
+        let extra = if task == "extract" { vec!["--input-encoding", "safe-bpe-v1", "--schema", "s.json"] }
+            else { vec!["--input-encoding", "safe-bpe-v1"] };
+        let a = args(task, &extra); let (_, limits) = a.validate().unwrap();
+        let policy = a.encoding_policy(limits).unwrap(); let totals = a.encoding_work_limits().unwrap();
+        let workspace = a.encoding_workspace_bytes(limits).unwrap();
+        let ceiling = a.host.task_budget(limits);
+        let schema = (task == "extract").then(|| r#"{"type":"string","maxLength":64}"#.to_owned());
+        let defaults = command::load_defaults(&a, ceiling, None, schema).unwrap();
+        let (prepared, _) = prepare(&a, &facts(), ceiling, defaults,
+            command::native_limits(&a, lifetime()).unwrap(), &mut Continue).unwrap();
+        check_encoding_quote(&prepared, &policy, totals, workspace).unwrap();
+        assert_eq!(check_encoding_quote(&prepared, &policy, totals, workspace + 1).unwrap_err().code,
+            "job_encoding_quote_mismatch");
+        assert!(check_encoding_quote(&prepared, &UntrustedEncoding::ByteFallback, None, 0).is_err());
+        if let PreparedJob::Source { planner, config } = prepared {
+            assert_eq!(planner.document_encoding(), &policy);
+            assert_eq!(config.identity.template_digest, *planner.template_digest());
+            let compiler = Int8SourceBatchPlanner::new(&planner, config.identity, ceiling,
+                config.planning, config.defaults).unwrap();
+            let document = || BatchDocument { id: "item".to_owned(), text: "Who moved? <tool_call> café".to_owned(),
+                task_args: (task == "answer").then(|| crate::batch::source::SourceBatchArgs::Answer {
+                    options: crate::tasks::answer::AnswerOptions::default(), budget: ceiling,
+                    passages: vec![crate::tasks::answer::AnswerPassage { id: "p1".to_owned(),
+                        text: "Alice moved to 上海.".to_owned() }] }) };
+            let first = compiler.prepare_with_control(document(), &mut Continue).unwrap();
+            let spent = planner.map_document_encoding_work().unwrap().unwrap();
+            let second = compiler.prepare_with_control(document(), &mut Continue).unwrap();
+            assert_eq!(first.execution_identity(), second.execution_identity());
+            assert_eq!(planner.map_document_encoding_work().unwrap().unwrap(), spent.checked_add(spent).unwrap());
+        }
+    }
+}
+#[test]
 fn cancelled_factory_preparation_never_constructs_a_usable_job() {
     struct Stop;
     impl DecodeStepControl for Stop { fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { Some(DecodeCancellationKind::Deadline) } }
@@ -87,6 +122,23 @@ fn metadata_report_does_not_contain_the_inputs_results_or_private_commitments() 
     }
 }
 #[test]
+fn byte_receipts_are_unchanged_and_compact_totals_are_explicitly_invocation_scoped() {
+    let p = progress();
+    let report = progress_report(p, p.job_id, lifetime(), true, RunMode::Start, "extract").unwrap();
+    let before = serde_json::to_value(&report).unwrap();
+    let byte = EncodingReport { response: &report, input_encoding: None, invocation_encoding_work_limits: None };
+    assert_eq!(serde_json::to_value(byte).unwrap(), before);
+    let a = args("extract", &["--input-encoding", "safe-bpe-v1"]);
+    let (_, limits) = a.validate().unwrap(); let policy = a.encoding_policy(limits).unwrap();
+    let totals = a.encoding_work_limits().unwrap();
+    let compact = EncodingReport { response: &report, input_encoding: Some(&policy), invocation_encoding_work_limits: totals };
+    let mut encoded = serde_json::to_value(compact).unwrap();
+    let object = encoded.as_object_mut().unwrap();
+    assert_eq!(object.remove("input_encoding"), Some(serde_json::to_value(policy).unwrap()));
+    assert_eq!(object.remove("invocation_encoding_work_limits"), Some(serde_json::to_value(totals.unwrap()).unwrap()));
+    assert_eq!(encoded, before);
+}
+#[test]
 fn invalid_progress_or_lost_materialization_cannot_be_reported_as_complete() {
     let good = progress();
     for axis in 0..8 {
@@ -118,13 +170,25 @@ fn impossible_population_memory_fails_before_resident_loading() {
         transport: PopulationReadLimits { max_stream_bytes: 64 * MIB, max_lines: 1000 },
         preparation_reserve_bytes: limits.preparation_bytes, io_reserve_bytes: 131072,
         journal_reserve_bytes: 64 * MIB, serialization_reserve_bytes: 16 * MIB };
-    preflight_memory(h, lifetime(), limits, JobInputMemory::CompletePopulation).unwrap();
+    preflight_memory(h, lifetime(), limits, JobInputMemory::CompletePopulation, 0).unwrap();
     let mut huge = lifetime(); huge.max_snapshot_bytes = i64::MAX as u64;
-    assert!(preflight_memory(h, huge, limits, JobInputMemory::CompletePopulation).is_err());
-    preflight_memory(h, huge, limits, JobInputMemory::RetainedRecord).unwrap();
+    assert!(preflight_memory(h, huge, limits, JobInputMemory::CompletePopulation, 0).is_err());
+    preflight_memory(h, huge, limits, JobInputMemory::RetainedRecord, 0).unwrap();
     let mut zero = h; zero.journal_reserve_bytes = 0;
-    assert!(preflight_memory(zero, lifetime(), limits, JobInputMemory::CompletePopulation).is_err());
-    assert!(preflight_memory(zero, lifetime(), limits, JobInputMemory::RetainedRecord).is_err());
+    assert!(preflight_memory(zero, lifetime(), limits, JobInputMemory::CompletePopulation, 0).is_err());
+    assert!(preflight_memory(zero, lifetime(), limits, JobInputMemory::RetainedRecord, 0).is_err());
+    let compact = args("ner", &["--input-encoding", "safe-bpe-v1"]);
+    let encoder = compact.encoding_workspace_bytes(limits).unwrap();
+    for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
+        let minimum = h.required_buffer_bytes_for_input(lifetime(), input).unwrap()
+            + limits.preparation_bytes + limits.weight_bytes;
+        let mut boundary = limits; boundary.memory_bytes = minimum;
+        preflight_memory(h, lifetime(), boundary, input, 0).unwrap();
+        assert_eq!(preflight_memory(h, lifetime(), boundary, input, encoder).unwrap_err().code, "job_population_memory");
+        boundary.memory_bytes += encoder;
+        preflight_memory(h, lifetime(), boundary, input, encoder).unwrap();
+        assert_eq!(preflight_memory(h, lifetime(), boundary, input, u64::MAX).unwrap_err().code, "job_memory_arithmetic");
+    }
 }
 
 #[test]

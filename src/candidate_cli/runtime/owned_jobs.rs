@@ -17,6 +17,7 @@ use crate::{
         population::PopulationReadLimits, runner::{JobRunError, extract::Int8ExtractionJobPlanner}},
     native_engine::decode::{DecodeCancellationKind, DecodeStepControl},
     tasks::{extract::ExtractionVocabulary, source_planning::SourceTaskPlanner},
+    tokenizer::untrusted::{SafeBpeWorkLimits, UntrustedEncoding},
 };
 
 const IO_BYTES: usize = 64 * 1024;
@@ -33,6 +34,9 @@ fn prepare(args: &JobArgs, facts: &ArtifactIdentity, ceiling: TaskBudget, defaul
     if args.document_config.is_some() { return Err(Failure::usage("document_job_configuration_missing")); }
     if args.source_document_config.is_some() { return Err(Failure::usage("source_document_job_configuration_missing")); }
     checkpoint(control)?;
+    let (_, limits) = args.validate()?;
+    let encoding = args.encoding_policy(limits)?;
+    let encoding_work_limits = args.encoding_work_limits()?;
     let registry = pinned_controls::pinned().map_err(|_| CandidateError::Identity)?;
     let controls = registry.template_controls();
     let eos = controls.entries().iter().find(|e| e.special && e.surface == crate::template::IM_END)
@@ -41,6 +45,11 @@ fn prepare(args: &JobArgs, facts: &ArtifactIdentity, ceiling: TaskBudget, defaul
         Defaults::Source(defaults) => {
             if args.task == "extract" { return Err(Failure::usage("job_task_defaults")); }
             let planner = SourceTaskPlanner::pinned(controls, eos).map_err(|_| CandidateError::Planning)?;
+            let planner = match encoding_work_limits {
+                Some(total) => planner.with_map_document_encoding(encoding.clone(), total)
+                    .map_err(|_| CandidateError::Planning)?,
+                None => planner,
+            };
             let identity = source_identity(facts, &planner, args.task_kind()?)?;
             source_batch::check_configuration(&planner, &identity, ceiling, args.host.planning(), defaults.as_ref())
                 .map_err(|_| CandidateError::Planning)?;
@@ -52,13 +61,34 @@ fn prepare(args: &JobArgs, facts: &ArtifactIdentity, ceiling: TaskBudget, defaul
             let mut identity = candidate_identity(facts)?; identity.task_spec = "extract-v1".to_owned();
             PreparedJob::Extract(Int8ExtractionJobPlanner::pinned(controls, eos, identity, ceiling,
                 schema_cli::compiler(&args.host), args.host.planning().source, defaults, native)
+                .and_then(|planner| planner.with_document_encoding(encoding.clone(), encoding_work_limits))
                 .map_err(|_| CandidateError::Planning)?)
         }
     };
+    check_encoding_quote(&prepared, &encoding, encoding_work_limits, args.encoding_workspace_bytes(limits)?)?;
     checkpoint(control)?;
     let vocabulary = Arc::new(ExtractionVocabulary::pinned(controls).map_err(|_| CandidateError::Planning)?);
     checkpoint(control)?;
     Ok((prepared, vocabulary))
+}
+fn check_encoding_quote(prepared: &PreparedJob, encoding: &UntrustedEncoding,
+    total: Option<SafeBpeWorkLimits>, expected: u64) -> Result<(), Failure> {
+    let (actual_policy, actual_total, workspace) = match prepared {
+        PreparedJob::Source { planner, .. } => (planner.document_encoding(),
+            planner.map_document_encoding_limits(), planner.map_document_encoding_workspace_bytes()
+                .map_err(|_| CandidateError::Planning)?),
+        PreparedJob::Extract(planner) => (planner.document_encoding(), planner.encoding_work_limits(),
+            planner.encoding_workspace_bytes().map_err(|_| CandidateError::Planning)?),
+        PreparedJob::Document { .. } | PreparedJob::SourceDocument { .. } => {
+            return if encoding == &UntrustedEncoding::ByteFallback && total.is_none() && expected == 0 {
+                Ok(())
+            } else { Err(Failure::usage("document_job_input_encoding")) };
+        }
+    };
+    if actual_policy != encoding || actual_total != total || workspace != expected {
+        return Err(Failure::usage("job_encoding_quote_mismatch"));
+    }
+    Ok(())
 }
 fn checkpoint(control: &mut impl DecodeStepControl) -> Result<(), Failure> {
     match control.prefill_checkpoint(0) { Some(c) => Err(cancelled(c)), None => Ok(()) }
@@ -79,8 +109,10 @@ fn host_limits(args: &JobArgs, common: &CandidateArgs, limits: Limits, session: 
         journal_reserve_bytes: args.journal_memory_mib.checked_mul(MIB).ok_or_else(|| Failure::usage("job_memory"))?,
         serialization_reserve_bytes: args.serialization_memory_mib.checked_mul(MIB).ok_or_else(|| Failure::usage("job_memory"))? })
 }
-fn preflight_memory(host: JobHostLimits, job: JobLimits, limits: Limits, input: JobInputMemory) -> Result<(), Failure> {
-    let buffers = host.required_buffer_bytes_for_input(job, input).map_err(host_failure)?;
+fn preflight_memory(host: JobHostLimits, job: JobLimits, limits: Limits, input: JobInputMemory,
+    encoding_workspace_bytes: u64) -> Result<(), Failure> {
+    let buffers = host.required_buffer_bytes_for_input(job, input).map_err(host_failure)?
+        .checked_add(encoding_workspace_bytes).ok_or_else(|| Failure::usage("job_memory_arithmetic"))?;
     // Necessary bound only; the real host additionally admits KV/workspace,
     // resident metadata and guarded output. Do not call this a memory permit.
     let minimum = buffers.checked_add(limits.preparation_bytes).and_then(|n| n.checked_add(limits.weight_bytes))
@@ -108,13 +140,16 @@ pub(in crate::candidate_cli) fn open_mode(mode: RunMode, retention: command::Inp
 pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode, args: JobArgs,
     common: CandidateArgs, limits: Limits, input: R, output: &mut impl Write) -> Result<(), Failure> {
     args.input_retention.validate(mode, &args.input)?;
+    let encoding = args.encoding_policy(limits)?;
+    let encoding_work_limits = args.encoding_work_limits()?;
+    let encoding_workspace_bytes = args.encoding_workspace_bytes(limits)?;
     // Declared first: preparation/input/factory/result storage drops BEFORE its
     // charge. No key/config/model IO occurs before this preparation admission.
     let session = Session::new(&common, limits)?;
     let lifetime = command::parse_limits(&read_config(&session, &args.limits_file, command::LIMIT_BYTES)?)?;
     let native = command::native_limits(&args, lifetime)?;
     preflight_memory(host_limits(&args, &common, limits, &session)?, lifetime, limits,
-        args.input_retention.input_memory()?)?;
+        args.input_retention.input_memory()?, encoding_workspace_bytes)?;
     let key = JobSecret::read(&args.key_file).map_err(job_failure)?;
     session.remaining()?;
     let defaults = args.defaults.as_ref().map(|path| read_config(&session, path, command::DEFAULT_BYTES)).transpose()?;
@@ -132,6 +167,7 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
         (None, None) => prepare(&args, &facts, ceiling, defaults, native, &mut session.control())?,
         (Some(_), Some(_)) => return Err(Failure::usage("source_document_job_options")),
     };
+    check_encoding_quote(&prepared, &encoding, encoding_work_limits, encoding_workspace_bytes)?;
     // Only owned IO crosses the worker boundary; retained replay supplies no
     // external population reader and is restored by the locked job owner.
     let reader = command::population_reader(mode, args.input_retention, &args.input, input, IO_BYTES)?;
@@ -162,7 +198,20 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
         quant_recipe: &facts.recipe_id, output: &report };
     // Metadata only. All persisted private results stay in their explicit
     // protected spool/materialization. Failed delivery never implies rollback.
-    publish(&response, command::REPORT_BYTES, output).map_err(Failure::from)
+    let response = EncodingReport { response: &response,
+        input_encoding: input_encoding::reported_policy(&encoding),
+        invocation_encoding_work_limits: encoding_work_limits };
+    publish_checked(&response, command::REPORT_BYTES, output,
+        &|| session.remaining().map(|_| ())).map_err(Failure::from)
+}
+
+#[derive(Serialize)]
+struct EncodingReport<'a, T: Serialize> {
+    #[serde(flatten)] response: &'a T,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<&'a UntrustedEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    invocation_encoding_work_limits: Option<SafeBpeWorkLimits>,
 }
 
 #[derive(Serialize)]

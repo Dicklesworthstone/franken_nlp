@@ -155,6 +155,86 @@ model, score/grammar policy or host ceiling. Default KV authority must cover the
 entire allocated context. Changed defaults or compiler/task limits invalidate
 resume rather than changing the meaning of pending items.
 
+## Compact input with authenticated resume
+
+Single-context `extract`, `ner`, `keyphrases`, `summarize` and `answer` jobs
+accept `--input-encoding safe-bpe-v1` on both `start` and `resume`. For example:
+
+```sh
+fnlp candidate job start corpus.ndjson --task extract \
+  --schema schema.json --input-encoding safe-bpe-v1 \
+  --max-total-tokenizer-input-bytes 67108864 \
+  --max-total-tokenizer-output-tokens 4194304 \
+  --max-total-tokenizer-pair-checks 268435456 \
+  --max-total-tokenizer-pair-bytes 4294967296 \
+  --store-results --job-dir /private/extraction-job --job-id "$JOB_ID" \
+  --key-file /private/extraction-job.key --limits job-limits.json \
+  --model ./model.fnlpq --memory-mib 8192
+```
+
+The directory, key, random job ID and limits must already have been provisioned
+as described above. Resume uses the same arguments with `resume` in place of
+`start`, and the original complete population or the existing explicit retained
+input route. Repeat the original encoding policy and all tokenizer ceilings:
+they are part of the authenticated recipe, so changing them refuses resume
+before pending inference or recovery repair. Existing byte-fallback recipes
+retain their exact serialized shape and remain the default.
+
+Each record receives a bounded tokenizer allowance. For extraction, the exact
+raw schema and original source share that allowance; the byte cap is the
+document limit plus the 64 KiB schema ceiling, capped at the encoder's 1 MiB
+maximum. Source-task records use the existing document and prompt-token bounds.
+QA shares one allowance across its question, passage IDs and all supplied
+evidence. `--max-tokenizer-pair-checks` and `--max-tokenizer-pair-bytes` bound
+per-record merge work. Schema/source or QA segments share one record allowance,
+and compiler reconstruction does not renew the invocation allowance. Repeated
+preparation must fit both its per-call cap and the remaining invocation ledger.
+Exhaustion never silently falls back to another encoding.
+
+An additional cumulative ledger bounds all encoding preparation in the current
+invocation, including failed and cancelled preparation:
+
+| Flag | Default invocation total |
+| --- | ---: |
+| `--max-total-tokenizer-input-bytes` | 67,108,864 bytes |
+| `--max-total-tokenizer-output-tokens` | 4,194,304 tokens |
+| `--max-total-tokenizer-pair-checks` | 268,435,456 checks |
+| `--max-total-tokenizer-pair-bytes` | 4,294,967,296 examined bytes |
+
+All four totals must be positive and are accepted only with compact input.
+Spent preparation remains spent when the factory hands its planner to the
+native job processor; later records use the remaining allowance. A resumed
+invocation receives the same declared tokenizer allowance. These are
+**invocation totals**, while native/mask work and attempts remain the original
+persisted lifetime totals. Neither a new invocation nor compact input refunds
+those durable debits.
+
+CLI admission includes the selected encoder's exact workspace before private
+input. The actual prepared planner's policy, cumulative caps and workspace must
+match that quote, and the host independently reserves it with either the
+complete population or retained-record buffers through physical completion.
+Preparation borrows the original cancellation controller, including source
+index construction and final plan sealing. Typed cancellation causes remain
+intact, and metadata publication checks the original deadline.
+
+Compact completion reports add `input_encoding` and
+`invocation_encoding_work_limits`; byte reports omit both. The report still
+contains no private content or prompt-derived commitment. Encoding preserves
+the original bytes and excludes template-control token IDs, while changing
+the prompt token sequence. It does not establish identical model output,
+numerical equivalence, quality or measured speed.
+
+Complete-document jobs using `--document-config` or
+`--source-document-config` continue to require byte fallback. They reject
+compact input before configuration, key, model or population access; their
+chunk-level accounting contract is separate.
+
+Library callers configure `Int8ExtractionJobPlanner::with_document_encoding`
+with the fixed policy and invocation totals. Source jobs use the existing
+`SourceTaskPlanner::with_map_document_encoding` cumulative owner. Keep that
+owner across preparation and native execution; the hosted job entry points
+admit its workspace independently.
+
 ## Admission, cancellation and failure reporting
 
 Preparation is admitted before key/config/tokenizer allocation. The CLI checks
@@ -193,7 +273,12 @@ acknowledgement. No second stdout record is appended after a failed write.
 ## Validation scope
 
 Added command, configuration, no-IO, real pinned factory, work/memory admission,
-recovery-policy and metadata/diagnostic regression sources. They do not simulate
+recovery-policy and metadata/diagnostic regression sources. Compact additions
+cover both operations for all five tasks, exact schema/source preservation,
+all eight authenticated per-record/total policy axes, fixed identity under
+shrinking remaining budgets, failed-preparation debits, all eleven typed
+cancellation causes, byte recipe/report compatibility, and exact full-input
+and retained-input memory boundaries. They do not simulate
 neural success. Rust compilation/tests, full-model execution, crash/power-loss
 qualification, measured memory/performance and controller DSR validation were
 not executed for this checkpoint. All outputs retain the non-authoritative

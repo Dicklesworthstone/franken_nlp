@@ -147,7 +147,10 @@ impl NlpEngine {
     where R: BufRead + Send + 'static {
         dispatch::preflight(self, limits.native.run)?;
         self.check_resident_domain(model)?;
-        let bytes = limits.required_buffer_bytes_for_input(request.limits, request.mode.input_memory())?;
+        let encoder_bytes = planner.map_document_encoding_workspace_bytes()
+            .map_err(|_| HostedError::Limits("source job cumulative encoding admission"))?;
+        let bytes = sum(&[limits.required_buffer_bytes_for_input(request.limits, request.mode.input_memory())?,
+            encoder_bytes])?;
         let required = requirements(limits.native)?;
         check_model_identity(model.artifact_identity(), &config.identity)?;
         source_batch::check_configuration(&planner, &config.identity, config.task_ceiling,

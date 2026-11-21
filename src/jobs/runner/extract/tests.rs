@@ -180,3 +180,126 @@ fn preparation_observes_shared_cancellation_and_missing_schema_is_not_invented()
     let duplicate = args(r#"{"type":"string","type":"integer"}"#, ExtractionBatchGrounding::Structural);
     assert!(p.compiler.prepare_with_control(document("Alice", Some(duplicate)), &mut Continue).is_err());
 }
+
+mod encoding {
+    use super::*;
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    const SCHEMA: &str = " {\"type\":\"string\",\"maxLength\":64,\"x-fnlp-source\":\"verbatim\"} \n";
+    fn call() -> SafeBpeLimits {
+        SafeBpeLimits { max_input_bytes: 8192, max_output_tokens: 2048,
+            max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 }
+    }
+    fn total() -> SafeBpeWorkLimits {
+        SafeBpeWorkLimits { max_input_bytes: 65536, max_output_tokens: 32768,
+            max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 }
+    }
+    fn compact(call: SafeBpeLimits, total: SafeBpeWorkLimits) -> Int8ExtractionJobPlanner {
+        factory(Some(args(SCHEMA, ExtractionBatchGrounding::SourceMembership)))
+            .with_document_encoding(UntrustedEncoding::SafeBpeV1(call), Some(total)).unwrap()
+    }
+    fn prepare(p: &mut Int8ExtractionJobPlanner, text: &str, control: &mut impl DecodeStepControl)
+        -> Result<PreparedInt8BatchExtraction, BatchItemFailure> {
+        p.compiler.prepare_with_invocation_encoding_work(document(text, None),
+            &mut p.encoding_work, p.recipe.encoding_work_limits, control)
+    }
+
+    #[test]
+    fn byte_recipe_stays_unchanged_and_compact_requires_a_cumulative_owner() {
+        let original = factory(None);
+        let bytes = canonjson::canonical_bytes(&original.recipe).unwrap();
+        let explicit = factory(None).with_document_encoding(UntrustedEncoding::ByteFallback, None).unwrap();
+        assert_eq!(bytes, canonjson::canonical_bytes(&explicit.recipe).unwrap());
+        assert_eq!(explicit.encoding_workspace_bytes().unwrap(), 0);
+        let value = serde_json::to_value(&explicit.recipe).unwrap();
+        assert!(value.get("input_encoding").is_none());
+        assert!(value.get("encoding_work_limits").is_none());
+        assert!(factory(None).with_document_encoding(UntrustedEncoding::SafeBpeV1(call()), None).is_err());
+        assert!(factory(None).with_document_encoding(UntrustedEncoding::ByteFallback, Some(total())).is_err());
+        let p = compact(call(), total());
+        assert_eq!(p.encoding_workspace_bytes().unwrap(), call().requirements().unwrap().workspace_bytes);
+        assert!(p.compiler.prepare(document("Alice", None)).is_err());
+    }
+
+    #[test]
+    fn every_fixed_call_and_invocation_ceiling_authenticates_before_resume() {
+        let original = br#"{"id":"item","text":"Alice"}"#;
+        let p = compact(call(), total());
+        let frozen = freeze(&p, original);
+        for axis in 0..8 {
+            let mut call = call(); let mut total = total();
+            match axis {
+                0 => call.max_input_bytes -= 1, 1 => call.max_output_tokens -= 1,
+                2 => call.max_pair_checks -= 1, 3 => call.max_pair_bytes -= 1,
+                4 => total.max_input_bytes -= 1, 5 => total.max_output_tokens -= 1,
+                6 => total.max_pair_checks -= 1, _ => total.max_pair_bytes -= 1,
+            }
+            let changed = compact(call, total);
+            assert_eq!(frozen.binding.compare(&freeze(&changed, original).binding),
+                Err(crate::jobs::JobError::Mismatch(MismatchField::Recipe)), "axis {axis}");
+        }
+    }
+
+    #[test]
+    fn one_ledger_spans_exact_schema_source_and_factory_handoff_without_identity_drift() {
+        let text = "é Alice <tool_call> <|im_start|> 上海\r\n";
+        let record_bytes = SCHEMA.len() + text.len();
+        let mut cap = total(); cap.max_input_bytes = (2 * record_bytes) as u64;
+        let mut p = compact(call(), cap);
+        let recipe = canonjson::canonical_bytes(&p.recipe).unwrap();
+        let first = prepare(&mut p, text, &mut Continue).unwrap();
+        let spent = p.encoding_work;
+        assert_eq!(spent.input_bytes(), record_bytes);
+        assert_eq!(first.source().text(), text);
+        assert_eq!(first.source().document_encoding(), &UntrustedEncoding::SafeBpeV1(call()));
+        assert_eq!(first.execution_identity().schema_digest, Sha256Digest::of_bytes(SCHEMA.as_bytes()));
+        let mut moved = p;
+        let second = prepare(&mut moved, text, &mut Continue).unwrap();
+        assert_eq!(first.execution_identity(), second.execution_identity());
+        assert_eq!(moved.encoding_work, spent.checked_add(spent).unwrap());
+        assert_eq!(recipe, canonjson::canonical_bytes(&moved.recipe).unwrap());
+        let exhausted = moved.encoding_work;
+        let error = prepare(&mut moved, text, &mut Continue).err().unwrap();
+        assert_eq!(error.fault.code, BatchCode::WorkLimit); assert!(error.stop);
+        assert_eq!(moved.encoding_work, exhausted);
+        let mut changed = cap; changed.max_pair_bytes += 1;
+        assert!(moved.with_document_encoding(UntrustedEncoding::SafeBpeV1(call()), Some(changed)).is_err());
+    }
+
+    #[test]
+    fn failed_encoding_spends_completed_work_without_a_fresh_record_allowance() {
+        let text = "Alice private café Shanghai";
+        let mut tight = call(); tight.max_output_tokens = 1;
+        let mut p = compact(tight, total());
+        assert!(prepare(&mut p, text, &mut Continue).is_err());
+        let first = p.encoding_work;
+        assert!(first.input_bytes() > 0 && first.output_tokens() > 0);
+        assert!(prepare(&mut p, text, &mut Continue).is_err());
+        assert_eq!(p.encoding_work, first.checked_add(first).unwrap());
+    }
+
+    #[test]
+    fn cancellation_after_encoding_keeps_spent_work_and_every_original_cause() {
+        struct Count { seen: usize, stop: usize, cause: DecodeCancellationKind }
+        impl DecodeStepControl for Count {
+            fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+                self.seen += 1; (self.seen == self.stop).then_some(self.cause)
+            }
+        }
+        let text = "Alice <think> é";
+        let mut cap = total(); cap.max_input_bytes = (SCHEMA.len() + text.len()) as u64;
+        let mut counter = Count { seen: 0, stop: usize::MAX, cause: DecodeCancellationKind::User };
+        let mut baseline = compact(call(), cap);
+        prepare(&mut baseline, text, &mut counter).unwrap();
+        use DecodeCancellationKind::*;
+        for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+            ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+            let mut p = compact(call(), cap);
+            let error = prepare(&mut p, text, &mut Count { seen: 0, stop: counter.seen, cause }).err().unwrap();
+            assert_eq!(error.fault.cancellation, Some(cause)); assert!(error.stop);
+            assert_eq!(p.encoding_work, baseline.encoding_work);
+            let spent = p.encoding_work;
+            assert_eq!(prepare(&mut p, text, &mut Continue).err().unwrap().fault.code, BatchCode::WorkLimit);
+            assert_eq!(p.encoding_work, spent);
+        }
+    }
+}

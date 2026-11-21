@@ -38,6 +38,86 @@ fn all_five_native_job_tasks_have_distinct_start_and_resume_routes() {
     }
 }
 #[test]
+fn compact_job_input_is_explicit_on_all_five_start_and_resume_routes() {
+    for task in ["ner", "keyphrases", "summarize", "answer", "extract"] {
+        for mode in ["start", "resume"] {
+            let (_, byte) = command(mode, task, &[]).into_parts();
+            let (_, limits) = byte.validate().unwrap();
+            assert_eq!(byte.encoding_policy(limits).unwrap(), UntrustedEncoding::ByteFallback);
+            assert_eq!(byte.encoding_work_limits().unwrap(), None);
+            assert_eq!(byte.encoding_workspace_bytes(limits).unwrap(), 0);
+            let (_, compact) = command(mode, task, &["--input-encoding", "safe-bpe-v1",
+                "--max-tokenizer-pair-checks", "1000000", "--max-tokenizer-pair-bytes", "2000000",
+                "--max-total-tokenizer-input-bytes", "3000000", "--max-total-tokenizer-output-tokens", "4000000",
+                "--max-total-tokenizer-pair-checks", "5000000", "--max-total-tokenizer-pair-bytes", "6000000"]).into_parts();
+            let (_, limits) = compact.validate().unwrap();
+            let UntrustedEncoding::SafeBpeV1(call) = compact.encoding_policy(limits).unwrap() else { panic!("compact policy lost") };
+            assert_eq!(call.max_input_bytes, compact.host.max_input_bytes
+                + if task == "extract" { super::super::extract::SCHEMA_BYTES } else { 0 });
+            assert_eq!(call.max_output_tokens, limits.max_prompt_tokens);
+            assert_eq!(call.max_pair_checks, 1_000_000); assert_eq!(call.max_pair_bytes, 2_000_000);
+            assert_eq!(compact.encoding_work_limits().unwrap(), Some(SafeBpeWorkLimits {
+                max_input_bytes: 3_000_000, max_output_tokens: 4_000_000,
+                max_pair_checks: 5_000_000, max_pair_bytes: 6_000_000 }));
+            assert_eq!(compact.encoding_workspace_bytes(limits).unwrap(), call.requirements().unwrap().workspace_bytes
+                + if task == "extract" { 0 } else { 1024 });
+            assert_eq!(native_limits(&compact, lifetime()).unwrap().max_model_work,
+                native_limits(&byte, lifetime()).unwrap().max_model_work);
+        }
+    }
+}
+#[test]
+fn cumulative_tokenizer_caps_refuse_byte_mode_zero_and_overflow_before_private_io() {
+    struct NoRead;
+    impl Read for NoRead { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("invalid tokenizer policy read private input") } }
+    for flag in ["--max-total-tokenizer-input-bytes", "--max-total-tokenizer-output-tokens",
+        "--max-total-tokenizer-pair-checks", "--max-total-tokenizer-pair-bytes"] {
+        for mode in ["start", "resume"] {
+            let mut stdout = Vec::new();
+            let error = command(mode, "ner", &[flag, "1"]).execute_owned(NoRead, &mut stdout).unwrap_err();
+            assert_eq!(error.code, "job_input_encoding"); assert!(stdout.is_empty());
+            for invalid in ["0", "18446744073709551615"] {
+                let error = command(mode, "ner", &["--input-encoding", "safe-bpe-v1", flag, invalid])
+                    .execute_owned(NoRead, &mut stdout).unwrap_err();
+                assert_eq!(error.code, "job_tokenizer_work"); assert!(stdout.is_empty());
+            }
+        }
+    }
+}
+#[test]
+fn compact_document_jobs_fail_before_key_configuration_model_or_population_reads() {
+    struct NoRead;
+    impl Read for NoRead { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("unsupported document mode read private input") } }
+    for mode in ["start", "resume"] {
+        for task in ["extract", "ner", "keyphrases", "summarize"] {
+            let extra = if task == "extract" {
+                vec!["--schema", "private/schema.json", "--document-config", "private/document.json"]
+            } else { vec!["--source-document-config", "private/source-map.json"] };
+            command(mode, task, &extra).into_parts().1.validate().unwrap();
+            let mut compact = extra;
+            compact.extend_from_slice(&["--input-encoding", "safe-bpe-v1"]);
+            let mut stdout = Vec::new();
+            let error = command(mode, task, &compact).execute_owned(NoRead, &mut stdout).unwrap_err();
+            assert_eq!(error.code, "document_job_input_encoding"); assert!(stdout.is_empty());
+        }
+    }
+}
+#[test]
+fn compact_job_preparation_funds_original_input_and_exact_schema_plus_encoder_workspace() {
+    for task in ["ner", "extract"] {
+        args(task, &["--max-input-bytes", "1048576"]).validate().unwrap();
+        assert!(args(task, &["--max-input-bytes", "1048576", "--input-encoding", "safe-bpe-v1"])
+            .validate().is_err());
+        let funded = args(task, &["--max-input-bytes", "1048576", "--input-encoding", "safe-bpe-v1",
+            "--preparation-mib", "600"]);
+        let (_, limits) = funded.validate().unwrap();
+        let UntrustedEncoding::SafeBpeV1(call) = funded.encoding_policy(limits).unwrap() else { panic!("compact policy lost") };
+        assert_eq!(call.max_input_bytes, crate::tokenizer::untrusted::SafeBpeLimits::MAX_INPUT_BYTES);
+        assert_eq!(funded.encoding_workspace_bytes(limits).unwrap(), call.requirements().unwrap().workspace_bytes
+            + if task == "extract" { 0 } else { 1024 });
+    }
+}
+#[test]
 fn retention_consent_and_original_identity_are_mandatory_before_any_io() {
     let mut a = args("ner", &[]); a.store_results = false;
     let c = JobCommand { operation: Operation::Start(a) };

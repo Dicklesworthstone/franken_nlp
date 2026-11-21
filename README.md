@@ -553,13 +553,35 @@ That aggregate policy is reported in `input_encoding`; its byte, token and pair
 work limits cover both segments. A source near one MiB leaves correspondingly
 less room for its schema. Library callers use the explicit one-request
 `prepare_with_document_encoding(document, policy, control)` method on the
-eager, INT8 or INT4 extraction batch planner. INT4 resident streams can freeze
+eager, INT8 or INT4 extraction batch planner. INT8 and INT4 resident streams can freeze
 the policy with `with_document_encoding`; their hosted entry points reserve the
 corresponding workspace. Legacy constructors and byte-capacity map/job methods
 retain their separate byte-only contract unless they expose an explicit policy
 builder. Complete-document INT4 extraction maps, corpora and jobs provide the
 separately bounded opt-in described under
 [whole-document extraction](#implemented-candidate-int4-whole-document-extraction).
+
+Native INT8 `candidate batch --task extract` also accepts
+`--input-encoding safe-bpe-v1` for single-context records. The exact schema and
+source share one record allowance, encoder workspace is admitted before private
+IO, and every corpus frame carries the fixed policy. Original cancellation
+continues through source indexing and plan sealing. Complete-document INT8
+maps remain byte-only; see the [resident extraction contract](docs/candidate-extraction-batch-cli.md).
+
+Retained INT8 `candidate job start|resume` supports the same compact input for
+`--task extract|ner|keyphrases|summarize|answer`. In addition to per-record
+limits, `--max-total-tokenizer-input-bytes`,
+`--max-total-tokenizer-output-tokens`, `--max-total-tokenizer-pair-checks` and
+`--max-total-tokenizer-pair-bytes` bound all preparation in one invocation.
+Failed preparation keeps its spent work, and native handoff does not reset
+the ledger. The fixed policy and all four totals enter the authenticated
+resume recipe. A resumed invocation gets the same declared tokenizer
+allowance, while native/mask work and attempts retain their original durable
+lifetime debits. Compact reports expose `input_encoding` and
+`invocation_encoding_work_limits`; byte-mode recipes and reports remain
+unchanged. Document-map job configurations still require byte fallback.
+See [compact input with authenticated resume](docs/candidate-owned-jobs-cli.md#compact-input-with-authenticated-resume)
+for the flags, limits and memory contract.
 
 One-off `classify` and `sentiment` apply the same explicit policy before native
 planning. Classification encodes the original document once and each canonical

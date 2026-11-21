@@ -37,6 +37,36 @@ and allocator slack. The database file cap is not misrepresented as a database
 RAM bound. Native KV/RoPE/scratch and per-result output claims are additional.
 These modeled commitments are not an RSS bound or an allocator interceptor.
 
+## Compact single-context input
+
+The source host accepts a pinned `SourceTaskPlanner` configured with
+`with_map_document_encoding(policy, total)`. For compact input this keeps one
+shared cumulative tokenizer owner across all pending records and native
+compiler reconstruction. The fixed per-record policy and all four invocation
+totals enter the authenticated source recipe and template identity. Ordinary
+byte-fallback recipes omit the additional fields and remain compatible.
+
+The corresponding extraction host accepts an
+`Int8ExtractionJobPlanner::with_document_encoding(policy, Some(total))` factory.
+Its exact raw schema and source share each record allowance. The factory moves
+its spent tokenizer ledger into the native processor, so rejected/cancelled
+preparation and factory handoff do not renew that invocation's authority.
+Both hosts use the original cancellation controller through preparation.
+
+The host independently adds the selected encoder workspace to the full-input
+or retained-record buffer reservation before dispatch, and retains that charge
+through physical completion. Source jobs include their cumulative owner's
+additional bounded storage. Embeddings must also price preparation while
+constructing their planner; a payload quote alone is not a reservation.
+
+The total tokenizer allowance is invocation-scoped and recipe-bound. Resume
+must repeat the original declaration and receives that same bounded allowance;
+persisted native/mask work and attempts remain spent under their existing
+lifetime contract. Complete-document byte-sized map planners do not accept
+this single-context policy. See the
+[compact CLI contract](candidate-owned-jobs-cli.md#compact-input-with-authenticated-resume)
+for the per-record and invocation ceilings.
+
 ## Execution and physical ownership
 
 The existing hosted preflight requires the actual process runtime, the same

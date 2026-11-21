@@ -15,6 +15,7 @@ use crate::{
     tasks::{extract::ExtractionVocabulary, ir::TaskBudget,
         source_planning::{SourcePlanningLimits, SourceTaskPlanner, SOURCE_PROMPT_VERSION,
             quantized::{Int8SourceTaskRun, PreparedInt8SourceTask, INT8_SOURCE_EXECUTION}}},
+    tokenizer::untrusted::{SafeBpeWorkLimits, UntrustedEncoding},
 };
 use serde::Serialize;
 pub mod document;
@@ -33,6 +34,10 @@ pub struct Int8SourceJobRecipe {
     planning: PlanningRecipe,
     native: NativeRecipe,
     defaults: Option<SourceBatchArgs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<UntrustedEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding_work_limits: Option<SafeBpeWorkLimits>,
 }
 #[derive(Serialize)]
 struct PlanningRecipe {
@@ -66,7 +71,18 @@ impl Int8SourceJobRecipe {
                 compiler: CompilerRecipe { max_schema_bytes, max_string_bytes, max_array_items,
                     max_output_bytes, max_states, max_transitions, max_mask_bytes }, source },
             native: NativeRecipe { max_model_work, max_trie_node_visits, checkpoint_interval_nodes,
-                max_visits_per_item, max_visits_per_run }, defaults }
+                max_visits_per_item, max_visits_per_run }, defaults,
+            input_encoding: None, encoding_work_limits: None }
+    }
+    fn with_document_encoding(mut self, planner: &SourceTaskPlanner) -> Result<Self, BatchFault> {
+        // Compact durable jobs require the original cumulative owner, not a
+        // fresh per-record allowance. Native compiler reconstruction borrows
+        // this SAME planner and therefore never resets consumed work.
+        planner.map_document_encoding_workspace_bytes().map_err(|_| BatchCode::InvalidLimits)?;
+        self.input_encoding = (planner.document_encoding() != &UntrustedEncoding::ByteFallback)
+            .then(|| planner.document_encoding().clone());
+        self.encoding_work_limits = planner.map_document_encoding_limits();
+        Ok(self)
     }
 }
 
@@ -87,10 +103,12 @@ impl<'p, 'e, 'weights, 'v, A: Int8SourceBatchAdmission> Int8SourceJobProcessor<'
         admission: A, native_limits: Int8SourceBatchLimits) -> Result<Self, BatchFault> {
         // Bound private defaults before cloning and retain the same exact
         // configuration in the compiler and the keyed job recipe.
+        planner.map_document_encoding_workspace_bytes().map_err(|_| BatchCode::InvalidLimits)?;
         quantized::check_configuration(planner, &identity, task_ceiling, planning, defaults.as_ref())?;
         quantized::validate_limits(native_limits)?;
         let compiler = Int8SourceBatchPlanner::new(planner, identity.clone(), task_ceiling, planning, defaults.clone())?;
-        let recipe = Int8SourceJobRecipe::new(task_ceiling, planning, native_limits, defaults);
+        let recipe = Int8SourceJobRecipe::new(task_ceiling, planning, native_limits, defaults)
+            .with_document_encoding(planner)?;
         // Bound the whole projection, not only its optional default arguments.
         // Leave space for the runner's outer protocol/input-profile envelope.
         bounded_json(&recipe, 1024 * 1024 - 1024).map_err(|_| BatchFault::from(BatchCode::InvalidLimits))?;
@@ -128,6 +146,13 @@ impl<A: Int8SourceBatchAdmission> DurableBatchProcessor for Int8SourceJobProcess
     fn job_recipe(&self) -> &Self::Recipe { &self.recipe }
     fn durable_work(&self, prepared: &Self::Prepared) -> Result<JobWork, BatchItemFailure> {
         if self.native.is_poisoned() { return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)); }
+        // A foreign prepared plan cannot bypass the authenticated policy and
+        // total caps, which the configured source planner binds in its template.
+        if prepared.execution_identity().template_digest != self.identity.template_digest
+            || prepared.execution_identity().tokenizer_digest != self.identity.tokenizer_digest
+            || prepared.execution_identity().task_spec != self.identity.task_spec {
+            return Err(BatchItemFailure::fatal(BatchCode::Admission));
+        }
         Ok(JobWork { model: prepared.planned_work(), mask_node_visits: self.recipe.native.max_visits_per_item })
     }
     fn max_result_bytes(&self, prepared: &Self::Prepared) -> u64 { prepared.max_result_bytes() }

@@ -5,6 +5,7 @@
 use super::*;
 use clap::Subcommand;
 use crate::jobs::{InputRetentionLimits, JobId, JobLimits};
+use crate::tokenizer::untrusted::{SafeBpeWorkLimits, UntrustedEncoding};
 use super::source::SourceHostArgs;
 mod config;
 pub(super) mod document;
@@ -46,6 +47,8 @@ pub(super) struct JobArgs {
     #[arg(long, value_parser = ["ner", "keyphrases", "summarize", "answer", "extract"])]
     pub task: String,
     #[command(flatten)] pub host: SourceHostArgs,
+    #[arg(skip)] pub encoding: input_encoding::InputEncodingArgs,
+    #[command(flatten)] pub encoding_work: EncodingWorkArgs,
     /// Required consent: retain private native results in the owner-only spool.
     #[arg(long)] pub store_results: bool,
     #[command(flatten)] pub input_retention: InputRetentionArgs,
@@ -79,6 +82,37 @@ pub(super) struct JobArgs {
     /// Explicit modeled database RAM, separate from the database file-size limit.
     #[arg(long, default_value_t = 64)] pub journal_memory_mib: u64,
     #[arg(long, default_value_t = 16)] pub serialization_memory_mib: u64,
+}
+
+/// One immutable tokenizer allowance spans every record and failed preparation
+/// in this invocation; native/mask work remains a separate durable lifetime.
+#[derive(Args, Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct EncodingWorkArgs {
+    /// Total untrusted input bytes encoded per invocation; safe-bpe-v1 only, default 67108864.
+    #[arg(long)] max_total_tokenizer_input_bytes: Option<u64>,
+    /// Total untrusted tokens produced per invocation; safe-bpe-v1 only, default 4194304.
+    #[arg(long)] max_total_tokenizer_output_tokens: Option<u64>,
+    /// Total BPE pair checks per invocation; safe-bpe-v1 only, default 268435456.
+    #[arg(long)] max_total_tokenizer_pair_checks: Option<u64>,
+    /// Total examined BPE pair bytes per invocation; safe-bpe-v1 only, default 4294967296.
+    #[arg(long)] max_total_tokenizer_pair_bytes: Option<u64>,
+}
+impl EncodingWorkArgs {
+    fn limits(self, encoding: &input_encoding::InputEncodingArgs)
+        -> Result<Option<SafeBpeWorkLimits>, Failure> {
+        if encoding.is_default() {
+            return if self == Self::default() { Ok(None) }
+                else { Err(Failure::usage("job_input_encoding")) };
+        }
+        let limits = SafeBpeWorkLimits {
+            max_input_bytes: self.max_total_tokenizer_input_bytes.unwrap_or(64 * MIB),
+            max_output_tokens: self.max_total_tokenizer_output_tokens.unwrap_or(4 * MIB),
+            max_pair_checks: self.max_total_tokenizer_pair_checks.unwrap_or(256 * MIB),
+            max_pair_bytes: self.max_total_tokenizer_pair_bytes.unwrap_or(4096 * MIB),
+        };
+        limits.validate().map_err(|_| Failure::usage("job_tokenizer_work"))?;
+        Ok(Some(limits))
+    }
 }
 #[derive(Clone, Copy)]
 pub(super) enum RunMode { Start, Resume { discard_uncommitted: bool } }
@@ -167,6 +201,11 @@ pub(super) fn definition() -> clap::Command {
         .about("Start or resume explicitly retained, non-certified native corpus jobs")
         .long_about("Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. Store private results only with --store-results, a protected existing directory, original key, random job ID and immutable limits. Resume authenticates the complete original input and unchanged task/model recipe, with an explicit retained-input source available. Stdout contains metadata only; errors may follow durable progress. No automatic retry, directory/key creation or release activation. Add --task extract --schema FILE --document-config FILE to retain and resume complete documents larger than one context. One journal result contains independent exact-schema chunk values, never a repaired global object or a partial document. Document settings and the shared schema must remain unchanged on resume. For --task ner, keyphrases or summarize, use --source-document-config FILE instead: fixed task options, complete source-aligned chunk maps and one durable result per original document, without global reranking or summary synthesis.")
         .after_help(INPUT_RETENTION_HELP))
+        .mut_subcommand("start", encoding_definition)
+        .mut_subcommand("resume", encoding_definition)
+}
+fn encoding_definition(command: clap::Command) -> clap::Command {
+    input_encoding::definition(command).after_long_help("Explicit --input-encoding safe-bpe-v1 supports single-context extract, ner, keyphrases, summarize and answer jobs. Schema and source share each extraction record's allowance; QA question, passage IDs and all evidence share each answer record's allowance. One additional --max-total-tokenizer-* invocation ledger spans all records and failed/cancelled preparation without resetting at native handoff. Every per-record and total cap is authenticated: repeat it on resume. A resumed invocation receives that same declared bounded tokenizer allowance while persisted native/mask work and attempts stay spent. Encoder workspace is admitted before private IO and remains charged through physical completion. Compact input changes prompt tokens, preserves original bytes/control containment and makes no tokenizer-parity, identical-output, quality or speed claim. Complete-document configurations continue to require byte-fallback. Byte-fallback remains the default and adds no encoding metadata.")
 }
 impl JobArgs {
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), Failure> {
@@ -185,13 +224,52 @@ impl JobArgs {
         }
         self.task_kind()?;
         source_document::validate_mode(self)?;
-        let (common, limits) = self.host.common(self.input.clone()).map_err(Failure::from)?;
+        self.encoding_work_limits()?;
+        if !self.encoding.is_default()
+            && (self.document_config.is_some() || self.source_document_config.is_some()) {
+            return Err(Failure::usage("document_job_input_encoding"));
+        }
+        let (common, limits) = self.host.common_with_encoding(self.input.clone(), &self.encoding)
+            .map_err(Failure::from)?;
+        let policy = self.encoding_policy(limits)?;
+        if self.task == "extract" && !self.encoding.is_default() {
+            super::extract::validate_preparation(&self.host, &policy, limits)?;
+        }
+        let workspace = self.encoding_workspace_bytes(limits)?;
+        if matches!(policy, UntrustedEncoding::SafeBpeV1(_)) && self.task != "extract" {
+            let floor = (256 * MIB).checked_add(self.host.max_input_bytes as u64 * 32)
+                .and_then(|n| n.checked_add(self.host.max_result_bytes as u64 * 16))
+                .and_then(|n| n.checked_add(workspace)).ok_or_else(|| Failure::usage("job_memory_arithmetic"))?;
+            if limits.preparation_bytes < floor { return Err(Failure::usage("job_encoder_memory")); }
+        }
         for mib in [self.journal_memory_mib, self.serialization_memory_mib] {
             if mib.checked_mul(MIB).is_none_or(|bytes| bytes > limits.memory_bytes) {
                 return Err(Failure::usage("job_memory_options"));
             }
         }
         Ok((common, limits))
+    }
+    pub(super) fn encoding_policy(&self, limits: Limits) -> Result<UntrustedEncoding, Failure> {
+        if self.task == "extract" {
+            super::extract::encoding_policy(&self.host, &self.encoding, limits).map_err(Failure::from)
+        } else {
+            self.encoding.policy(self.host.max_input_bytes, limits.max_prompt_tokens).map_err(Failure::from)
+        }
+    }
+    pub(super) fn encoding_work_limits(&self) -> Result<Option<SafeBpeWorkLimits>, Failure> {
+        self.encoding_work.limits(&self.encoding)
+    }
+    pub(super) fn encoding_workspace_bytes(&self, limits: Limits) -> Result<u64, Failure> {
+        let total = self.encoding_work_limits()?;
+        match (self.encoding_policy(limits)?, total) {
+            (UntrustedEncoding::ByteFallback, None) => Ok(0),
+            (UntrustedEncoding::SafeBpeV1(call), Some(_)) => {
+                let bytes = call.requirements().map_err(|_| Failure::usage("job_input_encoding"))?.workspace_bytes;
+                bytes.checked_add(if self.task == "extract" { 0 } else { 1024 })
+                    .ok_or_else(|| Failure::usage("job_memory_arithmetic"))
+            }
+            _ => Err(Failure::usage("job_input_encoding")),
+        }
     }
     pub(super) fn task_kind(&self) -> Result<crate::tasks::BuiltInTask, Failure> {
         use crate::tasks::BuiltInTask;
@@ -203,6 +281,17 @@ impl JobArgs {
     }
 }
 impl JobCommand {
+    pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let mut command = Self::from_arg_matches(matches)?;
+        let (_, operation) = matches.subcommand().ok_or_else(||
+            clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "job operation required"))?;
+        let encoding = input_encoding::InputEncodingArgs::from_matches(operation)?;
+        match &mut command.operation {
+            Operation::Start(args) => args.encoding = encoding,
+            Operation::Resume(args) => args.common.encoding = encoding,
+        }
+        Ok(command)
+    }
     fn mode(&self) -> RunMode {
         match &self.operation { Operation::Start(_) => RunMode::Start,
             Operation::Resume(r) => RunMode::Resume { discard_uncommitted: r.discard_uncommitted_tail } }
