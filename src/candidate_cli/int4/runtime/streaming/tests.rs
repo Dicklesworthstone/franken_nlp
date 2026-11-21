@@ -102,6 +102,32 @@ fn a_team_stream_cannot_reuse_a_different_width_or_workspace_admission() {
 }
 
 #[test]
+fn a_prefill_team_stream_cannot_reuse_a_single_row_quote_or_changed_prompt_capacity() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private input accessed"); } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("stdout accessed"); }
+        fn flush(&mut self) -> io::Result<()> { panic!("stdout flushed"); }
+    }
+    for axis in 0..7 {
+        let (options, mut a) = args("generate", &["--compute-threads", "4", "--prefill-rows", "4"]);
+        let (mut limits, bounds) = options.validate(&a).unwrap();
+        match axis {
+            0 => limits.compute = a.compute.admit(a.group_width).unwrap(),
+            1 => limits.prefill.as_mut().unwrap().max_batch_rows = 1,
+            2 => limits.prefill.as_mut().unwrap().max_extra_scratch_bytes -= 1,
+            3 => a.compute = args("generate", &["--compute-threads", "2", "--prefill-rows", "4"]).1.compute,
+            4 => limits.compute.workspace_bytes -= 1,
+            5 => a.group_width /= 2,
+            _ => a.policy = args("generate", &["--compute-threads", "4", "--prefill-rows", "1"]).1.policy,
+        }
+        let failure = execute(Task::Generate, a, limits, bounds, &mut NoIo, NoIo).unwrap_err();
+        assert_eq!(failure.exit, ErrorCode::Usage);
+        assert_eq!(failure.code, "stream_admitted_options_mismatch");
+    }
+}
+
+#[test]
 fn changed_encoding_workspace_cannot_reuse_an_insufficient_preparation_quote() {
     struct NoIo;
     impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("read before encoding admission"); } }

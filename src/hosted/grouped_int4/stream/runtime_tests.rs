@@ -79,22 +79,32 @@ fn every_pre_cancelled_stream_team_preserves_its_cause_and_drops_the_sink_under_
                 cleanup_reserve_bytes: 65_536 } },
         max_sampler_bytes: 32 * MIB, preparation_reserve_bytes: PREPARATION, sink_reserve_bytes: MIB,
     };
+    let prefill = Int4PrefillLimits { max_batch_rows: 4,
+        max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(4).unwrap() };
     use DecodeCancellationKind::*;
     for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
         ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
-        let (sink, observation) = sink(&host);
-        let stop = CancellationToken::default(); stop.cancel(cause);
-        let error = host.execute_int4_chat_stream_with_threads(&model, prepared(&model, limits), 1,
-            limits, PackedInt4Kernel::scalar(), 3, sink, stop).err().unwrap();
-        let HostedError::Stopped { stop, .. } = error else { panic!("pre-cancellation lost its typed cause"); };
-        assert_eq!(stop.kind, cause);
-        assert_eq!(observation.callbacks.load(Ordering::SeqCst), 0);
-        assert_eq!(observation.dropped.load(Ordering::SeqCst), 1);
-        assert!(observation.bytes_at_drop.load(Ordering::SeqCst) >= PREPARATION + retained_bytes(limits).unwrap());
-        drained(&host, &baseline);
+        for packed in [false, true] {
+            let (sink, observation) = sink(&host);
+            let stop = CancellationToken::default(); stop.cancel(cause);
+            let prepared = prepared(&model, limits);
+            let error = if packed {
+                host.execute_int4_chat_stream_layer_major_with_threads(&model, prepared, 1,
+                    limits, prefill, PackedInt4Kernel::scalar(), 3, sink, stop)
+            } else {
+                host.execute_int4_chat_stream_with_threads(&model, prepared, 1,
+                    limits, PackedInt4Kernel::scalar(), 3, sink, stop)
+            }.err().unwrap();
+            let HostedError::Stopped { stop, .. } = error else { panic!("pre-cancellation lost its typed cause"); };
+            assert_eq!(stop.kind, cause);
+            assert_eq!(observation.callbacks.load(Ordering::SeqCst), 0);
+            assert_eq!(observation.dropped.load(Ordering::SeqCst), 1);
+            assert!(observation.bytes_at_drop.load(Ordering::SeqCst) >= PREPARATION + retained_bytes(limits).unwrap());
+            drained(&host, &baseline);
+        }
     }
-    // Invalid widths, an installed-envelope overrun and the unsupported
-    // combined schedule must fail before the task or sink can execute.
+    // Invalid widths, an installed-envelope overrun and underfunded batch
+    // workspace must fail before the task or sink can execute.
     for width in [0, 1, 4, 65, usize::MAX] {
         let (sink, observation) = sink(&host);
         let error = host.execute_int4_chat_stream_with_threads(&model, prepared(&model, limits), 1,
@@ -104,15 +114,17 @@ fn every_pre_cancelled_stream_team_preserves_its_cause_and_drops_the_sink_under_
         assert_eq!(observation.dropped.load(Ordering::SeqCst), 1);
         drained(&host, &baseline);
     }
-    let (sink, observation) = sink(&host);
-    let prefill = Int4PrefillLimits { max_batch_rows: 2,
-        max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(2).unwrap() };
-    let error = host.run_int4_chat_stream(&model, prepared(&model, limits), 1, limits,
-        Some(prefill), Some(3), PackedInt4Kernel::scalar(), sink, CancellationToken::default()).err().unwrap();
-    assert!(matches!(error, HostedError::Limits(_)));
-    assert_eq!(observation.callbacks.load(Ordering::SeqCst), 0);
-    assert_eq!(observation.dropped.load(Ordering::SeqCst), 1);
-    drained(&host, &baseline);
+    for invalid in [Int4PrefillLimits { max_batch_rows: 0, ..prefill },
+        Int4PrefillLimits { max_batch_rows: 65, ..prefill },
+        Int4PrefillLimits { max_extra_scratch_bytes: prefill.max_extra_scratch_bytes - 1, ..prefill }] {
+        let (sink, observation) = sink(&host);
+        let error = host.execute_int4_chat_stream_layer_major_with_threads(&model, prepared(&model, limits), 1,
+            limits, invalid, PackedInt4Kernel::scalar(), 3, sink, CancellationToken::default()).err().unwrap();
+        assert!(matches!(error, HostedError::Int4(Int4HostError::Native(StrictInt4Error::Memory))));
+        assert_eq!(observation.callbacks.load(Ordering::SeqCst), 0);
+        assert_eq!(observation.dropped.load(Ordering::SeqCst), 1);
+        drained(&host, &baseline);
+    }
     for sink_bytes in [1024 * MIB, u64::MAX] {
         let (sink, observation) = self::sink(&host);
         let oversized = ChatStreamLimits { sink_reserve_bytes: sink_bytes, ..limits };

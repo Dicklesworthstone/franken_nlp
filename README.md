@@ -379,7 +379,7 @@ schedule and declared width; it does not invent per-item projection receipts.
 The required `run_complete` is staged under the existing transport budget and
 published after all workers join, inside the original invocation and deadline.
 
-Buffered `generate` and `chat` can combine a worker count above one with
+Buffered and live-streamed `generate` and `chat` can combine a worker count above one with
 `--prefill-rows 1..=64`. The same fixed team serves layer-major prompt morsels
 and subsequent single-token decode. Each output-row shard reuses its packed
 groups across the morsel; admitted worker input/output storage covers the
@@ -387,6 +387,9 @@ declared prompt width before IO. Library callers use
 `execute_int4_chat_layer_major_with_threads` and
 `int4_chat_prefill_team_workspace_bytes` for this combined route, in addition
 to the ordinary native and prefill workspace reservations.
+For live token delivery, the corresponding hosted entry is
+`execute_int4_chat_stream_layer_major_with_threads`; its sink remains charged
+until physical join and final publication.
 
 Resident `score-batch --task classify|sentiment|judge` also combines
 `--prefill-rows 1..=64` with `--compute-threads 2..=64`. One fixed team spans
@@ -639,9 +642,12 @@ Live `stream generate|chat` also accepts `--input-encoding safe-bpe-v1` and
 the same whole-transcript tokenizer-work ceilings. The explicit policy is
 reported in `run_start`; the final task result keeps the buffered format.
 `--compute-threads 2..=64` selects one persistent row team across the complete
-prompt and generation. Width `1` retains the serial route; multiple workers
-cannot combine with `--prefill-rows`. Compact input and seeded generation can
-use the team without changing their identities or token protocol.
+prompt and generation. Width `1` retains the serial route. Add
+`--prefill-rows 1..=64` to share that team across bounded layer-major prompt
+morsels and subsequent single-token decoding. Both the coordinator's prompt
+workspace and every worker's fixed batch capacity are admitted before private
+IO. Compact input and seeded generation can use the combined schedule without
+changing their identities or token protocol.
 
 ```bash
 fnlp candidate source-int4 stream generate prompt.txt \
@@ -655,7 +661,7 @@ fnlp candidate source-int4 stream chat messages.json \
   --snapshot /models/nanbeige.int4.snapshot \
   --expected-model-sha256 "$EXPECTED_MODEL_SHA256" \
   --memory-mib 8192 \
-  --compute-threads 4 --input-encoding safe-bpe-v1 \
+  --compute-threads 4 --prefill-rows 4 --input-encoding safe-bpe-v1 \
   --logprobs
 ```
 
@@ -691,7 +697,7 @@ buffered semantics. Exact stop bytes remain in the output, including stops
 split across token boundaries. `--max-output-bytes` bounds generated content;
 `--max-stream-bytes` separately bounds the entire transport and reserves space
 for the terminal result. Admission includes full native buffers, optional
-prefill or worker scratch, retained preparation, sink storage and output.
+prefill and worker scratch when selected, retained preparation, sink storage and output.
 Blocking writes apply backpressure to the coordinator, without a writer thread
 or detached task. Cancellation and output failures drain the same fixed team
 before native storage or its reservations can be released.

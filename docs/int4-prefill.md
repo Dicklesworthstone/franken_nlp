@@ -30,10 +30,11 @@ and prompt scheduling are independent; scalar remains the kernel default and
 unsupported explicit kernels fail rather than fall back. The example memory
 ceiling is a ledger allowance, not measured RSS.
 
-### Buffered text with persistent workers
+### Buffered and streamed text with persistent workers
 
-Buffered `generate` and `chat` can use the same persistent output-row team for
-prompt prefill and decode. Add `--compute-threads 2..=64` to either example:
+Buffered `generate` and `chat`, and live `stream generate|chat`, can use the
+same persistent output-row team for prompt prefill and decode. Add
+`--compute-threads 2..=64` to either example:
 
 ```sh
 fnlp candidate source-int4 generate prompt.txt \
@@ -57,9 +58,10 @@ declared prompt widths therefore increase the team scratch quote even when a
 particular prompt uses a shorter final morsel. Cancellation and failure drain
 the team before releasing its charged storage or publishing completed output.
 
-Library callers use `NlpEngine::execute_int4_chat_layer_major_with_threads` and
-`int4_chat_prefill_team_workspace_bytes` with a compatible resource host. The
-completed JSON includes the existing `compute` receipt; `completed_rows` counts
+Library callers use `NlpEngine::execute_int4_chat_layer_major_with_threads` or
+`NlpEngine::execute_int4_chat_stream_layer_major_with_threads`, with
+`int4_chat_prefill_team_workspace_bytes` and a compatible resource host. The
+completed response includes the existing `compute` receipt; `completed_rows` counts
 completed output scalars across all prompt rows, while `completed_projections`
 counts successfully completed batch or single-row operations. These counters
 do not establish speed or model quality. Resident `score-batch` also composes
@@ -68,8 +70,16 @@ sentiment or judgment heads, records and flushes. Its hosted entry is
 `NlpEngine::batch_int4_scored_layer_major_with_threads`; the terminal footer
 uses the original run control after every worker joins. See the
 [scoring stream contract](candidate-scored-batch-cli.md#grouped-int4-scoring-streams)
-for combined memory admission and per-frame schedule metadata. Streaming,
-structured and retained-job routes keep their existing schedule restrictions.
+for combined memory admission and per-frame schedule metadata. Structured and
+retained-job routes keep their existing schedule restrictions.
+
+Live streams retain directly backpressured provisional token events. Their
+`run_complete` remains unavailable until prompt/decode execution, independent
+task validation, native cleanup, all worker joins and the final cancellation
+decision succeed. A writer or permit failure does not append terminal success.
+The same team handles each short prompt morsel and each decoded token without
+reallocating its admitted capacity or renewing any work allowance. See the
+[token-stream contract](candidate-streaming.md#grouped-int4-streams-with-packed-prompts-and-workers).
 
 ### Other task routes
 
@@ -272,8 +282,9 @@ native operations; failed work is not refunded or automatically retried.
 Failures after mutation poison the normal session; RAII cleanup clears every
 KV slot. No token event is emitted by the new generation adapter until prompt
 prefill and its final head complete. Library stream events remain provisional
-until the full task finalizer succeeds; the CLI still emits one completed JSON
-object, not provisional events.
+until the full task finalizer succeeds. Buffered commands emit one completed
+JSON object; explicit `stream` commands expose provisional token events and
+require the independently validated terminal frame.
 
 ## Embedding APIs
 

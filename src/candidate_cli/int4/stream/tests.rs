@@ -83,13 +83,47 @@ fn stream_teams_preserve_text_policy_and_admit_worker_scratch_before_io() {
 }
 
 #[test]
-fn invalid_stream_team_or_combined_schedule_refuses_before_private_io() {
+fn stream_prefill_teams_admit_both_workspaces_and_preserve_text_policy() {
+    for operation in ["generate", "chat"] {
+        for rows in ["1", "3", "64"] {
+            let (serial_options, serial) = args(operation, &["--compute-threads", "1", "--prefill-rows", rows,
+                "--input-encoding", "safe-bpe-v1"]);
+            let (serial_limits, serial_bounds) = serial_options.validate(&serial).unwrap();
+            for width in ["2", "4", "64"] {
+                let (options, mut a) = args(operation, &["--compute-threads", width, "--prefill-rows", rows,
+                    "--input-encoding", "safe-bpe-v1"]);
+                let (limits, bounds) = options.validate(&a).unwrap();
+                let prefill = limits.prefill.unwrap();
+                let worker_bytes = crate::native_engine::strict_int4::projection::int4_prefill_team_workspace_bytes(
+                    width.parse().unwrap(), a.group_width, rows.parse().unwrap()).unwrap();
+                assert_eq!(prefill.max_batch_rows, rows.parse::<usize>().unwrap());
+                assert_eq!(limits.compute.workspace_bytes, worker_bytes);
+                assert_eq!(limits.minimum_memory_bytes, serial_limits.minimum_memory_bytes + worker_bytes);
+                assert_eq!(limits.native, serial_limits.native);
+                assert_eq!(limits.preparation_bytes, serial_limits.preparation_bytes);
+                assert_eq!(bounds.stream_bytes, serial_bounds.stream_bytes);
+                assert_eq!(bounds.sink_memory_bytes, serial_bounds.sink_memory_bytes);
+                assert_eq!(canonjson::canonical_bytes(&a.options(166101).unwrap()).unwrap(),
+                    canonjson::canonical_bytes(&serial.options(166101).unwrap()).unwrap());
+                assert_eq!(a.input_encoding.policy(a.max_input_bytes, limits.max_prompt_tokens).unwrap(),
+                    serial.input_encoding.policy(serial.max_input_bytes, serial_limits.max_prompt_tokens).unwrap());
+                a.memory_mib = (limits.minimum_memory_bytes - 1) / MIB;
+                assert!(options.validate(&a).is_err(), "combined schedule must fund every retained owner");
+                a.memory_mib = limits.minimum_memory_bytes.div_ceil(MIB);
+                options.validate(&a).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_stream_team_or_prompt_capacity_refuses_before_private_io() {
     for operation in ["generate", "chat"] {
         for extra in [
             &["--compute-threads", "0"][..],
             &["--compute-threads", "65"][..],
-            &["--compute-threads", "2", "--prefill-rows", "1"][..],
-            &["--compute-threads", "4", "--prefill-rows", "64"][..],
+            &["--compute-threads", "2", "--prefill-rows", "0"][..],
+            &["--compute-threads", "4", "--prefill-rows", "65"][..],
         ] {
             let mut diagnostics = Vec::new();
             let status = parse(operation, extra).unwrap().run_owned(NoIo, NoIo, &mut diagnostics);
@@ -204,7 +238,8 @@ fn every_token_and_the_completed_result_have_nonrenewable_transport_space() {
 
 #[test]
 fn stream_memory_includes_native_and_packed_prefill_plus_both_retained_owners() {
-    for flags in [&[][..], &["--prefill-rows", "4"][..], &["--compute-threads", "4"][..]] {
+    for flags in [&[][..], &["--prefill-rows", "4"][..], &["--compute-threads", "4"][..],
+        &["--compute-threads", "4", "--prefill-rows", "4"][..]] {
         let (options, a) = args("generate", flags);
         let common = a.validate_text_compute().unwrap();
         let (stream, bounds) = options.validate(&a).unwrap();
@@ -241,7 +276,8 @@ fn borrowed_dispatch_and_invalid_transport_never_read_or_publish() {
 #[test]
 fn unavailable_runtime_refuses_without_private_input_model_or_output_access() {
     for (operation, task) in [("generate", Task::Generate), ("chat", Task::Chat)] {
-        for flags in [&[][..], &["--compute-threads", "4"][..]] {
+        for flags in [&[][..], &["--compute-threads", "4"][..],
+            &["--compute-threads", "4", "--prefill-rows", "4"][..]] {
             let (options, a) = args(operation, flags);
             assert_eq!(options.execute(task, a, &mut NoIo, NoIo).unwrap_err().code, "stream_profile_unavailable");
         }

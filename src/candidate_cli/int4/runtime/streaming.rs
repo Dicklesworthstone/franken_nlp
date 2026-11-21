@@ -10,7 +10,8 @@ pub(in crate::candidate_cli::int4) fn execute<W: Write + Send + 'static>(task: T
     args: Int4Args, limits: Int4Limits, bounds: StreamBounds, input: &mut impl Read, output: W)
     -> Result<(), Failure> {
     if limits.minimum_memory_bytes > limits.memory_bytes || limits.kernel.kind() != args.kernel
-        || !prefill::matches(&args, limits)? || limits.compute != args.compute.admit(args.group_width)?
+        || !prefill::matches(&args, limits)?
+        || limits.compute != args.compute.admit_with_prefill(args.group_width, limits.prefill)?
         || bounds.tokens != args.max_new_tokens
         || bounds.content_bytes != args.max_output_bytes || bounds.capture_logprobs != args.logprobs {
         return Err(Failure::usage("stream_admitted_options_mismatch"));
@@ -83,8 +84,12 @@ pub(in crate::candidate_cli::int4) fn execute<W: Write + Send + 'static>(task: T
         sink_reserve_bytes: bounds.sink_memory_bytes,
     };
     let mut completed = if limits.compute.threads > 1 {
-        engine.execute_int4_chat_stream_with_threads(&model, prepared, 1, stream_limits,
-            limits.kernel, limits.compute.threads, sink, cancellation)
+        match limits.prefill {
+            Some(prefill) => engine.execute_int4_chat_stream_layer_major_with_threads(&model, prepared, 1,
+                stream_limits, prefill, limits.kernel, limits.compute.threads, sink, cancellation),
+            None => engine.execute_int4_chat_stream_with_threads(&model, prepared, 1, stream_limits,
+                limits.kernel, limits.compute.threads, sink, cancellation),
+        }
     } else {
         match limits.prefill {
             Some(prefill) => engine.execute_int4_chat_stream_layer_major(&model, prepared, 1,

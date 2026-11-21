@@ -64,7 +64,7 @@ fn native(args: &Int4Args) -> NativeLimits {
 }
 
 #[test]
-#[ignore = "run alone with controller-admitted INT4 snapshot, independent pin and real serial/two/four-worker streamed inference"]
+#[ignore = "run alone with controller-admitted INT4 snapshot, independent pin and real serial/packed/two/four-worker streamed inference"]
 fn snapshot_teams_preserve_streamed_tokens_complete_results_and_physical_cleanup() {
     let snapshot = std::env::var("FNLP_INT4_STREAM_SNAPSHOT").expect("explicit existing snapshot required");
     let pin = std::env::var("FNLP_INT4_STREAM_MODEL_SHA256").expect("independent model-content pin required");
@@ -83,9 +83,10 @@ fn snapshot_teams_preserve_streamed_tokens_complete_results_and_physical_cleanup
         assert_eq!(closures.active_closures, 0);
         assert_eq!(closures.wrapper_cancelled_closures, 0);
     };
-    let make = |operation, seeded| {
-        let (options, mut a) = args(operation, &["--compute-threads", "4",
-            "--input-encoding", "safe-bpe-v1", "--min-new-tokens", "1"]);
+    let make = |operation, seeded, rows: Option<&str>| {
+        let mut flags = vec!["--compute-threads", "4", "--input-encoding", "safe-bpe-v1", "--min-new-tokens", "1"];
+        if let Some(rows) = rows { flags.extend(["--prefill-rows", rows]); }
+        let (options, mut a) = args(operation, &flags);
         a.source_dir = None; a.source_manifest = None;
         a.snapshot = Some(PathBuf::from(&snapshot)); a.expected_model_sha256 = Some(pin.clone());
         a.memory_mib = memory; a.context_tokens = 256; a.max_new_tokens = 4;
@@ -98,7 +99,7 @@ fn snapshot_teams_preserve_streamed_tokens_complete_results_and_physical_cleanup
     };
     // This reservation precedes model/planner/sink allocations and retains
     // private comparison values until the fixture discards them.
-    let (options, load_args) = make("generate", false);
+    let (options, load_args) = make("generate", false, None);
     let (load_limits, _) = options.validate(&load_args).unwrap();
     let lease = engine.resources().acquire_lease();
     let preparation = lease.reserve(MemoryClass::JobBuffers, load_limits.preparation_bytes)
@@ -111,15 +112,18 @@ fn snapshot_teams_preserve_streamed_tokens_complete_results_and_physical_cleanup
             r#"[{"role":"user","content":"Reply with a short English greeting for Zoë."}]"#
         } else { "Reply with a short English greeting for Zoë." };
         for seeded in [false, true] {
-            let (options, a) = make(operation, seeded);
-            let (limits, bounds) = options.validate(&a).unwrap();
+            let (options, a) = make(operation, seeded, None);
+            let (limits, _) = options.validate(&a).unwrap();
             let prepared = plan(text, task, &model, &a, limits);
             let identity = prepared.execution_identity().clone();
             let buffered = engine.execute_int4_chat(&model, prepared, 1, native(&a), SAMPLER_BYTES,
                 limits.kernel, CancellationToken::default()).unwrap();
             let expected = serde_json::to_value(buffered.result()).unwrap();
             drop(buffered); assert_drained(&resident);
-            for width in [2, 4] {
+            let mut single_row_projections = std::collections::BTreeMap::new();
+            for (width, rows) in [(2, None), (4, None), (2, Some("4")), (4, Some("4"))] {
+                let (options, a) = make(operation, seeded, rows);
+                let (limits, bounds) = options.validate(&a).unwrap();
                 let prepared = plan(text, task, &model, &a, limits);
                 assert_eq!(prepared.execution_identity(), &identity);
                 let wire = Arc::new(Mutex::new(Wire::default()));
@@ -128,13 +132,21 @@ fn snapshot_teams_preserve_streamed_tokens_complete_results_and_physical_cleanup
                     .with_input_encoding(a.input_encoding.policy(a.max_input_bytes, limits.max_prompt_tokens).unwrap()).unwrap();
                 let stream_limits = ChatStreamLimits { native: native(&a), max_sampler_bytes: SAMPLER_BYTES,
                     preparation_reserve_bytes: limits.preparation_bytes, sink_reserve_bytes: bounds.sink_memory_bytes };
-                let mut completed = engine.execute_int4_chat_stream_with_threads(&model, prepared, 1,
-                    stream_limits, limits.kernel, width, sink, CancellationToken::default()).unwrap();
+                let mut completed = match limits.prefill {
+                    Some(prefill) => engine.execute_int4_chat_stream_layer_major_with_threads(&model, prepared, 1,
+                        stream_limits, prefill, limits.kernel, width, sink, CancellationToken::default()),
+                    None => engine.execute_int4_chat_stream_with_threads(&model, prepared, 1,
+                        stream_limits, limits.kernel, width, sink, CancellationToken::default()),
+                }.unwrap();
                 assert_eq!(serde_json::to_value(completed.result()).unwrap(), expected);
                 let receipt = *completed.compute().unwrap();
                 assert_eq!(receipt.compute_threads, width);
                 assert!(receipt.completed_projections > 0 && receipt.completed_worker_rows > 0);
                 assert!(receipt.completed_worker_rows < receipt.completed_rows);
+                if rows.is_some() {
+                    assert!(receipt.completed_projections < single_row_projections[&width],
+                        "packed prompt selection must reach the native team rather than be silently ignored");
+                } else { single_row_projections.insert(width, receipt.completed_projections); }
                 let closures = engine.resources().outstanding_closure_snapshot();
                 assert_eq!(closures.active_closures, 0);
                 assert_eq!(closures.wrapper_cancelled_closures, 0);
@@ -154,9 +166,9 @@ fn snapshot_teams_preserve_streamed_tokens_complete_results_and_physical_cleanup
             }
         }
     }
-    for width in [2, 4] {
+    for (width, rows) in [(2, None), (4, Some("4"))] {
         for fault in [Fault::Write, Fault::Flush, Fault::BeforeRun, Fault::Reserve, Fault::Permit] {
-            let (options, a) = make("generate", true);
+            let (options, a) = make("generate", true, rows);
             let (limits, bounds) = options.validate(&a).unwrap();
             let prepared = plan("Reply with a short English greeting.", Task::Generate, &model, &a, limits);
             let wire = Arc::new(Mutex::new(Wire::default()));
@@ -170,8 +182,12 @@ fn snapshot_teams_preserve_streamed_tokens_complete_results_and_physical_cleanup
             };
             let stream_limits = ChatStreamLimits { native: native(&a), max_sampler_bytes: SAMPLER_BYTES,
                 preparation_reserve_bytes: limits.preparation_bytes, sink_reserve_bytes: bounds.sink_memory_bytes };
-            let result = engine.execute_int4_chat_stream_with_threads(&model, prepared, 1, stream_limits,
-                limits.kernel, width, sink, cancellation);
+            let result = match limits.prefill {
+                Some(prefill) => engine.execute_int4_chat_stream_layer_major_with_threads(&model, prepared, 1,
+                    stream_limits, prefill, limits.kernel, width, sink, cancellation),
+                None => engine.execute_int4_chat_stream_with_threads(&model, prepared, 1, stream_limits,
+                    limits.kernel, width, sink, cancellation),
+            };
             let failure = host_failure(result.err().expect("failed delivery must not complete"));
             assert_drained(&resident);
             let wire = wire.lock().unwrap();

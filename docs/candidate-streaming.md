@@ -141,6 +141,55 @@ host invocations drop their owned sink after drain; earlier emitted tokens remai
 provisional. Embedders must price their own sink buffers and preserve that same
 terminal-completion discipline.
 
+## Grouped INT4 streams with packed prompts and workers
+
+`fnlp candidate source-int4 stream generate|chat` uses the same provisional
+token and terminal-completion protocol with an explicit source-converted INT4
+model or independently digest-pinned snapshot. It accepts both
+`--prefill-rows 1..=64` and `--compute-threads 2..=64` in one invocation:
+
+```sh
+fnlp candidate source-int4 stream chat messages.json \
+  --snapshot ./model.int4.snapshot \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --memory-mib 8192 --group-width 128 \
+  --prefill-rows 4 --compute-threads 4 \
+  --input-encoding safe-bpe-v1 --logprobs
+```
+
+One coordinator and three workers form once. The same team processes every
+bounded prompt morsel and all later single-token projections. Admission prices
+both the coordinator's additional prompt workspace and each worker's fixed
+input/output capacity for the declared prompt width, including short final
+morsels. These buffers cannot grow during a projection. Native context, full
+vocabulary, causal attention, sampler addressing, prompt identity and native
+work ceilings retain their existing contracts. Compact input and seeded
+sampling remain independent options; neither is required for this schedule.
+
+The hosted API is
+`NlpEngine::execute_int4_chat_stream_layer_major_with_threads(model, prepared, request_seq, limits, prefill, kernel, compute_threads, sink, cancellation)`.
+Use `int4_chat_prefill_team_workspace_bytes` for the additional worker quote,
+alongside the ordinary native and validated prefill reservations. The sink,
+preparation and result owners stay charged through physical drain and terminal
+publication. All workers must join before the completion becomes available.
+The original cancellation/deadline decision remains authoritative after the
+last token; no fresh allowance is introduced for cleanup or final publication.
+
+INT4 frames report `scope: "real-source-current-candidate-int4"`. A successful
+team terminal includes the existing top-level `compute` receipt alongside the
+unchanged complete task `data`. `completed_projections` counts successful batch
+or single-row dispatches; `completed_rows` counts completed output scalars over
+all prompt rows. Provisional frames do not claim completed-work receipts.
+These counters describe execution, not measured throughput or model quality.
+Serial defaults and their wire shape remain unchanged.
+
+Regression definitions cover exact combined memory charges, invalid row
+capacities, stale CLI admission, all eleven cancellation causes, writer and
+reserve/permit failures, and sink ownership through join. Controller-only
+fixtures compare complete buffered/streamed results across serial, team and
+packed schedules and check actual packed projection dispatch. They remain
+unexecuted pending the authorized DSR checkpoint and supplied model.
+
 ## Validation handoff
 
 Added 25 model-free test definitions across host admission (3), CLI routes and
