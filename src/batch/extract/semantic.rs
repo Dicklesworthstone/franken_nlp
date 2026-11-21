@@ -163,6 +163,17 @@ impl<'e, 'w, 'v, A: Int4SemanticExtractionBatchAdmission> NativeInt4SemanticExtr
     pub fn reserved_model_work(&self) -> Int4Work { self.run.reserved }
     pub fn reserved_mask_visits(&self) -> u64 { self.run.masks }
     pub fn is_poisoned(&self) -> bool { self.run.failed || !self.driver.clean() }
+    /// Durable adapters validate the private factory seal before reserving an
+    /// attempt. A plan from another schema/review factory cannot spend work
+    /// under this invocation's authenticated recipe, even if counts coincide.
+    pub(crate) fn verify_prepared(&self, prepared: &PreparedInt4SemanticBatchExtraction)
+        -> Result<(), BatchItemFailure> {
+        self.run.ready()?;
+        if !self.driver.clean() || !Arc::ptr_eq(&prepared.seal, &self.compiler.seal) {
+            return Err(BatchItemFailure::fatal(BatchCode::Admission));
+        }
+        Ok(())
+    }
 }
 impl<A: Int4SemanticExtractionBatchAdmission> BatchProcessor for NativeInt4SemanticExtractionBatch<'_, '_, '_, A> {
     type Args = ExtractionBatchArgs;

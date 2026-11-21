@@ -24,6 +24,8 @@ use serde::Serialize;
 
 /// Durable complete-document extraction with exact native chunk accounting.
 pub mod document;
+/// Complete extraction plus explicit correlated field reviews per durable item.
+pub mod semantic;
 
 const INPUT_POLICY: &str = "fixed-shared-schema-no-record-overrides-v1";
 
