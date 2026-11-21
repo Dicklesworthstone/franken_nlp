@@ -312,6 +312,16 @@ fn nested_document_budgets_are_recoverable_fixed_protocol_errors() {
     }
 }
 #[test]
+fn mask_allocation_failure_is_terminal_and_keeps_its_resource_classification() {
+    for error in [JsonDecodeError::AllocationRefused,
+        JsonDecodeError::Mask(MaskOracleError::AllocationRefused)] {
+        let out = failure(json_error(error));
+        assert!(out.stop);
+        assert_eq!(out.fault.code, BatchCode::Allocation);
+        assert_eq!(out.fault.cancellation, None);
+    }
+}
+#[test]
 fn invalid_receipts_identity_and_dirty_invariants_are_never_recoverable() {
     let errors: Vec<Int4LongRedactionError> = vec![
         Int4SourceMapError::Admission.into(), Int4SourceMapError::InvalidLimits.into(),

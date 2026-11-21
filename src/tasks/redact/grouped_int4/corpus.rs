@@ -505,7 +505,8 @@ fn json_failure(error: JsonDecodeError) -> BatchItemFailure {
         JsonDecodeError::BudgetExceeded(_) | JsonDecodeError::Mask(MaskOracleError::WorkCounterOverflow
             | MaskOracleError::WorkBudgetExceeded { .. }) => BatchItemFailure::reject(BatchCode::WorkLimit),
         JsonDecodeError::NoLegalToken => BatchItemFailure::reject(BatchCode::Execution),
-        JsonDecodeError::AllocationRefused => BatchItemFailure::fatal(BatchCode::Allocation),
+        JsonDecodeError::AllocationRefused | JsonDecodeError::Mask(MaskOracleError::AllocationRefused)
+            => BatchItemFailure::fatal(BatchCode::Allocation),
         JsonDecodeError::InvalidRequest(_) | JsonDecodeError::Mask(MaskOracleError::InvalidWorkLimits)
             => BatchItemFailure::fatal(BatchCode::Admission),
         JsonDecodeError::Mask(MaskOracleError::CancelledAtCheckpoint { .. }) => BatchItemFailure::fatal(BatchCode::Cancelled),

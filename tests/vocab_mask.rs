@@ -1,7 +1,9 @@
 //! Model-free coverage for the exact-byte vocabulary trie and schema-only cache.
 
 use std::{
-    collections::BTreeMap,
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
     sync::{Arc, Mutex},
     thread,
 };
@@ -12,10 +14,11 @@ use franken_nlp::{
         MaskCacheMaterializationError, MaskOracleError, MaskWorkLimits,
         NANBEIGE_MASK_BYTES_PER_STATE, SchemaMaskCache, SchemaMaskKey, VocabMaskOracle, VocabTrie,
     },
+    grammar::{CompileLimits, runtime::JsonProgram},
     tokenizer::{
         bpe::{AddedToken, SpBpeTokenizer},
         sp_model::{
-            ModelType, NormalizerFacts, PieceType, SpecialPieceIds, SpmModel, SpmPiece,
+            MAX_PIECE_STRING_BYTES, ModelType, NormalizerFacts, PieceType, SpecialPieceIds, SpmModel, SpmPiece,
             parse_spm_model,
         },
     },
@@ -250,6 +253,126 @@ fn mask_work_limits_and_checkpoints_refuse_partial_success() {
         cancelled,
         MaskOracleError::CancelledAtCheckpoint { .. }
     ));
+}
+
+#[test]
+fn longest_admitted_piece_materializes_on_a_small_native_stack() {
+    // This is the protobuf parser's actual accepted piece-length ceiling, not
+    // an artificially unbounded vocabulary. A recursive visit per emitted byte
+    // exhausts a native stack long before the normal mask work budget.
+    let long_piece = "a".repeat(MAX_PIECE_STRING_BYTES);
+    let tokenizer = SpBpeTokenizer::from_model(SpmModel {
+        pieces: vec![
+            piece("<unk>", PieceType::Unknown),
+            piece("<s>", PieceType::Control),
+            piece("<0x00>", PieceType::Byte),
+            piece(&long_piece, PieceType::Normal),
+        ],
+        model_type: ModelType::Bpe,
+        normalizer: NormalizerFacts {
+            name: "identity".to_owned(),
+            is_identity: true,
+            precompiled_charsmap_is_empty: true,
+        },
+        special_ids: SpecialPieceIds { unk_id: 0, bos_id: 1, eos_id: -1, pad_id: -1 },
+    }).unwrap();
+    let oracle = VocabMaskOracle::new(VocabTrie::from_tokenizer(&tokenizer, 4).unwrap());
+    thread::Builder::new().stack_size(128 * 1024).spawn(move || {
+        let program = JsonProgram::compile(r#"{"type":"string"}"#, CompileLimits {
+            max_string_bytes: MAX_PIECE_STRING_BYTES,
+            max_output_bytes: MAX_PIECE_STRING_BYTES + 2,
+            ..CompileLimits::default()
+        }).unwrap();
+        let mut initial = program.initial_state();
+        assert!(initial.consume(b'"'));
+        let limits = MaskWorkLimits {
+            max_trie_node_visits: oracle.trie().node_count(),
+            checkpoint_interval_nodes: 1024,
+        };
+        let mask = oracle.materialize(&initial, limits, |_| true).unwrap();
+        assert!(mask.contains(3));
+        for id in 0..4 {
+            let legal = oracle.trie().token_bytes(id).is_some_and(|bytes| {
+                let mut trial = initial.clone();
+                bytes.iter().copied().all(|byte| trial.consume(byte))
+            });
+            assert_eq!(mask.contains(id), legal);
+        }
+        let error = oracle.materialize(&initial, MaskWorkLimits {
+            max_trie_node_visits: MAX_PIECE_STRING_BYTES,
+            ..limits
+        }, |_| true).unwrap_err();
+        assert_eq!(error, MaskOracleError::WorkBudgetExceeded {
+            max_trie_node_visits: MAX_PIECE_STRING_BYTES,
+        });
+    }).unwrap().join().unwrap();
+}
+
+#[test]
+fn trie_walk_retains_depth_first_order_and_exact_node_work() {
+    #[derive(Clone)]
+    struct TraceState { prefix: Vec<u8>, visited: Rc<RefCell<Vec<Vec<u8>>>> }
+    impl ByteState for TraceState {
+        fn consume(&mut self, byte: u8) -> bool {
+            self.prefix.push(byte);
+            self.visited.borrow_mut().push(self.prefix.clone());
+            true
+        }
+    }
+    let oracle = VocabMaskOracle::new(VocabTrie::from_tokenizer(&tokenizer(), 10).unwrap());
+    // Sorted, distinct byte prefixes are the lexical depth-first order. This
+    // reference is derived directly from per-token decoder output, independent
+    // of trie nodes and the materializer's traversal state.
+    let mut prefixes = BTreeSet::new();
+    for id in 0..10 {
+        if let Some(bytes) = oracle.trie().token_bytes(id) {
+            for length in 1..=bytes.len() { prefixes.insert(bytes[..length].to_vec()); }
+        }
+    }
+    let expected: Vec<_> = prefixes.into_iter().collect();
+    let visits = expected.len() + 1; // The root is also charged.
+    let visited = Rc::new(RefCell::new(Vec::new()));
+    let initial = TraceState { prefix: Vec::new(), visited: Rc::clone(&visited) };
+    let mut checkpoints = Vec::new();
+    let mask = oracle.materialize(&initial, MaskWorkLimits {
+        max_trie_node_visits: visits, checkpoint_interval_nodes: 2,
+    }, |progress| { checkpoints.push(progress.trie_node_visits); true }).unwrap();
+    assert_eq!(*visited.borrow(), expected);
+    let mut expected_checkpoints = vec![0];
+    expected_checkpoints.extend((2..=visits).step_by(2));
+    expected_checkpoints.push(visits);
+    assert_eq!(checkpoints, expected_checkpoints);
+    for id in 0..10 {
+        assert_eq!(mask.contains(id), oracle.trie().token_bytes(id).is_some());
+    }
+}
+
+#[test]
+fn cancellation_is_checked_before_cloning_and_before_small_mask_publication() {
+    struct Unclonable;
+    impl Clone for Unclonable {
+        fn clone(&self) -> Self { panic!("cancelled materialization must not clone the state") }
+    }
+    impl ByteState for Unclonable {
+        fn consume(&mut self, _: u8) -> bool { panic!("cancelled materialization must not consume bytes") }
+    }
+    let oracle = VocabMaskOracle::new(VocabTrie::from_tokenizer(&tokenizer(), 10).unwrap());
+    assert_eq!(oracle.materialize(&Unclonable, MaskWorkLimits::default(), |_| false),
+        Err(MaskOracleError::CancelledAtCheckpoint { trie_node_visits: 0 }));
+
+    let key = SchemaMaskKey {
+        tokenizer_digest: [5; 32], schema_digest: [6; 32], grammar_version: 1,
+    };
+    let mut cache = SchemaMaskCache::new(1024);
+    let mut checkpoints = Vec::new();
+    let result = cache.get_or_materialize(key, 7, &oracle, &PrefixState::new(b" a"),
+        MaskWorkLimits { max_trie_node_visits: 100, checkpoint_interval_nodes: 100 },
+        |progress| { checkpoints.push(progress.trie_node_visits); progress.trie_node_visits == 0 });
+    assert_eq!(checkpoints, vec![0, 3]);
+    assert!(matches!(result, Err(MaskCacheMaterializationError::Oracle(
+        MaskOracleError::CancelledAtCheckpoint { trie_node_visits: 3 }))));
+    assert!(cache.get(key, 7).is_none());
+    assert_eq!(cache.stats().used_bytes, 0);
 }
 
 #[test]

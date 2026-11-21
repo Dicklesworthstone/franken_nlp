@@ -180,7 +180,7 @@ impl Vocabulary for VocabMaskOracle {
             cancellation = control.checkpoint(step); cancellation.is_none()
         });
         if let Some(cause) = cancellation { return Err(JsonDecodeError::Cancelled(cause)); }
-        mask.map_err(JsonDecodeError::Mask)
+        mask.map_err(JsonDecodeError::from)
     }
 }
 

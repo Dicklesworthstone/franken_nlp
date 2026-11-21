@@ -87,6 +87,14 @@ impl fmt::Display for JsonDecodeError {
     }
 }
 impl Error for JsonDecodeError {}
+impl From<MaskOracleError> for JsonDecodeError {
+    fn from(error: MaskOracleError) -> Self {
+        match error {
+            MaskOracleError::AllocationRefused => Self::AllocationRefused,
+            error => Self::Mask(error),
+        }
+    }
+}
 
 /// Execute on the exact existing bf16 engine. Cleanup retains its weight and
 /// reserved KV buffers but discards all request KV on success, failure, or
@@ -155,7 +163,7 @@ impl Vocabulary for VocabMaskOracle {
             cancellation = control.checkpoint(step); cancellation.is_none()
         });
         if let Some(kind) = cancellation { return Err(JsonDecodeError::Cancelled(kind)); }
-        result.map_err(JsonDecodeError::Mask)
+        result.map_err(JsonDecodeError::from)
     }
 }
 

@@ -276,7 +276,7 @@ impl Vocabulary for VocabMaskOracle {
             cancellation = control.checkpoint(step); cancellation.is_none()
         });
         if let Some(cause) = cancellation { return Err(JsonDecodeError::Cancelled(cause).into()); }
-        mask.map_err(JsonDecodeError::Mask).map_err(Into::into)
+        mask.map_err(JsonDecodeError::from).map_err(Into::into)
     }
 }
 fn checked_logits(logits: &[f32], width: usize) -> Result<(), Int4JsonError> {

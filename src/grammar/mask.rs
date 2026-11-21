@@ -10,7 +10,7 @@
 //! component and it accepts only a [`SchemaMaskKey`], so source products must
 //! remain in request-owned state rather than entering this cross-request map.
 
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{collections::{BTreeMap, btree_map}, error::Error, fmt};
 
 use crate::tokenizer::bpe::{DecodeBytesError, EncodeError, SpBpeTokenizer};
 
@@ -32,6 +32,14 @@ impl DenseTokenMask {
             vocab_size,
             bytes: vec![0; vocab_size.div_ceil(8)],
         }
+    }
+
+    fn try_empty(vocab_size: usize) -> Result<Self, MaskOracleError> {
+        let byte_len = vocab_size.div_ceil(8);
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(byte_len).map_err(|_| MaskOracleError::AllocationRefused)?;
+        bytes.resize(byte_len, 0);
+        Ok(Self { vocab_size, bytes })
     }
 
     /// Width of the model-logit vector this mask applies to.
@@ -312,8 +320,14 @@ impl VocabMaskOracle {
 
     /// Materialize a legal-token bitset by walking shared byte prefixes once.
     ///
-    /// The callback is the required cancellation checkpoint: returning false
-    /// aborts without returning a partial success mask.
+    /// The callback runs before allocation, at the requested node cadence, and
+    /// before publication, including for masks smaller than that cadence.
+    /// Returning false aborts without returning a partial success mask.
+    ///
+    /// Traversal is iterative and depth-first. Only ancestors with unvisited
+    /// siblings retain a state; long single-child token prefixes do not grow
+    /// the native stack or accumulate one state per byte. The fallible pending
+    /// stack is bounded by the smaller of the trie and the node-visit budget.
     pub fn materialize<S, F>(
         &self,
         initial_state: &S,
@@ -327,60 +341,63 @@ impl VocabMaskOracle {
         if limits.max_trie_node_visits == 0 || limits.checkpoint_interval_nodes == 0 {
             return Err(MaskOracleError::InvalidWorkLimits);
         }
-        let mut mask = DenseTokenMask::empty(self.trie.vocab_size());
-        let mut visits = 0;
-        self.walk(
-            0,
-            initial_state.clone(),
-            &mut mask,
-            limits,
-            &mut visits,
-            &mut checkpoint,
-        )?;
-        Ok(mask)
-    }
-
-    fn walk<S, F>(
-        &self,
-        node_index: usize,
-        state: S,
-        mask: &mut DenseTokenMask,
-        limits: MaskWorkLimits,
-        visits: &mut usize,
-        checkpoint: &mut F,
-    ) -> Result<(), MaskOracleError>
-    where
-        S: ByteState,
-        F: FnMut(MaskWorkProgress) -> bool,
-    {
-        *visits = visits
-            .checked_add(1)
-            .ok_or(MaskOracleError::WorkCounterOverflow)?;
-        if *visits > limits.max_trie_node_visits {
-            return Err(MaskOracleError::WorkBudgetExceeded {
-                max_trie_node_visits: limits.max_trie_node_visits,
-            });
+        if !checkpoint(MaskWorkProgress { trie_node_visits: 0 }) {
+            return Err(MaskOracleError::CancelledAtCheckpoint { trie_node_visits: 0 });
         }
-        if *visits % limits.checkpoint_interval_nodes == 0
-            && !checkpoint(MaskWorkProgress {
-                trie_node_visits: *visits,
-            })
-        {
-            return Err(MaskOracleError::CancelledAtCheckpoint {
-                trie_node_visits: *visits,
-            });
-        }
-        let node = &self.trie.nodes[node_index];
-        for &token_id in &node.terminal_ids {
-            mask.set_legal(token_id)?;
-        }
-        for (&byte, &child) in &node.children {
-            let mut child_state = state.clone();
-            if child_state.consume(byte) {
-                self.walk(child, child_state, mask, limits, visits, checkpoint)?;
+        let mut mask = DenseTokenMask::try_empty(self.trie.vocab_size())?;
+        let mut visits = 0_usize;
+        let maximum_pending = self.trie.node_count().min(limits.max_trie_node_visits);
+        let mut pending: Vec<(S, btree_map::Iter<'_, u8, usize>)> = Vec::new();
+        let mut next = Some((0, initial_state.clone()));
+        while let Some((node_index, mut state)) = next.take() {
+            visits = visits.checked_add(1).ok_or(MaskOracleError::WorkCounterOverflow)?;
+            if visits > limits.max_trie_node_visits {
+                return Err(MaskOracleError::WorkBudgetExceeded {
+                    max_trie_node_visits: limits.max_trie_node_visits,
+                });
+            }
+            if visits % limits.checkpoint_interval_nodes == 0
+                && !checkpoint(MaskWorkProgress { trie_node_visits: visits })
+            {
+                return Err(MaskOracleError::CancelledAtCheckpoint { trie_node_visits: visits });
+            }
+            let node = &self.trie.nodes[node_index];
+            for &token_id in &node.terminal_ids {
+                mask.set_legal(token_id)?;
+            }
+            let mut children = node.children.iter();
+            loop {
+                if let Some((&byte, &child)) = children.next() {
+                    let mut child_state = state.clone();
+                    if child_state.consume(byte) {
+                        if children.len() != 0 {
+                            if pending.len() == pending.capacity() {
+                                let remaining = maximum_pending.checked_sub(pending.len())
+                                    .filter(|&count| count != 0)
+                                    .ok_or(MaskOracleError::WorkBudgetExceeded {
+                                        max_trie_node_visits: limits.max_trie_node_visits,
+                                    })?;
+                                let additional = pending.len().max(1).min(remaining);
+                                pending.try_reserve_exact(additional)
+                                    .map_err(|_| MaskOracleError::AllocationRefused)?;
+                            }
+                            pending.push((state, children));
+                        }
+                        next = Some((child, child_state));
+                        break;
+                    }
+                } else if let Some((parent, siblings)) = pending.pop() {
+                    state = parent;
+                    children = siblings;
+                } else {
+                    break;
+                }
             }
         }
-        Ok(())
+        if !checkpoint(MaskWorkProgress { trie_node_visits: visits }) {
+            return Err(MaskOracleError::CancelledAtCheckpoint { trie_node_visits: visits });
+        }
+        Ok(mask)
     }
 }
 
@@ -587,6 +604,7 @@ impl Error for VocabTrieBuildError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaskOracleError {
     InvalidWorkLimits,
+    AllocationRefused,
     WorkCounterOverflow,
     WorkBudgetExceeded { max_trie_node_visits: usize },
     CancelledAtCheckpoint { trie_node_visits: usize },
@@ -597,6 +615,7 @@ impl fmt::Display for MaskOracleError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidWorkLimits => formatter.write_str("mask work limits must both be nonzero"),
+            Self::AllocationRefused => formatter.write_str("mask materialization allocation refused"),
             Self::WorkCounterOverflow => {
                 formatter.write_str("mask trie-node work counter overflowed")
             }
