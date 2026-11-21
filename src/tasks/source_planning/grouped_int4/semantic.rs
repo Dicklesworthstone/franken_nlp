@@ -3,7 +3,7 @@
 //! original evidence, not just its displayed citations, and never certifies
 //! citation entailment, atomic-claim coverage, correctness or acceptance.
 use super::*;
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 use crate::{
     grammar::mask::MaskWorkLimits,
     native_engine::{kv::KV_BYTES_PER_TOKEN, lmhead::scoring::ScoringWork,
@@ -267,13 +267,21 @@ fn check_evidence<C: DecodeStepControl>(source: &str, policy: FaithfulnessPolicy
 pub struct PreparedInt4SourceSemantic {
     source_task: PreparedInt4SourceTask,
     evidence: EvidenceContext,
-    judge: Int4JudgePlanner,
+    judge: Arc<Int4JudgePlanner>,
     options: Int4SourceSemanticOptions,
     policy_digest: Sha256Digest,
 }
 impl PreparedInt4SourceSemantic {
     pub fn new<C: DecodeStepControl>(source_task: PreparedInt4SourceTask, request: SourceTaskRequest,
         judge: Int4JudgePlanner, options: Int4SourceSemanticOptions, control: &mut C)
+        -> Result<Self, Int4SourceSemanticError> {
+        Self::new_shared(source_task, request, Arc::new(judge), options, control)
+    }
+
+    /// Reuse one immutable judge compiler while each complete source request,
+    /// evidence layout, generation plan and review ledger stay request-owned.
+    pub fn new_shared<C: DecodeStepControl>(source_task: PreparedInt4SourceTask, request: SourceTaskRequest,
+        judge: Arc<Int4JudgePlanner>, options: Int4SourceSemanticOptions, control: &mut C)
         -> Result<Self, Int4SourceSemanticError> {
         poll(control)?;
         if source_task.input_encoding() != judge.document_encoding() {
@@ -676,7 +684,7 @@ fn finish_statements<C: DecodeStepControl>(statements: &[Statement], plans: &[Pr
     poll(control)?;
     Ok((results, work, scoring, heads, rewound))
 }
-fn same_model(a: &ExecutionIdentity, b: &ExecutionIdentity) -> Result<(), Int4SourceSemanticError> {
+pub(crate) fn same_model(a: &ExecutionIdentity, b: &ExecutionIdentity) -> Result<(), Int4SourceSemanticError> {
     let mut normalized = a.clone();
     normalized.task_spec = b.task_spec.clone(); normalized.template_digest = b.template_digest;
     normalized.taskir_digest = b.taskir_digest; normalized.prompt_digest = b.prompt_digest;
