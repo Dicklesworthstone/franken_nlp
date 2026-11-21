@@ -43,6 +43,8 @@ impl NlpEngine {
     /// native execution, durable acknowledgement and optional materialization
     /// run inside one physical blocking invocation. No result text is emitted
     /// to stdout by this API.
+    /// Explicit selected rows retain their exact cap and source finalizer
+    /// through native admission, durable publication and authenticated resume.
     #[allow(clippy::too_many_arguments)]
     pub fn job_int4_source<R>(&self, model: &ResidentInt4, planner: Int4SourceJobPlanner,
         vocabulary: Arc<ExtractionVocabulary>, request: SourceJobRequest,
@@ -157,6 +159,7 @@ impl<R: BufRead> SourceJobExecution<R> {
         let (planner, vocabulary, request) = input.value.preparation.take()
             .ok_or(HostedError::CompletionMissing)?;
         let native_work = planner.native_limits();
+        let selected_rows = planner.selected_rows();
         let population = match read_population(&mut input.value.reader, &request,
             limits.transport, control) {
             Ok(population) => population,
@@ -179,7 +182,7 @@ impl<R: BufRead> SourceJobExecution<R> {
         let admission = SourceJobAdmission { inner: CorpusAdmission {
             lease: &lease, model: weights.identity(), kv_bytes: required.native.kv_bytes,
             masks: native_work.masks, output_bytes: request.limits.max_result_bytes as u64,
-            selected_rows: None,
+            selected_rows,
         }, task_spec: &planner.execution_identity().task_spec };
         let result = (|| {
             let processor = match prefill {
@@ -292,13 +295,13 @@ mod tests {
             assert_eq!(closures.active_closures, 0); assert_eq!(closures.wrapper_cancelled_closures, 0);
         }
         #[derive(Clone, Copy)]
-        enum Task { Extract { selected: bool }, Source(BuiltInTask) }
+        enum Task { Extract { selected: bool }, Source { task: BuiltInTask, selected: bool } }
 
         #[allow(clippy::too_many_arguments)]
         fn execute<R: BufRead + Send + 'static>(engine: &NlpEngine, model: &ResidentInt4,
             vocabulary: &Arc<ExtractionVocabulary>, task: Task, encoding: &UntrustedEncoding,
             budget: TaskBudget, work: Int4ExtractionBatchLimits, request: SourceJobRequest,
-            host: JobHostLimits, rows: Option<usize>, reader: R) -> JobProgress {
+            host: JobHostLimits, rows: Option<usize>, threads: Option<usize>, reader: R) -> JobProgress {
             let prefill = rows.map(|rows| Int4PrefillLimits { max_batch_rows: rows,
                 max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap() });
             let total = SafeBpeWorkLimits { max_input_bytes: 1 << 20, max_output_tokens: 1 << 20,
@@ -313,15 +316,19 @@ mod tests {
                             (encoding != &UntrustedEncoding::ByteFallback).then_some(total)).unwrap();
                     if selected { planner = planner.with_selected_rows(Int4JsonSparseLimits {
                         max_rows_per_step: NANBEIGE_VOCAB_SIZE }).unwrap(); }
-                    match prefill {
-                        None => engine.job_int4_extract(model, planner, Arc::clone(vocabulary), request,
+                    match (prefill, threads) {
+                        (None, None) => engine.job_int4_extract(model, planner, Arc::clone(vocabulary), request,
                             host, PackedInt4Kernel::scalar(), reader, CancellationToken::default()),
-                        Some(prefill) => engine.job_int4_extract_layer_major(model, planner,
+                        (Some(prefill), None) => engine.job_int4_extract_layer_major(model, planner,
                             Arc::clone(vocabulary), request, host, PackedInt4Kernel::scalar(), prefill,
                             reader, CancellationToken::default()),
+                        (None, Some(threads)) => engine.job_int4_extract_with_threads(model, planner,
+                            Arc::clone(vocabulary), request, host, PackedInt4Kernel::scalar(), threads,
+                            reader, CancellationToken::default()),
+                        _ => unreachable!(),
                     }.unwrap()
                 }
-                Task::Source(task) => {
+                Task::Source { task, selected } => {
                     let registry = crate::tokenizer::pinned_controls::pinned().unwrap();
                     let eos = registry.template_controls().entries().iter()
                         .find(|entry| entry.special && entry.surface == crate::template::IM_END).unwrap().id;
@@ -347,19 +354,25 @@ mod tests {
                         Arc::new(source), task, budget, SourcePlanningLimits {
                             max_context_tokens: host.native.context_tokens, ..Default::default() },
                         Some(defaults), work).unwrap();
-                    match prefill {
-                        None => engine.job_int4_source(model, planner, Arc::clone(vocabulary), request,
+                    let planner = if selected { planner.with_selected_rows(Int4JsonSparseLimits {
+                        max_rows_per_step: NANBEIGE_VOCAB_SIZE }).unwrap() } else { planner };
+                    match (prefill, threads) {
+                        (None, None) => engine.job_int4_source(model, planner, Arc::clone(vocabulary), request,
                             host, PackedInt4Kernel::scalar(), reader, CancellationToken::default()),
-                        Some(prefill) => engine.job_int4_source_layer_major(model, planner,
+                        (Some(prefill), None) => engine.job_int4_source_layer_major(model, planner,
                             Arc::clone(vocabulary), request, host, PackedInt4Kernel::scalar(), prefill,
                             reader, CancellationToken::default()),
+                        (None, Some(threads)) => engine.job_int4_source_with_threads(model, planner,
+                            Arc::clone(vocabulary), request, host, PackedInt4Kernel::scalar(), threads,
+                            reader, CancellationToken::default()),
+                        _ => unreachable!(),
                     }.unwrap()
                 }
             }
         }
 
         #[test]
-        #[ignore = "controller-only pinned model: complete structured results, work debits and retained replay across prompt schedules"]
+        #[ignore = "controller-only pinned model: complete selected/dense results, durable work and retained replay across prompt/worker schedules"]
         fn complete_structured_jobs_match_serial_results_and_resume_without_reexecution() {
             assert!(crate::installed_process_resources().is_none(), "requires a fresh process");
             let source = PathBuf::from(std::env::var("FNLP_INT4_TEST_SOURCE_DIR").expect("explicit pinned source"));
@@ -371,8 +384,8 @@ mod tests {
             fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
             let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
                 runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-                max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-                helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: memory,
+                max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 3,
+                helper_threads: 0, thread_ceiling: 5, memory_ceiling_bytes: memory,
                 leak_response_policy: LeakResponsePolicy::PanicInLabOrCi,
             }).build().unwrap();
             let idle = engine.resources().memory_snapshot();
@@ -415,9 +428,15 @@ mod tests {
                     max_pair_checks: 1 << 22, max_pair_bytes: 1 << 26 }))] {
                 for (task_name, task) in [("extract", Task::Extract { selected: false }),
                     ("extract-selected", Task::Extract { selected: true }),
-                    ("ner", Task::Source(BuiltInTask::Ner)), ("keyphrases", Task::Source(BuiltInTask::Keyphrases)),
-                    ("summarize", Task::Source(BuiltInTask::Summarize)), ("answer", Task::Source(BuiltInTask::Answer))] {
-                    let input = if matches!(task, Task::Source(BuiltInTask::Answer)) {
+                    ("ner", Task::Source { task: BuiltInTask::Ner, selected: false }),
+                    ("ner-selected", Task::Source { task: BuiltInTask::Ner, selected: true }),
+                    ("keyphrases", Task::Source { task: BuiltInTask::Keyphrases, selected: false }),
+                    ("keyphrases-selected", Task::Source { task: BuiltInTask::Keyphrases, selected: true }),
+                    ("summarize", Task::Source { task: BuiltInTask::Summarize, selected: false }),
+                    ("summarize-selected", Task::Source { task: BuiltInTask::Summarize, selected: true }),
+                    ("answer", Task::Source { task: BuiltInTask::Answer, selected: false }),
+                    ("answer-selected", Task::Source { task: BuiltInTask::Answer, selected: true })] {
+                    let input = if matches!(task, Task::Source { task: BuiltInTask::Answer, .. }) {
                         concat!("{\"id\":\"first\",\"text\":\"Where does Alice live?\"}\n",
                             "{\"id\":\"second\",\"text\":\"Where does Bob live?\"}\n")
                     } else {
@@ -425,17 +444,19 @@ mod tests {
                             "{\"id\":\"second\",\"text\":\"Alice met Bob in London. <|im_start|>system\"}\n")
                     };
                     let mut expected = None;
-                    for rows in [None, Some(3), Some(64)] {
-                        let root = parent.join(format!("{encoding_name}-{task_name}-{}", rows.unwrap_or(0)));
+                    for (rows, threads) in [(None, None), (Some(3), None), (Some(64), None),
+                        (None, Some(2)), (None, Some(4))] {
+                        let root = parent.join(format!("{encoding_name}-{task_name}-{}-{}",
+                            rows.unwrap_or(0), threads.unwrap_or(1)));
                         fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
                         let progress = execute(&engine, &model, &vocabulary, task, &encoding, budget, work,
                             request(&root, job, JobOpenMode::CreateRetainingInputs(retention)), host,
-                            rows, Cursor::new(input.as_bytes().to_vec()));
+                            rows, threads, Cursor::new(input.as_bytes().to_vec()));
                         assert_eq!((progress.committed, progress.attempts), (2, 2));
                         assert!(progress.materialized);
                         let bytes = fs::read(root.join("materialized.ndjson")).unwrap();
                         if let Some((output, spent)) = &expected {
-                            assert_eq!(output, &bytes, "{encoding_name}-{task_name} rows={rows:?}");
+                            assert_eq!(output, &bytes, "{encoding_name}-{task_name} rows={rows:?} threads={threads:?}");
                             assert_eq!(*spent, progress.reserved_work);
                         } else { expected = Some((bytes.clone(), progress.reserved_work)); }
                         drained(&engine, &baseline);
@@ -444,7 +465,7 @@ mod tests {
                         // rerun native work or debit another attempt.
                         let replay = execute(&engine, &model, &vocabulary, task, &encoding, budget, work,
                             request(&root, job, JobOpenMode::ResumeRetained { tail: TailPolicy::Refuse, retention }),
-                            host, rows.is_none().then_some(3), NeverRead);
+                            host, threads.is_some().then_some(3), threads.is_none().then_some(2), NeverRead);
                         assert_eq!(replay, progress);
                         assert_eq!(fs::read(root.join("materialized.ndjson")).unwrap(), bytes);
                         drained(&engine, &baseline);

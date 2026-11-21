@@ -17,6 +17,7 @@ use crate::{
 use serde::Serializer;
 use std::{cell::Cell, fs, os::unix::fs::DirBuilderExt, path::PathBuf, rc::Rc,
     sync::atomic::{AtomicU64, Ordering}};
+mod selected;
 
 const WIDTH: usize = 32;
 fn source() -> Arc<SourceTaskPlanner> {
@@ -317,7 +318,7 @@ impl DurableBatchProcessor for Processor {
     fn job_recipe(&self) -> &Self::Recipe { &self.planner.recipe }
     fn validate_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> { self.planner.check_job_limits(limits) }
     fn durable_work(&self, prepared: &Self::Prepared) -> Result<JobWork, BatchItemFailure> {
-        Ok(JobWork::from_int4(prepared.planned_work(), self.planner.native_limits().masks.max_visits_per_item))
+        durable_plan_work(prepared, &self.planner.recipe)
     }
     fn max_result_bytes(&self, prepared: &Self::Prepared) -> u64 { prepared.max_result_bytes() }
 }
@@ -423,7 +424,7 @@ fn compact_planner(task: BuiltInTask, call: crate::tokenizer::untrusted::SafeBpe
 }
 
 #[test]
-fn layer_major_source_jobs_preserve_all_task_recipes_and_shared_encoding_debits() {
+fn layer_major_source_jobs_preserve_projection_recipes_and_shared_encoding_debits() {
     use crate::native_engine::strict_int4::{Int4MemoryBudget, weights::projection_fixture};
     struct Admission;
     impl Int4SourceBatchAdmission for Admission {
@@ -438,7 +439,7 @@ fn layer_major_source_jobs_preserve_all_task_recipes_and_shared_encoding_debits(
     let prefill = Int4PrefillLimits { max_batch_rows: 3,
         max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(3).unwrap() };
     for task in [BuiltInTask::Ner, BuiltInTask::Keyphrases, BuiltInTask::Summarize, BuiltInTask::Answer] {
-        for compact in [false, true] {
+        for (compact, selected) in [(false, false), (false, true), (true, false), (true, true)] {
             let (call, mut total) = compact_limits();
             // Measure exact question/manifest/passage encoding from the real
             // pinned planner, then grant only one complete preparation.
@@ -452,6 +453,8 @@ fn layer_major_source_jobs_preserve_all_task_recipes_and_shared_encoding_debits(
             let owner = Arc::new(original);
             let p = Int4SourceJobPlanner::for_model_with_document_encoding(weights.identity(), Arc::clone(&owner), task,
                 budget(), SourcePlanningLimits::default(), Some(args(task)), native(WIDTH)).unwrap();
+            let p = if selected { p.with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: 7 }).unwrap() }
+                else { p };
             let prepared = prepare(&p, document());
             let recipe = serde_json::to_vec(&p.recipe).unwrap();
             let spent = owner.map_document_encoding_work().unwrap();

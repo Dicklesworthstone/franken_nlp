@@ -709,8 +709,11 @@ cumulative native/mask limits. Per-record options cannot change that policy.
 Complete-document `extract-map`, `extract-corpus` and
 `extract-document-job start|resume` also support a fixed selected-row policy,
 including chunk cohorts; retained document jobs authenticate the cap on resume.
-Other source-task maps/corpora, single-context durable extraction, redaction
-and semantic second-reader routes retain full-vocabulary execution.
+Single-context `extract-job`, `ner-job`, `keyphrases-job`, `summarize-job`
+and `answer-job` also authenticate the fixed cap on `start` and `resume`,
+including compact input, persistent CPU teams and explicit retained-input replay.
+Other source-task maps/corpora, redaction and semantic second-reader routes
+retain full-vocabulary execution.
 Full-vocabulary execution remains the default.
 Prose fields can require a large row cap and fail
 explicitly when it is too small. See [selected-row INT4 source tasks](docs/int4-selected-rows.md)
@@ -4156,8 +4159,22 @@ cover final metadata staging, write and flush. A late delivery failure can
 follow durable progress and still requires authenticated status/resume.
 
 Library callers use `NlpEngine::job_int4_source_with_threads` for the same
-worker path. Byte-preserving input and the existing full-projection,
-sequential-prompt planning contract remain in force.
+worker path. Byte-fallback input, full-vocabulary projection and sequential
+prompts remain the defaults.
+
+All four retained source tasks accept `--max-selected-rows N` on `start` and
+`resume`, with `N` from 1 through 166144. Every grammar-legal row, including
+accepting EOS, must fit: an over-cap step refuses without pruning, retry or
+fallback. The private recipe binds the task finalizer, execution strategy and
+exact cap, so repeat the same option on resume. Selected-only native work
+allowances remain valid; complete KV, decoder, output, worker and encoder
+storage stay reserved. Existing jobs retain their full-head recipe and metadata
+when the option is omitted; selected completion metadata adds only the public
+`max_selected_rows` cap. The policy composes with compact input, retained-input
+replay and either a persistent CPU team or serial `--prefill-rows` execution.
+See [retained source-task selected rows](docs/int4-selected-rows.md#retained-single-context-source-tasks)
+for a concrete start/resume example. Summary and answer prose may require a
+wide legal set; the option does not imply a speed or quality claim.
 
 All four retained source tasks also accept explicit
 `--input-encoding safe-bpe-v1`. Original source bytes remain exact and template

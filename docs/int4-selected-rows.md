@@ -32,8 +32,9 @@ promise that an arbitrary schema fits.
 document cohorts and packed prompt passes. Complete-document extraction also
 supports it on `extract-map`, `extract-corpus` and
 `extract-document-job start|resume`, with serial or cohort chunk execution.
-Single-context retained extraction also supports it on `extract-job start|resume`,
-including persistent CPU teams and compact input encoding. Other source-task
+Single-context retained jobs also support it on `extract-job`, `ner-job`,
+`keyphrases-job`, `summarize-job` and `answer-job` with `start|resume`, including
+persistent CPU teams and compact input encoding. Other source-task
 maps/corpora, redaction and the semantic second-reader route retain their
 full-vocabulary contracts.
 Without the option, these tasks retain full-vocabulary execution and their
@@ -206,8 +207,67 @@ Selected decoding composes with source-converted and independently pinned
 snapshot models, the admitted persistent CPU team, `safe-bpe-v1` and explicit
 retained-input replay. Compact schema/source encoding retains its per-record
 and cumulative invocation budgets. KV, decoder, worker, input-owner and encoder
-memory remain fully reserved. This job family retains sequential prompt
-execution and does not expose document cohorts or `--prefill-rows`.
+memory remain fully reserved. Sequential prompts remain the default;
+`--prefill-rows N` selects bounded layer-major execution with serial compute
+and composes with selected rows. Document cohorts remain unavailable.
+
+### Retained single-context source tasks
+
+`ner-job`, `keyphrases-job`, `summarize-job` and `answer-job` accept the same
+`--max-selected-rows N` contract on `start` and `resume`. One task and one exact
+cap apply to the complete retained population; per-record arguments cannot
+change either. Each record must still fit its single-context task budget.
+After preparing the protected job directory, key, ID and immutable limits
+described in [source-task jobs](../README.md#implemented-candidate-int4-source-task-jobs),
+explicit input retention allows this recovery flow:
+
+```bash
+common=(
+  --snapshot /models/nanbeige-g128.int4snap
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256"
+  --group-width 128 --memory-mib "$MEMORY_MIB"
+  --max-selected-rows 4096 --compute-threads 4
+  --store-results --job-dir /private/ner-job --job-id "$JOB_ID"
+  --key-file /private/ner-job.key --limits ner-job-limits.json
+  --max-retained-input-mib 16
+)
+fnlp candidate source-int4 ner-job start documents.ndjson \
+  --spool-input "${common[@]}"
+fnlp candidate source-int4 ner-job resume \
+  --use-retained-input "${common[@]}"
+```
+
+The second command authenticates the original stored population before skipping
+committed items. Repeat the exact row cap and every other authenticated setting.
+Adding, removing or changing selected-row policy refuses before tail repair or
+pending inference, including changing from a full-vocabulary-sized selected cap
+to the default full head. Omitting the option preserves existing recipes and
+completion metadata; selected metadata adds only `max_selected_rows`.
+
+Every legal row, including accepting EOS, must fit. An over-cap step refuses
+without pruning, fallback or a committed partial result. NER occurrences,
+verbatim keyphrases and summary/answer citations use the existing task
+finalizers; failed inference or citation checks never become successful QA
+abstention. Summary and answer strings can have wide legal sets, so the example
+cap is not a promise that every record will fit.
+
+Source-converted and independently pinned snapshot models, explicit
+`safe-bpe-v1`, persistent CPU teams and retained-input replay keep their existing
+contracts. With serial compute, `--prefill-rows N` selects bounded layer-major
+prompts instead; it cannot be combined with a nonserial team. The immutable
+job file controls all five native work axes and grammar-mask visits across
+every attempt and resume. Selected-only projection allowances are accepted
+without adding dense-head work, while full KV, decoder, output, worker, encoder
+and input-owner memory remain admitted. Compact input retains both per-record
+and invocation-wide tokenizer ceilings. No budget is multiplied by the row
+cap or replenished when a record completes.
+
+Library callers apply `Int4SourceJobPlanner::with_selected_rows` before using
+`NlpEngine::job_int4_source`, `job_int4_source_with_threads` or
+`job_int4_source_layer_major`. The private recipe, prepared task and resident
+processor must agree on the task finalizer and exact selected policy before
+work is reserved. Model-present correctness and performance qualification
+remain separate from this candidate source-level integration.
 
 ### Persistent CPU teams for a complete extraction document
 

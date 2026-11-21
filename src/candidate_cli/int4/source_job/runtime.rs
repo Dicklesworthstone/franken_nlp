@@ -63,8 +63,15 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let planner = Int4SourceJobPlanner::for_model_with_document_encoding(model.model_identity(),
         Arc::new(source_planner), source::task(job.kind), budget,
         job.source.planning(&args), defaults, limits.native).map_err(|_| CandidateError::Planning)?;
+    let selected_rows = job.source.selected_rows()?;
+    let planner = match selected_rows {
+        Some(rows) => planner.with_selected_rows(rows).map_err(|_| CandidateError::Planning)?,
+        None => planner,
+    };
+    if planner.selected_rows() != selected_rows { return Err(CandidateError::Planning.into()); }
     planner.check_job_limits(lifetime).map_err(|_| CandidateError::Planning)?;
     check_encoding_quote(&planner, &encoding, encoding_work_limits, limits.encoding_workspace_bytes)?;
+    let max_selected_rows = planner.selected_rows().map(|rows| rows.max_rows_per_step);
     remaining()?;
     let identity = planner.execution_identity().clone();
     let mut snapshot = common.snapshot_pin.map(|_| SnapshotRecord::new("loaded", common.snapshot_need));
@@ -110,7 +117,8 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         integer_kernel: common.kernel.kind().id(), snapshot,
         input_encoding: input_encoding::reported_policy(&encoding), encoding_work_limits,
         compute_schedule: compute::Schedule::for_threads(common.compute.threads),
-        prefill_schedule: common.prefill.map(PrefillSchedule::new).transpose()?, output: &report,
+        prefill_schedule: common.prefill.map(PrefillSchedule::new).transpose()?,
+        max_selected_rows, output: &report,
     };
     // Metadata only. Delivery/flush failure may follow durable commits and
     // never authorizes retry without the authenticated resume path.
@@ -204,6 +212,8 @@ struct Response<'a, T: Serialize> {
     compute_schedule: Option<compute::Schedule>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefill_schedule: Option<PrefillSchedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_selected_rows: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     input_encoding: Option<&'a UntrustedEncoding>,
     #[serde(skip_serializing_if = "Option::is_none")]

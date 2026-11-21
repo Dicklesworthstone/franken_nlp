@@ -381,7 +381,7 @@ fn worker_width_and_incompatible_schedules_refuse_before_private_source_job_io()
                 assert!(c.execute_owned(args, NoRead, &mut NoWrite).is_err());
             }
         }
-        for option in ["--prefill-rows", "--cohort-heads", "--cohort-documents", "--max-selected-rows"] {
+        for option in ["--prefill-rows", "--cohort-heads", "--cohort-documents"] {
             let mut words = argv(kind, "resume");
             words.extend(["--compute-threads", "4", option, "1"].into_iter().map(str::to_owned));
             if let Ok((c, args)) = parse(kind, words) {
@@ -499,5 +499,99 @@ fn compact_workspace_adds_to_full_and_retained_input_without_renewing_native_wor
             "job_population_memory");
         short.memory_bytes += 1;
         assert!(compact.args.lifetime_limits(&args, short, fixed).is_ok());
+    }
+}
+
+#[test]
+fn selected_source_jobs_admit_exact_work_with_full_memory_across_all_existing_routes() {
+    for kind in [Kind::Ner, Kind::Keyphrases, Kind::Summarize, Kind::Answer] {
+        for operation in ["start", "resume"] { for compact in [false, true] {
+            for snapshot in [false, true] { for schedule in [None, Some("--compute-threads"), Some("--prefill-rows")] {
+                let mut extra = vec!["--preparation-mib", "1024",
+                    if operation == "start" { "--spool-input" } else { "--use-retained-input" },
+                    "--max-retained-input-mib", "16"];
+                if compact { extra.extend(["--input-encoding", "safe-bpe-v1"]); }
+                if let Some(flag) = schedule { extra.extend([flag, "4"]); }
+                let (dense, mut dense_args) = command(kind, operation, &extra);
+                extra.extend(["--max-selected-rows", "4096"]);
+                let (selected, mut args) = command(kind, operation, &extra);
+                if snapshot {
+                    for native in [&mut dense_args, &mut args] {
+                        native.source_dir = None; native.source_manifest = None;
+                        native.snapshot = Some(PathBuf::from("model.int4"));
+                        native.expected_model_sha256 = Some("ab".repeat(32));
+                    }
+                }
+                selected.args.storage.input_retention.validate(selected.mode, &args.input).unwrap();
+                let baseline = dense.args.validate(&dense_args).unwrap();
+                let common = selected.args.validate(&args).unwrap();
+                let rows = selected.args.source.selected_rows().unwrap().unwrap();
+                assert_eq!(rows.max_rows_per_step, 4096);
+                assert_eq!(dense.args.source.selected_rows().unwrap(), None);
+                assert_eq!(common.native, baseline.native);
+                assert_eq!(common.compute, baseline.compute);
+                assert_eq!(common.prefill.map(|p| (p.max_batch_rows, p.max_extra_scratch_bytes)),
+                    baseline.prefill.map(|p| (p.max_batch_rows, p.max_extra_scratch_bytes)));
+                assert_eq!(common.minimum_memory_bytes, baseline.minimum_memory_bytes);
+                assert_eq!(selected.args.source.budget(&args, common),
+                    dense.args.source.budget(&dense_args, baseline));
+                let dense_work = constrained_int4::planned_work(args.group_width,
+                    common.max_prompt_tokens, args.max_new_tokens).unwrap();
+                let selected_work = constrained_int4::sparse::planned_work(args.group_width,
+                    common.max_prompt_tokens, args.max_new_tokens, rows).unwrap();
+                assert_eq!(selected_work.forward_positions, dense_work.forward_positions);
+                assert_eq!(selected_work.attention_pairs, dense_work.attention_pairs);
+                assert!(selected_work.projected_logits < dense_work.projected_logits);
+                assert!(selected_work.projections.dot_products < dense_work.projections.dot_products);
+                assert!(selected_work.projections.multiply_accumulates < dense_work.projections.multiply_accumulates);
+                let mut fixed = lifetime(&dense.args, &dense_args, baseline);
+                fixed.max_work = JobWork::from_int4(selected_work, selected.args.source.mask_visits() * 3);
+                let dense_limits = dense.args.lifetime_limits(&dense_args, baseline, fixed).unwrap();
+                let admitted = selected.args.lifetime_limits(&args, common, fixed).unwrap();
+                assert_eq!(admitted.native.max_model_work, selected_work);
+                assert_eq!(admitted.native.masks.max_visits_per_run, fixed.max_work.mask_node_visits);
+                assert_same_native_limits(admitted.native, dense_limits.native);
+                assert_eq!(admitted.buffer_bytes, dense_limits.buffer_bytes);
+                assert_eq!(admitted.encoding_workspace_bytes, dense_limits.encoding_workspace_bytes);
+                assert_eq!(admitted.common.minimum_memory_bytes, dense_limits.common.minimum_memory_bytes);
+                assert_eq!(selected.args.encoding.limits(&args).unwrap(),
+                    dense.args.encoding.limits(&dense_args).unwrap());
+                let mut short = common; short.memory_bytes = admitted.common.minimum_memory_bytes - 1;
+                assert_eq!(selected.args.lifetime_limits(&args, short, fixed).unwrap_err().code,
+                    "job_population_memory");
+                fixed.max_attempts += 5;
+                let retry = selected.args.lifetime_limits(&args, common, fixed).unwrap();
+                assert_same_native_limits(retry.native, admitted.native);
+            } }
+        } }
+    }
+}
+
+#[test]
+fn every_source_job_validates_selected_caps_before_private_io() {
+    for kind in [Kind::Ner, Kind::Keyphrases, Kind::Summarize, Kind::Answer] {
+        for operation in ["start", "resume"] {
+            for cap in ["1", "166144"] {
+                let (c, args) = command(kind, operation, &["--max-selected-rows", cap]);
+                assert!(c.args.validate(&args).is_ok());
+                assert_eq!(c.args.source.selected_rows().unwrap().unwrap().max_rows_per_step,
+                    cap.parse::<usize>().unwrap());
+            }
+            for cap in ["0", "166145", "18446744073709551615", "18446744073709551616"] {
+                let mut words = argv(kind, operation);
+                words.extend(["--max-selected-rows".to_owned(), cap.to_owned()]);
+                if let Ok((c, args)) = parse(kind, words) {
+                    assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().exit,
+                        ErrorCode::Usage);
+                }
+            }
+            let (c, args) = command(kind, operation, &["--max-selected-rows", "4096",
+                "--prefill-rows", "4", "--compute-threads", "2"]);
+            assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().exit, ErrorCode::Usage);
+        }
+        let (c, args) = command(kind, "start", &["--max-selected-rows", "4096",
+            "--save-snapshot", "new-model.int4"]);
+        assert!(c.args.validate(&args).is_ok());
+        assert_eq!(args.save_snapshot.as_deref(), Some(std::path::Path::new("new-model.int4")));
     }
 }
