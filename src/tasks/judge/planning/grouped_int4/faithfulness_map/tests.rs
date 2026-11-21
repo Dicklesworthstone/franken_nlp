@@ -71,6 +71,14 @@ fn run(plan: &PreparedInt4Judge, favorite: Option<&str>) -> Int4JudgeRun {
 fn finish(plan: &PreparedInt4FaithfulnessMap<'_>) -> Result<Int4FaithfulnessMapRun, Int4FaithfulnessMapError> {
     plan.collect_with_control(&mut Continue, |_, row, _| Ok(run(row, None)))
 }
+/// Exercise the real private collector/binding with declared synthetic logits.
+/// This helper is test-only and grants no public native execution authority.
+pub(crate) fn semantic_composition_fixture<C: DecodeStepControl>(plan: &PreparedInt4FaithfulnessMap<'_>,
+    favorites: &[Option<&str>], control: &mut C)
+    -> Result<Int4FaithfulnessMapRun, Int4FaithfulnessMapError> {
+    assert_eq!(favorites.len(), plan.chunk_count());
+    plan.collect_with_control(control, |index, row, _| Ok(run(row, favorites[index])))
+}
 fn cohort_budget(plan: &PreparedInt4FaithfulnessMap<'_>) -> Int4FaithfulnessMapCohortBudget {
     Int4FaithfulnessMapCohortBudget { native: Int4RunBudget::exact(plan.planned_work()),
         memory: Int4MemoryBudget { max_kv_bytes: u64::MAX, max_rope_bytes: u64::MAX,

@@ -72,6 +72,22 @@ fn run(prepared: PreparedInt4ObjectExtractionMap<'_>, args: &ExtractionBatchArgs
     finish(source, schema, limits, expected, partial_map, control)
 }
 
+/// Share only the original sealed finalizer with the composed document tests.
+/// Scripted JSON is private test data, never native execution or parity evidence.
+pub(crate) fn semantic_composition_fixture<C: DecodeStepControl>(prepared: PreparedInt4ObjectExtractionMap<'_>,
+    args: &ExtractionBatchArgs, json: Vec<String>, control: &mut C)
+    -> Result<(Int4ObjectExtractionMapRun, RootObjectSchema), Int4ObjectExtractionMapError> {
+    let PreparedInt4ObjectExtractionMap { source, schema, mapped, limits, expected } = prepared;
+    assert_eq!(json.len(), expected.chunk_count());
+    let partial_args = ExtractionBatchArgs { schema: schema.partial_schema().to_owned(),
+        grounding: args.grounding, budget: args.budget };
+    let inner = map_fixture::Script::new(&partial_args);
+    let identities: Vec<_> = mapped.execution_identities().cloned().collect();
+    let partial = mapped.execute_with_driver(&identities, Script { inner, json, next: 0 }, control)?;
+    let result = finish_with_schema(source, &schema, limits, expected, partial, control)?;
+    Ok((result, schema))
+}
+
 #[test]
 fn complete_document_envelope_keeps_object_wire_and_full_verification_authority() {
     use super::super::stream::{DocumentPreflight, Int4ExtractionDocumentRun};

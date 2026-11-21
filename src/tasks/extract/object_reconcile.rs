@@ -135,6 +135,7 @@ impl RootObjectSchema {
     }
     pub fn partial_schema(&self) -> &str { &self.partial_json }
     pub fn requires_source(&self) -> bool { self.original.requires_verbatim_source() }
+    pub(crate) fn original_schema(&self) -> &SchemaNode { self.original.root() }
     pub(crate) fn binding(&self, limits: RootObjectLimits) -> Result<Sha256Digest, RootObjectError> {
         let bytes = canonjson::canonical_bytes(&(ROOT_OBJECT_DERIVATION, ROOT_OBJECT_RECONCILIATION,
             self.original_digest, self.partial_digest, limits)).map_err(|_| RootObjectError::Serialization)?;

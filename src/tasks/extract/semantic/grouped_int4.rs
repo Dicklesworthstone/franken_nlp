@@ -20,6 +20,9 @@ use crate::{
 
 pub const INT4_SEMANTIC_EXECUTION: &str = "grouped-int4-extraction-correlated-second-reader-v1";
 
+/// Reconciled root-object extraction followed by complete-source field reviews.
+pub mod document;
+
 /// One explicit whole-request ceiling covers extraction and every field's
 /// complete judgment. Early EOS never refunds the extraction reservation.
 #[derive(Clone, Deserialize, Serialize)]

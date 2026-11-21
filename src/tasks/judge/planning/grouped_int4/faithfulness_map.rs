@@ -134,6 +134,13 @@ pub struct Int4FaithfulnessMapRun {
     #[serde(skip)]
     result_binding: [u8; 32],
 }
+impl Int4FaithfulnessMapRun {
+    /// Composite completions bind the private source/claim association too:
+    /// identical public JSON from another request is not interchangeable.
+    pub(crate) fn completion_binding(&self) -> ([u8; 32], [u8; 32]) {
+        (self.request_binding, self.result_binding)
+    }
+}
 impl fmt::Debug for Int4FaithfulnessMapRun {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Int4FaithfulnessMapRun")
@@ -400,6 +407,15 @@ impl<'a> PreparedInt4FaithfulnessMap<'a> {
     pub fn chunk_count(&self) -> usize { self.plans.len() }
     /// Total heads across the whole source, including every evidence window.
     pub fn head_count(&self) -> usize { self.expected.heads }
+    /// Exact prompt positions over every original chunk and evidence head.
+    /// Composed reviews use this to enforce one global prompt allowance.
+    pub(crate) fn total_prompt_tokens(&self) -> Result<usize, Int4FaithfulnessMapError> {
+        self.plans.iter().try_fold(0_usize, |total, plan| {
+            plan.inner.executable.bundle().heads.iter().try_fold(total, |total, head| {
+                total.checked_add(head.prompt_len).ok_or(Int4FaithfulnessMapError::Work)
+            })
+        })
+    }
     pub fn max_head_count(&self) -> usize { self.expected.max_heads }
     pub fn group_width(&self) -> usize { self.expected.group_width }
     pub fn planned_work(&self) -> Int4Work { self.expected.work }
@@ -519,4 +535,4 @@ fn value_bytes(value: &impl Serialize, cap: u64) -> Result<u64, Int4Faithfulness
     Ok(bytes.len() as u64)
 }
 
-#[cfg(test)] mod tests;
+#[cfg(test)] pub(crate) mod tests;

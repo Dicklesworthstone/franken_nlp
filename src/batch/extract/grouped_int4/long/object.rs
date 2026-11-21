@@ -267,8 +267,14 @@ pub struct PreparedInt4ObjectExtractionMap<'s> {
     limits: Int4ObjectExtractionMapLimits,
     expected: Int4ObjectExtractionMapPreflight,
 }
-impl PreparedInt4ObjectExtractionMap<'_> {
+impl<'s> PreparedInt4ObjectExtractionMap<'s> {
     pub(crate) fn mapped(&self) -> &PreparedInt4ExtractionMap<'_> { &self.mapped }
+    pub(crate) fn original_source(&self) -> &'s str { self.source }
+    pub(crate) fn original_schema(&self) -> &crate::grammar::SchemaNode { self.schema.original_schema() }
+    pub(crate) fn limits(&self) -> Int4ObjectExtractionMapLimits { self.limits }
+    pub(crate) fn task_budget(&self) -> Option<TaskBudget> {
+        self.mapped.plans.first().map(|plan| *plan.task_plan().ir().budget())
+    }
     pub fn preflight_metadata(&self) -> Int4ObjectExtractionMapPreflight { self.expected }
     pub fn execution_identities(&self) -> impl ExactSizeIterator<Item = &ExecutionIdentity> {
         self.mapped.execution_identities()
@@ -283,10 +289,19 @@ impl PreparedInt4ObjectExtractionMap<'_> {
     pub fn execute_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
         engine: &mut StrictInt4Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
         -> Result<Int4ObjectExtractionMapRun, Int4ObjectExtractionMapError> {
+        self.execute_with_original_schema(admitted, engine, vocabulary, control).map(|(run, _)| run)
+    }
+    /// Keep the actual original schema owner for an in-crate composed task.
+    /// This still executes and validates the sealed native map; it accepts no
+    /// replacement source, schema, partial result or final reconciliation.
+    pub(crate) fn execute_with_original_schema<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        engine: &mut StrictInt4Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
+        -> Result<(Int4ObjectExtractionMapRun, RootObjectSchema), Int4ObjectExtractionMapError> {
         if self.expected.map_batch_chunks != 1 { return Err(Int4ObjectExtractionMapError::Admission); }
         let Self { source, schema, mapped, limits, expected } = self;
         let partial = mapped.execute_with_control(admitted, engine, vocabulary, control)?;
-        finish(source, schema, limits, expected, partial, control)
+        let result = finish_with_schema(source, &schema, limits, expected, partial, control)?;
+        Ok((result, schema))
     }
     #[allow(clippy::too_many_arguments)]
     pub fn execute_cohorts_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
@@ -320,6 +335,11 @@ fn finish_cohorts<C: DecodeStepControl>(source: &str, schema: RootObjectSchema, 
 fn finish<C: DecodeStepControl>(source: &str, schema: RootObjectSchema, limits: Int4ObjectExtractionMapLimits,
     expected: Int4ObjectExtractionMapPreflight, partial_map: Int4ExtractionMapRun, control: &mut C)
     -> Result<Int4ObjectExtractionMapRun, Int4ObjectExtractionMapError> {
+    finish_with_schema(source, &schema, limits, expected, partial_map, control)
+}
+fn finish_with_schema<C: DecodeStepControl>(source: &str, schema: &RootObjectSchema, limits: Int4ObjectExtractionMapLimits,
+    expected: Int4ObjectExtractionMapPreflight, partial_map: Int4ExtractionMapRun, control: &mut C)
+    -> Result<Int4ObjectExtractionMapRun, Int4ObjectExtractionMapError> {
     expected.mapped.verify_completed(&partial_map)?;
     let used = partial_map.verification_used;
     let v = limits.mapping.verification;
@@ -328,7 +348,7 @@ fn finish<C: DecodeStepControl>(source: &str, schema: RootObjectSchema, limits: 
         max_matches: v.max_matches.checked_sub(used.matches).ok_or(Int4ObjectExtractionMapError::Admission)?,
         max_scan_steps: v.max_scan_steps.checked_sub(used.scan_steps).ok_or(Int4ObjectExtractionMapError::Admission)?,
     };
-    let object = object_reconcile::reconcile(&schema, source, expected.binding, limits.reconciliation,
+    let object = object_reconcile::reconcile(schema, source, expected.binding, limits.reconciliation,
         remaining, partial_map.grounding == ExtractionGrounding::SourceMembership,
         partial_map.mapped.root().value().chunks().map(object_chunk), control)?;
     let additional = object.verification_used();
@@ -352,4 +372,4 @@ fn poll(control: &mut impl DecodeStepControl) -> Result<(), RootObjectError> {
     control.prefill_checkpoint(0).map_or(Ok(()), |cause| Err(RootObjectError::Cancelled(cause)))
 }
 
-#[cfg(test)] mod tests;
+#[cfg(test)] pub(crate) mod tests;
