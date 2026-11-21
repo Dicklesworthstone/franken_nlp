@@ -278,6 +278,68 @@ fn complete_retained_resume_starts_at_eof_without_another_delivery() {
 }
 
 #[test]
+fn complete_retained_resume_preserves_every_terminal_cancellation_cause() {
+    struct Cancel(DecodeCancellationKind);
+    impl DecodeStepControl for Cancel {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { Some(self.0) }
+    }
+    let root = Root::new(); let population = inputs(); let mut control = Control::default();
+    let mut created = JobRunner::create_with_retained_inputs(&root.0, key(), JobId([7;16]), limits(),
+        retention(), &population, Processor::new(Rc::new(Events::default())), &mut control).unwrap();
+    let completed = created.run(&mut control).unwrap(); drop(created);
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        for through_run in [false, true] {
+            let events = Rc::new(Events::default());
+            let mut resumed = JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([7;16]),
+                limits(), retention(), Processor::new(events.clone()), TailPolicy::Refuse,
+                &mut control).unwrap();
+            let failure = if through_run { err(resumed.run(&mut Cancel(cause))) }
+                else { err(resumed.step(&mut Cancel(cause))) };
+            assert_eq!(failure, JobRunError::Storage(JobError::Cancelled(cause)));
+            assert!(resumed.is_stopped());
+            assert_eq!(resumed.progress().committed, completed.committed);
+            assert_eq!(resumed.progress().attempts, completed.attempts);
+            assert_eq!(resumed.progress().reserved_work, completed.reserved_work);
+            assert!(events.prepared.borrow().is_empty()); assert!(events.executed.borrow().is_empty());
+            assert_eq!(err(resumed.step(&mut control)), JobRunError::Stopped);
+        }
+    }
+}
+
+#[test]
+fn cancellation_after_final_commit_stops_run_without_losing_or_reexecuting_results() {
+    struct CancelAfterRelease { events: Rc<Events> }
+    impl DecodeStepControl for CancelAfterRelease {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            (self.events.executed.borrow().len() == 2 && !self.events.held.get())
+                .then_some(DecodeCancellationKind::ParentCancelled)
+        }
+    }
+    let root = Root::new(); let population = inputs(); let mut control = Control::default();
+    let events = Rc::new(Events::default());
+    let mut run = JobRunner::create_with_retained_inputs(&root.0, key(), JobId([7;16]), limits(),
+        retention(), &population, Processor::new(events.clone()), &mut control).unwrap();
+    assert_eq!(err(run.run(&mut CancelAfterRelease { events: events.clone() })),
+        JobRunError::Storage(JobError::Cancelled(DecodeCancellationKind::ParentCancelled)));
+    assert!(run.is_stopped()); assert!(!events.held.get());
+    assert_eq!(run.progress().committed, 2); assert_eq!(run.progress().attempts, 2);
+    assert_eq!(run.progress().reserved_work, work().checked_add(work()).unwrap());
+    drop(run);
+    // The cancellation changes the returned outcome, not the durable commit.
+    let mut resumed = JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([7;16]), limits(),
+        retention(), Processor::new(events.clone()), TailPolicy::Refuse, &mut control).unwrap();
+    assert_eq!(resumed.run(&mut control).unwrap().attempts, 2);
+    assert!(!resumed.is_stopped());
+    assert_eq!(resumed.read_committed(0, &mut control).unwrap(), b"1");
+    assert_eq!(resumed.read_committed(1, &mut control).unwrap(), b"2");
+    assert!(resumed.materialize_ordered(&mut control).unwrap().materialized);
+    assert_eq!(*events.prepared.borrow(), vec!["alpha", "beta"]);
+    assert_eq!(*events.executed.borrow(), vec![1, 2]);
+}
+
+#[test]
 fn damaged_retained_input_blocks_repair_even_when_original_inputs_are_supplied() {
     use std::io::{Seek, SeekFrom, Write};
     let root = Root::new(); let population = inputs(); let mut control = Control::default();

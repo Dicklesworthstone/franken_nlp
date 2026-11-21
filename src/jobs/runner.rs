@@ -184,11 +184,17 @@ impl<'items, 'bytes, P: DurableBatchProcessor> JobRunner<'items, 'bytes, P> {
     pub fn step<C: DecodeStepControl>(&mut self, control: &mut C)
         -> Result<Option<JobProgress>, JobRunError> {
         if self.is_stopped() { return Err(JobRunError::Stopped); }
-        let progress = self.job.progress();
-        if progress.committed == progress.items { return Ok(None); }
         // Set BEFORE any fallible planning/host call, including an unwind.
         self.stopped = true;
+        // Completion still belongs to the caller's cancellation scope. This
+        // also polls after the final guarded output has been committed and
+        // released, and when reopening an already complete population.
         checkpoint(control)?;
+        let progress = self.job.progress();
+        if progress.committed == progress.items {
+            self.stopped = false;
+            return Ok(None);
+        }
         let ordinal = usize::try_from(progress.committed).map_err(|_| JobError::Limit)?;
         let input = self.inputs.get(ordinal, &mut self.job, control)?;
         let document = parse::<P>(&input, self.limits)?;
