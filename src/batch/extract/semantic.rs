@@ -22,6 +22,9 @@ use crate::{
     tokenizer::untrusted::{SafeBpeWork, UntrustedEncoding},
 };
 
+/// Complete-document root-object extraction and full-source review populations.
+pub mod document;
+
 /// Six invocation-wide ceilings, never renewed by a flush or failed attempt.
 /// Int4SemanticOptions supplies the independent whole-document native ceiling.
 #[derive(Clone, Copy, Debug)]

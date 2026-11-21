@@ -5307,12 +5307,23 @@ tokenizer ledger cover extraction plus every review. Memory admission includes
 all retained maps and results. Source conversion, pinned snapshots, byte or
 compact input and an optional persistent CPU team share this route; chunks use
 serial full-vocabulary execution. Failed composition publishes no successful
-partial object/review result. This slice has no corpus or durable-resume mode.
+partial object/review result.
+
+`extract-semantic-document-corpus` streams complete original documents through
+the same composition with one resident model and optional numerical team.
+Fixed schema and review policy span the population. Five native work counters,
+mask visits and all three source-verification counters are bounded across the
+run; record counts and flushes never replenish them. Compact reconstruction
+retains both actual preparation charges. Each complete record preserves the
+original extraction beside all full-source reviews; whole-run success requires
+`run_complete` and exit zero after worker join. Explicit `--max-run-*` limits
+fund the desired number of documents; defaults fund one complete attempt.
 
 See the [complete-document semantic object guide](docs/int4-semantic-object-map.md)
 for a complete supported schema, explicit options, bounded command and result
-paths. Source review and syntax checks are complete; compilation, executable
-regressions and controller-only native/model qualification remain **UNRUN**.
+paths and resident-corpus commands. Source review and static checks are
+complete; compilation, executable regressions and controller-only native/model
+qualification remain **UNRUN**.
 
 ### Retained summary and passage-answer review
 

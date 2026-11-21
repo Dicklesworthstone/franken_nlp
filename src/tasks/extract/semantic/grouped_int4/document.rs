@@ -147,7 +147,24 @@ impl<'s> PreparedInt4SemanticObjectDocument<'s> {
     pub fn max_model_work(&self) -> Int4Work { self.options.max_model_work }
     pub fn max_result_bytes(&self) -> u64 { self.options.limits.max_output_bytes }
     pub fn input_encoding(&self) -> &UntrustedEncoding { &self.expected.encoding }
-    pub fn input_encoding_work(&self) -> Option<SafeBpeWork> { self.expected.extraction.encoding_work() }
+    pub fn input_encoding_work(&self) -> Option<SafeBpeWork> {
+        matches!(self.expected.encoding, UntrustedEncoding::SafeBpeV1(_))
+            .then_some(self.expected.initial_encoding_work)
+    }
+    /// An owned-source population freezes this plan, then reconstructs its
+    /// borrowed source programs at execution. Retain the first preparation's
+    /// actual compact work before any review; reconstruction cannot reset the
+    /// document allowance or hide failed sizing probes. The caller first
+    /// compares the exact original proof, and independently admits the known
+    /// reconstruction cost before spending it.
+    pub(crate) fn with_prior_preparation_encoding_work(mut self, prior: SafeBpeWork)
+        -> Result<Self, Int4SemanticObjectDocumentError> {
+        let combined = self.expected.initial_encoding_work.checked_add(prior)
+            .ok_or(Int4SemanticObjectDocumentError::WorkBudget)?;
+        Int4SemanticEncoding::from_work(&self.expected.encoding, combined)?;
+        self.expected.initial_encoding_work = combined;
+        Ok(self)
+    }
     pub fn encoding_workspace_bytes(&self) -> Result<u64, Int4SemanticObjectDocumentError> {
         self.judge.document_encoding_workspace_bytes()
             .map_err(|e| Int4SemanticObjectDocumentError::Semantic(e.into()))
@@ -364,7 +381,7 @@ pub struct Int4SemanticObjectDocumentRun {
 }
 
 /// Sealed original-map and complete-request authority. This is not wire data.
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct Int4SemanticObjectDocumentPreflight {
     extraction: Int4ObjectExtractionMapPreflight,
     request_binding: [u8; 32],

@@ -135,6 +135,7 @@ enum Int4Task {
     Stream(Task, stream::StreamArgs),
     Semantic(semantic::SemanticArgs),
     SemanticObjectMap(semantic::document::SemanticObjectArgs),
+    SemanticObjectCorpus(semantic::document::corpus::CorpusArgs),
     SemanticBatch(semantic::corpus::BatchArgs),
     SemanticJob,
     Sentiment(sentiment::SentimentArgs),
@@ -253,6 +254,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(compute::definition(input_encoding::definition(prefill::definition(extract::one_off_definition()))))
         .subcommand(semantic::one_off_definition())
         .subcommand(semantic::document::definition())
+        .subcommand(semantic::document::corpus::definition())
         .subcommand(semantic::corpus::definition())
         .subcommand(semantic::jobs::definition())
         .subcommands(source_semantic::definitions())
@@ -404,6 +406,7 @@ impl Int4Command {
             "extract" => Int4Task::Extract(extract::ExtractionArgs::from_matches_with_prefill(matches)?),
             "extract-semantic" => Int4Task::Semantic(semantic::SemanticArgs::from_matches(matches)?),
             "extract-semantic-map" => Int4Task::SemanticObjectMap(semantic::document::SemanticObjectArgs::from_matches(matches)?),
+            "extract-semantic-document-corpus" => Int4Task::SemanticObjectCorpus(semantic::document::corpus::CorpusArgs::from_matches(matches)?),
             "extract-semantic-batch" => Int4Task::SemanticBatch(semantic::corpus::BatchArgs::from_matches(matches)?),
             "summarize-semantic" | "answer-semantic" => Int4Task::SourceSemantic(
                 crate::candidate_cli::source::Kind::named(name.trim_end_matches("-semantic")).ok_or_else(||
@@ -453,7 +456,7 @@ impl Int4Command {
             | "ner-batch" | "keyphrases-batch" | "summarize-batch" | "answer-batch"
             | "classify-map" | "classify-corpus" | "sentiment-map" | "sentiment-corpus" | "extract-map" | "extract-corpus"
             | "faithfulness-corpus" | "redact-document" | "redact-corpus" | "resolve" | "resolve-corpus"
-            | "extract-semantic" | "extract-semantic-map" | "extract-semantic-batch" | "summarize-semantic" | "answer-semantic"
+            | "extract-semantic" | "extract-semantic-map" | "extract-semantic-document-corpus" | "extract-semantic-batch" | "summarize-semantic" | "answer-semantic"
             | "summarize-semantic-batch" | "answer-semantic-batch"
             | "ner-map" | "keyphrases-map" | "summarize-map" | "answer-map"
             | "ner-corpus" | "keyphrases-corpus" | "summarize-corpus" | "answer-corpus") {
@@ -468,6 +471,8 @@ impl Int4Command {
         let result = match self {
             Self { task: Int4Task::SemanticObjectMap(options), args, batch: None, job: None } =>
                 return options.run(args, &mut input, &mut output, diagnostics),
+            Self { task: Int4Task::SemanticObjectCorpus(options), args, batch: None, job: None } =>
+                return options.run_owned(args, input, output, diagnostics),
             Self { task: Int4Task::SampledSentiment(options), args, batch: None, job: None } =>
                 return options.run(args, &mut input, &mut output, diagnostics),
             Self { task: Int4Task::SampledSentimentMap(options), args, batch: None, job: None } =>
@@ -553,7 +558,7 @@ impl Int4Command {
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
         // These executable routes use the typed task failure boundary above.
-        if matches!(self.task, Int4Task::SemanticObjectMap(_)) {
+        if matches!(self.task, Int4Task::SemanticObjectMap(_) | Int4Task::SemanticObjectCorpus(_)) {
             return Err(CandidateError::Arguments);
         }
         if matches!(self.task, Int4Task::SampledSentiment(_) | Int4Task::SampledSentimentMap(_) | Int4Task::SampledSentimentCorpus(_) | Int4Task::SampledSentimentBatch(_) | Int4Task::SampledSentimentJob | Int4Task::SampledSentimentDocumentJob) {
@@ -606,7 +611,8 @@ impl Int4Command {
             return options.execute(self.args, input, output);
         }
         let limits = match &self.task {
-            Int4Task::SemanticJob | Int4Task::SourceSemanticJob | Int4Task::SemanticObjectMap(_) => return Err(CandidateError::Arguments),
+            Int4Task::SemanticJob | Int4Task::SourceSemanticJob | Int4Task::SemanticObjectMap(_)
+                | Int4Task::SemanticObjectCorpus(_) => return Err(CandidateError::Arguments),
             Int4Task::SampledSentiment(_) | Int4Task::SampledSentimentMap(_) | Int4Task::SampledSentimentCorpus(_) | Int4Task::SampledSentimentBatch(_) | Int4Task::SampledSentimentJob | Int4Task::SampledSentimentDocumentJob => return Err(CandidateError::Arguments),
             Int4Task::Text(_) => self.args.validate_text_compute()?,
             Int4Task::Classify(scoring) => scoring.validate_one_off_with_prefill(&self.args)?,

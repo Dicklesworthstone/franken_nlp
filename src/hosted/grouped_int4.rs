@@ -41,7 +41,8 @@ mod semantic;
 pub use semantic::{Int4SemanticHostLimits, Int4SemanticHostRequirements,
     Int4SemanticCorpusConfig, Int4SemanticCorpusRequirements, int4_semantic_corpus_requirements,
     Int4SemanticObjectDocumentHostLimits, Int4SemanticObjectDocumentRequirements,
-    int4_semantic_object_document_requirements};
+    int4_semantic_object_document_requirements, Int4SemanticObjectDocumentCorpusConfig,
+    Int4SemanticObjectDocumentCorpusRequirements, int4_semantic_object_document_corpus_requirements};
 #[cfg(all(feature = "metadata-store", target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub use semantic::{Int4SemanticJobRequirements, int4_semantic_job_requirements};

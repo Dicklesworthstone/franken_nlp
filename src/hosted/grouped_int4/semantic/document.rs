@@ -4,6 +4,9 @@
 //! serve the complete invocation without renewing any task allowance.
 
 use super::*;
+mod corpus;
+pub use corpus::{Int4SemanticObjectDocumentCorpusConfig, Int4SemanticObjectDocumentCorpusRequirements,
+    int4_semantic_object_document_corpus_requirements};
 use std::{panic::{catch_unwind, AssertUnwindSafe}, sync::Mutex};
 use crate::{
     batch::extract::{ExtractionBatchArgs, grouped_int4::Int4ExtractionBatchPlanner,

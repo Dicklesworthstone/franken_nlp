@@ -309,6 +309,95 @@ bytes and source coordinates remain authoritative, and template-control token
 IDs remain excluded from untrusted encoding. Compact encoding changes prompt
 tokens; identical model output, quality, parity and speed are not established.
 
+## Resident whole-document populations
+
+`fnlp candidate source-int4 extract-semantic-document-corpus` accepts ordered
+NDJSON records whose `text` is a complete original document. One resident
+model, immutable original-schema factory, judge, extraction vocabulary and
+optional numerical team serve the entire stream. The input is bounded and
+streamed; corpus size does not multiply resident model or document-plan memory.
+
+For example, save these records as `invoices.ndjson` and use the schema and
+semantic-options files above:
+
+```json
+{"id":"invoice-001","text":"Invoice amount: 7 whole units. Payment currency: USD."}
+{"id":"invoice-002","text":"Invoice amount: 9 whole units. Payment currency: EUR."}
+```
+
+The following declarations fund two complete attempts. These are illustrative
+ceilings, not measured costs or a promise of successful model output.
+
+```sh
+fnlp candidate source-int4 extract-semantic-document-corpus invoices.ndjson \
+  --snapshot /private/model.snapshot --expected-model-sha256 "$MODEL_SHA256" \
+  --context-tokens 2048 --memory-mib 32768 \
+  --schema ./invoice.schema.json --semantic-options ./invoice-semantic.json \
+  --max-input-bytes 1024 --max-chunks 4 --max-chunk-bytes 256 \
+  --max-new-tokens 64 --max-result-bytes 65536 \
+  --max-map-result-bytes 262144 \
+  --max-live-value-bytes 1048576 --max-total-value-bytes 1048576 \
+  --max-object-properties 2 --max-object-origins 8 \
+  --max-object-input-bytes 262144 --max-object-nodes 1024 \
+  --max-object-json-bytes 65536 --max-object-result-bytes 262144 \
+  --review-max-chunks 4 --review-max-chunk-bytes 256 \
+  --review-max-tokenizer-calls 1024 \
+  --review-max-retained-result-bytes 524288 --review-max-result-bytes 262144 \
+  --max-mask-node-visits 128000000 --max-total-mask-node-visits 512000000 \
+  --max-requests 2 \
+  --max-run-forward-positions 200000 --max-run-projected-logits 200000000 \
+  --max-run-attention-pairs 2000000000000 \
+  --max-run-dot-products 20000000000000 \
+  --max-run-multiply-accumulates 2000000000000000 \
+  --max-run-mask-node-visits 1024000000 \
+  --max-run-extraction-fields 8192 --max-run-extraction-evidence-spans 32768 \
+  --max-run-extraction-scan-steps 134217728 \
+  > invoices-reviewed.ndjson
+```
+
+The original map flags retain their per-document scope. The options file's
+`max_model_work` covers one complete extraction-plus-review attempt; the five
+`--max-run-*` native limits cover the entire stream. The mask and three
+source-verification run limits are also separate from their per-document
+declarations. Omitted run limits fund **one** complete document; increasing
+`--max-requests` never grants more inference authority. A run must have enough
+of every axis for each attempted document, including a document without
+source-membership annotations, because admission reserves the fixed declared
+verification ceiling conservatively.
+
+Records accept `id` and `text`; non-null `task_args` are refused. Exact
+`{"flush":true}` controls can close an output epoch, but consume a request slot
+and do not renew any work allowance. The CLI also bounds line bytes, total
+input bytes, total output bytes and record count. Each successful record
+contains the complete reconciled extraction and all field reviews. An
+extraction, reconciliation, review or completion-authentication failure cannot
+publish a successful partial combined record. Earlier completed records can
+remain available if a later record fails.
+
+Require a complete `run_complete` frame **and exit status zero** for whole-run
+success. Candidate frames identify the
+`fnlp-candidate-int4-semantic-object-corpus-v1` protocol and retain the explicit
+same-model, uncalibrated diagnostic scope. Terminal completion follows physical
+worker join. Add `--compute-threads 4` to use one numerical team for the whole
+stream; `-` selects stdin, and the source-conversion/snapshot options above
+retain their meanings.
+
+Owned-source records freeze their original complete-request proof and rebuild
+borrowed plans at execution. Both real preparation passes count toward the
+same per-document compact-tokenizer allowance. The known reconstruction cost
+must fit before it is repeated; the second pass cannot erase the first pass
+or obtain a fresh review allowance. Completed compact accounting includes both
+preparations and every sealed review delta.
+
+Library callers use
+`Int4SemanticObjectDocumentCorpusConfig`,
+`int4_semantic_object_document_corpus_requirements` and
+`NlpEngine::batch_int4_semantic_object_documents[_with_threads]`.
+The quote includes the existing simultaneous whole-document peak, retained
+fixed-schema/policy copies, bounded transport and IO staging, and optional
+team workspace before private schema/population/model IO. Caller-owned
+configuration and weights remain additional, as on the one-shot route.
+
 ## Failure, cancellation and current scope
 
 Invalid schema/rules, reconciliation conflicts, missing required properties,
@@ -334,10 +423,11 @@ and exit status zero. Publication does not retry as a new inference attempt.
 This initial route uses full-vocabulary constrained extraction and
 full-vocabulary reviewer scoring, serial chunks and optional numerical CPU
 teams. Selected-row projection, chunk cohorts, packed prefill, sampling,
-thinking and tools are refused. There is no corpus or durable-resume variant
-of this whole-document semantic composition in this slice. The existing
-`extract-semantic-batch` and `extract-semantic-job` have their own
-single-context contracts; they do not implicitly select this document map.
+thinking and tools are refused. The resident corpus route above explicitly
+selects the complete-document composition. A retained-job variant is not yet
+part of this increment. The existing `extract-semantic-batch` and
+`extract-semantic-job` have their own single-context contracts; they do not
+implicitly select this document map.
 
 Library users can pre-admit with
 `int4_semantic_object_document_requirements` and call
@@ -347,9 +437,14 @@ Library users can pre-admit with
 and a real model-bound judge; no public execution API accepts substituted
 native outputs, source text or schema authority.
 
-The implementation has received source/API review, Rust syntax parsing and
-whitespace checks. Regression definitions cover real planner composition with
-private scripted completions, shared work/tokenizer limits, full-source
-diagnostics, tampering and cancellation. Compilation, executable tests,
+The original one-shot implementation received source/API review, Rust syntax
+parsing and whitespace checks. The resident-corpus increment received
+independent source/API review and static delimiter, string, comment,
+conflict-marker and whitespace checks; its execution environment was
+unavailable. New regression definitions cover exact original-schema/source
+authority, all nine run work axes, compact reconstruction accounting,
+nonrenewal at flush, typed cancellation, memory admission and CLI dispatch.
+Existing private scripted-completion cases check full-source diagnostics and
+tampering without claiming native success. Compilation, executable tests,
 controller-only DSR runs, native parity, model quality and incremental
 error-catching value remain **UNRUN**. The examples above were not executed.

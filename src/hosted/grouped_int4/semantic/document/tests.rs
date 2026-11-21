@@ -20,7 +20,7 @@ fn maximum() -> Int4Work {
         attention_pairs: u64::MAX / 8, projections: ProjectionWork {
             dot_products: u64::MAX / 8, multiply_accumulates: u64::MAX / 8 } }
 }
-fn fixture() -> (ExtractionBatchArgs, Int4SemanticOptions, Int4SemanticObjectDocumentHostLimits) {
+pub(super) fn fixture() -> (ExtractionBatchArgs, Int4SemanticOptions, Int4SemanticObjectDocumentHostLimits) {
     let kv = Int4MemoryRequirement::for_context(256, WIDTH).unwrap().kv_bytes;
     let budget = TaskBudget { max_input_tokens: 224, max_output_tokens: 32,
         max_output_bytes: 4096, max_grammar_states: 64, max_kv_bytes: kv };

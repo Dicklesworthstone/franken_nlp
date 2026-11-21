@@ -567,3 +567,50 @@ fn cancellation_is_terminal_in_claim_preparation_review_planning_and_final_bindi
     assert!(matches!(digest.value(&large), Err(Int4SemanticObjectDocumentError::Cancelled(
         DecodeCancellationKind::CostBudget))));
 }
+
+#[test]
+fn reconstructed_population_work_is_retained_in_complete_review_and_completion_authority() {
+    let encoding = UntrustedEncoding::SafeBpeV1(compact_limits());
+    let first = prepare(SOURCE, SCHEMA, encoding.clone(), options());
+    let prior = first.input_encoding_work().unwrap();
+    let original_proof = first.preflight_metadata();
+    let original_identities = first.execution_identities().cloned().collect::<Vec<_>>();
+    drop(first);
+    let repeated = prepare(SOURCE, SCHEMA, encoding, options());
+    assert!(repeated.preflight_metadata() == original_proof);
+    let repeated = repeated.with_prior_preparation_encoding_work(prior).unwrap();
+    let combined = prior.checked_add(prior).unwrap();
+    assert_eq!(repeated.input_encoding_work(), Some(combined));
+    assert_eq!(repeated.execution_identities().cloned().collect::<Vec<_>>(), original_identities);
+    let expected = repeated.preflight_metadata();
+    assert!(expected != original_proof);
+    let PreparedInt4SemanticObjectDocument { extraction, source, judge, options,
+        judge_mapping: mapping, expected: authority, .. } = repeated;
+    let count = extraction.preflight_metadata().chunk_count();
+    let mut values = vec!["{}".to_owned(); count];
+    values[0] = r#"{"amount":7}"#.to_owned();
+    values[count - 1] = r#"{"name":"Alice"}"#.to_owned();
+    let args = request(SCHEMA, ExtractionBatchGrounding::Structural);
+    let (extraction, schema) = object_fixture(extraction, &args, values, &mut Continue).unwrap();
+    let run = complete(Composition { source, schema, extraction, judge, options, mapping,
+        expected: authority }, Some("unsupported"));
+    expected.verify_completed_with_control(&run, &mut Continue).unwrap();
+    assert!(original_proof.verify_completed_with_control(&run, &mut Continue).is_err());
+    let review_work = run.semantic.fields.iter().filter_map(|field| field.review.as_ref())
+        .fold(SafeBpeWork::default(), |total, review|
+            total.checked_add(review.input_encoding.as_ref().unwrap().work).unwrap());
+    assert_eq!(run.input_encoding.as_ref().unwrap().work, combined.checked_add(review_work).unwrap());
+}
+
+#[test]
+fn byte_reconstruction_retains_original_encoding_absence_and_rejects_fictitious_compact_work() {
+    let prepared = prepare(SOURCE, SCHEMA, UntrustedEncoding::ByteFallback, options());
+    let original = prepared.preflight_metadata();
+    let repeated = prepared.with_prior_preparation_encoding_work(SafeBpeWork::default()).unwrap();
+    assert!(repeated.preflight_metadata() == original);
+    assert!(repeated.input_encoding_work().is_none());
+    let compact = prepare(SOURCE, SCHEMA, UntrustedEncoding::SafeBpeV1(compact_limits()), options());
+    let used = compact.input_encoding_work().unwrap();
+    let byte = prepare(SOURCE, SCHEMA, UntrustedEncoding::ByteFallback, options());
+    assert!(byte.with_prior_preparation_encoding_work(used).is_err());
+}

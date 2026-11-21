@@ -3,7 +3,7 @@ use super::*;
 use crate::{native_engine::kv::KV_BYTES_PER_TOKEN,
     tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding}};
 
-fn argv(extra: &[&str]) -> Vec<String> {
+pub(super) fn argv(extra: &[&str]) -> Vec<String> {
     ["candidate", "source-int4", "extract-semantic-map", "--source-dir", "explicit-source",
         "--source-manifest", "explicit-manifest.json", "--schema", "schema.json",
         "--semantic-options", "semantic.json", "--memory-mib", "32768",

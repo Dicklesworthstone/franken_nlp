@@ -109,7 +109,7 @@ pub(super) fn execute(args: Int4Args, command: SemanticObjectArgs,
     publish(&response, envelope_bytes, output, &remaining, &cancellation)
 }
 
-fn source_request(command: &SemanticObjectArgs, options: &Int4SemanticOptions, schema: String,
+pub(super) fn source_request(command: &SemanticObjectArgs, options: &Int4SemanticOptions, schema: String,
     task: TaskBudget, limits: extract_map::object::ObjectMapLimits, control: &mut impl DecodeStepControl)
     -> Result<ExtractionBatchArgs, Failure> {
     let original = RootObjectSchema::derive(&schema, command.object.map.extraction.compiler(),
@@ -124,7 +124,7 @@ fn source_request(command: &SemanticObjectArgs, options: &Int4SemanticOptions, s
         error => error.into(),
     })
 }
-fn caller_preparation_bytes(command: &SemanticObjectArgs, common: Int4Limits) -> Result<u64, Failure> {
+pub(super) fn caller_preparation_bytes(command: &SemanticObjectArgs, common: Int4Limits) -> Result<u64, Failure> {
     // Original/partial schema derivation occurs before hosted preparation.
     // Keep its independent declaration-based charge alive through that phase;
     // a tiny result cap cannot hide a large optional schema or grammar bound.
@@ -132,7 +132,7 @@ fn caller_preparation_bytes(command: &SemanticObjectArgs, common: Int4Limits) ->
         .map_err(|_| CandidateError::Memory)?;
     sum(&[common.preparation_bytes, OPTIONS_BYTES as u64 * 16, schemas]).map_err(Failure::from)
 }
-fn host_limits(args: &Int4Args, command: &SemanticObjectArgs,
+pub(super) fn host_limits(args: &Int4Args, command: &SemanticObjectArgs,
     limits: extract_map::object::ObjectMapLimits, options: &Int4SemanticOptions,
     review: Int4FaithfulnessMapLimits, remaining: Duration) -> Int4SemanticObjectDocumentHostLimits {
     Int4SemanticObjectDocumentHostLimits {
@@ -159,7 +159,7 @@ fn admit_memory(args: &Int4Args, mut common: Int4Limits,
     if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Memory.into()); }
     Ok(common)
 }
-fn read_local(path: &std::path::Path, cap: usize, remaining: &impl Fn() -> Result<Duration, Failure>)
+pub(super) fn read_local(path: &std::path::Path, cap: usize, remaining: &impl Fn() -> Result<Duration, Failure>)
     -> Result<String, Failure> {
     remaining()?;
     let text = read_input(&mut crate::local_io::open_document(path).map_err(|_| CandidateError::Input)?, cap)?;
@@ -169,7 +169,7 @@ fn read_local(path: &std::path::Path, cap: usize, remaining: &impl Fn() -> Resul
 fn semantic_error(error: Int4SemanticError) -> Failure {
     error.cancellation().map(cancelled).unwrap_or_else(|| CandidateError::Planning.into())
 }
-fn cancelled(cause: DecodeCancellationKind) -> Failure {
+pub(super) fn cancelled(cause: DecodeCancellationKind) -> Failure {
     use DecodeCancellationKind::*;
     let (exit, code) = match cause {
         Timeout | Deadline | PollQuota | CostBudget => (ErrorCode::BudgetOrTimeout, "semantic_object_map_budget"),
@@ -180,7 +180,7 @@ fn cancelled(cause: DecodeCancellationKind) -> Failure {
     };
     Failure { exit, code, cancellation: Some(cause) }
 }
-fn host_error(error: HostedError) -> Failure {
+pub(super) fn host_error(error: HostedError) -> Failure {
     match error {
         HostedError::Join { physical_error: Some(error), .. }
             | HostedError::Scope { physical_error: Some(error), .. } => host_error(*error),
@@ -235,7 +235,7 @@ fn host_error(error: HostedError) -> Failure {
         _ => CandidateError::Execution.into(),
     }
 }
-fn publish<T: Serialize>(response: &T, cap: usize, output: &mut impl Write,
+pub(super) fn publish<T: Serialize>(response: &T, cap: usize, output: &mut impl Write,
     remaining: &impl Fn() -> Result<Duration, Failure>, cancellation: &CancellationToken)
     -> Result<(), Failure> {
     publish_checked(response, cap, output, &|| {
