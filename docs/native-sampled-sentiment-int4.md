@@ -65,6 +65,65 @@ alongside the axis prompt and generated tokens. Increase the explicitly
 admitted context for larger documents; this route does not chunk or truncate.
 Prompt-injection resistance and explanation quality require empirical tests.
 
+## Selected output rows
+
+All sampled command families accept `--max-selected-rows N`, with
+`N` from 1 through 166144:
+
+| Command | Fixed policy scope |
+| --- | --- |
+| `sentiment-sampled` | Every axis and independent sample in one request |
+| `sentiment-sampled-map` | Every source chunk, axis and independent sample |
+| `sentiment-sampled-batch` | Every record and flush in the resident single-context stream |
+| `sentiment-sampled-corpus` | Every complete document in the resident stream |
+| `sentiment-sampled-job` (`start` / `resume`) | The authenticated retained single-context population |
+| `sentiment-sampled-document-job` (`start` / `resume`) | The authenticated retained complete-document population |
+
+For example, the one-request route can select legal rows and reuse its private
+axis prefixes with a persistent numerical team:
+
+```sh
+fnlp candidate source-int4 sentiment-sampled sentiment-request.json \
+  --snapshot /path/to/local-int4-snapshot \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --memory-mib "$MEMORY_MIB" \
+  --seed 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --max-selected-rows 4096 --compute-threads 4 --reuse-prefill
+```
+
+Every grammar-legal row, including accepting EOS, is projected before the
+existing temperature, top-k and top-p policy runs. If the complete legal set
+exceeds the cap, the sample refuses before that projection. The strategy does
+not prune the grammar, replace top-k, fall back to the full head or retry.
+Explanation strings can have wide legal sets, so the example cap does not
+guarantee that a request will complete. One failed sample still prevents a
+complete bundle or document from committing.
+
+The cap and selected execution version bind admission and private durable
+recipes. Repeat the exact cap on resume: adding, removing or changing the
+policy refuses before tail repair or pending execution. A full-vocabulary-sized
+selected cap is still a distinct policy. Semantic draw addresses retain the
+original request/item/chunk/axis/sample identity, independently of the selected
+head cap, scheduling width and prefix reuse. This preserves draw addressing;
+model-present output parity remains a separate qualification gate.
+
+Planned projected rows use the cap for every allowed output token; actual work
+counts every projected legal row. Transformer/attention work and complete mask
+allowances remain charged. Full decoder, KV, sampler, output and host storage
+stay admitted; selecting fewer rows grants no memory discount. Existing native
+and mask ceilings remain scoped to the complete request, document, stream or
+job lifetime. Prefix reuse retains conservative cold-work admission. Compact
+input and each existing physical schedule remain available under their current
+limits, including the exclusion between nonserial teams and layer-major prefill.
+
+Public CLI metadata adds `max_selected_rows` only when requested; full-head
+defaults retain their existing shape and recipes. Raw seeds, request bindings
+and private draw digests remain absent. Library callers apply
+`SampledSentimentPlanner::with_selected_rows` before planning or constructing
+batch/job adapters. Whole-document hosted callers set
+`SampledSentimentMapHostConfig.selected_rows`. No throughput, task-quality or
+full-vocabulary probability-mass claim follows from this candidate integration.
+
 ## Compact input and persistent CPU workers
 
 The explicit options can be used together with either pinned source conversion
@@ -171,8 +230,9 @@ Per-sample and complete-bundle `model_work` report executed work. For a prompt
 of P tokens and a completed sample of G generated tokens, including EOS, the
 first sample forwards P + G − 1 positions; every later sample forwards G
 positions starting at logical position P − 1. Attention accounting includes
-the retained prompt prefix. Full-vocabulary output projections and mask
-charges still occur for every generated token, including the scored EOS.
+the retained prompt prefix. Output projections and mask charges still occur
+for every generated token, including the scored EOS. Projection uses the full
+vocabulary by default or every legal row under the explicit selected-row cap.
 For N samples this avoids (N − 1) × (P − 1) forward positions per axis. This is
 work accounting, not a measured latency or quality claim.
 

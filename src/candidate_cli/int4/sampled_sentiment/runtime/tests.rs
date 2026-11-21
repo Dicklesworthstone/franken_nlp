@@ -106,7 +106,7 @@ fn optional_encoding_and_compute_metadata_leave_default_result_bytes_unchanged()
         task: "sentiment-sampled", model_id: "Nanbeige4.2-3B", source_revision: "fixture",
         source_root_sha256: "fixture-source", model_content_sha256: "fixture-model",
         candidate_format: "fixture-format", quant_recipe: "fixture-recipe", group_width: 128,
-        integer_kernel: "s_scalar_i32", snapshot: None,
+        integer_kernel: "s_scalar_i32", snapshot: None, max_selected_rows: None,
     };
     let response = Response { provenance: &provenance, output: &output };
     let mut original = Vec::new();
@@ -116,6 +116,8 @@ fn optional_encoding_and_compute_metadata_leave_default_result_bytes_unchanged()
         response: &response, compute: None }, input_encoding: None },
         4096, &mut serial, &|| Ok(())).unwrap();
     assert_eq!(serial, original);
+    let baseline: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    assert!(baseline.get("max_selected_rows").is_none());
     let receipt = crate::hosted::Int4ComputeReceipt { schedule: "int4-output-row-team-v1",
         compute_threads: 4, completed_projections: 31, completed_rows: 1000, completed_worker_rows: 750 };
     let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 4096,
@@ -139,6 +141,10 @@ fn optional_encoding_and_compute_metadata_leave_default_result_bytes_unchanged()
             Err(CandidateError::Timeout));
         assert!(refused.is_empty());
     }
+    let selected = Provenance { max_selected_rows: Some(4096), ..provenance };
+    let mut metadata = serde_json::to_value(Response { provenance: &selected, output: &output }).unwrap();
+    assert_eq!(metadata.as_object_mut().unwrap().remove("max_selected_rows"), Some(serde_json::json!(4096)));
+    assert_eq!(metadata, baseline);
 }
 
 #[test]
@@ -161,6 +167,7 @@ fn complete_optional_metadata_fits_the_admitted_envelope_above_an_exact_result_c
         integer_kernel: Int8KernelKind::ALL.into_iter().max_by_key(|kind| kind.id().len()).unwrap().id(),
         snapshot: Some(SnapshotRecord { operation: "loaded", format: INT4_SNAPSHOT_VERSION,
             file_bytes: u64::MAX }),
+        max_selected_rows: Some(166144),
     };
     let receipt = crate::hosted::Int4ComputeReceipt { schedule: "int4-output-row-team-v1",
         compute_threads: 64, completed_projections: u64::MAX, completed_rows: u64::MAX,

@@ -23,12 +23,11 @@ use crate::{
     grammar::mask::MaskWorkLimits,
     native_engine::{
         constrained::JsonWorkBudget,
-        constrained_int4::{Int4JsonBudget, json_sampling_workspace_bytes},
+        constrained_int4::{Int4JsonBudget, json_sampling_workspace_bytes, sparse::Int4JsonSparseLimits},
         strict_int4::{Int4Work, prefill::Int4PrefillLimits},
     },
     tasks::{ir::TaskBudget, sentiment::sampled::{PreparedSampledSentiment,
-        SampledSentimentError, SampledSentimentRun, SampledSentimentVocabulary,
-        SAMPLED_SENTIMENT_EXECUTION, SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION}},
+        SampledSentimentError, SampledSentimentRun, SampledSentimentVocabulary}},
 };
 
 /// All work ceilings apply to the whole axis-by-sample bundle. Preparation
@@ -217,14 +216,26 @@ fn execute_prepared(prepared: &PreparedSampledSentiment, vocabulary: &SampledSen
                 vocabulary, budget, limits.max_sampler_bytes, prefill, control),
         }
     }.map_err(task_error)?;
-    let execution = if reuse_prefill { SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION }
-        else { SAMPLED_SENTIMENT_EXECUTION };
+    let execution = prepared.execution_version(reuse_prefill);
     if run.execution != execution || !fits(run.model_work, work) || run.group_width != prepared.group_width()
         || engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) {
         return Err(HostedError::Limits("sampled sentiment completion accounting"));
     }
     checkpoint(control)?;
     Ok(run)
+}
+
+// The sealed plan reserves every possible generation step at the declared
+// projection width. Early EOS and smaller actual legal sets never lower this
+// cold attempt debit, and selected execution does not shrink native buffers.
+fn projection_matches(work: Int4Work, max_output_tokens: u64,
+    selected: Option<Int4JsonSparseLimits>) -> bool {
+    let rows = match selected {
+        Some(limits) => match limits.validate() { Ok(rows) => rows, Err(_) => return false },
+        None => crate::native_engine::lmhead::NANBEIGE_VOCAB_SIZE,
+    };
+    max_output_tokens != 0
+        && max_output_tokens.checked_mul(rows as u64) == Some(work.projected_logits)
 }
 
 fn execution_budget(work: Int4Work, kv_bytes: u64, limits: SampledSentimentHostLimits)

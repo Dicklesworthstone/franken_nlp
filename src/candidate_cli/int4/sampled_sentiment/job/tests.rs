@@ -45,6 +45,41 @@ impl Write for NoIo {
 }
 
 #[test]
+fn selected_sample_jobs_preserve_seed_retained_owners_and_lifetime_head_caps() {
+    for route in 0..3 { for operation in ["start", "resume"] {
+        for schedule in [&[][..], &["--reuse-prefill", "--compute-threads", "4"][..],
+            &["--reuse-prefill", "--prefill-rows", "4", "--input-encoding", "safe-bpe-v1"][..]] {
+            let mut flags = schedule.to_vec();
+            flags.extend([if operation == "start" { "--spool-input" } else { "--use-retained-input" },
+                "--max-retained-input-mib", "16", "--max-projected-logits", "16777216"]);
+            let (dense, dense_args) = command(operation, route, &flags);
+            let baseline = dense.args.validate(&dense_args).unwrap();
+            flags.extend(["--max-selected-rows", "4096"]);
+            let (selected, args) = command(operation, route, &flags);
+            selected.args.storage.input_retention.validate(selected.mode, &args.input).unwrap();
+            let common = selected.args.validate(&args).unwrap();
+            let fixed = lifetime(&args, &selected, common);
+            let before = dense.args.lifetime_limits(&dense_args, baseline, fixed).unwrap();
+            let admitted = selected.args.lifetime_limits(&args, common, fixed).unwrap();
+            assert_eq!(selected.args.sampled.options(&args).unwrap(), dense.args.sampled.options(&dense_args).unwrap());
+            assert_eq!(selected.args.sampled.selected_rows().unwrap(), Some(Int4JsonSparseLimits { max_rows_per_step: 4096 }));
+            assert_eq!(admitted.native.max_item_work.projected_logits, 16_777_216);
+            assert_eq!(admitted.native.max_model_work, fixed.max_work.int4_model_work());
+            assert_eq!(admitted.native.masks.max_visits_per_run, fixed.max_work.mask_node_visits);
+            assert_eq!(admitted.common.minimum_memory_bytes, before.common.minimum_memory_bytes);
+            assert_eq!(admitted.common.native, before.common.native);
+            assert_eq!(admitted.buffer_bytes, before.buffer_bytes);
+            assert_eq!(admitted.execution_bytes, before.execution_bytes);
+            assert_eq!(admitted.native.max_sampler_bytes, before.native.max_sampler_bytes);
+            let mut more = fixed; more.max_items *= 2; more.max_attempts *= 2;
+            let resumed = selected.args.lifetime_limits(&args, common, more).unwrap();
+            assert_eq!(resumed.native.max_model_work, admitted.native.max_model_work);
+            assert_eq!(resumed.native.masks.max_visits_per_run, admitted.native.masks.max_visits_per_run);
+        }
+    } }
+}
+
+#[test]
 fn job_prefill_reuse_preserves_cold_lifetime_debits_and_admission_on_every_route() {
     for route in 0..3 { for operation in ["start", "resume"] {
       for flags in [

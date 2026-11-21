@@ -83,6 +83,19 @@ struct MapLimits {
 }
 
 impl MapArgs {
+    #[cfg(any(feature = "asupersync-runtime", test))]
+    fn execution(self) -> &'static str {
+        use crate::tasks::sentiment::sampled::long::{SAMPLED_SENTIMENT_MAP_EXECUTION,
+            SAMPLED_SENTIMENT_MAP_REUSED_PREFILL_EXECUTION, SAMPLED_SENTIMENT_MAP_SPARSE_EXECUTION,
+            SAMPLED_SENTIMENT_MAP_SPARSE_REUSED_PREFILL_EXECUTION};
+        match (self.sampled.max_selected_rows.is_some(), self.sampled.reuse_prefill) {
+            (false, false) => SAMPLED_SENTIMENT_MAP_EXECUTION,
+            (false, true) => SAMPLED_SENTIMENT_MAP_REUSED_PREFILL_EXECUTION,
+            (true, false) => SAMPLED_SENTIMENT_MAP_SPARSE_EXECUTION,
+            (true, true) => SAMPLED_SENTIMENT_MAP_SPARSE_REUSED_PREFILL_EXECUTION,
+        }
+    }
+
     pub(in crate::candidate_cli::int4) fn from_matches(matches: &clap::ArgMatches)
         -> Result<Self, clap::Error> {
         Ok(Self { sampled: SampledArgs::from_matches(matches)?,

@@ -40,6 +40,46 @@ fn identity() -> ExecutionIdentity {
         calibration_digest: digest, decision_policy_digest: digest, backend_semantic_version: STRICT_INT4_EXECUTION.to_owned(),
         host_class: None, compiler_identity: None }
 }
+
+#[test]
+fn actual_complete_document_planning_carries_selected_cap_across_every_original_chunk() {
+    use crate::native_engine::{lmhead::NANBEIGE_VOCAB_SIZE, strict_int4::weights::projection_fixture};
+    let (model, _) = projection_fixture(32);
+    let vocabulary = Arc::new(SampledSentimentVocabulary::pinned().unwrap());
+    let task = TaskBudget { max_input_tokens: 4096, max_output_tokens: 1024,
+        max_output_bytes: 65_536, max_grammar_states: 4096, max_kv_bytes: 1 << 30 };
+    let options = SampledSentimentOptions { effective_seed: [17; 32], samples: 2,
+        temperature_milli: 1000, top_k: None, top_p_ppm: 1_000_000,
+        max_sample_tokens: 64, max_justification_chars: 64 };
+    let work = Int4Work::for_sequence(32, 0, 32768, 4096 * NANBEIGE_VOCAB_SIZE).unwrap();
+    let mapping = SampledSentimentMapLimits { chunks: ChunkLimits { max_input_bytes: 4096,
+        max_chunk_bytes: 512, max_chunk_tokens: 512, context_tokens: 4096,
+        reserved_tokens: 1536, max_chunks: 2, max_tokenizer_calls: 64 },
+        max_model_work: work, max_retained_result_bytes: 1 << 20, max_result_bytes: 2 << 20 };
+    let native = SampledSentimentBatchLimits { max_item_work: work,
+        max_model_work: work.checked_add(work).unwrap(), ..limits(2) };
+    let make = |projection: Option<Int4JsonSparseLimits>| {
+        let planner = SampledSentimentPlanner::for_model(model.identity(), options.clone(), task,
+            SampledSentimentLimits::default()).unwrap();
+        let planner = match projection { Some(cap) => planner.with_selected_rows(cap).unwrap(), None => planner };
+        SampledSentimentDocumentPlanner::new(planner, Arc::clone(&vocabulary), task, mapping, native).unwrap()
+    };
+    let document = || BatchDocument { id: "stable-complete-item".to_owned(), text: "good.".repeat(120),
+        task_args: Some(SampledSentimentBatchArgs { axes: vec![SentimentAxis::Valence], budget: None }) };
+    let dense = make(None); let dense_plan = dense.prepare(document(), &mut Continue).unwrap();
+    let selected = Int4JsonSparseLimits { max_rows_per_step: 4096 };
+    let sparse = make(Some(selected)); let sparse_plan = sparse.prepare(document(), &mut Continue).unwrap();
+    let facts = DocumentPlan::facts(&sparse_plan);
+    assert_eq!(facts.chunk_count, 2); assert_eq!(facts.sample_count, 4);
+    assert_eq!(facts.selected_rows, Some(selected)); assert_eq!(sparse.selected_rows(), Some(selected));
+    assert_eq!(facts.max_output_tokens, 4 * 64);
+    assert_eq!(facts.model_work.projected_logits, facts.max_output_tokens * 4096);
+    assert_eq!(facts.model_work.forward_positions, dense_plan.planned_work().forward_positions);
+    assert_eq!(facts.model_work.attention_pairs, dense_plan.planned_work().attention_pairs);
+    assert!(facts.model_work.projections.multiply_accumulates < dense_plan.planned_work().projections.multiply_accumulates);
+    assert_eq!(sparse.preparation_requirement_bytes(), dense.preparation_requirement_bytes());
+    assert_ne!(sparse.base_execution_identity(), dense.base_execution_identity());
+}
 fn context(sequence: u64, epoch: u64) -> BatchRequestContext {
     BatchRequestContext { request_seq: sequence, epoch, input_line: sequence, byte_offset: 0 }
 }
@@ -61,7 +101,7 @@ impl DocumentPlan for FixturePlan {
     fn facts(&self) -> SampledSentimentDocumentPlanFacts<'_> {
         SampledSentimentDocumentPlanFacts { identity: &self.identity, model_work: work(1), group_width: 32,
             sample_count: 2, chunk_count: 2, required_context: self.context, original_task: task(),
-            max_result_bytes: 16_384, max_output_tokens: 32, preparation_bytes: 1024 }
+            max_result_bytes: 16_384, max_output_tokens: 32, selected_rows: None, preparation_bytes: 1024 }
     }
     fn verify_identity(&self, admitted: &ExecutionIdentity) -> Result<(), BatchItemFailure> {
         if admitted == &self.identity { Ok(()) } else { Err(BatchItemFailure::fatal(BatchCode::Admission)) }

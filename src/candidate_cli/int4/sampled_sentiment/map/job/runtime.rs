@@ -14,8 +14,7 @@ use crate::{
     native_engine::{decode::DecodeCancellationKind,
         strict_int4::{prefill::INT4_LAYER_MAJOR_PREFILL_VERSION,
             weights::snapshot::INT4_SNAPSHOT_VERSION}},
-    tasks::sentiment::sampled::{SampledSentimentPlanner, SampledSentimentVocabulary,
-        long::SAMPLED_SENTIMENT_MAP_REUSED_PREFILL_EXECUTION},
+    tasks::sentiment::sampled::{SampledSentimentPlanner, SampledSentimentVocabulary},
 };
 
 pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, job: JobArgs,
@@ -52,6 +51,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
     let compiler = SampledSentimentPlanner::for_model(model.model_identity(), options,
         limits.task, limits.planning).map_err(task_failure)?
         .with_input_encoding(encoding.clone()).map_err(task_failure)?;
+    let compiler = job.document.sampled.configure_planner(compiler)?;
     let vocabulary = Arc::new(SampledSentimentVocabulary::pinned().map_err(task_failure)?);
     remaining()?;
     let planner = SampledSentimentDocumentJobPlanner::new(compiler, vocabulary, limits.mapping,
@@ -66,12 +66,13 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
     planner.check_job_limits(lifetime).map_err(batch_failure)?;
     if planner.preparation_requirement_bytes() != limits.preparation_reserve_bytes
         || planner.max_result_bytes() != limits.memory.max_output_bytes
+        || planner.selected_rows() != job.document.sampled.selected_rows()?
         || planner.document_encoding() != &encoding {
         return Err(Failure::output("sampled_document_job_planner_quote"));
     }
     let identity = planner.base_execution_identity().clone();
     let snapshot = common.snapshot_pin.map(|_| SnapshotRecord::new(common.snapshot_need));
-    let reuse_prefill = job.document.sampled.reuse_prefill;
+    let prefill_reuse = job.document.sampled.reuse_prefill.then_some(job.document.execution());
     remaining()?;
     let reader = job_cli::population_reader(mode, job.storage.input_retention, &args.input, input, IO_BUFFER_BYTES)
         .map_err(storage_failure)?;
@@ -104,7 +105,8 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         input_encoding: input_encoding::reported_policy(&encoding),
         compute_schedule: compute::Schedule::for_threads(common.compute.threads),
         prefill_schedule: common.prefill.map(PrefillSchedule::new).transpose()?,
-        prefill_reuse: reuse_prefill.then_some(SAMPLED_SENTIMENT_MAP_REUSED_PREFILL_EXECUTION),
+        prefill_reuse,
+        max_selected_rows: job.document.sampled.max_selected_rows,
         output: &report,
     };
     // Metadata delivery can fail after durable progress. Keep the original
@@ -245,6 +247,8 @@ struct Response<'a, T: Serialize> {
     prefill_schedule: Option<PrefillSchedule>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefill_reuse: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_selected_rows: Option<usize>,
     output: &'a T,
 }
 

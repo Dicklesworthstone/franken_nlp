@@ -223,7 +223,8 @@ impl<R: BufRead> JobExecution<R> {
             native.commit()?;
             let admission = DocumentAdmission::for_job(&lease, weights.identity(), limits.native.context_tokens,
                 need.native.kv_bytes, mapping, work, limits.preparation_reserve_bytes,
-                need.output_reservation_bytes, need.max_output_bytes, need.max_output_tokens);
+                need.output_reservation_bytes, need.max_output_bytes, need.max_output_tokens,
+                planner.selected_rows());
             let result = (|| {
                 let processor = SampledSentimentDocumentJobProcessor::new(planner, &mut engine, admission)
                     .map_err(JobRunError::Processor)?;

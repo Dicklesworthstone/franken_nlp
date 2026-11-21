@@ -24,6 +24,91 @@ impl Read for NoRead {
 }
 
 #[test]
+fn selected_rows_preserve_exact_sampling_and_full_memory_on_every_single_request_schedule() {
+    use crate::tasks::sentiment::sampled::{SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION,
+        SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION};
+    for compact in [false, true] { for route in 0..3 {
+        for schedule in [&[][..], &["--reuse-prefill"][..], &["--compute-threads", "4"][..],
+            &["--reuse-prefill", "--compute-threads", "4"][..], &["--prefill-rows", "4"][..],
+            &["--reuse-prefill", "--prefill-rows", "4"][..]] {
+            let mut flags = schedule.to_vec();
+            if compact { flags.extend(["--input-encoding", "safe-bpe-v1"]); }
+            let (mut args, dense) = command(&flags);
+            if route == 1 { args.save_snapshot = Some(PathBuf::from("new-private-snapshot")); }
+            if route == 2 {
+                args.source_dir = None; args.source_manifest = None;
+                args.snapshot = Some(PathBuf::from("private-snapshot"));
+                args.expected_model_sha256 = Some(SEED.to_owned());
+            }
+            flags.extend(["--max-selected-rows", "4096"]);
+            let (_, selected) = command(&flags);
+            let baseline = dense.validate(&args).unwrap();
+            let admitted = selected.validate(&args).unwrap();
+            assert_eq!(dense.selected_rows().unwrap(), None);
+            assert_eq!(selected.selected_rows().unwrap(), Some(Int4JsonSparseLimits { max_rows_per_step: 4096 }));
+            assert_eq!(selected.options(&args).unwrap(), dense.options(&args).unwrap());
+            assert_eq!(selected.budget(&args, admitted, 4).unwrap(), dense.budget(&args, baseline, 4).unwrap());
+            assert_eq!(selected.work_ceiling(), dense.work_ceiling());
+            assert_eq!(selected.masks(), dense.masks());
+            assert_eq!(selected.max_mask_node_visits, dense.max_mask_node_visits);
+            assert_eq!(admitted.native, baseline.native);
+            assert_eq!(admitted.compute, baseline.compute);
+            assert_eq!(admitted.preparation_bytes, baseline.preparation_bytes);
+            assert_eq!(admitted.minimum_memory_bytes, baseline.minimum_memory_bytes);
+            assert_eq!(selected.prefill_reuse_execution(),
+                selected.reuse_prefill.then_some(SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION));
+            assert_eq!(dense.prefill_reuse_execution(),
+                dense.reuse_prefill.then_some(SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION));
+        }
+    } }
+}
+
+#[test]
+fn every_sampled_family_refuses_invalid_selected_policy_before_any_private_io() {
+    struct NoWrite;
+    impl Write for NoWrite {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("refused sampled command published output"); }
+        fn flush(&mut self) -> io::Result<()> { panic!("refused sampled command flushed output"); }
+    }
+    for (task, operation) in [
+        ("sentiment-sampled", None), ("sentiment-sampled-map", None),
+        ("sentiment-sampled-batch", None), ("sentiment-sampled-corpus", None),
+        ("sentiment-sampled-job", Some("start")), ("sentiment-sampled-job", Some("resume")),
+        ("sentiment-sampled-document-job", Some("start")),
+        ("sentiment-sampled-document-job", Some("resume")),
+    ] {
+        let mut words = vec!["candidate", "source-int4", task];
+        if let Some(operation) = operation { words.push(operation); }
+        words.extend(["--source-dir", "private-source", "--source-manifest", "private-manifest",
+            "--memory-mib", "131072", "--seed", SEED]);
+        if operation.is_some() {
+            words.extend(["--store-results", "--job-dir", "private-job", "--key-file", "private-key",
+                "--limits", "private-limits", "--job-id", "0123456789abcdef0123456789abcdef"]);
+        }
+        for cap in ["1", "166144"] {
+            let mut valid = words.clone(); valid.extend(["--max-selected-rows", cap]);
+            let matches = crate::candidate_cli::definition().try_get_matches_from(valid).unwrap();
+            assert!(CandidateCommand::from_matches(&matches).is_ok());
+        }
+        for flags in [&["--max-selected-rows", "0"][..], &["--max-selected-rows", "166145"][..],
+            &["--max-selected-rows", "18446744073709551615"][..],
+            &["--max-selected-rows", "18446744073709551616"][..],
+            &["--max-selected-rows", "4096", "--compute-threads", "2", "--prefill-rows", "4"][..]] {
+            let mut invalid = words.clone(); invalid.extend_from_slice(flags);
+            if let Ok(matches) = crate::candidate_cli::definition().try_get_matches_from(invalid) {
+                let CandidateCommand::SourceInt4(command) = CandidateCommand::from_matches(&matches).unwrap()
+                    else { panic!("selected policy escaped the INT4 dispatcher"); };
+                let mut diagnostics = Vec::new();
+                assert_eq!(command.run_owned(NoRead, NoWrite, &mut diagnostics), ErrorCode::Usage.as_process_exit(),
+                    "{task} {operation:?} {flags:?}");
+                let text = String::from_utf8(diagnostics).unwrap();
+                assert!(!text.contains("private-") && !text.contains(SEED));
+            }
+        }
+    }
+}
+
+#[test]
 fn prompt_reuse_is_explicit_and_preserves_cold_admission_and_sampling_policy() {
     assert!(!command(&[]).1.reuse_prefill);
     for flags in [

@@ -29,6 +29,32 @@ impl Write for NoWrite {
 }
 
 #[test]
+fn selected_complete_maps_preserve_all_chunk_memory_and_sampling_limits() {
+    use crate::tasks::sentiment::sampled::long::{SAMPLED_SENTIMENT_MAP_SPARSE_EXECUTION,
+        SAMPLED_SENTIMENT_MAP_SPARSE_REUSED_PREFILL_EXECUTION};
+    for flags in [&[][..], &["--reuse-prefill"][..], &["--compute-threads", "4"][..],
+        &["--reuse-prefill", "--prefill-rows", "4", "--input-encoding", "safe-bpe-v1"][..]] {
+        let (args, dense) = command(flags);
+        let baseline = dense.validate(&args).unwrap();
+        for cap in [1, 4096, 166144] {
+            let mut selected = dense; selected.sampled.max_selected_rows = Some(cap);
+            let admitted = selected.validate(&args).unwrap();
+            assert_eq!(admitted.memory, baseline.memory);
+            assert_eq!(admitted.common.minimum_memory_bytes, baseline.common.minimum_memory_bytes);
+            assert_eq!(admitted.cli_preparation_bytes, baseline.cli_preparation_bytes);
+            assert_eq!(admitted.envelope_bytes, baseline.envelope_bytes);
+            assert_eq!(admitted.mapping.max_model_work, baseline.mapping.max_model_work);
+            assert_eq!(admitted.planning.max_total_prompt_tokens, baseline.planning.max_total_prompt_tokens);
+            assert_eq!(selected.input_encoding(&args).unwrap(), dense.input_encoding(&args).unwrap());
+            assert_eq!(selected.sampled.options(&args).unwrap(), dense.sampled.options(&args).unwrap());
+            assert_eq!(selected.execution(), if selected.sampled.reuse_prefill {
+                SAMPLED_SENTIMENT_MAP_SPARSE_REUSED_PREFILL_EXECUTION
+            } else { SAMPLED_SENTIMENT_MAP_SPARSE_EXECUTION });
+        }
+    }
+}
+
+#[test]
 fn map_dispatch_requires_a_seed_and_preserves_explicit_sample_controls() {
     let (args, options) = command(&["complete-request.json", "--samples", "3",
         "--temperature-milli", "700", "--top-k", "17", "--top-p-ppm", "800000",

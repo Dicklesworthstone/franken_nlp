@@ -32,7 +32,7 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
             .mut_arg("max_result_bytes", |arg| arg.help("Complete sample bundle per chunk; --max-map-result-bytes caps the committed document"))
             .mut_arg("max_map_result_bytes", |arg| arg.help("Complete committed document result; must fit JobLimits.max_result_bytes"))
             .mut_arg("max_forward_positions", |arg| arg.help("Per-document cold forward ceiling across every chunk, axis and sample"))
-            .mut_arg("max_projected_logits", |arg| arg.help("Per-document full-vocabulary projection ceiling"))
+                .mut_arg("max_projected_logits", |arg| arg.help("Per-document projected output-row ceiling"))
             .mut_arg("max_attention_pairs", |arg| arg.help("Per-document attention-pair ceiling"))
             .mut_arg("max_dot_products", |arg| arg.help("Per-document grouped dot-product ceiling"))
             .mut_arg("max_multiply_accumulates", |arg| arg.help("Per-document multiply-accumulate ceiling"))

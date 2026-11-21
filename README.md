@@ -1177,6 +1177,17 @@ versioned prompt and sampler; existing distribution sentiment is unchanged.
 See [sampled sentiment usage and limits](docs/native-sampled-sentiment-int4.md)
 for commands, result fields, reproducibility, admission and validation status.
 
+Every sampled route described here accepts explicit `--max-selected-rows N`,
+from 1 through 166144. It projects the complete grammar-legal set, including
+accepting EOS, before applying top-k/top-p sampling; an over-cap step refuses
+without pruning, fallback or retry. Semantic sample addresses stay fixed,
+while the exact cap binds execution and authenticated resume. Full native,
+sampler, KV and output memory stay reserved. The option composes with compact
+input, CPU teams, serial layer-major prefill and private prefix reuse; selected
+metadata adds only the public row cap. Repeat the cap on durable resume.
+See [selected sampled output rows](docs/native-sampled-sentiment-int4.md#selected-output-rows)
+for all six command families and the separate model-parity/performance gates.
+
 `sentiment-sampled-map` extends independent sampled scoring to complete
 documents that exceed one native context. It prepares every lossless source
 chunk before inference, gives repeated equal-text chunks distinct private draw

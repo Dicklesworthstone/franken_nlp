@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     candidate_cli::stream::Failure,
     grammar::{CompileLimits, mask::MaskWorkLimits},
-    native_engine::{constrained_int4::json_sampling_workspace_bytes,
+    native_engine::{constrained_int4::{json_sampling_workspace_bytes, sparse::Int4JsonSparseLimits},
         portable_int8::ProjectionWork, strict_int4::Int4Work},
     tasks::{ir::TaskBudget, sentiment::{SentimentAxis, SentimentRequest,
         sampled::{SampledSentimentLimits, SampledSentimentOptions}}},
@@ -25,6 +25,15 @@ const UNSUPPORTED: &[&str] = &[
 
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SampledArgs {
+    /// Project every legal grammar row; 1..=166144 rows per step including accepting EOS.
+    ///
+    /// The complete legal set must fit before top-k/top-p sampling. An over-cap
+    /// step refuses without pruning, dense fallback or retry. The exact cap
+    /// binds execution and durable resume policy while semantic sample addresses
+    /// remain unchanged. Repeat it on resume; per-record arguments cannot replace
+    /// it. Full decoder/KV/sampler memory and grammar-mask allowances stay reserved.
+    #[arg(long)]
+    max_selected_rows: Option<usize>,
     /// Prefill each axis once; retain its private causal prefix across samples.
     /// Private to one document and axis. Cold work admission is unchanged.
     #[arg(long)]
@@ -76,9 +85,30 @@ pub(super) fn definition() -> clap::Command {
 }
 
 impl SampledArgs {
+    fn selected_rows(self) -> Result<Option<Int4JsonSparseLimits>, CandidateError> {
+        self.max_selected_rows.map(|max_rows_per_step| {
+            let limits = Int4JsonSparseLimits { max_rows_per_step };
+            limits.validate().map_err(|_| CandidateError::Arguments)?;
+            Ok(limits)
+        }).transpose()
+    }
+
+    #[cfg(any(feature = "asupersync-runtime", test))]
+    fn configure_planner(self, planner: crate::tasks::sentiment::sampled::SampledSentimentPlanner)
+        -> Result<crate::tasks::sentiment::sampled::SampledSentimentPlanner, CandidateError> {
+        if planner.selected_rows().is_some() { return Err(CandidateError::Planning); }
+        match self.selected_rows()? {
+            Some(limits) => planner.with_selected_rows(limits).map_err(|_| CandidateError::Planning),
+            None => Ok(planner),
+        }
+    }
+
     fn prefill_reuse_execution(self) -> Option<&'static str> {
-        self.reuse_prefill.then_some(
-            crate::tasks::sentiment::sampled::SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION)
+        use crate::tasks::sentiment::sampled::{SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION,
+            SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION};
+        self.reuse_prefill.then_some(if self.max_selected_rows.is_some() {
+            SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION
+        } else { SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION })
     }
 
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
@@ -105,6 +135,7 @@ impl SampledArgs {
     }
 
     pub(super) fn validate(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
+        self.selected_rows()?;
         self.options(args)?;
         self.task_limits(args).validate().map_err(|_| CandidateError::Arguments)?;
         if !(1..=32).contains(&self.samples) || !(1..=1024).contains(&args.max_new_tokens)

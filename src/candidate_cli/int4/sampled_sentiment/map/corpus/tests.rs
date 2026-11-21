@@ -16,6 +16,35 @@ pub(super) fn command(extra: &[&str], snapshot: bool) -> (Int4Args, CorpusArgs) 
 }
 
 #[test]
+fn selected_document_stream_keeps_distinct_item_and_run_head_ceilings_without_memory_discount() {
+    for snapshot in [false, true] { for schedule in [&[][..],
+        &["--reuse-prefill", "--compute-threads", "4"][..],
+        &["--reuse-prefill", "--prefill-rows", "4", "--input-encoding", "safe-bpe-v1"][..]] {
+        let (dense_args, dense) = command(schedule, snapshot);
+        let baseline = dense.validate(&dense_args).unwrap();
+        let mut flags = schedule.to_vec();
+        flags.extend(["--max-selected-rows", "4096", "--max-projected-logits", "33554432",
+            "--max-document-projected-logits", "16777216"]);
+        let (args, selected) = command(&flags, snapshot);
+        let admitted = selected.validate(&args).unwrap();
+        assert_eq!(selected.document.sampled.selected_rows().unwrap(),
+            Some(Int4JsonSparseLimits { max_rows_per_step: 4096 }));
+        assert_eq!(selected.document.sampled.options(&args).unwrap(), dense.document.sampled.options(&dense_args).unwrap());
+        assert_eq!(admitted.memory, baseline.memory);
+        assert_eq!(admitted.common.minimum_memory_bytes, baseline.common.minimum_memory_bytes);
+        assert_eq!(admitted.cli_preparation_bytes, baseline.cli_preparation_bytes);
+        assert_eq!(admitted.native.max_sampler_bytes, baseline.native.max_sampler_bytes);
+        assert_eq!(admitted.native.max_item_work.projected_logits, 16_777_216);
+        assert_eq!(admitted.document.mapping.max_model_work, admitted.native.max_item_work);
+        assert_eq!(admitted.native.max_model_work.projected_logits, 33_554_432);
+        assert_eq!(admitted.transport.max_work.projected_logits, 33_554_432);
+        assert_eq!(admitted.native.masks.max_visits_per_run, baseline.native.masks.max_visits_per_run);
+        assert_eq!(admitted.native.masks.max_visits_per_item, baseline.native.masks.max_visits_per_item);
+        assert_eq!(admitted.transport.max_output_bytes, baseline.transport.max_output_bytes);
+    } }
+}
+
+#[test]
 fn parser_preserves_sampler_complete_document_encoding_and_transport_limits() {
     let (args, options) = command(&["population.ndjson", "--samples", "3", "--reuse-prefill",
         "--compute-threads", "4", "--max-chunks", "7", "--max-chunk-bytes", "128",

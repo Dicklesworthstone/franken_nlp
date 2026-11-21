@@ -36,6 +36,8 @@ pub struct SampledSentimentMapHostConfig {
     pub max_mask_node_visits: u64,
     pub prefill: Option<Int4PrefillLimits>,
     pub reuse_prefill: bool,
+    /// Project every legal row under this hard cap; retain full sampler/KV memory.
+    pub selected_rows: Option<Int4JsonSparseLimits>,
 }
 impl SampledSentimentMapHostConfig {
     /// Pure byte-input quote, before private source/model IO or tokenization.
@@ -51,6 +53,9 @@ impl SampledSentimentMapHostConfig {
         max_axes: usize, encoding: &UntrustedEncoding)
         -> Result<SampledSentimentMapMemoryRequirement, HostedError> {
         self.native.run.validate()?;
+        if let Some(limits) = self.selected_rows {
+            limits.validate().map_err(SampledSentimentError::from).map_err(task_error)?;
+        }
         if self.mask_limits.max_trie_node_visits == 0
             || self.mask_limits.checkpoint_interval_nodes == 0 || self.max_mask_node_visits == 0 {
             return Err(HostedError::Limits("sampled sentiment document mask allowance"));
@@ -200,6 +205,10 @@ impl MapExecution {
         let planner = SampledSentimentPlanner::for_model_with_encoding(weights.identity(),
             config.options.clone(), input.value.request.budget, config.planning, input.value.encoding.clone())
             .map_err(task_error)?;
+        let planner = match config.selected_rows {
+            Some(limits) => planner.with_selected_rows(limits).map_err(task_error)?,
+            None => planner,
+        };
         let vocabulary = SampledSentimentVocabulary::pinned().map_err(task_error)?;
         let prepared = planner.plan_document_with_control(&input.value.request, config.mapping, control)
             .map_err(map_error)?;
@@ -263,6 +272,8 @@ fn validate_prepared(prepared: &PreparedSampledSentimentMap, input: &MapInput,
         .and_then(|count| count.checked_mul(config.options.samples))
         .ok_or(HostedError::Limits("sampled sentiment document sample count"))?;
     if prepared.group_width() != model.group_width() || prepared.chunk_count() == 0
+        || prepared.selected_rows() != config.selected_rows
+        || !projection_matches(prepared.planned_work(), prepared.max_output_tokens(), config.selected_rows)
         || prepared.chunk_count() > config.mapping.chunks.max_chunks || prepared.sample_count() != samples
         || prepared.task_budget() != input.request.budget || prepared.required_context() == 0
         || prepared.required_context() > config.native.context_tokens

@@ -17,13 +17,16 @@ use crate::{
     grammar::{CompileLimits, mask::MaskWorkLimits, runtime::JSON_RUNTIME_VERSION},
     jobs::{JobLimits, JobWork, manifest::bounded_json, runner::DurableBatchProcessor},
     native_engine::{constrained_int4::{INT4_JSON_SAMPLED_EXECUTION,
-            INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION, JSON_SAMPLER_VERSION},
+            INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION, INT4_JSON_SAMPLED_SPARSE_EXECUTION,
+            INT4_JSON_SAMPLED_SPARSE_REUSED_PREFILL_EXECUTION, JSON_SAMPLER_VERSION,
+            sparse::Int4JsonSparseLimits},
         decode::DecodeStepControl, strict_int4::{Int4MemoryRequirement, Int4Work, StrictInt4Engine,
             prefill::{Int4PrefillLimits, INT4_LAYER_MAJOR_PREFILL_VERSION}}},
     tasks::{ir::TaskBudget, sentiment::{SentimentAxis, sampled::{SampledSentimentLimits, SampledSentimentOptions,
         SampledSentimentPlanner, SampledSentimentRun, SampledSentimentVocabulary, MAX_SENTIMENT_SAMPLES,
         SAMPLED_SENTIMENT_AGGREGATION_VERSION, SAMPLED_SENTIMENT_EXECUTION,
-        SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION,
+        SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION, SAMPLED_SENTIMENT_SPARSE_EXECUTION,
+        SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION,
         SAMPLED_SENTIMENT_ITEM_ADDRESS_VERSION, SAMPLED_SENTIMENT_PROMPT_VERSION}}},
     tokenizer::untrusted::UntrustedEncoding,
 };
@@ -59,6 +62,15 @@ pub struct SampledSentimentJobRecipe {
     job: JobLimits,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefill: Option<PrefillRecipe>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_rows: Option<SelectedRowsRecipe>,
+}
+
+#[derive(Serialize)]
+struct SelectedRowsRecipe {
+    execution: &'static str,
+    native_execution: &'static str,
+    max_rows_per_step: usize,
 }
 
 #[derive(Serialize)]
@@ -138,7 +150,8 @@ impl SampledSentimentJobRecipe {
             sample_address_stride: MAX_SENTIMENT_SAMPLES, native_execution: INT4_JSON_SAMPLED_EXECUTION,
             task_spec: "sentiment-v1", group_width, task_budget,
             default_axes: SampledSentimentBatchArgs::default().axes, sampling,
-            planning: planning.into(), native: native.into(), input_encoding, job, prefill: None };
+            planning: planning.into(), native: native.into(), input_encoding, job, prefill: None,
+            selected_rows: None };
         recipe.check_job_limits(job)?;
         bounded_json(&recipe, SAMPLED_SENTIMENT_JOB_RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
         Ok(recipe)
@@ -154,12 +167,58 @@ impl SampledSentimentJobRecipe {
     fn with_reused_prefill(mut self) -> Result<Self, BatchFault> {
         // These existing fields bind the physical execution policy without
         // changing the canonical recipe of an already retained cold job.
-        self.execution = SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION;
-        self.native_execution = INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION;
+        if self.checked_selected_rows()?.is_some() {
+            self.execution = SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION;
+            self.native_execution = INT4_JSON_SAMPLED_SPARSE_REUSED_PREFILL_EXECUTION;
+        } else {
+            self.execution = SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION;
+            self.native_execution = INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION;
+        }
         bounded_json(&self, SAMPLED_SENTIMENT_JOB_RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
         Ok(self)
     }
-    fn reuses_prefill(&self) -> bool { self.execution == SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION }
+    fn reuses_prefill(&self) -> bool {
+        matches!(self.execution, SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION
+            | SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION)
+    }
+    fn with_selected_rows(mut self, selected: Option<Int4JsonSparseLimits>) -> Result<Self, BatchFault> {
+        self.checked_selected_rows()?;
+        let Some(limits) = selected else { return Ok(self); };
+        limits.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        if self.selected_rows.is_some() { return Err(BatchCode::InvalidLimits.into()); }
+        let reuse = self.reuses_prefill();
+        self.selected_rows = Some(SelectedRowsRecipe { execution: SAMPLED_SENTIMENT_SPARSE_EXECUTION,
+            native_execution: INT4_JSON_SAMPLED_SPARSE_EXECUTION, max_rows_per_step: limits.max_rows_per_step });
+        self.execution = if reuse { SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION }
+            else { SAMPLED_SENTIMENT_SPARSE_EXECUTION };
+        self.native_execution = if reuse { INT4_JSON_SAMPLED_SPARSE_REUSED_PREFILL_EXECUTION }
+            else { INT4_JSON_SAMPLED_SPARSE_EXECUTION };
+        self.check_job_limits(self.job)?;
+        bounded_json(&self, SAMPLED_SENTIMENT_JOB_RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
+        Ok(self)
+    }
+    fn checked_selected_rows(&self) -> Result<Option<Int4JsonSparseLimits>, BatchFault> {
+        let selected = match &self.selected_rows {
+            None => None,
+            Some(policy) if policy.execution == SAMPLED_SENTIMENT_SPARSE_EXECUTION
+                && policy.native_execution == INT4_JSON_SAMPLED_SPARSE_EXECUTION => {
+                let limits = Int4JsonSparseLimits { max_rows_per_step: policy.max_rows_per_step };
+                limits.validate().map_err(|_| BatchCode::Admission)?;
+                Some(limits)
+            }
+            Some(_) => return Err(BatchCode::Admission.into()),
+        };
+        let valid = match (selected.is_some(), self.execution, self.native_execution) {
+            (false, SAMPLED_SENTIMENT_EXECUTION, INT4_JSON_SAMPLED_EXECUTION)
+                | (false, SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION, INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION)
+                | (true, SAMPLED_SENTIMENT_SPARSE_EXECUTION, INT4_JSON_SAMPLED_SPARSE_EXECUTION)
+                | (true, SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION,
+                    INT4_JSON_SAMPLED_SPARSE_REUSED_PREFILL_EXECUTION) => true,
+            _ => false,
+        };
+        if !valid { return Err(BatchCode::Admission.into()); }
+        Ok(selected)
+    }
     fn prefill_limits(&self) -> Option<Int4PrefillLimits> {
         self.prefill.as_ref().map(|prefill| Int4PrefillLimits { max_batch_rows: prefill.max_batch_rows,
             max_extra_scratch_bytes: prefill.max_extra_scratch_bytes })
@@ -167,10 +226,8 @@ impl SampledSentimentJobRecipe {
     fn max_result_bytes(&self) -> u64 { self.task_budget.max_output_bytes.min(self.planning.max_result_bytes) }
     fn check_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> {
         limits.validate().map_err(|_| BatchCode::InvalidLimits)?;
-        let valid_execution = matches!((self.execution, self.native_execution),
-            (SAMPLED_SENTIMENT_EXECUTION, INT4_JSON_SAMPLED_EXECUTION)
-                | (SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION, INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION));
-        if !valid_execution || limits != self.job || limits.max_id_bytes > 256
+        self.checked_selected_rows()?;
+        if limits != self.job || limits.max_id_bytes > 256
             || self.planning.max_input_bytes > limits.max_input_bytes_per_item
             || limits.max_work != JobWork::from_int4(self.native.max_model_work, self.native.max_mask_visits_per_run)
             || self.task_budget.max_output_bytes.min(self.planning.max_result_bytes) > limits.max_result_bytes as u64 {
@@ -198,7 +255,8 @@ impl SampledSentimentJobPlanner {
         let compiler = SampledSentimentBatchPlanner::new(planner, vocabulary, task, native)?;
         let (options, planning) = compiler.durable_configuration();
         let recipe = SampledSentimentJobRecipe::new(compiler.group_width(), task,
-            options.clone(), planning, native, compiler.document_encoding().clone(), limits)?;
+            options.clone(), planning, native, compiler.document_encoding().clone(), limits)?
+            .with_selected_rows(compiler.selected_rows())?;
         let preparation_bytes = sampled_sentiment_job_preparation_bytes(task, planning, compiler.document_encoding())?;
         let identity = compiler.base_execution_identity().clone();
         Ok(Self { compiler, identity, recipe, planning, preparation_bytes })
@@ -223,6 +281,7 @@ impl SampledSentimentJobPlanner {
     pub fn planning_limits(&self) -> SampledSentimentLimits { self.planning }
     pub fn group_width(&self) -> usize { self.compiler.group_width() }
     pub fn document_encoding(&self) -> &UntrustedEncoding { self.compiler.document_encoding() }
+    pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.compiler.selected_rows() }
     pub fn preparation_requirement_bytes(&self) -> u64 { self.preparation_bytes }
     pub fn max_result_bytes(&self) -> u64 { self.recipe.max_result_bytes() }
     pub fn prefill_limits(&self) -> Option<Int4PrefillLimits> { self.recipe.prefill_limits() }
@@ -231,7 +290,11 @@ impl SampledSentimentJobPlanner {
     /// Private configuration for keyed commitment only; do not publish it.
     pub fn job_recipe(&self) -> &SampledSentimentJobRecipe { &self.recipe }
     pub fn check_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> {
-        self.recipe.check_job_limits(limits)
+        self.recipe.check_job_limits(limits)?;
+        if self.recipe.checked_selected_rows()? != self.compiler.selected_rows() {
+            return Err(BatchCode::Admission.into());
+        }
+        Ok(())
     }
 }
 
@@ -248,6 +311,9 @@ impl<'e, 'w, A: SampledSentimentBatchAdmission> SampledSentimentJobProcessor<'e,
         -> Result<Self, BatchFault> {
         let SampledSentimentJobPlanner { compiler, identity, recipe, .. } = planner;
         recipe.check_job_limits(recipe.job)?;
+        if recipe.checked_selected_rows()? != compiler.selected_rows() {
+            return Err(BatchCode::Admission.into());
+        }
         let native = if recipe.reuses_prefill() {
             NativeSampledSentimentBatch::new_reusing_prefill(compiler, engine, admission,
                 recipe.prefill_limits())?
@@ -282,6 +348,10 @@ impl<A: SampledSentimentBatchAdmission> DurableBatchProcessor for SampledSentime
     fn validate_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> { self.recipe.check_job_limits(limits) }
     fn durable_work(&self, prepared: &Self::Prepared) -> Result<JobWork, BatchItemFailure> {
         if self.native.is_poisoned() { return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)); }
+        if prepared.selected_rows() != self.recipe.checked_selected_rows().map_err(BatchItemFailure::fatal)?
+            || prepared.execution_version(self.recipe.reuses_prefill()) != self.recipe.execution {
+            return Err(BatchItemFailure::fatal(BatchCode::Admission));
+        }
         // Reserve the complete independent sample schedule BEFORE execution.
         // Early EOS, cancellation and failed attempts cannot refund its work.
         Ok(JobWork::from_int4(prepared.model_work(), prepared.mask_node_visits()))

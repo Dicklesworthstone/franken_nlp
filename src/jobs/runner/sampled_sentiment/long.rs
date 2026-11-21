@@ -13,7 +13,8 @@ use crate::{
     tasks::{mapreduce::{CHUNK_PROFILE, ChunkLimits}, sentiment::sampled::long::{
         SampledSentimentMapLimits, SampledSentimentMapRun,
         SAMPLED_SENTIMENT_MAP_AGGREGATION, SAMPLED_SENTIMENT_MAP_EXECUTION,
-        SAMPLED_SENTIMENT_MAP_REUSED_PREFILL_EXECUTION}},
+        SAMPLED_SENTIMENT_MAP_REUSED_PREFILL_EXECUTION, SAMPLED_SENTIMENT_MAP_SPARSE_EXECUTION,
+        SAMPLED_SENTIMENT_MAP_SPARSE_REUSED_PREFILL_EXECUTION}},
 };
 
 /// Only the job's owner-only keyed recipe may serialize this value. It has
@@ -56,9 +57,10 @@ impl MappingRecipe {
 impl SampledSentimentDocumentJobRecipe {
     fn new(chunk_sampling: SampledSentimentJobRecipe, mapping: SampledSentimentMapLimits)
         -> Result<Self, BatchFault> {
+        let execution = map_execution(&chunk_sampling)?;
         let recipe = Self { version: 1, dependency_scope: "item-local",
             input_policy: "exact-complete-source-chunk-axis-sample-addresses-v1",
-            execution: SAMPLED_SENTIMENT_MAP_EXECUTION, chunk_profile: CHUNK_PROFILE,
+            execution, chunk_profile: CHUNK_PROFILE,
             aggregation_version: SAMPLED_SENTIMENT_MAP_AGGREGATION,
             item_address_version: crate::tasks::sentiment::sampled::long::SAMPLED_SENTIMENT_MAP_ITEM_ADDRESS_VERSION,
             chunk_sampling, mapping: mapping.into() };
@@ -74,9 +76,7 @@ impl SampledSentimentDocumentJobRecipe {
         self.chunk_sampling.check_job_limits(limits)?;
         self.mapping.limits().validate(self.chunk_sampling.task_budget)
             .map_err(|_| BatchCode::InvalidLimits)?;
-        let expected = if self.chunk_sampling.reuses_prefill() {
-            SAMPLED_SENTIMENT_MAP_REUSED_PREFILL_EXECUTION
-        } else { SAMPLED_SENTIMENT_MAP_EXECUTION };
+        let expected = map_execution(&self.chunk_sampling)?;
         if self.execution != expected
             || self.mapping.chunks.max_input_bytes > limits.max_input_bytes_per_item
             || self.mapping.max_model_work != self.chunk_sampling.native.max_item_work
@@ -85,6 +85,15 @@ impl SampledSentimentDocumentJobRecipe {
         }
         Ok(())
     }
+}
+
+fn map_execution(sampling: &SampledSentimentJobRecipe) -> Result<&'static str, BatchFault> {
+    Ok(match (sampling.checked_selected_rows()?.is_some(), sampling.reuses_prefill()) {
+        (false, false) => SAMPLED_SENTIMENT_MAP_EXECUTION,
+        (false, true) => SAMPLED_SENTIMENT_MAP_REUSED_PREFILL_EXECUTION,
+        (true, false) => SAMPLED_SENTIMENT_MAP_SPARSE_EXECUTION,
+        (true, true) => SAMPLED_SENTIMENT_MAP_SPARSE_REUSED_PREFILL_EXECUTION,
+    })
 }
 
 /// A real model-bound whole-document compiler, with one immutable private
@@ -105,7 +114,8 @@ impl SampledSentimentDocumentJobPlanner {
         let compiler = SampledSentimentDocumentPlanner::new(planner, vocabulary, task, mapping, native)?;
         let (options, planning) = compiler.durable_configuration();
         let chunk_sampling = SampledSentimentJobRecipe::new(compiler.group_width(), task,
-            options.clone(), planning, native, compiler.document_encoding().clone(), limits)?;
+            options.clone(), planning, native, compiler.document_encoding().clone(), limits)?
+            .with_selected_rows(compiler.selected_rows())?;
         let recipe = SampledSentimentDocumentJobRecipe::new(chunk_sampling, mapping)?;
         let preparation_bytes = compiler.preparation_requirement_bytes()
             .checked_add(SAMPLED_SENTIMENT_JOB_RECIPE_BYTES as u64).ok_or(BatchCode::InvalidLimits)?;
@@ -122,7 +132,7 @@ impl SampledSentimentDocumentJobPlanner {
     /// debits continue to price the full cold schedule, including failed work.
     pub fn with_reused_prefill(mut self) -> Result<Self, BatchFault> {
         self.recipe.chunk_sampling = self.recipe.chunk_sampling.with_reused_prefill()?;
-        self.recipe.execution = SAMPLED_SENTIMENT_MAP_REUSED_PREFILL_EXECUTION;
+        self.recipe.execution = map_execution(&self.recipe.chunk_sampling)?;
         self.recipe.check_bytes()?;
         Ok(self)
     }
@@ -134,6 +144,7 @@ impl SampledSentimentDocumentJobPlanner {
     pub fn sampling_options(&self) -> &SampledSentimentOptions { &self.recipe.chunk_sampling.sampling }
     pub fn group_width(&self) -> usize { self.compiler.group_width() }
     pub fn document_encoding(&self) -> &UntrustedEncoding { self.compiler.document_encoding() }
+    pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.compiler.selected_rows() }
     pub fn preparation_requirement_bytes(&self) -> u64 { self.preparation_bytes }
     pub fn max_result_bytes(&self) -> u64 { self.recipe.mapping.max_result_bytes }
     pub fn prefill_limits(&self) -> Option<Int4PrefillLimits> { self.recipe.chunk_sampling.prefill_limits() }
@@ -142,7 +153,11 @@ impl SampledSentimentDocumentJobPlanner {
     /// Private configuration for keyed storage commitment; never publish it.
     pub fn job_recipe(&self) -> &SampledSentimentDocumentJobRecipe { &self.recipe }
     pub fn check_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> {
-        self.recipe.check_job_limits(limits)
+        self.recipe.check_job_limits(limits)?;
+        if self.recipe.chunk_sampling.checked_selected_rows()? != self.compiler.selected_rows() {
+            return Err(BatchCode::Admission.into());
+        }
+        Ok(())
     }
 }
 
@@ -158,6 +173,9 @@ impl<'e, 'w, A: SampledSentimentDocumentBatchAdmission> SampledSentimentDocument
         -> Result<Self, BatchFault> {
         let SampledSentimentDocumentJobPlanner { compiler, identity, recipe, .. } = planner;
         recipe.check_job_limits(recipe.chunk_sampling.job)?;
+        if recipe.chunk_sampling.checked_selected_rows()? != compiler.selected_rows() {
+            return Err(BatchCode::Admission.into());
+        }
         let native = if recipe.chunk_sampling.reuses_prefill() {
             NativeSampledSentimentDocumentBatch::new_reusing_prefill(compiler, engine, admission,
                 recipe.chunk_sampling.prefill_limits())?
@@ -192,6 +210,11 @@ impl<A: SampledSentimentDocumentBatchAdmission> DurableBatchProcessor for Sample
     fn validate_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> { self.recipe.check_job_limits(limits) }
     fn durable_work(&self, prepared: &Self::Prepared) -> Result<JobWork, BatchItemFailure> {
         if self.native.is_poisoned() { return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)); }
+        if prepared.selected_rows() != self.recipe.chunk_sampling.checked_selected_rows()
+                .map_err(BatchItemFailure::fatal)?
+            || prepared.execution_version(self.recipe.chunk_sampling.reuses_prefill()) != self.recipe.execution {
+            return Err(BatchItemFailure::fatal(BatchCode::Admission));
+        }
         Ok(JobWork::from_int4(prepared.model_work(), prepared.mask_node_visits()))
     }
     fn max_result_bytes(&self, prepared: &Self::Prepared) -> u64 { prepared.max_result_bytes() }

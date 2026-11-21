@@ -31,7 +31,7 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
                 .mut_arg("max_result_bytes", |arg| arg.help("Complete sample bundle cap per document; must fit JobLimits.max_result_bytes"))
                 .mut_arg("reuse_prefill", |arg| arg.hide(false).help("Reuse only the current document/axis prompt across independent samples; authenticated policy must match on resume, lifetime cold-work debits are unchanged"))
                 .mut_arg("max_forward_positions", |arg| arg.help("Per-document forward ceiling across every requested axis and sample"))
-                .mut_arg("max_projected_logits", |arg| arg.help("Per-document full-vocabulary projection ceiling"))
+                .mut_arg("max_projected_logits", |arg| arg.help("Per-document projected output-row ceiling"))
                 .mut_arg("max_attention_pairs", |arg| arg.help("Per-document attention-pair ceiling"))
                 .mut_arg("max_dot_products", |arg| arg.help("Per-document grouped dot-product ceiling"))
                 .mut_arg("max_multiply_accumulates", |arg| arg.help("Per-document multiply-accumulate ceiling"))

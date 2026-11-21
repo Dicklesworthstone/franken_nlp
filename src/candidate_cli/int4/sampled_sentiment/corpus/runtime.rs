@@ -82,12 +82,14 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let planner = SampledSentimentPlanner::for_model(model.model_identity(), options, budget,
         batch.sampled.task_limits(&args)).map_err(task_failure)?
         .with_input_encoding(encoding.clone()).map_err(task_failure)?;
+    let planner = batch.sampled.configure_planner(planner)?;
     remaining()?;
     let vocabulary = Arc::new(SampledSentimentVocabulary::pinned().map_err(task_failure)?);
     remaining()?;
     let planner = SampledSentimentBatchPlanner::new(planner, vocabulary, budget, limits.native)
         .map_err(batch_failure)?;
     if planner.group_width() != args.group_width || planner.document_encoding() != &encoding
+        || planner.selected_rows() != batch.sampled.selected_rows()?
         || planner.preparation_requirement_bytes() > limits.preparation_reserve_bytes {
         return Err(CandidateError::Identity.into());
     }
@@ -113,6 +115,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         compute_schedule: compute::Schedule::for_threads(common.compute.threads),
         prefill_schedule: common.prefill.map(PrefillSchedule::new).transpose()?,
         prefill_reuse: batch.sampled.prefill_reuse_execution(),
+        max_selected_rows: batch.sampled.max_selected_rows,
         input_encoding: input_encoding::reported_policy(&encoding),
     };
     // Only this framing sink owns stdout. The host's terminal event is final;
@@ -180,13 +183,16 @@ struct Provenance<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     prefill_reuse: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    max_selected_rows: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     input_encoding: Option<&'a crate::tokenizer::untrusted::UntrustedEncoding>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::sentiment::sampled::SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION;
+    use crate::tasks::sentiment::sampled::{SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION,
+        SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION};
     #[test]
     fn batch_cancellation_keeps_every_typed_cause() {
         use DecodeCancellationKind::*;
@@ -217,6 +223,7 @@ mod tests {
             candidate_format: "candidate", quant_recipe: "recipe", group_width: 128,
             integer_kernel: "s_scalar_i32", snapshot: None,
             compute_schedule: compute::Schedule::for_threads(4), prefill_schedule: None, prefill_reuse: None,
+            max_selected_rows: None,
             input_encoding: input_encoding::reported_policy(&encoding) };
         let mut output = Vec::new();
         {
@@ -237,6 +244,7 @@ mod tests {
             assert!(value.get("input_encoding").is_none());
             assert!(value.get("prefill_schedule").is_none());
             assert!(value.get("prefill_reuse").is_none());
+            assert!(value.get("max_selected_rows").is_none());
             assert!(value.get("effective_seed").is_none());
         }
     }
@@ -245,7 +253,9 @@ mod tests {
     fn physical_prefill_and_reuse_provenance_are_explicit_on_every_event_and_absent_on_default() {
         use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
         for rows in [None, Some(1), Some(4), Some(64)] {
-            for (compact, reuse) in [(false, false), (false, true), (true, false), (true, true)] {
+            for (compact, reuse, selected) in [(false, false, false), (false, true, false),
+                (true, false, false), (true, true, false), (false, false, true),
+                (false, true, true), (true, false, true), (true, true, true)] {
                 let encoding = if compact { UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
                     max_input_bytes: 32, max_output_tokens: 64, max_pair_checks: 1024, max_pair_bytes: 16384,
                 }) } else { UntrustedEncoding::ByteFallback };
@@ -253,6 +263,8 @@ mod tests {
                     max_batch_rows, max_extra_scratch_bytes:
                         Int4PrefillLimits::required_extra_scratch_bytes(max_batch_rows).unwrap(),
                 });
+                let reuse_execution = if selected { SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION }
+                    else { SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION };
                 let provenance = Provenance { protocol: "fnlp-candidate-int4-sentiment-sampled-batch-v1",
                     schema_version: 1, scope: "real-source-current-candidate-int4", evidence: "non_authoritative",
                     task: "sentiment-sampled", model_id: "Nanbeige4.2-3B", source_revision: "public-revision",
@@ -261,7 +273,8 @@ mod tests {
                     integer_kernel: "s_scalar_i32", snapshot: None,
                     compute_schedule: compute::Schedule::for_threads(1),
                     prefill_schedule: prefill.map(PrefillSchedule::new).transpose().unwrap(),
-                    prefill_reuse: reuse.then_some(SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION),
+                    prefill_reuse: reuse.then_some(reuse_execution),
+                    max_selected_rows: selected.then_some(4096),
                     input_encoding: input_encoding::reported_policy(&encoding) };
                 let mut output = Vec::new();
                 {
@@ -280,8 +293,10 @@ mod tests {
                     assert_eq!(value["evidence"], "non_authoritative");
                     assert!(value.get("compute_schedule").is_none());
                     assert_eq!(value.get("input_encoding").is_some(), compact);
+                    assert_eq!(value.get("max_selected_rows").is_some(), selected);
+                    if selected { assert_eq!(value["max_selected_rows"], 4096); }
                     if reuse {
-                        assert_eq!(value["prefill_reuse"], SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION);
+                        assert_eq!(value["prefill_reuse"], reuse_execution);
                     } else { assert!(value.get("prefill_reuse").is_none()); }
                     if let Some(prefill) = prefill {
                         assert_eq!(value["prefill_schedule"]["execution"], INT4_LAYER_MAJOR_PREFILL_VERSION);

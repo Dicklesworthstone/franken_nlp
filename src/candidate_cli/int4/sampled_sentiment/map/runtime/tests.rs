@@ -11,6 +11,9 @@ fn host_quote_matches_all_cli_owners_and_prices_prefill_workspace_once() {
         &["--reuse-prefill", "--prefill-rows", "64"][..],
         &["--input-encoding", "safe-bpe-v1", "--compute-threads", "4"][..],
         &["--input-encoding", "safe-bpe-v1", "--reuse-prefill", "--prefill-rows", "4"][..],
+        &["--max-selected-rows", "1"][..],
+        &["--max-selected-rows", "4096", "--input-encoding", "safe-bpe-v1", "--compute-threads", "4"][..],
+        &["--max-selected-rows", "166144", "--reuse-prefill", "--prefill-rows", "4"][..],
     ] {
         let (args, options) = command(flags);
         let limits = options.validate(&args).unwrap();
@@ -24,6 +27,7 @@ fn host_quote_matches_all_cli_owners_and_prices_prefill_workspace_once() {
         assert_eq!(config.mapping.max_model_work, options.sampled.work_ceiling());
         assert_eq!(config.options, options.sampled.options(&args).unwrap());
         assert_eq!(config.reuse_prefill, options.sampled.reuse_prefill);
+        assert_eq!(config.selected_rows, options.sampled.selected_rows().unwrap());
         let task = options.sampled.budget(&args, limits.common, 4).unwrap();
         let quote = config.requirements_with_encoding(args.group_width, task, 4, &encoding).unwrap();
         let extra = config.prefill.map(|p| p.validate().unwrap()).unwrap_or(0);
@@ -196,9 +200,10 @@ fn response_keeps_complete_result_and_optional_physical_metadata_inside_its_quot
         model_id: "Nanbeige4.2-3B", source_revision: crate::artifact::converter::PINNED_REVISION,
         source_root_sha256: &digest, model_content_sha256: &digest,
         candidate_format: INT4_SOURCE_FORMAT, quant_recipe: "fixture-quant-recipe", group_width: 128,
-        integer_kernel: "s_scalar_i32", snapshot: None, prefill_schedule: None, prefill_reuse: None, output: &output };
+        integer_kernel: "s_scalar_i32", snapshot: None, prefill_schedule: None, prefill_reuse: None,
+        max_selected_rows: None, output: &output };
     let original = serde_json::to_value(&response).unwrap();
-    for field in ["snapshot", "prefill_schedule", "prefill_reuse", "compute", "seed", "effective_seed",
+    for field in ["snapshot", "prefill_schedule", "prefill_reuse", "max_selected_rows", "compute", "seed", "effective_seed",
         "document", "source_dir", "prompt_digest", "request_binding", "result_binding"] {
         assert!(original.get(field).is_none());
     }
@@ -206,12 +211,14 @@ fn response_keeps_complete_result_and_optional_physical_metadata_inside_its_quot
     let prefill = Int4PrefillLimits { max_batch_rows: 64,
         max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(64).unwrap() + MIB };
     response.prefill_schedule = Some(PrefillSchedule::new(prefill).unwrap());
-    response.prefill_reuse = Some(crate::tasks::sentiment::sampled::SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION);
+    response.prefill_reuse = Some(crate::tasks::sentiment::sampled::SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION);
+    response.max_selected_rows = Some(166144);
     let mut bytes = Vec::new();
     publish_complete(&response, result_bytes + 4096, &mut bytes,
         &|| Ok(Duration::from_secs(1)), &CancellationToken::default()).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["output"], output);
+    assert_eq!(value["max_selected_rows"], 166144);
     assert_eq!(value["prefill_schedule"]["execution"], INT4_LAYER_MAJOR_PREFILL_VERSION);
     assert_eq!(value["prefill_schedule"]["max_batch_rows"], 64);
     assert_eq!(value["prefill_schedule"]["admitted_workspace_bytes"], prefill.validate().unwrap());

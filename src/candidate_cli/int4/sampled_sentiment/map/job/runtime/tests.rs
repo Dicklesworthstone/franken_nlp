@@ -169,6 +169,8 @@ fn assert_public_metadata(value: &serde_json::Value) {
 
 #[test]
 fn success_reports_complete_document_progress_and_no_source_seed_or_retained_result() {
+    use crate::tasks::sentiment::sampled::long::{SAMPLED_SENTIMENT_MAP_REUSED_PREFILL_EXECUTION,
+        SAMPLED_SENTIMENT_MAP_SPARSE_REUSED_PREFILL_EXECUTION};
     let (selected, args) = command("resume", true, &["--reuse-prefill", "--prefill-rows", "3"]);
     let admitted = selected.args.validate(&args).unwrap();
     let fixed = lifetime(&args, &selected, admitted);
@@ -189,7 +191,8 @@ fn success_reports_complete_document_progress_and_no_source_seed_or_retained_res
         snapshot: Some(SnapshotRecord::new(admitted.common.snapshot_need)),
         input_encoding: None, compute_schedule: None,
         prefill_schedule: admitted.common.prefill.map(PrefillSchedule::new).transpose().unwrap(),
-        prefill_reuse: Some(SAMPLED_SENTIMENT_MAP_REUSED_PREFILL_EXECUTION), output: &report,
+        prefill_reuse: Some(SAMPLED_SENTIMENT_MAP_REUSED_PREFILL_EXECUTION),
+        max_selected_rows: None, output: &report,
     };
     let mut bytes = Vec::new();
     publish_report(&response, &mut bytes, &|| Ok(Duration::from_secs(1)),
@@ -205,7 +208,16 @@ fn success_reports_complete_document_progress_and_no_source_seed_or_retained_res
     assert_eq!(value["output"]["reserved_work"], serde_json::to_value(fixed.max_work).unwrap());
     assert_eq!(value["snapshot"]["operation"], "loaded");
     assert_eq!(value["evidence"], "non_authoritative");
+    assert!(value.get("max_selected_rows").is_none());
     assert_public_metadata(&value);
     assert!(bytes.ends_with(b"\n"));
     assert!(!String::from_utf8(bytes).unwrap().contains("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    let selected = Response { max_selected_rows: Some(4096),
+        prefill_reuse: Some(SAMPLED_SENTIMENT_MAP_SPARSE_REUSED_PREFILL_EXECUTION), ..response };
+    let mut metadata = serde_json::to_value(&selected).unwrap();
+    assert_eq!(metadata.as_object_mut().unwrap().remove("max_selected_rows"), Some(serde_json::json!(4096)));
+    assert_eq!(metadata["prefill_reuse"], SAMPLED_SENTIMENT_MAP_SPARSE_REUSED_PREFILL_EXECUTION);
+    metadata["prefill_reuse"] = value["prefill_reuse"].clone();
+    assert_public_metadata(&metadata);
+    assert_eq!(metadata, value);
 }

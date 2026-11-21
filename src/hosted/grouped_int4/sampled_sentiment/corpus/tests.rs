@@ -52,11 +52,43 @@ fn identity(width: usize) -> ExecutionIdentity {
 fn request(id: &ExecutionIdentity, width: usize) -> SampledSentimentAdmission<'_> {
     SampledSentimentAdmission { facts: SampledSentimentPlanFacts {
         identity: id, model_work: work(width, 8), group_width: width, sample_count: 8,
-        required_context: 47, task_budget: task(width), max_result_bytes: 65_536, preparation_bytes: PREPARATION },
+        required_context: 47, task_budget: task(width), max_result_bytes: 65_536,
+        max_output_tokens: 8 * 16, selected_rows: None, preparation_bytes: PREPARATION },
         kv_reservation_bytes: task(width).max_kv_bytes, mask_node_visits: 100_000 }
 }
 fn check(request: &SampledSentimentAdmission<'_>) -> Result<(), BatchItemFailure> {
-    check_request(32, 128, task(32).max_kv_bytes, work_limits(32, 8), PREPARATION, 65_536, request)
+    check_request(32, 128, task(32).max_kv_bytes, work_limits(32, 8), PREPARATION, 65_536, None, request)
+}
+
+#[test]
+fn selected_attempts_bind_exact_policy_and_cold_row_ceiling_without_memory_discounts() {
+    let id = identity(32);
+    let selected = Int4JsonSparseLimits { max_rows_per_step: 4096 };
+    let one = constrained_int4::sparse::planned_work(32, 32, 16, selected).unwrap();
+    let item = (0..8).try_fold(Int4Work::default(), |total, _| total.checked_add(one)).unwrap();
+    let dense = work_limits(32, 8);
+    let cap = SampledSentimentBatchLimits { max_item_work: item,
+        max_model_work: item.checked_add(item).unwrap(), ..dense };
+    let dense_memory = requirements(32, dense, task(32), PREPARATION, corpus()).unwrap();
+    assert_eq!(requirements(32, cap, task(32), PREPARATION, corpus()).unwrap(), dense_memory);
+    assert!(item.projected_logits < dense.max_item_work.projected_logits);
+    let mut admitted = request(&id, 32);
+    admitted.facts.selected_rows = Some(selected);
+    admitted.facts.model_work = item;
+    let check = |request: &SampledSentimentAdmission<'_>, policy|
+        check_request(32, 128, task(32).max_kv_bytes, cap, PREPARATION, 65_536, policy, request);
+    check(&admitted, Some(selected)).unwrap();
+    assert!(check(&admitted, None).unwrap_err().stop);
+    assert!(check(&admitted, Some(Int4JsonSparseLimits { max_rows_per_step: 4095 })).unwrap_err().stop);
+    admitted.facts.max_output_tokens -= 1;
+    assert!(check(&admitted, Some(selected)).unwrap_err().stop);
+    admitted.facts.max_output_tokens += 1;
+    admitted.facts.model_work.projected_logits -= 1;
+    assert!(check(&admitted, Some(selected)).unwrap_err().stop,
+        "admission prices the cap at every possible step, not a guessed smaller legal set");
+    admitted.facts.model_work = item;
+    admitted.mask_node_visits = cap.masks.max_visits_per_item + 1;
+    assert!(check(&admitted, Some(selected)).unwrap_err().stop);
 }
 
 #[test]

@@ -32,7 +32,7 @@ fn fixture() -> (SampledSentimentMapHostConfig, SentimentRequest) {
         preparation_reserve_bytes: 600 * MIB,
         max_sampler_bytes: json_sampling_workspace_bytes().unwrap(),
         mask_limits: MaskWorkLimits { max_trie_node_visits: 2_000_000, checkpoint_interval_nodes: 256 },
-        max_mask_node_visits: u64::MAX, prefill: None, reuse_prefill: false,
+        max_mask_node_visits: u64::MAX, prefill: None, reuse_prefill: false, selected_rows: None,
     };
     let request = SentimentRequest { document: "Helpful service. café 上海".to_owned(),
         axes: vec![SentimentAxis::Valence, SentimentAxis::Arousal], budget: task };
@@ -41,6 +41,24 @@ fn fixture() -> (SampledSentimentMapHostConfig, SentimentRequest) {
 fn prefill(rows: usize) -> Int4PrefillLimits {
     Int4PrefillLimits { max_batch_rows: rows,
         max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap() }
+}
+
+#[test]
+fn selected_projection_keeps_full_document_sampler_and_memory_admission() {
+    let (mut config, request) = fixture();
+    let dense = config.requirements(WIDTH, request.budget, 4).unwrap();
+    for rows in [1, 4096, crate::native_engine::lmhead::NANBEIGE_VOCAB_SIZE] {
+        config.selected_rows = Some(Int4JsonSparseLimits { max_rows_per_step: rows });
+        assert_eq!(config.requirements(WIDTH, request.budget, 4).unwrap(), dense);
+    }
+    for rows in [0, crate::native_engine::lmhead::NANBEIGE_VOCAB_SIZE + 1, usize::MAX] {
+        config.selected_rows = Some(Int4JsonSparseLimits { max_rows_per_step: rows });
+        assert!(config.requirements(WIDTH, request.budget, 4).is_err());
+    }
+    config.selected_rows = Some(Int4JsonSparseLimits { max_rows_per_step: 4096 });
+    config.max_sampler_bytes -= 1;
+    assert!(config.requirements(WIDTH, request.budget, 4).is_err(),
+        "a selected head cannot remove the full legal-token sampling workspace");
 }
 
 #[test]

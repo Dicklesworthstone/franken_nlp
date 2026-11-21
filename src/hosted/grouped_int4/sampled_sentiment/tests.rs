@@ -1,6 +1,7 @@
 use super::*;
 use crate::native_engine::{constrained::JsonDecodeError,
     constrained_int4::{Int4JsonError, planned_work}, decode::DecodeCancellationKind};
+use crate::tasks::sentiment::sampled::SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION;
 
 const PREPARATION: u64 = 600 * 1024 * 1024;
 

@@ -37,6 +37,10 @@ Single-context retained jobs also support it on `extract-job`, `ner-job`,
 persistent CPU teams and compact input encoding. Other source-task
 maps/corpora, redaction and the semantic second-reader route retain their
 full-vocabulary contracts.
+The six independent sampled-sentiment command families also expose an explicit
+legal-row cap, with grammar-conditioned sampling after the complete legal set
+is projected. See [selected sampled output rows](native-sampled-sentiment-int4.md#selected-output-rows)
+for one-request, whole-document, resident-stream and durable-job usage.
 Without the option, these tasks retain full-vocabulary execution and their
 existing identity. Native work in the result reports actual projected rows;
 grammar-mask, task, source and complete-result limits are unchanged.

@@ -3,7 +3,7 @@ use super::*;
 use super::super::tests::command;
 use super::super::super::tests::{NoRead, NoWrite};
 use crate::{hosted::{Int4HostError, RunStop},
-    tasks::sentiment::sampled::{SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION,
+    tasks::sentiment::sampled::{SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION,
         long::SampledSentimentMapError}};
 
 #[test]
@@ -15,6 +15,9 @@ fn shared_host_quote_matches_every_cli_memory_owner_before_any_io() {
             &["--compute-threads", "2"][..], &["--compute-threads", "64"][..],
             &["--input-encoding", "safe-bpe-v1", "--compute-threads", "4"][..],
             &["--input-encoding", "safe-bpe-v1", "--reuse-prefill", "--prefill-rows", "4"][..],
+            &["--max-selected-rows", "1"][..],
+            &["--max-selected-rows", "4096", "--input-encoding", "safe-bpe-v1", "--compute-threads", "4"][..],
+            &["--max-selected-rows", "166144", "--reuse-prefill", "--prefill-rows", "4"][..],
         ] {
             let (args, options) = command(flags, snapshot);
             let limits = options.validate(&args).unwrap();
@@ -29,6 +32,7 @@ fn shared_host_quote_matches_every_cli_memory_owner_before_any_io() {
             assert_eq!(config.encoding, options.document.input_encoding(&args).unwrap());
             assert_eq!(config.document.options, options.document.sampled.options(&args).unwrap());
             assert_eq!(config.document.reuse_prefill, options.document.sampled.reuse_prefill);
+            assert_eq!(config.document.selected_rows, options.document.sampled.selected_rows().unwrap());
             assert_eq!(config.transport.max_work, limits.transport.max_work);
             assert_eq!(config.transport.max_output_bytes, limits.transport.max_output_bytes);
             assert_eq!(config.io_reserve_bytes, limits.io_bytes);
@@ -64,6 +68,7 @@ fn distinct_document_and_run_limits_reach_every_host_schedule_with_exact_memory(
             &[][..], &["--reuse-prefill"][..], &["--prefill-rows", "4"][..],
             &["--prefill-rows", "4", "--reuse-prefill"][..], &["--compute-threads", "4"][..],
             &["--input-encoding", "safe-bpe-v1", "--reuse-prefill", "--compute-threads", "4"][..],
+            &["--max-selected-rows", "4096", "--reuse-prefill", "--compute-threads", "4"][..],
         ] {
             let mut flags = flags.to_vec();
             flags.extend(["--max-forward-positions", "67108864", "--max-mask-node-visits", "64000000000000",
@@ -85,6 +90,7 @@ fn distinct_document_and_run_limits_reach_every_host_schedule_with_exact_memory(
             assert_ne!(config.document.max_mask_node_visits, config.max_mask_node_visits);
             assert_eq!(config.document.planning.max_total_prompt_tokens, 32768);
             assert_eq!(config.document.options, options.document.sampled.options(&args).unwrap());
+            assert_eq!(config.document.selected_rows, options.document.sampled.selected_rows().unwrap());
             assert_eq!(config.transport.max_work, limits.transport.max_work);
         }
     }
@@ -152,12 +158,12 @@ fn candidate_frames_omit_private_seed_and_bind_optional_public_execution() {
         source_root_sha256: &digest, model_content_sha256: &digest,
         candidate_format: INT4_SOURCE_FORMAT, quant_recipe: "fixture-recipe", group_width: 128,
         integer_kernel: "s_scalar_i32", snapshot: None, compute_schedule: None,
-        prefill_schedule: None, prefill_reuse: None, input_encoding: None,
+        prefill_schedule: None, prefill_reuse: None, max_selected_rows: None, input_encoding: None,
     };
     let plain = serde_json::to_value(&provenance).unwrap();
     for name in ["seed", "effective_seed", "document", "source_dir", "snapshot_path",
         "request_binding", "result_binding", "input_encoding", "prefill_reuse",
-        "snapshot", "compute_schedule", "prefill_schedule"] {
+        "snapshot", "compute_schedule", "prefill_schedule", "max_selected_rows"] {
         assert!(plain.get(name).is_none(), "unexpected provenance field {name}");
     }
     let prefill = Int4PrefillLimits { max_batch_rows: 64,
@@ -167,7 +173,8 @@ fn candidate_frames_omit_private_seed_and_bind_optional_public_execution() {
         max_pair_checks: 65536, max_pair_bytes: 1_048_576 });
     provenance.snapshot = Some(SnapshotRecord { operation: "loaded", format: INT4_SNAPSHOT_VERSION, file_bytes: u64::MAX });
     provenance.prefill_schedule = Some(PrefillSchedule::new(prefill).unwrap());
-    provenance.prefill_reuse = Some(SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION);
+    provenance.prefill_reuse = Some(SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION);
+    provenance.max_selected_rows = Some(166144);
     provenance.input_encoding = Some(&encoding);
     let mut output = Vec::new();
     {
@@ -178,7 +185,8 @@ fn candidate_frames_omit_private_seed_and_bind_optional_public_execution() {
     }
     let frame: serde_json::Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(frame["record"]["event"], "fixture_only");
-    assert_eq!(frame["prefill_reuse"], SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION);
+    assert_eq!(frame["prefill_reuse"], SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION);
+    assert_eq!(frame["max_selected_rows"], 166144);
     assert_eq!(frame["prefill_schedule"]["admitted_workspace_bytes"], prefill.validate().unwrap());
     assert!(serde_json::to_vec(&provenance).unwrap().len() as u64 + 16 < FRAME_ALLOWANCE);
 }

@@ -206,6 +206,10 @@ impl<R: BufRead, W: Write> StreamExecution<R, W> {
             let planner = SampledSentimentPlanner::for_model_with_encoding(weights.identity(),
                 config.document.options.clone(), config.task, config.document.planning,
                 config.encoding.clone()).map_err(task_error)?;
+            let planner = match config.document.selected_rows {
+                Some(limits) => planner.with_selected_rows(limits).map_err(task_error)?,
+                None => planner,
+            };
             let vocabulary = Arc::new(SampledSentimentVocabulary::pinned().map_err(task_error)?);
             let planner = SampledSentimentDocumentPlanner::new(planner, vocabulary, config.task,
                 config.document.mapping, config.work_limits()).map_err(HostedError::BatchSetup)?;
@@ -223,7 +227,8 @@ impl<R: BufRead, W: Write> StreamExecution<R, W> {
             let admission = DocumentAdmission::for_job(&owners.lease, weights.identity(),
                 config.document.native.context_tokens, required.native.kv_bytes,
                 config.document.mapping, config.work_limits(), required.input_bytes,
-                required.output_reservation_bytes, required.max_output_bytes, required.max_output_tokens);
+                required.output_reservation_bytes, required.max_output_bytes, required.max_output_tokens,
+                config.document.selected_rows);
             let result = {
                 let mut processor = if config.document.reuse_prefill {
                     NativeSampledSentimentDocumentBatch::new_reusing_prefill(planner,
@@ -270,6 +275,7 @@ pub(super) struct DocumentCapacity {
     output_reservation_bytes: u64,
     max_output_bytes: u64,
     max_output_tokens: u64,
+    selected_rows: Option<Int4JsonSparseLimits>,
 }
 pub(super) struct DocumentAdmission<'a> {
     lease: &'a EngineLease,
@@ -283,9 +289,10 @@ impl<'a> DocumentAdmission<'a> {
     pub(super) fn for_job(lease: &'a EngineLease, model: &'a Int4ModelIdentity,
         context: usize, kv_bytes: u64, mapping: SampledSentimentMapLimits,
         work: SampledSentimentBatchLimits, preparation_bytes: u64,
-        output_reservation_bytes: u64, max_output_bytes: u64, max_output_tokens: u64) -> Self {
+        output_reservation_bytes: u64, max_output_bytes: u64, max_output_tokens: u64,
+        selected_rows: Option<Int4JsonSparseLimits>) -> Self {
         Self { lease, model, capacity: DocumentCapacity { context, kv_bytes, mapping, work,
-            preparation_bytes, output_reservation_bytes, max_output_bytes, max_output_tokens } }
+            preparation_bytes, output_reservation_bytes, max_output_bytes, max_output_tokens, selected_rows } }
     }
 }
 impl SampledSentimentDocumentBatchAdmission for DocumentAdmission<'_> {
@@ -310,6 +317,8 @@ fn check_request(width: usize, capacity: DocumentCapacity, request: &SampledSent
     if facts.identity.task_spec != "sentiment-v1"
         || facts.identity.sampler_version != constrained_int4::JSON_SAMPLER_VERSION
         || facts.group_width != width || request.kv_reservation_bytes != capacity.kv_bytes
+        || facts.selected_rows != capacity.selected_rows
+        || !projection_matches(facts.model_work, facts.max_output_tokens, capacity.selected_rows)
         || facts.original_task.validate().is_err() || facts.preparation_bytes == 0
         || facts.preparation_bytes > capacity.preparation_bytes {
         return Err(fail());

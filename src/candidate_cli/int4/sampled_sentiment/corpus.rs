@@ -49,7 +49,7 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
         .after_help("With --reuse-prefill, only the current record and axis retain private prompt KV. Every later sample replays the final prompt token with its original independent sample address. No prefix crosses an axis, document or flush boundary. Actual work is reported in each result; conservative cold native/mask debits and whole-run limits never renew or refund. Every event names the selected reuse execution in prefill_reuse.")
         .mut_arg("max_checkpoints", |arg| arg.help("Nonrenewable cooperative checkpoints for the ENTIRE stream"))
         .mut_arg("max_forward_positions", |arg| arg.help("Whole-stream forward ceiling across all records, axes and samples"))
-        .mut_arg("max_projected_logits", |arg| arg.help("Whole-stream full-vocabulary projection ceiling"))
+        .mut_arg("max_projected_logits", |arg| arg.help("Whole-stream projected output-row ceiling"))
         .mut_arg("max_attention_pairs", |arg| arg.help("Whole-stream attention-pair ceiling"))
         .mut_arg("max_dot_products", |arg| arg.help("Whole-stream actual grouped native dot-product ceiling"))
         .mut_arg("max_multiply_accumulates", |arg| arg.help("Whole-stream multiply-accumulate ceiling"))

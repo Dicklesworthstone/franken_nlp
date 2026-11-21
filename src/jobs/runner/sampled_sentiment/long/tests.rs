@@ -143,6 +143,86 @@ fn reuse_and_prefill_bind_resume_without_reducing_the_cold_attempt_allowance() {
     assert!(bad.check_job_limits(limits()).is_err());
 }
 
+#[test]
+fn complete_document_recipe_binds_selected_child_policy_and_unchanged_cold_work() {
+    let dense = recipe();
+    assert!(serde_json::to_value(&dense).unwrap()["chunk_sampling"].get("selected_rows").is_none());
+    for reuse in [false, true] {
+        let make = |rows| {
+            let mut child = recipe().chunk_sampling.with_selected_rows(
+                Some(Int4JsonSparseLimits { max_rows_per_step: rows })).unwrap();
+            if reuse { child = child.with_reused_prefill().unwrap(); }
+            SampledSentimentDocumentJobRecipe::new(child, mapping()).unwrap()
+        };
+        let sparse = make(4096);
+        sparse.check_job_limits(limits()).unwrap();
+        assert_eq!(sparse.execution, if reuse { SAMPLED_SENTIMENT_MAP_SPARSE_REUSED_PREFILL_EXECUTION }
+            else { SAMPLED_SENTIMENT_MAP_SPARSE_EXECUTION });
+        assert_eq!(sparse.chunk_sampling.checked_selected_rows().unwrap(),
+            Some(Int4JsonSparseLimits { max_rows_per_step: 4096 }));
+        assert_eq!(sparse.mapping.max_model_work, dense.mapping.max_model_work);
+        assert_eq!(sparse.chunk_sampling.job.max_work, dense.chunk_sampling.job.max_work);
+        assert_eq!(sparse.chunk_sampling.sampling.effective_seed, dense.chunk_sampling.sampling.effective_seed);
+        assert_eq!(freeze(&dense).binding.compare(&freeze(&sparse).binding),
+            Err(JobError::Mismatch(MismatchField::Recipe)));
+        assert_eq!(freeze(&sparse).binding.compare(&freeze(&make(4095)).binding),
+            Err(JobError::Mismatch(MismatchField::Recipe)));
+        let mut expected = serde_json::to_value(&sparse).unwrap();
+        expected["chunk_sampling"].as_object_mut().unwrap().remove("selected_rows");
+        expected["execution"] = serde_json::json!(SAMPLED_SENTIMENT_MAP_EXECUTION);
+        expected["chunk_sampling"]["execution"] = serde_json::json!(SAMPLED_SENTIMENT_EXECUTION);
+        expected["chunk_sampling"]["native_execution"] = serde_json::json!(INT4_JSON_SAMPLED_EXECUTION);
+        assert_eq!(expected, serde_json::to_value(&dense).unwrap());
+        for axis in 0..5 {
+            let mut changed = make(4096);
+            match axis {
+                0 => changed.execution = SAMPLED_SENTIMENT_MAP_EXECUTION,
+                1 => changed.chunk_sampling.execution = SAMPLED_SENTIMENT_EXECUTION,
+                2 => changed.chunk_sampling.native_execution = INT4_JSON_SAMPLED_EXECUTION,
+                3 => changed.chunk_sampling.selected_rows.as_mut().unwrap().max_rows_per_step = 0,
+                _ => changed.chunk_sampling.selected_rows = None,
+            }
+            assert!(changed.check_job_limits(limits()).is_err(), "document projection binding {axis}");
+        }
+    }
+}
+
+#[test]
+fn actual_document_factory_keeps_selected_cap_encoding_and_full_preparation_across_schedules() {
+    use crate::native_engine::strict_int4::weights::projection_fixture;
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    let (model, _) = projection_fixture(32);
+    let vocabulary = Arc::new(SampledSentimentVocabulary::pinned().unwrap());
+    let compact = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 32768,
+        max_output_tokens: 32768, max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 });
+    for encoding in [UntrustedEncoding::ByteFallback, compact] {
+        let make = |projection: Option<Int4JsonSparseLimits>| {
+            let recipe = recipe();
+            let planner = SampledSentimentPlanner::for_model_with_encoding(model.identity(),
+                recipe.chunk_sampling.sampling, task(), SampledSentimentLimits {
+                    max_input_bytes: 2048, max_result_bytes: 65536, ..Default::default() }, encoding.clone()).unwrap();
+            let planner = match projection { Some(cap) => planner.with_selected_rows(cap).unwrap(), None => planner };
+            SampledSentimentDocumentJobPlanner::new(planner, Arc::clone(&vocabulary), mapping(), native(), limits()).unwrap()
+        };
+        let dense = make(None);
+        let cap = Int4JsonSparseLimits { max_rows_per_step: 4096 };
+        let sparse = make(Some(cap));
+        assert_eq!(sparse.selected_rows(), Some(cap));
+        assert_eq!(sparse.preparation_requirement_bytes(), dense.preparation_requirement_bytes());
+        assert_eq!(sparse.document_encoding(), dense.document_encoding());
+        assert_eq!(sparse.native_limits().max_model_work, dense.native_limits().max_model_work);
+        assert_ne!(sparse.base_execution_identity(), dense.base_execution_identity());
+        let identity = sparse.base_execution_identity().clone();
+        let sparse = sparse.with_layer_major_prefill(Int4PrefillLimits { max_batch_rows: 4,
+            max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(4).unwrap() }).unwrap()
+            .with_reused_prefill().unwrap();
+        sparse.check_job_limits(limits()).unwrap();
+        assert_eq!(sparse.base_execution_identity(), &identity);
+        assert_eq!(sparse.selected_rows(), Some(cap));
+        assert_eq!(sparse.job_recipe().execution, SAMPLED_SENTIMENT_MAP_SPARSE_REUSED_PREFILL_EXECUTION);
+    }
+}
+
 struct RefuseAdmission;
 impl SampledSentimentDocumentBatchAdmission for RefuseAdmission {
     type Guard = ();

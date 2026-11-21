@@ -65,6 +65,7 @@ fn host_config(args: &Int4Args, options: CorpusArgs, limits: CorpusLimits, remai
             mask_limits: limits.native.masks.per_mask,
             max_mask_node_visits: limits.native.masks.max_visits_per_item,
             prefill: limits.common.prefill, reuse_prefill: sampled.reuse_prefill,
+            selected_rows: sampled.selected_rows()?,
         },
         task: sampled.budget(args, limits.common, SentimentAxis::ALL.len())?,
         encoding: options.document.input_encoding(args)?,
@@ -128,6 +129,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         compute_schedule: compute::Schedule::for_threads(common.compute.threads),
         prefill_schedule: common.prefill.map(PrefillSchedule::new).transpose()?,
         prefill_reuse: options.document.sampled.prefill_reuse_execution(),
+        max_selected_rows: options.document.sampled.max_selected_rows,
         input_encoding: input_encoding::reported_policy(&config.encoding),
     };
     let writer = CandidateWriter::new(output, &provenance, limits.transport.max_output_line_bytes,
@@ -167,6 +169,8 @@ struct Provenance<'a> {
     prefill_schedule: Option<PrefillSchedule>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefill_reuse: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_selected_rows: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     input_encoding: Option<&'a UntrustedEncoding>,
 }

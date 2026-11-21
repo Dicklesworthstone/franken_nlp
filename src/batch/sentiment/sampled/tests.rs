@@ -54,14 +54,18 @@ impl DecodeStepControl for StopAt {
     }
 }
 #[derive(Clone, Copy)]
-enum Mode { Success, NoResult, Dirty, Cancel, WrongWork, WrongSchedule, Panic }
-struct FixturePlan { identity: ExecutionIdentity, mode: Mode, required_context: usize }
-fn plan(mode: Mode) -> FixturePlan { FixturePlan { identity: identity(), mode, required_context: 8 } }
+enum Mode { Success, NoResult, Dirty, Cancel, WrongWork, WrongSchedule, WrongProjection, Panic }
+struct FixturePlan {
+    identity: ExecutionIdentity, mode: Mode, required_context: usize, selected_rows: Option<Int4JsonSparseLimits>,
+}
+fn plan(mode: Mode) -> FixturePlan {
+    FixturePlan { identity: identity(), mode, required_context: 8, selected_rows: None }
+}
 impl Plan for FixturePlan {
     fn facts(&self) -> SampledSentimentPlanFacts<'_> {
         SampledSentimentPlanFacts { identity: &self.identity, model_work: work(1), group_width: 32,
             sample_count: 1, required_context: self.required_context, task_budget: task(),
-            max_result_bytes: 8192, preparation_bytes: 1024 }
+            max_result_bytes: 8192, max_output_tokens: 16, selected_rows: self.selected_rows, preparation_bytes: 1024 }
     }
     fn verify(&self, admitted: &ExecutionIdentity) -> Result<(), BatchItemFailure> {
         if &self.identity != admitted { Err(BatchItemFailure::fatal(BatchCode::Admission)) } else { Ok(()) }
@@ -128,8 +132,13 @@ impl Driver<FixturePlan> for Engine {
             justification: "Synthetic lifecycle fixture.".to_owned(), generated_tokens: 2,
             model_work: self.actual_work, mask_node_visit_charge: 3 };
         let reuse_prefill = self.reuse_prefill ^ matches!(plan.mode, Mode::WrongSchedule);
-        let execution = if reuse_prefill { SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION }
-            else { SAMPLED_SENTIMENT_EXECUTION };
+        let selected = plan.selected_rows.is_some() ^ matches!(plan.mode, Mode::WrongProjection);
+        let execution = match (selected, reuse_prefill) {
+            (false, false) => SAMPLED_SENTIMENT_EXECUTION,
+            (false, true) => SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION,
+            (true, false) => SAMPLED_SENTIMENT_SPARSE_EXECUTION,
+            (true, true) => SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION,
+        };
         let mut output = SampledSentimentRun { schema_version: 1, execution: execution.to_owned(),
             task_spec: "sentiment-v1".to_owned(), prompt_template_sha256: identity.template_digest,
             numerics_profile: STRICT_INT4_PROFILE.to_owned(), group_width: 32,
@@ -610,6 +619,68 @@ fn completed_schedule_substitution_is_fatal_for_both_cold_and_reused_streams() {
         assert_eq!(probe.drops.get(), 1); assert!(!probe.live.get());
         assert!(run.enter().is_err());
     }
+}
+
+#[test]
+fn selected_completions_preserve_schedule_tags_and_never_refund_attempt_work() {
+    for selected in [None, Some(Int4JsonSparseLimits { max_rows_per_step: 4096 })] {
+    for reuse in [false, true] { for wrong_projection in [false, true] {
+        let probe = Rc::new(Probe::default()); let seal = Arc::new(());
+        let (mut driver, mut admission, mut run) = host(&probe, 2);
+        driver.reuse_prefill = reuse;
+        let mut planned = plan(if wrong_projection { Mode::WrongProjection } else { Mode::Success });
+        planned.selected_rows = selected;
+        let record = prepare_checked(planned, &seal, &driver, limits(2), 1024, &mut Continue).unwrap();
+        let result = execute_owned(record, &seal, &mut driver, &mut admission,
+            &mut run, context(1, 1), &mut Continue);
+        if wrong_projection {
+            let error = result.err().unwrap();
+            assert!(error.stop); assert_eq!(error.fault.code, BatchCode::InvalidExecution);
+            assert_eq!(run.state, State::Failed);
+        } else {
+            drop(result.unwrap());
+            assert_eq!(run.state, State::Ready);
+        }
+        assert_eq!(run.remaining, work(1)); assert_eq!(run.remaining_masks, 5);
+        assert_eq!(probe.calls.get(), 1); assert_eq!(probe.drops.get(), 1); assert!(!probe.live.get());
+    } } }
+}
+
+#[test]
+fn real_batch_planning_carries_exact_selected_projection_and_complete_generation_ceiling() {
+    use crate::native_engine::strict_int4::weights::projection_fixture;
+    use crate::tasks::sentiment::sampled::SampledSentimentOptions;
+    let (model, _) = projection_fixture(32);
+    let vocabulary = Arc::new(SampledSentimentVocabulary::pinned().unwrap());
+    let task = TaskBudget { max_input_tokens: 4096, max_output_tokens: 1024,
+        max_output_bytes: 65_536, max_grammar_states: 4096, max_kv_bytes: 1 << 30 };
+    let options = SampledSentimentOptions { effective_seed: [17; 32], samples: 2,
+        temperature_milli: 1000, top_k: None, top_p_ppm: 1_000_000,
+        max_sample_tokens: 64, max_justification_chars: 64 };
+    let work = Int4Work::for_sequence(32, 0, 8192,
+        1024 * crate::native_engine::lmhead::NANBEIGE_VOCAB_SIZE).unwrap();
+    let native = SampledSentimentBatchLimits { max_item_work: work,
+        max_model_work: work.checked_add(work).unwrap(), ..limits(2) };
+    let make = |selected: Option<Int4JsonSparseLimits>| {
+        let planner = SampledSentimentPlanner::for_model(model.identity(), options.clone(), task,
+            SampledSentimentLimits::default()).unwrap();
+        let planner = match selected { Some(cap) => planner.with_selected_rows(cap).unwrap(), None => planner };
+        SampledSentimentBatchPlanner::new(planner, Arc::clone(&vocabulary), task, native).unwrap()
+    };
+    let document = || BatchDocument { id: "stable-item".to_owned(), text: "Useful service.".to_owned(),
+        task_args: Some(SampledSentimentBatchArgs { axes: vec![SentimentAxis::Valence], budget: None }) };
+    let dense = make(None); let dense_plan = dense.prepare(document(), &mut Continue).unwrap();
+    let cap = Int4JsonSparseLimits { max_rows_per_step: 4096 };
+    let sparse = make(Some(cap)); let sparse_plan = sparse.prepare(document(), &mut Continue).unwrap();
+    let facts = Plan::facts(&sparse_plan);
+    assert_eq!(sparse.selected_rows(), Some(cap)); assert_eq!(facts.selected_rows, Some(cap));
+    assert_eq!(facts.max_output_tokens, 2 * 64);
+    assert_eq!(facts.model_work.projected_logits, facts.max_output_tokens * 4096);
+    assert_eq!(facts.model_work.forward_positions, dense_plan.planned_work().forward_positions);
+    assert_eq!(facts.model_work.attention_pairs, dense_plan.planned_work().attention_pairs);
+    assert!(facts.model_work.projections.multiply_accumulates < dense_plan.planned_work().projections.multiply_accumulates);
+    assert_eq!(sparse.preparation_requirement_bytes(), dense.preparation_requirement_bytes());
+    assert_ne!(sparse.base_execution_identity(), dense.base_execution_identity());
 }
 
 #[test]

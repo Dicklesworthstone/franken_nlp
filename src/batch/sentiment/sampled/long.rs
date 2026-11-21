@@ -62,6 +62,7 @@ impl SampledSentimentDocumentPlanner {
     pub fn mapping(&self) -> SampledSentimentMapLimits { self.mapping }
     pub fn limits(&self) -> SampledSentimentBatchLimits { self.limits }
     pub fn document_encoding(&self) -> &UntrustedEncoding { self.planner.input_encoding() }
+    pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.planner.selected_rows() }
     pub fn preparation_requirement_bytes(&self) -> u64 { self.preparation_bytes }
     #[cfg(all(feature = "metadata-store", target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -95,6 +96,7 @@ pub struct SampledSentimentDocumentPlanFacts<'a> {
     pub original_task: TaskBudget,
     pub max_result_bytes: u64,
     pub max_output_tokens: u64,
+    pub selected_rows: Option<Int4JsonSparseLimits>,
     pub preparation_bytes: u64,
 }
 pub struct SampledSentimentDocumentAdmission<'a> {
@@ -114,6 +116,11 @@ impl PreparedSampledSentimentDocumentRecord {
     pub fn model_work(&self) -> Int4Work { self.record.plan.planned_work() }
     pub fn mask_node_visits(&self) -> u64 { self.record.mask_node_visits }
     pub fn max_result_bytes(&self) -> u64 { self.record.plan.max_result_bytes() }
+    pub fn max_output_tokens(&self) -> u64 { self.record.plan.max_output_tokens() }
+    pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.record.plan.selected_rows() }
+    pub fn execution_version(&self, reuse_prefill: bool) -> &'static str {
+        self.record.plan.execution_version(reuse_prefill)
+    }
 }
 
 /// One process-admitted engine executes every original chunk, axis and sample
@@ -222,7 +229,7 @@ impl DocumentPlan for PreparedSampledSentimentMap {
             group_width: self.group_width(), sample_count: self.sample_count(), chunk_count: self.chunk_count(),
             required_context: self.required_context(), original_task: self.task_budget(),
             max_result_bytes: self.max_result_bytes(), max_output_tokens: self.max_output_tokens(),
-            preparation_bytes: self.preparation_requirement_bytes() }
+            selected_rows: self.selected_rows(), preparation_bytes: self.preparation_requirement_bytes() }
     }
     fn verify_identity(&self, admitted: &ExecutionIdentity) -> Result<(), BatchItemFailure> {
         if admitted != self.execution_identity() { Err(BatchItemFailure::fatal(BatchCode::Admission)) } else { Ok(()) }

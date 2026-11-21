@@ -117,6 +117,7 @@ impl NlpEngine {
             return Err(HostedError::ModelIdentity);
         }
         let work = planner.limits();
+        let selected_rows = planner.selected_rows();
         let required = scheduled_requirements(model.model_identity().group_width(), work, planner.task_budget(),
             planner.preparation_requirement_bytes(), limits, prefill)?;
         let team_scratch = compute_threads.map(|width|
@@ -143,7 +144,7 @@ impl NlpEngine {
             })?;
             let admission = Admission { lease: &lease, model: model.model_identity(),
                 context: limits.native.context_tokens, kv_bytes: required.native.kv_bytes,
-                work, preparation_bytes: limits.preparation_reserve_bytes,
+                work, selected_rows, preparation_bytes: limits.preparation_reserve_bytes,
                 output_bytes: limits.transport.max_output_line_bytes as u64 };
             let completion = {
                 let mut processor = if reuse_prefill {
@@ -179,7 +180,7 @@ impl NlpEngine {
                 })?;
                 let admission = Admission { lease: &lease, model: weights.identity(),
                     context: limits.native.context_tokens, kv_bytes: required.native.kv_bytes,
-                    work, preparation_bytes: limits.preparation_reserve_bytes,
+                    work, selected_rows, preparation_bytes: limits.preparation_reserve_bytes,
                     output_bytes: limits.transport.max_output_line_bytes as u64 };
                 let completion = {
                     let mut processor = if reuse_prefill {
@@ -234,6 +235,7 @@ fn scheduled_requirements(width: usize, work: SampledSentimentBatchLimits, task:
 pub(super) struct Admission<'a> {
     lease: &'a EngineLease, model: &'a Int4ModelIdentity, context: usize, kv_bytes: u64,
     work: SampledSentimentBatchLimits, preparation_bytes: u64, output_bytes: u64,
+    selected_rows: Option<Int4JsonSparseLimits>,
 }
 #[cfg(all(feature = "metadata-store", target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -242,8 +244,8 @@ impl<'a> Admission<'a> {
     /// through spool synchronization and the journal's commit acknowledgement.
     pub(super) fn for_job(lease: &'a EngineLease, model: &'a Int4ModelIdentity,
         context: usize, kv_bytes: u64, work: SampledSentimentBatchLimits,
-        preparation_bytes: u64, output_bytes: u64) -> Self {
-        Self { lease, model, context, kv_bytes, work, preparation_bytes, output_bytes }
+        preparation_bytes: u64, output_bytes: u64, selected_rows: Option<Int4JsonSparseLimits>) -> Self {
+        Self { lease, model, context, kv_bytes, work, preparation_bytes, output_bytes, selected_rows }
     }
 }
 impl SampledSentimentBatchAdmission for Admission<'_> {
@@ -253,7 +255,7 @@ impl SampledSentimentBatchAdmission for Admission<'_> {
         constrained_int4::check_model(request.facts.identity, self.model)
             .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
         check_request(self.model.group_width(), self.context, self.kv_bytes, self.work,
-            self.preparation_bytes, self.output_bytes, &request)?;
+            self.preparation_bytes, self.output_bytes, self.selected_rows, &request)?;
         // Results retain explanation strings and counters, not native token
         // arrays. Keep the full result charge through serialization and flush.
         let guard = output_claim(self.lease, request.facts.max_result_bytes, 0).map_err(|error| match error {
@@ -266,7 +268,8 @@ impl SampledSentimentBatchAdmission for Admission<'_> {
 
 #[allow(clippy::too_many_arguments)]
 fn check_request(width: usize, context: usize, kv_bytes: u64, work: SampledSentimentBatchLimits,
-    preparation_bytes: u64, output_bytes: u64, request: &SampledSentimentAdmission<'_>)
+    preparation_bytes: u64, output_bytes: u64, selected_rows: Option<Int4JsonSparseLimits>,
+    request: &SampledSentimentAdmission<'_>)
     -> Result<(), BatchItemFailure> {
     let facts = &request.facts;
     constrained_int4::check_profile(facts.identity, width)
@@ -274,6 +277,9 @@ fn check_request(width: usize, context: usize, kv_bytes: u64, work: SampledSenti
     if facts.identity.task_spec != "sentiment-v1"
         || facts.identity.sampler_version != constrained_int4::JSON_SAMPLER_VERSION
         || facts.group_width != width || request.kv_reservation_bytes != kv_bytes
+        || facts.selected_rows != selected_rows
+        || !projection_matches(facts.model_work, facts.max_output_tokens, selected_rows)
+        || facts.max_output_tokens > u64::from(facts.task_budget.max_output_tokens)
         || facts.task_budget.validate().is_err() || facts.preparation_bytes == 0
         || facts.preparation_bytes > preparation_bytes {
         return Err(BatchItemFailure::fatal(BatchCode::Admission));

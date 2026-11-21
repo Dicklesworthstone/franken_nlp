@@ -11,8 +11,7 @@ use crate::{
         strict_int4::{Int4ModelError, StrictInt4Error,
             weights::snapshot::{Int4SnapshotError, INT4_SNAPSHOT_VERSION}}},
     tasks::sentiment::sampled::{SampledSentimentError, SampledSentimentPlanner,
-        SampledSentimentVocabulary, SAMPLED_SENTIMENT_EXECUTION,
-        SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION},
+        SampledSentimentVocabulary},
 };
 
 struct DeadlineControl { started: Instant, deadline: Duration }
@@ -131,17 +130,20 @@ pub(super) fn execute(args: Int4Args, command: SampledArgs, _admitted: Int4Limit
     let planner = SampledSentimentPlanner::for_model(model.model_identity(), options,
         request.budget, command.task_limits(&args)).map_err(task_failure)?
         .with_input_encoding(encoding.clone()).map_err(task_failure)?;
+    let planner = command.configure_planner(planner)?;
     let prepared = planner.plan_with_control(&request, &mut DeadlineControl { started, deadline })
         .map_err(task_failure)?;
     command.admit_plan(prepared.required_context(), args.context_tokens, prepared.planned_work())
         .map_err(admission_failure)?;
     if prepared.sample_count() != samples || prepared.group_width() != args.group_width
         || prepared.input_encoding() != &encoding
+        || prepared.selected_rows() != command.selected_rows()?
         || prepared.preparation_requirement_bytes() > limits.preparation_bytes {
         return Err(admission_failure(CandidateError::Planning));
     }
     let identity = prepared.execution_identity().clone();
     let expected_work = prepared.planned_work();
+    let execution = prepared.execution_version(command.reuse_prefill);
     let vocabulary = Arc::new(SampledSentimentVocabulary::pinned().map_err(task_failure)?);
     drop(planner);
     drop(request);
@@ -183,8 +185,6 @@ pub(super) fn execute(args: Int4Args, command: SampledArgs, _admitted: Int4Limit
         }.map(compute::Completion::serial)
     }.map_err(host_failure)?;
     let used = result.result().model_work;
-    let execution = if command.reuse_prefill { SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION }
-        else { SAMPLED_SENTIMENT_EXECUTION };
     if result.result().execution != execution || result.result().group_width != args.group_width
         || used.forward_positions > expected_work.forward_positions
         || used.projected_logits > expected_work.projected_logits
@@ -202,6 +202,7 @@ pub(super) fn execute(args: Int4Args, command: SampledArgs, _admitted: Int4Limit
         model_content_sha256: &content, candidate_format: &identity.artifact_format,
         quant_recipe: &identity.quant_recipe, group_width: args.group_width,
         integer_kernel: limits.kernel.kind().id(), snapshot,
+        max_selected_rows: command.max_selected_rows,
     };
     publish_checked(&input_encoding::Response {
         response: &compute::Response {
@@ -238,6 +239,8 @@ struct Provenance<'a> {
     group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<SnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_selected_rows: Option<usize>,
 }
 #[derive(Serialize)]
 struct Response<'a, 'b, T: Serialize> {

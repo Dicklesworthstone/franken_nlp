@@ -15,7 +15,8 @@ use crate::{
     execution_identity::ExecutionIdentity,
     native_engine::{
         constrained::JsonWorkBudget,
-        constrained_int4::{self, Int4JsonBudget, JSON_SAMPLER_VERSION, json_sampling_workspace_bytes},
+        constrained_int4::{self, Int4JsonBudget, JSON_SAMPLER_VERSION, json_sampling_workspace_bytes,
+            sparse::Int4JsonSparseLimits},
         decode::DecodeStepControl,
         portable_int8::ProjectionWork,
         strict_int4::{Int4MemoryRequirement, Int4RunBudget, Int4Work, StrictInt4Engine, STRICT_INT4_PROFILE,
@@ -24,7 +25,8 @@ use crate::{
     tasks::{ir::TaskBudget, sentiment::{SentimentAxis, SentimentRequest,
         sampled::{PreparedSampledSentiment, SampledSentimentError, SampledSentimentLimits,
             SampledSentimentPlanner, SampledSentimentRun, SampledSentimentVocabulary,
-            SAMPLED_SENTIMENT_EXECUTION, SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION}}},
+            SAMPLED_SENTIMENT_EXECUTION, SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION,
+            SAMPLED_SENTIMENT_SPARSE_EXECUTION, SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION}}},
     tokenizer::untrusted::UntrustedEncoding,
 };
 
@@ -134,6 +136,7 @@ impl SampledSentimentBatchPlanner {
     pub fn task_budget(&self) -> TaskBudget { self.task_budget }
     pub fn limits(&self) -> SampledSentimentBatchLimits { self.limits }
     pub fn document_encoding(&self) -> &UntrustedEncoding { self.planner.input_encoding() }
+    pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.planner.selected_rows() }
     pub fn preparation_requirement_bytes(&self) -> u64 { self.preparation_bytes }
     #[cfg(all(feature = "metadata-store", target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -173,6 +176,8 @@ pub struct SampledSentimentPlanFacts<'a> {
     pub required_context: usize,
     pub task_budget: TaskBudget,
     pub max_result_bytes: u64,
+    pub max_output_tokens: u64,
+    pub selected_rows: Option<Int4JsonSparseLimits>,
     pub preparation_bytes: u64,
 }
 pub struct SampledSentimentAdmission<'a> {
@@ -193,6 +198,11 @@ impl PreparedSampledSentimentRecord {
     pub fn model_work(&self) -> Int4Work { self.record.plan.planned_work() }
     pub fn mask_node_visits(&self) -> u64 { self.record.mask_node_visits }
     pub fn max_result_bytes(&self) -> u64 { self.record.plan.max_result_bytes() }
+    pub fn max_output_tokens(&self) -> u64 { self.record.plan.max_output_tokens() }
+    pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.record.plan.selected_rows() }
+    pub fn execution_version(&self, reuse_prefill: bool) -> &'static str {
+        self.record.plan.execution_version(reuse_prefill)
+    }
 }
 
 /// One native engine serves every independently addressed sample in every record.
@@ -290,7 +300,8 @@ impl Plan for PreparedSampledSentiment {
         SampledSentimentPlanFacts { identity: self.execution_identity(), model_work: self.planned_work(),
             group_width: self.group_width(), sample_count: self.sample_count(),
             required_context: self.required_context(), task_budget: self.task_budget(),
-            max_result_bytes: self.max_result_bytes(), preparation_bytes: self.preparation_requirement_bytes() }
+            max_result_bytes: self.max_result_bytes(), max_output_tokens: self.max_output_tokens(),
+            selected_rows: self.selected_rows(), preparation_bytes: self.preparation_requirement_bytes() }
     }
     fn verify(&self, admitted: &ExecutionIdentity) -> Result<(), BatchItemFailure> {
         self.verify_identity(admitted).map_err(task_failure)
@@ -420,8 +431,12 @@ fn native_budget(work: Int4Work, kv_bytes: u64, masks: u64, limits: SampledSenti
 fn valid_result<P: Plan>(plan: &P, output: &SampledSentimentRun, masks: u64, reuse_prefill: bool) -> bool {
     let facts = plan.facts();
     let samples = output.dimensions.iter().try_fold(0_usize, |count, axis| count.checked_add(axis.samples.len()));
-    let execution = if reuse_prefill { SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION }
-        else { SAMPLED_SENTIMENT_EXECUTION };
+    let execution = match (facts.selected_rows.is_some(), reuse_prefill) {
+        (false, false) => SAMPLED_SENTIMENT_EXECUTION,
+        (false, true) => SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION,
+        (true, false) => SAMPLED_SENTIMENT_SPARSE_EXECUTION,
+        (true, true) => SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION,
+    };
     output.schema_version == 1 && output.execution == execution
         && output.task_spec == "sentiment-v1" && output.sampler_version == JSON_SAMPLER_VERSION
         && output.prompt_template_sha256 == facts.identity.template_digest
@@ -430,6 +445,7 @@ fn valid_result<P: Plan>(plan: &P, output: &SampledSentimentRun, masks: u64, reu
         && output.dimensions.iter().all(|axis| axis.samples.len() == output.samples_per_axis
             && axis.samples.iter().enumerate().all(|(index, sample)| sample.sample_index == index))
         && fits(output.model_work, facts.model_work)
+        && output.generated_tokens <= facts.max_output_tokens
         && output.generated_tokens <= u64::from(facts.task_budget.max_output_tokens)
         && output.mask_node_visit_charge <= masks
 }

@@ -214,7 +214,7 @@ fn completion_metadata_binds_candidate_and_all_six_spent_axes_without_private_sa
         group_width: args.group_width, integer_kernel: common.kernel.kind().id(),
         snapshot: Some(SnapshotRecord::new("loaded", common.snapshot_need)),
         input_encoding: None, compute_schedule: None, prefill_schedule: None,
-        prefill_reuse: None, output: &report,
+        prefill_reuse: None, max_selected_rows: None, output: &report,
     };
     let mut bytes = Vec::new();
     publish_report(&response, &mut bytes, &|| Ok(Duration::from_secs(1)),
@@ -250,7 +250,7 @@ fn completion_metadata_binds_candidate_and_all_six_spent_axes_without_private_sa
     assert!(!std::str::from_utf8(&bytes).unwrap().contains("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
     assert!(bytes.ends_with(b"\n"));
     assert_eq!(publish(&response, 1, &mut NoIo), Err(CandidateError::Output));
-    for key in ["input_encoding", "compute_schedule", "prefill_schedule", "prefill_reuse"] {
+    for key in ["input_encoding", "compute_schedule", "prefill_schedule", "prefill_reuse", "max_selected_rows"] {
         assert!(value.get(key).is_none());
     }
     let encoding = crate::tokenizer::untrusted::UntrustedEncoding::SafeBpeV1(
@@ -284,6 +284,18 @@ fn completion_metadata_binds_candidate_and_all_six_spent_axes_without_private_sa
     assert_eq!(reused_value.as_object_mut().unwrap().remove("prefill_reuse"),
         Some(serde_json::json!(crate::tasks::sentiment::sampled::SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION)));
     assert_eq!(reused_value, value);
+    let (selected_rows, selected_args) = command("resume", 0,
+        &["--max-selected-rows", "4096", "--reuse-prefill"]);
+    selected_rows.args.validate(&selected_args).unwrap();
+    response.max_selected_rows = selected_rows.args.sampled.max_selected_rows;
+    response.prefill_reuse = selected_rows.args.sampled.prefill_reuse_execution();
+    let mut metadata = serde_json::to_value(&response).unwrap();
+    assert_eq!(metadata.as_object_mut().unwrap().remove("max_selected_rows"),
+        Some(serde_json::json!(4096)));
+    assert_eq!(metadata.as_object_mut().unwrap().remove("prefill_reuse"), Some(serde_json::json!(
+        crate::tasks::sentiment::sampled::SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION)));
+    assert_public_metadata(&metadata);
+    assert_eq!(metadata, value);
 }
 
 fn cancellations() -> [(DecodeCancellationKind, ErrorCode, &'static str); 11] {

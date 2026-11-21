@@ -39,6 +39,36 @@ impl Write for NoWrite {
 }
 
 #[test]
+fn selected_resident_stream_keeps_lower_head_ceiling_and_complete_reservations() {
+    for route in 0..3 { for schedule in [&[][..], &["--reuse-prefill", "--compute-threads", "4"][..],
+        &["--reuse-prefill", "--prefill-rows", "4", "--input-encoding", "safe-bpe-v1"][..]] {
+        let (dense_args, dense) = command_for_route(schedule, route);
+        let baseline = dense.validate(&dense_args).unwrap();
+        let mut flags = schedule.to_vec();
+        flags.extend(["--max-selected-rows", "4096", "--max-projected-logits", "16777216"]);
+        let (args, selected) = command_for_route(&flags, route);
+        let admitted = selected.validate(&args).unwrap();
+        assert_eq!(selected.sampled.selected_rows().unwrap(), Some(Int4JsonSparseLimits { max_rows_per_step: 4096 }));
+        assert_eq!(selected.sampled.options(&args).unwrap(), dense.sampled.options(&dense_args).unwrap());
+        assert_eq!(admitted.common.native, baseline.common.native);
+        assert_eq!(admitted.common.minimum_memory_bytes, baseline.common.minimum_memory_bytes);
+        assert_eq!(admitted.preparation_reserve_bytes, baseline.preparation_reserve_bytes);
+        assert_eq!(admitted.native.max_sampler_bytes, baseline.native.max_sampler_bytes);
+        assert_eq!(admitted.native.max_item_work, admitted.native.max_model_work);
+        assert_eq!(admitted.native.max_model_work.projected_logits, 16_777_216);
+        assert_eq!(admitted.transport.max_work.projected_logits, 16_777_216);
+        assert!(admitted.native.max_model_work.projected_logits < baseline.native.max_model_work.projected_logits);
+        assert_eq!(admitted.native.masks.max_visits_per_run, baseline.native.masks.max_visits_per_run);
+        assert_eq!(admitted.native.masks.max_visits_per_item, baseline.native.masks.max_visits_per_item);
+        assert_eq!(admitted.transport.max_output_bytes, baseline.transport.max_output_bytes);
+        let mut larger = selected; larger.stream.max_requests *= 2;
+        let larger = larger.validate(&args).unwrap();
+        assert_eq!(larger.native.max_model_work, admitted.native.max_model_work);
+        assert_eq!(larger.native.masks.max_visits_per_run, admitted.native.masks.max_visits_per_run);
+    } }
+}
+
+#[test]
 fn resident_prefill_reuse_preserves_cold_work_memory_and_sampler_admission() {
     assert!(!command(&[]).1.sampled.reuse_prefill);
     for route in 0..3 {

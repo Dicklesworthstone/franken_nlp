@@ -18,6 +18,8 @@ use serde::{Serialize, Serializer};
 use std::{cell::Cell, fs, os::unix::fs::DirBuilderExt, path::PathBuf, rc::Rc,
     sync::atomic::{AtomicU64, Ordering}};
 
+mod selected;
+
 struct Continue;
 impl DecodeStepControl for Continue {
     fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }

@@ -251,7 +251,8 @@ impl<R: BufRead> JobExecution<R> {
             };
             native.commit()?;
             let admission = Admission::for_job(&lease, weights.identity(), limits.native.context_tokens,
-                required.native.kv_bytes, work, limits.preparation_reserve_bytes, result_bytes);
+                required.native.kv_bytes, work, limits.preparation_reserve_bytes, result_bytes,
+                planner.selected_rows());
             let result = (|| {
                 let processor = SampledSentimentJobProcessor::new(planner, &mut engine, admission)
                     .map_err(JobRunError::Processor)?;

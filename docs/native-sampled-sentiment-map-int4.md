@@ -98,6 +98,16 @@ Worker and prefill scratch are charged before private input or model IO.
 Physical widths do not change the sampling recipe or complete cold-work cap.
 No measured speedup or executed schedule parity is claimed here.
 
+`--max-selected-rows N` applies one fixed legal-row ceiling to every chunk,
+axis and sample. It is also available on `sentiment-sampled-corpus` and
+`sentiment-sampled-document-job start|resume`; retained jobs authenticate the
+exact cap before replay. All legal rows, including accepting EOS, must fit
+before top-k/top-p sampling, and an over-cap step refuses the complete document.
+Original chunk coordinates, semantic draw addresses and full memory
+reservations remain unchanged. See [selected output rows](native-sampled-sentiment-int4.md#selected-output-rows)
+for the refusal contract, accounting, scheduling combinations and qualification
+limits.
+
 ## Complete source and independent draws
 
 The planner accepts one `SentimentRequest` with its complete original document,

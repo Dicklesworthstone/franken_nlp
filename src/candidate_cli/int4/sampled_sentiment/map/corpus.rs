@@ -89,7 +89,7 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
         .mut_arg("max_map_result_bytes", |arg| arg.help("Complete document result; event and provenance framing are additional"))
         .mut_arg("max_checkpoints", |arg| arg.help("Nonrenewable cooperative checkpoints for the ENTIRE stream"))
         .mut_arg("max_forward_positions", |arg| arg.help("Whole-stream cold forward ceiling across documents, chunks, axes and samples"))
-        .mut_arg("max_projected_logits", |arg| arg.help("Whole-stream full-vocabulary projection ceiling"))
+        .mut_arg("max_projected_logits", |arg| arg.help("Whole-stream projected output-row ceiling"))
         .mut_arg("max_attention_pairs", |arg| arg.help("Whole-stream attention-pair ceiling"))
         .mut_arg("max_dot_products", |arg| arg.help("Whole-stream grouped dot-product ceiling"))
         .mut_arg("max_multiply_accumulates", |arg| arg.help("Whole-stream multiply-accumulate ceiling"))

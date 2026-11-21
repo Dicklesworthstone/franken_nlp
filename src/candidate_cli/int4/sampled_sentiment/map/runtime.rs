@@ -9,8 +9,7 @@ use crate::{
         generation::grouped_int4::INT4_SOURCE_FORMAT,
         strict_int4::{prefill::INT4_LAYER_MAJOR_PREFILL_VERSION,
             weights::snapshot::INT4_SNAPSHOT_VERSION}},
-    tasks::{mapreduce::MapReduceError, sentiment::sampled::long::{SampledSentimentMapError,
-        SAMPLED_SENTIMENT_MAP_EXECUTION, SAMPLED_SENTIMENT_MAP_REUSED_PREFILL_EXECUTION}},
+    tasks::{mapreduce::MapReduceError, sentiment::sampled::long::SampledSentimentMapError},
     validation::grounded_fields::VerifiedSourceSpan,
 };
 use super::super::runtime::{cancelled, task_failure};
@@ -60,6 +59,7 @@ fn host_config(args: &Int4Args, options: MapArgs, limits: MapLimits, remaining: 
         max_sampler_bytes: json_sampling_workspace_bytes().map_err(|_| CandidateError::Arguments)?,
         mask_limits: options.sampled.masks(), max_mask_node_visits: options.sampled.max_mask_node_visits,
         prefill: limits.common.prefill, reuse_prefill: options.sampled.reuse_prefill,
+        selected_rows: options.sampled.selected_rows()?,
     })
 }
 
@@ -121,8 +121,7 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
             common.kernel, cancellation.clone()).map(compute::Completion::serial)
     }.map_err(host_failure)?;
     let run = result.result();
-    let execution = if options.sampled.reuse_prefill { SAMPLED_SENTIMENT_MAP_REUSED_PREFILL_EXECUTION }
-        else { SAMPLED_SENTIMENT_MAP_EXECUTION };
+    let execution = options.execution();
     if run.execution != execution || run.group_width != args.group_width
         || run.single_context_equivalence || run.source_span != source_span
         || run.samples_per_axis != options.sampled.samples
@@ -148,7 +147,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         snapshot: common.snapshot_pin.map(|_| SnapshotRecord { operation: "loaded",
             format: INT4_SNAPSHOT_VERSION, file_bytes: common.snapshot_need.file_bytes }),
         prefill_schedule: common.prefill.map(PrefillSchedule::new).transpose()?,
-        prefill_reuse: options.sampled.prefill_reuse_execution(), output: run,
+        prefill_reuse: options.sampled.prefill_reuse_execution(),
+        max_selected_rows: options.sampled.max_selected_rows, output: run,
     };
     publish_complete(&compute::Response { response: &response, compute: result.compute() },
         limits.envelope_bytes, output, &remaining, &cancellation)
@@ -194,6 +194,8 @@ struct Response<'a, T: Serialize> {
     prefill_schedule: Option<PrefillSchedule>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefill_reuse: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_selected_rows: Option<usize>,
     output: &'a T,
 }
 

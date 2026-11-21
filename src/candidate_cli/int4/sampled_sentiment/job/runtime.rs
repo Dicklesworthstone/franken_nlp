@@ -61,6 +61,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
     let compiler = SampledSentimentPlanner::for_model(model.model_identity(),
         job.sampled.options(&args)?, limits.task, limits.planning).map_err(task_failure)?
         .with_input_encoding(encoding.clone()).map_err(task_failure)?;
+    let compiler = job.sampled.configure_planner(compiler)?;
     let vocabulary = Arc::new(SampledSentimentVocabulary::pinned().map_err(task_failure)?);
     remaining()?;
     let planner = SampledSentimentJobPlanner::new(compiler, vocabulary, limits.native, lifetime)
@@ -75,6 +76,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
     planner.check_job_limits(lifetime).map_err(batch_failure)?;
     if planner.preparation_requirement_bytes() != preparation
         || planner.max_result_bytes() != common.result_bytes as u64
+        || planner.selected_rows() != job.sampled.selected_rows()?
         || planner.document_encoding() != &encoding {
         return Err(Failure::output("sampled_sentiment_job_planner_quote"));
     }
@@ -119,6 +121,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         compute_schedule: compute::Schedule::for_threads(common.compute.threads),
         prefill_schedule: common.prefill.map(PrefillSchedule::new).transpose()?,
         prefill_reuse: job.sampled.prefill_reuse_execution(),
+        max_selected_rows: job.sampled.max_selected_rows,
         output: &report,
     };
     // Staging/deadline failure can follow durable progress. Publish only one
@@ -230,6 +233,8 @@ struct Response<'a, T: Serialize> {
     prefill_schedule: Option<PrefillSchedule>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefill_reuse: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_selected_rows: Option<usize>,
     output: &'a T,
 }
 

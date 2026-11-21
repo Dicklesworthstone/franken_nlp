@@ -39,7 +39,7 @@ fn fixture(width: usize) -> SampledSentimentDocumentBatchHostConfig {
             preparation_reserve_bytes: 600 * MIB,
             max_sampler_bytes: json_sampling_workspace_bytes().unwrap(),
             mask_limits: MaskWorkLimits { max_trie_node_visits: 2_000_000, checkpoint_interval_nodes: 256 },
-            max_mask_node_visits: 1_000_000_000_000, prefill: None, reuse_prefill: false,
+            max_mask_node_visits: 1_000_000_000_000, prefill: None, reuse_prefill: false, selected_rows: None,
         },
         task, encoding: UntrustedEncoding::ByteFallback,
         transport: BatchLimits { max_line_bytes: 65_536, max_document_bytes: 4096,
@@ -72,7 +72,8 @@ fn capacity(config: &SampledSentimentDocumentBatchHostConfig, width: usize) -> D
     DocumentCapacity { context: config.document.native.context_tokens, kv_bytes: required.native.kv_bytes,
         mapping: config.document.mapping, work: config.work_limits(), preparation_bytes: required.input_bytes,
         output_reservation_bytes: required.output_reservation_bytes,
-        max_output_bytes: required.max_output_bytes, max_output_tokens: required.max_output_tokens }
+        max_output_bytes: required.max_output_bytes, max_output_tokens: required.max_output_tokens,
+        selected_rows: config.document.selected_rows }
 }
 fn request<'a>(config: &SampledSentimentDocumentBatchHostConfig, id: &'a ExecutionIdentity)
     -> SampledSentimentDocumentAdmission<'a> {
@@ -81,8 +82,41 @@ fn request<'a>(config: &SampledSentimentDocumentBatchHostConfig, id: &'a Executi
         identity: id, model_work: config.document.mapping.max_model_work, group_width: WIDTH,
         sample_count: 64, chunk_count: 8, required_context: 1824, original_task: config.task,
         max_result_bytes: required.max_output_bytes, max_output_tokens: required.max_output_tokens,
-        preparation_bytes: required.input_bytes },
+        selected_rows: config.document.selected_rows, preparation_bytes: required.input_bytes },
         kv_reservation_bytes: required.native.kv_bytes, mask_node_visits: 1_000_000 }
+}
+
+#[test]
+fn complete_selected_documents_bind_the_exact_cap_without_discounting_stream_memory() {
+    let mut config = fixture(WIDTH);
+    let dense = config.requirements(WIDTH).unwrap();
+    let selected = Int4JsonSparseLimits { max_rows_per_step: 4096 };
+    config.document.selected_rows = Some(selected);
+    let one = constrained_int4::sparse::planned_work(WIDTH, config.task.max_input_tokens as usize,
+        config.document.options.max_sample_tokens, selected).unwrap();
+    let item = (0..64).try_fold(Int4Work::default(), |total, _| total.checked_add(one)).unwrap();
+    config.document.mapping.max_model_work = item;
+    config.max_model_work = item.checked_add(item).unwrap();
+    config.transport.max_work = BatchWork { forward_positions: config.max_model_work.forward_positions,
+        projected_logits: config.max_model_work.projected_logits };
+    assert_eq!(config.requirements(WIDTH).unwrap(), dense);
+    let id = identity(WIDTH); let cap = capacity(&config, WIDTH);
+    let mut admitted = request(&config, &id);
+    check_request(WIDTH, cap, &admitted).unwrap();
+    for foreign in [None, Some(Int4JsonSparseLimits { max_rows_per_step: 4095 })] {
+        admitted.facts.selected_rows = foreign;
+        assert!(check_request(WIDTH, cap, &admitted).unwrap_err().stop);
+    }
+    admitted.facts.selected_rows = Some(selected);
+    admitted.facts.model_work.projected_logits -= 1;
+    assert!(check_request(WIDTH, cap, &admitted).unwrap_err().stop);
+    admitted.facts.model_work = item;
+    admitted.facts.max_output_tokens -= 1;
+    assert!(check_request(WIDTH, cap, &admitted).unwrap_err().stop);
+    for rows in [0, crate::native_engine::lmhead::NANBEIGE_VOCAB_SIZE + 1] {
+        config.document.selected_rows = Some(Int4JsonSparseLimits { max_rows_per_step: rows });
+        assert!(config.requirements(WIDTH).is_err());
+    }
 }
 
 #[test]
