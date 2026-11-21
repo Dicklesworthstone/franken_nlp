@@ -38,7 +38,8 @@ mod redact;
 mod extract;
 mod structured_cohort;
 mod semantic;
-pub use semantic::{Int4SemanticHostLimits, Int4SemanticHostRequirements};
+pub use semantic::{Int4SemanticHostLimits, Int4SemanticHostRequirements,
+    Int4SemanticCorpusConfig, Int4SemanticCorpusRequirements, int4_semantic_corpus_requirements};
 mod source_semantic;
 pub use source_semantic::{Int4SourceSemanticHostLimits, Int4SourceSemanticHostRequirements};
 mod extraction_map;

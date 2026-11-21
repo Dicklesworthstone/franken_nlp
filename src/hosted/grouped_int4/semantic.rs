@@ -1,5 +1,8 @@
 //! One charged native extraction and explicitly requested correlated review.
 use super::*;
+mod corpus;
+pub use corpus::{Int4SemanticCorpusConfig, Int4SemanticCorpusRequirements,
+    int4_semantic_corpus_requirements};
 use crate::{
     grammar::mask::MaskWorkLimits,
     native_engine::{constrained_int4, strict_int4::{Int4Work, STRICT_INT4_PROFILE}},
