@@ -268,10 +268,63 @@ fn persistent_workers_are_explicit_and_do_not_change_semantic_budgets() {
             Err(CandidateError::Arguments));
     }
     for flags in [vec!["--compute-threads", "2", "--prefill-rows", "1"],
-        vec!["--compute-threads", "2", "--cohort-documents", "2"],
-        vec!["--compute-threads", "2", "--max-selected-rows", "8"]] {
+        vec!["--compute-threads", "2", "--cohort-documents", "2"]] {
         if let Ok(matches) = crate::candidate_cli::definition().try_get_matches_from(argv(&flags)) {
             assert!(CandidateCommand::from_matches(&matches).is_err());
         }
+    }
+}
+
+
+#[test]
+fn selected_semantic_extraction_is_explicit_and_composes_with_encoding_workers_and_snapshots() {
+    let (reference, reference_args, reference_limits, options) = fixture();
+    assert!(reference.extraction.selected_rows().unwrap().is_none());
+    for encoding in ["byte-fallback", "safe-bpe-v1"] {
+        for threads in ["1", "4"] {
+            for snapshot in [false, true] {
+                let mut command = command(&["--max-selected-rows", "64",
+                    "--input-encoding", encoding, "--compute-threads", threads]);
+                if snapshot {
+                    command.args.source_dir = None; command.args.source_manifest = None;
+                    command.args.snapshot = Some(PathBuf::from("private.snapshot"));
+                    command.args.expected_model_sha256 = Some("ab".repeat(32));
+                }
+                let Int4Task::Semantic(semantic) = command.task else { panic!("wrong semantic route"); };
+                let common = semantic.validate(&command.args).unwrap();
+                let admitted = semantic.admit_options(&command.args, common, &options).unwrap();
+                assert_eq!(semantic.extraction.selected_rows().unwrap().unwrap().max_rows_per_step, 64);
+                assert_eq!(admitted.compute.threads, threads.parse::<usize>().unwrap());
+                assert_eq!(admitted.snapshot_pin.is_some(), snapshot);
+                assert_eq!(semantic.extraction.budget(&command.args, admitted),
+                    reference.extraction.budget(&reference_args, reference_limits));
+                assert_eq!(semantic.extraction.mask_visits(), reference.extraction.mask_visits());
+                assert_eq!(semantic.extraction.masks().max_trie_node_visits,
+                    reference.extraction.masks().max_trie_node_visits);
+                assert_eq!(semantic.extraction.masks().checkpoint_interval_nodes,
+                    reference.extraction.masks().checkpoint_interval_nodes);
+                assert_eq!(admitted.max_prompt_tokens + command.args.max_new_tokens - 1, command.args.context_tokens);
+                assert_eq!(admitted.native, reference_limits.native);
+                assert_eq!(semantic.validate_full_projection(&command.args).err(), Some(CandidateError::Arguments));
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_selected_semantic_ceiling_refuses_before_source_io_and_population_routes_stay_explicit() {
+    for rows in [0, NANBEIGE_VOCAB_SIZE + 1, usize::MAX] {
+        let rows = rows.to_string();
+        let mut output = Vec::new();
+        assert_eq!(command(&["--max-selected-rows", &rows]).execute(&mut NoRead, &mut output),
+            Err(CandidateError::Arguments));
+        assert!(output.is_empty());
+    }
+    assert!(one_off_definition().get_arguments().any(|arg| arg.get_long() == Some("max-selected-rows")));
+    for definition in [definition(), corpus::definition()] {
+        assert!(!definition.get_arguments().any(|arg| arg.get_long() == Some("max-selected-rows")));
+    }
+    for operation in jobs::definition().get_subcommands() {
+        assert!(!operation.get_arguments().any(|arg| arg.get_long() == Some("max-selected-rows")));
     }
 }

@@ -251,7 +251,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(redact::long::corpus::definition())
         .subcommand(redact::long::jobs::definition())
         .subcommand(compute::definition(input_encoding::definition(prefill::definition(extract::one_off_definition()))))
-        .subcommand(semantic::definition())
+        .subcommand(semantic::one_off_definition())
         .subcommand(semantic::document::definition())
         .subcommand(semantic::corpus::definition())
         .subcommand(semantic::jobs::definition())

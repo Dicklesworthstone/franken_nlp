@@ -36,9 +36,17 @@ pub(super) fn definition() -> clap::Command {
             .help("Complete explicit experimental Int4SemanticOptions JSON; local file, never stdin"))
         .mut_arg("max_result_bytes", |arg| arg.help("Original extraction result cap; combined output cap is semantic limits.max_output_bytes"))
 }
+
+/// Only this one-shot route binds an explicit extraction-head policy. The
+/// shared definition remains the full-vocabulary base for semantic jobs and
+/// resident streams until those routes authenticate the same strategy.
+pub(super) fn one_off_definition() -> clap::Command {
+    definition().arg(extract::selected_rows_argument())
+        .after_long_help("--max-selected-rows N explicitly selects EVERY legal extraction token row, including EOS when the grammar accepts. A complete legal set larger than N refuses the invocation; no token is pruned and no unconstrained retry occurs. The strategy and row ceiling are sealed into the extraction identity before admission. Only extraction uses selected rows: all semantic judge heads retain their full-vocabulary sequence-score denominators and original prompt, evidence and work limits. Full-vocabulary extraction remains the default. Both policies retain identical schema/source validation, complete prompt/KV reservation and grammar-mask limits. This option composes with --input-encoding safe-bpe-v1 and --compute-threads. It does not claim model parity, measured speed or semantic accuracy.")
+}
 impl SemanticArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-        let extraction = extract::ExtractionArgs::from_matches(matches)?;
+        let extraction = extract::ExtractionArgs::from_matches_with_projection(matches)?;
         let semantic_options = matches.get_one::<PathBuf>("semantic_options").cloned().ok_or_else(||
             clap::Error::raw(clap::error::ErrorKind::MissingRequiredArgument, "semantic options file required"))?;
         Ok(Self { extraction, semantic_options,
@@ -49,8 +57,12 @@ impl SemanticArgs {
         if args.prefill()?.is_some() || !args.input_encoding.is_default() {
             return Err(CandidateError::Arguments);
         }
-        let common = self.extraction.validate_batch_with_prefill(args)?;
+        let common = self.extraction.validate_one_off_with_prefill(args)?;
         self.storage(args, common, common.result_bytes)
+    }
+    fn validate_full_projection(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
+        if self.extraction.selected_rows()?.is_some() { return Err(CandidateError::Arguments); }
+        self.validate(args)
     }
     fn storage(&self, args: &Int4Args, original: Int4Limits, result_bytes: usize)
         -> Result<Int4Limits, CandidateError> {

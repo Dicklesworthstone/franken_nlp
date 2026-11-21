@@ -92,7 +92,7 @@ impl BatchArgs {
                 .contains(&Some(0)) {
             return Err(CandidateError::Arguments);
         }
-        self.semantic.validate(args)
+        self.semantic.validate_full_projection(args)
     }
 
     /// The fixed options supply the complete combined-result and per-document

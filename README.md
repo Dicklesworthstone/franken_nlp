@@ -5100,6 +5100,13 @@ uncalibrated, correlated signals; the command never repairs a field,
 automatically accepts a document, or certifies factual correctness. Ordinary
 `extract`, extraction batches and extraction jobs keep their existing behavior.
 
+One-shot `extract-semantic` also accepts `--max-selected-rows N` to evaluate
+all legal extraction rows under an explicit refusal ceiling. The same-model
+reviewer retains full-vocabulary scoring, original evidence and the shared
+native work allowance. Compact input and persistent CPU teams compose with
+this strategy. See [selected semantic extraction](docs/int4-selected-rows.md#semantic-extraction-with-selected-rows)
+for the exact contract and qualification limits.
+
 Add `--input-encoding safe-bpe-v1` to compactly encode both extraction and review
 with one immutable policy. The original schema and source consume the same
 four-axis tokenizer allowance as all subsequent field claims, complete-source

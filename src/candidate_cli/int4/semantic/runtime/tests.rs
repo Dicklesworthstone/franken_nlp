@@ -119,13 +119,20 @@ fn publication_preserves_original_extraction_and_correlated_diagnostics_without_
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative", model_id: "Nanbeige4.2-3B",
         source_revision: "fixture", source_root_sha256: "fixture-root", model_content_sha256: "fixture-model",
         candidate_format: "fixture-format", quant_recipe: "fixture-group", group_width: 128,
-        integer_kernel: "s_scalar_i32", snapshot: None, output: &value };
+        integer_kernel: "s_scalar_i32", snapshot: None, max_selected_rows: None, output: &value };
     let mut bytes = Vec::new();
     publish(&response, 8192, &mut bytes).unwrap();
     let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(wire["output"], value);
     assert_eq!(wire["evidence"], "non_authoritative");
+    assert!(wire.get("max_selected_rows").is_none());
     assert!(wire["output"].get("input_encoding").is_none());
+    let selected_response = Response { max_selected_rows: Some(64), ..response };
+    let mut selected_bytes = Vec::new();
+    publish_checked(&selected_response, 8192, &mut selected_bytes, &|| Ok(())).unwrap();
+    let selected_wire: serde_json::Value = serde_json::from_slice(&selected_bytes).unwrap();
+    assert_eq!(selected_wire["max_selected_rows"], 64);
+    assert_eq!(selected_wire["output"], value);
     // Only pinned tokenization runs here. The surrounding result remains a
     // publication fixture, not evidence of native generation or review.
     use crate::{tasks::extract::{grounded::SourceDocumentEncoder,
@@ -142,7 +149,7 @@ fn publication_preserves_original_extraction_and_correlated_diagnostics_without_
     let receipt = Int4SemanticEncoding::from_work(&policy, work).unwrap().unwrap();
     let mut compact = value.clone();
     compact["input_encoding"] = serde_json::to_value(&receipt).unwrap();
-    let compact_response = Response { output: &compact, ..response };
+    let compact_response = Response { output: &compact, max_selected_rows: None, ..selected_response };
     let mut compact_bytes = Vec::new();
     publish_checked(&compact_response, 8192, &mut compact_bytes, &|| Ok(())).unwrap();
     let compact_wire: serde_json::Value = serde_json::from_slice(&compact_bytes).unwrap();

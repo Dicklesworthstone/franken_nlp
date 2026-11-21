@@ -5,6 +5,47 @@ that the current JSON grammar permits. This uses the existing quantized model,
 native session, selected-row kernels and source validator. Full-vocabulary
 execution remains the default and the reference for qualification.
 
+## Semantic extraction with selected rows
+
+Add `--max-selected-rows N` to an existing one-shot
+`fnlp candidate source-int4 extract-semantic` invocation with its exact schema
+and explicit semantic-options file. For example:
+
+```sh
+fnlp candidate source-int4 extract-semantic document.txt \
+  --schema schema.json --semantic-options semantic.json \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --group-width 128 --memory-mib "$MEMORY_MIB" \
+  --max-selected-rows 8192
+```
+
+The extraction head evaluates **every** currently legal token row, including
+EOS when accepting. If the complete legal set exceeds the cap, the invocation
+refuses; the cap never prunes a candidate or permits an unconstrained retry.
+The actual row cap and strategy enter the extraction execution identity before
+admission. Original schema/source bytes, prompt tokens, full KV capacity,
+grammar-mask limits and independent validation retain their existing contracts.
+
+The semantic reviewer keeps its original full-vocabulary sequence-score
+denominators, exact claim rendering, evidence and refusal limits. Extraction
+and all reviewers still share one five-axis native allowance. Early extraction
+EOS does not donate the unused extraction reservation to later reviewers.
+The completed result checks both identities and the exact component sums for
+reserved and actual work.
+
+Selected execution reports `max_selected_rows` in the candidate envelope and
+the selected extraction execution marker inside the unchanged combined result.
+Default execution omits the extra envelope field. This option composes with
+compact input and persistent CPU teams, but does not enable packed prefill,
+sampling or thinking on the semantic route.
+
+Planning and composition regression definitions cover source/schema binding,
+complete legal-row budgets, unchanged evidence and full-vocabulary reviewers,
+and malformed completion accounting. They are not native parity, task-quality
+or speed measurements; controller-selected DSR and actual-model qualification
+remain required.
+
 ## Candidate CLI
 
 One-off schema extraction exposes the strategy explicitly:
@@ -35,8 +76,10 @@ supports it on `extract-map`, `extract-corpus` and
 Single-context retained jobs also support it on `extract-job`, `ner-job`,
 `keyphrases-job`, `summarize-job` and `answer-job` with `start|resume`, including
 persistent CPU teams and compact input encoding. Other source-task
-maps/corpora, redaction and the semantic second-reader route retain their
-full-vocabulary contracts.
+maps/corpora and redaction retain their full-vocabulary contracts. One-shot
+`extract-semantic` supports an explicit selected-row extraction head; its
+reviewer still uses full-vocabulary scoring. Semantic streams, retained jobs
+and whole-document semantic extraction keep their existing full-head policies.
 The six independent sampled-sentiment command families also expose an explicit
 legal-row cap, with grammar-conditioned sampling after the complete legal set
 is projected. See [selected sampled output rows](native-sampled-sentiment-int4.md#selected-output-rows)

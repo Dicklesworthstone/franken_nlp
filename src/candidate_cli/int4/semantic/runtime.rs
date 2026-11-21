@@ -61,6 +61,7 @@ pub(super) fn execute(args: Int4Args, command: SemanticArgs, _admitted: Int4Limi
     let options = parse_options(&read_local(&command.semantic_options, OPTIONS_BYTES)?)?;
     let common = command.admit_options(&args, common, &options)?;
     let encoding = command.input_encoding.policy()?;
+    let selected_rows = command.extraction.selected_rows()?;
     let budget = command.extraction.budget(&args, common);
     let planning = judge_limits(&options);
     let native_work = options.max_model_work;
@@ -92,6 +93,7 @@ pub(super) fn execute(args: Int4Args, command: SemanticArgs, _admitted: Int4Limi
         command.extraction.compiler(), command.extraction.source_limits(), None)
         .and_then(|planner| planner.with_document_encoding(encoding.clone()))
         .map_err(|_| CandidateError::Planning)?;
+    let compiler = command.extraction.configure_planner(compiler)?;
     let extraction = compiler.prepare_with_control(BatchDocument {
         id: "cli".to_owned(), text: document, task_args: Some(request),
     }, &mut control).map_err(|error| error.fault.cancellation.map(cancelled).unwrap_or(CandidateError::Planning))?;
@@ -118,6 +120,7 @@ pub(super) fn execute(args: Int4Args, command: SemanticArgs, _admitted: Int4Limi
         || prepared.judge_budget() != judge_budget || prepared.semantic_limits() != semantic_limits
         || prepared.source_bytes() != source_bytes || prepared.max_model_work() != native_work
         || prepared.input_encoding() != &encoding || prepared.max_result_bytes() != common.result_bytes as u64
+        || prepared.extraction_selected_rows() != selected_rows
         || actual.native != quote.native || actual.native_workspace_bytes != quote.native_workspace_bytes
         || actual.preparation_bytes != quote.preparation_bytes || actual.output_bytes != quote.output_bytes {
         return Err(CandidateError::Identity);
@@ -141,7 +144,7 @@ pub(super) fn execute(args: Int4Args, command: SemanticArgs, _admitted: Int4Limi
         compute::Completion::serial(engine.execute_int4_semantic_extract(&model, prepared,
             vocabulary, limits, common.kernel, cancellation).map_err(execution_error)?)
     };
-    check_result(result.result(), args.group_width, extraction_reserved, native_work)?;
+    check_result(result.result(), args.group_width, extraction_reserved, native_work, selected_rows)?;
     remaining()?;
     let content = identity.logical_model_digest.to_hex();
     let response = Response {
@@ -151,6 +154,7 @@ pub(super) fn execute(args: Int4Args, command: SemanticArgs, _admitted: Int4Limi
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(), snapshot,
+        max_selected_rows: selected_rows.map(|rows| rows.max_rows_per_step),
         output: result.result(),
     };
     // The guarded combined result stays borrowed through serialization and
@@ -209,10 +213,20 @@ fn fits(work: Int4Work, cap: Int4Work) -> bool {
     work.forward_positions <= cap.forward_positions && work.projected_logits <= cap.projected_logits
         && work.attention_pairs <= cap.attention_pairs && work.projections.fits(cap.projections)
 }
-fn check_result(run: &Int4SemanticExtractionRun, width: usize, extraction: Int4Work, cap: Int4Work)
+fn check_result(run: &Int4SemanticExtractionRun, width: usize, extraction: Int4Work, cap: Int4Work,
+    selected_rows: Option<crate::native_engine::constrained_int4::sparse::Int4JsonSparseLimits>)
     -> Result<(), CandidateError> {
+    let execution = if selected_rows.is_some() {
+        crate::tasks::extract::grouped_int4::INT4_SPARSE_EXTRACT_VERSION
+    } else { crate::tasks::extract::grouped_int4::INT4_EXTRACT_VERSION };
+    let reserved = extraction.checked_add(run.semantic_model_work).map_err(|_| CandidateError::Execution)?;
+    let actual = run.extraction.model_work.checked_add(run.semantic_model_work)
+        .map_err(|_| CandidateError::Execution)?;
     if run.schema_version != 1 || run.execution != INT4_SEMANTIC_EXECUTION
         || run.numerics_profile != STRICT_INT4_PROFILE || run.group_width != width
+        || run.extraction.schema_version != 1 || run.extraction.group_width != width
+        || run.extraction.execution != execution || !fits(run.extraction.model_work, extraction)
+        || run.reserved_model_work != reserved || run.model_work != actual
         || run.extraction_reserved_work != extraction || !fits(run.reserved_model_work, cap)
         || !fits(run.model_work, run.reserved_model_work) || !run.semantic.same_model_correlated
         || run.semantic.calibration != "experimental_uncalibrated_diagnostic_only" {
@@ -236,6 +250,8 @@ struct Response<'a, T: Serialize> {
     group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<SnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_selected_rows: Option<usize>,
     output: &'a T,
 }
 

@@ -169,6 +169,9 @@ impl PreparedInt4SemanticExtraction {
     pub fn judge_identity(&self) -> &ExecutionIdentity { self.judge.execution_identity() }
     pub fn group_width(&self) -> usize { self.judge.group_width() }
     pub fn extraction_reserved_work(&self) -> Int4Work { self.extraction.planned_work() }
+    pub fn extraction_selected_rows(&self) -> Option<constrained_int4::sparse::Int4JsonSparseLimits> {
+        self.extraction.extraction_plan().selected_rows()
+    }
     pub fn max_model_work(&self) -> Int4Work { self.options.max_model_work }
     pub fn extraction_budget(&self) -> TaskBudget { *self.extraction.task_plan().ir().budget() }
     pub fn judge_budget(&self) -> TaskBudget { self.options.specification.judge_budget }

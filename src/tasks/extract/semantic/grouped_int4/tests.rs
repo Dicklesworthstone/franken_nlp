@@ -95,11 +95,17 @@ fn compact_limits() -> SafeBpeLimits {
         max_pair_checks: 4_000_000, max_pair_bytes: 16_000_000 }
 }
 fn encoded_extraction(schema: &str, source: &str, encoding: UntrustedEncoding) -> PreparedInt4BatchExtraction {
+    configured_extraction(schema, source, false, encoding, None)
+}
+fn configured_extraction(schema: &str, source: &str, grounded: bool, encoding: UntrustedEncoding,
+    rows: Option<constrained_int4::sparse::Int4JsonSparseLimits>) -> PreparedInt4BatchExtraction {
     let factory = Int4ExtractionBatchPlanner::for_model(model(), budget(), CompileLimits::default(),
         SourceRuntimeLimits::default(), None).unwrap().with_document_encoding(encoding).unwrap();
+    let factory = match rows { Some(rows) => factory.with_selected_rows(rows).unwrap(), None => factory };
     factory.prepare_with_control(BatchDocument { id: "encoded-original".to_owned(), text: source.to_owned(),
         task_args: Some(ExtractionBatchArgs { schema: schema.to_owned(), budget: budget(),
-            grounding: ExtractionBatchGrounding::Structural }) }, &mut Continue).unwrap()
+            grounding: if grounded { ExtractionBatchGrounding::SourceMembership }
+                else { ExtractionBatchGrounding::Structural } }) }, &mut Continue).unwrap()
 }
 fn encoded_preparation(schema: &str, source: &str, encoding: UntrustedEncoding,
     options: Int4SemanticOptions) -> PreparedInt4SemanticExtraction {
@@ -501,5 +507,133 @@ fn compact_semantic_cancellation_preserves_every_cause_and_returns_no_partial_re
         assert_eq!(prepared.prepare_review(original.clone(), &mut Stop(cause)).err().unwrap().cancellation(), Some(cause));
         let review = prepared.prepare_review(original, &mut Continue).unwrap();
         assert_eq!(prepared.finish(review, vec![], &mut Stop(cause)).err().unwrap().cancellation(), Some(cause));
+    }
+}
+
+
+// These selected-row fixtures exercise sealed planning and private composition,
+// not native inference or a measured speed/quality comparison.
+fn projection_result(prepared: &PreparedInt4BatchExtraction, schema: &str, json: &str,
+    grounded: bool) -> Int4ExtractRun {
+    let mut run = result(prepared, schema, json, grounded);
+    if prepared.extraction_plan().selected_rows().is_some() {
+        let work = prepared.extraction_plan().completed_work(run.result.output.token_ids.len(), 3).unwrap();
+        run.execution = prepared.extraction_plan().execution_version().to_owned();
+        run.model_work = work;
+        run.result.output.forward_positions = work.forward_positions;
+        run.result.output.projected_logits = work.projected_logits;
+    }
+    run
+}
+
+#[test]
+fn selected_semantic_extraction_keeps_original_source_prompts_evidence_and_full_vocabulary_reviews() {
+    let schema = r#"{"type":"object","properties":{"amount":{"type":"number"},"name":{"type":"string","x-fnlp-source":"verbatim"}},"required":["amount","name"],"additionalProperties":false}"#;
+    let json = r#"{"amount":7,"name":"Alice"}"#;
+    let source = "Café Alice Alice amount 7.";
+    let rows = constrained_int4::sparse::Int4JsonSparseLimits { max_rows_per_step: 64 };
+    let mut claim = rule();
+    claim.path = vec![ClaimPathStep::Property("amount".to_owned())];
+    for encoding in [UntrustedEncoding::ByteFallback, UntrustedEncoding::SafeBpeV1(compact_limits())] {
+        let prepare = |projection| {
+            let extraction = configured_extraction(schema, source, true, encoding.clone(), projection);
+            let judge = Int4JudgePlanner::for_model(model(), budget(), JudgeLimits::default()).unwrap()
+                .with_document_encoding(encoding.clone()).unwrap();
+            PreparedInt4SemanticExtraction::new(extraction, judge, options(vec![claim.clone()]), &mut Continue).unwrap()
+        };
+        let dense = prepare(None);
+        let selected = prepare(Some(rows));
+        assert_eq!(selected.extraction_selected_rows(), Some(rows));
+        assert!(dense.extraction_selected_rows().is_none());
+        assert_eq!(selected.extraction.source().text(), source);
+        assert_eq!(selected.extraction.source().token_ids(), dense.extraction.source().token_ids());
+        assert_eq!(selected.execution_identity().prompt_digest, dense.execution_identity().prompt_digest);
+        assert_eq!(selected.execution_identity().schema_digest, dense.execution_identity().schema_digest);
+        assert_eq!(selected.execution_identity().taskir_digest, dense.execution_identity().taskir_digest);
+        assert_ne!(selected.execution_identity().decision_policy_digest, dense.execution_identity().decision_policy_digest);
+        assert!(selected.extraction.verify_identity(dense.execution_identity()).is_err());
+        assert_eq!(selected.extraction_budget(), dense.extraction_budget());
+        let reserved = selected.extraction_reserved_work();
+        assert_eq!(reserved.forward_positions, dense.extraction_reserved_work().forward_positions);
+        assert_eq!(reserved.attention_pairs, dense.extraction_reserved_work().attention_pairs);
+        assert_eq!(reserved.projected_logits, u64::from(budget().max_output_tokens) * rows.max_rows_per_step as u64);
+        assert!(reserved.projected_logits < dense.extraction_reserved_work().projected_logits);
+
+        let original = projection_result(&selected.extraction, schema, json, true);
+        let selected_review = selected.prepare_review(original.clone(), &mut Continue).unwrap();
+        let dense_review = dense.prepare_review(projection_result(&dense.extraction, schema, json, true), &mut Continue).unwrap();
+        assert_eq!(selected_review.work, dense_review.work);
+        assert_eq!(selected_review.encoding_work, dense_review.encoding_work);
+        assert_eq!(selected_review.judges.len(), 1);
+        for (a, b) in selected_review.judges.iter().zip(&dense_review.judges) {
+            assert_eq!(a.execution_identity(), b.execution_identity());
+            assert_eq!(a.planned_work(), b.planned_work());
+        }
+        // The private logits fixture accepts FullVocabulary only. If any
+        // reviewer changes its score space to selected rows, this refuses.
+        let results = review_results(&selected, &selected_review);
+        let selected_run = selected.finish(selected_review, results, &mut Continue).unwrap();
+        let results = review_results(&dense, &dense_review);
+        let dense_run = dense.finish(dense_review, results, &mut Continue).unwrap();
+        assert_eq!(selected_run.extraction, original);
+        assert_eq!(selected_run.extraction.result.output.json, dense_run.extraction.result.output.json);
+        assert_eq!(selected_run.extraction.result.output.token_ids, dense_run.extraction.result.output.token_ids);
+        assert_eq!(selected_run.extraction.result.source_fields, dense_run.extraction.result.source_fields);
+        assert_eq!(selected_run.extraction.result.output.mask_node_visit_charge,
+            dense_run.extraction.result.output.mask_node_visit_charge);
+        assert_eq!(canonjson::canonical_bytes(&selected_run.semantic).unwrap(),
+            canonjson::canonical_bytes(&dense_run.semantic).unwrap());
+        assert_eq!(selected_run.input_encoding, dense_run.input_encoding);
+        assert!(selected_run.semantic_model_work.projected_logits > 0);
+        assert_eq!(selected_run.semantic_model_work.projected_logits % NANBEIGE_VOCAB_SIZE as u64, 0);
+        assert_eq!(selected_run.semantic.work.projected_logits, selected_run.semantic_model_work.projected_logits);
+        assert_eq!(selected_run.extraction.model_work.projected_logits, 3);
+        assert_eq!(selected_run.model_work,
+            selected_run.extraction.model_work.checked_add(selected_run.semantic_model_work).unwrap());
+        assert_eq!(selected_run.reserved_model_work,
+            reserved.checked_add(selected_run.semantic_model_work).unwrap());
+        assert!(selected_run.reserved_model_work.forward_positions > selected_run.model_work.forward_positions);
+    }
+}
+
+#[test]
+fn selected_extraction_never_renews_or_refunds_its_complete_semantic_allowance() {
+    let rows = constrained_int4::sparse::Int4JsonSparseLimits { max_rows_per_step: 64 };
+    let selected = configured_extraction(ARRAY_SCHEMA, COMPACT_SOURCE, false, UntrustedEncoding::ByteFallback, Some(rows));
+    let mut policy = array_options();
+    policy.max_model_work = selected.planned_work();
+    let judge = || Int4JudgePlanner::for_model(model(), budget(), JudgeLimits::default()).unwrap();
+    let selected = PreparedInt4SemanticExtraction::new(selected, judge(), policy.clone(), &mut Continue).unwrap();
+    let dense = encoded_extraction(ARRAY_SCHEMA, COMPACT_SOURCE, UntrustedEncoding::ByteFallback);
+    assert!(matches!(PreparedInt4SemanticExtraction::new(dense, judge(), policy, &mut Continue),
+        Err(Int4SemanticError::WorkBudget)));
+    let original = projection_result(&selected.extraction, ARRAY_SCHEMA, "[1,2]", false);
+    assert!(original.model_work.forward_positions < selected.extraction_reserved_work().forward_positions);
+    // Early extraction EOS cannot donate its unused reservation to a reviewer.
+    assert!(matches!(selected.prepare_review(original, &mut Continue), Err(Int4SemanticError::WorkBudget)));
+}
+
+#[test]
+fn selected_semantic_review_rejects_dense_markers_wrong_rows_and_altered_native_work() {
+    let rows = constrained_int4::sparse::Int4JsonSparseLimits { max_rows_per_step: 64 };
+    let extraction = configured_extraction(ARRAY_SCHEMA, COMPACT_SOURCE, false,
+        UntrustedEncoding::ByteFallback, Some(rows));
+    let judge = Int4JudgePlanner::for_model(model(), budget(), JudgeLimits::default()).unwrap();
+    let prepared = PreparedInt4SemanticExtraction::new(extraction, judge, array_options(), &mut Continue).unwrap();
+    let original = projection_result(&prepared.extraction, ARRAY_SCHEMA, "[1,2]", false);
+    prepared.prepare_review(original.clone(), &mut Continue).unwrap();
+    for axis in 0..8 {
+        let mut altered = original.clone();
+        match axis {
+            0 => altered.execution = INT4_EXTRACT_VERSION.to_owned(),
+            1 => altered.result.output.projected_logits = 0,
+            2 => altered.result.output.projected_logits = 2 * rows.max_rows_per_step as u64 + 1,
+            3 => altered.model_work.forward_positions += 1,
+            4 => altered.model_work.attention_pairs += 1,
+            5 => altered.model_work.projections.dot_products += 1,
+            6 => altered.model_work.projections.multiply_accumulates += 1,
+            _ => altered.group_width = 128,
+        }
+        assert!(prepared.prepare_review(altered, &mut Continue).is_err(), "axis {axis}");
     }
 }

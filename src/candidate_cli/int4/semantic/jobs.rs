@@ -80,7 +80,7 @@ impl JobArgs {
             || s.journal_memory_mib == 0 || s.serialization_memory_mib == 0 {
             return Err(Failure::usage("semantic_job_storage_options"));
         }
-        let common = self.semantic.validate(args)?;
+        let common = self.semantic.validate_full_projection(args)?;
         for mib in [s.journal_memory_mib, s.serialization_memory_mib] {
             if mib.checked_mul(MIB).is_none_or(|bytes| bytes > common.memory_bytes) {
                 return Err(Failure::usage("semantic_job_memory_options"));

@@ -11,7 +11,7 @@ use crate::{
 };
 
 #[test]
-fn only_supported_definitions_expose_selected_rows() {
+fn documented_definitions_expose_selected_rows_without_enabling_shared_defaults() {
     fn collect(command: &clap::Command, prefix: &str, found: &mut Vec<String>) {
         let path = format!("{prefix}/{}", command.get_name());
         if command.get_arguments().any(|arg| arg.get_long() == Some("max-selected-rows")) {
@@ -21,19 +21,26 @@ fn only_supported_definitions_expose_selected_rows() {
     }
     let mut found = Vec::new();
     collect(&crate::candidate_cli::definition(), "", &mut found);
-    assert_eq!(found, ["/candidate/source-int4/extract", "/candidate/source-int4/extract-batch",
+    // Each composed workflow owns its own capability gate. Keep these
+    // documented routes covered without rejecting independently supported
+    // additions (for example object maps or retained source-task jobs).
+    for supported in ["/candidate/source-int4/extract", "/candidate/source-int4/extract-semantic",
+        "/candidate/source-int4/extract-batch",
         "/candidate/source-int4/extract-map", "/candidate/source-int4/extract-corpus",
         "/candidate/source-int4/extract-document-job/start", "/candidate/source-int4/extract-document-job/resume",
         "/candidate/source-int4/ner",
         "/candidate/source-int4/keyphrases", "/candidate/source-int4/summarize", "/candidate/source-int4/answer",
         "/candidate/source-int4/ner-batch", "/candidate/source-int4/keyphrases-batch",
-        "/candidate/source-int4/summarize-batch", "/candidate/source-int4/answer-batch"]);
-    for shared in [definition(), super::super::super::extract_job::definition(),
-        super::super::super::semantic::definition()] {
-        let mut args = vec![shared.get_name().to_owned()];
-        if shared.get_subcommands().next().is_some() { args.push("start".to_owned()); }
-        args.extend(["--max-selected-rows".to_owned(), "7".to_owned()]);
-        assert!(shared.try_get_matches_from(args).is_err());
+        "/candidate/source-int4/summarize-batch", "/candidate/source-int4/answer-batch"] {
+        assert!(found.iter().any(|path| path == supported), "missing selected-row capability: {supported}");
+    }
+    for shared in [definition(), super::super::super::semantic::definition(),
+        super::super::super::semantic::corpus::definition(),
+        super::super::super::semantic::jobs::definition()] {
+        assert!(!shared.get_arguments().any(|arg| arg.get_long() == Some("max-selected-rows")));
+        for operation in shared.get_subcommands() {
+            assert!(!operation.get_arguments().any(|arg| arg.get_long() == Some("max-selected-rows")));
+        }
     }
 }
 
