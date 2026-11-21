@@ -2,6 +2,7 @@
 //! Original schema output stays unchanged; second-reader signals are explicitly
 //! correlated, experimental diagnostics with no repair or acceptance authority.
 use super::*;
+use std::sync::Arc;
 use crate::{
     batch::extract::grouped_int4::PreparedInt4BatchExtraction,
     grammar::mask::MaskWorkLimits,
@@ -54,9 +55,17 @@ impl Int4SemanticOptions {
     /// repeats these checks against its own sealed schema and original source.
     pub fn validate_source_schema(&self, schema: &crate::grammar::SchemaNode, source: &str)
         -> Result<(), Int4SemanticError> {
+        self.validate_schema(schema)?;
+        partition_evidence(source, self.specification.judge_policy).map_err(SemanticError::from)?;
+        Ok(())
+    }
+
+    /// Validate the fixed schema and claim rules before model or population IO.
+    /// Complete-source evidence partitioning still runs for each actual item.
+    pub fn validate_schema(&self, schema: &crate::grammar::SchemaNode)
+        -> Result<(), Int4SemanticError> {
         self.validate()?;
         claims::validate_rules(schema, &self.specification.claims, self.limits)?;
-        partition_evidence(source, self.specification.judge_policy).map_err(SemanticError::from)?;
         Ok(())
     }
 }
@@ -124,12 +133,21 @@ impl Int4SemanticEncoding {
 /// supply the public execution path. The original source stays attached.
 pub struct PreparedInt4SemanticExtraction {
     extraction: PreparedInt4BatchExtraction,
-    judge: Int4JudgePlanner,
+    judge: Arc<Int4JudgePlanner>,
     options: Int4SemanticOptions,
 }
 impl PreparedInt4SemanticExtraction {
     pub fn new<C: DecodeStepControl>(extraction: PreparedInt4BatchExtraction, judge: Int4JudgePlanner,
         options: Int4SemanticOptions, control: &mut C) -> Result<Self, Int4SemanticError> {
+        Self::new_shared(extraction, Arc::new(judge), options, control)
+    }
+
+    /// Reuse one immutable model-bound judge compiler across a resident
+    /// population. Source, grammar, encoding work and every dynamic review
+    /// remain owned by this complete extraction; no result or KV is shared.
+    pub fn new_shared<C: DecodeStepControl>(extraction: PreparedInt4BatchExtraction,
+        judge: Arc<Int4JudgePlanner>, options: Int4SemanticOptions, control: &mut C)
+        -> Result<Self, Int4SemanticError> {
         poll(control)?;
         let source = extraction.source();
         if source.document_encoding() != judge.document_encoding()

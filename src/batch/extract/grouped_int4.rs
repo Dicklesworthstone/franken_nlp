@@ -148,6 +148,15 @@ impl Int4ExtractionBatchPlanner {
         self.shared_defaults_only = true;
         Ok(self)
     }
+    pub(crate) fn shared_default_budget(&self) -> Result<TaskBudget, BatchFault> {
+        self.compiler.defaults.as_ref().map(|defaults| defaults.budget)
+            .ok_or_else(|| BatchCode::InvalidLimits.into())
+    }
+    pub(crate) fn shared_default_schema(&self) -> Result<(&str, CompileLimits, ExtractionBatchGrounding), BatchFault> {
+        self.compiler.defaults.as_ref().map(|defaults|
+            (defaults.schema.as_str(), self.compiler.compiler_limits, defaults.grounding))
+            .ok_or_else(|| BatchCode::InvalidLimits.into())
+    }
 
     /// The SAME caller control brackets bounded tokenization/schema work; no
     /// new deadline, poll quota or no-op controller is installed here.

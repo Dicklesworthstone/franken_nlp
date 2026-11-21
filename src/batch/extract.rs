@@ -21,6 +21,8 @@ use super::*;
 pub use super::judge::{JudgeBatchAdmission as ExtractionBatchAdmission, GuardedOutput};
 pub mod grouped_int4;
 pub mod quantized;
+/// Resident extraction with explicit full-source correlated field reviews.
+pub mod semantic;
 
 pub const EXTRACTION_BATCH_PROMPT: &str = "extract-segmented-schema-and-source-v1";
 const SCHEMA_SLOT: &str = "FNLP_EXTRACT_SCHEMA_0_967a";

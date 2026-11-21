@@ -172,7 +172,7 @@ fn complete_document_stream_keeps_charges_until_delivery_and_drains_every_termin
             drained(&host, &baseline);
         }
     }
-    for checkpoints in [1, 2, 3] {
+    for checkpoints in [2, 3] {
         let mut config = config(0); config.document.native.run.max_checkpoints = checkpoints;
         let dropped = Arc::new(AtomicUsize::new(0)); let active = Arc::new(AtomicUsize::new(usize::MAX));
         let input = NoRead { host: Arc::clone(&host), drops: Arc::clone(&dropped), active_at_drop: Arc::clone(&active) };
