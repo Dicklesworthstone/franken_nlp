@@ -42,6 +42,10 @@ impl<C: DecodeStepControl> Int4Session<'_, '_, C> {
         -> Result<(), StrictInt4Error> {
         check_tokens(tokens)?;
         limits.validate()?;
+        if self.engine.projection.get_mut().map_err(|_| StrictInt4Error::ProjectionExecutor)?
+            .as_ref().is_some_and(|executor| limits.max_batch_rows > executor.max_batch_rows()) {
+            return Err(StrictInt4Error::ProjectionExecutor);
+        }
         self.preflight(tokens.len(), 0)?;
         let capacity = tokens.len().min(limits.max_batch_rows);
         let mut activations = Vec::new();
@@ -68,6 +72,7 @@ impl<C: DecodeStepControl> Int4Session<'_, '_, C> {
                 final_norm: &self.engine.weights.final_norm, rope: &self.engine.rope,
                 cache: &mut self.engine.cache, activations: &mut activations[..chunk.len()],
                 unpack: &mut self.engine.unpack, kernel: self.engine.kernel,
+                projection: self.engine.projection.get_mut().map_err(|_| StrictInt4Error::ProjectionExecutor)?,
                 ledger: &mut self.ledger, control: &mut *self.control,
                 start, rows: chunk.len(), completed: 0, norms: 0,
             };
@@ -98,13 +103,14 @@ fn check_tokens(tokens: &[u32]) -> Result<(), StrictInt4Error> {
     if tokens.is_empty() || tokens.iter().any(|&id| id as usize >= V) { Err(StrictInt4Error::Input) } else { Ok(()) }
 }
 
-struct PrefillExecutor<'a, C> {
+struct PrefillExecutor<'a, 'executor, C> {
     final_norm: &'a [Bf16], rope: &'a RopeTablesF32, cache: &'a mut KvCache,
     activations: &'a mut [ActivationBuffer], unpack: &'a mut [i8], kernel: PackedInt4Kernel,
+    projection: &'a mut Option<&'executor mut (dyn Int4ProjectionExecutor + 'executor)>,
     ledger: &'a mut ProjectionLedger, control: &'a mut C,
     start: usize, rows: usize, completed: usize, norms: usize,
 }
-impl<C: DecodeStepControl> GroupLayerExecutor<Int4Layer> for PrefillExecutor<'_, C> {
+impl<C: DecodeStepControl> GroupLayerExecutor<Int4Layer> for PrefillExecutor<'_, '_, C> {
     type HiddenGroup = Vec<Vec<Bf16>>;
     type Error = StrictInt4Error;
     fn layer_group(&mut self, binding: &LayerBinding<'_, Int4Layer>, hidden: &mut Self::HiddenGroup)
@@ -113,15 +119,16 @@ impl<C: DecodeStepControl> GroupLayerExecutor<Int4Layer> for PrefillExecutor<'_,
             || binding.kv_slot() != self.completed || hidden.len() != self.rows
             || hidden.iter().any(|row| row.len() != H) { return Err(StrictInt4Error::Boundary); }
         let layer = binding.weights();
+        let projection = |kind| Int4ProjectionOp::Layer { layer: binding.layer_index(), kind };
         encode_norms(hidden, &layer.norm1, self.activations, self.control)?;
-        let mut query = self.project(&layer.q)?;
-        let mut key = self.project(&layer.k)?;
-        let value = self.project(&layer.v)?;
+        let mut query = self.project(projection(Int4ProjectionKind::Query), &layer.q)?;
+        let mut key = self.project(projection(Int4ProjectionKind::Key), &layer.k)?;
+        let value = self.project(projection(Int4ProjectionKind::Value), &layer.v)?;
         let attention = attend_rows(&mut query, &mut key, &value, self.rows, self.start,
             binding.kv_slot(), self.rope, self.cache, self.control)?;
         drop(query); drop(key); drop(value);
         for (input, row) in self.activations.iter_mut().zip(attention.chunks_exact(Q)) { input.encode_bf16(row)?; }
-        let update = self.project(&layer.o)?;
+        let update = self.project(projection(Int4ProjectionKind::AttentionOutput), &layer.o)?;
         for (row, update) in hidden.iter_mut().zip(update.chunks_exact(H)) {
             poll(self.control)?;
             *row = residual_add_f32_cast_back(row, update).map_err(|_| StrictInt4Error::Primitive)?;
@@ -129,15 +136,15 @@ impl<C: DecodeStepControl> GroupLayerExecutor<Int4Layer> for PrefillExecutor<'_,
         }
         drop(attention); drop(update);
         encode_norms(hidden, &layer.norm2, self.activations, self.control)?;
-        let gate = self.project(&layer.gate)?;
-        let up = self.project(&layer.up)?;
+        let gate = self.project(projection(Int4ProjectionKind::Gate), &layer.gate)?;
+        let up = self.project(projection(Int4ProjectionKind::Up), &layer.up)?;
         for ((input, gate), up) in self.activations.iter_mut().zip(gate.chunks_exact(I)).zip(up.chunks_exact(I)) {
             poll(self.control)?;
             let product = swiglu_f32_cast_back(gate, up).map_err(|_| StrictInt4Error::Primitive)?;
             input.encode_bf16(&product)?;
         }
         drop(gate); drop(up);
-        let update = self.project(&layer.down)?;
+        let update = self.project(projection(Int4ProjectionKind::Down), &layer.down)?;
         for (row, update) in hidden.iter_mut().zip(update.chunks_exact(H)) {
             poll(self.control)?;
             *row = residual_add_f32_cast_back(row, update).map_err(|_| StrictInt4Error::Primitive)?;
@@ -153,12 +160,12 @@ impl<C: DecodeStepControl> GroupLayerExecutor<Int4Layer> for PrefillExecutor<'_,
         self.norms += 1; Ok(())
     }
 }
-impl<C: DecodeStepControl> PrefillExecutor<'_, C> {
-    fn project(&mut self, matrix: &GroupedInt4Matrix) -> Result<Vec<Bf16>, StrictInt4Error> {
+impl<C: DecodeStepControl> PrefillExecutor<'_, '_, C> {
+    fn project(&mut self, op: Int4ProjectionOp, matrix: &GroupedInt4Matrix) -> Result<Vec<Bf16>, StrictInt4Error> {
         let length = matrix.rows().checked_mul(self.activations.len()).ok_or(StrictInt4Error::Memory)?;
         let mut output = filled(length, Bf16::from_bits(0))?;
-        matrix.as_linear().with_kernel(self.kernel).project_batch_bf16_into(self.activations, LinearRows::All,
-            &mut output, self.unpack, self.ledger, self.control)?;
+        projection::project_batch_bf16(self.projection, op, matrix, self.activations, LinearRows::All,
+            &mut output, self.unpack, self.kernel, self.ledger, self.control)?;
         Ok(output)
     }
 }

@@ -70,7 +70,7 @@ pub use grouped_int4::{Int4HostError, Int4LoadLimits, Int4LoadRequirements, Int4
     Int4EntityCorpusSummary, Int4EntityCorpusCohortSummary,
     Int4ResolveCohortHostRequirements, Int4EntityCohortHostRequirements};
 pub use grouped_int4::{HostedInt4ChatTeamResult, HostedInt4TeamResult, Int4ComputeReceipt,
-    int4_chat_team_workspace_bytes, int4_task_team_workspace_bytes};
+    int4_chat_team_workspace_bytes, int4_chat_prefill_team_workspace_bytes, int4_task_team_workspace_bytes};
 mod scored;
 mod sentiment;
 pub use sentiment::SentimentHostLimits;

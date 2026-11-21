@@ -12,6 +12,7 @@ use crate::native_engine::portable_int8::int4::GroupedInt4Linear;
 #[cfg(any(feature = "asupersync-runtime", test))]
 use super::Int4ModelWeights;
 use crate::native_engine::{lmhead::NANBEIGE_VOCAB_SIZE, quant_algebra::MAX_MODEL_K};
+use crate::native_engine::portable_int8::int4::batch::MAX_INT4_BATCH_ROWS;
 #[cfg(any(feature = "asupersync-runtime", test))]
 use serde::{Deserialize, Serialize};
 
@@ -23,16 +24,25 @@ pub(crate) const MAX_INT4_TEAM_WIDTH: usize = 64;
 /// Both the no-runtime CLI preflight and hosted allocation use this one quote.
 pub(crate) fn int4_team_workspace_bytes(team_width: usize, group_width: usize)
     -> Result<u64, StrictInt4Error> {
+    int4_prefill_team_workspace_bytes(team_width, group_width, 1)
+}
+
+/// The same fixed team can retain a bounded prompt-row pack per worker.
+/// Single-row decode reuses this storage after prefill; no operator grows it.
+pub(crate) fn int4_prefill_team_workspace_bytes(team_width: usize, group_width: usize,
+    max_batch_rows: usize) -> Result<u64, StrictInt4Error> {
     if team_width < 2 || team_width > MAX_INT4_TEAM_WIDTH
-        || group_width == 0 || group_width > MAX_MODEL_K { return Err(StrictInt4Error::Memory); }
+        || group_width == 0 || group_width > MAX_MODEL_K
+        || max_batch_rows == 0 || max_batch_rows > MAX_INT4_BATCH_ROWS { return Err(StrictInt4Error::Memory); }
     let rows = NANBEIGE_VOCAB_SIZE.div_ceil(team_width) as u64;
+    let batch = max_batch_rows as u64;
     // Every child cycles one owned buffer through its capacity-one lanes:
     // prequantized input, group unpacking, selected row IDs, and both output
     // rails. The coordinator writes directly to its private output shard.
-    let output_bytes = (std::mem::size_of::<u32>() + std::mem::size_of::<f32>()
-        + std::mem::size_of::<Bf16>()) as u64;
+    let output_bytes = (std::mem::size_of::<f32>() + std::mem::size_of::<Bf16>()) as u64 * batch
+        + std::mem::size_of::<u32>() as u64;
     let per_child = rows.checked_mul(output_bytes)
-        .and_then(|bytes| bytes.checked_add(MAX_MODEL_K as u64))
+        .and_then(|bytes| bytes.checked_add(MAX_MODEL_K as u64 * batch))
         .and_then(|bytes| bytes.checked_add(group_width as u64))
         .and_then(|bytes| bytes.checked_add(4096)).ok_or(StrictInt4Error::Memory)?;
     per_child.checked_mul((team_width - 1) as u64)
@@ -73,6 +83,9 @@ pub(crate) struct Int4ProjectionStats {
 pub(crate) trait Int4ProjectionExecutor: Send {
     fn model_identity(&self) -> &Int4ModelIdentity;
     fn kernel_kind(&self) -> Int8KernelKind;
+    /// Immutable capacity admitted before team formation. A native prefill
+    /// refuses a larger morsel before allocating or consuming any prompt work.
+    fn max_batch_rows(&self) -> usize;
     #[cfg(any(feature = "asupersync-runtime", test))]
     fn stats(&self) -> Int4ProjectionStats;
 
@@ -81,6 +94,9 @@ pub(crate) trait Int4ProjectionExecutor: Send {
         -> Result<(), StrictInt4Error>;
     fn project_f32_into(&mut self, op: Int4ProjectionOp, input: &ActivationBuffer,
         rows: LinearRows<'_>, output: &mut [f32], control: &mut dyn DecodeStepControl)
+        -> Result<(), StrictInt4Error>;
+    fn project_batch_bf16_into(&mut self, op: Int4ProjectionOp, inputs: &[ActivationBuffer],
+        rows: LinearRows<'_>, output: &mut [Bf16], control: &mut dyn DecodeStepControl)
         -> Result<(), StrictInt4Error>;
 }
 
@@ -146,6 +162,23 @@ pub(super) fn project_f32<'executor, C: DecodeStepControl>(
         }
         None => matrix.as_linear().with_kernel(kernel)
             .project_f32_into(input, rows, output, scratch, ledger, control).map_err(Into::into),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn project_batch_bf16<'executor, C: DecodeStepControl>(
+    executor: &mut Option<&'executor mut (dyn Int4ProjectionExecutor + 'executor)>,
+    op: Int4ProjectionOp, matrix: &GroupedInt4Matrix, inputs: &[ActivationBuffer],
+    rows: LinearRows<'_>, output: &mut [Bf16], scratch: &mut [i8], kernel: PackedInt4Kernel,
+    ledger: &mut ProjectionLedger, control: &mut C) -> Result<(), StrictInt4Error> {
+    match executor {
+        Some(executor) => {
+            if inputs.len() > executor.max_batch_rows() { return Err(StrictInt4Error::ProjectionExecutor); }
+            matrix.as_linear().reserve_batch_projection(inputs, rows, output.len(), ledger)?;
+            executor.project_batch_bf16_into(op, inputs, rows, output, control)
+        }
+        None => matrix.as_linear().with_kernel(kernel)
+            .project_batch_bf16_into(inputs, rows, output, scratch, ledger, control).map_err(Into::into),
     }
 }
 

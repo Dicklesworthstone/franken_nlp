@@ -322,7 +322,7 @@ fnlp candidate source-int4 generate prompt.txt \
   --snapshot nanbeige.int4.snapshot \
   --expected-model-sha256 "$MODEL_SHA256" \
   --memory-mib 8192 --compute-threads 4 \
-  --input-encoding safe-bpe-v1
+  --input-encoding safe-bpe-v1 --prefill-rows 4
 
 fnlp candidate source-int4 extract document.txt --schema extraction.schema.json \
   --snapshot nanbeige.int4.snapshot --expected-model-sha256 "$MODEL_SHA256" \
@@ -379,8 +379,17 @@ schedule and declared width; it does not invent per-item projection receipts.
 The required `run_complete` is staged under the existing transport budget and
 published after all workers join, inside the original invocation and deadline.
 
-A worker count above one cannot combine with explicit prompt or sequence
-cohort schedules such as `--prefill-rows`, `--cohort-heads`,
+Buffered `generate` and `chat` can combine a worker count above one with
+`--prefill-rows 1..=64`. The same fixed team serves layer-major prompt morsels
+and subsequent single-token decode. Each output-row shard reuses its packed
+groups across the morsel; admitted worker input/output storage covers the
+declared prompt width before IO. Library callers use
+`execute_int4_chat_layer_major_with_threads` and
+`int4_chat_prefill_team_workspace_bytes` for this combined route, in addition
+to the ordinary native and prefill workspace reservations.
+
+Other routes retain their existing restriction on combining worker teams with
+`--prefill-rows`. Worker teams cannot combine with `--cohort-heads`,
 `--cohort-documents` or `--cohort-chunks`. The task sections below describe
 additional supported complete-document maps, corpora and retained jobs.
 Invalid widths, incompatible schedules and insufficient memory refuse before

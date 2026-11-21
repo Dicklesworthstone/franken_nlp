@@ -667,8 +667,8 @@ impl Int4Args {
         let result_bytes = self.max_output_bytes.checked_mul(8)
             .and_then(|n| n.checked_add(self.max_new_tokens.checked_mul(64)?))
             .and_then(|n| n.checked_add(65_536)).ok_or(CandidateError::Arguments)?;
-        let limits = self.validate_storage(result_bytes, self.max_new_tokens,
-            self.context_tokens - self.max_new_tokens + 1, SAMPLER_BYTES, 0)?;
+        let limits = self.validate_storage_with_team_prefill(result_bytes, self.max_new_tokens,
+            self.context_tokens - self.max_new_tokens + 1, SAMPLER_BYTES, 0, None, true)?;
         let options = self.options(166_101)?;
         if options.banned_token_ids.contains(&166_101) { return Err(CandidateError::Arguments); }
         options.validate(self.generation_limits(limits)).map_err(|_| CandidateError::Arguments)?;
@@ -712,10 +712,18 @@ impl Int4Args {
     fn validate_storage_admission(&self, result_bytes: usize, output_tokens: usize,
         max_prompt_tokens: usize, sampler_bytes: u64, extra_preparation_bytes: u64,
         cohort: Option<cohort::Admission>) -> Result<Int4Limits, CandidateError> {
+        self.validate_storage_with_team_prefill(result_bytes, output_tokens, max_prompt_tokens,
+            sampler_bytes, extra_preparation_bytes, cohort, false)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn validate_storage_with_team_prefill(&self, result_bytes: usize, output_tokens: usize,
+        max_prompt_tokens: usize, sampler_bytes: u64, extra_preparation_bytes: u64,
+        cohort: Option<cohort::Admission>, allow_threaded_prefill: bool) -> Result<Int4Limits, CandidateError> {
         let snapshot_pin = self.checked_model_input()?;
         let prefill = self.prefill()?;
-        let compute = self.compute.admit(self.group_width)?;
-        if compute.threads != 1 && (prefill.is_some() || cohort.is_some()) {
+        let compute = if allow_threaded_prefill { self.compute.admit_with_prefill(self.group_width, prefill)? }
+            else { self.compute.admit(self.group_width)? };
+        if compute.threads != 1 && ((prefill.is_some() && !allow_threaded_prefill) || cohort.is_some()) {
             return Err(CandidateError::Arguments);
         }
         if cohort.is_some() && (prefill.is_some() || sampler_bytes != 0) { return Err(CandidateError::Arguments); }

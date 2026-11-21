@@ -76,7 +76,7 @@ mod scored_job;
 mod prefill;
 mod parallel;
 pub use parallel::{HostedInt4ChatTeamResult, HostedInt4TeamResult, Int4ComputeReceipt,
-    int4_chat_team_workspace_bytes, int4_task_team_workspace_bytes};
+    int4_chat_team_workspace_bytes, int4_chat_prefill_team_workspace_bytes, int4_task_team_workspace_bytes};
 mod stream;
 pub use stream::HostedInt4ChatStream;
 pub mod batch;

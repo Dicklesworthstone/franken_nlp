@@ -16,7 +16,12 @@ use projection::{Command, Peer, Reply, TeamExecutor, WorkerBuffers};
 
 pub(in crate::hosted) fn int4_team_workspace_bytes(width: usize, group_width: usize)
     -> Result<u64, HostedError> {
-    native_projection::int4_team_workspace_bytes(width, group_width)
+    int4_prefill_team_workspace_bytes(width, group_width, 1)
+}
+
+pub(in crate::hosted) fn int4_prefill_team_workspace_bytes(width: usize, group_width: usize,
+    max_batch_rows: usize) -> Result<u64, HostedError> {
+    native_projection::int4_prefill_team_workspace_bytes(width, group_width, max_batch_rows)
         .map_err(|_| HostedError::Limits("INT4 team workspace arithmetic or width"))
 }
 
@@ -33,19 +38,24 @@ pub(in crate::hosted) fn preflight_int4_team(engine: &NlpEngine, limits: RunLimi
 
 struct Workspace {
     children: Vec<WorkerBuffers>, coordinator_scratch: Vec<i8>,
+    max_batch_rows: usize,
     #[cfg(test)] panic_worker: Option<usize>,
 }
 impl Workspace {
+    #[cfg(test)]
     fn new(width: usize, group_width: usize) -> Result<Self, HostedError> {
+        Self::with_batch_rows(width, group_width, 1)
+    }
+    fn with_batch_rows(width: usize, group_width: usize, max_batch_rows: usize) -> Result<Self, HostedError> {
         // The pure quote validates width/group geometry before any allocation.
-        int4_team_workspace_bytes(width, group_width)?;
+        int4_prefill_team_workspace_bytes(width, group_width, max_batch_rows)?;
         let mut children = Vec::new();
         children.try_reserve_exact(width - 1).map_err(|_| HostedError::Limits("INT4 team allocation"))?;
         for _ in 1..width {
-            children.push(WorkerBuffers::new(NANBEIGE_VOCAB_SIZE.div_ceil(width), group_width)
+            children.push(WorkerBuffers::new(NANBEIGE_VOCAB_SIZE.div_ceil(width), group_width, max_batch_rows)
                 .map_err(native_error)?);
         }
-        Ok(Self { children, coordinator_scratch: zeroed(group_width).map_err(native_error)?,
+        Ok(Self { children, coordinator_scratch: zeroed(group_width).map_err(native_error)?, max_batch_rows,
             #[cfg(test)] panic_worker: None })
     }
 }
@@ -111,8 +121,22 @@ where T: Send + 'static,
         -> Result<T, HostedError> + Send + 'static {
     // Existing callers retain their exact checkpoint schedule and return their
     // guarded result only after physical join, as before.
-    run_int4_team_then(engine, limits, cancellation, model, width, kernel, work,
+    run_int4_team_then(engine, limits, cancellation, model, width, kernel, 1, work,
         |value, _, _| Ok(value))
+}
+
+/// Keep the same sealed team across bounded layer-major prefill and decode.
+/// Every child's input/output capacity is admitted for the declared batch
+/// width before the first blocking crossing; operator dispatch never grows it.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::hosted) fn run_int4_prefill_team<T, F>(engine: &NlpEngine, limits: RunLimits,
+    cancellation: CancellationToken, model: ResidentInt4, width: usize, kernel: PackedInt4Kernel,
+    max_batch_rows: usize, work: F) -> Result<T, HostedError>
+where T: Send + 'static,
+    F: FnOnce(&Int4ModelWeights, &mut RunControl, &mut dyn Int4ProjectionExecutor)
+        -> Result<T, HostedError> + Send + 'static {
+    run_int4_team_then(engine, limits, cancellation, model, width, kernel, max_batch_rows,
+        work, |value, _, _| Ok(value))
 }
 
 /// Publish a terminal result after the team joins, inside the same tracked
@@ -126,14 +150,14 @@ where T: Send + 'static, U: Send + 'static,
     F: FnOnce(&Int4ModelWeights, &mut RunControl, &mut dyn Int4ProjectionExecutor)
         -> Result<T, HostedError> + Send + 'static,
     G: FnOnce(T, &mut RunControl) -> Result<U, HostedError> + Send + 'static {
-    run_int4_team_then(engine, limits, cancellation, model, width, kernel, work,
+    run_int4_team_then(engine, limits, cancellation, model, width, kernel, 1, work,
         move |value, cx, shared| finalize_after_join(cx, shared, value, finalize))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_int4_team_then<T, U, F, G>(engine: &NlpEngine, limits: RunLimits,
     cancellation: CancellationToken, model: ResidentInt4, width: usize, kernel: PackedInt4Kernel,
-    work: F, finalize: G) -> Result<U, HostedError>
+    max_batch_rows: usize, work: F, finalize: G) -> Result<U, HostedError>
 where T: Send + 'static, U: Send + 'static,
     F: FnOnce(&Int4ModelWeights, &mut RunControl, &mut dyn Int4ProjectionExecutor)
         -> Result<T, HostedError> + Send + 'static,
@@ -142,9 +166,9 @@ where T: Send + 'static, U: Send + 'static,
     if !Arc::ptr_eq(engine.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
     let shared = RunShared::new(limits, cancellation)?;
     let lease = engine.resources().acquire_lease();
-    let bytes = int4_team_workspace_bytes(width, model.model_identity().group_width())?;
+    let bytes = int4_prefill_team_workspace_bytes(width, model.model_identity().group_width(), max_batch_rows)?;
     let pending = Pending::reserve(&lease, MemoryClass::ActivationScratch, bytes)?;
-    let workspace = allocate(pending, || Workspace::new(width, model.model_identity().group_width()))?;
+    let workspace = allocate(pending, || Workspace::with_batch_rows(width, model.model_identity().group_width(), max_batch_rows))?;
     run_blocking(engine, limits, move |blocking_cx| {
         // Keep the charged aggregate whole: its fields drop storage before
         // reservation even when setup or the coordinator unwinds.
@@ -185,7 +209,7 @@ where F: FnOnce(&Int4ModelWeights, &mut RunControl, &mut dyn Int4ProjectionExecu
         let mut formation_complete = false;
         #[cfg(test)] let panic_worker = workspace.panic_worker;
         let scope_result = leaf.scoped_cpu(width - 1, |scope| {
-            let mut executor = TeamExecutor::new(weights, kernel, width,
+            let mut executor = TeamExecutor::new(weights, kernel, width, workspace.max_batch_rows,
                 std::mem::take(&mut workspace.coordinator_scratch),
                 Arc::clone(&team), Arc::clone(&gate), Arc::clone(&shared))?;
             let mut control = RunControl { cx: leaf.clone(), shared: Arc::clone(&shared) };

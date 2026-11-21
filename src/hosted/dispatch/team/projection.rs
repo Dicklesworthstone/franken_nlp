@@ -3,15 +3,18 @@ use super::*;
 use std::ops::Range;
 use crate::native_engine::{portable_int8::{ActivationBuffer, LinearRows},
     simd::Int8KernelKind, strict_int4::Int4ModelIdentity};
+use crate::native_engine::portable_int8::int4::batch::MAX_INT4_BATCH_ROWS;
 
 pub(super) struct WorkerBuffers {
     input: Vec<i8>, selected: Vec<u32>, floats: Vec<f32>, bf16: Vec<Bf16>, unpack: Vec<i8>,
     #[cfg(test)] drop_probe: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 impl WorkerBuffers {
-    pub(super) fn new(rows: usize, group_width: usize) -> Result<Self, StrictInt4Error> {
-        Ok(Self { input: zeroed(MAX_MODEL_K)?, selected: zeroed(rows)?,
-            floats: zeroed(rows)?, bf16: zeroed(rows)?, unpack: zeroed(group_width)?,
+    pub(super) fn new(rows: usize, group_width: usize, max_batch_rows: usize) -> Result<Self, StrictInt4Error> {
+        if max_batch_rows == 0 || max_batch_rows > MAX_INT4_BATCH_ROWS { return Err(StrictInt4Error::Memory); }
+        let output = rows.checked_mul(max_batch_rows).ok_or(StrictInt4Error::Memory)?;
+        Ok(Self { input: zeroed(MAX_MODEL_K * max_batch_rows)?, selected: zeroed(rows)?,
+            floats: zeroed(output)?, bf16: zeroed(output)?, unpack: zeroed(group_width)?,
             #[cfg(test)] drop_probe: None })
     }
     #[cfg(test)]
@@ -33,10 +36,12 @@ impl Drop for WorkerBuffers {
 enum OutputKind { Float, Bf16 }
 pub(super) struct Command {
     epoch: u64, operation: Int4ProjectionOp, kind: OutputKind, range: Range<usize>,
-    selected: bool, input_len: usize, scale: f32, buffers: WorkerBuffers,
+    selected: bool, input_len: usize, batch_rows: usize,
+    scales: [f32; MAX_INT4_BATCH_ROWS], buffers: WorkerBuffers,
 }
 pub(super) struct ProjectionReply {
     epoch: u64, operation: Int4ProjectionOp, kind: OutputKind, range: Range<usize>,
+    batch_rows: usize,
     buffers: WorkerBuffers, pub(super) result: Result<(), StrictInt4Error>,
 }
 pub(super) enum Reply { Ready(Result<(), StrictInt4Error>), Projected(ProjectionReply) }
@@ -62,57 +67,72 @@ pub(super) fn execute_command(weights: &Int4ModelWeights, kernel: PackedInt4Kern
         let linear = weights.projection(command.operation)?.with_kernel(kernel);
         let length = command.range.end.checked_sub(command.range.start)
             .ok_or(StrictInt4Error::ProjectionExecutor)?;
-        if command.input_len > command.buffers.input.len()
+        let output_length = length.checked_mul(command.batch_rows).ok_or(StrictInt4Error::ProjectionExecutor)?;
+        if command.batch_rows == 0 || command.batch_rows > MAX_INT4_BATCH_ROWS
+            || command.input_len.checked_mul(command.batch_rows).is_none_or(|length| length > command.buffers.input.len())
             || command.input_len != linear.columns()
-            || length > command.buffers.floats.len() || length > command.buffers.bf16.len()
+            || output_length > command.buffers.floats.len() || output_length > command.buffers.bf16.len()
             || length > command.buffers.selected.len() {
             return Err(StrictInt4Error::ProjectionExecutor);
         }
         // A narrow matrix/selection can leave later ordinals idle. Such an
         // empty shard still acknowledges the command without inventing rows.
         if length == 0 { return Ok(()); }
-        let input = &command.buffers.input[..command.input_len];
+        let mut inputs: [&[i8]; MAX_INT4_BATCH_ROWS] = [&[]; MAX_INT4_BATCH_ROWS];
+        for (index, input) in inputs[..command.batch_rows].iter_mut().enumerate() {
+            *input = &command.buffers.input[index * command.input_len..(index + 1) * command.input_len];
+        }
         let (rows, range) = if command.selected {
             (LinearRows::Selected(&command.buffers.selected[..length]), 0..length)
         } else { (LinearRows::All, command.range.clone()) };
-        match command.kind {
-            OutputKind::Float => linear.project_f32_range_into(input, command.scale, rows, range,
+        match (command.kind, command.batch_rows) {
+            (OutputKind::Float, 1) => linear.project_f32_range_into(inputs[0], command.scales[0], rows, range,
                 &mut command.buffers.floats[..length], &mut command.buffers.unpack, control),
-            OutputKind::Bf16 => linear.project_bf16_range_into(input, command.scale, rows, range,
+            (OutputKind::Bf16, 1) => linear.project_bf16_range_into(inputs[0], command.scales[0], rows, range,
                 &mut command.buffers.bf16[..length], &mut command.buffers.unpack, control),
+            (OutputKind::Float, batch) => linear.project_batch_f32_range_into(&inputs[..batch],
+                &command.scales[..batch], rows, range, &mut command.buffers.floats[..output_length],
+                length, &mut command.buffers.unpack, control),
+            (OutputKind::Bf16, batch) => linear.project_batch_bf16_range_into(&inputs[..batch],
+                &command.scales[..batch], rows, range, &mut command.buffers.bf16[..output_length],
+                length, &mut command.buffers.unpack, control),
         }.map_err(Into::into)
     })();
     ProjectionReply { epoch: command.epoch, operation: command.operation, kind: command.kind,
-        range: command.range, buffers: command.buffers, result }
+        range: command.range, batch_rows: command.batch_rows, buffers: command.buffers, result }
 }
 
 enum Output<'a> { Float(&'a mut [f32]), Bf16(&'a mut [Bf16]) }
 impl Output<'_> {
     fn kind(&self) -> OutputKind { match self { Self::Float(_) => OutputKind::Float, Self::Bf16(_) => OutputKind::Bf16 } }
     fn len(&self) -> usize { match self { Self::Float(values) => values.len(), Self::Bf16(values) => values.len() } }
-    fn assemble(&mut self, range: Range<usize>, buffers: &WorkerBuffers) {
+    fn assemble(&mut self, range: Range<usize>, count: usize, batch_rows: usize, buffers: &WorkerBuffers) {
         let length = range.len();
-        match self {
-            Self::Float(values) => values[range].copy_from_slice(&buffers.floats[..length]),
-            Self::Bf16(values) => values[range].copy_from_slice(&buffers.bf16[..length]),
+        for lane in 0..batch_rows {
+            let target = lane * count + range.start..lane * count + range.end;
+            let source = lane * length..(lane + 1) * length;
+            match self {
+                Self::Float(values) => values[target].copy_from_slice(&buffers.floats[source]),
+                Self::Bf16(values) => values[target].copy_from_slice(&buffers.bf16[source]),
+            }
         }
     }
 }
 
 pub(super) struct TeamExecutor<'a> {
-    weights: &'a Int4ModelWeights, kernel: PackedInt4Kernel, width: usize,
+    weights: &'a Int4ModelWeights, kernel: PackedInt4Kernel, width: usize, max_batch_rows: usize,
     scratch: Vec<i8>, pub(super) peers: Vec<Peer>, stats: Int4ProjectionStats,
     team: Arc<SealedCpuTeam>, gate: Arc<EntryGate>, shared: Arc<RunShared>,
     poisoned: bool, pub(super) complete: bool,
 }
 impl<'a> TeamExecutor<'a> {
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn new(weights: &'a Int4ModelWeights, kernel: PackedInt4Kernel, width: usize,
+    pub(super) fn new(weights: &'a Int4ModelWeights, kernel: PackedInt4Kernel, width: usize, max_batch_rows: usize,
         scratch: Vec<i8>, team: Arc<SealedCpuTeam>, gate: Arc<EntryGate>, shared: Arc<RunShared>)
         -> Result<Self, HostedError> {
         let mut peers = Vec::new();
         peers.try_reserve_exact(width - 1).map_err(|_| native_error(StrictInt4Error::Allocation))?;
-        Ok(Self { weights, kernel, width, scratch, peers,
+        Ok(Self { weights, kernel, width, max_batch_rows, scratch, peers,
             stats: Int4ProjectionStats { team_width: width, ..Int4ProjectionStats::default() },
             team, gate, shared, poisoned: false, complete: false })
     }
@@ -120,11 +140,11 @@ impl<'a> TeamExecutor<'a> {
         self.gate.abort();
         for peer in &mut self.peers { drop(peer.command.take()); }
     }
-    fn project(&mut self, operation: Int4ProjectionOp, input: &ActivationBuffer,
+    fn project(&mut self, operation: Int4ProjectionOp, inputs: &[ActivationBuffer],
         rows: LinearRows<'_>, output: Output<'_>, control: &mut dyn DecodeStepControl)
         -> Result<(), StrictInt4Error> {
         if self.poisoned { return Err(StrictInt4Error::ProjectionExecutor); }
-        let mut result = self.project_inner(operation, input, rows, output, control);
+        let mut result = self.project_inner(operation, inputs, rows, output, control);
         if result.is_err() {
             self.poisoned = true;
             self.shared.stop(DecodeCancellationKind::FailFast);
@@ -149,31 +169,43 @@ impl<'a> TeamExecutor<'a> {
         }
         result
     }
-    fn project_inner(&mut self, operation: Int4ProjectionOp, input: &ActivationBuffer,
+    fn project_inner(&mut self, operation: Int4ProjectionOp, inputs: &[ActivationBuffer],
         rows: LinearRows<'_>, mut output: Output<'_>, control: &mut dyn DecodeStepControl)
         -> Result<(), StrictInt4Error> {
         if let Some(cause) = control.checkpoint(0) { return Err(StrictInt4Error::Cancelled(cause)); }
         let linear = self.weights.projection(operation)?.with_kernel(self.kernel);
-        let input_values = input.values()?;
-        let scale = input.scale()?;
+        let batch_rows = inputs.len();
+        if batch_rows == 0 || batch_rows > self.max_batch_rows || batch_rows > MAX_INT4_BATCH_ROWS {
+            return Err(StrictInt4Error::ProjectionExecutor);
+        }
+        let mut values: [&[i8]; MAX_INT4_BATCH_ROWS] = [&[]; MAX_INT4_BATCH_ROWS];
+        let mut scales = [1.0_f32; MAX_INT4_BATCH_ROWS];
+        for (index, input) in inputs.iter().enumerate() {
+            values[index] = input.values()?; scales[index] = input.scale()?;
+            if values[index].len() != linear.columns() { return Err(StrictInt4Error::ProjectionExecutor); }
+        }
+        let input_len = linear.columns();
         let count = rows.checked_count(linear.rows())?;
-        if output.len() != count || input_values.len() != linear.columns()
+        if count.checked_mul(batch_rows) != Some(output.len())
             || self.peers.len() != self.width - 1 {
             return Err(StrictInt4Error::ProjectionExecutor);
         }
         let epoch = self.stats.completed_projections.checked_add(1).ok_or(StrictInt4Error::Work)?;
         let coordinator = row_range(count, self.width, 0);
-        let completed_rows = self.stats.completed_rows.checked_add(count as u64).ok_or(StrictInt4Error::Work)?;
+        let completed_rows = self.stats.completed_rows.checked_add((count * batch_rows) as u64).ok_or(StrictInt4Error::Work)?;
         let completed_worker_rows = self.stats.completed_worker_rows
-            .checked_add((count - coordinator.len()) as u64).ok_or(StrictInt4Error::Work)?;
+            .checked_add(((count - coordinator.len()) * batch_rows) as u64).ok_or(StrictInt4Error::Work)?;
         let kind = output.kind();
         for (ordinal, peer) in self.peers.iter_mut().enumerate() {
             let range = row_range(count, self.width, ordinal + 1);
             let mut buffers = peer.buffers.take().ok_or(StrictInt4Error::ProjectionExecutor)?;
-            if input_values.len() > buffers.input.len() || range.len() > buffers.selected.len() {
+            if input_len * batch_rows > buffers.input.len() || range.len() > buffers.selected.len()
+                || range.len() * batch_rows > buffers.floats.len() || range.len() * batch_rows > buffers.bf16.len() {
                 return Err(StrictInt4Error::ProjectionExecutor);
             }
-            buffers.input[..input_values.len()].copy_from_slice(input_values);
+            for (lane, input) in values[..batch_rows].iter().enumerate() {
+                buffers.input[lane * input_len..(lane + 1) * input_len].copy_from_slice(input);
+            }
             let selected = match rows {
                 LinearRows::All => false,
                 LinearRows::Selected(ids) => {
@@ -181,16 +213,20 @@ impl<'a> TeamExecutor<'a> {
                 }
             };
             let command = Command { epoch, operation, kind, range, selected,
-                input_len: input_values.len(), scale, buffers };
+                input_len, batch_rows, scales, buffers };
             peer.command.as_ref().ok_or(StrictInt4Error::ProjectionExecutor)?
                 .try_send(command).map_err(|_| StrictInt4Error::ProjectionExecutor)?;
         }
         // The coordinator is a real participant, not a waiting extra thread.
-        match &mut output {
-            Output::Float(values) => linear.project_f32_range_into(input_values, scale, rows,
-                coordinator.clone(), &mut values[coordinator.clone()], &mut self.scratch, control),
-            Output::Bf16(values) => linear.project_bf16_range_into(input_values, scale, rows,
-                coordinator.clone(), &mut values[coordinator.clone()], &mut self.scratch, control),
+        match (&mut output, batch_rows) {
+            (Output::Float(output), 1) => linear.project_f32_range_into(values[0], scales[0], rows,
+                coordinator.clone(), &mut output[coordinator.clone()], &mut self.scratch, control),
+            (Output::Bf16(output), 1) => linear.project_bf16_range_into(values[0], scales[0], rows,
+                coordinator.clone(), &mut output[coordinator.clone()], &mut self.scratch, control),
+            (Output::Float(output), batch) => linear.project_batch_f32_range_into(&values[..batch],
+                &scales[..batch], rows, coordinator.clone(), output, count, &mut self.scratch, control),
+            (Output::Bf16(output), batch) => linear.project_batch_bf16_range_into(&values[..batch],
+                &scales[..batch], rows, coordinator.clone(), output, count, &mut self.scratch, control),
         }?;
         // Deterministic ordinal assembly happens only after matching the
         // command identity, range and output rail on that worker's reply.
@@ -201,12 +237,12 @@ impl<'a> TeamExecutor<'a> {
             };
             let expected = row_range(count, self.width, ordinal + 1);
             let valid = reply.epoch == epoch && reply.operation == operation && reply.kind == kind
-                && reply.range == expected;
+                && reply.range == expected && reply.batch_rows == batch_rows;
             let result = reply.result;
             peer.buffers = Some(reply.buffers);
             if !valid { return Err(StrictInt4Error::ProjectionExecutor); }
             result?;
-            output.assemble(expected, peer.buffers.as_ref().ok_or(StrictInt4Error::ProjectionExecutor)?);
+            output.assemble(expected, count, batch_rows, peer.buffers.as_ref().ok_or(StrictInt4Error::ProjectionExecutor)?);
         }
         if let Some(cause) = control.checkpoint(0) { return Err(StrictInt4Error::Cancelled(cause)); }
         self.stats.completed_projections = epoch;
@@ -229,15 +265,21 @@ impl Drop for TeamExecutor<'_> {
 impl Int4ProjectionExecutor for TeamExecutor<'_> {
     fn model_identity(&self) -> &Int4ModelIdentity { self.weights.identity() }
     fn kernel_kind(&self) -> Int8KernelKind { self.kernel.kind() }
+    fn max_batch_rows(&self) -> usize { self.max_batch_rows }
     fn stats(&self) -> Int4ProjectionStats { self.stats }
     fn project_bf16_into(&mut self, operation: Int4ProjectionOp, input: &ActivationBuffer,
         rows: LinearRows<'_>, output: &mut [Bf16], control: &mut dyn DecodeStepControl)
         -> Result<(), StrictInt4Error> {
-        self.project(operation, input, rows, Output::Bf16(output), control)
+        self.project(operation, std::slice::from_ref(input), rows, Output::Bf16(output), control)
     }
     fn project_f32_into(&mut self, operation: Int4ProjectionOp, input: &ActivationBuffer,
         rows: LinearRows<'_>, output: &mut [f32], control: &mut dyn DecodeStepControl)
         -> Result<(), StrictInt4Error> {
-        self.project(operation, input, rows, Output::Float(output), control)
+        self.project(operation, std::slice::from_ref(input), rows, Output::Float(output), control)
+    }
+    fn project_batch_bf16_into(&mut self, operation: Int4ProjectionOp, inputs: &[ActivationBuffer],
+        rows: LinearRows<'_>, output: &mut [Bf16], control: &mut dyn DecodeStepControl)
+        -> Result<(), StrictInt4Error> {
+        self.project(operation, inputs, rows, Output::Bf16(output), control)
     }
 }

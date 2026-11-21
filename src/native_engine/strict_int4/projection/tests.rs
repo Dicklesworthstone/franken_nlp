@@ -19,12 +19,12 @@ fn optional_executor_preserves_the_public_engine_send_and_sync_contract() {
 // The hosted tests exercise the persistent real scoped workers separately.
 struct PartitionExecutor<'model> {
     model: &'model Int4ModelWeights, scratch: Vec<i8>, calls: usize,
-    stop: Option<DecodeCancellationKind>, stats: Int4ProjectionStats,
+    stop: Option<DecodeCancellationKind>, stats: Int4ProjectionStats, max_batch_rows: usize,
 }
 impl<'model> PartitionExecutor<'model> {
     fn new(model: &'model Int4ModelWeights) -> Self {
         Self { model, scratch: vec![0; model.group_width()], calls: 0, stop: None,
-            stats: Int4ProjectionStats { team_width: 1, ..Default::default() } }
+            stats: Int4ProjectionStats { team_width: 1, ..Default::default() }, max_batch_rows: MAX_INT4_BATCH_ROWS }
     }
     fn entered(&mut self) -> Result<(), StrictInt4Error> {
         self.calls += 1;
@@ -37,6 +37,7 @@ impl<'model> PartitionExecutor<'model> {
 impl Int4ProjectionExecutor for PartitionExecutor<'_> {
     fn model_identity(&self) -> &Int4ModelIdentity { self.model.identity() }
     fn kernel_kind(&self) -> Int8KernelKind { Int8KernelKind::Scalar }
+    fn max_batch_rows(&self) -> usize { self.max_batch_rows }
     fn stats(&self) -> Int4ProjectionStats { self.stats }
     fn project_bf16_into(&mut self, op: Int4ProjectionOp, input: &ActivationBuffer,
         rows: LinearRows<'_>, output: &mut [Bf16], control: &mut dyn DecodeStepControl)
@@ -60,6 +61,117 @@ impl Int4ProjectionExecutor for PartitionExecutor<'_> {
         }
         self.completed(count); Ok(())
     }
+    fn project_batch_bf16_into(&mut self, op: Int4ProjectionOp, inputs: &[ActivationBuffer],
+        rows: LinearRows<'_>, output: &mut [Bf16], control: &mut dyn DecodeStepControl)
+        -> Result<(), StrictInt4Error> {
+        self.entered()?;
+        let matrix = self.model.projection(op)?; let count = rows.checked_count(matrix.rows())?;
+        for (input, output) in inputs.iter().zip(output.chunks_exact_mut(count)) {
+            for range in [0..count / 2, count / 2..count] {
+                matrix.project_bf16_range_into(input.values()?, input.scale()?, rows, range.clone(),
+                    &mut output[range], &mut self.scratch, control)?;
+            }
+        }
+        self.completed(count * inputs.len()); Ok(())
+    }
+}
+
+fn activation_batch(rows: usize) -> Vec<ActivationBuffer> {
+    (0..rows).map(|lane| {
+        let mut input = ActivationBuffer::try_new(6).unwrap();
+        let values: Vec<_> = (0..6).map(|i| Bf16::from_f32(
+            ((i * 3 + lane * 7) % 13) as f32 - 6.0)).collect();
+        input.encode_bf16(&values).unwrap(); input
+    }).collect()
+}
+
+#[test]
+fn injected_batch_preserves_all_and_selected_outputs_with_one_aggregate_debit() {
+    let (model, _) = projection_fixture(4); let matrix = &model.head;
+    for rows in [LinearRows::All, LinearRows::Selected(&[1, 6, 9])] {
+        let count = rows.checked_count(matrix.rows()).unwrap();
+        for copies in [1, 3, 5] {
+            let inputs = activation_batch(copies);
+            let one = matrix.as_linear().planned_work(rows).unwrap();
+            let work = ProjectionWork { dot_products: one.dot_products * copies as u64,
+                multiply_accumulates: one.multiply_accumulates * copies as u64 };
+            let mut reference = vec![Bf16::default(); copies * count];
+            let mut serial = ProjectionLedger::new(work);
+            project_batch_bf16(&mut None, Int4ProjectionOp::Head, matrix, &inputs, rows,
+                &mut reference, &mut [0; 4], PackedInt4Kernel::scalar(), &mut serial, &mut Continue).unwrap();
+            let mut actual = vec![Bf16::default(); copies * count];
+            let mut ledger = ProjectionLedger::new(work); let mut executor = PartitionExecutor::new(&model);
+            {
+                let mut injected: Option<&mut dyn Int4ProjectionExecutor> = Some(&mut executor);
+                project_batch_bf16(&mut injected, Int4ProjectionOp::Head, matrix, &inputs, rows,
+                    &mut actual, &mut [], PackedInt4Kernel::scalar(), &mut ledger, &mut Continue).unwrap();
+                assert!(project_batch_bf16(&mut injected, Int4ProjectionOp::Head, matrix, &inputs, rows,
+                    &mut actual, &mut [], PackedInt4Kernel::scalar(), &mut ledger, &mut Continue).is_err());
+            }
+            assert_eq!(actual, reference); assert_eq!(ledger.reserved(), serial.reserved());
+            assert_eq!(ledger.remaining(), ProjectionWork::default()); assert_eq!(executor.calls, 1);
+            assert_eq!(executor.stats().completed_projections, 1);
+            assert_eq!(executor.stats().completed_rows, (count * copies) as u64);
+        }
+    }
+}
+
+#[test]
+fn batch_capacity_shape_and_late_invalid_input_refuse_before_executor_or_debit() {
+    let (model, _) = projection_fixture(4); let matrix = &model.head;
+    let rows = LinearRows::Selected(&[1, 6, 9]);
+    let one = matrix.as_linear().planned_work(rows).unwrap();
+    let work = ProjectionWork { dot_products: one.dot_products * 3,
+        multiply_accumulates: one.multiply_accumulates * 3 };
+    for mode in 0..5 {
+        let mut inputs = activation_batch(3); let mut executor = PartitionExecutor::new(&model);
+        if mode == 0 { executor.max_batch_rows = 2; }
+        if mode == 1 { inputs[2] = ActivationBuffer::try_new(6).unwrap(); }
+        let mut budget = work;
+        if mode == 3 { budget.dot_products -= 1; }
+        if mode == 4 { budget.multiply_accumulates -= 1; }
+        let mut ledger = ProjectionLedger::new(budget); let sentinel = Bf16::from_bits(0x4111);
+        let mut output = [sentinel; 9];
+        {
+            let mut injected: Option<&mut dyn Int4ProjectionExecutor> = Some(&mut executor);
+            assert!(project_batch_bf16(&mut injected, Int4ProjectionOp::Head, matrix, &inputs, rows,
+                &mut output[..if mode == 2 { 8 } else { 9 }], &mut [], PackedInt4Kernel::scalar(),
+                &mut ledger, &mut Continue).is_err());
+        }
+        assert_eq!(executor.calls, 0); assert_eq!(output, [sentinel; 9]);
+        assert_eq!(ledger.reserved(), ProjectionWork::default()); assert_eq!(ledger.remaining(), budget);
+    }
+    let inputs = activation_batch(3); let mut executor = PartitionExecutor::new(&model);
+    executor.stop = Some(DecodeCancellationKind::Deadline); let mut ledger = ProjectionLedger::new(work);
+    {
+        let mut injected: Option<&mut dyn Int4ProjectionExecutor> = Some(&mut executor);
+        assert_eq!(project_batch_bf16(&mut injected, Int4ProjectionOp::Head, matrix, &inputs, rows,
+            &mut [Bf16::default(); 9], &mut [], PackedInt4Kernel::scalar(), &mut ledger, &mut Continue),
+            Err(StrictInt4Error::Cancelled(DecodeCancellationKind::Deadline)));
+    }
+    assert_eq!(ledger.reserved(), work); assert_eq!(executor.stats().completed_projections, 0);
+}
+
+#[test]
+fn prefill_refuses_larger_declared_batch_before_prompt_work_or_session_poisoning() {
+    use crate::native_engine::strict_int4::prefill::Int4PrefillLimits;
+    let (model, _) = projection_fixture(4); let mut executor = PartitionExecutor::new(&model);
+    executor.max_batch_rows = 1;
+    let memory = Int4MemoryRequirement::for_context(1, 4).unwrap();
+    let budget = Int4MemoryBudget { max_kv_bytes: memory.kv_bytes, max_rope_bytes: memory.rope_bytes,
+        max_scratch_payload_bytes: memory.scratch_payload_bound };
+    let mut engine = StrictInt4Engine::new(&model, 1, budget).unwrap()
+        .with_projection_executor(&mut executor).unwrap();
+    {
+        let mut control = Continue;
+        let mut session = engine.session(Int4RunBudget::exact(Int4Work::default()), &mut control).unwrap();
+        assert_eq!(session.append_layer_major(&[1], Int4PrefillLimits { max_batch_rows: 3,
+            max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(3).unwrap() }),
+            Err(StrictInt4Error::ProjectionExecutor));
+        assert_eq!(session.work(), Int4Work::default()); assert_eq!(session.position().unwrap(), 0);
+    }
+    assert!(!engine.is_poisoned()); assert!(engine.kv_cache().all_slots_have_len(0));
+    drop(engine); assert_eq!(executor.calls, 0);
 }
 
 #[test]
@@ -224,7 +336,7 @@ fn central_debit_refuses_exhaustion_instead_of_restarting_a_worker_allowance() {
 }
 
 /// Controller-selected model-present DSR gate: exercises the actual decoder's
-/// two passes, every physical matrix role and incremental head routing. The
+/// two passes, batched prefill, every matrix role and incremental head routing. The
 /// serial partition adapter proves arithmetic/routing only; actual worker
 /// lifecycle tests belong to hosted dispatch. Neither is a BF16 quality gate.
 #[test]
@@ -232,7 +344,7 @@ fn central_debit_refuses_exhaustion_instead_of_restarting_a_worker_allowance() {
 fn model_present_decoder_and_head_match_through_the_injected_executor() {
     use crate::artifact::converter::{ConversionSourceManifest, prepare_nanbeige42_input};
     use crate::native_engine::{kv::KV_SLOT_COUNT, lmhead::NANBEIGE_VOCAB_SIZE,
-        strict_int4::{Int4ModelLoadBudget, Int4ModelLoadRequirement}};
+        strict_int4::{Int4ModelLoadBudget, Int4ModelLoadRequirement, prefill::Int4PrefillLimits}};
     let root = std::env::var_os("FNLP_INT4_TEST_SOURCE_DIR").expect("explicit pinned source directory required");
     let manifest = std::env::var_os("FNLP_INT4_TEST_SOURCE_MANIFEST").expect("explicit pinned manifest path required");
     let source = prepare_nanbeige42_input(std::path::PathBuf::from(root),
@@ -241,42 +353,54 @@ fn model_present_decoder_and_head_match_through_the_injected_executor() {
     let model = Int4ModelWeights::from_prepared(&source, 128, Int4ModelLoadBudget {
         max_payload_bytes: need.peak_payload_bytes().unwrap(), max_source_values: need.source_values,
         max_groups: need.groups, max_shard_revalidation_bytes: need.shard_revalidation_bytes }, &mut Continue).unwrap();
-    let memory = Int4MemoryRequirement::for_context(2, 128).unwrap();
+    let memory = Int4MemoryRequirement::for_context(4, 128).unwrap();
     let budget = Int4MemoryBudget { max_kv_bytes: memory.kv_bytes, max_rope_bytes: memory.rope_bytes,
         max_scratch_payload_bytes: memory.scratch_payload_bound };
     let rows = LinearRows::Selected(&[0, 42, (NANBEIGE_VOCAB_SIZE - 1) as u32]);
-    let work = Int4Work::for_sequence(128, 0, 2, 6).unwrap();
+    let work = Int4Work::for_sequence(128, 0, 4, 6).unwrap();
+    let cache_bits = |cache: &crate::native_engine::kv::KvCache| {
+        let mut bits = Vec::new();
+        for slot in 0..KV_SLOT_COUNT { for position in 0..4 {
+            bits.extend_from_slice(cache.key_at(slot, position).unwrap());
+            bits.extend_from_slice(cache.value_at(slot, position).unwrap());
+        } }
+        bits
+    };
     let expected = {
-        let mut engine = StrictInt4Engine::new(&model, 2, budget).unwrap();
+        let mut engine = StrictInt4Engine::new(&model, 4, budget).unwrap();
         let mut control = Continue;
         let output;
         {
             let mut session = engine.session(Int4RunBudget::exact(work), &mut control).unwrap();
-            let first = session.prefill(&[1], rows).unwrap();
-            session.append(2).unwrap(); let second = session.logits(rows).unwrap();
-            assert_eq!(session.work(), work); output = (first, second);
+            let first = session.prefill(&[1, 2, 3], rows).unwrap();
+            session.append(4).unwrap(); let second = session.logits(rows).unwrap();
+            assert_eq!(session.work(), work); output = (first, second, cache_bits(session.engine.kv_cache()));
         }
         assert!(engine.kv_cache().all_slots_have_len(0)); assert!(!engine.is_poisoned()); output
     };
     let mut executor = PartitionExecutor::new(&model);
     let actual = {
-        let mut engine = StrictInt4Engine::new(&model, 2, budget).unwrap()
+        let mut engine = StrictInt4Engine::new(&model, 4, budget).unwrap()
             .with_projection_executor(&mut executor).unwrap();
         let mut control = Continue;
         let output;
         {
             let mut session = engine.session(Int4RunBudget::exact(work), &mut control).unwrap();
-            let first = session.prefill(&[1], rows).unwrap();
-            session.append(2).unwrap(); let second = session.logits(rows).unwrap();
-            assert_eq!(session.work(), work); output = (first, second);
+            let first = session.prefill_layer_major(&[1, 2, 3], rows, Int4PrefillLimits {
+                max_batch_rows: 3,
+                max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(3).unwrap(),
+            }).unwrap();
+            session.append(4).unwrap(); let second = session.logits(rows).unwrap();
+            assert_eq!(session.work(), work); output = (first, second, cache_bits(session.engine.kv_cache()));
         }
         assert!(engine.kv_cache().all_slots_have_len(0)); assert!(!engine.is_poisoned()); output
     };
     let bits = |values: &[f32]| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
     assert_eq!(bits(&actual.0), bits(&expected.0)); assert_eq!(bits(&actual.1), bits(&expected.1));
+    assert_eq!(actual.2, expected.2, "all 44 logical KV slots retain the serial bits");
     let stats = executor.stats();
     assert_eq!(stats.completed_projections, (2 * KV_SLOT_COUNT * 7 + 2) as u64);
     let decoder_rows: u64 = super::super::PROJECTION_SHAPES.iter().map(|&(rows, _)| rows as u64).sum();
-    assert_eq!(stats.completed_rows, 2 * KV_SLOT_COUNT as u64 * decoder_rows + 6);
+    assert_eq!(stats.completed_rows, 4 * KV_SLOT_COUNT as u64 * decoder_rows + 6);
     assert_eq!(stats.completed_worker_rows, 0);
 }

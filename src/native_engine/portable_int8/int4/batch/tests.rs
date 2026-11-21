@@ -55,6 +55,29 @@ fn parity(kernel: PackedInt4Kernel) {
                     &mut vec![0; width], &mut ProjectionLedger::new(work), &mut Control::default()).unwrap();
                 assert_eq!(bf16.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                     reference.iter().map(|&v| Bf16::from_f32(v).to_bits()).collect::<Vec<_>>());
+                let values: Vec<_> = inputs.iter().map(|input| input.values().unwrap()).collect();
+                let activation_scales: Vec<_> = inputs.iter().map(|input| input.scale().unwrap()).collect();
+                // A worker owns a compact local shard; the coordinator uses
+                // the full output stride. Neither may touch its row padding.
+                let range = count / 2..count;
+                for stride in [range.len(), count + 1] {
+                    let mut shard = vec![123.0_f32; m * stride];
+                    let sentinel = Bf16::from_bits(0x7fc1);
+                    let mut shard_bf16 = vec![sentinel; m * stride];
+                    matrix.with_kernel(kernel).project_batch_f32_range_into(&values, &activation_scales,
+                        rows, range.clone(), &mut shard, stride, &mut vec![0; width], &mut Control::default()).unwrap();
+                    matrix.with_kernel(kernel).project_batch_bf16_range_into(&values, &activation_scales,
+                        rows, range.clone(), &mut shard_bf16, stride, &mut vec![0; width], &mut Control::default()).unwrap();
+                    for lane in 0..m {
+                        let expected = &reference[lane * count + range.start..(lane + 1) * count];
+                        assert_eq!(shard[lane * stride..lane * stride + range.len()].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+                        let expected_bf16: Vec<_> = expected.iter().map(|&v| Bf16::from_f32(v)).collect();
+                        assert_eq!(&shard_bf16[lane * stride..lane * stride + range.len()], expected_bf16.as_slice());
+                        assert!(shard[lane * stride + range.len()..(lane + 1) * stride].iter().all(|&v| v == 123.0));
+                        assert!(shard_bf16[lane * stride + range.len()..(lane + 1) * stride].iter().all(|&v| v == sentinel));
+                    }
+                }
             }
         }
     } }
@@ -116,4 +139,40 @@ fn empty_oversized_and_invalid_selection_fail_before_charge() {
             &mut vec![0.0; selected.len()], &mut [0; 3], &mut ledger, &mut Control::default()).is_err());
         assert_eq!(ledger.reserved(), ProjectionWork::default());
     }
+}
+
+#[test]
+fn raw_batch_ranges_refuse_bad_shapes_scales_selections_and_stride_before_math() {
+    let bytes = packed(6, 7); let matrix = GroupedInt4Linear::checked(6, 7, 3, &bytes, &[0.25; 18]).unwrap();
+    let inputs = [activation(7, 0), activation(7, 1)];
+    let values = [inputs[0].values().unwrap(), inputs[1].values().unwrap()];
+    let scales = [inputs[0].scale().unwrap(), inputs[1].scale().unwrap()];
+    for axis in 0..11 {
+        let mut values = values; let mut scales = scales;
+        let mut range = 1..3; let mut stride = 3; let mut length = 6;
+        let mut rows = LinearRows::Selected(&[0, 2, 5]);
+        let mut scratch = [99; 3]; let mut output = [123.0; 6]; let mut control = Control::default();
+        match axis {
+            0 => values[1] = &values[1][..6],
+            1 => scales[1] = 0.0,
+            2 => scales[1] = f32::NAN,
+            3 => scales[1] = f32::INFINITY,
+            4 => { range.start = 2; range.end = 1; }
+            5 => range = 0..4,
+            6 => { stride = 1; length = 2; }
+            7 => length = 5,
+            8 => rows = LinearRows::Selected(&[0, 2, 2]),
+            9 => rows = LinearRows::Selected(&[0, 6]),
+            _ => {}
+        }
+        assert!(matrix.project_batch_f32_range_into(&values, &scales, rows, range,
+            &mut output[..length], stride, &mut scratch[..if axis == 10 { 2 } else { 3 }],
+            &mut control).is_err());
+        assert_eq!(output, [123.0; 6]); assert_eq!(scratch, [99; 3]); assert_eq!(control.polls, 0);
+    }
+    let mut output = [123.0; 6]; let mut scratch = [99; 3];
+    assert!(matches!(matrix.project_batch_f32_range_into(&values, &scales, LinearRows::All,
+        2..4, &mut output, 3, &mut scratch, &mut Control { polls: 0, cancel: Some(1) }),
+        Err(GroupedInt4Error::Linear(LinearError::Cancelled(DecodeCancellationKind::User)))));
+    assert_eq!(output, [123.0; 6]); assert_eq!(scratch, [99; 3]);
 }

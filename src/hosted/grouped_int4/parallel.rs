@@ -1,6 +1,7 @@
 //! Explicit whole-request output-row teams for single-request INT4 tasks.
 use super::*;
 use crate::native_engine::strict_int4::projection::Int4ProjectionStats;
+use crate::native_engine::strict_int4::prefill::Int4PrefillLimits;
 mod task;
 pub(super) use task::{TaskMemory, execute_task};
 
@@ -47,6 +48,14 @@ pub fn int4_chat_team_workspace_bytes(compute_threads: usize, group_width: usize
     dispatch::int4_team_workspace_bytes(compute_threads, group_width)
 }
 
+/// Additional fixed-team storage when layer-major prefill shares the team's
+/// output-row workers. This excludes the coordinator's separately admitted
+/// prefill workspace and all ordinary native/result reservations.
+pub fn int4_chat_prefill_team_workspace_bytes(compute_threads: usize, group_width: usize,
+    max_batch_rows: usize) -> Result<u64, HostedError> {
+    dispatch::int4_prefill_team_workspace_bytes(compute_threads, group_width, max_batch_rows)
+}
+
 /// Additional modeled scratch for a fixed structured/scored task team. This
 /// is the same quote used by the dispatcher; it excludes ordinary native KV,
 /// task preparation, masks, result storage, allocator and cleanup reserves.
@@ -69,6 +78,29 @@ impl NlpEngine {
         request_seq: u64, native: NativeLimits, max_sampler_bytes: u64, kernel: PackedInt4Kernel,
         compute_threads: usize, cancellation: CancellationToken)
         -> Result<HostedInt4ChatTeamResult, HostedError> {
+        self.execute_int4_chat_team(model, prepared, request_seq, native, max_sampler_bytes,
+            kernel, compute_threads, None, cancellation)
+    }
+
+    /// Use one fixed output-row team for layer-major prompt prefill and
+    /// subsequent decode. Each packed group is reused across the admitted
+    /// activation rows, while each output's group reduction retains its order.
+    /// All batch storage is reserved before native work; the team neither
+    /// resizes nor changes width between prefill and decode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_int4_chat_layer_major_with_threads(&self, model: &ResidentInt4, prepared: PreparedInt4Chat,
+        request_seq: u64, native: NativeLimits, max_sampler_bytes: u64, kernel: PackedInt4Kernel,
+        compute_threads: usize, prefill: Int4PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedInt4ChatTeamResult, HostedError> {
+        self.execute_int4_chat_team(model, prepared, request_seq, native, max_sampler_bytes,
+            kernel, compute_threads, Some(prefill), cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_int4_chat_team(&self, model: &ResidentInt4, prepared: PreparedInt4Chat,
+        request_seq: u64, native: NativeLimits, max_sampler_bytes: u64, kernel: PackedInt4Kernel,
+        compute_threads: usize, prefill: Option<Int4PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedInt4ChatTeamResult, HostedError> {
         dispatch::preflight_int4_team(self, native.run, compute_threads)?;
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
         let width = model.model_identity().group_width();
@@ -80,17 +112,18 @@ impl NlpEngine {
         let required = native_requirements(&prepared, request_seq, native, max_sampler_bytes)?;
         // The dispatcher reserves the same team quote before its single
         // blocking crossing; no native worker buffer exists before admission.
-        int4_chat_team_workspace_bytes(compute_threads, width)?;
-        let scratch = sum(&[required.rope_bytes, required.scratch_payload_bound,
-            max_sampler_bytes, native.allocator_reserve_bytes])?;
+        let max_batch_rows = prefill.map_or(1, |limits| limits.max_batch_rows);
+        int4_chat_prefill_team_workspace_bytes(compute_threads, width, max_batch_rows)?;
+        let scratch = prefill::with_extra_workspace(sum(&[required.rope_bytes, required.scratch_payload_bound,
+            max_sampler_bytes, native.allocator_reserve_bytes])?, prefill)?;
         let work = prepared.planned_work();
         let lease = self.resources().acquire_lease();
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
         let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch)?;
         let output = output_claim(&lease, prepared.task_plan().ir().budget().max_output_bytes,
             u64::from(prepared.task_plan().ir().budget().max_output_tokens))?;
-        dispatch::run_int4_team(self, native.run, cancellation, model.clone(), compute_threads,
-            kernel, move |weights, control, team| {
+        dispatch::run_int4_prefill_team(self, native.run, cancellation, model.clone(), compute_threads,
+            kernel, max_batch_rows, move |weights, control, team| {
                 let mut engine = allocate_native(kv, workspace, || {
                     StrictInt4Engine::new(weights, native.context_tokens, Int4MemoryBudget {
                         max_kv_bytes: required.kv_bytes, max_rope_bytes: required.rope_bytes,
@@ -100,8 +133,12 @@ impl NlpEngine {
                 })?;
                 let budget = Int4GenerationBudget { native: Int4RunBudget::exact(work),
                     max_kv_bytes: required.kv_bytes, max_sampler_bytes };
-                let result = prepared.execute(prepared.execution_identity(), &mut engine.value,
-                    request_seq, budget, control).map_err(chat_error)?;
+                let result = match prefill {
+                    None => prepared.execute(prepared.execution_identity(), &mut engine.value,
+                        request_seq, budget, control),
+                    Some(limits) => prepared.execute_layer_major(prepared.execution_identity(), &mut engine.value,
+                        request_seq, budget, limits, control),
+                }.map_err(chat_error)?;
                 drop(engine);
                 let compute = team.stats().into();
                 let committed = output.commit()?;

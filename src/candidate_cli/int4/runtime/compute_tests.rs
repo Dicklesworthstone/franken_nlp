@@ -15,6 +15,16 @@ fn changed_worker_admission_refuses_before_runtime_and_private_io() {
     let parallel = super::super::tests::args("generate", &["--compute-threads", "2"]);
     assert_eq!(execute_task(Int4Task::Text(Task::Generate), parallel, limits, &mut NoIo, &mut NoIo),
         Err(CandidateError::Arguments));
+    let parallel = super::super::tests::args("generate", &["--compute-threads", "4", "--prefill-rows", "3"]);
+    let mut limits = parallel.validate_text_compute().unwrap();
+    limits.compute.workspace_bytes = crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(4, 128).unwrap();
+    assert_eq!(execute_task(Int4Task::Text(Task::Generate), parallel, limits, &mut NoIo, &mut NoIo),
+        Err(CandidateError::Arguments));
+    let original = super::super::tests::args("generate", &["--compute-threads", "4", "--prefill-rows", "3"]);
+    let limits = original.validate_text_compute().unwrap();
+    let changed = super::super::tests::args("generate", &["--compute-threads", "4", "--prefill-rows", "5"]);
+    assert_eq!(execute_task(Int4Task::Text(Task::Generate), changed, limits, &mut NoIo, &mut NoIo),
+        Err(CandidateError::Arguments));
     let parallel = super::super::tests::args("generate", &["--compute-threads", "4"]);
     let mut limits = parallel.validate_text_compute().unwrap();
     limits.compute.workspace_bytes -= 1;
@@ -76,9 +86,10 @@ fn snapshot_fixed_teams_match_full_serial_results_and_drain_charges() {
         leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
     }).build().unwrap();
     let idle = engine.resources().memory_snapshot();
-    let make = |operation: &str, threads: &str, seeded: bool, bpe: bool| {
+    let make = |operation: &str, threads: &str, prefill: Option<&str>, seeded: bool, bpe: bool| {
         let mut flags = vec!["--compute-threads", threads, "--min-new-tokens", "1"];
         if bpe { flags.extend(["--input-encoding", "safe-bpe-v1"]); }
+        if let Some(rows) = prefill { flags.extend(["--prefill-rows", rows]); }
         let mut args = super::super::tests::args(operation, &flags);
         args.source_dir = None; args.source_manifest = None;
         args.snapshot = Some(PathBuf::from(&snapshot)); args.expected_model_sha256 = Some(pin.clone());
@@ -90,7 +101,7 @@ fn snapshot_fixed_teams_match_full_serial_results_and_drain_charges() {
         }
         args
     };
-    let base = make("generate", "1", false, false);
+    let base = make("generate", "1", None, false, false);
     let limits = base.validate().unwrap();
     let lease = engine.resources().acquire_lease();
     let preparation = lease.reserve(MemoryClass::JobBuffers, limits.preparation_bytes).unwrap().commit().unwrap();
@@ -104,8 +115,9 @@ fn snapshot_fixed_teams_match_full_serial_results_and_drain_charges() {
             r#"[{"role":"user","content":"Give a short greeting."}]"#
         } else { "Give a short greeting." };
         let mut serial = None;
-        for width in ["1", "2", "4"] {
-            let args = make(operation, width, seeded, bpe);
+        for (width, prefill) in [("1", None), ("2", None), ("4", None),
+            ("1", Some("3")), ("2", Some("1")), ("4", Some("3"))] {
+            let args = make(operation, width, prefill, seeded, bpe);
             let limits = args.validate_text_compute().unwrap();
             let request = Input::Text(parse_input(task, text.to_owned(), args.max_input_bytes).unwrap());
             let prepared = prepare(request, &model, &args, limits, &mut DeadlineControl {
@@ -117,9 +129,10 @@ fn snapshot_fixed_teams_match_full_serial_results_and_drain_charges() {
                     max_checkpoints: args.max_checkpoints, cleanup_reserve_bytes: CLEANUP_BYTES },
             }, limits, CancellationToken::default()).unwrap();
             let value = serde_json::to_value(&result).unwrap();
-            if width == "1" { assert!(result.compute().is_none()); serial = Some(value); }
+            if width == "1" && prefill.is_none() { serial = Some(value.clone()); }
+            assert_eq!(&value, serial.as_ref().unwrap());
+            if width == "1" { assert!(result.compute().is_none()); }
             else {
-                assert_eq!(&value, serial.as_ref().unwrap());
                 let receipt = result.compute().unwrap();
                 assert_eq!(receipt.compute_threads, width.parse::<usize>().unwrap());
                 assert!(receipt.completed_projections > 0);

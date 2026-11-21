@@ -77,8 +77,8 @@ fn unsupported_compute_widths_and_prompt_schedules_refuse_before_io() {
     for operation in ["generate", "chat"] {
         for flags in [
             &["--compute-threads", "0"][..], &["--compute-threads", "65"][..],
-            &["--compute-threads", "2", "--prefill-rows", "1"][..],
-            &["--compute-threads", "4", "--prefill-rows", "4"][..],
+            &["--compute-threads", "2", "--prefill-rows", "0"][..],
+            &["--compute-threads", "4", "--prefill-rows", "65"][..],
         ] {
             let mut output = Vec::new();
             assert_eq!(command(operation, flags).execute(&mut NoRead, &mut output), Err(CandidateError::Arguments));
@@ -95,6 +95,35 @@ fn unsupported_compute_widths_and_prompt_schedules_refuse_before_io() {
             "--memory-mib", "8192", "--compute-threads", "2"]);
         assert_eq!(crate::candidate_cli::definition().try_get_matches_from(argv).unwrap_err().kind(),
             clap::error::ErrorKind::UnknownArgument);
+    }
+}
+
+#[test]
+fn buffered_text_composes_prefill_and_fixed_teams_with_both_workspaces_admitted() {
+    for operation in ["generate", "chat"] {
+        for rows in ["1", "3", "64"] {
+            let mut serial = args(operation, &["--compute-threads", "1", "--prefill-rows", rows]);
+            let mut parallel = args(operation, &["--compute-threads", "4", "--prefill-rows", rows]);
+            for args in [&mut serial, &mut parallel] {
+                args.source_dir = None; args.source_manifest = None;
+                args.snapshot = Some(PathBuf::from("private-snapshot"));
+                args.expected_model_sha256 = Some("39".repeat(32));
+            }
+            let serial_limits = serial.validate_text_compute().unwrap();
+            let parallel_limits = parallel.validate_text_compute().unwrap();
+            let batch = rows.parse::<usize>().unwrap();
+            let extra = crate::native_engine::strict_int4::projection::int4_prefill_team_workspace_bytes(4, 128, batch).unwrap();
+            assert_eq!(parallel_limits.compute, compute::Admission { threads: 4, workspace_bytes: extra });
+            assert_eq!(parallel_limits.prefill.unwrap().max_batch_rows, batch);
+            assert_eq!(parallel_limits.minimum_memory_bytes, serial_limits.minimum_memory_bytes + extra);
+            assert_eq!(parallel_limits.native, serial_limits.native); assert_eq!(parallel_limits.load, serial_limits.load);
+            assert!(parallel.options(166_101).unwrap() == serial.options(166_101).unwrap());
+            assert!(parallel.validate().is_err(), "composed workflows still require their own routed schedule");
+            parallel.memory_mib = (parallel_limits.minimum_memory_bytes - 1) / MIB;
+            assert!(parallel.validate_text_compute().is_err());
+            parallel.memory_mib = parallel_limits.minimum_memory_bytes.div_ceil(MIB);
+            parallel.validate_text_compute().unwrap();
+        }
     }
 }
 

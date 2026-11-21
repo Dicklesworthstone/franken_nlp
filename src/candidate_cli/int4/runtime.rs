@@ -84,11 +84,17 @@ impl Prepared {
         -> Result<Completed, CandidateError> {
         let kernel = limits.kernel;
         if limits.compute.threads > 1 {
-            if limits.prefill.is_some() || limits.cohort.is_some() { return Err(CandidateError::Arguments); }
+            if limits.cohort.is_some() || (limits.prefill.is_some() && !matches!(&self, Self::Text(_))) {
+                return Err(CandidateError::Arguments);
+            }
             let threads = limits.compute.threads;
             return match self {
-                Self::Text(plan) => engine.execute_int4_chat_with_threads(model, plan, 1, native, SAMPLER_BYTES,
-                    kernel, threads, cancellation).map(Completed::TextTeam),
+                Self::Text(plan) => match limits.prefill {
+                    None => engine.execute_int4_chat_with_threads(model, plan, 1, native, SAMPLER_BYTES,
+                        kernel, threads, cancellation),
+                    Some(prefill) => engine.execute_int4_chat_layer_major_with_threads(model, plan, 1, native,
+                        SAMPLER_BYTES, kernel, threads, prefill, cancellation),
+                }.map(Completed::TextTeam),
                 Self::Classify(plan) => engine.execute_int4_classify_with_threads(model, plan, native,
                     kernel, threads, cancellation)
                     .map(|result| Completed::Classify(compute::Completion::Team(result))),

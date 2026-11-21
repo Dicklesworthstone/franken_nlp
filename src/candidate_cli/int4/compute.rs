@@ -1,6 +1,6 @@
 //! Explicit physical team selection for complete native tasks and resident streams.
 use super::*;
-use crate::native_engine::strict_int4::projection::int4_team_workspace_bytes;
+use crate::native_engine::strict_int4::projection::{int4_team_workspace_bytes, int4_prefill_team_workspace_bytes};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Args { threads: usize }
@@ -13,8 +13,15 @@ impl Args {
     }
     pub(super) fn threads(self) -> usize { self.threads }
     pub(super) fn admit(self, group_width: usize) -> Result<Admission, CandidateError> {
+        self.admit_with_prefill(group_width, None)
+    }
+    pub(super) fn admit_with_prefill(self, group_width: usize, prefill: Option<Int4PrefillLimits>)
+        -> Result<Admission, CandidateError> {
         let workspace_bytes = if self.threads == 1 { 0 }
-            else { int4_team_workspace_bytes(self.threads, group_width).map_err(|_| CandidateError::Arguments)? };
+            else { match prefill {
+                None => int4_team_workspace_bytes(self.threads, group_width),
+                Some(limits) => int4_prefill_team_workspace_bytes(self.threads, group_width, limits.max_batch_rows),
+            }.map_err(|_| CandidateError::Arguments)? };
         Ok(Admission { threads: self.threads, workspace_bytes })
     }
 }
@@ -24,7 +31,7 @@ pub(super) struct Admission { pub threads: usize, pub workspace_bytes: u64 }
 pub(super) fn definition(command: clap::Command) -> clap::Command {
     command.arg(clap::Arg::new("compute_threads").long("compute-threads")
         .value_name("N").value_parser(clap::value_parser!(usize)).default_value("1")
-        .help("Coordinator plus persistent INT4 row workers, 1..=64; 1 is serial. One team serves the complete request or supported resident batch across all documents, heads, tokens and flushes; cannot combine with --prefill-rows, --cohort-heads or --cohort-documents. Runtime threads are additional. Worker scratch is admitted before IO"))
+        .help("Coordinator plus persistent INT4 row workers, 1..=64; 1 is serial. One team serves the complete request or supported resident batch across all documents, heads, tokens and flushes. Buffered generate/chat can also use --prefill-rows; other routes cannot combine these schedules. Cannot combine with --cohort-heads or --cohort-documents. Runtime threads are additional. Worker scratch is admitted before IO"))
 }
 
 /// The same admitted team width determines the process envelope for every
@@ -55,11 +62,12 @@ impl Schedule {
 #[cfg(feature = "asupersync-runtime")]
 pub(super) fn matches(task: &Int4Task, args: &Int4Args, limits: Int4Limits)
     -> Result<bool, CandidateError> {
-    Ok(limits.compute == args.compute.admit(args.group_width)?
+    let text = matches!(task, Int4Task::Text(_));
+    Ok(limits.compute == args.compute.admit_with_prefill(args.group_width, if text { limits.prefill } else { None })?
         && (limits.compute.threads == 1
             || (matches!(task, Int4Task::Text(_) | Int4Task::Classify(_) | Int4Task::Sentiment(_)
                 | Int4Task::Judge(_) | Int4Task::Extract(_) | Int4Task::Source(..))
-                && limits.prefill.is_none() && limits.cohort.is_none())))
+                && (limits.prefill.is_none() || text) && limits.cohort.is_none())))
 }
 
 /// Keep each physical schedule's complete output owner alive while callers

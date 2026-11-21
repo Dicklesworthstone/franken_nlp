@@ -30,6 +30,43 @@ and prompt scheduling are independent; scalar remains the kernel default and
 unsupported explicit kernels fail rather than fall back. The example memory
 ceiling is a ledger allowance, not measured RSS.
 
+### Buffered text with persistent workers
+
+Buffered `generate` and `chat` can use the same persistent output-row team for
+prompt prefill and decode. Add `--compute-threads 2..=64` to either example:
+
+```sh
+fnlp candidate source-int4 generate prompt.txt \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256_FROM_TRUSTED_CONVERSION" \
+  --memory-mib 8192 --prefill-rows 4 --compute-threads 4 \
+  --input-encoding safe-bpe-v1
+```
+
+The coordinator and three workers form once before inference. Each shard
+prepares a packed group once and applies it across the prompt morsel, preserving
+each row's activation scale, increasing-group accumulation and final BF16 cast.
+The same buffers and workers then execute single-token decode. Causal
+attention, KV, sampling and the complete native work ledger remain with the
+coordinator. Selected output rows retain their exact ordered selection.
+
+Admission reserves both the ordinary prefill workspace and a fixed batch
+input/output capacity for every worker. No projection grows its worker buffers,
+creates another team or renews the request work/checkpoint allowance. Larger
+declared prompt widths therefore increase the team scratch quote even when a
+particular prompt uses a shorter final morsel. Cancellation and failure drain
+the team before releasing its charged storage or publishing completed output.
+
+Library callers use `NlpEngine::execute_int4_chat_layer_major_with_threads` and
+`int4_chat_prefill_team_workspace_bytes` with a compatible resource host. The
+completed JSON includes the existing `compute` receipt; `completed_rows` counts
+completed output scalars across all prompt rows, while `completed_projections`
+counts successfully completed batch or single-row operations. These counters
+do not establish speed or model quality. Streaming, structured, population and
+retained-job routes keep their existing schedule restrictions.
+
+### Other task routes
+
 Source verification, independent snapshot pins, optional create-new snapshot
 saving, tokenizer/template binding, input validation and the completed JSON
 envelope remain unchanged. A snapshot failure never starts source conversion.

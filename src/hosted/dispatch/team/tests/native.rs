@@ -70,6 +70,94 @@ fn one_team_reuses_real_workers_for_full_selected_and_both_projection_rails() {
     }
 }
 
+fn batch_inputs(rows: usize) -> Vec<ActivationBuffer> {
+    (0..rows).map(|lane| {
+        let mut input = ActivationBuffer::try_new(6).unwrap();
+        let values: Vec<_> = (0..6).map(|i| Bf16::from_f32(
+            ((i * 7 + lane * 11) % 17) as f32 - 8.0)).collect();
+        input.encode_bf16(&values).unwrap(); input
+    }).collect()
+}
+
+#[test]
+fn one_sealed_team_composes_batch_morsels_selected_rows_and_single_row_decode() {
+    for width in [2, 3, 7, 16] {
+        let (weights, input) = projection_fixture(4);
+        let mut workspace = Workspace::with_batch_rows(width, 4, 5).unwrap();
+        let dropped = track_children(&mut workspace);
+        let shared = RunShared::new(limits(100_000), CancellationToken::default()).unwrap();
+        let stats = run_scope(&Cx::for_testing(), &weights, &mut workspace, width,
+            PackedInt4Kernel::scalar(), shared, |weights, control, executor| {
+            assert_eq!(executor.max_batch_rows(), 5);
+            let selected = [0, 3, 5];
+            let operations = [Int4ProjectionOp::Head,
+                Int4ProjectionOp::Layer { layer: 3, kind: Int4ProjectionKind::Gate },
+                Int4ProjectionOp::Layer { layer: 17, kind: Int4ProjectionKind::Query }];
+            for copies in [1, 3, 5] {
+                let inputs = batch_inputs(copies);
+                for operation in operations {
+                    for rows in [LinearRows::All, LinearRows::Selected(&selected)] {
+                        let reference: Vec<_> = inputs.iter().flat_map(|input|
+                            expected(weights, operation, input, rows).1).collect();
+                        let mut actual = vec![Bf16::from_bits(0xffff); reference.len()];
+                        executor.project_batch_bf16_into(operation, &inputs, rows, &mut actual,
+                            control).map_err(native_error)?;
+                        assert_eq!(actual, reference);
+                    }
+                }
+                let rows = LinearRows::Selected(&selected);
+                let (reference, _) = expected(weights, Int4ProjectionOp::Head, &input, rows);
+                let mut actual = [f32::NAN; 3];
+                executor.project_f32_into(Int4ProjectionOp::Head, &input, rows, &mut actual,
+                    control).map_err(native_error)?;
+                let expected_bits: Vec<_> = reference.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(actual.map(f32::to_bits).as_slice(), expected_bits.as_slice());
+                assert_eq!(dropped.load(Ordering::SeqCst), 0);
+            }
+            Ok(executor.stats())
+        }).unwrap();
+        assert_eq!(stats.team_width, width); assert_eq!(stats.completed_projections, 21);
+        assert_eq!(stats.completed_rows, 288);
+        assert_eq!(stats.completed_worker_rows, match width { 2 => 129, 3 => 186, 7 => 222, 16 => 231, _ => unreachable!() });
+        assert_eq!(dropped.load(Ordering::SeqCst), width - 1);
+    }
+}
+
+#[test]
+fn oversized_batch_refuses_without_math_and_still_drains_the_sealed_team() {
+    let (weights, _) = projection_fixture(4); let width = 3;
+    let mut workspace = Workspace::with_batch_rows(width, 4, 2).unwrap();
+    let dropped = track_children(&mut workspace);
+    let shared = RunShared::new(limits(10_000), CancellationToken::default()).unwrap();
+    let result = run_scope(&Cx::for_testing(), &weights, &mut workspace, width,
+        PackedInt4Kernel::scalar(), shared, |_, control, executor| {
+        let sentinel = Bf16::from_bits(0x4111); let mut output = [sentinel; 30];
+        let result = executor.project_batch_bf16_into(Int4ProjectionOp::Head, &batch_inputs(3),
+            LinearRows::All, &mut output, control);
+        assert_eq!(result, Err(StrictInt4Error::ProjectionExecutor));
+        assert_eq!(executor.stats().completed_projections, 0); assert_eq!(output, [sentinel; 30]);
+        result.map_err(native_error)
+    });
+    assert!(result.is_err()); assert_eq!(dropped.load(Ordering::SeqCst), width - 1);
+}
+
+#[test]
+fn batched_worker_panic_drains_all_owned_input_and_output_rows() {
+    let (weights, _) = projection_fixture(4); let width = 4;
+    let mut workspace = Workspace::with_batch_rows(width, 4, 5).unwrap();
+    workspace.panic_worker = Some(1);
+    let dropped = track_children(&mut workspace);
+    let shared = RunShared::new(limits(10_000), CancellationToken::default()).unwrap();
+    let error = run_scope(&Cx::for_testing(), &weights, &mut workspace, width,
+        PackedInt4Kernel::scalar(), shared, |_, control, executor| {
+        executor.project_batch_bf16_into(Int4ProjectionOp::Head, &batch_inputs(5),
+            LinearRows::All, &mut [Bf16::default(); 50], control).map_err(native_error)
+    }).unwrap_err();
+    assert!(matches!(error, HostedError::Scope {
+        source: asupersync::cx::ScopedCpuError::ChildPanicked { .. }, .. }));
+    assert_eq!(dropped.load(Ordering::SeqCst), width - 1);
+}
+
 #[test]
 fn every_precancelled_cause_refuses_before_formation_and_survives_drain() {
     use DecodeCancellationKind::*;
