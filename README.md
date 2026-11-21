@@ -3109,6 +3109,79 @@ The bounded commands use constrained greedy decoding with thinking disabled.
 `--max-new-tokens` includes terminal EOS; `--max-result-bytes` bounds the whole
 typed result. Prompt plus reserved output must fit the selected context.
 
+### Resident summary and answer review populations
+
+`summarize-semantic-batch` and `answer-semantic-batch` apply the existing
+generation and complete-source review to ordered NDJSON. One source compiler,
+judge, vocabulary, model and native workspace serve the entire stream. Each
+successful record preserves its original cited result and the complete
+correlated review. Failed generation or review publishes no combined result
+for that record; successful answer abstention remains explicitly `not_checked`.
+
+Summary records contain the original source and omit `task_args`:
+
+```json
+{"id":"report-1","text":"Alice works in Shanghai."}
+```
+
+QA records put the question in `text` and original evidence in a passages-only
+`task_args` object:
+
+```json
+{"id":"question-1","text":"Where does Alice work?","task_args":{"passages":[{"id":"p1","text":"Alice works in Shanghai."}]}}
+```
+
+`--options FILE`, or the typed source-task default, fixes generation settings
+for every record. Required `--semantic-options FILE` fixes the explicit review
+policy. Records cannot replace either policy or supply a budget, task selector,
+prompt or execution identity. Summary records reject non-null `task_args`;
+answer records require passages. Both commands accept exact `{"flush":true}`
+controls, with IDs reusable only after the previous epoch drains.
+
+Using the illustrative review policy in
+[source-semantic.md](docs/source-semantic.md#complete-review-options), this declares
+work for at most 100 complete QA attempts:
+
+```bash
+fnlp candidate source-int4 answer-semantic-batch questions.ndjson \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$EXPECTED_MODEL_SHA256" \
+  --memory-mib 32768 --semantic-options source-semantic.json \
+  --compute-threads 4 --max-requests 100 \
+  --max-total-output-bytes 536870912 \
+  --max-total-forward-positions 10000000 \
+  --max-total-projected-logits 20000000000 \
+  --max-total-attention-pairs 100000000000000 \
+  --max-total-dot-products 1000000000000000 \
+  --max-total-multiply-accumulates 100000000000000000 \
+  --max-total-mask-node-visits 200000000000
+```
+
+Use `summarize-semantic-batch` with summary records for the same resident
+workflow. The five native totals default to **one** record's
+`semantic-options.max_model_work`, and the mask total defaults to one record's
+`--max-mask-node-visits`. Every total must cover a complete attempt.
+`--max-requests` never multiplies these ceilings. An admitted attempt spends
+its conservative generation-plus-review allowance even if it fails, and
+records, statements and flushes never replenish the run's work.
+
+For QA, `--max-input-bytes` caps the aggregate question, joined passage text and
+canonical passage manifest. `--max-line-bytes` separately caps the serialized
+envelope. Every original source and review must fit the context; passages are
+not selectively dropped, retrieved or truncated. `--input-encoding safe-bpe-v1`
+shares one tokenizer ledger per record across generation and all reviews.
+Serial execution and one persistent `--compute-threads` team support source
+conversion, independently pinned snapshots and optional snapshot saving.
+
+The complete memory peak is admitted before source options, population or
+model IO; only the bounded semantic-options file is read first. Every stdout
+frame carries the uncalibrated same-model scope. Earlier complete records
+remain valid after a later error; whole-run success requires `run_complete`
+and exit zero after physical worker join. Bounded stderr diagnostics preserve
+the original cancellation cause without private options, question or passage
+content. Compilation, runtime regressions, model replay and quality gates
+remain pending.
+
 ### Ordered INT4 source-task batches
 
 `ner-batch`, `keyphrases-batch`, `summarize-batch` and `answer-batch` reuse one
