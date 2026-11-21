@@ -28,7 +28,8 @@ use crate::{
     tokenizer::untrusted::UntrustedEncoding,
 };
 
-const RECIPE_BYTES: usize = 1024 * 1024 - 1024;
+/// Bound for the exact existing private recipe and its serialization workspace.
+pub(crate) const SEMANTIC_EXTRACTION_JOB_RECIPE_BYTES: usize = 1024 * 1024 - 1024;
 const INPUT_POLICY: &str = "fixed-schema-and-semantic-review-no-record-overrides-v1";
 const ENCODING_SCOPE: &str = "one-complete-document-and-all-field-reviews-v1";
 
@@ -163,7 +164,7 @@ impl Int4SemanticExtractionJobRecipe {
 /// Immutable actual-model factory. All fixed schema/review declarations are
 /// checked before any job storage is opened; each source is separately planned.
 pub struct Int4SemanticExtractionJobPlanner {
-    compiler: Int4SemanticExtractionBatchPlanner,
+    compiler: Arc<Int4SemanticExtractionBatchPlanner>,
     recipe: Int4SemanticExtractionJobRecipe,
 }
 impl Int4SemanticExtractionJobPlanner {
@@ -176,18 +177,23 @@ impl Int4SemanticExtractionJobPlanner {
         check_judge_limits(config.judge_planning)?;
         // Bound the owned schema and templates before cloning them into the
         // immutable genuine compilers. No synthetic document is compiled.
-        bounded_json(&Settings::from(&config), RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
+        bounded_json(&Settings::from(&config), SEMANTIC_EXTRACTION_JOB_RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
         let extraction = Int4ExtractionBatchPlanner::for_model(model, config.extraction.budget,
             config.compiler_limits, config.source_limits, Some(config.extraction.clone()))?
             .with_document_encoding(config.encoding.clone())?;
         let judge = Arc::new(Int4JudgePlanner::for_model(model, config.options.specification.judge_budget,
             config.judge_planning).and_then(|planner| planner.with_document_encoding(config.encoding.clone()))
             .map_err(|_| BatchCode::Admission)?);
-        let compiler = Int4SemanticExtractionBatchPlanner::new(extraction, judge, config.options.clone(), config.work)?;
+        let compiler = Arc::new(Int4SemanticExtractionBatchPlanner::new(extraction, judge, config.options.clone(), config.work)?);
         let recipe = Int4SemanticExtractionJobRecipe { config, group_width: model.group_width(),
             extraction_identity: compiler.base_execution_identity().clone(), judge_identity: compiler.judge_identity().clone() };
-        bounded_json(&recipe, RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
+        bounded_json(&recipe, SEMANTIC_EXTRACTION_JOB_RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
         Ok(Self { compiler, recipe })
+    }
+    /// Retain the genuine tokenizer/schema/judge owner outside the worker's
+    /// processor so unwind and queue discard cannot release it before join.
+    pub(crate) fn retain_compiler(&self) -> Arc<Int4SemanticExtractionBatchPlanner> {
+        Arc::clone(&self.compiler)
     }
     pub fn config(&self) -> &Int4SemanticExtractionJobConfig { &self.recipe.config }
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.recipe.extraction_identity }
@@ -224,7 +230,7 @@ impl<'e, 'w, 'v, A: Int4SemanticExtractionBatchAdmission> Int4SemanticExtraction
     pub fn new(planner: Int4SemanticExtractionJobPlanner, engine: &'e mut StrictInt4Engine<'w>,
         vocabulary: &'v ExtractionVocabulary, admission: A) -> Result<Self, BatchFault> {
         let Int4SemanticExtractionJobPlanner { compiler, recipe } = planner;
-        let native = NativeInt4SemanticExtractionBatch::new(compiler, engine, vocabulary, admission)?;
+        let native = NativeInt4SemanticExtractionBatch::new_shared(compiler, engine, vocabulary, admission)?;
         Ok(Self { native, recipe })
     }
 }

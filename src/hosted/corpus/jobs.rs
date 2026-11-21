@@ -205,6 +205,9 @@ impl NlpEngine {
 /// charged input that supplies its reader.
 pub(in crate::hosted) enum Population<'reader> {
     Original(JobPopulation),
+    /// The physical invocation owns these exact original bytes outside the
+    /// runner's fallible scope, including after its scoped worker team joins.
+    BorrowedOriginal(&'reader JobPopulation),
     Retaining { reader: Cell<Option<&'reader mut dyn BufRead>>, transport: PopulationReadLimits },
     Retained,
 }
@@ -239,13 +242,14 @@ pub(in crate::hosted) fn run_population<P: DurableBatchProcessor, C: DecodeStepC
     let SourceJobRequest { root, key, job_id, limits, mode, materialize } = request;
     let inputs = match population {
         Population::Original(original) => Some(original.borrowed_inputs()?),
+        Population::BorrowedOriginal(original) => Some(original.borrowed_inputs()?),
         Population::Retaining { .. } | Population::Retained => None,
     };
     let supplied = || inputs.as_deref().ok_or(JobError::InvalidLimits);
     let mut runner = match (mode, population) {
-        (JobOpenMode::Create, Population::Original(_)) =>
+        (JobOpenMode::Create, Population::Original(_) | Population::BorrowedOriginal(_)) =>
             JobRunner::create(&root, key, job_id, limits, supplied()?, processor, control)?,
-        (JobOpenMode::Resume(tail), Population::Original(_)) =>
+        (JobOpenMode::Resume(tail), Population::Original(_) | Population::BorrowedOriginal(_)) =>
             JobRunner::resume(&root, key, job_id, limits, supplied()?, processor, tail, control)?,
         (JobOpenMode::CreateRetainingInputs(retention), Population::Retaining { reader, transport }) => {
             let reader = reader.take().ok_or(JobError::InvalidLimits)?;

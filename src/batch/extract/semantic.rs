@@ -142,13 +142,20 @@ impl PreparedInt4SemanticBatchExtraction {
 }
 
 pub struct NativeInt4SemanticExtractionBatch<'e, 'w, 'v, A: Int4SemanticExtractionBatchAdmission> {
-    compiler: Int4SemanticExtractionBatchPlanner,
+    compiler: Arc<Int4SemanticExtractionBatchPlanner>,
     driver: NativeDriver<'e, 'w, 'v>,
     admission: A,
     run: RunState,
 }
 impl<'e, 'w, 'v, A: Int4SemanticExtractionBatchAdmission> NativeInt4SemanticExtractionBatch<'e, 'w, 'v, A> {
     pub fn new(compiler: Int4SemanticExtractionBatchPlanner, engine: &'e mut StrictInt4Engine<'w>,
+        vocabulary: &'v ExtractionVocabulary, admission: A) -> Result<Self, BatchFault> {
+        Self::new_shared(Arc::new(compiler), engine, vocabulary, admission)
+    }
+    /// Share the actual immutable compiler with an invocation owner that
+    /// retains its charged allocations until all physical workers have joined.
+    /// Native state, work allowances and prepared documents remain independent.
+    pub fn new_shared(compiler: Arc<Int4SemanticExtractionBatchPlanner>, engine: &'e mut StrictInt4Engine<'w>,
         vocabulary: &'v ExtractionVocabulary, admission: A) -> Result<Self, BatchFault> {
         compiler.limits.validate_item(compiler.options.max_model_work)?;
         if !clean(engine) || compiler.group_width() != engine.model_identity().group_width() {

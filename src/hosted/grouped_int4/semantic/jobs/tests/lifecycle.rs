@@ -4,7 +4,7 @@ use super::*;
 use crate::{
     LeakResponsePolicy, ResourceHostConfig, RuntimePreset,
     hosted::corpus::jobs::JobOpenMode,
-    jobs::{JobId, JobSecret},
+    jobs::{JobId, JobSecret, TailPolicy},
     native_engine::{decode::DecodeCancellationKind, strict_int4::weights::projection_fixture},
 };
 use std::{io::{self, Read}, path::PathBuf,
@@ -79,6 +79,24 @@ fn observed_reader(host: &NlpEngine, action: Action, cancellation: &Cancellation
         action, cancellation: cancellation.clone() }, observed)
 }
 
+// This finalizer runs after dispatch has joined every team child. It inspects
+// the actual assets, rather than inferring their lifetime from memory counters.
+fn finish_retained_assets(pending: DeferredSemanticJob<Cursor<Vec<u8>>>, control: &mut RunControl)
+    -> Result<Result<JobProgress, JobRunError>, HostedError> {
+    let compiler = pending.input.compiler.as_ref().expect("compiled assets survive the runner");
+    let compiler_lifetime = Arc::downgrade(compiler);
+    let population = pending.input.population.as_ref().expect("original population survives the runner");
+    let inputs = population.borrowed_inputs().unwrap();
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0].id, "retained-owner");
+    assert_eq!(inputs[0].original, br#"{"id":"retained-owner","text":"private source"}"#);
+    assert!(!matches!(&pending.result, Ok(Ok(_))), "missing resume storage cannot complete");
+    drop(inputs);
+    let result = pending.finish(control);
+    assert!(compiler_lifetime.upgrade().is_none(), "the retained compiler is released after finalization");
+    result
+}
+
 #[test]
 #[ignore = "controller-only fresh runtime: tiny weights prove semantic job cancellation, admission and drain, never inference"]
 fn semantic_jobs_retain_actual_inputs_and_all_claims_through_serial_and_team_failure() {
@@ -146,6 +164,42 @@ fn semantic_jobs_retain_actual_inputs_and_all_claims_through_serial_and_team_fai
             Err(HostedJobError::Host(HostedError::BatchSetup(_)))));
         assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
         assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+        drained(&host, &baseline);
+    }
+    // Fully read an original population, then fail its explicit resume before
+    // native work. Both actual compilers and plaintext records must reach the
+    // post-join finalizer, even though the processor/runner has already dropped.
+    for threads in [1, 4] {
+        let (config, job, limits) = fixture();
+        let required = quote(&config, job, limits, JobInputMemory::CompletePopulation,
+            if threads == 1 { None } else { Some(threads) }).unwrap();
+        let lease = host.resources().acquire_lease();
+        let owners = Arc::new(JobOwners {
+            _input: Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes).unwrap().commit().unwrap(),
+            _kv: Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes).unwrap().commit().unwrap(),
+            _scratch: Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes).unwrap().commit().unwrap(),
+            _output: Pending::reserve(&lease, MemoryClass::JobBuffers, required.output_reservation_bytes).unwrap().commit().unwrap(),
+            _lease: lease,
+        });
+        let mut request = request(job);
+        request.mode = JobOpenMode::Resume(TailPolicy::Refuse);
+        let execution = JobExecution { input: JobInput { config, request: Some(request),
+            vocabulary: None, compiler: None, population: None,
+            reader: Cursor::new(b"{\"id\":\"retained-owner\",\"text\":\"private source\"}\n".to_vec()) },
+            limits, required, owners };
+        let model = model.clone();
+        let completed = if threads == 1 {
+            dispatch::run(&host, limits.native.run, CancellationToken::default(), move |control| {
+                let pending = execution.run(&model.inner.loaded.value, PackedInt4Kernel::scalar(), None, control);
+                finish_retained_assets(pending, control)
+            })
+        } else {
+            dispatch::run_int4_team_with_finalize(&host, limits.native.run, CancellationToken::default(),
+                model, threads, PackedInt4Kernel::scalar(), move |weights, control, team|
+                    Ok(execution.run(weights, PackedInt4Kernel::scalar(), Some(team), control)),
+                finish_retained_assets)
+        };
+        assert!(!matches!(completed, Ok(Ok(_))));
         drained(&host, &baseline);
     }
     for checkpoints in [2, 3] {

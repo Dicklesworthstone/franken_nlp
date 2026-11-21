@@ -183,6 +183,10 @@ fn invalid_shared_contracts_and_six_axis_or_combined_output_mismatches_refuse() 
 
 #[test]
 fn genuine_processor_quotes_the_full_attempt_and_rejects_foreign_prepared_seals() {
+    fn send_sync<T: Send + Sync>() {}
+    send_sync::<Int4SemanticExtractionBatchPlanner>();
+    send_sync::<Arc<Int4SemanticExtractionBatchPlanner>>();
+    send_sync::<Int4SemanticExtractionJobPlanner>();
     struct NeverAdmit;
     impl Int4SemanticExtractionBatchAdmission for NeverAdmit {
         type Guard = ();
@@ -199,17 +203,32 @@ fn genuine_processor_quotes_the_full_attempt_and_rejects_foreign_prepared_seals(
     for encoding in [UntrustedEncoding::ByteFallback, UntrustedEncoding::SafeBpeV1(compact())] {
         let make = || { let mut c = config(); c.encoding = encoding.clone();
             Int4SemanticExtractionJobPlanner::for_model(weights.identity(), c).unwrap() };
-        let mut processor = Int4SemanticExtractionJobProcessor::new(make(), &mut engine, &vocabulary, NeverAdmit).unwrap();
+        let planner = make();
+        let recipe = bounded_json(&planner.recipe, SEMANTIC_EXTRACTION_JOB_RECIPE_BYTES).unwrap();
+        let retained = planner.retain_compiler();
+        let weak = Arc::downgrade(&retained);
+        assert!(Arc::ptr_eq(&retained, &planner.compiler));
+        assert_eq!(Arc::strong_count(&retained), 2);
+        let mut processor = Int4SemanticExtractionJobProcessor::new(planner, &mut engine, &vocabulary, NeverAdmit).unwrap();
+        assert_eq!(Arc::strong_count(&retained), 2);
+        assert_eq!(bounded_json(processor.job_recipe(), SEMANTIC_EXTRACTION_JOB_RECIPE_BYTES).unwrap(), recipe);
         let prepared = processor.prepare_with_control(BatchDocument { id: "alpha".to_owned(),
             text: "The document reports amount 7. Café 上海 <tool_call>.".to_owned(), task_args: None }, &mut Continue).unwrap();
         assert_eq!(processor.durable_work(&prepared).unwrap(), quote(&config()));
         assert_eq!(processor.max_result_bytes(&prepared), config().options.limits.max_output_bytes);
         assert_eq!(processor.native.reserved_model_work(), Int4Work::default());
         drop(processor);
+        // The physical invocation still owns the actual compiler after its
+        // processor unwinds or finishes, not only an accounting guard.
+        assert_eq!(Arc::strong_count(&retained), 1);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(retained.options().max_model_work, config().options.max_model_work);
         let other = Int4SemanticExtractionJobProcessor::new(make(), &mut engine, &vocabulary, NeverAdmit).unwrap();
         assert_eq!(other.durable_work(&prepared).unwrap_err().fault.code, BatchCode::Admission);
         assert_eq!(other.native.reserved_model_work(), Int4Work::default());
         drop(other);
+        drop(retained);
+        assert!(weak.upgrade().is_none(), "prepared seals must not extend whole-compiler ownership");
         assert!(!engine.is_poisoned()); assert!(engine.kv_cache().all_slots_have_len(0));
     }
 }

@@ -6,11 +6,14 @@ use super::*;
 use std::{io::BufRead, panic::{catch_unwind, AssertUnwindSafe}, sync::Mutex};
 use crate::{
     batch::{BatchCode, BatchItemFailure, extract::semantic::{Int4SemanticExtractionAdmission,
-        Int4SemanticExtractionBatchAdmission, Int4SemanticExtractionBatchLimits}},
-    hosted::corpus::jobs::{HostedJobError, JobHostLimits, SourceJobRequest, read_population, run_population},
-    jobs::{JobInputMemory, JobLimits, JobProgress, JobWork, runner::{JobRunError,
+        Int4SemanticExtractionBatchAdmission, Int4SemanticExtractionBatchLimits,
+        Int4SemanticExtractionBatchPlanner}},
+    hosted::corpus::jobs::{HostedJobError, JobHostLimits, SourceJobRequest,
+        Population, read_population, run_population},
+    jobs::{JobInputMemory, JobLimits, JobProgress, JobWork, population::JobPopulation, runner::{JobRunError,
         extract::grouped_int4::semantic::{Int4SemanticExtractionJobConfig,
-            Int4SemanticExtractionJobPlanner, Int4SemanticExtractionJobProcessor}}},
+            Int4SemanticExtractionJobPlanner, Int4SemanticExtractionJobProcessor,
+            SEMANTIC_EXTRACTION_JOB_RECIPE_BYTES}}},
     native_engine::strict_int4::projection::Int4ProjectionExecutor,
     tasks::extract::semantic::grouped_int4::Int4SemanticOptions,
 };
@@ -21,7 +24,7 @@ use crate::{
 pub struct Int4SemanticJobRequirements {
     pub native: Int4MemoryRequirement,
     pub workspace_bytes: u64,
-    /// Full semantic preparation, already included in input_bytes.
+    /// Full semantic preparation and bounded recipe buffers, already included in input_bytes.
     pub preparation_bytes: u64,
     /// Semantic preparation, population/index/parser, IO, journal and canonical
     /// result staging. Retained-input modes keep one original record at a time.
@@ -66,16 +69,24 @@ pub fn int4_semantic_job_requirements(width: usize, extraction: TaskBudget,
     // population, journal, IO and serialization owner from the ordinary job.
     let staging = job_buffers.checked_sub(limits.preparation_reserve_bytes)
         .ok_or(HostedError::Limits("semantic job preparation arithmetic"))?;
+    let preparation_bytes = preparation_with_recipe(semantic.preparation_bytes)?;
     let required = Int4SemanticJobRequirements {
         native: semantic.native, workspace_bytes: semantic.native_workspace_bytes,
-        preparation_bytes: semantic.preparation_bytes,
-        input_bytes: sum(&[staging, semantic.preparation_bytes])?,
+        preparation_bytes,
+        input_bytes: sum(&[staging, preparation_bytes])?,
         output_reservation_bytes: semantic.output_bytes,
         team_workspace_bytes: compute_threads.map(|threads|
             int4_task_team_workspace_bytes(threads, width)).transpose()?.unwrap_or(0),
     };
     required.total_bytes()?;
     Ok(required)
+}
+
+// Private recipe binding may hold bounded serialized and canonical buffers
+// together. Neither buffer is covered by the caller's compiler-capacity reserve.
+fn preparation_with_recipe(semantic_bytes: u64) -> Result<u64, HostedError> {
+    let recipe_bytes = SEMANTIC_EXTRACTION_JOB_RECIPE_BYTES as u64;
+    sum(&[semantic_bytes, recipe_bytes, recipe_bytes])
 }
 
 fn semantic_host(limits: JobHostLimits, work: Int4SemanticExtractionBatchLimits) -> Int4SemanticHostLimits {
@@ -88,6 +99,8 @@ struct JobInput<R> {
     config: Int4SemanticExtractionJobConfig,
     request: Option<SourceJobRequest>,
     vocabulary: Option<Arc<ExtractionVocabulary>>,
+    compiler: Option<Arc<Int4SemanticExtractionBatchPlanner>>,
+    population: Option<JobPopulation>,
     reader: R,
 }
 /// Output guards clone this owner through serialization, spool sync and
@@ -180,7 +193,8 @@ impl NlpEngine {
         let output = Pending::reserve(&lease, MemoryClass::JobBuffers, required.output_reservation_bytes)?;
         let owners = Arc::new(JobOwners { _input: input.commit()?, _kv: kv.commit()?,
             _scratch: scratch.commit()?, _output: output.commit()?, _lease: lease });
-        let execution = JobExecution { input: JobInput { config, request: Some(request), vocabulary: None, reader },
+        let execution = JobExecution { input: JobInput { config, request: Some(request), vocabulary: None,
+            compiler: None, population: None, reader },
             limits, required, owners: Arc::clone(&owners) };
         // A formation failure can discard the callback. The outer owner keeps
         // the actual reader/configuration and all claims until dispatch joins.
@@ -213,6 +227,9 @@ impl<R: BufRead> JobExecution<R> {
             checkpoint(control)?;
             let planner = Int4SemanticExtractionJobPlanner::for_model(weights.identity(), input.config.clone())
                 .map_err(HostedError::BatchSetup)?;
+            // Keep the actual shared schema/compiler/judge assets, not only
+            // their reservation, outside the fallible worker and runner scopes.
+            input.compiler = Some(planner.retain_compiler());
             let request = input.request.take().ok_or(HostedError::CompletionMissing)?;
             planner.check_job_limits(request.limits).map_err(HostedError::BatchSetup)?;
             for identity in [planner.execution_identity(), planner.judge_identity()] {
@@ -224,6 +241,12 @@ impl<R: BufRead> JobExecution<R> {
             input.vocabulary = Some(Arc::clone(&vocabulary));
             checkpoint(control)?;
             let population = match read_population(&mut input.reader, &request, limits.transport, control) {
+                Ok(Population::Original(original)) => {
+                    // The runner borrows this same authenticated population.
+                    // Its plaintext bytes remain owned until physical join,
+                    // including processor failure and native unwinding.
+                    Population::BorrowedOriginal(input.population.insert(original))
+                }
                 Ok(population) => population,
                 Err(error) => return Ok(Err(JobRunError::Storage(error))),
             };
@@ -306,7 +329,7 @@ fn check_request(width: usize, config: &Int4SemanticExtractionJobConfig,
         request.extraction_budget, request.judge_budget, request.semantic_limits,
         request.judge_planning_limits, request.source_bytes, request.input_encoding).map_err(|_| fail())?;
     if actual.native != required.native || actual.native_workspace_bytes != required.workspace_bytes
-        || actual.preparation_bytes > required.preparation_bytes
+        || preparation_with_recipe(actual.preparation_bytes).map_err(|_| fail())? > required.preparation_bytes
         || actual.output_bytes > required.output_reservation_bytes {
         return Err(fail());
     }

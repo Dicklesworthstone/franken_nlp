@@ -181,6 +181,41 @@ fn changed_original_population_cannot_resume_or_publish() {
     assert!(!root.0.join("materialized.ndjson").exists()); assert_eq!(*calls.lock().unwrap(), vec![1, 2]);
 }
 #[test]
+fn outer_owned_originals_preserve_exact_resume_binding_and_failed_attempt_debits() {
+    let root = Root::new(); let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut control = Control::default();
+    let Population::Original(original) = population(false) else { unreachable!() };
+    let borrowed = Population::BorrowedOriginal(&original);
+    let retention = InputRetentionLimits { max_spool_bytes: 1 << 20 };
+    for mode in [JobOpenMode::CreateRetainingInputs(retention),
+        JobOpenMode::ResumeRetained { tail: TailPolicy::Refuse, retention }] {
+        assert_eq!(run_population(request(&root, mode, false), &borrowed,
+            Fixture::new(&calls, false), &mut control).unwrap_err(),
+            JobRunError::Storage(JobError::InvalidLimits));
+    }
+    assert_eq!(fs::read_dir(&root.0).unwrap().count(), 0);
+    assert!(calls.lock().unwrap().is_empty());
+    let failure = run_population(request(&root, JobOpenMode::Create, true), &borrowed,
+        Fixture::new(&calls, true), &mut control).unwrap_err();
+    assert_eq!(failure, JobRunError::Processor(BatchCode::Execution.into()));
+    assert!(!root.0.join("materialized.ndjson").exists());
+    let Population::Original(changed) = population(true) else { unreachable!() };
+    let failure = run_population(request(&root,
+        JobOpenMode::Resume(TailPolicy::DiscardUncommitted), true),
+        &Population::BorrowedOriginal(&changed), Fixture::new(&calls, false),
+        &mut control).unwrap_err();
+    assert_eq!(failure, JobRunError::Storage(JobError::Mismatch(crate::jobs::MismatchField::Population)));
+    assert!(!root.0.join("materialized.ndjson").exists());
+    assert_eq!(*calls.lock().unwrap(), vec![1, 2]);
+    let progress = run_population(request(&root, JobOpenMode::Resume(TailPolicy::Refuse), true),
+        &borrowed, Fixture::new(&calls, false), &mut control).unwrap();
+    assert_eq!(progress.committed, 2); assert_eq!(progress.attempts, 3); assert!(progress.materialized);
+    assert_eq!(*calls.lock().unwrap(), vec![1, 2, 2]);
+    assert_eq!(fs::read(root.0.join("materialized.ndjson")).unwrap(), b"1\n2\n");
+    assert_eq!(original.borrowed_inputs().unwrap()[0].original, br#"{"id":"alpha","text":"original"}"#);
+}
+
+#[test]
 fn default_host_error_formatting_does_not_include_private_nested_messages() {
     let error = HostedJobError::Host(HostedError::Limits("private path or source"));
     assert!(!format!("{error:?} {error}").contains("private path"));

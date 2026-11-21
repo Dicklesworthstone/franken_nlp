@@ -85,10 +85,12 @@ fn complete_semantic_preparation_replaces_only_the_shared_job_preparation_compon
         let required = quote(&config, job, host, input, None).unwrap();
         assert_eq!(required.native, semantic.native);
         assert_eq!(required.workspace_bytes, semantic.native_workspace_bytes);
-        assert_eq!(required.preparation_bytes, semantic.preparation_bytes);
+        assert_eq!(required.preparation_bytes, semantic.preparation_bytes
+            + 2 * SEMANTIC_EXTRACTION_JOB_RECIPE_BYTES as u64);
         assert_eq!(required.output_reservation_bytes, semantic.output_bytes);
         assert_eq!(required.input_bytes, host.required_buffer_bytes_for_input(job, input).unwrap()
-            - host.preparation_reserve_bytes + semantic.preparation_bytes);
+            - host.preparation_reserve_bytes + semantic.preparation_bytes
+            + 2 * SEMANTIC_EXTRACTION_JOB_RECIPE_BYTES as u64);
         assert_eq!(required.team_workspace_bytes, 0);
         assert_eq!(required.total_bytes().unwrap(), required.native.kv_bytes + required.workspace_bytes
             + required.input_bytes + required.output_reservation_bytes);
@@ -100,6 +102,26 @@ fn complete_semantic_preparation_replaces_only_the_shared_job_preparation_compon
     assert_eq!(complete.native, retained.native);
     assert_eq!(complete.preparation_bytes, retained.preparation_bytes);
     assert_eq!(complete.output_reservation_bytes, retained.output_reservation_bytes);
+}
+
+#[test]
+fn recipe_buffers_are_a_checked_floor_independent_of_caller_preparation() {
+    let (config, job, mut host) = fixture();
+    host.preparation_reserve_bytes = 1;
+    for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
+        let semantic = semantic_host(host, config.work).requirements_with_encoding(WIDTH,
+            config.extraction.budget, config.options.specification.judge_budget,
+            config.options.limits, config.judge_planning, job.max_input_bytes_per_item,
+            &config.encoding).unwrap();
+        let required = quote(&config, job, host, input, None).unwrap();
+        assert_eq!(required.preparation_bytes - semantic.preparation_bytes,
+            2 * SEMANTIC_EXTRACTION_JOB_RECIPE_BYTES as u64);
+        assert!(required.input_bytes >= required.preparation_bytes);
+    }
+    assert!(preparation_with_recipe(u64::MAX).is_err());
+    let floor = 2 * SEMANTIC_EXTRACTION_JOB_RECIPE_BYTES as u64;
+    assert_eq!(preparation_with_recipe(u64::MAX - floor).unwrap(), u64::MAX);
+    assert!(preparation_with_recipe(u64::MAX - floor + 1).is_err());
 }
 
 #[test]
@@ -239,6 +261,8 @@ fn private_inputs_and_complete_output_claims_cross_the_owned_job_boundary() {
     send::<JobExecution<Cursor<Vec<u8>>>>();
     send::<DeferredSemanticJob<Cursor<Vec<u8>>>>();
     send::<Arc<JobOwners>>();
+    send::<Arc<Int4SemanticExtractionBatchPlanner>>();
+    send::<JobPopulation>();
     let _serial = NlpEngine::job_int4_semantic_extract::<Cursor<Vec<u8>>>;
     let _team = NlpEngine::job_int4_semantic_extract_with_threads::<Cursor<Vec<u8>>>;
 }
