@@ -5284,6 +5284,29 @@ before private job/model IO. See the
 start/resume examples, lifetime limits and recovery behavior. Compilation,
 executable tests and independently pinned model gates remain unrun.
 
+### Reviewed whole-document root objects
+
+`extract-semantic-map` combines complementary root properties from every
+source chunk, validates the reconciled JSON against the original schema, and
+reviews each configured scalar claim against the complete original document.
+The original object, chunk outputs and source evidence remain unchanged.
+Every field retains its full faithfulness map, including coverage, conflicts,
+abstention and counterevidence. These are explicit uncalibrated, same-model
+diagnostics with no single-context equivalence or automatic acceptance.
+
+All real reviewer maps preflight before the first review forward. One five-axis
+native ceiling, global reviewer prompt/logit limits and the spent compact
+tokenizer ledger cover extraction plus every review. Memory admission includes
+all retained maps and results. Source conversion, pinned snapshots, byte or
+compact input and an optional persistent CPU team share this route; chunks use
+serial full-vocabulary execution. Failed composition publishes no successful
+partial object/review result. This slice has no corpus or durable-resume mode.
+
+See the [complete-document semantic object guide](docs/int4-semantic-object-map.md)
+for a complete supported schema, explicit options, bounded command and result
+paths. Source review and syntax checks are complete; compilation, executable
+regressions and controller-only native/model qualification remain **UNRUN**.
+
 ### Retained summary and passage-answer review
 
 `summarize-semantic-job start|resume` and `answer-semantic-job start|resume`

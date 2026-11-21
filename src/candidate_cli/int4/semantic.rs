@@ -13,6 +13,7 @@ const OPTIONS_BYTES: usize = 1024 * 1024;
 mod runtime;
 pub(in crate::candidate_cli::int4) mod corpus;
 pub(in crate::candidate_cli::int4) mod jobs;
+pub(in crate::candidate_cli::int4) mod document;
 #[cfg(test)]
 mod tests;
 

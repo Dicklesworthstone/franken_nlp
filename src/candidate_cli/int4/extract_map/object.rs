@@ -7,7 +7,10 @@ use crate::{batch::extract::{ExtractionBatchGrounding, grouped_int4::long::objec
 #[cfg(test)] mod tests;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(in crate::candidate_cli::int4) struct ObjectMapArgs { map: MapArgs, object: ObjectArgs }
+pub(in crate::candidate_cli::int4) struct ObjectMapArgs {
+    pub(in crate::candidate_cli::int4) map: MapArgs,
+    object: ObjectArgs,
+}
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
 struct ObjectArgs {
     #[arg(long, default_value_t = 4096)]
@@ -132,9 +135,13 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
     input_encoding::document_definition(command).after_long_help(input_encoding::DOCUMENT_ENCODING_HELP)
 }
 #[derive(Clone, Copy, Debug)]
-struct ObjectMapLimits { map: MapLimits, object: RootObjectLimits, object_workspace_bytes: u64 }
+pub(in crate::candidate_cli::int4) struct ObjectMapLimits {
+    pub(in crate::candidate_cli::int4) map: MapLimits,
+    pub(in crate::candidate_cli::int4) object: RootObjectLimits,
+    object_workspace_bytes: u64,
+}
 impl ObjectMapLimits {
-    fn mapping(self) -> Int4ObjectExtractionMapLimits {
+    pub(in crate::candidate_cli::int4) fn mapping(self) -> Int4ObjectExtractionMapLimits {
         Int4ObjectExtractionMapLimits { mapping: self.map.mapping, reconciliation: self.object }
     }
 }
@@ -166,7 +173,27 @@ impl ObjectMapArgs {
         if map.common.minimum_memory_bytes > map.common.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(ObjectMapLimits { map, object, object_workspace_bytes })
     }
-    fn request<C: DecodeStepControl>(&self, schema: String, budget: TaskBudget,
+    /// The semantic composition admits its complete simultaneous ownership
+    /// after reading bounded fixed options. It still validates the actual
+    /// requested team, source policy and every extraction-map limit here.
+    pub(in crate::candidate_cli::int4) fn validate_semantic(&self, args: &Int4Args)
+        -> Result<ObjectMapLimits, CandidateError> {
+        if self.map.array_union.limits(self.map.mapping)?.is_some()
+            || self.map.cohort_chunks.is_some() || self.map.extraction.selected_rows()?.is_some()
+            || !args.input_encoding.is_default() || args.prefill()?.is_some() {
+            return Err(CandidateError::Arguments);
+        }
+        crate::candidate_cli::extract::check_schema_path(self.map.extraction.schema_path())?;
+        let map = self.map.validate_mode(args, false, false)?;
+        let object = self.object.limits(self.map.mapping)?;
+        let object_workspace_bytes = sum(&[
+            Int4ObjectExtractionMapLimits { mapping: map.mapping, reconciliation: object }
+                .reconciliation_workspace_bytes().map_err(|_| CandidateError::Arguments)?,
+            RootObjectSchema::workspace_bytes(self.map.extraction.compiler()).map_err(|_| CandidateError::Arguments)?,
+        ])?;
+        Ok(ObjectMapLimits { map, object, object_workspace_bytes })
+    }
+    pub(in crate::candidate_cli::int4) fn request<C: DecodeStepControl>(&self, schema: String, budget: TaskBudget,
         limits: ObjectMapLimits, control: &mut C) -> Result<ExtractionBatchArgs, CandidateError> {
         object_request(&self.map, schema, budget, limits.object, control)
     }
