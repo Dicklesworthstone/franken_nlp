@@ -4,7 +4,7 @@
 //! buffers, the pinned compiler/vocabulary, transport and six work ceilings
 //! belong to the whole stream. A flush cannot renew any of those ceilings.
 use super::*;
-use std::io::{BufRead, Write};
+use std::{io::{BufRead, Write}, panic::{catch_unwind, AssertUnwindSafe}, sync::Mutex};
 use crate::{
     batch::{self as stream, BatchCode, BatchItemFailure, BatchLimits, BatchSummary,
         extract::ExtractionMaskBudget,
@@ -85,8 +85,9 @@ struct StreamInput<R, W> {
 }
 
 // Separate shared ownership keeps every process charge and the resource host
-// alive through physical join, including coordinator error or unwind. The
-// team's finalizer owns another Arc outside the scoped computation itself.
+// alive through physical join, including coordinator error or unwind. Queued
+// execution also retains the actual input owners if formation discards work;
+// invoked work returns them in its deferred completion even after a panic.
 struct StreamOwners {
     _input: CommittedMemory,
     _kv: CommittedMemory,
@@ -102,6 +103,11 @@ struct DeferredDocumentStream<R, W> {
     completion: Result<stream::deferred::DeferredCompletion, HostedError>,
     input: StreamInput<R, W>,
     _owners: Arc<StreamOwners>,
+}
+
+fn take_execution<R, W>(queued: &Mutex<Option<StreamExecution<R, W>>>)
+    -> Result<StreamExecution<R, W>, HostedError> {
+    queued.lock().map_err(|_| HostedError::Panicked)?.take().ok_or(HostedError::CompletionMissing)
 }
 
 impl NlpEngine {
@@ -158,34 +164,43 @@ impl NlpEngine {
             _scratch: scratch.commit()?, lease });
         let execution = StreamExecution { input: StreamInput { config, reader, writer },
             required, owners: Arc::clone(&owners) };
+        // Team formation may discard its work callback before joining children.
+        // Keep the actual reader/writer/config, not only their charges, outside
+        // that callback until the dispatcher's physical completion handoff.
+        let queued_owner = Arc::new(Mutex::new(Some(execution)));
+        let queued = Arc::clone(&queued_owner);
         let model = model.clone();
-        match compute_threads {
+        let completed = match compute_threads {
             None => dispatch::run(self, run, cancellation, move |control| {
-                let pending = execution.run(&model.inner.loaded.value, kernel, None, control);
-                let result = pending.and_then(|pending| pending.publish(control));
+                let pending = take_execution(&queued)?.run(&model.inner.loaded.value, kernel, None, control);
+                let result = pending.publish(control);
                 drop(model); drop(owners);
                 result
             }),
             Some(threads) => dispatch::run_int4_team_with_finalize(self, run, cancellation,
-                model, threads, kernel, move |weights, control, team|
-                    execution.run(weights, kernel, Some(team), control),
+                model, threads, kernel, move |weights, control, team| {
+                    Ok(take_execution(&queued)?.run(weights, kernel, Some(team), control))
+                },
                 move |pending, control| {
                     let result = pending.publish(control);
                     drop(owners);
                     result
                 }),
-        }
+        };
+        drop(queued_owner);
+        completed
     }
 }
 
 impl<R: BufRead, W: Write> StreamExecution<R, W> {
     fn run<'weights>(self, weights: &'weights Int4ModelWeights, kernel: PackedInt4Kernel,
         projection: Option<&'weights mut (dyn Int4ProjectionExecutor + 'weights)>,
-        control: &mut RunControl) -> Result<DeferredDocumentStream<R, W>, HostedError> {
+        control: &mut RunControl) -> DeferredDocumentStream<R, W> {
         let Self { mut input, required, owners } = self;
-        // Even a task/transport failure is returned with its charged owners so
-        // the team can join before the original error escapes the invocation.
-        let completion = (|| {
+        // Reader/writer callbacks can unwind. Catch inside the owned input
+        // boundary so their storage and every claim survive until physical join.
+        // The native engine still drops before releasing its borrowed executor.
+        let completion = catch_unwind(AssertUnwindSafe(|| {
             checkpoint(control)?;
             let config = &input.config;
             let planner = SampledSentimentPlanner::for_model_with_encoding(weights.identity(),
@@ -223,8 +238,8 @@ impl<R: BufRead, W: Write> StreamExecution<R, W> {
             };
             drop(engine);
             result
-        })();
-        Ok(DeferredDocumentStream { completion, input, _owners: owners })
+        })).unwrap_or(Err(HostedError::Panicked));
+        DeferredDocumentStream { completion, input, _owners: owners }
     }
 }
 impl<R, W: Write> DeferredDocumentStream<R, W> {
