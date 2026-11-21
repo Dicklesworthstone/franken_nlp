@@ -184,7 +184,7 @@ impl CandidateCommand {
             return extract::ExtractCommand::from_arg_matches(matches).map(Self::Extract);
         }
         if name == "batch" {
-            return batch::BatchCommand::from_arg_matches(matches).map(Self::Batch);
+            return batch::BatchCommand::from_matches(matches).map(Self::Batch);
         }
         if let Some(kind) = source::Kind::named(name) {
             return source::SourceCommand::from_matches(kind, matches).map(Self::Source);

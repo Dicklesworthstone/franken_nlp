@@ -53,6 +53,8 @@ pub(crate) struct BatchCommand {
     /// Maximum NDJSON bytes before LF, including JSON syntax and any trailing CR.
     #[arg(long, default_value_t = 1_048_576)]
     pub(super) max_line_bytes: usize,
+    #[arg(skip)]
+    pub(super) encoding: input_encoding::InputEncodingArgs,
 }
 
 #[derive(Clone, Copy)]
@@ -64,11 +66,17 @@ pub(super) struct CorpusEnvelope {
 }
 
 pub(super) fn definition() -> clap::Command {
-    BatchCommand::augment_args(clap::Command::new("batch")
+    input_encoding::definition(BatchCommand::augment_args(clap::Command::new("batch")
         .about("Process bounded schema/source-task NDJSON using one resident candidate model")
-        .long_about("Run one fixed task over bounded ordered NDJSON. Each event carries non-authoritative candidate provenance. Weights and the native engine are reused; this is serial item-local execution, not parallel/GEMM batching or a durable job. Earlier completed records remain valid if later records fail. Any document failure produces a nonzero process exit. Add --task extract --chunked --schema FILE for complete documents larger than one context. Each successful record retains independent exact-schema JSON strings for every chunk and original-coordinate verbatim evidence when --source-membership is selected. Required fields must be satisfiable per chunk; objects are never merged or repaired. Chunked records cannot override the shared schema or budgets in task_args. No partial document success is emitted."))
+        .long_about("Run one fixed task over bounded ordered NDJSON. Each event carries non-authoritative candidate provenance. Weights and the native engine are reused; this is serial item-local execution, not parallel/GEMM batching or a durable job. Earlier completed records remain valid if later records fail. Any document failure produces a nonzero process exit. Add --task extract --chunked --schema FILE for complete documents larger than one context. Each successful record retains independent exact-schema JSON strings for every chunk and original-coordinate verbatim evidence when --source-membership is selected. Required fields must be satisfiable per chunk; objects are never merged or repaired. Chunked records cannot override the shared schema or budgets in task_args. No partial document success is emitted.")))
+        .after_long_help("For ner, keyphrases, summarize and answer, --input-encoding safe-bpe-v1 uses one bounded tokenizer allowance per complete record, including all QA passages and IDs. The allowance is not renewed between a record's segments. The maximum record count bounds total preparation; native work and mask quotas remain shared across the whole invocation and flushes. One transient encoder workspace is admitted before private IO. Exact source bytes and citation coordinates are preserved; the policy binds prompt identity and is reported in every compact frame. This option changes prompt tokens and makes no parity, quality or speed claim. Extract and chunked routes currently require byte-fallback.")
 }
 impl BatchCommand {
+    pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let mut command = Self::from_arg_matches(matches)?;
+        command.encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+        Ok(command)
+    }
     pub(super) fn kind(&self) -> Result<Kind, CandidateError> {
         Kind::named(&self.task).ok_or(CandidateError::Arguments)
     }
@@ -80,7 +88,10 @@ impl BatchCommand {
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits, CorpusEnvelope), CandidateError> {
         self.task()?;
         self.validate_extraction_flags()?;
-        let (args, limits) = self.host.common(self.input.clone())?;
+        if self.task == "extract" && !self.encoding.is_default() {
+            return Err(CandidateError::Arguments);
+        }
+        let (args, limits) = self.host.common_with_encoding(self.input.clone(), &self.encoding)?;
         if self.max_requests == 0 || self.max_requests > 100_000
             || self.max_line_bytes < self.host.max_input_bytes || self.max_line_bytes > 4 * 1024 * 1024
             || self.max_input_mib == 0 || self.max_input_mib > 1024 * 1024

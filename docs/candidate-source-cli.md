@@ -47,6 +47,40 @@ execution identity, prompt instructions or resource budget. `--options -` is
 refused so it cannot consume the source's stdin. Sampling/logprob/thinking/tool
 switches are absent: these tasks use the existing constrained greedy decoder.
 
+## Compact source input
+
+All four commands accept an explicit `--input-encoding safe-bpe-v1` policy:
+
+```sh
+fnlp candidate ner article.txt --model ./model.fnlpq --memory-mib 8192 \
+  --input-encoding safe-bpe-v1 --prefill-rows 4 --selected-rows 4096
+
+fnlp candidate answer question.json --model ./model.fnlpq --memory-mib 8192 \
+  --input-encoding safe-bpe-v1
+```
+
+The compact encoder preserves original UTF-8 bytes and excludes template-control
+token IDs. Source membership and citation coordinates still refer to the exact
+original document or passage. It uses one finite tokenizer allowance for the
+complete request; QA shares that allowance across its question, every passage
+and passage ID. The flags `--max-tokenizer-pair-checks` (default 4,194,304) and
+`--max-tokenizer-pair-bytes` (default 67,108,864) bound merge work independently.
+They require the compact policy. An exhausted allowance rejects the request
+without retrying under byte fallback.
+
+The host reserves encoder workspace before opening input, options or model
+files. The source preparation quote retains the full original byte allowance
+alongside grammar and result storage. For example, compact input with a 1-MiB
+input ceiling needs `--preparation-mib 1024`; the ordinary 512-MiB reservation
+is insufficient for that worst-case declaration. The process memory ledger
+still has to cover all simultaneous weights, native storage and preparations.
+
+The exact encoding policy and its work ceilings bind the prepared identity.
+Compact responses add an `input_encoding` field; byte fallback omits it and
+retains the original result envelope. Layer-major prefill and exact selected-row
+projection compose with compact input. This selects a different prompt token
+sequence and carries no model-output, quality or measured-speed claim.
+
 ## Execution and output contracts
 
 The command reserves preparation memory before reading private input or

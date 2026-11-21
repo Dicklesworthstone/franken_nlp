@@ -135,6 +135,50 @@ fn options_cannot_compete_for_the_source_stdin_stream() {
     assert_eq!(cmd.execute(&mut &b"unused"[..], &mut output), Err(CandidateError::Arguments));
     assert!(output.is_empty());
 }
+
+#[test]
+fn compact_source_flags_are_explicit_and_workspace_is_admitted_before_io() {
+    use crate::tokenizer::untrusted::UntrustedEncoding;
+    for task in ["ner", "keyphrases", "summarize", "answer"] {
+        let cmd = command(task, &["--input-encoding", "safe-bpe-v1",
+            "--max-tokenizer-pair-checks", "1234", "--max-tokenizer-pair-bytes", "10000"]);
+        let (args, limits) = cmd.args.host.common_with_encoding(cmd.args.input.clone(), &cmd.encoding).unwrap();
+        let UntrustedEncoding::SafeBpeV1(policy) = args.input_encoding_policy(limits).unwrap()
+            else { panic!("compact source policy was discarded"); };
+        assert_eq!(policy.max_pair_checks, 1234); assert_eq!(policy.max_pair_bytes, 10000);
+        assert_eq!(policy.max_input_bytes, cmd.args.host.max_input_bytes);
+        assert!(limits.preparation_bytes >= 256 * MIB + policy.requirements().unwrap().workspace_bytes);
+        let byte = command(task, &[]);
+        let (args, limits) = byte.args.host.common_with_encoding(byte.args.input.clone(), &byte.encoding).unwrap();
+        assert_eq!(args.input_encoding_policy(limits).unwrap(), UntrustedEncoding::ByteFallback);
+    }
+    // The extra 1-MiB-source encoder cannot hide behind the existing 512-MiB
+    // source preparation floor. A larger explicit reserve is accepted.
+    let cmd = command("ner", &["--input-encoding", "safe-bpe-v1", "--max-input-bytes", "1048576"]);
+    assert!(cmd.args.host.common_with_encoding(cmd.args.input.clone(), &cmd.encoding).is_err());
+    let cmd = command("ner", &["--input-encoding", "safe-bpe-v1", "--max-input-bytes", "1048576",
+        "--preparation-mib", "1024"]);
+    cmd.args.host.common_with_encoding(cmd.args.input.clone(), &cmd.encoding).unwrap();
+}
+
+#[test]
+fn invalid_compact_source_limits_never_read_options_document_or_model() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private source read") } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("source output written") }
+        fn flush(&mut self) -> io::Result<()> { panic!("source output flushed") }
+    }
+    for task in ["ner", "keyphrases", "summarize", "answer"] {
+        for flag in ["--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
+            let cmd = command(task, &["--options", "must-not-open.json", "--input-encoding", "safe-bpe-v1", flag, "0"]);
+            assert_eq!(cmd.execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+            let matches = super::super::definition().try_get_matches_from(["candidate", task,
+                "--model", "must-not-open.fnlpq", "--memory-mib", "8192", flag, "1"]).unwrap();
+            assert!(CandidateCommand::from_matches(&matches).is_err());
+        }
+    }
+}
 #[cfg(not(feature = "asupersync-runtime"))]
 #[test]
 fn default_build_refuses_all_source_commands_without_reading_any_input() {

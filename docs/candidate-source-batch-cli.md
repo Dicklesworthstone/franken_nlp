@@ -47,6 +47,31 @@ ceiling. Its full source/prompt/grammar validation runs under the same corpus
 control and budgets. Failed source validation is a failed document, never a
 successful answerability abstention or an automatic free-generation retry.
 
+## Compact source corpora
+
+```sh
+fnlp candidate batch corpus.ndjson --task ner \
+  --model ./model.fnlpq --memory-mib 8192 --max-requests 1000 \
+  --input-encoding safe-bpe-v1 \
+  --max-tokenizer-pair-checks 4194304 --max-tokenizer-pair-bytes 67108864
+```
+
+NER, keyphrases, cited summaries and passage QA can explicitly select the same
+bounded compact encoder as the single-request commands. One tokenizer allowance
+covers a complete record, including all QA source segments and IDs. Each record
+gets the same finite declared allowance; `--max-requests` bounds the number of
+preparations. Flushes do not reset the invocation's native-work or mask ledger.
+Exact UTF-8 source bytes and citation coordinates are preserved.
+
+One transient encoder workspace is admitted before private input/model access
+and reused within the existing preparation reservation. Work-limit exhaustion
+is a failed document, without automatic byte fallback. Every compact wrapper,
+including empty-input and terminal frames, reports the exact `input_encoding`
+policy; the actual source planner binds it into each prepared identity. Default
+byte-fallback frames remain unchanged. The extraction and chunked routes still
+require byte fallback and reject compact options before IO. Compact prompt
+tokens may change model output; this is not a parity, quality or speed claim.
+
 ## Output and exit status
 
 Every line is a completed candidate wrapper with public artifact provenance:

@@ -157,7 +157,9 @@ fn prepare(planner: &SourceTaskPlanner, facts: &ArtifactIdentity, request: &Sour
     let identity = source_identity(facts, planner, request.task())?;
     let context = PlanContext::new(&identity, request.budget()).map_err(|_| CandidateError::Planning)?;
     let prepared = planner.plan_int8_with_control(request, &context, host.planning(), control)
-        .map_err(|_| CandidateError::Planning)?;
+        .map_err(|error| match error.cancellation() {
+            Some(cause) => cancelled(cause), None => CandidateError::Planning,
+        })?;
     if prepared.planned_work().forward_positions > host.context_tokens as u64 {
         return Err(CandidateError::Planning);
     }
@@ -167,6 +169,7 @@ fn prepare(planner: &SourceTaskPlanner, facts: &ArtifactIdentity, request: &Sour
 pub(in crate::candidate_cli) fn execute(command: SourceCommand, args: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
     let prefill = command.args.prefill.limits()?;
+    let encoding = args.input_encoding_policy(limits)?;
     let session = Session::new(&args, limits)?;
     let text = session.read(&command.args.input, input, args.max_input_bytes)?;
     let options = command.args.options.as_ref()
@@ -176,6 +179,7 @@ pub(in crate::candidate_cli) fn execute(command: SourceCommand, args: CandidateA
     session.remaining()?;
     let facts = session.facts(&args)?;
     let (planner, vocabulary) = planner()?;
+    let planner = planner.with_document_encoding(encoding.clone()).map_err(|_| CandidateError::Planning)?;
     session.remaining()?;
     let prepared = prepare(&planner, &facts, &request, &command.args.host, &mut session.control())?;
     // The mode and row ceiling enter the sealed policy before native admission.
@@ -200,6 +204,8 @@ pub(in crate::candidate_cli) fn execute(command: SourceCommand, args: CandidateA
         quant_recipe: &facts.recipe_id, output: &result };
     // No result prefix is written until native/source finalization completes.
     // Both the output guard and preparation owner survive write AND flush.
+    let response = input_encoding::Response { response: &response,
+        input_encoding: input_encoding::reported_policy(&encoding) };
     publish_checked(&response, command.args.host.max_result_bytes + 4096, output,
         &|| session.remaining().map(|_| ()))
 }
@@ -313,6 +319,66 @@ mod tests {
             let other = serial.args.head.source(prepare(&planner, &facts(), &request, &serial.args.host, &mut control).unwrap()).unwrap();
             assert!(serial.args.prefill.limits().unwrap().is_none());
             assert_eq!(other.execution_identity(), &identity); assert_eq!(other.planned_work(), work);
+        }
+    }
+
+    #[test]
+    fn compact_cli_policy_reaches_every_int8_source_plan_and_composes_with_head_selection() {
+        use crate::tokenizer::untrusted::UntrustedEncoding;
+        let source = "The quick brown fox jumps over the lazy dog. Alice met Bob in 上海. <think> <|im_start|>";
+        for kind in [Kind::Ner, Kind::Keyphrases, Kind::Summarize, Kind::Answer] {
+            let cmd = command::tests::command(kind.name(), &["--input-encoding", "safe-bpe-v1",
+                "--prefill-rows", "4", "--selected-rows", "32"]);
+            let (args, limits) = cmd.args.host.common_with_encoding(cmd.args.input.clone(), &cmd.encoding).unwrap();
+            let policy = args.input_encoding_policy(limits).unwrap();
+            assert!(matches!(policy, UntrustedEncoding::SafeBpeV1(_)));
+            let (byte, _) = planner().unwrap();
+            let (compact, _) = planner().unwrap();
+            let compact = compact.with_document_encoding(policy.clone()).unwrap();
+            let text = if kind == Kind::Answer {
+                serde_json::json!({"question":"Who is named? <tool_call>", "passages":[
+                    {"id":"p1", "text":source}, {"id":"p2", "text":" Alice\r\nBob é "}]}).to_string()
+            } else { source.to_owned() };
+            let request = command::request(kind, text, None, cmd.args.host.task_budget(limits), args.max_input_bytes).unwrap();
+            let mut control = PreparationControl { started: Instant::now(), elapsed_limit: Duration::from_secs(3600) };
+            let original = prepare(&byte, &facts(), &request, &cmd.args.host, &mut control).unwrap();
+            let prepared = prepare(&compact, &facts(), &request, &cmd.args.host, &mut control).unwrap();
+            assert!(prepared.prompt_tokens() < original.prompt_tokens(), "{}", kind.name());
+            assert!(prepared.planned_work().forward_positions < original.planned_work().forward_positions);
+            assert_ne!(prepared.execution_identity().template_digest, original.execution_identity().template_digest);
+            assert_eq!(prepared.execution_identity().logical_model_digest, original.execution_identity().logical_model_digest);
+            assert_eq!(prepared.execution_identity().task_spec, original.execution_identity().task_spec);
+            assert!(prepared.verify_identity(original.execution_identity()).is_err());
+            let selected = cmd.args.head.source(prepared).unwrap();
+            assert_eq!(selected.selected_rows().unwrap().max_rows_per_step, 32);
+            assert_eq!(cmd.args.prefill.limits().unwrap().unwrap().max_batch_rows, 4);
+            selected.verify_identity(selected.execution_identity()).unwrap();
+            let response = input_encoding::Response { response: &serde_json::json!({"fixture":true}),
+                input_encoding: input_encoding::reported_policy(&policy) };
+            assert_eq!(serde_json::to_value(response).unwrap()["input_encoding"], serde_json::to_value(policy).unwrap());
+        }
+    }
+
+    #[test]
+    fn compact_source_work_exhaustion_refuses_and_preserves_original_cancellation_policy() {
+        let cmd = command::tests::command("ner", &["--input-encoding", "safe-bpe-v1",
+            "--max-tokenizer-pair-checks", "1"]);
+        let (args, limits) = cmd.args.host.common_with_encoding(cmd.args.input.clone(), &cmd.encoding).unwrap();
+        let (p, _) = planner().unwrap();
+        let p = p.with_document_encoding(args.input_encoding_policy(limits).unwrap()).unwrap();
+        let request = command::request(Kind::Ner, "Alice works in Paris. ".repeat(32), None,
+            cmd.args.host.task_budget(limits), args.max_input_bytes).unwrap();
+        let mut control = PreparationControl { started: Instant::now(), elapsed_limit: Duration::from_secs(3600) };
+        assert!(matches!(prepare(&p, &facts(), &request, &cmd.args.host, &mut control), Err(CandidateError::Planning)));
+        struct Stop(DecodeCancellationKind);
+        impl DecodeStepControl for Stop {
+            fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { Some(self.0) }
+        }
+        use DecodeCancellationKind::*;
+        for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast,
+            RaceLost, ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+            assert!(matches!(prepare(&p, &facts(), &request, &cmd.args.host, &mut Stop(cause)),
+                Err(error) if error == cancelled(cause)));
         }
     }
 }

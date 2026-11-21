@@ -70,6 +70,10 @@ pub(super) struct SourceHostArgs {
 }
 impl SourceHostArgs {
     pub(super) fn common(&self, input: PathBuf) -> Result<(CandidateArgs, Limits), CandidateError> {
+        self.common_with_encoding(input, &input_encoding::InputEncodingArgs::default())
+    }
+    pub(super) fn common_with_encoding(&self, input: PathBuf, encoding: &input_encoding::InputEncodingArgs)
+        -> Result<(CandidateArgs, Limits), CandidateError> {
         if self.max_new_tokens >= self.context_tokens || self.preparation_mib < 512
             || self.max_grammar_states == 0 || self.max_grammar_states > 65_536
             || self.mask_step_node_visits == 0 || self.mask_step_node_visits > 1_000_000_000
@@ -83,8 +87,16 @@ impl SourceHostArgs {
             timeout_seconds: self.timeout_seconds, max_checkpoints: self.max_checkpoints,
             seed: None, temperature_milli: None, top_k: None, top_p_ppm: None, logprobs: false,
             policy: generation_policy::GenerationPolicyArgs::default(),
-            input_encoding: input_encoding::InputEncodingArgs::default() };
+            input_encoding: encoding.clone() };
         let limits = common.validate()?;
+        // Keep the transient encoder beside the retained source, grammar and
+        // result buffers. A compact token count never discounts original bytes.
+        let encoder_bytes = encoding.workspace_bytes(self.max_input_bytes,
+            limits.max_prompt_tokens)?;
+        let floor = (256 * MIB).checked_add(self.max_input_bytes as u64 * 32)
+            .and_then(|n| n.checked_add(self.max_result_bytes as u64 * 16))
+            .and_then(|n| n.checked_add(encoder_bytes)).ok_or(CandidateError::Arguments)?;
+        if limits.preparation_bytes < floor { return Err(CandidateError::Arguments); }
         Ok((common, limits))
     }
     pub(super) fn task_budget(&self, limits: Limits) -> TaskBudget {
@@ -122,23 +134,32 @@ pub(super) struct SourceArgs {
     pub options: Option<PathBuf>,
 }
 
-pub(crate) struct SourceCommand { pub(super) kind: Kind, pub(super) args: SourceArgs }
+pub(crate) struct SourceCommand {
+    pub(super) kind: Kind,
+    pub(super) args: SourceArgs,
+    pub(super) encoding: input_encoding::InputEncodingArgs,
+}
+
+const SOURCE_ENCODING_HELP: &str = "--input-encoding safe-bpe-v1 explicitly compacts untrusted source bytes while excluding template-control tokens. One bounded tokenizer allowance covers the whole request, including the question and every passage and passage ID for answer. Exact source bytes and citation coordinates remain unchanged. Encoder workspace is admitted before input or model IO, and the exact policy binds the prompt identity and is reported on compact results. Pair-work exhaustion rejects without falling back. Byte-fallback remains the default. Compact input changes prompt tokens and implies no model-output, quality or speed equivalence claim.";
 
 pub(super) fn definitions() -> Vec<clap::Command> {
     [(Kind::Ner, "Find source-bound named entities with exact occurrence spans"),
         (Kind::Keyphrases, "Rank exact source keyphrases"),
         (Kind::Summarize, "Produce a summary with exact source citations"),
         (Kind::Answer, "Answer a question using only explicit evidence passages")]
-        .into_iter().map(|(kind, about)| SourceArgs::augment_args(clap::Command::new(kind.name()).about(about))).collect()
+        .into_iter().map(|(kind, about)| input_encoding::definition(
+            SourceArgs::augment_args(clap::Command::new(kind.name()).about(about)))
+            .after_long_help(SOURCE_ENCODING_HELP)).collect()
 }
 impl SourceCommand {
     pub(super) fn from_matches(kind: Kind, matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-        Ok(Self { kind, args: SourceArgs::from_arg_matches(matches)? })
+        Ok(Self { kind, args: SourceArgs::from_arg_matches(matches)?,
+            encoding: input_encoding::InputEncodingArgs::from_matches(matches)? })
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
         self.args.head.limits()?;
         self.args.prefill.limits()?;
-        let (common, limits) = self.args.host.common(self.args.input.clone())?;
+        let (common, limits) = self.args.host.common_with_encoding(self.args.input.clone(), &self.encoding)?;
         if self.args.options.as_ref().is_some_and(|path| path.as_os_str().is_empty() || path.as_os_str() == "-") {
             return Err(CandidateError::Arguments);
         }

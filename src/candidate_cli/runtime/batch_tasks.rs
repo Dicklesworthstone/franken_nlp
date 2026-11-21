@@ -30,6 +30,7 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Sen
     if command.task == "extract" {
         return extraction::execute(command, args, limits, envelope, input, output);
     }
+    let encoding = args.input_encoding_policy(limits)?;
     let session = Session::new(&args, limits)?;
     let raw_defaults = command.defaults.as_ref()
         .map(|path| session.read(path, &mut input, MAX_SOURCE_ARGUMENT_BYTES)).transpose()?;
@@ -37,6 +38,7 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Sen
     let defaults = command.load_defaults(raw_defaults.as_deref(), ceiling)?;
     let facts = session.facts(&args)?;
     let (planner, vocabulary) = planner()?;
+    let planner = planner.with_document_encoding(encoding.clone()).map_err(|_| CandidateError::Planning)?;
     session.remaining()?;
     let identity = source_identity(&facts, &planner, command.task()?)?;
     // Validate the fixed backend/task/template/default contract before weights.
@@ -51,6 +53,8 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Sen
         model_id: &facts.model_id, source_revision: &facts.revision,
         source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
         quant_recipe: &facts.recipe_id, task: &command.task };
+    let provenance = input_encoding::Response { response: &provenance,
+        input_encoding: input_encoding::reported_policy(&encoding) };
     let writer = CandidateWriter::new(output, &provenance, envelope.transport.max_output_line_bytes,
         envelope.output_bytes)?;
     // These OWNED handles cross the blocking boundary. In particular, the CLI

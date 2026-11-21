@@ -49,6 +49,41 @@ fn stream_work_is_the_sum_of_independent_contexts_and_never_a_long_context() {
     assert_eq!(e.transport.max_work.projected_logits, sum.projected_logits);
     assert_eq!(e.native.masks.max_visits_per_run, cmd.host.max_mask_node_visits * 3);
 }
+
+#[test]
+fn compact_source_corpora_preserve_whole_run_native_and_mask_ceilings() {
+    use crate::tokenizer::untrusted::UntrustedEncoding;
+    for task in ["ner", "keyphrases", "summarize", "answer"] {
+        let byte = command(task, &["--max-requests", "3"]);
+        let compact = command(task, &["--max-requests", "3", "--input-encoding", "safe-bpe-v1"]);
+        let (_, _, original) = byte.validate().unwrap();
+        let (args, limits, envelope) = compact.validate().unwrap();
+        assert!(matches!(args.input_encoding_policy(limits).unwrap(), UntrustedEncoding::SafeBpeV1(_)));
+        assert_eq!(envelope.native.max_model_work, original.native.max_model_work);
+        assert_eq!(envelope.native.masks.max_visits_per_run, original.native.masks.max_visits_per_run);
+        assert_eq!(envelope.transport.max_requests, 3);
+        assert_eq!(envelope.transport.max_input_bytes, original.transport.max_input_bytes);
+        assert_eq!(envelope.output_bytes, original.output_bytes);
+    }
+}
+
+#[test]
+fn invalid_compact_corpus_policies_refuse_before_owned_stream_access() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("corpus input read") } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("corpus output written") }
+        fn flush(&mut self) -> io::Result<()> { panic!("corpus output flushed") }
+    }
+    for (task, flags) in [
+        ("ner", vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "0"]),
+        ("answer", vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-bytes", "0"]),
+        ("extract", vec!["--input-encoding", "safe-bpe-v1"]),
+        ("extract", vec!["--chunked", "--schema", "must-not-open.json", "--input-encoding", "safe-bpe-v1"]),
+    ] {
+        assert_eq!(command(task, &flags).execute_owned(NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+}
 #[test]
 fn every_native_work_axis_uses_checked_scaling() {
     for axis in 0..5 {
