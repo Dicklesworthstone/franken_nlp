@@ -1,15 +1,20 @@
 //! Explicit summary/QA generation plus an unchanged correlated second reader.
 use super::*;
 use crate::{
+    batch::source::semantic::Int4SemanticSourceBatchTask,
     candidate_cli::source::Kind,
+    grammar::runtime::JsonValidationSchema,
     native_engine::lmhead::scoring::ScoringLimits,
-    tasks::{judge::JudgeLimits,
-        source_planning::grouped_int4::semantic::{Int4SourceSemanticOptions, SourceSemanticInputFacts}},
+    tasks::{answer::AnswerOptions, ir::TaskBudget, judge::JudgeLimits,
+        source_planning::{SourcePlanningLimits,
+            grouped_int4::semantic::{Int4SourceSemanticOptions, SourceSemanticInputFacts}},
+        summarize::SummaryOptions},
 };
 
 const OPTIONS_BYTES: usize = 1024 * 1024;
 #[cfg(feature = "asupersync-runtime")] mod runtime;
 pub(in crate::candidate_cli::int4) mod corpus;
+pub(in crate::candidate_cli::int4) mod jobs;
 #[cfg(test)] mod tests;
 
 #[derive(Clone, Eq, PartialEq)]
@@ -90,6 +95,27 @@ fn parse_options(text: &str) -> Result<Int4SourceSemanticOptions, CandidateError
     let options: Int4SourceSemanticOptions = serde_json::from_value(value).map_err(|_| CandidateError::Input)?;
     options.validate().map_err(|_| CandidateError::Arguments)?;
     Ok(options)
+}
+/// The resident and retained routes share the exact typed source defaults and
+/// declaration validation. Neither accepts per-record options or budgets.
+fn load_task(kind: Kind, json: Option<&str>, budget: TaskBudget, planning: SourcePlanningLimits,
+    semantic: &Int4SourceSemanticOptions) -> Result<Int4SemanticSourceBatchTask, CandidateError> {
+    let (task, schema) = match kind {
+        Kind::Summarize => {
+            let options: SummaryOptions = crate::candidate_cli::source::options(json)?;
+            let schema = options.schema_source().map_err(|_| CandidateError::Planning)?;
+            (Int4SemanticSourceBatchTask::Summarize { options, budget }, schema)
+        }
+        Kind::Answer => {
+            let options: AnswerOptions = crate::candidate_cli::source::options(json)?;
+            let schema = options.schema_source().map_err(|_| CandidateError::Planning)?;
+            (Int4SemanticSourceBatchTask::Answer { options, budget }, schema)
+        }
+        _ => return Err(CandidateError::Arguments),
+    };
+    task.validate_semantic(semantic).map_err(|_| CandidateError::Planning)?;
+    JsonValidationSchema::compile(&schema, planning.compiler).map_err(|_| CandidateError::Planning)?;
+    Ok(task)
 }
 fn judge_limits(options: &Int4SourceSemanticOptions) -> JudgeLimits {
     let budget = options.judge_budget; let nodes = budget.max_grammar_states as usize;

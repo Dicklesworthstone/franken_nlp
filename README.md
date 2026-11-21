@@ -5284,6 +5284,24 @@ before private job/model IO. See the
 start/resume examples, lifetime limits and recovery behavior. Compilation,
 executable tests and independently pinned model gates remain unrun.
 
+### Retained summary and passage-answer review
+
+`summarize-semantic-job start|resume` and `answer-semantic-job start|resume`
+persist the existing cited source result together with its complete correlated
+review. Summary records use `{id,text}`; answer records use
+`{id,text:question,task_args:{passages:[{id,text}]}}`. Source options and review
+policy stay fixed for the population. Resume authenticates both compiler
+identities, exact input and policy, and immutable lifetime work before running
+pending items. A failed review commits no partial source result.
+
+Source conversion, pinned snapshots, compact input, persistent CPU teams and
+explicit retained-input replay share the durable route. Stdout is metadata
+only; complete reviewed results remain in the protected spool and optional
+ordered materialization. See the [start/resume guide](docs/source-semantic-jobs.md)
+for concrete commands and lifetime limits. Review retains its existing
+same-model, uncalibrated diagnostic scope. Compilation and executable gates
+remain unrun.
+
 ## Native INT4 faithfulness evaluation and comparison
 
 `fnlp eval native-faithfulness-int4` executes the real native faithfulness

@@ -75,6 +75,12 @@ policy. Add `--input-encoding safe-bpe-v1` to use bounded compact input across
 both stages. Ordinary source tasks, batches, maps, synthesis and jobs retain
 their own interfaces.
 
+For protected persistence, `summarize-semantic-job start|resume` and
+`answer-semantic-job start|resume` retain these complete reviewed results with
+exact input and policy authentication. See the
+[durable source-review guide](source-semantic-jobs.md) for NDJSON formats,
+lifetime budgets, retained-input replay and start/resume examples.
+
 ## Compact input across generation and review
 
 `summarize-semantic`, `answer-semantic`, and `extract-semantic` accept the same

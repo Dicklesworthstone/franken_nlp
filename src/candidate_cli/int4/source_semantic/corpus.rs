@@ -5,10 +5,7 @@ use crate::{
         extract::ExtractionMaskBudget,
         source::semantic::{Int4SemanticSourceBatchLimits, Int4SemanticSourceBatchTask}},
     candidate_cli::{batch::{FRAME_ALLOWANCE, IO_BUFFER_BYTES}, stream::Failure},
-    grammar::runtime::JsonValidationSchema,
     native_engine::{portable_int8::ProjectionWork, strict_int4::Int4Work},
-    tasks::{answer::AnswerOptions, ir::TaskBudget, source_planning::SourcePlanningLimits,
-        summarize::SummaryOptions},
 };
 
 #[cfg(feature = "asupersync-runtime")]
@@ -146,22 +143,7 @@ impl BatchArgs {
     }
     fn load_task(&self, json: Option<&str>, budget: TaskBudget, planning: SourcePlanningLimits,
         semantic: &Int4SourceSemanticOptions) -> Result<Int4SemanticSourceBatchTask, CandidateError> {
-        let (task, schema) = match self.kind {
-            Kind::Summarize => {
-                let options: SummaryOptions = crate::candidate_cli::source::options(json)?;
-                let schema = options.schema_source().map_err(|_| CandidateError::Planning)?;
-                (Int4SemanticSourceBatchTask::Summarize { options, budget }, schema)
-            }
-            Kind::Answer => {
-                let options: AnswerOptions = crate::candidate_cli::source::options(json)?;
-                let schema = options.schema_source().map_err(|_| CandidateError::Planning)?;
-                (Int4SemanticSourceBatchTask::Answer { options, budget }, schema)
-            }
-            _ => return Err(CandidateError::Arguments),
-        };
-        task.validate_semantic(semantic).map_err(|_| CandidateError::Planning)?;
-        JsonValidationSchema::compile(&schema, planning.compiler).map_err(|_| CandidateError::Planning)?;
-        Ok(task)
+        super::load_task(self.kind, json, budget, planning, semantic)
     }
     pub(in crate::candidate_cli::int4) fn run_owned<R: Read + Send + 'static, W: Write + Send + 'static>(
         self, args: Int4Args, input: R, output: W, diagnostics: &mut impl Write) -> ExitCode {

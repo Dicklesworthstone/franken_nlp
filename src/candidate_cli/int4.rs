@@ -157,6 +157,7 @@ enum Int4Task {
     Source(crate::candidate_cli::source::Kind, source::SourceArgs),
     SourceSemantic(crate::candidate_cli::source::Kind, source_semantic::SemanticSourceArgs),
     SourceSemanticBatch(source_semantic::corpus::BatchArgs),
+    SourceSemanticJob,
     SourceBatch(source_batch::BatchArgs),
     SourceMap(source_map::MapArgs),
     SourceCorpus(source_map::documents::CorpusArgs),
@@ -192,6 +193,7 @@ enum Int4JobCommand {
     Generation(text_job::JobCommand),
     Extraction(extract_job::JobCommand),
     Semantic(semantic::jobs::JobCommand),
+    SourceSemantic(source_semantic::jobs::JobCommand),
     ExtractionDocument(extract_document_job::JobCommand),
     Scored(scored_job::JobCommand),
     ClassificationDocument(classify_document_job::JobCommand),
@@ -253,6 +255,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(semantic::jobs::definition())
         .subcommands(source_semantic::definitions())
         .subcommands(source_semantic::corpus::definitions())
+        .subcommands(source_semantic::jobs::definitions())
         .subcommand(compute::definition(extract_batch::definition()))
         .subcommand(extract_job::definition())
         .subcommand(extract_map::threaded_definition())
@@ -306,6 +309,14 @@ impl Int4Command {
             let (job, args) = semantic::jobs::JobCommand::from_matches(matches)?;
             return Ok(Self { task: Int4Task::SemanticJob, args, batch: None,
                 job: Some(Int4JobCommand::Semantic(job)) });
+        }
+        if matches!(name, "summarize-semantic-job" | "answer-semantic-job") {
+            let kind = crate::candidate_cli::source::Kind::named(name.trim_end_matches("-semantic-job"))
+                .ok_or_else(|| clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand,
+                    "semantic source job task refused"))?;
+            let (job, args) = source_semantic::jobs::JobCommand::from_matches(kind, matches)?;
+            return Ok(Self { task: Int4Task::SourceSemanticJob, args, batch: None,
+                job: Some(Int4JobCommand::SourceSemantic(job)) });
         }
         if name == "extract-document-job" {
             let (job, args) = extract_document_job::JobCommand::from_matches(matches)?;
@@ -476,6 +487,9 @@ impl Int4Command {
                 return job.run_owned(args, input, &mut output, diagnostics),
             Self { task: Int4Task::SemanticJob, args, batch: None, job: Some(Int4JobCommand::Semantic(job)) } =>
                 return job.run_owned(args, input, &mut output, diagnostics),
+            Self { task: Int4Task::SourceSemanticJob, args, batch: None,
+                job: Some(Int4JobCommand::SourceSemantic(job)) } =>
+                return job.run_owned(args, input, &mut output, diagnostics),
             Self { task: Int4Task::ExtractDocumentJob, args, batch: None, job: Some(Int4JobCommand::ExtractionDocument(job)) } =>
                 return job.run_owned(args, input, &mut output, diagnostics),
             Self { task: Int4Task::ScoredJob, args, batch: None, job: Some(Int4JobCommand::Scored(job)) } =>
@@ -584,7 +598,7 @@ impl Int4Command {
             return options.execute(self.args, input, output);
         }
         let limits = match &self.task {
-            Int4Task::SemanticJob => return Err(CandidateError::Arguments),
+            Int4Task::SemanticJob | Int4Task::SourceSemanticJob => return Err(CandidateError::Arguments),
             Int4Task::SampledSentiment(_) | Int4Task::SampledSentimentMap(_) | Int4Task::SampledSentimentCorpus(_) | Int4Task::SampledSentimentBatch(_) | Int4Task::SampledSentimentJob | Int4Task::SampledSentimentDocumentJob => return Err(CandidateError::Arguments),
             Int4Task::Text(_) => self.args.validate_text_compute()?,
             Int4Task::Classify(scoring) => scoring.validate_one_off_with_prefill(&self.args)?,
