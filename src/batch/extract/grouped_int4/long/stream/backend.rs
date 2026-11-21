@@ -69,7 +69,7 @@ impl Backend<'_, '_> {
             let mut budget = native_budget(row, masks);
             match self {
                 Self::Serial(engine) => {
-                    preflight(row, &NativeDriver { engine, vocabulary })?;
+                    preflight(row, &NativeDriver { engine, vocabulary, prefill: None })?;
                 }
                 Self::Cohorts { .. } => {
                     // Each independent row receives exactly its own actual

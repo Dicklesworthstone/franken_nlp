@@ -10,6 +10,7 @@ use crate::{
     hosted::corpus::jobs::{HostedJobError, JobHostLimits, SourceJobRequest, read_population, run_population},
     jobs::{JobInputMemory, JobLimits, JobProgress,
         runner::{JobRunError, extract::grouped_int4::{Int4ExtractionJobPlanner, Int4ExtractionJobProcessor}}},
+    native_engine::strict_int4::prefill::Int4PrefillLimits,
     tasks::ir::TaskBudget,
 };
 
@@ -20,7 +21,7 @@ struct JobInput<R> {
 
 struct ExtractionJobExecution<R> {
     input: Charged<JobInput<R>>, kv: Pending, scratch: Pending,
-    limits: JobHostLimits, required: Requirements, lease: EngineLease,
+    prefill: Option<Int4PrefillLimits>, limits: JobHostLimits, required: Requirements, lease: EngineLease,
 }
 
 /// Retain native reservations after their coordinator-owned buffers are gone.
@@ -59,7 +60,24 @@ impl NlpEngine {
         cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
         self.run_int4_extraction_job(model, planner, vocabulary, request, limits,
-            kernel, None, reader, cancellation)
+            kernel, None, None, reader, cancellation)
+    }
+
+    /// Start or resume the same authenticated extraction population with
+    /// bounded layer-major prompt morsels. The extra prompt workspace is
+    /// admitted before input and remains charged through native completion.
+    /// Exact schema/source checks, selected rows and lifetime work remain
+    /// unchanged. An explicit resume may change this physical row width.
+    /// This schedule owns one coordinator and cannot combine with a CPU team.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int4_extract_layer_major<R>(&self, model: &ResidentInt4,
+        planner: Int4ExtractionJobPlanner, vocabulary: Arc<ExtractionVocabulary>,
+        request: SourceJobRequest, limits: JobHostLimits, kernel: PackedInt4Kernel,
+        prefill: Int4PrefillLimits, reader: R, cancellation: CancellationToken)
+        -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        self.run_int4_extraction_job(model, planner, vocabulary, request, limits,
+            kernel, Some(prefill), None, reader, cancellation)
     }
 
     /// Reuse one admitted output-row team across population authentication,
@@ -76,16 +94,19 @@ impl NlpEngine {
         -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
         self.run_int4_extraction_job(model, planner, vocabulary, request, limits,
-            kernel, Some(compute_threads), reader, cancellation)
+            kernel, None, Some(compute_threads), reader, cancellation)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn run_int4_extraction_job<R>(&self, model: &ResidentInt4,
         planner: Int4ExtractionJobPlanner, vocabulary: Arc<ExtractionVocabulary>,
         request: SourceJobRequest, limits: JobHostLimits, kernel: PackedInt4Kernel,
-        compute_threads: Option<usize>, reader: R, cancellation: CancellationToken)
+        prefill: Option<Int4PrefillLimits>, compute_threads: Option<usize>, reader: R, cancellation: CancellationToken)
         -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
+        if prefill.is_some() && compute_threads.is_some() {
+            return Err(HostedError::Limits("INT4 extraction job team/prefill schedule").into());
+        }
         match compute_threads {
             Some(width) => dispatch::preflight_int4_team(self, limits.native.run, width)?,
             None => dispatch::preflight(self, limits.native.run)?,
@@ -103,6 +124,7 @@ impl NlpEngine {
         // population read, even when retained input is replayed on demand.
         required.input_bytes = sum(&[required.input_bytes,
             planner.encoding_workspace_bytes().map_err(HostedError::BatchSetup)?])?;
+        required = with_job_prefill_workspace(required, prefill)?;
         let team_scratch = compute_threads.map(|width|
             int4_task_team_workspace_bytes(width, model.model_identity().group_width())).transpose()?.unwrap_or(0);
         sum(&[required.input_bytes, required.native.kv_bytes, required.workspace_bytes, team_scratch])?;
@@ -111,7 +133,7 @@ impl NlpEngine {
             || Ok(JobInput { preparation: Some((planner, vocabulary, request)), reader }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes)?;
-        let execution = ExtractionJobExecution { input, kv, scratch, limits, required, lease };
+        let execution = ExtractionJobExecution { input, kv, scratch, prefill, limits, required, lease };
         let model = model.clone();
         let completed = match compute_threads {
             None => dispatch::run(self, limits.native.run, cancellation, move |control|
@@ -134,7 +156,7 @@ impl<R: BufRead> ExtractionJobExecution<R> {
     fn run<'weights>(self, weights: &'weights Int4ModelWeights, kernel: PackedInt4Kernel,
         projection: Option<&'weights mut (dyn crate::native_engine::strict_int4::projection::Int4ProjectionExecutor + 'weights)>,
         control: &mut RunControl) -> Result<ExtractionJobCompletion<R>, HostedError> {
-        let Self { mut input, kv, scratch, limits, required, lease } = self;
+        let Self { mut input, kv, scratch, prefill, limits, required, lease } = self;
         checkpoint(control)?;
         let (planner, vocabulary, request) = input.value.preparation.take()
             .ok_or(HostedError::CompletionMissing)?;
@@ -163,8 +185,11 @@ impl<R: BufRead> ExtractionJobExecution<R> {
             kv_bytes: required.native.kv_bytes, masks: native_work.masks,
             output_bytes: request.limits.max_result_bytes as u64, selected_rows };
         let result = (|| {
-            let processor = Int4ExtractionJobProcessor::new(planner, &mut engine.value, &vocabulary, admission)
-                .map_err(JobRunError::Processor)?;
+            let processor = match prefill {
+                None => Int4ExtractionJobProcessor::new(planner, &mut engine.value, &vocabulary, admission),
+                Some(prefill) => Int4ExtractionJobProcessor::new_layer_major(
+                    planner, &mut engine.value, &vocabulary, admission, prefill),
+            }.map_err(JobRunError::Processor)?;
             // Authentication precedes tail repair and any native forward.
             // Output guards survive spool sync and journal acknowledgement.
             run_population(request, &population, processor, control)
@@ -176,6 +201,13 @@ impl<R: BufRead> ExtractionJobExecution<R> {
         Ok(ExtractionJobCompletion { result, input,
             native: NativeJobCharges::Committed { _kv, _scratch }, lease })
     }
+}
+
+fn with_job_prefill_workspace(mut required: Requirements, prefill: Option<Int4PrefillLimits>)
+    -> Result<Requirements, HostedError> {
+    required.workspace_bytes = super::super::prefill::with_extra_workspace(required.workspace_bytes, prefill)?;
+    sum(&[required.input_bytes, required.native.kv_bytes, required.workspace_bytes])?;
+    Ok(required)
 }
 
 fn job_requirements(width: usize, task: TaskBudget, job: JobLimits, limits: JobHostLimits, input: JobInputMemory)
@@ -229,6 +261,38 @@ mod tests {
             + needed.native.scratch_payload_bound + host.native.allocator_reserve_bytes);
     }
     #[test]
+    fn prompt_morsels_admit_one_extra_workspace_beside_population_and_complete_kv() {
+        let (task, job, host) = fixture();
+        for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
+            let base = job_requirements(128, task, job, host, input).unwrap();
+            assert_eq!(with_job_prefill_workspace(base, None).unwrap(), base);
+            for rows in [1, 3, 64] {
+                let extra = Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+                let scheduled = with_job_prefill_workspace(base, Some(Int4PrefillLimits {
+                    max_batch_rows: rows, max_extra_scratch_bytes: extra })).unwrap();
+                assert_eq!(scheduled.input_bytes, base.input_bytes);
+                assert_eq!(scheduled.native, base.native);
+                assert_eq!(scheduled.workspace_bytes, base.workspace_bytes + extra);
+                assert!(with_job_prefill_workspace(base, Some(Int4PrefillLimits {
+                    max_batch_rows: rows, max_extra_scratch_bytes: extra - 1 })).is_err());
+            }
+            for rows in [0, 65, usize::MAX] {
+                assert!(with_job_prefill_workspace(base, Some(Int4PrefillLimits {
+                    max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX })).is_err());
+            }
+            for axis in 0..3 {
+                let mut overflow = base;
+                match axis {
+                    0 => overflow.workspace_bytes = u64::MAX,
+                    1 => overflow.input_bytes = u64::MAX,
+                    _ => overflow.native.kv_bytes = u64::MAX,
+                }
+                assert!(with_job_prefill_workspace(overflow, Some(Int4PrefillLimits {
+                    max_batch_rows: 3, max_extra_scratch_bytes: u64::MAX })).is_err());
+            }
+        }
+    }
+    #[test]
     fn looser_or_tighter_kv_and_oversized_results_refuse_before_input() {
         let (task, job, host) = fixture();
         for kv in [0, task.max_kv_bytes - 1, task.max_kv_bytes + 1] {
@@ -264,6 +328,7 @@ mod tests {
         send::<ExtractionJobCompletion<std::io::Cursor<Vec<u8>>>>();
         let _serial = NlpEngine::job_int4_extract::<std::io::Cursor<Vec<u8>>>;
         let _threaded = NlpEngine::job_int4_extract_with_threads::<std::io::Cursor<Vec<u8>>>;
+        let _prefill = NlpEngine::job_int4_extract_layer_major::<std::io::Cursor<Vec<u8>>>;
     }
 
     mod team {
@@ -357,6 +422,41 @@ mod tests {
             let vocabulary = Arc::new(ExtractionVocabulary::pinned(registry.template_controls()).unwrap());
             let baseline = host.resources().memory_snapshot();
             use DecodeCancellationKind::*;
+            for rows in [1, 3, 64] {
+                let prefill = Int4PrefillLimits { max_batch_rows: rows,
+                    max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap() };
+                for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+                    ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+                    let (planner, request, limits) = planner(&model);
+                    let charge = limits.required_buffer_bytes(request.limits).unwrap();
+                    let stop = CancellationToken::default(); stop.cancel(cause);
+                    let observed = Arc::new(Observation::default());
+                    let reader = Reader { resources: Arc::clone(host.resources()), observed: Arc::clone(&observed),
+                        action: Action::Refuse, stop: stop.clone() };
+                    let error = host.job_int4_extract_layer_major(&model, planner, Arc::clone(&vocabulary),
+                        request, limits, PackedInt4Kernel::scalar(), prefill, reader, stop).err().unwrap();
+                    let HostedJobError::Host(HostedError::Stopped { stop, .. }) = error
+                        else { panic!("extraction prefill cancellation lost its typed cause"); };
+                    assert_eq!(stop.kind, cause);
+                    assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
+                    assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+                    assert!(observed.input_at_drop.load(Ordering::SeqCst) >= PREPARATION + charge);
+                    drained(&host, &baseline);
+                }
+            }
+            for rows in [0, 65, usize::MAX] {
+                let (planner, request, limits) = planner(&model);
+                let observed = Arc::new(Observation::default());
+                let stop = CancellationToken::default();
+                let reader = Reader { resources: Arc::clone(host.resources()), observed: Arc::clone(&observed),
+                    action: Action::Refuse, stop: stop.clone() };
+                assert!(host.job_int4_extract_layer_major(&model, planner, Arc::clone(&vocabulary), request,
+                    limits, PackedInt4Kernel::scalar(), Int4PrefillLimits {
+                        max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX }, reader, stop).is_err());
+                assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
+                assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+                drained(&host, &baseline);
+            }
             for width in [2, 4] {
                 for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
                     ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {

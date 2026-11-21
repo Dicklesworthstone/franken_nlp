@@ -87,6 +87,69 @@ fn freeze(planner: &Int4ExtractionJobPlanner) -> FrozenManifest {
 mod selected;
 
 #[test]
+fn prompt_schedule_preserves_authenticated_extraction_policy_and_spent_preparation() {
+    use crate::native_engine::strict_int4::{Int4MemoryBudget, Int4MemoryRequirement,
+        weights::projection_fixture};
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    struct Admission;
+    impl Int4ExtractionBatchAdmission for Admission {
+        type Guard = ();
+        fn admit(&mut self, _: crate::batch::extract::grouped_int4::Int4ExtractionAdmission<'_>)
+            -> Result<(ExecutionIdentity, ()), BatchItemFailure> {
+            panic!("planning-only fixture reached native admission")
+        }
+    }
+    let (weights, _) = projection_fixture(WIDTH);
+    let controls = pinned_controls::pinned().unwrap();
+    let vocabulary = ExtractionVocabulary::pinned(controls.template_controls()).unwrap();
+    for compact in [false, true] { for selected in [false, true] { for rows in [1, 3, 64] {
+        let mut p = Int4ExtractionJobPlanner::for_model(weights.identity(), budget(),
+            CompileLimits::default(), SourceRuntimeLimits::default(), defaults(), native(WIDTH)).unwrap();
+        if selected { p = p.with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: 8 }).unwrap(); }
+        if compact {
+            p = p.with_document_encoding(UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+                max_input_bytes: 8192, max_output_tokens: 4096,
+                max_pair_checks: 1 << 22, max_pair_bytes: 1 << 26,
+            }), Some(SafeBpeWorkLimits {
+                max_input_bytes: (defaults().schema.len() + "PRIVATE_SOURCE".len()) as u64,
+                max_output_tokens: 32768, max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28,
+            })).unwrap();
+        }
+        let prepared = p.compiler.prepare_with_invocation_encoding_work(
+            shared_document(document("PRIVATE_SOURCE")).unwrap(), &mut p.encoding_work,
+            p.recipe.encoding_work_limits, &mut Continue).unwrap();
+        let spent = p.encoding_work;
+        let recipe = serde_json::to_vec(&p.recipe).unwrap();
+        let identity = p.identity.clone();
+        let expected = JobWork::from_int4(prepared.planned_work(), native(WIDTH).masks.max_visits_per_item);
+        let context = usize::try_from(prepared.planned_work().forward_positions).unwrap();
+        let memory = Int4MemoryRequirement::for_context(context, WIDTH).unwrap();
+        let mut engine = StrictInt4Engine::new(&weights, context, Int4MemoryBudget {
+            max_kv_bytes: memory.kv_bytes, max_rope_bytes: memory.rope_bytes,
+            max_scratch_payload_bytes: memory.scratch_payload_bound,
+        }).unwrap();
+        let prefill = Int4PrefillLimits { max_batch_rows: rows,
+            max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap() };
+        let mut processor = Int4ExtractionJobProcessor::new_layer_major(
+            p, &mut engine, &vocabulary, Admission, prefill).unwrap();
+        assert_eq!(serde_json::to_vec(processor.job_recipe()).unwrap(), recipe);
+        assert_eq!(processor.execution_identity(), &identity);
+        assert_eq!(processor.durable_work(&prepared).unwrap(), expected);
+        processor.validate_job_limits(job_limits(native(WIDTH))).unwrap();
+        assert_eq!(processor.encoding_work, spent);
+        if compact {
+            let failure = processor.prepare_with_control(document("PRIVATE_SOURCE"), &mut Continue).err().unwrap();
+            assert_eq!(failure.fault.code, BatchCode::WorkLimit);
+            assert!(failure.stop);
+            assert_eq!(processor.encoding_work, spent);
+        }
+        drop(processor);
+        assert!(!engine.is_poisoned());
+        assert!(engine.kv_cache().all_slots_have_len(0));
+    } } }
+}
+
+#[test]
 fn exact_schema_and_source_bytes_are_bound_without_privileged_marker_tokens() {
     let mut args = defaults();
     args.schema = format!(" {{\"type\":\"number\",\"const\":{NUMBER}}} \n");

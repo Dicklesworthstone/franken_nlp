@@ -13,7 +13,8 @@ use crate::{
         runtime::{SourceRuntimeLimits, JSON_RUNTIME_VERSION, SOURCE_JSON_RUNTIME_VERSION}},
     jobs::{JobLimits, JobWork, manifest::bounded_json},
     native_engine::{constrained_int4::sparse::{Int4JsonSparseLimits, INT4_SPARSE_JSON_EXECUTION},
-        decode::DecodeStepControl, strict_int4::{Int4ModelIdentity, Int4Work, StrictInt4Engine}},
+        decode::DecodeStepControl, strict_int4::{Int4ModelIdentity, Int4Work, StrictInt4Engine,
+            prefill::Int4PrefillLimits}},
     tasks::{extract::{ExtractionVocabulary,
         grouped_int4::{Int4ExtractRun, INT4_EXTRACT_VERSION, INT4_SPARSE_EXTRACT_VERSION}},
         ir::TaskBudget},
@@ -275,6 +276,20 @@ impl<'e, 'weights, 'v, A: Int4ExtractionBatchAdmission> Int4ExtractionJobProcess
         let Int4ExtractionJobPlanner { compiler, identity, recipe, native, encoding_work } = planner;
         let native = NativeInt4ExtractionBatch::new_with_document_encoding(
             compiler, engine, vocabulary, admission, native)?;
+        Ok(Self { native, identity, recipe, encoding_work })
+    }
+    /// Execute each pending record with bounded layer-major prompt morsels.
+    /// Row width is physical scheduling and does not change the private
+    /// recipe, selected-row policy or any durable native/mask/attempt debit.
+    /// The embedding host retains the additional workspace through the job.
+    pub fn new_layer_major(planner: Int4ExtractionJobPlanner, engine: &'e mut StrictInt4Engine<'weights>,
+        vocabulary: &'v ExtractionVocabulary, admission: A, prefill: Int4PrefillLimits)
+        -> Result<Self, BatchFault> {
+        planner.check_document_encoding()?;
+        planner.check_selected_rows()?;
+        let Int4ExtractionJobPlanner { compiler, identity, recipe, native, encoding_work } = planner;
+        let native = NativeInt4ExtractionBatch::new_layer_major(
+            compiler, engine, vocabulary, admission, native, prefill)?;
         Ok(Self { native, identity, recipe, encoding_work })
     }
 }

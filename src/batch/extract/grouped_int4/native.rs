@@ -1,4 +1,4 @@
-//! Sequential schema/source extraction over one resident grouped-INT4 engine.
+//! Schema/source extraction over one resident grouped-INT4 engine.
 //!
 //! The existing task owns constrained decoding and independent finalization.
 //! This adapter owns delivery ordering, nonrenewable native/mask allowances,
@@ -8,7 +8,7 @@ use super::*;
 use crate::native_engine::{
     constrained_int4::{self, Int4JsonBudget},
     strict_int4::{Int4MemoryRequirement, Int4RunBudget, StrictInt4Engine, StrictInt4Error,
-        STRICT_INT4_PROFILE},
+        STRICT_INT4_PROFILE, prefill::Int4PrefillLimits},
 };
 use crate::tasks::extract::grouped_int4::Int4ExtractRun;
 
@@ -78,7 +78,20 @@ impl<'e, 'weights, 'v, A: Int4ExtractionBatchAdmission> NativeInt4ExtractionBatc
         }
         constrained_int4::check_model(compiler.base_execution_identity(), engine.model_identity())
             .map_err(|_| BatchCode::Admission)?;
-        Ok(Self { compiler, driver: NativeDriver { engine, vocabulary }, admission, run: RunState::new(limits) })
+        Ok(Self { compiler, driver: NativeDriver { engine, vocabulary, prefill: None }, admission, run: RunState::new(limits) })
+    }
+    /// Use bounded causal prompt morsels for every record. The host admits
+    /// the validated extra workspace once and retains it through the stream.
+    /// This physical schedule preserves exact schema/source finalization,
+    /// complete legal-row selection and all nonrenewable native/mask debits.
+    /// Compact input keeps the compiler's original explicit encoding policy.
+    pub fn new_layer_major(compiler: Int4ExtractionBatchPlanner, engine: &'e mut StrictInt4Engine<'weights>,
+        vocabulary: &'v ExtractionVocabulary, admission: A, limits: Int4ExtractionBatchLimits,
+        prefill: Int4PrefillLimits) -> Result<Self, BatchFault> {
+        prefill.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        let mut processor = Self::new_with_document_encoding(compiler, engine, vocabulary, admission, limits)?;
+        processor.driver.prefill = Some(prefill);
+        Ok(processor)
     }
     pub fn reserved_model_work(&self) -> Int4Work { self.run.reserved }
     pub fn reserved_mask_visits(&self) -> u64 { self.run.mask_visits }
@@ -197,6 +210,7 @@ pub(super) trait Driver {
 pub(super) struct NativeDriver<'e, 'weights, 'v> {
     pub(super) engine: &'e mut StrictInt4Engine<'weights>,
     pub(super) vocabulary: &'v ExtractionVocabulary,
+    pub(super) prefill: Option<Int4PrefillLimits>,
 }
 impl Driver for NativeDriver<'_, '_, '_> {
     fn capacity(&self) -> usize { self.engine.kv_cache().capacity_positions() }
@@ -207,7 +221,11 @@ impl Driver for NativeDriver<'_, '_, '_> {
         -> Result<Int4ExtractRun, Int4ExtractError> {
         // Actual model identity, vocabulary controls, final validation and the
         // final cancellation checkpoint remain inside the real task/session.
-        prepared.plan.execute(self.engine, identity, self.vocabulary, budget, control)
+        match self.prefill {
+            None => prepared.plan.execute(self.engine, identity, self.vocabulary, budget, control),
+            Some(prefill) => prepared.plan.execute_layer_major(self.engine, identity,
+                self.vocabulary, budget, prefill, control),
+        }
     }
 }
 pub(super) fn preflight(prepared: &PreparedInt4BatchExtraction, driver: &impl Driver) -> Result<u64, BatchItemFailure> {

@@ -35,7 +35,7 @@ impl PreparedInt4ExtractionMap<'_> {
             step(control)?;
             constrained_int4::check_model(identity, engine.model_identity()).map_err(Int4ExtractError::from)?;
         }
-        self.execute_with_driver(admitted, NativeDriver { engine, vocabulary }, control)
+        self.execute_with_driver(admitted, NativeDriver { engine, vocabulary, prefill: None }, control)
     }
     // Private fault-injection seam only; public execution always owns the real
     // native extraction driver and cannot accept a fabricated map result.
