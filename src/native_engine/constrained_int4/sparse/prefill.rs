@@ -65,7 +65,8 @@ impl<D: PromptDriver> Driver for LayerMajor<'_, D> {
         self.driver.append_layer_major(prompt, self.prefill)
     }
     fn logits(&mut self, rows: &[u32]) -> Result<Vec<f32>, Int4JsonError> { self.driver.logits(rows) }
-    fn work(&self) -> Int4Work { self.driver.work() }
+    fn work(&self) -> Result<Int4Work, Int4JsonError> { self.driver.work() }
+    fn retained_prompt_positions(&self) -> usize { self.driver.retained_prompt_positions() }
     fn abort(&mut self) { self.driver.abort(); }
 }
 

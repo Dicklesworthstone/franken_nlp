@@ -63,7 +63,7 @@ impl Driver for Script {
     fn control(&mut self) -> &mut Control { &mut self.control }
     fn append(&mut self, token: u32) -> Result<(), Int4JsonError> { self.forward(token) }
     fn logits(&mut self, rows: &[u32]) -> Result<Vec<f32>, Int4JsonError> { self.project(rows) }
-    fn work(&self) -> Int4Work { self.receipt() }
+    fn work(&self) -> Result<Int4Work, Int4JsonError> { Ok(self.receipt()) }
     fn abort(&mut self) { self.aborted = true; }
 }
 impl super::super::Driver for Script {

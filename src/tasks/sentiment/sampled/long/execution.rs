@@ -86,7 +86,7 @@ impl PreparedSampledSentimentMap {
         let aggregate = reduction::aggregate_with_control(&chunks, self.expected.source_span,
             self.expected.samples, control)?;
         let mut result = SampledSentimentMapRun { schema_version: 1,
-            execution: execution(reuse_prefill).to_owned(), numerics_profile: STRICT_INT4_PROFILE.to_owned(),
+            execution: self.execution_version(reuse_prefill).to_owned(), numerics_profile: STRICT_INT4_PROFILE.to_owned(),
             group_width: self.group_width(), chunk_profile: CHUNK_PROFILE.to_owned(), semantics: SEMANTICS.to_owned(),
             single_context_equivalence: false, source_span: self.expected.source_span,
             chunk_limits: self.expected.chunk_limits, tokenizer_checks: self.expected.tokenizer_checks,
@@ -109,7 +109,7 @@ impl SampledSentimentMapPreflight {
         checkpoint(control)?;
         if run.request_binding != self.request_binding
             || run.result_binding != binding::result(run, self.max_result_bytes, control)?
-            || run.schema_version != 1 || run.execution != execution(reuse_prefill)
+            || run.schema_version != 1 || run.execution != self.execution_version(reuse_prefill)
             || run.numerics_profile != STRICT_INT4_PROFILE || run.group_width != self.group_width
             || run.chunk_profile != CHUNK_PROFILE || run.semantics != SEMANTICS || run.single_context_equivalence
             || run.source_span != self.source_span || run.chunk_limits != self.chunk_limits
@@ -126,7 +126,7 @@ impl SampledSentimentMapPreflight {
         }
         let mut work = Int4Work::default(); let mut masks = 0_u64;
         let mut tokens = 0_u64; let mut retained = 0_u64;
-        let chunk_execution = if reuse_prefill { SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION } else { SAMPLED_SENTIMENT_EXECUTION };
+        let chunk_execution = projection::execution(self.selected_rows, reuse_prefill);
         for chunk in &run.chunks {
             checkpoint(control)?;
             if chunk.source_tokens == 0
@@ -149,7 +149,4 @@ impl SampledSentimentMapPreflight {
         }
         checkpoint(control)
     }
-}
-fn execution(reuse_prefill: bool) -> &'static str {
-    if reuse_prefill { SAMPLED_SENTIMENT_MAP_REUSED_PREFILL_EXECUTION } else { SAMPLED_SENTIMENT_MAP_EXECUTION }
 }

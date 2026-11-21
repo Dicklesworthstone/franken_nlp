@@ -15,7 +15,9 @@ pub(super) fn document<C: DecodeStepControl>(request: &SentimentRequest,
         p.max_input_bytes, p.max_total_prompt_tokens, p.max_sample_json_bytes, p.max_result_bytes))?;
     writer.value(&(c.max_schema_bytes, c.max_string_bytes, c.max_array_items, c.max_output_bytes,
         c.max_states, c.max_transitions, c.max_mask_bytes))?;
-    writer.value(&planner.execution_identity().receipt_identity().map_err(|_| SampledSentimentMapError::Admission)?)?;
+    // Physical selected-row admission is bound by each prepared chunk below;
+    // it must not change the original document/chunk sampling addresses.
+    writer.value(&planner.identity.receipt_identity().map_err(|_| SampledSentimentMapError::Admission)?)?;
     writer.checkpoint()?; Ok(writer.finish().0)
 }
 pub(super) fn chunk_address<C: DecodeStepControl>(document: [u8; 32], id: usize,

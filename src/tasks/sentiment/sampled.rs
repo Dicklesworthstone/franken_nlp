@@ -17,6 +17,7 @@ use crate::{
         constrained::JsonDecodeOptions,
         constrained_int4::{self, Int4JsonBudget, Int4JsonError, Int4JsonRun, JsonSamplingOptions,
             INT4_JSON_SAMPLED_EXECUTION, INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION,
+            sparse::Int4JsonSparseLimits,
             JSON_SAMPLER_VERSION, json_sampling_workspace_bytes},
         decode::{DecodeCancellationKind, DecodeStepControl},
         generation::grouped_int4::bind_candidate_model,
@@ -37,6 +38,9 @@ use crate::{
 use super::{SentimentAxis, SentimentRequest};
 
 pub mod long;
+mod projection;
+pub use projection::{SAMPLED_SENTIMENT_SPARSE_EXECUTION,
+    SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION};
 
 pub const SAMPLED_SENTIMENT_EXECUTION: &str = "grouped-int4-independent-sampled-sentiment-v1";
 pub const SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION: &str = "grouped-int4-independent-sampled-sentiment-reused-prefill-v1";
@@ -190,6 +194,8 @@ struct Compiler { tokenizer: EmbeddedTokenizer, controls: TemplateControlIds,
 pub struct SampledSentimentPlanner {
     compiler: Compiler, identity: ExecutionIdentity, group_width: usize,
     options: SampledSentimentOptions, ceiling: TaskBudget, limits: SampledSentimentLimits,
+    selected_rows: Option<Int4JsonSparseLimits>,
+    admission_identity: Option<ExecutionIdentity>,
 }
 impl SampledSentimentPlanner {
     pub fn for_model(model: &Int4ModelIdentity, options: SampledSentimentOptions,
@@ -200,7 +206,8 @@ impl SampledSentimentPlanner {
         let identity = bind_candidate_model(unbound_identity(&compiler), model)
             .map_err(|_| SampledSentimentError::Identity)?;
         constrained_int4::check_model(&identity, model)?;
-        Ok(Self { compiler, identity, group_width: model.group_width(), options, ceiling, limits })
+        Ok(Self { compiler, identity, group_width: model.group_width(), options, ceiling, limits,
+            selected_rows: None, admission_identity: None })
     }
     /// Construct a model-bound planner with an explicit input policy. The
     /// original constructor remains byte-default and identity compatible.
@@ -223,10 +230,13 @@ impl SampledSentimentPlanner {
         self.compiler.set_input_encoding(encoding)?;
         self.identity.template_digest = self.compiler.template_digest;
         self.identity.validate().map_err(|_| SampledSentimentError::Identity)?;
+        self.refresh_projection_identity()?;
         Ok(self)
     }
     pub fn input_encoding(&self) -> &UntrustedEncoding { &self.compiler.input_encoding }
-    pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
+    pub fn execution_identity(&self) -> &ExecutionIdentity {
+        self.admission_identity.as_ref().unwrap_or(&self.identity)
+    }
     pub fn group_width(&self) -> usize { self.group_width }
     pub fn task_budget(&self) -> TaskBudget { self.ceiling }
     pub fn limits(&self) -> SampledSentimentLimits { self.limits }
@@ -244,7 +254,7 @@ impl SampledSentimentPlanner {
     pub fn plan_with_control<C: DecodeStepControl>(&self, request: &SentimentRequest, control: &mut C)
         -> Result<PreparedSampledSentiment, SampledSentimentError> {
         compile_request(&self.compiler, &self.identity, self.group_width, &self.options,
-            self.ceiling, self.limits, request, control)
+            self.ceiling, self.limits, request, control)?.with_projection(self.selected_rows)
     }
     /// Give one population record its own stable sample addresses. The caller
     /// ID joins the complete semantic identity through a private length-framed
@@ -274,7 +284,7 @@ impl SampledSentimentPlanner {
         control: &mut C, work: &mut SafeBpeWork)
         -> Result<PreparedSampledSentiment, SampledSentimentError> {
         compile_request_with_work(&self.compiler, &self.identity, self.group_width, &self.options,
-            self.ceiling, self.limits, request, control, work)
+            self.ceiling, self.limits, request, control, work)?.with_projection(self.selected_rows)
     }
 }
 
@@ -288,6 +298,7 @@ pub struct PreparedSampledSentiment {
     group_width: usize, work: Int4Work, budget: TaskBudget, context: usize,
     max_result_bytes: u64, preparation_bytes: u64,
     input_encoding: UntrustedEncoding, encoding_work: SafeBpeWork,
+    selected_rows: Option<Int4JsonSparseLimits>,
 }
 impl PreparedSampledSentiment {
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
@@ -297,6 +308,10 @@ impl PreparedSampledSentiment {
     pub fn group_width(&self) -> usize { self.group_width }
     pub fn max_result_bytes(&self) -> u64 { self.max_result_bytes }
     pub fn sample_count(&self) -> usize { self.axes.len() * self.options.samples }
+    /// Exact aggregate token ceiling, including each sample's scored EOS.
+    pub fn max_output_tokens(&self) -> u64 {
+        self.sample_count() as u64 * self.options.max_sample_tokens as u64
+    }
     pub fn input_encoding(&self) -> &UntrustedEncoding { &self.input_encoding }
     /// Actual encoding work for the one source segment shared by all axes and
     /// samples. Native execution work remains separately charged per sample.
@@ -398,9 +413,15 @@ impl PreparedSampledSentiment {
                         max_kv_bytes: budget.json.max_kv_bytes,
                         max_total_mask_node_visits: axis_masks,
                         mask_limits: budget.json.mask_limits } };
-                constrained_int4::decode_json_int4_sampled_reusing_prefill_with(engine, &axis.identity,
-                    &axis.prompt, &self.program, &vocabulary.oracle, &self.decode, &sampling,
-                    axis_budget, max_sampler_bytes, prefill, control, &mut finalize)?
+                match self.selected_rows {
+                    Some(selected) => constrained_int4::decode_json_int4_sampled_sparse_reusing_prefill_with(
+                        engine, &axis.identity, &axis.prompt, &self.program, &vocabulary.oracle,
+                        &self.decode, &sampling, axis_budget, max_sampler_bytes, selected, prefill,
+                        control, &mut finalize),
+                    None => constrained_int4::decode_json_int4_sampled_reusing_prefill_with(engine, &axis.identity,
+                        &axis.prompt, &self.program, &vocabulary.oracle, &self.decode, &sampling,
+                        axis_budget, max_sampler_bytes, prefill, control, &mut finalize),
+                }?
             } else {
                 let mut samples = reserved(self.options.samples)?;
                 for sample_index in 0..self.options.samples {
@@ -413,14 +434,22 @@ impl PreparedSampledSentiment {
                             max_kv_bytes: budget.json.max_kv_bytes,
                             max_total_mask_node_visits: mask_charge,
                             mask_limits: budget.json.mask_limits } };
-                    let checked = match prefill {
-                        None => constrained_int4::decode_json_int4_sampled_with(engine, &axis.identity,
+                    let checked = match (self.selected_rows, prefill) {
+                        (None, None) => constrained_int4::decode_json_int4_sampled_with(engine, &axis.identity,
                             &axis.prompt, &self.program, &vocabulary.oracle, &self.decode, &sampling,
                             sample_budget, max_sampler_bytes, control, |run| finalize(sample_index, run)),
-                        Some(limits) => constrained_int4::decode_json_int4_sampled_layer_major_with(engine,
+                        (None, Some(limits)) => constrained_int4::decode_json_int4_sampled_layer_major_with(engine,
                             &axis.identity, &axis.prompt, &self.program, &vocabulary.oracle, &self.decode,
                             &sampling, sample_budget, max_sampler_bytes, limits, control,
                             |run| finalize(sample_index, run)),
+                        (Some(selected), None) => constrained_int4::decode_json_int4_sampled_sparse_with(engine,
+                            &axis.identity, &axis.prompt, &self.program, &vocabulary.oracle, &self.decode,
+                            &sampling, sample_budget, max_sampler_bytes, selected, control,
+                            |run| finalize(sample_index, run)),
+                        (Some(selected), Some(limits)) => constrained_int4::decode_json_int4_sampled_sparse_layer_major_with(
+                            engine, &axis.identity, &axis.prompt, &self.program, &vocabulary.oracle,
+                            &self.decode, &sampling, sample_budget, max_sampler_bytes, selected,
+                            limits, control, |run| finalize(sample_index, run)),
                     }?;
                     samples.push(checked);
                     checkpoint(control)?;
@@ -435,8 +464,7 @@ impl PreparedSampledSentiment {
             dimensions.push(aggregate(axis.axis, samples)?);
         }
         let result = SampledSentimentRun { schema_version: 1,
-            execution: if reuse_prefill { SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION }
-                else { SAMPLED_SENTIMENT_EXECUTION }.to_owned(), task_spec: "sentiment-v1".to_owned(),
+            execution: self.execution_version(reuse_prefill).to_owned(), task_spec: "sentiment-v1".to_owned(),
             prompt_template_sha256: self.identity.template_digest,
             numerics_profile: STRICT_INT4_PROFILE.to_owned(), group_width: self.group_width,
             aggregation: SAMPLED_SENTIMENT_AGGREGATION_VERSION.to_owned(),
@@ -461,8 +489,7 @@ impl PreparedSampledSentiment {
         reuse_prefill: bool, control: &mut C)
         -> Result<(), SampledSentimentError> {
         checkpoint(control)?;
-        let execution = if reuse_prefill { SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION }
-            else { SAMPLED_SENTIMENT_EXECUTION };
+        let execution = self.execution_version(reuse_prefill);
         if mask_charge_per_token == 0 || run.schema_version != 1 || run.execution != execution
             || run.task_spec != "sentiment-v1" || run.prompt_template_sha256 != self.identity.template_digest
             || run.numerics_profile != STRICT_INT4_PROFILE || run.group_width != self.group_width
@@ -489,7 +516,8 @@ impl PreparedSampledSentiment {
                     || sample.generated_tokens == 0 || sample.generated_tokens > self.options.max_sample_tokens {
                     return Err(SampledSentimentError::Accounting);
                 }
-                let expected = self.sample_work(axis, index, sample.generated_tokens, reuse_prefill)?;
+                let expected = self.sample_work_for_rows(axis, index, sample.generated_tokens,
+                    reuse_prefill, sample.model_work.projected_logits)?;
                 let expected_masks = (sample.generated_tokens as u64).checked_mul(mask_charge_per_token)
                     .ok_or(SampledSentimentError::Accounting)?;
                 if sample.model_work != expected || !fits_work(expected, axis.work)
@@ -540,8 +568,16 @@ impl PreparedSampledSentiment {
         if all > budget.json.max_total_mask_node_visits { return Err(SampledSentimentError::WorkBudget); }
         Ok(one)
     }
+    #[cfg(test)]
     fn sample_work(&self, axis: &PreparedAxis, sample_index: usize, generated_tokens: usize,
         reuse_prefill: bool) -> Result<Int4Work, SampledSentimentError> {
+        let logits = generated_tokens.checked_mul(NANBEIGE_VOCAB_SIZE)
+            .ok_or(SampledSentimentError::Accounting)?;
+        self.sample_work_for_rows(axis, sample_index, generated_tokens, reuse_prefill, logits as u64)
+    }
+
+    fn sample_work_for_rows(&self, axis: &PreparedAxis, sample_index: usize, generated_tokens: usize,
+        reuse_prefill: bool, projected_logits: u64) -> Result<Int4Work, SampledSentimentError> {
         if sample_index >= self.options.samples || generated_tokens == 0 || axis.prompt.is_empty() {
             return Err(SampledSentimentError::Accounting);
         }
@@ -551,16 +587,21 @@ impl PreparedSampledSentiment {
             (0, axis.prompt.len().checked_add(generated_tokens - 1)
                 .ok_or(SampledSentimentError::Accounting)?)
         };
-        let logits = generated_tokens.checked_mul(NANBEIGE_VOCAB_SIZE)
+        let cap = self.selected_rows.map_or(NANBEIGE_VOCAB_SIZE, |limits| limits.max_rows_per_step);
+        let maximum = generated_tokens.checked_mul(cap)
             .ok_or(SampledSentimentError::Accounting)?;
+        let logits = usize::try_from(projected_logits).map_err(|_| SampledSentimentError::Accounting)?;
+        if logits < generated_tokens || logits > maximum
+            || (self.selected_rows.is_none() && logits != maximum) {
+            return Err(SampledSentimentError::Accounting);
+        }
         Ok(Int4Work::for_sequence(self.group_width, start, positions, logits)?)
     }
 
     fn finalize_sample(&self, axis: &PreparedAxis, sample_index: usize, run: Int4JsonRun, reuse_prefill: bool)
         -> Result<SampledSentimentSample, SampledSentimentError> {
         let output = &run.output;
-        let execution = if reuse_prefill { INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION }
-            else { INT4_JSON_SAMPLED_EXECUTION };
+        let execution = projection::native_execution(self.selected_rows, reuse_prefill);
         if sample_index >= self.options.samples || run.schema_version != 1
             || run.execution != execution || run.group_width != self.group_width
             || output.schema_version != 1 || output.numerics_profile != STRICT_INT4_PROFILE
@@ -570,7 +611,8 @@ impl PreparedSampledSentiment {
                 *id as usize >= NANBEIGE_VOCAB_SIZE || self.decode.excluded_token_ids.contains(id)) {
             return Err(SampledSentimentError::Accounting);
         }
-        let expected = self.sample_work(axis, sample_index, output.token_ids.len(), reuse_prefill)?;
+        let expected = self.sample_work_for_rows(axis, sample_index, output.token_ids.len(),
+            reuse_prefill, output.projected_logits)?;
         if expected != run.model_work || !fits_work(expected, axis.work)
             || output.forward_positions != expected.forward_positions || output.projected_logits != expected.projected_logits {
             return Err(SampledSentimentError::Accounting);
@@ -861,6 +903,7 @@ fn compile_request_with_work<C: DecodeStepControl>(compiler: &Compiler, identity
         decode: compiler.decode.clone(), controls: compiler.controls.ids().clone(), identity: sealed,
         group_width, work, budget: request.budget, context, max_result_bytes, preparation_bytes,
         input_encoding: compiler.input_encoding.clone(),
+        selected_rows: None,
         encoding_work: encoding_work.checked_sub(before_encoding).ok_or(SampledSentimentError::Accounting)? })
 }
 

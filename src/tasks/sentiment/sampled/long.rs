@@ -19,6 +19,10 @@ pub use reduction::{SampledSentimentMapAggregate, SampledSentimentMapAggregateDi
 pub const SAMPLED_SENTIMENT_MAP_EXECUTION: &str = "grouped-int4-complete-sampled-sentiment-map-v1";
 pub const SAMPLED_SENTIMENT_MAP_REUSED_PREFILL_EXECUTION: &str =
     "grouped-int4-complete-sampled-sentiment-map-reused-prefill-v1";
+pub const SAMPLED_SENTIMENT_MAP_SPARSE_EXECUTION: &str =
+    "grouped-int4-complete-sampled-sentiment-map-selected-rows-v1";
+pub const SAMPLED_SENTIMENT_MAP_SPARSE_REUSED_PREFILL_EXECUTION: &str =
+    "grouped-int4-complete-sampled-sentiment-map-selected-rows-reused-prefill-v1";
 /// Stable population item addressing. Transport order, request sequence and
 /// flush epochs never enter the private complete-document or chunk keys.
 pub const SAMPLED_SENTIMENT_MAP_ITEM_ADDRESS_VERSION: &str =
@@ -157,12 +161,22 @@ pub struct SampledSentimentMapPreflight {
     encoding: Option<crate::tokenizer::untrusted::SafeBpeLimits>,
     encoding_work: SafeBpeWork,
     request_binding: [u8; 32],
+    selected_rows: Option<Int4JsonSparseLimits>,
 }
 impl SampledSentimentMapPreflight {
     pub fn source_span(&self) -> VerifiedSourceSpan { self.source_span }
     pub fn chunk_count(&self) -> usize { self.chunks }
     pub fn planned_work(&self) -> Int4Work { self.work }
     pub fn max_result_bytes(&self) -> u64 { self.max_result_bytes }
+    pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.selected_rows }
+    pub fn execution_version(&self, reuse_prefill: bool) -> &'static str {
+        match (self.selected_rows.is_some(), reuse_prefill) {
+            (false, false) => SAMPLED_SENTIMENT_MAP_EXECUTION,
+            (false, true) => SAMPLED_SENTIMENT_MAP_REUSED_PREFILL_EXECUTION,
+            (true, false) => SAMPLED_SENTIMENT_MAP_SPARSE_EXECUTION,
+            (true, true) => SAMPLED_SENTIMENT_MAP_SPARSE_REUSED_PREFILL_EXECUTION,
+        }
+    }
     fn encoding_record(&self) -> Option<SampledSentimentMapEncoding> {
         self.encoding.map(|limits| SampledSentimentMapEncoding {
             policy: UntrustedEncoding::SafeBpeV1(limits), work: self.encoding_work })
@@ -315,7 +329,8 @@ impl SampledSentimentPlanner {
             max_output_tokens: total_output, max_retained_bytes: limits.max_retained_result_bytes,
             max_result_bytes: limits.max_result_bytes, chunk_limits, tokenizer_checks: chunks.tokenizer_calls(),
             geometry, encoding: match self.input_encoding() { UntrustedEncoding::ByteFallback => None,
-                UntrustedEncoding::SafeBpeV1(limits) => Some(*limits) }, encoding_work, request_binding };
+                UntrustedEncoding::SafeBpeV1(limits) => Some(*limits) }, encoding_work, request_binding,
+            selected_rows: self.selected_rows };
         let preparation_bytes = memory::prepared_bytes(self.limits, limits, plans.len(),
             retained_prompt_tokens, self.compiler.encoding_workspace_bytes()?)?;
         checkpoint(control)?;
@@ -334,6 +349,10 @@ impl PreparedSampledSentimentMap {
     pub fn max_result_bytes(&self) -> u64 { self.expected.max_result_bytes }
     pub fn preparation_requirement_bytes(&self) -> u64 { self.preparation_bytes }
     pub fn preflight_metadata(&self) -> SampledSentimentMapPreflight { self.expected }
+    pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.expected.selected_rows }
+    pub fn execution_version(&self, reuse_prefill: bool) -> &'static str {
+        self.expected.execution_version(reuse_prefill)
+    }
 }
 
 fn source_capacity(planner: &SampledSentimentPlanner, axes: &[SentimentAxis], task: TaskBudget,

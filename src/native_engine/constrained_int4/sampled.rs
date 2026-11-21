@@ -1,8 +1,8 @@
 //! Addressed sampling under the existing exact JSON/source-language mask.
 //!
-//! This is a full-vocabulary candidate path. It does not claim that sampled
-//! scores or justifications are calibrated, and it never samples from sparse
-//! rows, a guessed mask, or a partially completed JSON value.
+//! Full-vocabulary defaults and an explicit complete-legal-row candidate share
+//! one addressed sampler. Neither claims calibrated scores or explanations;
+//! no path samples from guessed/pruned masks or partially completed JSON.
 
 use super::*;
 use sha2::{Digest, Sha256};
@@ -10,6 +10,11 @@ use crate::native_engine::{
     generation::{GenerationError, GenerationOptions, GenerationSampling, policy},
     sampler::{MAX_TOP_K, SAMPLER_VERSION, StableRequestKey},
 };
+mod selected;
+pub use selected::{INT4_JSON_SAMPLED_SPARSE_EXECUTION, INT4_JSON_SAMPLED_SPARSE_REUSED_PREFILL_EXECUTION,
+    decode_json_int4_sampled_sparse, decode_json_int4_sampled_sparse_layer_major};
+pub(crate) use selected::{decode_json_int4_sampled_sparse_with,
+    decode_json_int4_sampled_sparse_layer_major_with, decode_json_int4_sampled_sparse_reusing_prefill_with};
 
 pub const INT4_JSON_SAMPLED_EXECUTION: &str = "grouped-int4-sampled-constrained-json-final-prefill-head-v1";
 /// Explicit physical schedule: only the first sample prefills the complete

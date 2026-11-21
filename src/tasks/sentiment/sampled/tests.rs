@@ -376,7 +376,8 @@ fn encoding_planner(encoding: UntrustedEncoding) -> SampledSentimentPlanner {
     let compiler = Compiler::pinned(&options(), budget(), SampledSentimentLimits::default()).unwrap();
     let identity = unbound_identity(&compiler);
     SampledSentimentPlanner { compiler, identity, group_width: 32, options: options(),
-        ceiling: budget(), limits: SampledSentimentLimits::default() }
+        ceiling: budget(), limits: SampledSentimentLimits::default(),
+        selected_rows: None, admission_identity: None }
         .with_input_encoding(encoding).unwrap()
 }
 
@@ -638,6 +639,8 @@ fn population_ids_are_bounded_before_document_preparation() {
 }
 
 const COMPLETE_MASK_CHARGE_PER_TOKEN: u64 = 17;
+
+mod selected;
 
 fn complete_bundle(plan: &PreparedSampledSentiment) -> SampledSentimentRun {
     complete_bundle_with_prefill(plan, false)

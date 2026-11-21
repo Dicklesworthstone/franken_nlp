@@ -5,6 +5,8 @@ use std::sync::OnceLock;
 use crate::{grammar::mask::MaskWorkLimits, native_engine::constrained::JsonWorkBudget,
     tokenizer::untrusted::SafeBpeLimits};
 
+mod selected;
+
 pub(super) fn options() -> SampledSentimentOptions {
     SampledSentimentOptions { effective_seed: [37; 32], samples: 2, temperature_milli: 1000,
         top_k: None, top_p_ppm: 1_000_000, max_sample_tokens: 128, max_justification_chars: 64 }
@@ -28,7 +30,8 @@ fn planner() -> &'static SampledSentimentPlanner {
         let compiler = Compiler::pinned(&options(), budget(), SampledSentimentLimits::default()).unwrap();
         let identity = unbound_identity(&compiler);
         SampledSentimentPlanner { compiler, identity, group_width: 32,
-            options: options(), ceiling: budget(), limits: SampledSentimentLimits::default() }
+            options: options(), ceiling: budget(), limits: SampledSentimentLimits::default(),
+            selected_rows: None, admission_identity: None }
     })
 }
 fn request(text: &str) -> SentimentRequest {
@@ -184,7 +187,8 @@ fn compact_probes_and_chunk_preparation_share_one_cumulative_work_allowance() {
     let compiler = Compiler::pinned(&options, budget(), SampledSentimentLimits::default()).unwrap();
     let identity = unbound_identity(&compiler);
     let compact = SampledSentimentPlanner { compiler, identity, group_width: 32, options,
-        ceiling: budget(), limits: SampledSentimentLimits::default() }.with_input_encoding(
+        ceiling: budget(), limits: SampledSentimentLimits::default(),
+        selected_rows: None, admission_identity: None }.with_input_encoding(
             UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 4096,
                 max_pair_checks: 1_000_000, max_pair_bytes: 64 * MIB })).unwrap();
     let source = request("testing testing testing testing");
@@ -229,7 +233,8 @@ fn fixture_run(map: &PreparedSampledSentimentMap) -> SampledSentimentMapRun {
         for axis in &chunk.plan.axes {
             let mut samples = Vec::new();
             for sample_index in 0..options().samples {
-                let work = chunk.plan.sample_work(axis, sample_index, 1, false).unwrap();
+                let rows = chunk.plan.selected_rows().map_or(NANBEIGE_VOCAB_SIZE, |limits| limits.max_rows_per_step);
+                let work = chunk.plan.sample_work_for_rows(axis, sample_index, 1, false, rows as u64).unwrap();
                 chunk_work = chunk_work.checked_add(work).unwrap();
                 samples.push(SampledSentimentSample { sample_index, score: 10,
                     justification: "Synthetic boundary fixture".to_owned(), generated_tokens: 1,
@@ -238,7 +243,7 @@ fn fixture_run(map: &PreparedSampledSentimentMap) -> SampledSentimentMapRun {
             dimensions.push(aggregate(axis.axis, samples).unwrap());
         }
         let count = chunk.plan.sample_count() as u64;
-        let run = SampledSentimentRun { schema_version: 1, execution: SAMPLED_SENTIMENT_EXECUTION.to_owned(),
+        let run = SampledSentimentRun { schema_version: 1, execution: chunk.plan.execution_version(false).to_owned(),
             task_spec: "sentiment-v1".to_owned(), prompt_template_sha256: chunk.plan.identity.template_digest,
             numerics_profile: STRICT_INT4_PROFILE.to_owned(), group_width: map.group_width(),
             aggregation: SAMPLED_SENTIMENT_AGGREGATION_VERSION.to_owned(),
@@ -251,7 +256,7 @@ fn fixture_run(map: &PreparedSampledSentimentMap) -> SampledSentimentMapRun {
         chunks.push(result); model_work = model_work.checked_add(chunk_work).unwrap(); tokens += count; masks += count;
     }
     let aggregate = reduction::aggregate_with_control(&chunks, map.expected.source_span, options().samples, &mut Continue).unwrap();
-    let mut run = SampledSentimentMapRun { schema_version: 1, execution: SAMPLED_SENTIMENT_MAP_EXECUTION.to_owned(),
+    let mut run = SampledSentimentMapRun { schema_version: 1, execution: map.execution_version(false).to_owned(),
         numerics_profile: STRICT_INT4_PROFILE.to_owned(), group_width: map.group_width(), chunk_profile: CHUNK_PROFILE.to_owned(),
         semantics: SEMANTICS.to_owned(), single_context_equivalence: false, source_span: map.expected.source_span,
         chunk_limits: map.expected.chunk_limits, tokenizer_checks: map.expected.tokenizer_checks, samples_per_axis: options().samples,

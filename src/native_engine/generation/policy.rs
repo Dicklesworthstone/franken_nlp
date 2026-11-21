@@ -38,11 +38,14 @@ pub(in crate::native_engine) fn workspace_bytes() -> Result<u64, GenerationError
     (NANBEIGE_VOCAB_SIZE as u64).checked_mul(per_row as u64)
         .and_then(|n| n.checked_add(4096)).ok_or(GenerationError::Limit("sampler accounting"))
 }
-pub(in crate::native_engine) struct Workspace { counts: Vec<u32>, ids: Vec<u32>, logits: Vec<f32> }
+pub(in crate::native_engine) struct Workspace {
+    counts: Vec<u32>, ids: Vec<u32>, logits: Vec<f32>, last_selected_id: Option<u32>,
+}
 impl Workspace {
     pub fn new(prompt: &[u32]) -> Result<Self, GenerationError> {
         let mut counts = reserved(NANBEIGE_VOCAB_SIZE)?; counts.resize(NANBEIGE_VOCAB_SIZE, 0_u32);
-        let mut result = Self { counts, ids: reserved(NANBEIGE_VOCAB_SIZE)?, logits: reserved(NANBEIGE_VOCAB_SIZE)? };
+        let mut result = Self { counts, ids: reserved(NANBEIGE_VOCAB_SIZE)?,
+            logits: reserved(NANBEIGE_VOCAB_SIZE)?, last_selected_id: None };
         for &id in prompt { result.commit(id)?; }
         Ok(result)
     }
@@ -72,30 +75,69 @@ impl Workspace {
         &mut self, raw: &[f32], p: &GenerationOptions, key: StableRequestKey,
         sample_index: u64, step: u64, legal: F,
     ) -> Result<u32, GenerationError> {
-        self.ids.clear(); self.logits.clear();
-        let repetition = f64::from(p.repetition_penalty_milli) / 1000.0;
-        let temperature = match &p.sampling { GenerationSampling::Greedy => 1.0,
-            GenerationSampling::Seeded { temperature_milli, .. } => f64::from(*temperature_milli) / 1000.0 };
+        self.begin_legal_rows();
+        let scales = processor_scales(p);
         for (index, &raw_logit) in raw.iter().enumerate() {
             let id = index as u32;
-            // Static bans cannot be overridden by bias. EOS is additionally
-            // absent until the required non-EOS output count has committed.
-            if !legal(id) || p.banned_token_ids.binary_search(&id).is_ok()
-                || (step < p.min_new_tokens as u64 && p.eos_token_ids.binary_search(&id).is_ok()) { continue; }
-            let count = self.counts[index];
-            let mut value = f64::from(raw_logit);
-            if count > 0 {
-                value = if value > 0.0 { value / repetition } else { value * repetition };
-                value -= f64::from(p.presence_penalty_milli) / 1000.0;
-                value -= f64::from(p.frequency_penalty_milli) * f64::from(count) / 1000.0;
-            }
-            value += f64::from(*p.logit_bias_milli.get(&id).unwrap_or(&0)) / 1000.0;
-            let processed = (value / temperature) as f32;
-            if !processed.is_finite() { return Err(GenerationError::InvalidLogits); }
-            // Compact IDs remain increasing, preserving the pinned sampler's
-            // lowest-original-ID tie break without feeding artificial -Inf.
-            self.ids.push(id); self.logits.push(processed);
+            if legal(id) { self.push_processed(id, raw_logit, p, step, scales)?; }
         }
+        self.finish_legal_rows(p, key, sample_index, step)
+    }
+
+    /// Start one exact selected-row step using the already admitted sampler
+    /// buffers. The caller must supply EVERY legal row, in original ID order,
+    /// before finishing; this private seam never invents absent logits.
+    pub(in crate::native_engine) fn begin_legal_rows(&mut self) {
+        self.ids.clear(); self.logits.clear(); self.last_selected_id = None;
+    }
+
+    /// Append a bounded projection block through the SAME ordered arithmetic
+    /// as the full-head path. Ordering is checked across block boundaries, so
+    /// compact positions retain the original-token-ID ranking and tie rules.
+    pub(in crate::native_engine) fn extend_legal_rows(&mut self, rows: &[u32], raw: &[f32],
+        p: &GenerationOptions, step: u64) -> Result<(), GenerationError> {
+        if rows.is_empty() || rows.len() != raw.len()
+            || rows.windows(2).any(|pair| pair[0] >= pair[1])
+            || self.last_selected_id.is_some_and(|last| rows[0] <= last)
+            || rows.last().is_some_and(|&id| id as usize >= self.counts.len())
+            || raw.iter().any(|value| !value.is_finite()) {
+            return Err(GenerationError::InvalidLogits);
+        }
+        let scales = processor_scales(p);
+        for (&id, &logit) in rows.iter().zip(raw) { self.push_processed(id, logit, p, step, scales)?; }
+        self.last_selected_id = rows.last().copied();
+        Ok(())
+    }
+
+    fn push_processed(&mut self, id: u32, raw_logit: f32, p: &GenerationOptions, step: u64,
+        (repetition, temperature): (f64, f64))
+        -> Result<(), GenerationError> {
+        // Static bans cannot be overridden by bias. EOS is additionally
+        // absent until the required non-EOS output count has committed.
+        if p.banned_token_ids.binary_search(&id).is_ok()
+            || (step < p.min_new_tokens as u64 && p.eos_token_ids.binary_search(&id).is_ok()) {
+            return Ok(());
+        }
+        let count = self.counts[id as usize];
+        let mut value = f64::from(raw_logit);
+        if count > 0 {
+            value = if value > 0.0 { value / repetition } else { value * repetition };
+            value -= f64::from(p.presence_penalty_milli) / 1000.0;
+            value -= f64::from(p.frequency_penalty_milli) * f64::from(count) / 1000.0;
+        }
+        value += f64::from(*p.logit_bias_milli.get(&id).unwrap_or(&0)) / 1000.0;
+        let processed = (value / temperature) as f32;
+        if !processed.is_finite() { return Err(GenerationError::InvalidLogits); }
+        // Compact IDs remain increasing, preserving the pinned sampler's
+        // lowest-original-ID tie break without feeding artificial -Inf.
+        self.ids.push(id); self.logits.push(processed);
+        Ok(())
+    }
+
+    /// Select only after the complete exact legal set has been projected.
+    /// No native block, cap or physical schedule enters the addressed draw.
+    pub(in crate::native_engine) fn finish_legal_rows(&self, p: &GenerationOptions,
+        key: StableRequestKey, sample_index: u64, step: u64) -> Result<u32, GenerationError> {
         if self.ids.is_empty() { return Err(GenerationError::NoLegalToken); }
         let selected = match &p.sampling {
             GenerationSampling::Greedy => {
@@ -112,6 +154,12 @@ impl Workspace {
         };
         self.ids.get(selected).copied().ok_or(GenerationError::InvalidLogits)
     }
+}
+fn processor_scales(p: &GenerationOptions) -> (f64, f64) {
+    let repetition = f64::from(p.repetition_penalty_milli) / 1000.0;
+    let temperature = match &p.sampling { GenerationSampling::Greedy => 1.0,
+        GenerationSampling::Seeded { temperature_milli, .. } => f64::from(*temperature_milli) / 1000.0 };
+    (repetition, temperature)
 }
 fn select_uniform(logits: &[f32], top_k: Option<usize>, p: f64, u: f64) -> Result<usize, GenerationError> {
     match top_k {
@@ -185,5 +233,66 @@ mod tests {
                     masked.select_legal(&logits, &p, key, 8, step, |_| true).unwrap());
             }
         }
+    }
+    #[test]
+    fn selected_blocks_reuse_bit_exact_processor_order_and_original_id_draws() {
+        let mut p = GenerationOptions::greedy(4, 100, 0);
+        p.min_new_tokens = 1; p.banned_token_ids = vec![1, 9];
+        p.repetition_penalty_milli = 1357; p.presence_penalty_milli = -217;
+        p.frequency_penalty_milli = 399; p.logit_bias_milli.insert(7, 1319);
+        let raw = [2.0, 999.0, -0.0, 0.0, -2.75, 1.25, 8.0, -1.0, -17.125, 999.0,
+            f32::MIN_POSITIVE, -f32::MIN_POSITIVE, 3.5, 0.75, -4.125, 0.25];
+        let rows = [0, 1, 2, 3, 4, 7, 8, 9, 10, 11, 13, 15];
+        let key = StableRequestKey::from_canonical_digest([29; 32]);
+        for sampling in [GenerationSampling::Greedy, GenerationSampling::Seeded {
+            effective_seed: [61; 32], temperature_milli: 719, top_k: Some(4), top_p_ppm: 611_111,
+        }, GenerationSampling::Seeded {
+            effective_seed: [61; 32], temperature_milli: 1317, top_k: None, top_p_ppm: 1_000_000,
+        }, GenerationSampling::Seeded {
+            effective_seed: [61; 32], temperature_milli: 100_000, top_k: None, top_p_ppm: 700_001,
+        }] {
+            p.sampling = sampling;
+            for step in 0..3 { for sample in 0..8 { for block in [1, 3, 8, rows.len()] {
+                let mut dense = Workspace::new(&[2, 2, 3, 7, 7, 7, 11]).unwrap();
+                let expected = dense.select_legal(&raw, &p, key, sample, step,
+                    |id| rows.binary_search(&id).is_ok()).unwrap();
+                let mut selected = Workspace::new(&[2, 2, 3, 7, 7, 7, 11]).unwrap();
+                let capacities = (selected.ids.capacity(), selected.logits.capacity(), selected.counts.capacity());
+                selected.begin_legal_rows();
+                for ids in rows.chunks(block) {
+                    let logits: Vec<_> = ids.iter().map(|&id| raw[id as usize]).collect();
+                    selected.extend_legal_rows(ids, &logits, &p, step).unwrap();
+                }
+                assert_eq!(selected.ids, dense.ids);
+                assert_eq!(selected.logits.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    dense.logits.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+                assert_eq!(selected.finish_legal_rows(&p, key, sample, step).unwrap(), expected);
+                assert_eq!((selected.ids.capacity(), selected.logits.capacity(), selected.counts.capacity()), capacities);
+            } } }
+        }
+    }
+    #[test]
+    fn selected_blocks_refuse_duplicates_reordering_shape_and_nonfinite_rows() {
+        let p = GenerationOptions::greedy(2, 100, 0);
+        let key = StableRequestKey::from_canonical_digest([0; 32]);
+        let cases: &[(&[u32], &[f32])] = &[
+            (&[], &[]), (&[2], &[]), (&[2, 2], &[1.0, 1.0]), (&[3, 2], &[1.0, 1.0]),
+            (&[NANBEIGE_VOCAB_SIZE as u32], &[1.0]), (&[2], &[f32::NAN]),
+            (&[2], &[f32::INFINITY]), (&[2], &[f32::NEG_INFINITY]),
+        ];
+        for &(ids, raw) in cases {
+            let mut workspace = Workspace::new(&[]).unwrap();
+            workspace.begin_legal_rows();
+            assert!(matches!(workspace.extend_legal_rows(ids, raw, &p, 0), Err(GenerationError::InvalidLogits)));
+        }
+        let mut workspace = Workspace::new(&[]).unwrap();
+        workspace.begin_legal_rows();
+        assert!(matches!(workspace.finish_legal_rows(&p, key, 0, 0), Err(GenerationError::NoLegalToken)));
+        workspace.extend_legal_rows(&[2, 4], &[1.0, 1.0], &p, 0).unwrap();
+        assert!(workspace.extend_legal_rows(&[4, 5], &[1.0, 1.0], &p, 0).is_err());
+        assert!(workspace.extend_legal_rows(&[3], &[1.0], &p, 0).is_err());
+        workspace.begin_legal_rows();
+        workspace.extend_legal_rows(&[1], &[1.0], &p, 0).unwrap();
+        assert_eq!(workspace.finish_legal_rows(&p, key, 0, 0).unwrap(), 1);
     }
 }

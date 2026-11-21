@@ -31,9 +31,12 @@ mod prefill;
 mod sampled;
 pub use sampled::{JsonSamplingOptions, INT4_JSON_SAMPLED_EXECUTION, JSON_SAMPLER_VERSION,
     INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION,
+    INT4_JSON_SAMPLED_SPARSE_EXECUTION, INT4_JSON_SAMPLED_SPARSE_REUSED_PREFILL_EXECUTION,
+    decode_json_int4_sampled_sparse, decode_json_int4_sampled_sparse_layer_major,
     decode_json_int4_sampled, decode_json_int4_sampled_layer_major, json_sampling_workspace_bytes};
 pub(crate) use sampled::{decode_json_int4_sampled_with, decode_json_int4_sampled_layer_major_with,
-    decode_json_int4_sampled_reusing_prefill_with};
+    decode_json_int4_sampled_reusing_prefill_with, decode_json_int4_sampled_sparse_with,
+    decode_json_int4_sampled_sparse_layer_major_with, decode_json_int4_sampled_sparse_reusing_prefill_with};
 
 /// Group dots, MACs and attention pairs are additional to JSON/mask work.
 /// The KV ceiling prices the engine's complete resident capacity.

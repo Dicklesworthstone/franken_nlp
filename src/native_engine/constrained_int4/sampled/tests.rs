@@ -6,11 +6,11 @@ use crate::{
     grammar::{CompileLimits, runtime::SourceRuntimeLimits},
 };
 
-const GROUP: usize = 127;
+pub(super) const GROUP: usize = 127;
 
-struct Table { bytes: Vec<Vec<u8>>, lie: bool }
+pub(super) struct Table { bytes: Vec<Vec<u8>>, lie: bool }
 impl Table {
-    fn new(bytes: &[&[u8]]) -> Self {
+    pub(super) fn new(bytes: &[&[u8]]) -> Self {
         Self { bytes: bytes.iter().map(|bytes| bytes.to_vec()).collect(), lie: false }
     }
 }
@@ -79,14 +79,14 @@ impl prefill::PrefillDriver for Script {
     }
 }
 
-fn sampling() -> JsonSamplingOptions {
+pub(super) fn sampling() -> JsonSamplingOptions {
     JsonSamplingOptions { effective_seed: [37; 32], temperature_milli: 1000,
         top_k: None, top_p_ppm: 1_000_000, sample_index: 0 }
 }
-fn options(tokens: usize) -> JsonDecodeOptions {
+pub(super) fn options(tokens: usize) -> JsonDecodeOptions {
     JsonDecodeOptions { max_new_tokens: tokens, eos_token_id: 0, excluded_token_ids: BTreeSet::new() }
 }
-fn identity() -> ExecutionIdentity {
+pub(super) fn identity() -> ExecutionIdentity {
     let d = Sha256Digest::of_bytes(b"sampled-json-synthetic-identity");
     ExecutionIdentity { schema_version: 1, source_revision: "fixture".to_owned(), logical_model_digest: d,
         artifact_format: "fixture".to_owned(), quant_recipe: "fixture".to_owned(), packing_set_digest: d,
@@ -97,7 +97,7 @@ fn identity() -> ExecutionIdentity {
         tool_mode: ToolMode::None, calibration_digest: d, decision_policy_digest: d,
         backend_semantic_version: "fixture".to_owned(), host_class: None, compiler_identity: None }
 }
-fn program(schema: &str) -> JsonProgram { JsonProgram::compile(schema, CompileLimits::default()).unwrap() }
+pub(super) fn program(schema: &str) -> JsonProgram { JsonProgram::compile(schema, CompileLimits::default()).unwrap() }
 fn budget(prompt: usize, tokens: usize, width: usize) -> Int4JsonBudget {
     let work = work_for_width(GROUP, prompt, tokens, width).unwrap();
     Int4JsonBudget { native: Int4RunBudget::exact(work), json: JsonWorkBudget {
