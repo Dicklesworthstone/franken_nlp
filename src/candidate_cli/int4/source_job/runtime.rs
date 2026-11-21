@@ -12,6 +12,7 @@ use crate::{
     native_engine::strict_int4::{StrictInt4Error, weights::snapshot::INT4_SNAPSHOT_VERSION},
     tokenizer::untrusted::UntrustedEncoding,
 };
+use super::super::scored_batch::runtime::PrefillSchedule;
 
 pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     job: JobArgs, _admitted: Int4Limits, input: R, output: &mut impl Write) -> Result<(), Failure> {
@@ -19,6 +20,9 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     job.storage.input_retention.validate(mode, &args.input)?;
     let input_memory = job.storage.input_retention.input_memory()?;
     let common = job.validate(&args)?;
+    if !super::super::prefill::matches(&args, common)? {
+        return Err(CandidateError::Arguments.into());
+    }
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
@@ -80,7 +84,10 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     // Host authenticates the exact complete population and private recipe,
     // skips committed items and retains each output guard through spool sync
     // and journal acknowledgement. No native result is fabricated here.
-    let progress = if common.compute.threads == 1 {
+    let progress = if let Some(prefill) = common.prefill {
+        engine.job_int4_source_layer_major(&model, planner, Arc::new(vocabulary), request, host,
+            common.kernel, prefill, reader, cancellation.clone())
+    } else if common.compute.threads == 1 {
         engine.job_int4_source(&model, planner, Arc::new(vocabulary), request, host,
             common.kernel, reader, cancellation.clone())
     } else {
@@ -102,7 +109,8 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         quant_recipe: &identity.quant_recipe, group_width: model.model_identity().group_width(),
         integer_kernel: common.kernel.kind().id(), snapshot,
         input_encoding: input_encoding::reported_policy(&encoding), encoding_work_limits,
-        compute_schedule: compute::Schedule::for_threads(common.compute.threads), output: &report,
+        compute_schedule: compute::Schedule::for_threads(common.compute.threads),
+        prefill_schedule: common.prefill.map(PrefillSchedule::new).transpose()?, output: &report,
     };
     // Metadata only. Delivery/flush failure may follow durable commits and
     // never authorizes retry without the authenticated resume path.
@@ -194,6 +202,8 @@ struct Response<'a, T: Serialize> {
     snapshot: Option<SnapshotRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compute_schedule: Option<compute::Schedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefill_schedule: Option<PrefillSchedule>,
     #[serde(skip_serializing_if = "Option::is_none")]
     input_encoding: Option<&'a UntrustedEncoding>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -99,7 +99,7 @@ fn completion_envelope_contains_candidate_identity_and_authenticated_progress_on
         candidate_format: "fixture-candidate-format", quant_recipe: "fixture-grouped-int4",
         group_width: args.group_width, integer_kernel: common.kernel.kind().id(),
         snapshot: Some(SnapshotRecord::new("loaded", common.snapshot_need)),
-        compute_schedule: None, max_selected_rows: None,
+        compute_schedule: None, prefill_schedule: None, max_selected_rows: None,
         input_encoding: None, encoding_work_limits: None, output: &report,
     };
     let mut bytes = Vec::new();
@@ -120,6 +120,7 @@ fn completion_envelope_contains_candidate_identity_and_authenticated_progress_on
     }
     assert!(bytes.ends_with(b"\n"));
     assert!(value.get("compute_schedule").is_none());
+    assert!(value.get("prefill_schedule").is_none());
     assert!(value.get("input_encoding").is_none());
     assert!(value.get("encoding_work_limits").is_none());
     assert!(value.get("max_selected_rows").is_none());
@@ -151,6 +152,18 @@ fn completion_envelope_contains_candidate_identity_and_authenticated_progress_on
     selected_value.as_object_mut().unwrap().remove("input_encoding");
     selected_value.as_object_mut().unwrap().remove("encoding_work_limits");
     assert_eq!(selected_value, value);
+    threaded.compute_schedule = None;
+    let prefill = Int4PrefillLimits { max_batch_rows: 4,
+        max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(4).unwrap() };
+    threaded.prefill_schedule = Some(PrefillSchedule::new(prefill).unwrap());
+    let mut scheduled = serde_json::to_value(&threaded).unwrap();
+    let schedule = scheduled.as_object_mut().unwrap().remove("prefill_schedule").unwrap();
+    assert_eq!(schedule["max_batch_rows"], 4);
+    assert_eq!(schedule["admitted_workspace_bytes"], prefill.max_extra_scratch_bytes);
+    scheduled.as_object_mut().unwrap().remove("max_selected_rows");
+    scheduled.as_object_mut().unwrap().remove("input_encoding");
+    scheduled.as_object_mut().unwrap().remove("encoding_work_limits");
+    assert_eq!(scheduled, value);
     assert_eq!(publish(&threaded, 1, &mut NoWrite), Err(CandidateError::Output));
 }
 

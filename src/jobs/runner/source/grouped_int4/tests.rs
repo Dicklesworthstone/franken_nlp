@@ -423,6 +423,66 @@ fn compact_planner(task: BuiltInTask, call: crate::tokenizer::untrusted::SafeBpe
 }
 
 #[test]
+fn layer_major_source_jobs_preserve_all_task_recipes_and_shared_encoding_debits() {
+    use crate::native_engine::strict_int4::{Int4MemoryBudget, weights::projection_fixture};
+    struct Admission;
+    impl Int4SourceBatchAdmission for Admission {
+        type Guard = ();
+        fn admit(&mut self, _: Int4SourceAdmission<'_>) -> Result<(ExecutionIdentity, ()), BatchItemFailure> {
+            panic!("planning-only source fixture reached native admission")
+        }
+    }
+    let (weights, _) = projection_fixture(WIDTH);
+    let registry = pinned_controls::pinned().unwrap();
+    let vocabulary = ExtractionVocabulary::pinned(registry.template_controls()).unwrap();
+    let prefill = Int4PrefillLimits { max_batch_rows: 3,
+        max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(3).unwrap() };
+    for task in [BuiltInTask::Ner, BuiltInTask::Keyphrases, BuiltInTask::Summarize, BuiltInTask::Answer] {
+        for compact in [false, true] {
+            let (call, mut total) = compact_limits();
+            // Measure exact question/manifest/passage encoding from the real
+            // pinned planner, then grant only one complete preparation.
+            if compact {
+                let probe = compact_planner(task, call, total);
+                prepare(&probe, document());
+                total.max_input_bytes = probe.planner.map_document_encoding_work().unwrap().unwrap().input_bytes() as u64;
+            }
+            let mut original = Arc::try_unwrap(source()).ok().unwrap();
+            if compact { original = original.with_map_document_encoding(UntrustedEncoding::SafeBpeV1(call), total).unwrap(); }
+            let owner = Arc::new(original);
+            let p = Int4SourceJobPlanner::for_model_with_document_encoding(weights.identity(), Arc::clone(&owner), task,
+                budget(), SourcePlanningLimits::default(), Some(args(task)), native(WIDTH)).unwrap();
+            let prepared = prepare(&p, document());
+            let recipe = serde_json::to_vec(&p.recipe).unwrap();
+            let spent = owner.map_document_encoding_work().unwrap();
+            let work = JobWork::from_int4(prepared.planned_work(), native(WIDTH).masks.max_visits_per_item);
+            let memory = Int4MemoryRequirement::for_context(64, WIDTH).unwrap();
+            let mut engine = StrictInt4Engine::new(&weights, 64, Int4MemoryBudget {
+                max_kv_bytes: memory.kv_bytes, max_rope_bytes: memory.rope_bytes,
+                max_scratch_payload_bytes: memory.scratch_payload_bound,
+            }).unwrap();
+            let mut processor = Int4SourceJobProcessor::new_layer_major(&p, &mut engine,
+                &vocabulary, Admission, prefill).unwrap();
+            assert_eq!(serde_json::to_vec(processor.job_recipe()).unwrap(), recipe);
+            assert_eq!(processor.execution_identity(), p.execution_identity());
+            assert_eq!(processor.durable_work(&prepared).unwrap(), work);
+            processor.validate_job_limits(limits(native(WIDTH))).unwrap();
+            assert!(Arc::ptr_eq(&owner, &processor.planner.planner));
+            assert_eq!(owner.map_document_encoding_work().unwrap(), spent);
+            if compact {
+                let failure = processor.prepare_with_control(document(), &mut Continue).err().unwrap();
+                assert_eq!(failure.fault.code, BatchCode::WorkLimit);
+                assert!(failure.stop);
+                assert_eq!(owner.map_document_encoding_work().unwrap(), spent);
+            }
+            drop(processor);
+            assert!(!engine.is_poisoned());
+            assert!(engine.kv_cache().all_slots_have_len(0));
+        }
+    }
+}
+
+#[test]
 fn compact_source_jobs_keep_fixed_identity_as_one_invocation_ledger_is_spent() {
     let (call, total) = compact_limits();
     for task in [BuiltInTask::Ner, BuiltInTask::Keyphrases, BuiltInTask::Summarize, BuiltInTask::Answer] {

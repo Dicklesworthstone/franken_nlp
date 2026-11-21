@@ -112,7 +112,8 @@ fn all_tasks_publish_only_authenticated_progress_and_public_model_provenance() {
             candidate_format: "fixture-candidate-format", quant_recipe: "fixture-grouped-int4",
             group_width: args.group_width, integer_kernel: common.kernel.kind().id(),
             snapshot: Some(SnapshotRecord::new("loaded", common.snapshot_need)),
-            compute_schedule: None, input_encoding: None, encoding_work_limits: None, output: &report,
+            compute_schedule: None, prefill_schedule: None,
+            input_encoding: None, encoding_work_limits: None, output: &report,
         };
         let mut bytes = Vec::new(); publish(&response, job_cli::REPORT_BYTES, &mut bytes).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -122,6 +123,7 @@ fn all_tasks_publish_only_authenticated_progress_and_public_model_provenance() {
         assert_eq!(value["group_width"], args.group_width);
         assert_eq!(value["snapshot"]["format"], INT4_SNAPSHOT_VERSION);
         assert!(value.get("compute_schedule").is_none());
+        assert!(value.get("prefill_schedule").is_none());
         assert!(value.get("input_encoding").is_none());
         assert!(value.get("encoding_work_limits").is_none());
         assert_eq!(value["output"]["attempts"], 3); assert_eq!(value["output"]["committed"], 2);
@@ -146,6 +148,16 @@ fn all_tasks_publish_only_authenticated_progress_and_public_model_provenance() {
         selected.as_object_mut().unwrap().remove("input_encoding");
         selected.as_object_mut().unwrap().remove("encoding_work_limits");
         assert_eq!(selected, value);
+        let prefill = Int4PrefillLimits { max_batch_rows: 4,
+            max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(4).unwrap() };
+        let scheduled = Response { prefill_schedule: Some(PrefillSchedule::new(prefill).unwrap()), ..compact };
+        let mut metadata = serde_json::to_value(&scheduled).unwrap();
+        let schedule = metadata.as_object_mut().unwrap().remove("prefill_schedule").unwrap();
+        assert_eq!(schedule["max_batch_rows"], 4);
+        assert_eq!(schedule["admitted_workspace_bytes"], prefill.max_extra_scratch_bytes);
+        metadata.as_object_mut().unwrap().remove("input_encoding");
+        metadata.as_object_mut().unwrap().remove("encoding_work_limits");
+        assert_eq!(metadata, value);
     }
 }
 
@@ -303,7 +315,7 @@ fn worker_schedule_is_optional_physical_metadata_only() {
             source_root_sha256: &source, model_content_sha256: &content,
             candidate_format: "fixture-candidate-format", quant_recipe: "fixture-grouped-int4",
             group_width: args.group_width, integer_kernel: common.kernel.kind().id(),
-            snapshot: None, compute_schedule: compute::Schedule::for_threads(width),
+            snapshot: None, compute_schedule: compute::Schedule::for_threads(width), prefill_schedule: None,
             input_encoding: None, encoding_work_limits: None, output: &report,
         };
         let mut bytes = Vec::new();

@@ -42,7 +42,7 @@ and the CLI and host reserve the extra scratch once. See
 [structured cohort packing](int4-structured-cohorts.md#packed-prompt-and-feedback-passes)
 for the schedule, memory quote and ordered delivery contract.
 
-Serial structured batches, maps, other retained structured jobs, resolution, redaction and
+Serial structured streams, maps, complete-document retained jobs, resolution, redaction and
 semantic extraction keep their existing prompt schedules and reject this option,
 including programmatically constructed requests. Their independent
 document/head/chunk cohort options remain separate. Generation/chat retain
@@ -87,6 +87,40 @@ that field; private stored results keep their existing schema.
 The [sampled-sentiment commands](native-sampled-sentiment-int4.md) have their own
 explicit prompt schedule. Their durable recipe freezes that choice; the
 generation/chat rule allowing physical row changes does not alter it.
+
+### Retained extraction and source tasks
+
+The `extract-job`, `ner-job`, `keyphrases-job`, `summarize-job` and `answer-job`
+commands accept `--prefill-rows N` on both `start` and `resume`, with the same
+range of 1 through 64. Each retained item uses bounded prompt morsels within
+its own exclusive session. This option also works with `--input-encoding
+safe-bpe-v1`; extraction additionally supports its existing exact selected-row
+projection. Source-task jobs retain full-vocabulary projection.
+
+Use `--compute-threads 1` with this option. The CLI validates the full memory
+envelope before reading private inputs. Hosted execution independently admits
+the extra prompt workspace, compact-encoder workspace, native allocation and
+retained-input buffers before dispatch. These reservations remain owned until
+the worker has physically finished.
+
+Prompt width is a physical schedule and may change on authenticated resume,
+including switching between serial and layer-major execution. It does not
+change the job recipe, result schema, input policy, lifetime native/mask-work
+limits or tokenizer allowance. Committed items remain skipped. Pending items
+retain their original cumulative debits and restart with empty logical KV.
+Completion reports add the same optional `prefill_schedule` object described
+above; serial reports omit it.
+
+Library callers can opt into `NativeInt4ExtractionBatch::new_layer_major`,
+`NativeInt4SourceBatch::new_layer_major`, and the corresponding
+`Int4ExtractionJobProcessor` and `Int4SourceJobProcessor` constructors. The
+hosted entry points are `NlpEngine::job_int4_extract_layer_major` and
+`NlpEngine::job_int4_source_layer_major`. Existing constructors keep serial
+execution. The ignored pinned-model gate
+`complete_structured_jobs_match_serial_results_and_resume_without_reexecution`
+covers complete output/work equivalence and retained replay across schedules;
+it must pass under the repository's authorized build controller before these
+paths can claim numerical qualification or model-tested parity.
 
 The separate [scoring-cohort mode](int4-scoring-cohorts.md) groups independent
 heads with `--cohort-heads N`. It cannot be combined with `--prefill-rows` and

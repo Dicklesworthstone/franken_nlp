@@ -8,7 +8,7 @@ use super::*;
 use crate::{
     native_engine::{constrained_int4::{self, Int4JsonBudget, Int4JsonError, sparse::Int4JsonSparseLimits},
         strict_int4::{Int4MemoryRequirement, Int4RunBudget, Int4Work, StrictInt4Engine,
-            StrictInt4Error, STRICT_INT4_PROFILE}},
+            StrictInt4Error, STRICT_INT4_PROFILE, prefill::Int4PrefillLimits}},
     tasks::{extract::grouped_int4::Int4ExtractError,
         source_planning::grouped_int4::{Int4SourceError, Int4SourceTaskRun, PreparedInt4SourceTask}},
     tokenizer::untrusted::UntrustedEncoding,
@@ -173,10 +173,22 @@ impl<'p, 'e, 'weights, 'v, A: Int4SourceBatchAdmission> NativeInt4SourceBatch<'p
         }
         constrained_int4::check_model(compiler.base_execution_identity(), engine.model_identity())
             .map_err(|_| BatchCode::Admission)?;
-        let driver = NativeDriver { engine, vocabulary };
+        let driver = NativeDriver { engine, vocabulary, prefill: None };
         if !driver.clean() { return Err(BatchCode::InvalidExecution.into()); }
         let run = RunState::new(limits, compiler.selected_rows());
         Ok(Self { compiler, driver, admission, run })
+    }
+    /// Execute every source-task prompt in bounded causal morsels under the
+    /// original compiler and independent task finalizer. The embedding host
+    /// admits one validated extra workspace for the stream. All work/mask
+    /// allowances and source/selected-row identities keep their exact scope.
+    pub fn new_layer_major(compiler: Int4SourceBatchPlanner<'p>, engine: &'e mut StrictInt4Engine<'weights>,
+        vocabulary: &'v ExtractionVocabulary, admission: A, limits: Int4SourceBatchLimits,
+        prefill: Int4PrefillLimits) -> Result<Self, BatchFault> {
+        prefill.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        let mut processor = Self::new_with_document_encoding(compiler, engine, vocabulary, admission, limits)?;
+        processor.driver.prefill = Some(prefill);
+        Ok(processor)
     }
     pub fn reserved_model_work(&self) -> Int4Work { self.run.reserved }
     pub fn reserved_mask_visits(&self) -> u64 { self.run.mask_visits }
@@ -262,14 +274,21 @@ trait Driver {
     fn execute<C: DecodeStepControl>(&mut self, prepared: &PreparedInt4SourceTask, identity: &ExecutionIdentity,
         budget: Int4JsonBudget, control: &mut C) -> Result<Int4SourceTaskRun, Int4SourceError>;
 }
-struct NativeDriver<'e, 'weights, 'v> { engine: &'e mut StrictInt4Engine<'weights>, vocabulary: &'v ExtractionVocabulary }
+struct NativeDriver<'e, 'weights, 'v> {
+    engine: &'e mut StrictInt4Engine<'weights>, vocabulary: &'v ExtractionVocabulary,
+    prefill: Option<Int4PrefillLimits>,
+}
 impl Driver for NativeDriver<'_, '_, '_> {
     fn capacity(&self) -> usize { self.engine.kv_cache().capacity_positions() }
     fn group_width(&self) -> usize { self.engine.model_identity().group_width() }
     fn clean(&self) -> bool { !self.engine.is_poisoned() && self.engine.kv_cache().all_slots_have_len(0) }
     fn execute<C: DecodeStepControl>(&mut self, prepared: &PreparedInt4SourceTask, identity: &ExecutionIdentity,
         budget: Int4JsonBudget, control: &mut C) -> Result<Int4SourceTaskRun, Int4SourceError> {
-        prepared.execute_with_control(identity, self.engine, self.vocabulary, budget, control)
+        match self.prefill {
+            None => prepared.execute_with_control(identity, self.engine, self.vocabulary, budget, control),
+            Some(prefill) => prepared.execute_layer_major_with_control(identity, self.engine,
+                self.vocabulary, budget, prefill, control),
+        }
     }
 }
 fn preflight(prepared: &PreparedInt4SourceTask, driver: &impl Driver) -> Result<u64, BatchItemFailure> {

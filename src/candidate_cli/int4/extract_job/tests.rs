@@ -90,6 +90,57 @@ fn persistent_width_is_explicit_and_never_replenishes_retained_native_or_mask_wo
 }
 
 #[test]
+fn prompt_morsels_compose_with_selected_compact_jobs_without_renewing_work() {
+    for operation in ["start", "resume"] { for compact in [false, true] { for selected in [false, true] {
+        let mut extra = vec!["--preparation-mib", "1024"];
+        if compact { extra.extend(["--input-encoding", "safe-bpe-v1"]); }
+        if selected { extra.extend(["--max-selected-rows", "4096"]); }
+        extra.extend([if operation == "start" { "--spool-input" } else { "--use-retained-input" },
+            "--max-retained-input-mib", "16"]);
+        let (serial, serial_args) = command(operation, &extra);
+        let baseline = serial.args.validate(&serial_args).unwrap();
+        let fixed = lifetime(&serial.args, &serial_args, baseline);
+        let base_job = serial.args.lifetime_limits(&serial_args, baseline, fixed).unwrap();
+        for rows in ["1", "3", "64"] {
+            let mut scheduled = extra.clone(); scheduled.extend(["--prefill-rows", rows]);
+            let (c, args) = command(operation, &scheduled);
+            let common = c.args.validate(&args).unwrap();
+            let prefill = common.prefill.unwrap();
+            assert_eq!(prefill.max_batch_rows, rows.parse::<usize>().unwrap());
+            assert_eq!(prefill.validate().unwrap(),
+                Int4PrefillLimits::required_extra_scratch_bytes(prefill.max_batch_rows).unwrap());
+            assert_eq!(common.compute.threads, 1);
+            assert_eq!(common.native, baseline.native);
+            assert_eq!(c.args.extraction.budget(&args, common),
+                serial.args.extraction.budget(&serial_args, baseline));
+            let admitted = c.args.lifetime_limits(&args, common, fixed).unwrap();
+            assert_eq!(admitted.native.max_model_work, base_job.native.max_model_work);
+            assert_eq!(admitted.native.masks.max_visits_per_run, fixed.max_work.mask_node_visits);
+            assert_eq!(admitted.native.masks.max_visits_per_item, base_job.native.masks.max_visits_per_item);
+            assert_eq!(admitted.encoding_work_limits, base_job.encoding_work_limits);
+            assert_eq!(admitted.encoding_workspace_bytes, base_job.encoding_workspace_bytes);
+            assert_eq!(admitted.buffer_bytes, base_job.buffer_bytes);
+            assert!(admitted.common.minimum_memory_bytes >= base_job.common.minimum_memory_bytes);
+            let mut short = common; short.memory_bytes = admitted.common.minimum_memory_bytes - 1;
+            assert_eq!(c.args.lifetime_limits(&args, short, fixed).unwrap_err().code, "job_population_memory");
+        }
+    } } }
+}
+
+#[test]
+fn invalid_prompt_rows_and_mixed_workers_refuse_before_extraction_job_io() {
+    for rows in ["0", "65", "18446744073709551615"] {
+        let mut words = argv("resume");
+        words.extend(["--prefill-rows", rows].into_iter().map(str::to_owned));
+        if let Ok((c, args)) = parse(words) {
+            assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().exit, ErrorCode::Usage);
+        }
+    }
+    let (c, args) = command("start", &["--prefill-rows", "4", "--compute-threads", "2"]);
+    assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().exit, ErrorCode::Usage);
+}
+
+#[test]
 fn invalid_worker_widths_and_unsupported_schedules_refuse_before_private_io() {
     for width in ["0", "65", "18446744073709551615"] {
         let mut words = argv("start");
@@ -104,7 +155,9 @@ fn invalid_worker_widths_and_unsupported_schedules_refuse_before_private_io() {
     ] {
         let mut words = argv("resume");
         words.extend(extra.into_iter().map(str::to_owned));
-        assert!(parse(words).is_err());
+        if let Ok((c, args)) = parse(words) {
+            assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().exit, ErrorCode::Usage);
+        }
     }
 }
 
@@ -215,7 +268,7 @@ fn shared_schema_is_mandatory_and_no_defaults_or_generation_policy_is_accepted()
     assert!(parse(missing).is_err());
     for extra in [
         vec!["--defaults", "defaults.json"], vec!["--task", "extract"],
-        vec!["--prefill-rows", "1"], vec!["--max-output-bytes", "65536"],
+        vec!["--max-output-bytes", "65536"],
         vec!["--min-new-tokens", "0"], vec!["--logprobs"],
     ] {
         let mut words = argv("start"); words.extend(extra.into_iter().map(str::to_owned));
@@ -511,7 +564,6 @@ fn selected_row_caps_are_explicit_and_invalid_caps_refuse_before_private_io() {
             }
         }
         for unsupported in [
-            vec!["--prefill-rows", "1"],
             vec!["--cohort-documents", "2"],
             vec!["--temperature-milli", "0"],
         ] {

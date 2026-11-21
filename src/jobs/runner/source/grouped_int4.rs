@@ -16,7 +16,7 @@ use crate::{
     jobs::{JobLimits, JobWork, manifest::bounded_json, runner::DurableBatchProcessor},
     native_engine::{decode::DecodeStepControl, generation::grouped_int4::bind_candidate_model,
         strict_int4::{Int4MemoryRequirement, Int4ModelIdentity, Int4Work, StrictInt4Engine,
-            STRICT_INT4_EXECUTION}},
+            STRICT_INT4_EXECUTION, prefill::Int4PrefillLimits}},
     tasks::{BuiltInTask, extract::ExtractionVocabulary, ir::TaskBudget,
         source_planning::{SourcePlanningLimits, SourceTaskPlanner, SOURCE_PROMPT_VERSION,
             grouped_int4::{Int4SourceTaskRun, PreparedInt4SourceTask, INT4_SOURCE_EXECUTION}}},
@@ -235,6 +235,16 @@ impl<'p, 'e, 'weights, 'v, A: Int4SourceBatchAdmission> Int4SourceJobProcessor<'
         vocabulary: &'v ExtractionVocabulary, admission: A) -> Result<Self, BatchFault> {
         let native = NativeInt4SourceBatch::new_with_document_encoding(
             planner.compiler()?, engine, vocabulary, admission, planner.native)?;
+        Ok(Self { native, planner })
+    }
+    /// Reuse one caller-admitted prompt workspace across all pending records.
+    /// Physical row width does not change the authenticated source recipe,
+    /// and the same planner Arc retains every spent tokenizer-work counter.
+    pub fn new_layer_major(planner: &'p Int4SourceJobPlanner, engine: &'e mut StrictInt4Engine<'weights>,
+        vocabulary: &'v ExtractionVocabulary, admission: A, prefill: Int4PrefillLimits)
+        -> Result<Self, BatchFault> {
+        let native = NativeInt4SourceBatch::new_layer_major(
+            planner.compiler()?, engine, vocabulary, admission, planner.native, prefill)?;
         Ok(Self { native, planner })
     }
 }

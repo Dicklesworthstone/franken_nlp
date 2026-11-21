@@ -12,6 +12,7 @@ use crate::{
     native_engine::strict_int4::{StrictInt4Error, weights::snapshot::INT4_SNAPSHOT_VERSION},
     tasks::extract::ExtractionVocabulary,
 };
+use super::super::scored_batch::runtime::PrefillSchedule;
 
 pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     job: JobArgs, _admitted: Int4Limits, input: R, output: &mut impl Write) -> Result<(), Failure> {
@@ -20,6 +21,9 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let input_memory = job.storage.input_retention.input_memory()?;
     // Recheck options at the owned boundary before private IO/runtime creation.
     let common = job.validate(&args)?;
+    if !super::super::prefill::matches(&args, common)? {
+        return Err(CandidateError::Arguments.into());
+    }
     let encoding = job.extraction.encoding_policy(&args, common.max_prompt_tokens)?;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
@@ -83,7 +87,10 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         mode: open_mode(mode, job.storage.input_retention)?, materialize };
     // Only the real host opens the protected job, authenticates the exact
     // population/recipe, skips committed ordinals and admits pending forwards.
-    let progress = if common.compute.threads == 1 {
+    let progress = if let Some(prefill) = common.prefill {
+        engine.job_int4_extract_layer_major(&model, planner, vocabulary, request, host,
+            common.kernel, prefill, reader, cancellation.clone())
+    } else if common.compute.threads == 1 {
         engine.job_int4_extract(&model, planner, vocabulary, request, host,
             common.kernel, reader, cancellation.clone())
     } else {
@@ -105,6 +112,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         quant_recipe: &identity.quant_recipe, group_width: model.model_identity().group_width(),
         integer_kernel: common.kernel.kind().id(), snapshot,
         compute_schedule: compute::Schedule::for_threads(common.compute.threads),
+        prefill_schedule: common.prefill.map(PrefillSchedule::new).transpose()?,
         max_selected_rows,
         input_encoding: input_encoding::reported_policy(&encoding),
         encoding_work_limits: limits.encoding_work_limits, output: &report,
@@ -193,6 +201,8 @@ struct Response<'a, T: Serialize> {
     snapshot: Option<SnapshotRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compute_schedule: Option<compute::Schedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefill_schedule: Option<PrefillSchedule>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_selected_rows: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
