@@ -95,14 +95,25 @@ impl Int4ExtractPlan {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_builtin_with_encoding(task: &TaskPlan, schema: &str, options: JsonDecodeOptions, limits: CompileLimits,
         controls: &TemplateControlIds, source: Option<(&SourceDocument, SourceRuntimeLimits)>,
-        task_identity: &'static str, mut identity: ExecutionIdentity, group_width: usize,
+        task_identity: &'static str, identity: ExecutionIdentity, group_width: usize,
         encoding: &UntrustedEncoding) -> Result<Self, Int4ExtractError> {
+        Self::from_builtin_with_encoding_control(task, schema, options, limits, controls, source,
+            task_identity, identity, group_width, encoding, &mut || None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_builtin_with_encoding_control<F: FnMut() -> Option<DecodeCancellationKind>>(
+        task: &TaskPlan, schema: &str, options: JsonDecodeOptions, limits: CompileLimits,
+        controls: &TemplateControlIds, source: Option<(&SourceDocument, SourceRuntimeLimits)>,
+        task_identity: &'static str, mut identity: ExecutionIdentity, group_width: usize,
+        encoding: &UntrustedEncoding, checkpoint: &mut F) -> Result<Self, Int4ExtractError> {
         // Refuse profile, candidate namespace and group mismatch BEFORE any
         // source copies or grammar construction. Model identity is rechecked
         // against actual resident weights by the native execution boundary.
         constrained_int4::check_profile(&identity, group_width)?;
         if identity.task_spec != task_identity { return Err(Int4ExtractError::Identity); }
-        let extraction = ExtractPlan::from_builtin_with_encoding(task, schema, options, limits, controls, source, task_identity, encoding)?;
+        let extraction = ExtractPlan::from_builtin_with_encoding_control(task, schema, options, limits,
+            controls, source, task_identity, encoding, checkpoint)?;
         let work = constrained_int4::planned_work(group_width, extraction.prompt.len(), extraction.options.max_new_tokens)?;
         identity.taskir_digest = extraction.taskir_digest;
         identity.prompt_digest = extraction.prompt_digest;
@@ -117,6 +128,7 @@ impl Int4ExtractPlan {
             INT4_EXTRACT_VERSION, INT4_JSON_EXECUTION, "comparison-subject-group-width-v1", extraction.policy_digest,
         )).map_err(|_| ExtractError::Serialization)?);
         identity.validate().map_err(|_| Int4ExtractError::Identity)?;
+        if let Some(cause) = checkpoint() { return Err(ExtractError::Decode(JsonDecodeError::Cancelled(cause)).into()); }
         Ok(Self { extraction, identity, comparison_policy_digest, group_width, work, selected_rows: None })
     }
 

@@ -252,6 +252,34 @@ fn cancellation_before_and_after_compilation_remains_typed() {
 }
 
 #[test]
+fn every_source_task_propagates_original_cancellation_from_index_construction() {
+    use DecodeCancellationKind::*;
+    struct Control { calls: usize, at: usize, cause: DecodeCancellationKind }
+    impl DecodeStepControl for Control {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.calls += 1; (self.calls == self.at).then_some(self.cause)
+        }
+    }
+    let p = planner();
+    let source = "ébanana ".repeat(200);
+    for r in [ner(&source), keyphrases(&source), summary(&source), answer(&[("passage", &source)])] {
+        let id = identity(&p, &r);
+        let context = PlanContext::new(&id, budget()).unwrap();
+        let mut completed = Control { calls: 0, at: usize::MAX, cause: User };
+        p.plan_int4_with_control(&r, &context, SourcePlanningLimits::default(), 32, &mut completed).unwrap();
+        assert!(completed.calls > 20);
+        for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast,
+            RaceLost, ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+            let mut control = Control { calls: 0, at: completed.calls / 2, cause };
+            let failure = p.plan_int4_with_control(&r, &context, SourcePlanningLimits::default(), 32,
+                &mut control).err().expect("source compiler must observe its original control");
+            assert_eq!(failure.cancellation(), Some(cause));
+            assert_eq!(control.calls, control.at);
+        }
+    }
+}
+
+#[test]
 fn ner_preserves_all_unicode_occurrences_and_the_quantized_profile() {
     let p = planner(); let source = "é上海 and 上海"; let r = ner(source); let prepared = prepare(&p, &r);
     let run = prepared.finish(synthetic(&prepared, &r, source, r#"[{"text":"上海","type":"location"}]"#)).unwrap();

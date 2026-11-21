@@ -13,11 +13,11 @@ use crate::{
     grammar::{
         CompileLimits, SchemaError,
         mask::{VocabMaskOracle, VocabTrie},
-        runtime::{JSON_RUNTIME_VERSION, SOURCE_JSON_RUNTIME_VERSION, JsonProgram, SourceRuntimeLimits},
+        runtime::{JSON_RUNTIME_VERSION, SOURCE_JSON_RUNTIME_VERSION, JsonProgram, SourceCompileError, SourceRuntimeLimits},
     },
     native_engine::{
         constrained::{JsonDecodeError, JsonDecodeOptions, JsonDecodeOutput, JsonWorkBudget, decode_json_eager},
-        decode::DecodeStepControl,
+        decode::{DecodeCancellationKind, DecodeStepControl},
         hf_bf16_eager::{HF_BF16_EAGER_PROFILE, HfBf16EagerEngine},
         lmhead::NANBEIGE_VOCAB_SIZE,
     },
@@ -170,11 +170,25 @@ impl ExtractPlan {
     /// plan. Legacy trusted TaskIR construction retains its byte policy.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_builtin_with_encoding(
-        task: &TaskPlan, schema_source: &str, mut options: JsonDecodeOptions,
-        mut limits: CompileLimits, controls: &TemplateControlIds,
+        task: &TaskPlan, schema_source: &str, options: JsonDecodeOptions,
+        limits: CompileLimits, controls: &TemplateControlIds,
         source: Option<(&SourceDocument, SourceRuntimeLimits)>, task_identity: &'static str,
         encoding: &UntrustedEncoding,
     ) -> Result<Self, ExtractError> {
+        Self::from_builtin_with_encoding_control(task, schema_source, options, limits, controls,
+            source, task_identity, encoding, &mut || None)
+    }
+
+    /// The original request control also owns source-index construction;
+    /// cancellation must not be flattened into an invalid-schema refusal.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_builtin_with_encoding_control<F: FnMut() -> Option<DecodeCancellationKind>>(
+        task: &TaskPlan, schema_source: &str, mut options: JsonDecodeOptions,
+        mut limits: CompileLimits, controls: &TemplateControlIds,
+        source: Option<(&SourceDocument, SourceRuntimeLimits)>, task_identity: &'static str,
+        encoding: &UntrustedEncoding, checkpoint: &mut F,
+    ) -> Result<Self, ExtractError> {
+        if let Some(cause) = checkpoint() { return Err(ExtractError::Decode(JsonDecodeError::Cancelled(cause))); }
         encoding.validate().map_err(|_| ExtractError::Contract("invalid extraction document encoding policy"))?;
         if source.is_some_and(|(document, _)| document.document_encoding() != encoding) {
             return Err(ExtractError::Contract("source encoding differs from extraction policy"));
@@ -232,10 +246,15 @@ impl ExtractPlan {
         let program = match source {
             Some((document, source_limits)) => {
                 document.verify_task(ir, controls)?;
-                JsonProgram::compile_with_source(schema_source, document.text(), limits, source_limits)
+                JsonProgram::compile_with_source_control(schema_source, document.text(), limits, source_limits, checkpoint)
+                    .map_err(|error| match error {
+                        SourceCompileError::Schema(error) => ExtractError::Schema(error),
+                        SourceCompileError::Cancelled(cause) => ExtractError::Decode(JsonDecodeError::Cancelled(cause)),
+                    })
             }
-            None => JsonProgram::compile(schema_source, limits),
-        }.map_err(ExtractError::Schema)?;
+            None => JsonProgram::compile(schema_source, limits).map_err(ExtractError::Schema),
+        }?;
+        if let Some(cause) = checkpoint() { return Err(ExtractError::Decode(JsonDecodeError::Cancelled(cause))); }
         if source.is_some() && !program.requires_source() {
             return Err(ExtractError::Contract("source plan requires a verbatim field"));
         }
@@ -253,6 +272,7 @@ impl ExtractPlan {
         let mut prompt = Vec::new();
         prompt.try_reserve_exact(prompt_len).map_err(|_| ExtractError::AllocationRefused)?;
         prompt.extend(ir.prompt_segments().iter().flat_map(|segment| segment.token_ids().iter().copied()));
+        if let Some(cause) = checkpoint() { return Err(ExtractError::Decode(JsonDecodeError::Cancelled(cause))); }
         Ok(Self {
             task_identity, program, prompt, options, controls: controls.ids().clone(), taskir_digest,
             prompt_digest, schema_digest, policy_digest,

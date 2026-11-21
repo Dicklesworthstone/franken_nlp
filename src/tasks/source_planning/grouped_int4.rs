@@ -120,8 +120,8 @@ pub struct PreparedInt4SourceTask {
 }
 impl SourceTaskPlanner {
     /// The context must already identify the strict-v2 candidate and exact
-    /// group partition. Safe-BPE polls inside its bounded encoding work; other
-    /// compiler operations remain cooperative around calls, without OS preemption.
+    /// group partition. Encoding and source-index construction poll inside
+    /// bounded work; schema compilation remains bracketed, without OS preemption.
     pub fn plan_int4_with_control<C: DecodeStepControl>(&self, request: &SourceTaskRequest,
         context: &PlanContext<'_>, limits: SourcePlanningLimits, group_width: usize, control: &mut C)
         -> Result<PreparedInt4SourceTask, Int4SourceError> {
@@ -142,8 +142,9 @@ impl SourceTaskPlanner {
             let task = self.task(kind, document, schema, context, budget, limits)?;
             let decode = JsonDecodeOptions { max_new_tokens: budget.max_output_tokens as usize,
                 eos_token_id: self.eos, excluded_token_ids: Default::default() };
-            let extraction = Int4ExtractPlan::from_builtin(&task, schema, decode, limits.compiler, &self.controls,
-                Some((document, limits.source)), task_spec, context.execution_identity().clone(), group_width)?
+            let extraction = Int4ExtractPlan::from_builtin_with_encoding_control(&task, schema, decode, limits.compiler, &self.controls,
+                Some((document, limits.source)), task_spec, context.execution_identity().clone(), group_width,
+                document.document_encoding(), &mut || control.prefill_checkpoint(0))?
                 .with_finalizer_version(INT4_SOURCE_EXECUTION)?;
             checkpoint(control)?;
             Ok((extraction, document.document_encoding().clone(), document.input_encoding_work()))
@@ -174,6 +175,7 @@ impl SourceTaskPlanner {
         checkpoint(control)?;
         let request_digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(request)
             .map_err(|_| SourcePlanningError::Serialization)?);
+        checkpoint(control)?;
         Ok(PreparedInt4SourceTask { extraction, finalizer, budget, request_digest,
             input_encoding, input_encoding_work })
     }

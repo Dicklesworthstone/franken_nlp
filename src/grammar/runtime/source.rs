@@ -5,10 +5,24 @@
 
 use serde::{Deserialize, Serialize};
 use super::*;
-use crate::grammar::source_index::SourceLanguageLimits;
+use crate::grammar::source_index::{SourceBuildError, SourceLanguageLimits};
 use crate::validation::grounded_fields::{GroundingBudget, SourceFieldEvidence, verify_source_fields};
 
 pub const SOURCE_JSON_RUNTIME_VERSION: &str = "canonical-source-json-runtime-v1";
+
+/// Source compilation keeps request cancellation distinct from an invalid
+/// schema or a source-language resource refusal.
+#[derive(Debug)]
+pub enum SourceCompileError<E> { Schema(SchemaError), Cancelled(E) }
+impl<E> std::fmt::Display for SourceCompileError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Schema(error) => write!(f, "{error}"),
+            Self::Cancelled(_) => f.write_str("source JSON compilation cancelled"),
+        }
+    }
+}
+impl<E: std::fmt::Debug> std::error::Error for SourceCompileError<E> {}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -27,13 +41,36 @@ impl JsonProgram {
     /// external authority digest in place of the actual source. Callers must
     /// separately bind these bytes to their prompt and ExecutionIdentity.
     pub fn compile_with_source(
-        schema: &str, document: &str, limits: CompileLimits, mut source_limits: SourceRuntimeLimits,
+        schema: &str, document: &str, limits: CompileLimits, source_limits: SourceRuntimeLimits,
     ) -> Result<Self, SchemaError> {
-        if schema.len() > limits.max_schema_bytes { return Err(resource("schema byte limit exceeded")); }
+        match Self::compile_with_source_control(schema, document, limits, source_limits,
+            &mut || None::<std::convert::Infallible>) {
+            Ok(program) => Ok(program),
+            Err(SourceCompileError::Schema(error)) => Err(error),
+            Err(SourceCompileError::Cancelled(never)) => match never {},
+        }
+    }
+
+    /// Source counting, copying, sorting and index filtering poll the original
+    /// request callback at bounded intervals. Schema compilation is separately
+    /// bounded by CompileLimits and bracketed by that same callback.
+    pub fn compile_with_source_control<E, F: FnMut() -> Option<E>>(
+        schema: &str, document: &str, limits: CompileLimits, mut source_limits: SourceRuntimeLimits,
+        checkpoint: &mut F,
+    ) -> Result<Self, SourceCompileError<E>> {
+        if let Some(cause) = checkpoint() { return Err(SourceCompileError::Cancelled(cause)); }
+        if schema.len() > limits.max_schema_bytes {
+            return Err(SourceCompileError::Schema(resource("schema byte limit exceeded")));
+        }
         source_limits.verification.max_matches = source_limits.verification.max_matches.min(source_limits.index.max_matches);
-        let language = SourceLanguage::build(document, source_limits.index)
-            .map_err(|e| resource(&e.to_string()))?;
-        Self::compile_bound(schema, limits, Some(SourceBinding { language, limits: source_limits }))
+        let language = SourceLanguage::build_with_control(document, source_limits.index, checkpoint)
+            .map_err(|error| match error {
+                SourceBuildError::Source(error) => SourceCompileError::Schema(resource(&error.to_string())),
+                SourceBuildError::Cancelled(cause) => SourceCompileError::Cancelled(cause),
+            })?;
+        let program = Self::compile_bound(schema, limits, Some(SourceBinding { language, limits: source_limits }));
+        if let Some(cause) = checkpoint() { return Err(SourceCompileError::Cancelled(cause)); }
+        program.map_err(SourceCompileError::Schema)
     }
 
     #[must_use]
@@ -172,6 +209,28 @@ mod tests {
         assert_eq!(program(STRING, "Alice").version(), SOURCE_JSON_RUNTIME_VERSION);
         assert_eq!(JsonProgram::compile(r#"{"type":"string"}"#, CompileLimits::default()).unwrap().version(), JSON_RUNTIME_VERSION);
         assert!(JsonProgram::compile(STRING, CompileLimits::default()).is_err());
+    }
+    #[test]
+    fn source_compile_preserves_cancellation_and_language_authority() {
+        let source = "ébanana".repeat(1025);
+        let expected = program(STRING, &source);
+        let mut calls = 0;
+        let actual = JsonProgram::compile_with_source_control(STRING, &source,
+            CompileLimits::default(), SourceRuntimeLimits::default(), &mut || {
+                calls += 1; None::<u8>
+            }).unwrap();
+        assert!(calls > 20);
+        assert_eq!(expected.sampling_digest(), actual.sampling_digest());
+        assert_eq!(expected.source_fields("\"ébanana\"").unwrap(), actual.source_fields("\"ébanana\"").unwrap());
+        for cancel_at in [1, calls / 2, calls] {
+            let mut observed = 0;
+            let result = JsonProgram::compile_with_source_control(STRING, &source,
+                CompileLimits::default(), SourceRuntimeLimits::default(), &mut || {
+                    observed += 1; (observed == cancel_at).then_some(7_u8)
+                });
+            assert!(matches!(result, Err(SourceCompileError::Cancelled(7))));
+            assert_eq!(observed, cancel_at);
+        }
     }
     #[test]
     fn scalar_caps_and_empty_sources_remain_exact() {

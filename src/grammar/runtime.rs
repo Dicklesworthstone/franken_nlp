@@ -19,7 +19,7 @@ use super::{
 };
 
 mod source;
-pub use source::{SOURCE_JSON_RUNTIME_VERSION, SourceRuntimeLimits};
+pub use source::{SOURCE_JSON_RUNTIME_VERSION, SourceCompileError, SourceRuntimeLimits};
 
 /// Versioned canonical byte-language and code-point length semantics.
 pub const JSON_RUNTIME_VERSION: &str = "canonical-json-runtime-v1";

@@ -158,17 +158,22 @@ impl Int4ExtractionBatchPlanner {
             .ok_or_else(|| BatchCode::InvalidLimits.into())
     }
 
-    /// The SAME caller control brackets bounded tokenization/schema work; no
-    /// new deadline, poll quota or no-op controller is installed here.
+    /// The SAME caller control covers encoding and source-index sort work;
+    /// no new deadline, poll quota or no-op controller is installed here.
     pub fn prepare_with_control<C: DecodeStepControl>(&self, document: BatchDocument<ExtractionBatchArgs>,
         control: &mut C) -> Result<PreparedInt4BatchExtraction, BatchItemFailure> {
         if self.document_encoding != UntrustedEncoding::ByteFallback {
             return self.prepare_with_document_encoding(document, &self.document_encoding, control);
         }
         checkpoint(control)?;
-        let result = self.prepare(document);
+        if self.shared_defaults_only && document.task_args.is_some() {
+            return Err(BatchItemFailure::reject(BatchCode::InvalidEnvelope));
+        }
+        let input = self.compiler.prepare_input_with_encoding(document, &UntrustedEncoding::ByteFallback,
+            &mut || control.prefill_checkpoint(0)).map_err(planning_fault)?;
+        let result = self.prepare_from_input(input, &mut || control.prefill_checkpoint(0))?;
         checkpoint(control)?;
-        result
+        Ok(result)
     }
     pub fn prepare(&self, document: BatchDocument<ExtractionBatchArgs>) -> Result<PreparedInt4BatchExtraction, BatchItemFailure> {
         self.require_byte_encoding().map_err(BatchItemFailure::reject)?;
@@ -176,7 +181,7 @@ impl Int4ExtractionBatchPlanner {
             return Err(BatchItemFailure::reject(BatchCode::InvalidEnvelope));
         }
         let input = self.compiler.prepare_input(document).map_err(planning_fault)?;
-        self.prepare_from_input(input)
+        self.prepare_from_input(input, &mut || None)
     }
     /// Explicit one-request schema/source encoding. One nonrenewable ledger
     /// spans both untrusted segments; selected-row planning remains independent.
@@ -213,9 +218,9 @@ impl Int4ExtractionBatchPlanner {
         // Debit before propagating any encoding or cancellation failure.
         *used = used.checked_add(work).ok_or_else(|| BatchItemFailure::fatal(BatchCode::WorkLimit))?;
         let input = input.map_err(planning_fault)?;
-        let result = self.prepare_from_input(input);
+        let result = self.prepare_from_input(input, &mut || control.prefill_checkpoint(0))?;
         checkpoint(control)?;
-        result
+        Ok(result)
     }
 
     /// Only composed planning supplies an existing work ledger. A public
@@ -233,18 +238,20 @@ impl Int4ExtractionBatchPlanner {
         }
         let input = self.compiler.prepare_input_with_encoding_work(document, policy, work,
             &mut || control.prefill_checkpoint(0)).map_err(planning_fault)?;
-        let result = self.prepare_from_input(input);
+        let result = self.prepare_from_input(input, &mut || control.prefill_checkpoint(0))?;
         checkpoint(control)?;
-        result
+        Ok(result)
     }
-    fn prepare_from_input(&self, input: ExtractionInput) -> Result<PreparedInt4BatchExtraction, BatchItemFailure> {
+    fn prepare_from_input<F: FnMut() -> Option<DecodeCancellationKind>>(&self,
+        input: ExtractionInput, checkpoint: &mut F) -> Result<PreparedInt4BatchExtraction, BatchItemFailure> {
         let ExtractionInput { task, source, schema, options, grounded, encoding, .. } = input;
         let request_digest = extraction_request_digest(source.text(), &schema,
             if grounded { ExtractionBatchGrounding::SourceMembership } else { ExtractionBatchGrounding::Structural },
             *task.ir().budget()).map_err(BatchItemFailure::fatal)?;
         let c = &self.compiler;
-        let plan = Int4ExtractPlan::from_builtin_with_encoding(&task, &schema, options, c.compiler_limits,
-            &c.controls, grounded.then_some((&source, c.source_limits)), "extract-v1", c.identity.clone(), self.group_width, &encoding)
+        let plan = Int4ExtractPlan::from_builtin_with_encoding_control(&task, &schema, options, c.compiler_limits,
+            &c.controls, grounded.then_some((&source, c.source_limits)), "extract-v1", c.identity.clone(), self.group_width,
+            &encoding, checkpoint)
             .map_err(planning_failure)?;
         let plan = match self.selected_rows {
             Some(limits) => plan.with_selected_rows(limits).map_err(planning_failure)?,
@@ -517,6 +524,42 @@ mod tests {
             };
             assert!(error.stop); assert_eq!(control.calls, at + 1);
             assert_eq!(error.fault.cancellation, Some(DecodeCancellationKind::CostBudget));
+        }
+    }
+
+    #[test]
+    fn source_index_cancellation_stays_terminal_in_byte_and_compact_preparation() {
+        use DecodeCancellationKind::*;
+        let planner = planner(127, None);
+        let source = "ébanana ".repeat(200);
+        let make = || document(r#"{"type":"string","x-fnlp-source":"verbatim"}"#,
+            &source, ExtractionBatchGrounding::SourceMembership);
+        let compact = UntrustedEncoding::SafeBpeV1(crate::tokenizer::untrusted::SafeBpeLimits {
+            max_input_bytes: 8192, max_output_tokens: 4096,
+            max_pair_checks: 1 << 26, max_pair_bytes: 1 << 29,
+        });
+        for policy in [UntrustedEncoding::ByteFallback, compact] {
+            // Locate the same preparation's encoding boundary without fixing
+            // tokenizer callback counts. Nine later callbacks are inside the
+            // multi-pass source-index construction, before the plan exists.
+            let mut input_calls = 0;
+            planner.compiler.prepare_input_with_encoding(make(), &policy, &mut || {
+                input_calls += 1; None
+            }).unwrap();
+            let cancel_at = 1 + input_calls + 8;
+            for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast,
+                RaceLost, ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+                let mut control = Stop { calls: 0, at: cancel_at, cause };
+                let result = if policy == UntrustedEncoding::ByteFallback {
+                    planner.prepare_with_control(make(), &mut control)
+                } else {
+                    planner.prepare_with_document_encoding(make(), &policy, &mut control)
+                };
+                let failure = result.err().expect("source construction must be cancelled");
+                assert!(failure.stop);
+                assert_eq!(failure.fault.cancellation, Some(cause));
+                assert_eq!(control.calls, cancel_at + 1, "the first cause must not be repolled or replaced");
+            }
         }
     }
 
