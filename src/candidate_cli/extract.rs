@@ -25,18 +25,47 @@ pub(crate) struct ExtractCommand {
     /// Requires at least one annotated field; this is not semantic verification.
     #[arg(long)]
     pub(super) source_membership: bool,
+    #[arg(skip)]
+    pub(super) encoding: input_encoding::InputEncodingArgs,
 }
 
 pub(super) fn definition() -> clap::Command {
-    ExtractCommand::augment_args(clap::Command::new("extract")
+    input_encoding::definition(ExtractCommand::augment_args(clap::Command::new("extract")
         .about("Extract using an exact local JSON schema and constrained INT8 decoding")
-        .long_about("Compile a bounded user schema and exact source before loading weights. The supported schema subset is the existing grammar compiler's; unsupported keywords fail closed. Schema validity does not prove extracted facts. Use --source-membership for explicit verbatim source fields. --selected-rows explicitly projects the complete legal grammar set instead of the full vocabulary, with a per-step row ceiling that refuses rather than prunes. EOS remains a scored choice; no speed or parity qualification is implied. No sampling, repair retry, remote schema resolution or semantic-verification claim is available."))
+        .long_about("Compile a bounded user schema and exact source before loading weights. The supported schema subset is the existing grammar compiler's; unsupported keywords fail closed. Schema validity does not prove extracted facts. Use --source-membership for explicit verbatim source fields. --selected-rows explicitly projects the complete legal grammar set instead of the full vocabulary, with a per-step row ceiling that refuses rather than prunes. EOS remains a scored choice; no speed or parity qualification is implied. No sampling, repair retry, remote schema resolution or semantic-verification claim is available.")))
+        .after_long_help("--input-encoding safe-bpe-v1 explicitly compacts the exact schema and source while excluding template-control tokens. Both segments share ONE tokenizer allowance, including pair checks, examined pair bytes and actual untrusted tokens. The aggregate input ceiling is max-input-bytes plus the 64-KiB schema allowance, capped at 1 MiB; the separate schema and document byte ceilings still apply. Workspace for the complete allowance is admitted before either file or model IO. The policy binds execution identity and is reported on compact results. Exhaustion refuses without fallback. Original schema numbers, source bytes and citation offsets remain exact. Byte-fallback is the default. Compact input changes prompt tokens and makes no identical-output, quality or measured-speed claim.")
 }
 impl ExtractCommand {
+    pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let mut command = Self::from_arg_matches(matches)?;
+        command.encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+        Ok(command)
+    }
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), CandidateError> {
         self.head.limits()?;
         check_schema_path(&self.schema)?;
-        self.host.common(self.input.clone())
+        let (args, limits) = self.host.common_with_encoding(self.input.clone(), &self.encoding)?;
+        let encoder_bytes = match self.encoding_policy(limits)? {
+            crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback => 0,
+            crate::tokenizer::untrusted::UntrustedEncoding::SafeBpeV1(policy) => policy.requirements()
+                .map_err(|_| CandidateError::Arguments)?.workspace_bytes,
+        };
+        // The source host prices the document-only encoder. Its complete
+        // replacement quote and the original schema coexist with retained
+        // source, grammar and result storage until output delivery finishes.
+        let floor = (256 * MIB).checked_add(self.host.max_input_bytes as u64 * 32)
+            .and_then(|n| n.checked_add(SCHEMA_BYTES as u64 * 32))
+            .and_then(|n| n.checked_add(self.host.max_result_bytes as u64 * 16))
+            .and_then(|n| n.checked_add(encoder_bytes)).ok_or(CandidateError::Arguments)?;
+        if limits.preparation_bytes < floor { return Err(CandidateError::Arguments); }
+        Ok((args, limits))
+    }
+    pub(super) fn encoding_policy(&self, limits: Limits)
+        -> Result<crate::tokenizer::untrusted::UntrustedEncoding, CandidateError> {
+        let bytes = self.host.max_input_bytes.checked_add(SCHEMA_BYTES)
+            .ok_or(CandidateError::Arguments)?
+            .min(crate::tokenizer::untrusted::SafeBpeLimits::MAX_INPUT_BYTES);
+        self.encoding.policy(bytes, limits.max_prompt_tokens)
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
         let (args, limits) = self.validate()?;

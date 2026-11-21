@@ -106,6 +106,80 @@ fn host_budget_reserves_complete_context_and_fixed_schema_cap() {
     assert_eq!(compiler(&command.host).max_output_bytes, command.host.max_result_bytes);
 }
 
+#[test]
+fn compact_extraction_admits_the_complete_schema_and_source_workspace_before_io() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    let cmd = command(&["--input-encoding", "safe-bpe-v1",
+        "--max-tokenizer-pair-checks", "1234", "--max-tokenizer-pair-bytes", "10000"]);
+    let (_, limits) = cmd.validate().unwrap();
+    let UntrustedEncoding::SafeBpeV1(policy) = cmd.encoding_policy(limits).unwrap()
+        else { panic!("compact extraction policy was discarded"); };
+    assert_eq!(policy.max_input_bytes, cmd.host.max_input_bytes + SCHEMA_BYTES);
+    assert_eq!(policy.max_output_tokens, limits.max_prompt_tokens);
+    assert_eq!(policy.max_pair_checks, 1234); assert_eq!(policy.max_pair_bytes, 10000);
+    assert!(limits.preparation_bytes >= 256 * MIB + SCHEMA_BYTES as u64 * 32
+        + policy.requirements().unwrap().workspace_bytes);
+
+    // The document-only reserve fits 512 MiB. The additional exact schema and
+    // its tokenizer workspace must still refuse before any private IO.
+    let cmd = command(&["--input-encoding", "safe-bpe-v1", "--max-input-bytes", "850000"]);
+    cmd.host.common_with_encoding(cmd.input.clone(), &cmd.encoding).unwrap();
+    assert!(cmd.validate().is_err());
+    let cmd = command(&["--input-encoding", "safe-bpe-v1", "--max-input-bytes", "850000",
+        "--preparation-mib", "1024"]);
+    cmd.validate().unwrap();
+
+    let cmd = command(&["--input-encoding", "safe-bpe-v1", "--max-input-bytes", "1048576",
+        "--preparation-mib", "1024"]);
+    let (_, limits) = cmd.validate().unwrap();
+    let UntrustedEncoding::SafeBpeV1(policy) = cmd.encoding_policy(limits).unwrap() else { unreachable!() };
+    assert_eq!(policy.max_input_bytes, SafeBpeLimits::MAX_INPUT_BYTES);
+    assert_eq!(cmd.host.max_input_bytes, 1_048_576);
+}
+
+#[test]
+fn invalid_compact_extraction_arguments_never_open_schema_source_or_model() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private source read") } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("extraction output written") }
+        fn flush(&mut self) -> io::Result<()> { panic!("extraction output flushed") }
+    }
+    for flags in [
+        vec!["--max-tokenizer-pair-checks", "0"],
+        vec!["--max-tokenizer-pair-bytes", "0"],
+        vec!["--max-tokenizer-pair-checks", "67108865"],
+        vec!["--max-tokenizer-pair-bytes", "536870913"],
+        vec!["--max-input-bytes", "850000"],
+        vec!["--max-input-bytes", "1048577", "--preparation-mib", "1024"],
+    ] {
+        let mut args = vec!["--input-encoding", "safe-bpe-v1"];
+        args.extend(flags);
+        assert_eq!(command(&args).execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+    }
+    for flag in ["--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
+        let matches = super::super::definition().try_get_matches_from(["candidate", "extract",
+            "--schema", "must-not-open.json", "--model", "must-not-open.fnlpq",
+            "--memory-mib", "8192", flag, "1"]).unwrap();
+        assert!(CandidateCommand::from_matches(&matches).is_err());
+    }
+}
+
+#[test]
+fn compact_encoding_keeps_original_schema_and_document_caps_and_exact_numbers() {
+    let cmd = command(&["--input-encoding", "safe-bpe-v1", "--max-input-bytes", "64"]);
+    let (_, limits) = cmd.validate().unwrap();
+    let number = "0.12345678901234567890123456789012345678";
+    let schema = format!(" {{\"type\":\"number\",\"const\":{number}}}\n");
+    let request = arguments(schema.clone(), false, cmd.host.task_budget(limits)).unwrap();
+    check_schema(&request, &"x".repeat(64), &cmd.host).unwrap();
+    assert_eq!(request.schema, schema);
+    let program = JsonProgram::compile(&request.schema, compiler(&cmd.host)).unwrap();
+    program.validate_json(number).unwrap();
+    assert_eq!(check_schema(&request, &"x".repeat(65), &cmd.host), Err(CandidateError::Input));
+    assert!(arguments(" ".repeat(SCHEMA_BYTES + 1), false, request.budget).is_err());
+}
+
 #[cfg(not(feature = "asupersync-runtime"))]
 #[test]
 fn disabled_feature_never_reads_schema_source_or_model() {
@@ -119,4 +193,6 @@ fn disabled_feature_never_reads_schema_source_or_model() {
     let diagnostic = String::from_utf8(diagnostics).unwrap();
     assert!(diagnostic.contains("asupersync-runtime"));
     assert!(!diagnostic.contains("local.fnlpq") && !diagnostic.contains("schema.json"));
+    let cmd = command(&["--input-encoding", "safe-bpe-v1"]);
+    assert_eq!(cmd.execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Unavailable));
 }

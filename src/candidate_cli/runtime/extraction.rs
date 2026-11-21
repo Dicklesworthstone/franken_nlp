@@ -8,6 +8,7 @@ use crate::{
     candidate_cli::extract::{self as command, ExtractCommand},
     native_engine::decode::{DecodeCancellationKind, DecodeStepControl},
     tasks::extract::ExtractionVocabulary,
+    tokenizer::untrusted::UntrustedEncoding,
 };
 
 pub(super) fn planner(facts: &ArtifactIdentity, host: &source::SourceHostArgs, limits: Limits,
@@ -30,11 +31,15 @@ pub(super) fn vocabulary() -> Result<Arc<ExtractionVocabulary>, CandidateError> 
 }
 
 fn prepare(planner: &Int8ExtractionBatchPlanner, document: String, request: ExtractionBatchArgs,
-    host: &source::SourceHostArgs, control: &mut impl DecodeStepControl)
+    host: &source::SourceHostArgs, encoding: &UntrustedEncoding, control: &mut impl DecodeStepControl)
     -> Result<PreparedInt8BatchExtraction, CandidateError> {
-    let prepared = planner.prepare_with_control(BatchDocument {
+    let document = BatchDocument {
         id: "cli".to_owned(), text: document, task_args: Some(request),
-    }, control).map_err(|error| match error.fault.cancellation {
+    };
+    let prepared = match encoding {
+        UntrustedEncoding::ByteFallback => planner.prepare_with_control(document, control),
+        UntrustedEncoding::SafeBpeV1(_) => planner.prepare_with_document_encoding(document, encoding, control),
+    }.map_err(|error| match error.fault.cancellation {
         Some(DecodeCancellationKind::Deadline | DecodeCancellationKind::Timeout) => CandidateError::Timeout,
         Some(_) => CandidateError::Execution,
         None => CandidateError::Planning,
@@ -50,6 +55,7 @@ fn prepare(planner: &Int8ExtractionBatchPlanner, document: String, request: Extr
 
 pub(in crate::candidate_cli) fn execute(command: ExtractCommand, args: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+    let encoding = command.encoding_policy(limits)?;
     // Storage-before-charge lifetime: this owner is declared before schema,
     // document, tokenizer, program, executable and output-staging allocations.
     let session = Session::new(&args, limits)?;
@@ -60,7 +66,7 @@ pub(in crate::candidate_cli) fn execute(command: ExtractCommand, args: Candidate
     session.remaining()?;
     let facts = session.facts(&args)?;
     let compiler = planner(&facts, &command.host, limits, None)?;
-    let prepared = prepare(&compiler, document, request, &command.host, &mut session.control())?;
+    let prepared = prepare(&compiler, document, request, &command.host, &encoding, &mut session.control())?;
     // Seal the explicit head choice BEFORE loading/admitting native execution.
     let prepared = command.head.extraction(prepared.into_extraction_plan())?;
     drop(compiler);
@@ -80,6 +86,8 @@ pub(in crate::candidate_cli) fn execute(command: ExtractCommand, args: Candidate
     // The raw extracted JSON remains a STRING in the typed result. Converting
     // it through Value here would destroy the exact decimal/scalar contract.
     // Output and preparation guards remain live until external flush completes.
+    let response = input_encoding::Response { response: &response,
+        input_encoding: input_encoding::reported_policy(&encoding) };
     publish_checked(&response, command.host.max_result_bytes + 4096, output,
         &|| session.remaining().map(|_| ()))
 }

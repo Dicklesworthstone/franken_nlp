@@ -181,7 +181,7 @@ impl CandidateCommand {
             return scored_batch::ScoreBatchCommand::from_matches(matches).map(Self::ScoreBatch);
         }
         if name == "extract" {
-            return extract::ExtractCommand::from_arg_matches(matches).map(Self::Extract);
+            return extract::ExtractCommand::from_matches(matches).map(Self::Extract);
         }
         if name == "batch" {
             return batch::BatchCommand::from_matches(matches).map(Self::Batch);
