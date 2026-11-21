@@ -9,6 +9,7 @@ use crate::{
 #[cfg(feature = "asupersync-runtime")]
 mod runtime;
 pub(in crate::candidate_cli::int4) mod corpus;
+pub(in crate::candidate_cli::int4) mod job;
 #[cfg(test)]
 mod tests;
 

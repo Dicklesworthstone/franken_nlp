@@ -140,6 +140,7 @@ enum Int4Task {
     SampledSentimentCorpus(sampled_sentiment::map::corpus::CorpusArgs),
     SampledSentimentBatch(sampled_sentiment::corpus::BatchArgs),
     SampledSentimentJob,
+    SampledSentimentDocumentJob,
     SentimentMap(sentiment_map::MapArgs),
     SentimentCorpus(sentiment_map::corpus::CorpusArgs),
     Judge(judge::JudgeArgs),
@@ -192,6 +193,7 @@ enum Int4JobCommand {
     ClassificationDocument(classify_document_job::JobCommand),
     SentimentDocument(sentiment_map::job::JobCommand),
     SampledSentiment(sampled_sentiment::job::JobCommand),
+    SampledSentimentDocument(sampled_sentiment::map::job::JobCommand),
     FaithfulnessDocument(faithfulness_map::job::JobCommand),
     QuestionDocument(source_map::corpus::job::JobCommand),
     Source(source_job::JobCommand),
@@ -221,6 +223,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(compute::definition(input_encoding::definition(sampled_sentiment::definition())))
         .subcommand(sampled_sentiment::map::definition())
         .subcommand(sampled_sentiment::map::corpus::definition())
+        .subcommand(sampled_sentiment::map::job::definition())
         .subcommand(compute::definition(input_encoding::definition(sampled_sentiment::corpus::definition())))
         .subcommand(sampled_sentiment::job::definition())
         .subcommand(sentiment_map::threaded_definition())
@@ -315,6 +318,11 @@ impl Int4Command {
             let (job, args) = sampled_sentiment::job::JobCommand::from_matches(matches)?;
             return Ok(Self { task: Int4Task::SampledSentimentJob, args, batch: None,
                 job: Some(Int4JobCommand::SampledSentiment(job)) });
+        }
+        if name == "sentiment-sampled-document-job" {
+            let (job, args) = sampled_sentiment::map::job::JobCommand::from_matches(matches)?;
+            return Ok(Self { task: Int4Task::SampledSentimentDocumentJob, args, batch: None,
+                job: Some(Int4JobCommand::SampledSentimentDocument(job)) });
         }
         if name == "faithfulness-document-job" {
             let (job, args) = faithfulness_map::job::JobCommand::from_matches(matches)?;
@@ -436,6 +444,9 @@ impl Int4Command {
             Self { task: Int4Task::SampledSentimentJob, args, batch: None,
                 job: Some(Int4JobCommand::SampledSentiment(job)) } =>
                 return job.run_owned(args, input, &mut output, diagnostics),
+            Self { task: Int4Task::SampledSentimentDocumentJob, args, batch: None,
+                job: Some(Int4JobCommand::SampledSentimentDocument(job)) } =>
+                return job.run_owned(args, input, &mut output, diagnostics),
             Self { task: Int4Task::Stream(task, options), args, batch: None, job: None } =>
                 return options.run_owned(task, args, input, output, diagnostics),
             Self { task: Int4Task::ResolveCorpus(options), args, batch: None, job: None } =>
@@ -498,7 +509,7 @@ impl Int4Command {
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
         // The executable uses the typed sampled-task failure boundary above.
-        if matches!(self.task, Int4Task::SampledSentiment(_) | Int4Task::SampledSentimentMap(_) | Int4Task::SampledSentimentCorpus(_) | Int4Task::SampledSentimentBatch(_) | Int4Task::SampledSentimentJob) {
+        if matches!(self.task, Int4Task::SampledSentiment(_) | Int4Task::SampledSentimentMap(_) | Int4Task::SampledSentimentCorpus(_) | Int4Task::SampledSentimentBatch(_) | Int4Task::SampledSentimentJob | Int4Task::SampledSentimentDocumentJob) {
             return Err(CandidateError::Arguments);
         }
         if self.job.is_some() || matches!(self.task, Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::ClassificationDocumentJob | Int4Task::SentimentDocumentJob | Int4Task::FaithfulnessDocumentJob | Int4Task::QuestionDocumentJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob) {
@@ -548,7 +559,7 @@ impl Int4Command {
             return options.execute(self.args, input, output);
         }
         let limits = match &self.task {
-            Int4Task::SampledSentiment(_) | Int4Task::SampledSentimentMap(_) | Int4Task::SampledSentimentCorpus(_) | Int4Task::SampledSentimentBatch(_) | Int4Task::SampledSentimentJob => return Err(CandidateError::Arguments),
+            Int4Task::SampledSentiment(_) | Int4Task::SampledSentimentMap(_) | Int4Task::SampledSentimentCorpus(_) | Int4Task::SampledSentimentBatch(_) | Int4Task::SampledSentimentJob | Int4Task::SampledSentimentDocumentJob => return Err(CandidateError::Arguments),
             Int4Task::Text(_) => self.args.validate_text_compute()?,
             Int4Task::Classify(scoring) => scoring.validate_one_off_with_prefill(&self.args)?,
             Int4Task::Extract(extraction) => extraction.validate_one_off_with_prefill(&self.args)?,

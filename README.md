@@ -1228,6 +1228,51 @@ persistent-worker and layer-major prompt routes share this contract. See
 [durable sampled jobs](docs/native-sampled-sentiment-int4.md#durable-sampled-populations)
 for complete start/resume commands and required storage limits.
 
+`sentiment-sampled-document-job start|resume` adds the complete-source estimator
+to that durable contract. One committed item contains every original source
+chunk, all independent sample bundles and the scalar-weighted document
+replicates. The authenticated recipe also binds chunk limits, the reducer,
+encoding and private prefix reuse. A failed chunk leaves the document
+uncommitted; earlier complete documents stay committed. Whole-document native
+and mask attempt charges remain spent across restart. All-chunk preparation,
+complete-result staging and retained-input memory are admitted before the key,
+model or population opens. This route requires `metadata-store` and
+`asupersync-runtime` on Linux x86-64/AArch64.
+
+Use the [existing durable limits format](docs/native-sampled-sentiment-int4.md#lifetime-work-and-storage-limits),
+sized for complete documents: `max_result_bytes` must cover
+`--max-map-result-bytes` and the per-chunk `--max-result-bytes` ceiling.
+Each `max_work` axis must cover the complete-document work flags, including
+`--max-mask-node-visits`; the single-context example's smaller values need
+adjustment. With a pinned snapshot, protected job directory/key, random job ID,
+explicit sampling seed and an appropriate `$DOCUMENT_LIMITS` file:
+
+```bash
+sampled_document_job_args=(
+  --snapshot "$SNAPSHOT" --expected-model-sha256 "$MODEL_SHA256"
+  --memory-mib 32768 --seed "$SAMPLING_SEED" --samples 4
+  --max-input-bytes 1048576 --max-chunks 64 --max-chunk-bytes 4096
+  --max-result-bytes 1048576 --max-map-result-bytes 16777216
+  --input-encoding safe-bpe-v1 --compute-threads 4 --reuse-prefill
+  --store-results --job-dir "$JOB_DIR" --key-file "$JOB_KEY_FILE"
+  --job-id "$JOB_ID" --limits "$DOCUMENT_LIMITS"
+)
+
+fnlp candidate source-int4 sentiment-sampled-document-job start ./documents.ndjson \
+  "${sampled_document_job_args[@]}" \
+  --spool-input --max-retained-input-mib 64 --materialize
+
+fnlp candidate source-int4 sentiment-sampled-document-job resume \
+  "${sampled_document_job_args[@]}" \
+  --use-retained-input --max-retained-input-mib 64 --materialize
+```
+
+Resume repeats the same semantic flags and skips already committed documents.
+Without input retention, pass the complete original population to both commands.
+Stdout contains metadata; verified private results stay in the protected spool
+and are materialized only after the complete population commits. The map route
+accepts source conversion or pinned snapshots and refuses `--save-snapshot`.
+
 ## Implemented candidate compact faithfulness maps
 
 `fnlp candidate source-int4 faithfulness-map` accepts
