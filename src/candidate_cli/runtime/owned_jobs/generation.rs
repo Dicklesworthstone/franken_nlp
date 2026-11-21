@@ -4,6 +4,7 @@ use crate::{
     batch::generation::quantized::Int8BatchLimits,
     candidate_cli::{jobs::generation::TextJobArgs, text_batch::TextTask},
     jobs::runner::generation::{GenerationJobConfig, GenerationJobTask, Int8GenerationJobPlanner},
+    native_engine::strict_int8::prefill::{Int8PrefillLimits, LAYER_MAJOR_PREFILL_VERSION},
     tasks::chat::ChatLimits,
 };
 
@@ -45,7 +46,14 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     let session = Session::new(&args.common, limits)?;
     let lifetime = command::parse_limits(&read_config(&session, &args.limits_file, command::LIMIT_BYTES)?)?;
     args.check_lifetime(lifetime, limits)?;
-    preflight_memory(host_limits(&args, limits, &session)?, lifetime, limits, args.input_retention.input_memory()?)?;
+    let buffers = host_limits(&args, limits, &session)?.required_buffer_bytes_for_input(lifetime,
+        args.input_retention.input_memory()?).map_err(host_failure)?;
+    let complete = args.execution_memory_bytes(limits)?.checked_add(buffers)
+        .ok_or_else(|| Failure::usage("text_job_memory_arithmetic"))?;
+    if complete > limits.memory_bytes {
+        return Err(Failure { exit: ErrorCode::AdmissionOrResourceLimit, code: "text_job_population_memory" });
+    }
+    let prefill = args.common.policy.prefill()?;
     let key = JobSecret::read(&args.key_file).map_err(job_failure)?;
     session.remaining()?;
     let facts = session.facts(&args.common)?;
@@ -58,8 +66,12 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     let task = args.task_name(); let job_id = args.job_id; let materialize = args.materialize;
     let request = SourceJobRequest { root: args.job_dir, key, job_id, limits: lifetime,
         mode: open_mode(mode, args.input_retention)?, materialize };
-    let progress = session.engine.job_int8_text(&model, planner, request, host, reader, cancellation)
-        .map_err(host_failure)?;
+    let progress = match prefill {
+        None => session.engine.job_int8_text(&model, planner, request, host, reader, cancellation.clone()),
+        Some(prefill) => session.engine.job_int8_text_layer_major(&model, planner, request,
+            host, prefill, reader, cancellation.clone()),
+    }.map_err(host_failure)?;
+    if let Some(cause) = cancellation.cause() { return Err(job_failure(JobError::Cancelled(cause))); }
     session.remaining()?;
     let report = progress_report(progress, job_id, lifetime, materialize, mode, task)?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
@@ -68,6 +80,24 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
         quant_recipe: &facts.recipe_id, output: &report };
     // No generated content, prompt, token IDs, seed or raw logprobs on stdout.
     // A report delivery failure may follow committed durable progress.
-    publish(&response, command::REPORT_BYTES, output).map_err(Failure::from)
+    let response = ScheduledResponse { response: &response,
+        prefill_schedule: prefill.map(PrefillSchedule::new).transpose()? };
+    publish_checked(&response, command::REPORT_BYTES, output, &|| session.remaining().map(|_| ()))
+        .map_err(Failure::from)
+}
+
+#[derive(Serialize)]
+struct PrefillSchedule { execution: &'static str, max_batch_rows: usize, admitted_workspace_bytes: u64 }
+impl PrefillSchedule {
+    fn new(limits: Int8PrefillLimits) -> Result<Self, Failure> {
+        Ok(Self { execution: LAYER_MAJOR_PREFILL_VERSION, max_batch_rows: limits.max_batch_rows,
+            admitted_workspace_bytes: limits.validate().map_err(|_| Failure::usage("text_job_prefill_quote"))? })
+    }
+}
+#[derive(Serialize)]
+struct ScheduledResponse<'a, T: Serialize> {
+    #[serde(flatten)] response: &'a T,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefill_schedule: Option<PrefillSchedule>,
 }
 #[cfg(test)] mod tests;

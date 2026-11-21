@@ -60,3 +60,42 @@ fn unsupported_model_revision_and_short_output_envelope_fail_during_preparation(
     let mut short = lifetime(); short.max_result_bytes = l.result_bytes - 1;
     assert!(prepare(&a, l, short, &facts()).is_err());
 }
+
+#[test]
+fn changing_prompt_schedule_on_resume_preserves_recipe_identity_sampling_and_all_work_axes() {
+    let seed = "07".repeat(32);
+    for task in ["generate", "chat"] {
+        let serial = args(task, &["--seed", &seed]);
+        let original = prepare(&serial, serial.validate().unwrap(), lifetime(), &facts()).unwrap();
+        let before = original.prepare_with_control(document(7, task == "chat"), &mut Continue).unwrap();
+        for rows in ["1", "4", "64"] {
+            let grouped = args(task, &["--seed", &seed, "--prefill-rows", rows]);
+            let resumed = prepare(&grouped, grouped.validate().unwrap(), lifetime(), &facts()).unwrap();
+            let after = resumed.prepare_with_control(document(7, task == "chat"), &mut Continue).unwrap();
+            assert_eq!(canonjson::canonical_bytes(original.job_recipe()).unwrap(),
+                canonjson::canonical_bytes(resumed.job_recipe()).unwrap());
+            assert_eq!(original.execution_identity(), resumed.execution_identity());
+            assert_eq!(before.execution_identity(), after.execution_identity());
+            assert_eq!(before.model_work(), after.model_work());
+            assert_eq!(original.task_budget(), resumed.task_budget());
+        }
+    }
+}
+
+#[test]
+fn prompt_schedule_is_explicit_public_metadata_and_absent_for_sequential_jobs() {
+    let report = serde_json::json!({"schema_version": 1, "output": {"committed": 2}});
+    assert_eq!(serde_json::to_value(ScheduledResponse {
+        response: &report, prefill_schedule: None }).unwrap(), report);
+    let a = args("generate", &["--prefill-rows", "4"]);
+    let prefill = a.common.policy.prefill().unwrap().unwrap();
+    let value = serde_json::to_value(ScheduledResponse { response: &report,
+        prefill_schedule: Some(PrefillSchedule::new(prefill).unwrap()) }).unwrap();
+    assert_eq!(value["prefill_schedule"]["execution"], LAYER_MAJOR_PREFILL_VERSION);
+    assert_eq!(value["prefill_schedule"]["max_batch_rows"], 4);
+    assert_eq!(value["prefill_schedule"]["admitted_workspace_bytes"], prefill.validate().unwrap());
+    assert_eq!(value["output"], report["output"]);
+    for private in ["seed", "history", "token_ids", "prompt_digest", "content"] {
+        assert!(!value.to_string().contains(private));
+    }
+}

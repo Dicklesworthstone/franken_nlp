@@ -25,6 +25,7 @@ impl DecodeStepControl for Continue { fn checkpoint(&mut self, _: usize) -> Opti
 struct State {
     live: Cell<bool>, running: Cell<bool>, dropped: Cell<usize>,
     admitted: RefCell<Option<(Int8Work, u64, u64)>>,
+    prefill_rows: Cell<Option<usize>>,
 }
 struct Guard(Rc<State>);
 impl Drop for Guard {
@@ -50,7 +51,7 @@ impl Int8GenerationBatchAdmission for Admission {
     }
 }
 #[derive(Clone, Copy)]
-enum Mode { Success, Cancel, Panic, WorkFailure, DirtySuccess, PoisonedSuccess, WrongSequence, WrongWork }
+enum Mode { Success, Cancel(DecodeCancellationKind), Panic, WorkFailure, DirtySuccess, PoisonedSuccess, WrongSequence, WrongWork }
 struct Engine { state: Rc<State>, mode: Mode, calls: usize, empty: bool, poisoned: bool }
 impl Engine {
     fn new(state: &Rc<State>) -> Self { Self { state: Rc::clone(state), mode: Mode::Success, calls: 0, empty: true, poisoned: false } }
@@ -75,14 +76,16 @@ impl Driver for Engine {
         Ok(())
     }
     fn run<C: DecodeStepControl>(&mut self, prepared: &PreparedInt8Chat, identity: &ExecutionIdentity,
-        seq: u64, _: Int8GenerationBudget, _: &mut C) -> Result<Int8ChatResult, Int8ChatError> {
+        seq: u64, _: Int8GenerationBudget, prefill: Option<Int8PrefillLimits>,
+        _: &mut C) -> Result<Int8ChatResult, Int8ChatError> {
         prepared.verify_identity(identity)?;
         assert!(self.state.live.get()); assert!(!self.state.running.replace(true));
+        self.state.prefill_rows.set(prefill.map(|limits| limits.max_batch_rows));
         let _physical = PhysicalCall(Rc::clone(&self.state)); self.calls += 1;
         match self.mode {
             Mode::Panic => panic!("private simulated native panic"),
-            Mode::Cancel => { self.poisoned = true; return Err(Int8GenerationError::Native(
-                StrictInt8Error::Cancelled(DecodeCancellationKind::Deadline)).into()); }
+            Mode::Cancel(cause) => { self.poisoned = true; return Err(Int8GenerationError::Native(
+                StrictInt8Error::Cancelled(cause)).into()); }
             Mode::WorkFailure => { self.poisoned = true; return Err(Int8GenerationError::Native(StrictInt8Error::Work).into()); }
             Mode::DirtySuccess => self.empty = false,
             Mode::PoisonedSuccess => self.poisoned = true,
@@ -208,7 +211,7 @@ fn rejected_admission_is_not_refunded_and_new_epoch_does_not_replenish_work() {
 fn native_cancellation_preserves_cause_and_permanently_stops_admission() {
     let (planner, eos) = fixture(); let compiler = Int8GenerationBatchPlanner::new(&planner, Some(args(eos))).unwrap();
     let state = Rc::new(State::default()); let mut admission = Admission::new(&state); let mut engine = Engine::new(&state);
-    engine.mode = Mode::Cancel; let mut run = RunState::new(room());
+    engine.mode = Mode::Cancel(DecodeCancellationKind::Deadline); let mut run = RunState::new(room());
     let error = execute_admitted(compiler.prepare(document("x")).unwrap(), &mut engine, &mut admission,
         &mut run, u64::MAX, context(1, 1), &mut Continue).err().unwrap();
     assert!(error.stop); assert_eq!(error.fault.cancellation, Some(DecodeCancellationKind::Deadline));
@@ -253,6 +256,80 @@ fn missing_or_replayed_delivery_coordinates_are_fatal_before_admission() {
     }
     let mut run = RunState::new(room()); run.begin(work, context(5, 1)).unwrap(); run.failed = false;
     assert!(run.begin(work, context(5, 2)).is_err()); assert!(run.failed);
+}
+
+fn prefill(rows: usize) -> Int8PrefillLimits {
+    Int8PrefillLimits { max_batch_rows: rows,
+        max_extra_scratch_bytes: Int8PrefillLimits::required_extra_scratch_bytes(rows).unwrap() }
+}
+
+#[test]
+fn grouped_driver_uses_exact_schedule_and_keeps_all_native_work_spent_across_records() {
+    let (planner, eos) = fixture();
+    let compiler = Int8GenerationBatchPlanner::new(&planner, Some(args(eos))).unwrap();
+    let expected = crate::canonjson::canonical_bytes(&completed_result(
+        &compiler.prepare(document("x")).unwrap(), 1)).unwrap();
+    for rows in [1, 4, 64] {
+        let prepared = compiler.prepare(document("x")).unwrap(); let work = prepared.planned_work();
+        let state = Rc::new(State::default()); let mut admission = Admission::new(&state);
+        let mut engine = Engine::new(&state); let mut run = RunState::new(work);
+        run.prefill = Some(prefill(rows));
+        let output = execute_admitted(prepared, &mut engine, &mut admission, &mut run,
+            u64::MAX, context(1, 1), &mut Continue).unwrap();
+        assert_eq!(state.prefill_rows.get(), Some(rows));
+        assert_eq!(crate::canonjson::canonical_bytes(&output).unwrap(), expected);
+        assert_eq!(run.reserved, work); assert!(state.live.get());
+        drop(output); assert_eq!(state.dropped.get(), 1);
+        let error = execute_admitted(compiler.prepare(document("x")).unwrap(), &mut engine,
+            &mut admission, &mut run, u64::MAX, context(3, 2), &mut Continue).err().unwrap();
+        assert_eq!(error.fault.code, BatchCode::WorkLimit);
+        assert!(error.stop); assert_eq!(engine.calls, 1); assert_eq!(admission.calls, 1);
+        assert_eq!(run.reserved, work);
+    }
+}
+
+#[test]
+fn grouped_native_cancellation_retains_every_cause_and_never_falls_back() {
+    use DecodeCancellationKind::*;
+    let (planner, eos) = fixture();
+    let compiler = Int8GenerationBatchPlanner::new(&planner, Some(args(eos))).unwrap();
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast,
+        RaceLost, ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let prepared = compiler.prepare(document("x")).unwrap(); let work = prepared.planned_work();
+        let state = Rc::new(State::default()); let mut admission = Admission::new(&state);
+        let mut engine = Engine::new(&state); engine.mode = Mode::Cancel(cause);
+        let mut run = RunState::new(room()); run.prefill = Some(prefill(4));
+        let error = execute_admitted(prepared, &mut engine, &mut admission, &mut run,
+            u64::MAX, context(1, 1), &mut Continue).err().unwrap();
+        assert!(error.stop); assert_eq!(error.fault.cancellation, Some(cause));
+        assert_eq!(engine.calls, 1); assert_eq!(state.prefill_rows.get(), Some(4));
+        assert_eq!(run.reserved, work); assert!(run.failed);
+        assert!(!state.live.get()); assert!(!state.running.get());
+        assert_eq!(state.dropped.get(), 1);
+        engine.poisoned = false; engine.mode = Mode::Success;
+        assert!(execute_admitted(compiler.prepare(document("y")).unwrap(), &mut engine,
+            &mut admission, &mut run, u64::MAX, context(2, 1), &mut Continue).is_err());
+        assert_eq!(engine.calls, 1);
+    }
+}
+
+#[test]
+fn grouped_native_failure_and_panic_keep_guards_until_physical_drain_without_retry() {
+    let (planner, eos) = fixture();
+    let compiler = Int8GenerationBatchPlanner::new(&planner, Some(args(eos))).unwrap();
+    for mode in [Mode::Panic, Mode::WorkFailure, Mode::DirtySuccess, Mode::WrongWork] {
+        let state = Rc::new(State::default()); let mut admission = Admission::new(&state);
+        let mut engine = Engine::new(&state); engine.mode = mode;
+        let mut run = RunState::new(room()); run.prefill = Some(prefill(4));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute_admitted(compiler.prepare(document("x")).unwrap(), &mut engine,
+                &mut admission, &mut run, u64::MAX, context(1, 1), &mut Continue)
+        }));
+        assert!(outcome.is_err() || outcome.is_ok_and(|result| result.is_err()));
+        assert_eq!(engine.calls, 1); assert_eq!(state.prefill_rows.get(), Some(4));
+        assert_eq!(state.dropped.get(), 1); assert!(!state.running.get()); assert!(!state.live.get());
+        assert!(run.failed); assert!(run.reserved.forward_positions > 0);
+    }
 }
 
 // Exercise the unchanged real NDJSON framing/output runner with the PRIVATE

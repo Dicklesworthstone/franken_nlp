@@ -44,9 +44,6 @@ impl TextJobArgs {
     pub(in crate::candidate_cli) fn validate(&self) -> Result<Limits, Failure> {
         self.input_retention.limits()?;
         let limits = self.common.validate()?;
-        // The retained adapter is serial. Never accept a scheduling option and
-        // quietly ignore it or let it change across resumed executions.
-        if self.common.policy.prefill()?.is_some() { return Err(Failure::usage("text_job_serial_schedule")); }
         let local = |p: &std::path::Path| !p.as_os_str().is_empty() && p.as_os_str() != "-";
         if !self.store_results || !local(&self.job_dir) || !local(&self.key_file) || !local(&self.limits_file)
             || !(1..=1024 * 1024).contains(&self.max_stream_mib)
@@ -59,7 +56,29 @@ impl TextJobArgs {
                 return Err(Failure::usage("text_job_memory"));
             }
         }
+        // Refuse impossible native occupancy before reading even the limits
+        // file. Its population/job buffer quote is added after bounded parsing.
+        if self.execution_memory_bytes(limits)? > limits.memory_bytes {
+            return Err(Failure { exit: ErrorCode::AdmissionOrResourceLimit, code: "text_job_native_memory" });
+        }
         Ok(limits)
+    }
+    pub(in crate::candidate_cli) fn execution_memory_bytes(&self, limits: Limits) -> Result<u64, Failure> {
+        let native = Int8MemoryRequirement::for_context(self.common.context_tokens)
+            .map_err(|_| Failure::usage("text_job_native_quote"))?;
+        let prefill = self.common.policy.prefill()?.map(|limits| limits.validate()).transpose()
+            .map_err(|_| Failure::usage("text_job_prefill_quote"))?.unwrap_or(0);
+        let output = (limits.result_bytes as u64).checked_mul(4)
+            .and_then(|n| n.checked_add((self.common.max_new_tokens as u64).checked_mul(8)?))
+            .and_then(|n| n.checked_add(4096)).ok_or_else(|| Failure::usage("text_job_memory_arithmetic"))?;
+        // Matches Session::load and the owned job host: resident metadata and
+        // allocator slack coexist with the native engine, guarded result and
+        // CLI preparation. This is a conservative quote, not a RAM permit.
+        [limits.preparation_bytes, limits.weight_bytes, 128 * MIB, 64 * MIB,
+            native.kv_bytes, native.rope_bytes, native.scratch_payload_bound,
+            64 * MIB, SAMPLER_BYTES, prefill, output, 65_536]
+            .iter().try_fold(0_u64, |total, bytes| total.checked_add(*bytes)
+                .ok_or_else(|| Failure::usage("text_job_memory_arithmetic")))
     }
     pub(in crate::candidate_cli) fn check_lifetime(&self, job: JobLimits, limits: Limits) -> Result<(), Failure> {
         job.validate().map_err(|_| Failure::usage("text_job_lifetime"))?;
@@ -78,7 +97,7 @@ impl TextJobArgs {
 pub(in crate::candidate_cli) fn definition() -> clap::Command {
     TextJobCommand::augment_args(clap::Command::new("text-job")
         .about("Start or resume retained native generation/chat jobs")
-        .long_about("Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. Input is the COMPLETE original {id,text,task_args?} NDJSON population, not the text-batch prompt/messages protocol; resume can explicitly restore retained inputs. Optional task_args contains sample_index and chat history only; text becomes the final user turn. Shared generation flags, explicit seed, stops and penalties are frozen in the authenticated recipe. No seed means greedy, never random seed generation. Results commit only after whole native completion; no partial token stream is retained. Failed attempts retain all native work charges. --store-results, protected existing storage, original job key and immutable limits are required. Stdout is completion metadata only. No automatic retry, model download, tools or thinking mode. This retained route is serial; --prefill-rows/cohort-rows/active-rows are unsupported.")
+        .long_about("Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. Input is the COMPLETE original {id,text,task_args?} NDJSON population, not the text-batch prompt/messages protocol; resume can explicitly restore retained inputs. Optional task_args contains sample_index and chat history only; text becomes the final user turn. Shared generation flags, explicit seed, stops and penalties are frozen in the authenticated recipe. No seed means greedy, never random seed generation. Results commit only after whole native completion; no partial token stream is retained. Failed attempts retain all native work charges. --store-results, protected existing storage, original job key and immutable limits are required. Stdout is completion metadata only. No automatic retry, model download, tools or thinking mode. --prefill-rows opts in to bounded layer-major prompt execution with separately admitted scratch; the physical schedule may change on resume without changing the authenticated semantic recipe or renewing lifetime work. Documents still execute in original order; --cohort-rows/active-rows remain unsupported.")
         .after_help(INPUT_RETENTION_HELP))
 }
 impl TextJobCommand {

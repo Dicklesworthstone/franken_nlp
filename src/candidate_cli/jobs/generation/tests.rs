@@ -112,7 +112,7 @@ fn transport_changes_do_not_grant_more_generation_or_lifetime_authority() {
     assert_eq!(a.validate().unwrap().result_bytes, b.validate().unwrap().result_bytes);
 }
 #[test]
-fn unsupported_schedules_refuse_before_reading_keys_or_population() {
+fn invalid_prompt_schedules_refuse_before_reading_keys_or_population() {
     struct NoIo;
     impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("read") } }
     impl Write for NoIo {
@@ -120,11 +120,42 @@ fn unsupported_schedules_refuse_before_reading_keys_or_population() {
         fn flush(&mut self) -> io::Result<()> { panic!("flush") }
     }
     for operation in ["start", "resume"] {
-        let (mode, a) = parse(operation, "generate", &["--prefill-rows", "4"]).unwrap().into_parts();
-        assert_eq!(execute_owned(mode, a, NoIo, &mut NoIo).unwrap_err().code, "text_job_serial_schedule");
+        for rows in ["0", "65", "18446744073709551615"] {
+            let Ok(command) = parse(operation, "generate", &["--prefill-rows", rows]) else { continue; };
+            let (mode, a) = command.into_parts();
+            assert_eq!(execute_owned(mode, a, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+        }
+        let (mode, mut a) = parse(operation, "generate", &["--prefill-rows", "64"]).unwrap().into_parts();
+        a.common.memory_mib = 1024; a.common.max_weight_mib = 512;
+        assert_eq!(execute_owned(mode, a, NoIo, &mut NoIo).unwrap_err().code, "text_job_native_memory");
     }
     for flag in ["--cohort-rows", "--active-rows", "--schema", "--defaults", "--key"] {
         assert!(parse("start", "generate", &[flag, "4"]).is_err());
+    }
+}
+#[test]
+fn bounded_prompt_schedule_is_additional_memory_and_not_generation_policy() {
+    use crate::native_engine::strict_int8::prefill::Int8PrefillLimits;
+    for task in ["generate", "chat"] {
+        let serial = args(task, &[]); let serial_limits = serial.validate().unwrap();
+        let seed = "07".repeat(32);
+        for rows in [1, 4, 64] {
+            let spelling = rows.to_string();
+            let grouped = args(task, &["--prefill-rows", &spelling]);
+            let grouped_limits = grouped.validate().unwrap();
+            assert_eq!(grouped.common.policy.prefill().unwrap().unwrap().max_batch_rows, rows);
+            assert_eq!(grouped.execution_memory_bytes(grouped_limits).unwrap()
+                - serial.execution_memory_bytes(serial_limits).unwrap(),
+                Int8PrefillLimits::required_extra_scratch_bytes(rows).unwrap());
+            assert!(serial.common.options(166_101).unwrap() == grouped.common.options(166_101).unwrap());
+            let (_, resumed) = parse("resume", task, &["--prefill-rows", &spelling, "--seed", &seed])
+                .unwrap().into_parts();
+            let seeded = args(task, &["--seed", &seed]);
+            resumed.validate().unwrap();
+            assert!(seeded.common.options(166_101).unwrap() == resumed.common.options(166_101).unwrap());
+            assert_eq!(serial_limits.result_bytes, grouped_limits.result_bytes);
+            grouped.check_lifetime(lifetime(), grouped_limits).unwrap();
+        }
     }
 }
 #[cfg(not(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
@@ -138,7 +169,9 @@ fn unavailable_feature_graph_never_opens_key_config_input_or_output() {
         fn flush(&mut self) -> io::Result<()> { panic!("flush") }
     }
     for task in ["generate", "chat"] {
-        assert_eq!(execute_owned(RunMode::Start, args(task, &[]), NoIo, &mut NoIo).unwrap_err().code,
-            "owned_text_job_profile_unavailable");
+        for flags in [vec![], vec!["--prefill-rows", "4"]] {
+            assert_eq!(execute_owned(RunMode::Start, args(task, &flags), NoIo, &mut NoIo).unwrap_err().code,
+                "owned_text_job_profile_unavailable");
+        }
     }
 }

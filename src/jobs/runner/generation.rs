@@ -9,7 +9,7 @@ use crate::{
     canonjson, execution_identity::{ExecutionIdentity, Sha256Digest},
     jobs::JobWork,
     native_engine::{decode::DecodeStepControl, generation::GenerationOptions,
-        strict_int8::{Int8Work, StrictInt8Engine}},
+        strict_int8::{Int8Work, StrictInt8Engine, prefill::Int8PrefillLimits}},
     tasks::{chat::{ChatLimits, ChatMessage, quantized::{Int8ChatPlanner, Int8ChatResult, PreparedInt8Chat}},
         ir::TaskBudget},
     tokenizer::specials::TemplateControlIds,
@@ -127,6 +127,18 @@ impl<'p, 'e, 'w, A: Int8GenerationBatchAdmission> Int8GenerationJobProcessor<'p,
         -> Result<Self, BatchFault> {
         let compiler = Int8GenerationBatchPlanner::new(&planner.planner, None)?;
         let native = NativeInt8GenerationBatch::new(compiler, engine, admission, planner.native_limits())?;
+        Ok(Self { planner, native, failed: false })
+    }
+    /// Change only the physical prompt schedule. The exact recipe, addressed
+    /// sampling, complete result guard and durable attempt debit are shared
+    /// with sequential execution. The host admits all extra prompt scratch.
+    pub fn new_layer_major(planner: &'p Int8GenerationJobPlanner,
+        engine: &'e mut StrictInt8Engine<'w>, admission: A, prefill: Int8PrefillLimits)
+        -> Result<Self, BatchFault> {
+        prefill.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        let compiler = Int8GenerationBatchPlanner::new(&planner.planner, None)?;
+        let native = NativeInt8GenerationBatch::new_layer_major(compiler, engine, admission,
+            planner.native_limits(), prefill)?;
         Ok(Self { planner, native, failed: false })
     }
     fn ready(&self) -> Result<(), BatchItemFailure> {

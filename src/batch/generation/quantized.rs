@@ -10,7 +10,8 @@ use crate::{
     execution_identity::ExecutionIdentity,
     native_engine::{decode::DecodeStepControl, generation::GenerationError,
         generation::quantized::{Int8GenerationBudget, Int8GenerationError}, kv::KV_BYTES_PER_TOKEN,
-        strict_int8::{Int8RunBudget, Int8Work, StrictInt8Engine, StrictInt8Error}},
+        strict_int8::{Int8RunBudget, Int8Work, StrictInt8Engine, StrictInt8Error,
+            prefill::Int8PrefillLimits}},
     tasks::chat::{ChatError, ChatMessage, ChatRequest, ChatRole, GenerateRequest,
         quantized::{Int8ChatError, Int8ChatPlanner, Int8ChatResult, PreparedInt8Chat}},
 };
@@ -94,6 +95,17 @@ impl<'p, 'e, 'weights, A: Int8GenerationBatchAdmission> NativeInt8GenerationBatc
         if engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) { return Err(BatchCode::InvalidExecution.into()); }
         Ok(Self { compiler, engine, admission, limits, run: RunState::new(limits.max_model_work) })
     }
+    /// Reuse the same guarded generator with bounded layer-major prompt
+    /// morsels. The host must admit the validated extra workspace for the
+    /// complete resident invocation before calling this constructor.
+    pub fn new_layer_major(compiler: Int8GenerationBatchPlanner<'p>,
+        engine: &'e mut StrictInt8Engine<'weights>, admission: A, limits: Int8BatchLimits,
+        prefill: Int8PrefillLimits) -> Result<Self, BatchFault> {
+        prefill.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        let mut processor = Self::new(compiler, engine, admission, limits)?;
+        processor.run.prefill = Some(prefill);
+        Ok(processor)
+    }
     pub fn reserved_model_work(&self) -> Int8Work { self.run.reserved }
     pub fn is_poisoned(&self) -> bool { self.run.failed || self.engine.is_poisoned() }
 }
@@ -134,9 +146,16 @@ fn budget(prepared: &PreparedInt8Chat, max_sampler_bytes: u64) -> Int8Generation
 
 // One nonrenewable work ledger. No reset/refund method or external mutation.
 // Latch before fallible admission/native work; panic leaves it permanently set.
-struct RunState { limit: Int8Work, reserved: Int8Work, last_sequence: u64, failed: bool }
+struct RunState {
+    limit: Int8Work, reserved: Int8Work, last_sequence: u64, failed: bool,
+    // Physical invocation policy; never a prompt/sampler identity or a new
+    // native-work allowance at record boundaries, flushes or durable resume.
+    prefill: Option<Int8PrefillLimits>,
+}
 impl RunState {
-    fn new(limit: Int8Work) -> Self { Self { limit, reserved: Int8Work::default(), last_sequence: 0, failed: false } }
+    fn new(limit: Int8Work) -> Self {
+        Self { limit, reserved: Int8Work::default(), last_sequence: 0, failed: false, prefill: None }
+    }
     fn ready(&self) -> Result<(), BatchItemFailure> {
         if self.failed { Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)) } else { Ok(()) }
     }
@@ -172,7 +191,8 @@ trait Driver {
     fn preflight(&self, prepared: &PreparedInt8Chat, identity: &ExecutionIdentity, budget: Int8GenerationBudget)
         -> Result<(), Int8ChatError>;
     fn run<C: DecodeStepControl>(&mut self, prepared: &PreparedInt8Chat, identity: &ExecutionIdentity,
-        seq: u64, budget: Int8GenerationBudget, control: &mut C) -> Result<Int8ChatResult, Int8ChatError>;
+        seq: u64, budget: Int8GenerationBudget, prefill: Option<Int8PrefillLimits>,
+        control: &mut C) -> Result<Int8ChatResult, Int8ChatError>;
 }
 impl Driver for StrictInt8Engine<'_> {
     fn capacity(&self) -> usize { self.kv_cache().capacity_positions() }
@@ -181,8 +201,12 @@ impl Driver for StrictInt8Engine<'_> {
     fn preflight(&self, prepared: &PreparedInt8Chat, identity: &ExecutionIdentity, budget: Int8GenerationBudget)
         -> Result<(), Int8ChatError> { prepared.preflight(identity, self, budget) }
     fn run<C: DecodeStepControl>(&mut self, prepared: &PreparedInt8Chat, identity: &ExecutionIdentity,
-        seq: u64, budget: Int8GenerationBudget, control: &mut C) -> Result<Int8ChatResult, Int8ChatError> {
-        prepared.execute(identity, self, seq, budget, control)
+        seq: u64, budget: Int8GenerationBudget, prefill: Option<Int8PrefillLimits>,
+        control: &mut C) -> Result<Int8ChatResult, Int8ChatError> {
+        match prefill {
+            None => prepared.execute(identity, self, seq, budget, control),
+            Some(prefill) => prepared.execute_layer_major(identity, self, seq, budget, prefill, control),
+        }
     }
 }
 
@@ -209,7 +233,8 @@ fn execute_admitted<D: Driver, A: Int8GenerationBatchAdmission, C: DecodeStepCon
         // Compare the whole admitted identity before any physical forward.
         prepared.verify_identity(&identity).map_err(execution_failure)?;
         engine.preflight(&prepared, &identity, budget).map_err(execution_failure)?;
-        let result = engine.run(&prepared, &identity, context.request_seq, budget, control).map_err(execution_failure)?;
+        let result = engine.run(&prepared, &identity, context.request_seq, budget, run.prefill, control)
+            .map_err(execution_failure)?;
         if !valid_output(&prepared, &result, context.request_seq, work) {
             return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
         }

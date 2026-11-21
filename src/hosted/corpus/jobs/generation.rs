@@ -2,6 +2,7 @@
 use super::*;
 use crate::{
     jobs::runner::generation::{Int8GenerationJobPlanner, Int8GenerationJobProcessor},
+    native_engine::strict_int8::prefill::Int8PrefillLimits,
     tasks::ir::TaskBudget,
 };
 
@@ -16,6 +17,27 @@ impl NlpEngine {
         request: SourceJobRequest, limits: JobHostLimits, reader: R, cancellation: CancellationToken)
         -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
+        self.job_int8_text_scheduled(model, planner, request, limits, None, reader, cancellation)
+    }
+
+    /// Retained generation/chat with explicitly bounded layer-major prompt
+    /// execution. Extra scratch is charged before population IO and remains
+    /// owned until the actual blocking closure drains. The schedule may change
+    /// on resume; the authenticated semantic recipe and lifetime work cannot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int8_text_layer_major<R>(&self, model: &ResidentInt8,
+        planner: Int8GenerationJobPlanner, request: SourceJobRequest, limits: JobHostLimits,
+        prefill: Int8PrefillLimits, reader: R, cancellation: CancellationToken)
+        -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        self.job_int8_text_scheduled(model, planner, request, limits, Some(prefill), reader, cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn job_int8_text_scheduled<R>(&self, model: &ResidentInt8, planner: Int8GenerationJobPlanner,
+        request: SourceJobRequest, limits: JobHostLimits, prefill: Option<Int8PrefillLimits>,
+        reader: R, cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
         dispatch::preflight(self, limits.native.run)?;
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), planner.execution_identity())?;
@@ -25,7 +47,7 @@ impl NlpEngine {
         let required = requirements(limits.native)?;
         capacity(planner.task_budget(), required.kv_bytes, request.limits.max_result_bytes)?;
         let scratch_bytes = workspace(sum(&[required.rope_bytes, required.scratch_payload_bound,
-            limits.native.allocator_reserve_bytes])?, native.max_sampler_bytes)?;
+            limits.native.allocator_reserve_bytes])?, native.max_sampler_bytes, prefill)?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
             || Ok(StreamInput { planner: Some((planner, request)), reader, writer: () }))?;
@@ -48,8 +70,11 @@ impl NlpEngine {
                 kv_bytes: required.kv_bytes, sampler_bytes: native.max_sampler_bytes,
                 output_bytes: request.limits.max_result_bytes as u64 };
             let result = (|| {
-                let processor = Int8GenerationJobProcessor::new(&planner, &mut engine.value, admission)
-                    .map_err(JobRunError::Processor)?;
+                let processor = match prefill {
+                    None => Int8GenerationJobProcessor::new(&planner, &mut engine.value, admission),
+                    Some(prefill) => Int8GenerationJobProcessor::new_layer_major(&planner,
+                        &mut engine.value, admission, prefill),
+                }.map_err(JobRunError::Processor)?;
                 // The common runner authenticates the exact recipe/population
                 // before repair or forwards. Failed-attempt debits survive it.
                 run_population(request, &population, processor, control)
@@ -69,9 +94,10 @@ fn capacity(task: TaskBudget, kv: u64, output: usize) -> Result<(), HostedError>
     }
     Ok(())
 }
-fn workspace(ordinary: u64, sampler: u64) -> Result<u64, HostedError> {
+fn workspace(ordinary: u64, sampler: u64, prefill: Option<Int8PrefillLimits>) -> Result<u64, HostedError> {
     if sampler == 0 { return Err(HostedError::Limits("text job sampler reservation")); }
-    sum(&[ordinary, sampler])
+    let extra = prefill.map(Int8PrefillLimits::validate).transpose().map_err(HostedError::Native)?.unwrap_or(0);
+    sum(&[ordinary, sampler, extra])
 }
 
 #[cfg(test)]
@@ -90,10 +116,25 @@ mod tests {
     }
     #[test]
     fn sampler_workspace_is_additional_not_a_discount_on_native_scratch() {
-        assert_eq!(workspace(12345, 32 << 20).unwrap(), 12345 + (32 << 20));
-        assert!(workspace(12345, 0).is_err());
-        assert!(workspace(u64::MAX, 1).is_err());
-        assert_eq!(workspace(u64::MAX - 1, 1).unwrap(), u64::MAX);
+        assert_eq!(workspace(12345, 32 << 20, None).unwrap(), 12345 + (32 << 20));
+        assert!(workspace(12345, 0, None).is_err());
+        assert!(workspace(u64::MAX, 1, None).is_err());
+        assert_eq!(workspace(u64::MAX - 1, 1, None).unwrap(), u64::MAX);
+    }
+    #[test]
+    fn grouped_prompt_workspace_is_validated_and_additional_for_the_whole_job() {
+        for rows in [1, 4, 64] {
+            let extra = Int8PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+            let limits = Int8PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: extra };
+            assert_eq!(workspace(12345, 32 << 20, Some(limits)).unwrap(), 12345 + (32 << 20) + extra);
+            assert!(workspace(12345, 32 << 20, Some(Int8PrefillLimits {
+                max_extra_scratch_bytes: extra - 1, ..limits })).is_err());
+            assert!(workspace(u64::MAX - extra, 1, Some(limits)).is_err());
+        }
+        for rows in [0, 65, usize::MAX] {
+            assert!(workspace(12345, 32 << 20, Some(Int8PrefillLimits {
+                max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX })).is_err());
+        }
     }
     #[test]
     fn invalid_task_budgets_are_not_repaired_to_match_storage() {
@@ -108,5 +149,6 @@ mod tests {
         send::<StreamInput<(Int8GenerationJobPlanner, SourceJobRequest), std::io::Cursor<Vec<u8>>, ()>>();
         send::<crate::tasks::chat::quantized::Int8ChatResult>();
         let _entry = NlpEngine::job_int8_text::<std::io::Cursor<Vec<u8>>>;
+        let _grouped = NlpEngine::job_int8_text_layer_major::<std::io::Cursor<Vec<u8>>>;
     }
 }

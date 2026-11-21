@@ -38,8 +38,9 @@ empty history and sample zero. It cannot supply a budget, model, generation
 policy, seed, tools or task override. Duplicate JSON keys and changed original
 envelopes fail closed. Flush commands are not durable population records.
 
-Every resume receives the COMPLETE original ordered NDJSON population. Original
-inputs are not persisted for you; preserve them separately. Input JSON framing
+Every resume authenticates the COMPLETE original ordered NDJSON population.
+Supply the original inputs again, or explicitly opt into
+[retained-input creation and replay](retained-inputs.md). Input JSON framing
 and escaping count toward `JobLimits.max_input_bytes_per_item`, which must fit
 `--max-input-bytes`. This conservative ceiling is distinct from model tokens.
 
@@ -59,6 +60,7 @@ fnlp candidate text-job start original.ndjson --task generate \
 
 fnlp candidate text-job resume original.ndjson --task generate \
   --model ./model.fnlpq --memory-mib 8192 \
+  --prefill-rows 4 \
   --store-results --job-dir ./protected-job --job-id "$JOB_ID" \
   --key-file ./job.key --limits ./job-limits.json --materialize
 ```
@@ -120,15 +122,42 @@ seeds and token scores remain in the explicit protected result spool or
 materialization. Diagnostics do not print nested private content. Unavailable
 feature graphs or invalid command options refuse before key/config/input IO.
 
-This retained adapter executes serially. It rejects `--prefill-rows`,
-`--cohort-rows` and `--active-rows`; it does not silently ignore or implicitly
-change scheduling. Existing live cohort/refill execution is unchanged.
+## Bounded prompt prefill
+
+`--prefill-rows 1..=64` explicitly selects the existing strict-INT8 layer-major
+prompt path. Each prompt is processed in bounded morsels that share decoder
+weight traversals across their rows, with token-ordered causal attention and
+both loop-boundary norms. Generated tokens still use the same native generator,
+addressed sampler and complete-result finalizer. Omitting the option keeps
+sequential prompt execution. Documents remain ordered; `--cohort-rows` and
+`--active-rows` still reject.
+
+Extra prompt workspace is additional to full KV, native scratch and sampler
+memory. The CLI checks simultaneous native occupancy before key/model/input IO
+and adds the complete job-buffer quote after reading the bounded limits file.
+The host reserves the prompt workspace before population ingestion, retains it
+through the entire physical invocation, and reuses it for every pending item.
+An invalid or underfunded schedule refuses; there is no sequential retry or
+fallback. A prompt failure cannot publish or retain partial generated content.
+
+The physical row width may change on an explicit authenticated resume, as in
+the example above. It is deliberately excluded from the immutable semantic
+recipe: changing it does not alter the prompt, seed address, generation policy
+or lifetime work/attempt ceiling, and spent attempts stay spent. Completion
+metadata adds `prefill_schedule` with the execution version, maximum row count
+and admitted extra workspace only when selected. The stored semantic result
+format remains the same. This opt-in route carries no measured throughput or
+model-parity claim.
 
 ## Verification scope
 
 Added regression definitions cover pinned generate/chat plans, seed and sample
 identity reconstruction, keyed recipe/population mismatches, every work/limit
 axis, history validation, explicit consent, metadata-only reporting and no-IO
-failures. Rust compilation/test execution, DSR, filesystem crash/restart
+failures. Prompt-schedule regression definitions additionally cover exact
+dispatch, recipe/sampling identity across schedule changes, additional
+workspace and overflow refusal, all cancellation kinds, guard lifetime through
+native failure/panic, and nonrenewable work across record boundaries.
+Rust compilation/test execution, DSR, filesystem crash/restart
 execution with this producer, real-model replay and performance qualification
 remain pending. Source inspection is not a substitute for those receipts.
