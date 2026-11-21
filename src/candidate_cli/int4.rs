@@ -137,6 +137,7 @@ enum Int4Task {
     Sentiment(sentiment::SentimentArgs),
     SampledSentiment(sampled_sentiment::SampledArgs),
     SampledSentimentMap(sampled_sentiment::map::MapArgs),
+    SampledSentimentCorpus(sampled_sentiment::map::corpus::CorpusArgs),
     SampledSentimentBatch(sampled_sentiment::corpus::BatchArgs),
     SampledSentimentJob,
     SentimentMap(sentiment_map::MapArgs),
@@ -219,6 +220,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(compute::definition(input_encoding::definition(sentiment::definition())))
         .subcommand(compute::definition(input_encoding::definition(sampled_sentiment::definition())))
         .subcommand(sampled_sentiment::map::definition())
+        .subcommand(sampled_sentiment::map::corpus::definition())
         .subcommand(compute::definition(input_encoding::definition(sampled_sentiment::corpus::definition())))
         .subcommand(sampled_sentiment::job::definition())
         .subcommand(sentiment_map::threaded_definition())
@@ -353,6 +355,7 @@ impl Int4Command {
             "sentiment" => Int4Task::Sentiment(sentiment::SentimentArgs::from_matches(matches)?),
             "sentiment-sampled" => Int4Task::SampledSentiment(sampled_sentiment::SampledArgs::from_matches(matches)?),
             "sentiment-sampled-map" => Int4Task::SampledSentimentMap(sampled_sentiment::map::MapArgs::from_matches(matches)?),
+            "sentiment-sampled-corpus" => Int4Task::SampledSentimentCorpus(sampled_sentiment::map::corpus::CorpusArgs::from_matches(matches)?),
             "sentiment-sampled-batch" => Int4Task::SampledSentimentBatch(sampled_sentiment::corpus::BatchArgs::from_matches(matches)?),
             "sentiment-map" => Int4Task::SentimentMap(sentiment_map::MapArgs::from_matches(matches)?),
             "sentiment-corpus" => Int4Task::SentimentCorpus(sentiment_map::corpus::CorpusArgs::from_matches(matches)?),
@@ -398,14 +401,14 @@ impl Int4Command {
             _ => return Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source-int4 task refused")),
         };
         let mut args = Int4Args::from_arg_matches(matches)?;
-        if matches!(name, "generate" | "chat" | "classify" | "classify-map" | "classify-corpus" | "sentiment" | "sentiment-sampled" | "sentiment-sampled-map" | "sentiment-sampled-batch" | "sentiment-map" | "sentiment-corpus" | "judge" | "faithfulness-map" | "faithfulness-corpus" | "extract" | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch"
+        if matches!(name, "generate" | "chat" | "classify" | "classify-map" | "classify-corpus" | "sentiment" | "sentiment-sampled" | "sentiment-sampled-map" | "sentiment-sampled-corpus" | "sentiment-sampled-batch" | "sentiment-map" | "sentiment-corpus" | "judge" | "faithfulness-map" | "faithfulness-corpus" | "extract" | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch"
             | "redact" | "redact-document" | "redact-corpus" | "resolve" | "resolve-corpus"
             | "extract-batch" | "ner-batch" | "keyphrases-batch" | "summarize-batch" | "answer-batch"
             | "ner-map" | "keyphrases-map" | "summarize-map" | "answer-map"
             | "ner-corpus" | "keyphrases-corpus" | "summarize-corpus" | "answer-corpus") {
             args.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
         }
-        if matches!(name, "generate" | "chat" | "classify" | "sentiment" | "sentiment-sampled" | "sentiment-sampled-map" | "sentiment-sampled-batch" | "judge" | "extract"
+        if matches!(name, "generate" | "chat" | "classify" | "sentiment" | "sentiment-sampled" | "sentiment-sampled-map" | "sentiment-sampled-corpus" | "sentiment-sampled-batch" | "judge" | "extract"
             | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch" | "extract-batch"
             | "ner-batch" | "keyphrases-batch" | "summarize-batch" | "answer-batch"
             | "classify-map" | "classify-corpus" | "sentiment-map" | "sentiment-corpus" | "extract-map" | "extract-corpus"
@@ -426,6 +429,8 @@ impl Int4Command {
                 return options.run(args, &mut input, &mut output, diagnostics),
             Self { task: Int4Task::SampledSentimentMap(options), args, batch: None, job: None } =>
                 return options.run(args, &mut input, &mut output, diagnostics),
+            Self { task: Int4Task::SampledSentimentCorpus(options), args, batch: None, job: None } =>
+                return options.run_owned(args, input, output, diagnostics),
             Self { task: Int4Task::SampledSentimentBatch(options), args, batch: None, job: None } =>
                 return options.run_owned(args, input, output, diagnostics),
             Self { task: Int4Task::SampledSentimentJob, args, batch: None,
@@ -493,7 +498,7 @@ impl Int4Command {
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
         // The executable uses the typed sampled-task failure boundary above.
-        if matches!(self.task, Int4Task::SampledSentiment(_) | Int4Task::SampledSentimentMap(_) | Int4Task::SampledSentimentBatch(_) | Int4Task::SampledSentimentJob) {
+        if matches!(self.task, Int4Task::SampledSentiment(_) | Int4Task::SampledSentimentMap(_) | Int4Task::SampledSentimentCorpus(_) | Int4Task::SampledSentimentBatch(_) | Int4Task::SampledSentimentJob) {
             return Err(CandidateError::Arguments);
         }
         if self.job.is_some() || matches!(self.task, Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::ClassificationDocumentJob | Int4Task::SentimentDocumentJob | Int4Task::FaithfulnessDocumentJob | Int4Task::QuestionDocumentJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob) {
@@ -543,7 +548,7 @@ impl Int4Command {
             return options.execute(self.args, input, output);
         }
         let limits = match &self.task {
-            Int4Task::SampledSentiment(_) | Int4Task::SampledSentimentMap(_) | Int4Task::SampledSentimentBatch(_) | Int4Task::SampledSentimentJob => return Err(CandidateError::Arguments),
+            Int4Task::SampledSentiment(_) | Int4Task::SampledSentimentMap(_) | Int4Task::SampledSentimentCorpus(_) | Int4Task::SampledSentimentBatch(_) | Int4Task::SampledSentimentJob => return Err(CandidateError::Arguments),
             Int4Task::Text(_) => self.args.validate_text_compute()?,
             Int4Task::Classify(scoring) => scoring.validate_one_off_with_prefill(&self.args)?,
             Int4Task::Extract(extraction) => extraction.validate_one_off_with_prefill(&self.args)?,

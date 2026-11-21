@@ -30,6 +30,8 @@ use crate::{
 
 pub use crate::batch::sentiment::sampled::sampled_sentiment_job_preparation_bytes;
 
+pub mod long;
+
 /// Serialize only for the owned job's keyed commitment. There is no Debug,
 /// Deserialize, public field or caller-supplied constructor; a recipe cannot
 /// become a model factory, a public receipt or an independent sampling seed.

@@ -2,6 +2,14 @@
 //! All chunk plans and cold work/mask bounds are admitted before any forward.
 //! Source evidence, paired document samples and final output stay charged.
 use super::*;
+pub(super) mod corpus;
+pub use corpus::SampledSentimentDocumentBatchHostConfig;
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod job;
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub use job::{SampledSentimentDocumentJobRequirements, int4_sampled_sentiment_document_job_requirements};
 use crate::{
     native_engine::strict_int4::projection::Int4ProjectionExecutor,
     tasks::sentiment::{SentimentAxis, SentimentRequest,

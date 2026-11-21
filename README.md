@@ -1187,6 +1187,29 @@ serial, persistent-worker, layer-major and within-chunk prompt-reuse routes.
 See [complete sampled documents](docs/native-sampled-sentiment-map-int4.md)
 for invocation, estimator semantics, ownership and validation limits.
 
+`sentiment-sampled-corpus` applies that complete-document estimator to ordered
+`{id,text,task_args?}` NDJSON with one resident model, vocabulary and native
+allocation. Optional `task_args` selects axes and may tighten the task budget;
+the seed, sampler and complete-document policy remain fixed. Each successful
+record retains every source chunk and document replicate. All five native
+work ceilings and the mask allowance cover the entire stream, including
+failed admitted attempts; a drained `{"flush":true}` resets only the ID epoch.
+The same item and policy reproduce the same addressed samples independently
+of input order or flush placement. Serial execution, persistent CPU workers,
+layer-major prompts, compact input and private within-chunk prefix reuse are
+explicit options. Require `run_complete` and exit status zero for whole-run
+success. This route is a candidate and has no measured throughput or quality
+qualification.
+
+```bash
+fnlp candidate source-int4 sentiment-sampled-corpus documents.ndjson \
+  --snapshot /private/model.snapshot --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 32768 --seed "$SEED_HEX" --samples 4 \
+  --max-chunks 64 --max-chunk-bytes 4096 --input-encoding safe-bpe-v1 \
+  --compute-threads 4 --reuse-prefill --max-requests 1000 \
+  --max-total-input-bytes 67108864 --max-total-output-bytes 268435456
+```
+
 The one-document command, resident `sentiment-sampled-batch` stream, and durable
 `sentiment-sampled-job` accept `--reuse-prefill`. Each document/axis prefills once, then later independent
 samples recompute the final prompt token using the retained causal prefix.

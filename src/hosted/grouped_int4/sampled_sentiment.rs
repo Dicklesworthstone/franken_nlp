@@ -7,7 +7,10 @@
 
 mod corpus;
 mod long;
-pub use long::SampledSentimentMapHostConfig;
+pub use long::{SampledSentimentDocumentBatchHostConfig, SampledSentimentMapHostConfig};
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub use long::{SampledSentimentDocumentJobRequirements, int4_sampled_sentiment_document_job_requirements};
 #[cfg(all(feature = "metadata-store", target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod job;

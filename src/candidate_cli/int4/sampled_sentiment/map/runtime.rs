@@ -32,7 +32,7 @@ fn map_failure(error: SampledSentimentMapError) -> Failure {
     Failure { exit, code, cancellation: None }
 }
 
-fn host_failure(error: HostedError) -> Failure {
+pub(super) fn host_failure(error: HostedError) -> Failure {
     match error {
         HostedError::Int4(Int4HostError::SampledSentimentMap(error)) => map_failure(error),
         HostedError::Stopped { stop, task_error } => {
