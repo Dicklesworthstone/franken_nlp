@@ -39,6 +39,8 @@ source preservation does not establish recall or single-context equivalence.
 Source membership is not semantic entailment. Passage QA and schema extraction
 have separate task-specific routes under this command; compact input below is
 available for NER, keyphrases, cited-summary maps and independent passage QA.
+Exact-schema extraction also accepts compact input through its dedicated
+`--task extract --schema FILE` route, including explicit source membership.
 
 ## Exact capacity instead of a guessed scaffold reserve
 
@@ -70,7 +72,8 @@ No second model, alternate tokenizer or inference retry is introduced.
 ## Bounded compact input
 
 Use `--input-encoding safe-bpe-v1` for `--task ner`, `--task keyphrases`,
-`--task summarize` or `--task answer --question FILE`. Exact `--reduce-keyphrases` and `--reduce-summary`
+`--task summarize`, `--task answer --question FILE`, or
+`--task extract --schema FILE`. Exact `--reduce-keyphrases` and `--reduce-summary`
 remain available with the same policy:
 
 ```sh
@@ -92,6 +95,29 @@ determine native context fit. Original passage bytes alone authorize citations.
 The CLI retains the same planner through hosted execution and final reporting;
 another chunk, rejected candidate or hosted replan cannot renew the budget.
 
+Schema extraction additionally charges the initial exact-schema sizing pass
+and every repeated schema/source prompt. The per-call byte allowance covers
+the requested source candidate plus the complete 64-KiB schema ceiling, bounded
+by the encoder's 1-MiB aggregate maximum. Actual partitioning reserves the exact
+schema length and its compact token count separately; original byte ceilings
+never substitute for native context fit. For example:
+
+```sh
+fnlp candidate map document.txt --task extract \
+  --schema extraction.schema.json --source-membership \
+  --model ./model.fnlpq --memory-mib 8192 \
+  --input-encoding safe-bpe-v1 --max-chunk-bytes 4096
+```
+
+The schema stays an exact declarative string, including decimal constants and
+formatting; it is never normalized through a JSON-value round trip. Structural
+and source-membership modes keep their independent validators. Successful
+chunks retain their exact native JSON strings and original source evidence;
+this route does not manufacture one globally merged object. Library callers
+configure `Int8ExtractionBatchPlanner::with_map_document_encoding` with a
+`SafeBpeWorkLimits` value and retain that planner across preflight and execution.
+A record-local encoding policy alone cannot authorize complete-document maps.
+
 | Complete-invocation option | Default |
 | --- | --- |
 | `--max-total-tokenizer-input-bytes` | Eight times `--max-input-bytes` |
@@ -110,9 +136,10 @@ operation limits and cumulative work used. Default byte responses retain their
 existing shape. Encoder workspace is admitted before private input/model IO and
 charged beside the full retained-plan preparation reserve.
 
-Compact schema extraction, `--synthesize-answer` and `--synthesize-summary` are
-refused during option validation. Their distinct planning work requires separate
-admission. Compact passage QA retains independent passage answers and every
+`--synthesize-answer` and `--synthesize-summary` still refuse compact input during
+option validation. Complete-document extraction corpora and retained extraction
+jobs retain their separate byte-mode contracts. Compact passage QA retains
+independent passage answers and every
 verified source occurrence; it adds no answer vote or global synthesis pass.
 The default byte routes retain their existing behavior.
 

@@ -23,6 +23,7 @@ pub mod long;
 pub struct Int8ExtractionBatchPlanner {
     compiler: ExtractionBatchPlanner,
     document_encoding: UntrustedEncoding,
+    map_encoding: Option<long::MapEncoding>,
 }
 pub struct PreparedInt8BatchExtraction {
     plan: Int8ExtractPlan,
@@ -38,12 +39,13 @@ impl Int8ExtractionBatchPlanner {
         defaults: Option<ExtractionBatchArgs>) -> Result<Self, BatchFault> {
         Ok(Self { compiler: ExtractionBatchPlanner::pinned_for_backend(controls, eos, identity,
             ceiling, compiler_limits, source_limits, defaults, ExtractionBackend::Int8)?,
-            document_encoding: UntrustedEncoding::ByteFallback })
+            document_encoding: UntrustedEncoding::ByteFallback, map_encoding: None })
     }
     /// Fix one schema/source encoding for an ordered resident stream. Every
     /// record spends one allowance across BOTH untrusted segments. The host
     /// admits its transient workspace before reading or preparing any record.
-    /// Complete-document chunk planners retain their separate byte contract.
+    /// Complete-document chunk planners additionally require an explicitly
+    /// admitted invocation ledger through `with_map_document_encoding`.
     pub fn with_document_encoding(mut self, policy: UntrustedEncoding) -> Result<Self, BatchFault> {
         policy.validate().map_err(|_| BatchCode::InvalidLimits)?;
         self.require_byte_encoding()?;
@@ -84,7 +86,8 @@ impl Int8ExtractionBatchPlanner {
         document: BatchDocument<ExtractionBatchArgs>, policy: &UntrustedEncoding, control: &mut C,
     ) -> Result<PreparedInt8BatchExtraction, BatchItemFailure> {
         preparation_checkpoint(control)?;
-        if self.document_encoding != UntrustedEncoding::ByteFallback && policy != self.document_encoding() {
+        if self.map_encoding.is_some()
+            || (self.document_encoding != UntrustedEncoding::ByteFallback && policy != self.document_encoding()) {
             return Err(BatchItemFailure::reject(BatchCode::Admission));
         }
         let input = self.compiler.prepare_input_with_encoding(document, policy,

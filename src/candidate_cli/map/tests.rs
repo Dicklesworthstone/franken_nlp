@@ -164,6 +164,21 @@ fn compact_passage_qa_admits_auxiliary_context_beside_source_before_io() {
     assert!(byte.encoding.limits(&byte).unwrap().is_none());
 }
 #[test]
+fn compact_extraction_admits_schema_and_chunk_storage_before_any_private_io() {
+    for grounded in [false, true] {
+        let mut flags = vec!["--schema", "schema.json", "--input-encoding", "safe-bpe-v1",
+            "--max-chunk-bytes", "4096"];
+        if grounded { flags.push("--source-membership"); }
+        let cmd = command("extract", &flags);
+        let (_, limits) = cmd.validate().unwrap();
+        let encoding = cmd.encoding.limits(&cmd).unwrap().unwrap();
+        assert_eq!(encoding.call.max_input_bytes, 4096 + crate::candidate_cli::extract::SCHEMA_BYTES);
+        assert_eq!(encoding.call.max_output_tokens, encoding.call.max_input_bytes);
+        assert!(encoding.workspace_bytes().unwrap() < limits.preparation_bytes);
+        assert_eq!(cmd.extraction_mapping().unwrap().mapping.chunks.max_chunk_bytes, 4096);
+    }
+}
+#[test]
 fn unsupported_compact_compositions_refuse_before_private_io() {
     struct NoRead;
     impl Read for NoRead {
@@ -175,7 +190,6 @@ fn unsupported_compact_compositions_refuse_before_private_io() {
         fn flush(&mut self) -> io::Result<()> { panic!("output flushed") }
     }
     for (task, extra) in [("answer", vec!["--question", "never-open.txt", "--synthesize-answer"]),
-        ("extract", vec!["--schema", "never-open.json"]),
         ("summarize", vec!["--synthesize-summary"])] {
         let mut flags = vec!["--input-encoding", "safe-bpe-v1"];
         flags.extend(extra);

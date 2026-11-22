@@ -68,8 +68,10 @@ delivery, as for the existing single-source task.
 
 A planner configured through
 `SourceTaskPlanner::with_map_document_encoding(UntrustedEncoding::SafeBpeV1(...), SafeBpeWorkLimits { ... })`
-supports compact NER, keyphrase and cited-summary maps, including the existing
-exact keyphrase and summary reducers. A one-request encoding policy without a
+supports compact NER, keyphrase, cited-summary and passage-QA maps, including
+the existing exact keyphrase and summary reducers. QA also charges question
+sizing and every repeated question/manifest segment in its native plans.
+A one-request encoding policy without a
 complete-operation ledger is refused by both map capacity and map planning.
 
 All candidate partition probes, including candidates discarded while shrinking,
@@ -84,7 +86,25 @@ Use `map_document_encoding_work()` for cumulative usage and
 exact reducers add `map_document_encoding_workspace_bytes()` to their input
 reservation, alongside source capacity and the caller's full preparation reserve.
 
-Neural summary synthesis and long-redaction compositions remain explicitly
+Exact-schema extraction uses the corresponding
+`Int8ExtractionBatchPlanner::with_map_document_encoding` method and the same
+four cumulative work ceilings. Schema sizing, discarded source probes, every
+final schema/source prompt and hosted reconstruction all debit that planner's
+single ledger. Each final plan retains the declared policy and identity even
+as remaining work decreases. All per-call and complete-operation caps bind the
+extended template identity; original schema bytes and decimal constants remain
+exact. Concurrent planning on one ledger and record preparation through a map
+planner refuse instead of silently restarting work.
+
+`NlpEngine::extract_int8_document` adds the map encoder/ledger workspace beside
+source and schema capacities and the entire retained preparation reserve.
+`map_document_encoding_work`, `map_document_encoding_limits` and
+`map_document_encoding_workspace_bytes` are available on the extraction planner
+as well. Complete-document extraction corpora and retained extraction jobs
+retain their separate byte-only admission. Chunk JSON remains independent;
+compact encoding does not authorize a global object merge.
+
+Neural answer/summary synthesis and long-redaction compositions remain explicitly
 byte-only on these INT8 library paths. This change does not extend their
 multi-stage accounting. Compact tokens may change native output; implementation
 and regression definitions establish no model-quality or parity result.

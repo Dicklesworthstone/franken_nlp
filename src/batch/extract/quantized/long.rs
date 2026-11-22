@@ -5,7 +5,7 @@
 //! before the first forward. Independent JSON values are NOT merged into a
 //! fabricated global object; required fields are not replaced with guessed nulls.
 use super::*;
-use std::sync::Arc;
+use std::{cell::RefCell, sync::{Arc, Mutex}};
 use crate::{
     tasks::{extract::{ExtractionGrounding, quantized::check_size},
         mapreduce::{self, ChunkPlan, MapReduceError, MapReduceResult, MapReduceTask, MapOutput,
@@ -20,6 +20,13 @@ pub mod stream;
 
 pub const INT8_EXTRACTION_MAP_EXECUTION: &str = "portable-int8-exact-schema-document-map-v1";
 const SEMANTICS: &str = "independent-chunk-json-no-global-object-merge-v1";
+
+/// The planner owns one nonrenewable operation ledger across sizing, every
+/// real schema/source plan, and hosted reconstruction. No source is cached.
+pub(super) struct MapEncoding {
+    limits: SafeBpeWorkLimits,
+    used: Mutex<SafeBpeWork>,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Int8ExtractionMapLimits {
@@ -114,6 +121,45 @@ impl PreparedInt8ExtractionMap<'_> {
     pub fn max_result_bytes(&self) -> u64 { self.limits.mapping.reduction.max_result_bytes as u64 }
 }
 impl Int8ExtractionBatchPlanner {
+    /// Configure complete-document compact extraction before deriving any
+    /// execution identity. The same planner must survive CLI preflight and
+    /// hosted reconstruction; another call never restores spent work.
+    pub fn with_map_document_encoding(mut self, policy: UntrustedEncoding,
+        limits: SafeBpeWorkLimits) -> Result<Self, BatchFault> {
+        if !matches!(policy, UntrustedEncoding::SafeBpeV1(_)) {
+            return Err(BatchCode::InvalidLimits.into());
+        }
+        limits.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        self = self.with_document_encoding(policy)?;
+        // Keep the pinned template binding while extending its semantic
+        // identity with ALL declared limits, never decreasing remaining work.
+        self.compiler.identity.template_digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&(
+            "int8-extraction-map-encoding-v1", self.compiler.identity.template_digest,
+            self.document_encoding(), limits,
+        )).map_err(|_| BatchCode::Admission)?);
+        self.map_encoding = Some(MapEncoding { limits, used: Mutex::new(SafeBpeWork::default()) });
+        Ok(self)
+    }
+    pub fn map_document_encoding_limits(&self) -> Option<SafeBpeWorkLimits> {
+        self.map_encoding.as_ref().map(|ledger| ledger.limits)
+    }
+    pub fn map_document_encoding_work(&self) -> Result<Option<SafeBpeWork>, BatchFault> {
+        self.map_encoding.as_ref().map(|ledger| ledger.used.try_lock().map(|used| *used)
+            .map_err(|_| BatchCode::Admission.into())).transpose()
+    }
+    /// Extra transient encoder and ledger storage, beside all retained plans.
+    /// A record-local policy alone cannot authorize repeated document probes.
+    pub fn map_document_encoding_workspace_bytes(&self) -> Result<u64, BatchFault> {
+        match (self.document_encoding(), self.map_document_encoding_limits()) {
+            (UntrustedEncoding::ByteFallback, None) => Ok(0),
+            (UntrustedEncoding::SafeBpeV1(_), Some(limits)) => {
+                limits.validate().map_err(|_| BatchCode::InvalidLimits)?;
+                if std::mem::size_of::<MapEncoding>() > 1024 { return Err(BatchCode::InvalidLimits.into()); }
+                self.encoding_workspace_bytes()?.checked_add(1024).ok_or_else(|| BatchCode::InvalidLimits.into())
+            },
+            _ => Err(BatchCode::InvalidLimits.into()),
+        }
+    }
     /// Compile every actual chunk, not a placeholder document. The caller must
     /// retain a preparation guard for this complete set; CLI preflight drops it
     /// before loading weights and the charged host builds the same set again.
@@ -121,10 +167,12 @@ impl Int8ExtractionBatchPlanner {
         args: &ExtractionBatchArgs, limits: Int8ExtractionMapLimits, control: &mut C)
         -> Result<PreparedInt8ExtractionMap<'s>, Int8SourceMapError> {
         step(control)?;
-        // Chunk sizing currently uses the byte-fallback token geometry. A
-        // configured compact record planner cannot silently change that map
-        // or renew a compact allowance for every probe/chunk.
-        self.require_byte_encoding().map_err(|_| Int8SourceMapError::InvalidLimits)?;
+        self.map_document_encoding_workspace_bytes().map_err(|_| Int8SourceMapError::InvalidLimits)?;
+        let total = self.map_document_encoding_limits();
+        let mut shared = self.map_encoding.as_ref().map(|ledger| ledger.used.try_lock()
+            .map_err(|_| Int8SourceMapError::Admission)).transpose()?;
+        let mut byte_work = SafeBpeWork::default();
+        let used = shared.as_deref_mut().unwrap_or(&mut byte_work);
         if source.is_empty() { return Err(Int8SourceMapError::EmptySource); }
         let b = args.budget; let c = &self.compiler; let m = limits.mapping; let v = limits.verification;
         b.validate().map_err(|_| Int8SourceMapError::InvalidLimits)?;
@@ -142,13 +190,16 @@ impl Int8ExtractionBatchPlanner {
         // neither it nor source text passes through trusted template rendering.
         let scaffold = c.fragments.iter().try_fold(0_usize, |n, f| n.checked_add(f.len()))
             .ok_or(Int8SourceMapError::WorkLimit)?;
-        let schema = c.encoder.encode(&args.schema, c.compiler_limits.max_schema_bytes, b.max_input_tokens as usize)
-            .map_err(|_| Int8SourceMapError::InvalidLimits)?;
+        let schema = self.encode_map_segment(&args.schema, c.compiler_limits.max_schema_bytes,
+            b.max_input_tokens as usize, used, total, control)?;
         let non_source = scaffold.checked_add(schema.total_token_count()).ok_or(Int8SourceMapError::WorkLimit)?;
         let token_room = (b.max_input_tokens as usize).checked_sub(non_source).filter(|&n| n > 0)
             .ok_or(Int8SourceMapError::InvalidLimits)?;
-        let byte_room = (b.max_input_tokens as usize).checked_sub(scaffold)
-            .and_then(|n| n.checked_sub(args.schema.len())).filter(|&n| n > 0).ok_or(Int8SourceMapError::InvalidLimits)?;
+        let byte_room = match self.document_encoding() {
+            UntrustedEncoding::ByteFallback => (b.max_input_tokens as usize).checked_sub(scaffold)
+                .and_then(|n| n.checked_sub(args.schema.len())),
+            UntrustedEncoding::SafeBpeV1(call) => call.max_input_bytes.checked_sub(args.schema.len()),
+        }.filter(|&n| n > 0).ok_or(Int8SourceMapError::InvalidLimits)?;
         let mut chunk_limits = m.chunks;
         chunk_limits.effective_token_limit().map_err(Int8SourceMapError::Chunk)?;
         chunk_limits.reserved_tokens = chunk_limits.reserved_tokens.max(non_source.checked_add(b.max_output_tokens as usize)
@@ -156,13 +207,21 @@ impl Int8ExtractionBatchPlanner {
         chunk_limits.max_chunk_tokens = chunk_limits.max_chunk_tokens.min(token_room);
         chunk_limits.max_chunk_bytes = chunk_limits.max_chunk_bytes.min(byte_room.max(4));
         let mut cancelled = None;
-        let chunks = ChunkPlan::build_with_checkpoints(source, chunk_limits, |text| {
-            c.encoder.encode(text, chunk_limits.max_chunk_bytes, chunk_limits.max_chunk_bytes)
-                .map(|d| d.total_token_count()).map_err(|_| MapReduceError::Tokenizer)
-        }, || match control.prefill_checkpoint(0) {
-            Some(cause) => { cancelled = Some(cause); Err(MapReduceError::Cancelled) }, None => Ok(()),
-        });
+        let mut encoding_error = None;
+        let chunks = {
+            let control = RefCell::new(&mut *control);
+            ChunkPlan::build_with_checkpoints(source, chunk_limits, |text| {
+                self.encode_map_segment(text, chunk_limits.max_chunk_bytes, chunk_limits.max_chunk_bytes,
+                    used, total, &mut **control.borrow_mut())
+                    .map(|document| document.total_token_count()).map_err(|error| {
+                        encoding_error = Some(error); MapReduceError::Tokenizer
+                    })
+            }, || match control.borrow_mut().prefill_checkpoint(0) {
+                Some(cause) => { cancelled = Some(cause); Err(MapReduceError::Cancelled) }, None => Ok(()),
+            })
+        };
         if let Some(cause) = cancelled { return Err(Int8SourceError::Cancelled(cause).into()); }
+        if let Some(error) = encoding_error { return Err(error); }
         let chunks = chunks.map_err(Int8SourceMapError::Chunk)?;
         let first = chunks.chunks().first().ok_or(Int8SourceMapError::EmptySource)?.span();
         let last = chunks.chunks().last().ok_or(Int8SourceMapError::EmptySource)?.span();
@@ -176,12 +235,16 @@ impl Int8ExtractionBatchPlanner {
         plans.try_reserve_exact(expected.chunks).map_err(|_| Int8SourceMapError::Allocation)?;
         for chunk in chunks.chunks() {
             step(control)?;
-            let plan = self.prepare_with_control(BatchDocument { id: format!("chunk_{}", chunk.id()), text: copy(chunk.text())?,
-                task_args: Some(ExtractionBatchArgs { schema: copy(&args.schema)?, grounding: args.grounding, budget: b }) }, control)
+            let plan = self.prepare_with_invocation_encoding_work(BatchDocument {
+                id: format!("chunk_{}", chunk.id()), text: copy(chunk.text())?,
+                task_args: Some(ExtractionBatchArgs { schema: copy(&args.schema)?, grounding: args.grounding, budget: b }) },
+                used, total, control)
                 .map_err(batch_error)?;
             if non_source.checked_add(chunk.tokens()) != Some(plan.plan.prompt_tokens())
                 || plan.plan.prompt_tokens().checked_add(b.max_output_tokens as usize).is_none_or(|n| n > chunk_limits.context_tokens)
-                || plan.source().text() != chunk.text() {
+                || plan.source().text() != chunk.text()
+                || plan.source().total_token_count() != chunk.tokens()
+                || plan.source().document_encoding() != self.document_encoding() {
                 return Err(Int8SourceMapError::Admission);
             }
             expected.work = add_work(expected.work, plan.planned_work()).filter(|w| fits(*w, m.max_model_work))
@@ -192,6 +255,24 @@ impl Int8ExtractionBatchPlanner {
         }
         step(control)?;
         Ok(PreparedInt8ExtractionMap { chunks, plans, limits, expected })
+    }
+    fn encode_map_segment<C: DecodeStepControl>(&self, text: &str, max_bytes: usize,
+        max_tokens: usize, used: &mut SafeBpeWork, total: Option<SafeBpeWorkLimits>, control: &mut C)
+        -> Result<SourceDocument, Int8SourceMapError> {
+        step(control)?;
+        let effective = match (self.document_encoding(), total) {
+            (UntrustedEncoding::ByteFallback, None) if *used == SafeBpeWork::default() =>
+                UntrustedEncoding::ByteFallback,
+            (UntrustedEncoding::SafeBpeV1(call), Some(total)) => UntrustedEncoding::SafeBpeV1(
+                total.remaining_call(*used, *call).map_err(|_| Int8SourceMapError::WorkLimit)?),
+            _ => return Err(Int8SourceMapError::InvalidLimits),
+        };
+        let mut work = SafeBpeWork::default();
+        let result = self.compiler.encoder.encode_with_policy_and_work(text, &effective,
+            max_bytes, max_tokens, &mut work, &mut || control.prefill_checkpoint(0));
+        // Failure and cancellation never refund work already performed.
+        *used = used.checked_add(work).ok_or(Int8SourceMapError::WorkLimit)?;
+        result.map_err(|error| Int8SourceError::from(error).into())
     }
 }
 fn step<C: DecodeStepControl>(control: &mut C) -> Result<(), Int8SourceError> {

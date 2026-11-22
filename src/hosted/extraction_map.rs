@@ -40,12 +40,12 @@ impl NlpEngine {
         -> Result<HostedOutput<Int8ExtractionMapRun>, HostedError> {
         dispatch::preflight(self, config.native.run)?;
         self.check_resident_domain(model)?;
-        planner.require_byte_encoding().map_err(HostedError::BatchSetup)?;
+        planner.map_document_encoding_workspace_bytes().map_err(HostedError::BatchSetup)?;
         let identity = planner.base_execution_identity();
         check_model_identity(model.artifact_identity(), identity)?;
         let required = requirements(config.native)?;
         validate(&config, identity, source.len(), required.kv_bytes)?;
-        let bytes = input_bytes(source.capacity(), &config)?;
+        let bytes = input_bytes(source.capacity(), &config, &planner)?;
         let run = config.native.run;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
@@ -134,8 +134,11 @@ fn validate(config: &ExtractionMapConfig, identity: &ExecutionIdentity, source_b
     m.chunks.effective_token_limit().map_err(|_| HostedError::Limits("extraction map chunk geometry"))?;
     Ok(())
 }
-fn input_bytes(source_capacity: usize, config: &ExtractionMapConfig) -> Result<u64, HostedError> {
-    sum(&[source_capacity as u64, config.request.schema.capacity() as u64, config.preparation_reserve_bytes])
+fn input_bytes(source_capacity: usize, config: &ExtractionMapConfig, planner: &Int8ExtractionBatchPlanner)
+    -> Result<u64, HostedError> {
+    let encoding = planner.map_document_encoding_workspace_bytes().map_err(HostedError::BatchSetup)?;
+    sum(&[source_capacity as u64, config.request.schema.capacity() as u64,
+        config.preparation_reserve_bytes, encoding])
 }
 fn reduction_bytes(config: &ExtractionMapConfig, chunks: usize) -> Result<u64, HostedError> {
     document_workspace_bytes(config.request.budget, config.limits, chunks, config.reduction_reserve_bytes)

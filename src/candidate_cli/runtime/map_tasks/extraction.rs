@@ -40,6 +40,11 @@ pub(super) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
     session.remaining()?;
     let facts = session.facts(&args)?;
     let planner = compiler::planner(&facts, &command.host, limits, None)?;
+    let planner = match command.encoding.limits(&command)? {
+        Some(encoding) => planner.with_map_document_encoding(encoding.policy(), encoding.complete)
+            .map_err(|_| CandidateError::Planning)?,
+        None => planner,
+    };
     // Do not compile one whole-document source automaton here: the source may
     // exceed a single-context source limit. Validate the exact schema against
     // EVERY real chunk instead, never a placeholder and never truncated input.
@@ -52,12 +57,16 @@ pub(super) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
     let config = ExtractionMapConfig { request, limits: mapping, native: session.native(&args)?,
         preparation_reserve_bytes: limits.preparation_bytes,
         reduction_reserve_bytes: command.reduction_reserve_mib.checked_mul(MIB).ok_or(CandidateError::Arguments)? };
-    let result = session.engine.extract_int8_document(&model, text, Arc::new(planner), vocabulary,
-        config, cancellation).map_err(|_| CandidateError::Execution)?;
+    // The actual hosted plans spend the SAME allowance as the discarded CLI
+    // preflight. Retain the owner until cumulative usage has been reported.
+    let planner = Arc::new(planner);
+    let result = session.engine.extract_int8_document(&model, text, Arc::clone(&planner), vocabulary,
+        config, cancellation).map_err(host_error)?;
     expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
     // Exact native JSON remains a STRING. No serde Value roundtrip, repair,
     // object merge, source-field synthesis or partially successful publication.
-    deliver(&session, &facts, &result, command.max_map_result_bytes + 4096, output)
+    deliver_encoded(&session, &facts, &result, encoding::extraction_report(&planner)?.as_ref(),
+        command.max_map_result_bytes + 4096, output)
 }
 
 #[cfg(test)] mod tests;

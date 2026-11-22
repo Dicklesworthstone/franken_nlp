@@ -122,3 +122,74 @@ fn source_membership_is_explicit_and_blank_chunks_are_not_skipped() {
     request.grounding = crate::batch::extract::ExtractionBatchGrounding::Structural;
     assert!(preflight(text, &request, &planner, mapping, &mut continuing()).is_err());
 }
+
+fn compact_fixture(cmd: &MapCommand) -> (Int8ExtractionBatchPlanner, ExtractionBatchArgs, Int8ExtractionMapLimits) {
+    let (_, limits) = cmd.validate().unwrap();
+    let encoding = cmd.encoding.limits(cmd).unwrap().unwrap();
+    let planner = compiler::planner(&facts(), &cmd.host, limits, None).unwrap()
+        .with_map_document_encoding(encoding.policy(), encoding.complete).unwrap();
+    let request = schema::arguments(r#"{"type":"string","maxLength":32}"#.to_owned(), false,
+        cmd.host.task_budget(limits)).unwrap();
+    (planner, request, cmd.extraction_mapping().unwrap())
+}
+
+#[test]
+fn compact_cli_extraction_preflight_host_plans_and_report_keep_one_operation_ledger() {
+    let cmd = command("extract", &["--schema", "s", "--input-encoding", "safe-bpe-v1",
+        "--max-chunk-bytes", "128", "--max-new-tokens", "16"]);
+    let (planner, request, mapping) = compact_fixture(&cmd);
+    let source = SOURCE.repeat(32);
+    let expected = preflight(&source, &request, &planner, mapping, &mut continuing()).unwrap();
+    assert!(expected.chunk_count() > 1);
+    let first = planner.map_document_encoding_work().unwrap().unwrap();
+    let planner = Arc::new(planner);
+    let prepared = planner.plan_document_with_control(&source, &request, mapping, &mut continuing()).unwrap();
+    assert_eq!(expected, prepared.preflight_metadata());
+    assert_eq!(expected.source_span().byte_end, source.len());
+    assert_eq!(expected.source_span().scalar_end, source.chars().count());
+    for identity in prepared.execution_identities() {
+        assert_eq!(identity.schema_digest, Sha256Digest::of_bytes(request.schema.as_bytes()));
+        assert_eq!(identity.task_spec, "extract-v1");
+    }
+    let complete = planner.map_document_encoding_work().unwrap().unwrap();
+    assert_eq!(complete, first.checked_add(first).unwrap());
+    assert!(complete.input_bytes() > source.len() * 2);
+    let report = serde_json::to_value(encoding::extraction_report(&planner).unwrap().unwrap()).unwrap();
+    assert_eq!(report["policy"], serde_json::to_value(planner.document_encoding()).unwrap());
+    assert_eq!(report["work_used"], serde_json::to_value(complete).unwrap());
+    assert_eq!(report["complete_operation_limits"],
+        serde_json::to_value(planner.map_document_encoding_limits().unwrap()).unwrap());
+    let (byte, _, _) = fixture();
+    assert!(encoding::extraction_report(&byte).unwrap().is_none());
+}
+
+#[test]
+fn compact_cli_extraction_cannot_refund_preflight_before_hosted_reconstruction() {
+    let cmd = command("extract", &["--schema", "s", "--input-encoding", "safe-bpe-v1",
+        "--max-chunk-bytes", "128", "--max-new-tokens", "16"]);
+    let (planner, request, mapping) = compact_fixture(&cmd);
+    preflight(SOURCE, &request, &planner, mapping, &mut continuing()).unwrap();
+    let exact = planner.map_document_encoding_work().unwrap().unwrap().input_bytes().to_string();
+    let cmd = command("extract", &["--schema", "s", "--input-encoding", "safe-bpe-v1",
+        "--max-chunk-bytes", "128", "--max-new-tokens", "16", "--max-total-tokenizer-input-bytes", &exact]);
+    let (planner, request, mapping) = compact_fixture(&cmd);
+    preflight(SOURCE, &request, &planner, mapping, &mut continuing()).unwrap();
+    let spent = planner.map_document_encoding_work().unwrap().unwrap();
+    assert_eq!(spent.input_bytes().to_string(), exact);
+    assert!(planner.plan_document_with_control(SOURCE, &request, mapping, &mut continuing()).is_err());
+    assert_eq!(planner.map_document_encoding_work().unwrap().unwrap(), spent);
+    assert!(preflight(SOURCE, &request, &planner, mapping, &mut continuing()).is_err());
+    assert_eq!(planner.map_document_encoding_work().unwrap().unwrap(), spent);
+}
+
+#[test]
+fn compact_cli_extraction_preserves_cancellation_at_preflight_and_host_boundaries() {
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let error = crate::tasks::source_planning::quantized::Int8SourceError::Cancelled(cause);
+        assert_eq!(planning_error(error.into()), cancelled(cause));
+        let error = crate::tasks::source_planning::quantized::Int8SourceError::Cancelled(cause);
+        assert_eq!(host_error(HostedError::SourceMap(error.into())), cancelled(cause));
+    }
+}

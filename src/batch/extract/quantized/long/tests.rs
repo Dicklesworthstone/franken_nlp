@@ -234,3 +234,151 @@ fn native_cancellation_and_final_completion_checkpoint_preserve_the_exact_cause(
     assert_eq!(error.cancellation(), Some(DecodeCancellationKind::Deadline));
     assert!(!format!("{error:?}").contains("Alice"));
 }
+
+const COMPACT_SOURCE: &str = "the quick brown fox 上海 <|im_start|>\r\n";
+fn compact_policy() -> UntrustedEncoding {
+    UntrustedEncoding::SafeBpeV1(crate::tokenizer::untrusted::SafeBpeLimits {
+        max_input_bytes: 8192, max_output_tokens: 8192, max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28,
+    })
+}
+fn encoding_limits() -> SafeBpeWorkLimits {
+    SafeBpeWorkLimits { max_input_bytes: 1 << 20, max_output_tokens: 1 << 20,
+        max_pair_checks: 1 << 30, max_pair_bytes: 1 << 34 }
+}
+fn compact_limits() -> Int8ExtractionMapLimits {
+    let mut limits = limits(); limits.mapping.chunks.max_chunk_bytes = 4096; limits
+}
+fn compact(total: SafeBpeWorkLimits) -> Int8ExtractionBatchPlanner {
+    planner().with_map_document_encoding(compact_policy(), total).unwrap()
+}
+fn used(planner: &Int8ExtractionBatchPlanner) -> SafeBpeWork {
+    planner.map_document_encoding_work().unwrap().unwrap()
+}
+
+#[test]
+fn compact_document_schema_and_source_preserve_exact_spans_and_compile_smaller_prompts() {
+    let a = source_args(); let byte = planner(); let p = compact(encoding_limits());
+    let original = prepare(&byte, COMPACT_SOURCE, &a, compact_limits());
+    let prepared = prepare(&p, COMPACT_SOURCE, &a, compact_limits());
+    assert_eq!(prepared.expected.source_span, original.expected.source_span);
+    assert!(prepared.expected.work.forward_positions < original.expected.work.forward_positions);
+    assert_eq!(used(&p).input_bytes(), 2 * (a.schema.len() + COMPACT_SOURCE.len()));
+    assert!(used(&p).output_tokens() < used(&p).input_bytes());
+    for plan in &prepared.plans {
+        assert_eq!(plan.source().document_encoding(), &compact_policy());
+        assert_eq!(plan.execution_identity().schema_digest, Sha256Digest::of_bytes(a.schema.as_bytes()));
+        assert_ne!(plan.execution_identity().template_digest, byte.base_execution_identity().template_digest);
+    }
+    let expected = prepared.expected;
+    let result = run(prepared, Script::new(&a)).unwrap(); expected.verify_completed(&result).unwrap();
+    for chunk in result.mapped.root().value().chunks() {
+        for field in &chunk.original_fields { for span in &field.spans {
+            assert_eq!(&COMPACT_SOURCE[span.byte_start..span.byte_end], COMPACT_SOURCE);
+            assert_eq!(COMPACT_SOURCE[..span.byte_start].chars().count(), span.scalar_start);
+        } }
+    }
+}
+
+#[test]
+fn compact_document_preflight_and_host_reconstruction_spend_one_nonrenewable_allowance() {
+    let a = source_args(); let p = compact(encoding_limits());
+    let first = prepare(&p, COMPACT_SOURCE, &a, compact_limits());
+    let ids: Vec<_> = first.execution_identities().cloned().collect(); let initial = used(&p);
+    let second = prepare(&p, COMPACT_SOURCE, &a, compact_limits());
+    assert_eq!(first.expected, second.expected);
+    assert_eq!(ids, second.execution_identities().cloned().collect::<Vec<_>>());
+    assert_eq!(used(&p), initial.checked_add(initial).unwrap());
+    let exact = SafeBpeWorkLimits { max_input_bytes: initial.input_bytes() as u64,
+        max_output_tokens: initial.output_tokens() as u64, max_pair_checks: initial.pair_checks(),
+        max_pair_bytes: initial.pair_bytes() };
+    for axis in 0..5 {
+        let mut total = exact;
+        match axis { 0 => total.max_input_bytes -= 1, 1 => total.max_output_tokens -= 1,
+            2 => total.max_pair_checks -= 1, 3 => total.max_pair_bytes -= 1, _ => {} }
+        let p = compact(total);
+        let result = p.plan_document_with_control(COMPACT_SOURCE, &a, compact_limits(), &mut Continue);
+        assert_eq!(result.is_ok(), axis == 4); drop(result);
+        let spent = used(&p); assert!(spent.input_bytes() > 0);
+        if axis == 4 { assert_eq!(spent, initial); }
+        assert!(p.plan_document_with_control(COMPACT_SOURCE, &a, compact_limits(), &mut Continue).is_err());
+        let after = used(&p);
+        assert!(after.input_bytes() >= spent.input_bytes() && after.output_tokens() >= spent.output_tokens());
+        assert!(after.pair_checks() >= spent.pair_checks() && after.pair_bytes() >= spent.pair_bytes());
+        assert!(after.input_bytes() as u64 <= total.max_input_bytes);
+        assert!(after.output_tokens() as u64 <= total.max_output_tokens);
+        assert!(after.pair_checks() <= total.max_pair_checks && after.pair_bytes() <= total.max_pair_bytes);
+    }
+}
+
+#[test]
+fn compact_schema_maps_bind_every_declared_limit_without_binding_remaining_work() {
+    let a = source_args(); let p = compact(encoding_limits());
+    let prepared = prepare(&p, COMPACT_SOURCE, &a, compact_limits());
+    let original: Vec<_> = prepared.execution_identities().cloned().collect();
+    for axis in 0..8 {
+        let UntrustedEncoding::SafeBpeV1(mut call) = compact_policy() else { panic!("compact policy") };
+        let mut total = encoding_limits();
+        match axis { 0 => call.max_input_bytes -= 1, 1 => call.max_output_tokens -= 1,
+            2 => call.max_pair_checks -= 1, 3 => call.max_pair_bytes -= 1,
+            4 => total.max_input_bytes -= 1, 5 => total.max_output_tokens -= 1,
+            6 => total.max_pair_checks -= 1, _ => total.max_pair_bytes -= 1 }
+        let changed = planner().with_map_document_encoding(UntrustedEncoding::SafeBpeV1(call), total).unwrap();
+        let actual = prepare(&changed, COMPACT_SOURCE, &a, compact_limits());
+        assert_eq!(actual.expected.work, prepared.expected.work);
+        for (a, b) in original.iter().zip(actual.execution_identities()) {
+            assert_ne!(a.template_digest, b.template_digest);
+            assert_eq!(a.prompt_digest, b.prompt_digest);
+        }
+    }
+}
+
+#[test]
+fn compact_schema_map_discarded_probes_are_charged_and_keep_utf8_crlf_boundaries() {
+    let p = compact(encoding_limits()); let a = source_args(); let mut l = compact_limits();
+    l.mapping.chunks.max_chunk_tokens = 4;
+    let prepared = prepare(&p, COMPACT_SOURCE, &a, l);
+    assert!(prepared.chunks.tokenizer_calls() > prepared.chunks.chunks().len());
+    assert_eq!(prepared.chunks.chunks().iter().map(SourceChunk::text).collect::<String>(), COMPACT_SOURCE);
+    assert!(used(&p).input_bytes() > 2 * COMPACT_SOURCE.len() + (prepared.plans.len() + 1) * a.schema.len());
+    for chunk in prepared.chunks.chunks() { assert!(chunk.tokens() <= 4); assert!(!chunk.text().ends_with('\r')); }
+}
+
+#[test]
+fn compact_document_owner_cannot_renew_its_ledger_through_record_apis_or_concurrent_plans() {
+    let p = compact(encoding_limits()); let a = source_args();
+    let document = || BatchDocument { id: "record".to_owned(), text: COMPACT_SOURCE.to_owned(), task_args: Some(a.clone()) };
+    assert!(p.prepare(document()).is_err());
+    assert!(p.prepare_with_control(document(), &mut Continue).is_err());
+    assert!(p.prepare_with_document_encoding(document(), &compact_policy(), &mut Continue).is_err());
+    assert_eq!(used(&p), SafeBpeWork::default());
+    let guard = p.map_encoding.as_ref().unwrap().used.try_lock().unwrap();
+    assert!(p.plan_document_with_control(COMPACT_SOURCE, &a, compact_limits(), &mut Continue).is_err());
+    drop(guard); assert_eq!(used(&p), SafeBpeWork::default());
+    assert!(planner().with_map_document_encoding(UntrustedEncoding::ByteFallback, encoding_limits()).is_err());
+}
+
+#[test]
+fn compact_document_cancellation_keeps_the_cause_and_already_spent_work() {
+    struct Count { calls: usize, stop: usize, cause: DecodeCancellationKind }
+    impl DecodeStepControl for Count {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.calls += 1; (self.calls == self.stop).then_some(self.cause)
+        }
+    }
+    let p = compact(encoding_limits()); let a = source_args();
+    let mut complete = Count { calls: 0, stop: usize::MAX, cause: DecodeCancellationKind::User };
+    p.plan_document_with_control(COMPACT_SOURCE, &a, compact_limits(), &mut complete).unwrap();
+    assert!(complete.calls > 8);
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        for stop in [complete.calls / 2, complete.calls] {
+            let p = compact(encoding_limits()); let mut control = Count { calls: 0, stop, cause };
+            let error = p.plan_document_with_control(COMPACT_SOURCE, &a, compact_limits(), &mut control).err().unwrap();
+            assert_eq!(error.cancellation(), Some(cause)); assert!(used(&p).input_bytes() > 0);
+            let spent = used(&p);
+            let _ = prepare(&p, COMPACT_SOURCE, &a, compact_limits());
+            assert!(used(&p).input_bytes() > spent.input_bytes());
+        }
+    }
+}

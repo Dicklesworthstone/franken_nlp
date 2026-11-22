@@ -6,6 +6,7 @@ use crate::{
     native_engine::{decode::DecodeCancellationKind, strict_int8::{Int8Work, STRICT_INT8_EXECUTION}},
     tasks::{ir::TaskBudget, mapreduce::{ChunkLimits, ExecutionLimits},
         source_planning::quantized::long::Int8SourceMapLimits},
+    tokenizer::{pinned_controls, untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding}},
     validation::grounded_fields::GroundingBudget,
 };
 
@@ -39,6 +40,14 @@ fn config() -> ExtractionMapConfig {
             run: RunLimits { max_elapsed: Duration::from_secs(1), max_checkpoints: 100, cleanup_reserve_bytes: 4096 } },
         preparation_reserve_bytes: 4096, reduction_reserve_bytes: 4096,
     }
+}
+fn planner() -> Int8ExtractionBatchPlanner {
+    let controls = pinned_controls::pinned().unwrap();
+    let eos = controls.template_controls().entries().iter()
+        .find(|entry| entry.special && entry.surface == "<|im_end|>").unwrap().id;
+    Int8ExtractionBatchPlanner::pinned(controls.template_controls(), eos, identity(), config().request.budget,
+        crate::grammar::runtime::CompileLimits::default(),
+        crate::grammar::runtime::SourceRuntimeLimits::default(), None).unwrap()
 }
 #[test]
 fn task_profile_and_full_resident_capacity_are_required() {
@@ -98,13 +107,29 @@ fn schema_preparation_output_and_verification_limits_are_not_optional() {
 }
 #[test]
 fn schema_capacity_not_only_schema_length_is_charged() {
+    let planner = planner();
     let mut c = config();
     let mut schema = String::with_capacity(8192); schema.push_str(&c.request.schema);
     c.request.schema = schema;
     assert!(c.request.schema.capacity() > c.request.schema.len());
-    assert_eq!(input_bytes(1024, &c).unwrap(), 1024 + c.request.schema.capacity() as u64 + 4096);
+    assert_eq!(input_bytes(1024, &c, &planner).unwrap(), 1024 + c.request.schema.capacity() as u64 + 4096);
     c.preparation_reserve_bytes = u64::MAX;
-    assert!(input_bytes(1024, &c).is_err());
+    assert!(input_bytes(1024, &c, &planner).is_err());
+}
+#[test]
+fn compact_document_workspace_is_additive_and_record_local_admission_is_refused() {
+    let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 8192,
+        max_output_tokens: 8192, max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 });
+    let total = SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 1 << 26, max_pair_bytes: 1 << 30 };
+    let byte = planner(); let compact = planner().with_map_document_encoding(policy.clone(), total).unwrap();
+    let c = config();
+    assert_eq!(input_bytes(1024, &c, &compact).unwrap() - input_bytes(1024, &c, &byte).unwrap(),
+        compact.map_document_encoding_workspace_bytes().unwrap());
+    let record = planner().with_document_encoding(policy).unwrap();
+    assert!(input_bytes(1024, &c, &record).is_err());
+    let mut c = c; c.preparation_reserve_bytes = u64::MAX;
+    assert!(input_bytes(1024, &c, &compact).is_err());
 }
 #[test]
 fn reduction_charges_native_results_and_temporary_coordinate_scan_storage() {

@@ -663,16 +663,17 @@ tokenizer budget for every candidate boundary.
 
 This is a distinct candidate tokenization contract, with its own regression
 fixtures; it does not assert ordinary slow-tokenizer token-ID parity or task
-quality gains. Other source-task maps and retained jobs keep their existing
-byte-fallback contract; complete-document INT4 extraction has the explicit
-policy described below. These encoding and
+quality gains. Supported complete-document INT8 maps are described below;
+retained source-document jobs and complete-document INT4 extraction have their
+own explicit policies. Other composed routes retain their declared admission
+boundaries. These encoding and
 planner tests still require
 the repository's authorized DSR checkpoint and model-present qualification.
 
 ## Implemented candidate INT8 compact document maps
 
 `fnlp candidate map` accepts `--input-encoding safe-bpe-v1` for NER,
-keyphrases, cited summaries and passage QA, including exact `--reduce-keyphrases` and
+keyphrases, cited summaries, passage QA and exact-schema extraction, including exact `--reduce-keyphrases` and
 `--reduce-summary` reductions:
 
 ```sh
@@ -689,14 +690,24 @@ sizing probes, hosted repartitioning and actual chunk compilation. The four
 pair checks and examined pair bytes. Compact responses report the policy,
 limits and actual work; byte fallback remains the default output contract.
 
+For schema extraction, use `--task extract --schema extraction.schema.json`
+and optional `--source-membership` with the compact flag. The same cumulative
+ledger charges initial schema sizing, rejected source probes and every repeated
+schema/source prompt in preflight and hosted reconstruction. Original schema
+bytes, exact decimal constants and source coordinates remain intact. Each chunk
+retains its independently validated JSON string; no global object merge is
+inferred. The host admits the encoder workspace beside the retained schema and
+source plans. Complete-document extraction corpora and retained extraction jobs
+keep their separate byte-mode contracts.
+
 For passage QA, use `--task answer --question question.txt` with the same compact
 flag. The repeated question, passage manifests, discarded source probes and
 actual passage plans all spend the same cumulative tokenizer allowance. Each
 answer retains passage-scoped evidence in original-document coordinates.
 
 Encoder workspace is charged alongside retained source, prompts and grammars.
-Compact input on this INT8 route currently excludes arbitrary schema extraction
-and neural answer/summary synthesis. All output remains candidate
+Compact input on this INT8 route currently excludes neural answer/summary
+synthesis. All output remains candidate
 evidence; changed prompt tokens establish no output-parity, quality or speed
 claim. See the [CLI contract](docs/candidate-long-document-cli.md#bounded-compact-input)
 and [library contract](docs/int8-long-source.md#compact-source-encoding).
