@@ -82,7 +82,11 @@ fn document_workspace(planner: &Int8SourceDocumentJobPlanner, reserve: u64) -> R
     // In addition to JobHostLimits' explicit preparation/journal/IO/serializer
     // reservations. Price the maximum frontier, not just the first document.
     // These are modeled commitments, not allocator or OS-enforced RSS bounds.
-    sum(&[staged, tokens, reserve])
+    // The same cumulative encoder stays live across population preparation and
+    // native reconstruction. Its transient workspace coexists with the entire
+    // retained frontier; compact input never discounts original source storage.
+    let encoding = planner.encoding_workspace_bytes().map_err(HostedError::BatchSetup)?;
+    sum(&[staged, tokens, reserve, encoding])
 }
 
 // Do not widen extraction's admission implementation to accept other tasks.

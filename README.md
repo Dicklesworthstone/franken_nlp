@@ -448,7 +448,12 @@ These INT8 requests share the byte-preservation, control-exclusion, context,
 work-limit and provenance contracts below. Explicit compact input remains a
 separate input profile; source-level regression definitions do not establish
 compiled execution, model parity or task quality. Retained INT8 jobs keep their
-existing input contract.
+single-context policy, and complete NER/keyphrase/cited-summary jobs now accept
+compact input with `--source-document-config`, including exact document reducers.
+Their cumulative tokenizer allowance spans all documents and reconstruction in
+one invocation; the same declared allowance is authenticated on resume while
+persisted native work and attempts remain spent. See
+[resumable source documents](docs/owned-source-document-jobs.md#compact-input).
 
 Resident INT8 `text-batch --task generate|chat` binds this policy to every
 complete NDJSON record. Generate records contain `id` and `prompt`; chat records

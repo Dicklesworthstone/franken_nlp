@@ -28,6 +28,23 @@ fn workspace_prices_the_maximum_frontier_not_a_single_chunks_output() {
     assert!(document_workspace(&p, u64::MAX).is_err());
 }
 #[test]
+fn compact_workspace_is_added_to_the_complete_frontier_and_not_renewed_per_document() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding};
+    let byte = factory(); let reserve = 1 << 20;
+    let original = document_workspace(&byte, reserve).unwrap();
+    let call = SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 4096,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
+    let total = SafeBpeWorkLimits { max_input_bytes: 1 << 20, max_output_tokens: 1 << 20,
+        max_pair_checks: 1 << 28, max_pair_bytes: 1 << 32 };
+    let compact = byte.with_document_encoding(UntrustedEncoding::SafeBpeV1(call), Some(total)).unwrap();
+    let workspace = compact.encoding_workspace_bytes().unwrap();
+    assert_eq!(workspace, call.requirements().unwrap().workspace_bytes + 1024);
+    assert_eq!(document_workspace(&compact, reserve).unwrap(), original + workspace);
+    assert!(document_workspace(&compact, u64::MAX - (original - reserve)).is_err());
+    assert_eq!(compact.encoding_work_limits(), Some(total));
+    assert_eq!(compact.encoding_work().unwrap(), Some(crate::tokenizer::untrusted::SafeBpeWork::default()));
+}
+#[test]
 fn whole_owned_input_is_send_without_releasing_its_charge_early() {
     fn send<T: Send + 'static>() {}
     send::<StreamInput<(Int8SourceDocumentJobPlanner, Arc<ExtractionVocabulary>, SourceJobRequest),

@@ -85,21 +85,17 @@ fn cumulative_tokenizer_caps_refuse_byte_mode_zero_and_overflow_before_private_i
     }
 }
 #[test]
-fn compact_document_jobs_fail_before_key_configuration_model_or_population_reads() {
+fn compact_extraction_document_jobs_fail_before_key_configuration_model_or_population_reads() {
     struct NoRead;
     impl Read for NoRead { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("unsupported document mode read private input") } }
     for mode in ["start", "resume"] {
-        for task in ["extract", "ner", "keyphrases", "summarize"] {
-            let extra = if task == "extract" {
-                vec!["--schema", "private/schema.json", "--document-config", "private/document.json"]
-            } else { vec!["--source-document-config", "private/source-map.json"] };
-            command(mode, task, &extra).into_parts().1.validate().unwrap();
-            let mut compact = extra;
-            compact.extend_from_slice(&["--input-encoding", "safe-bpe-v1"]);
-            let mut stdout = Vec::new();
-            let error = command(mode, task, &compact).execute_owned(NoRead, &mut stdout).unwrap_err();
-            assert_eq!(error.code, "document_job_input_encoding"); assert!(stdout.is_empty());
-        }
+        let extra = ["--schema", "private/schema.json", "--document-config", "private/document.json"];
+        command(mode, "extract", &extra).into_parts().1.validate().unwrap();
+        let mut compact = extra.to_vec();
+        compact.extend_from_slice(&["--input-encoding", "safe-bpe-v1"]);
+        let mut stdout = Vec::new();
+        let error = command(mode, "extract", &compact).execute_owned(NoRead, &mut stdout).unwrap_err();
+        assert_eq!(error.code, "document_job_input_encoding"); assert!(stdout.is_empty());
     }
 }
 #[test]

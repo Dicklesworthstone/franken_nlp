@@ -88,6 +88,8 @@ pub(in crate::candidate_cli) fn load(text: &str, args: &JobArgs, budget: TaskBud
         .and_then(|n| n.checked_add((host.max_input_bytes as u64).checked_mul(64)?))
         .and_then(|n| n.checked_add((d.max_result_bytes as u64).checked_mul(2)?))
         .ok_or_else(|| Failure::usage("source_document_job_memory"))?;
+    let floor = floor.checked_add(args.encoding_workspace_bytes(limits)?)
+        .ok_or_else(|| Failure::usage("source_document_job_memory"))?;
     if floor > limits.preparation_bytes { return Err(Failure::usage("source_document_job_preparation")); }
     let masks = host.max_mask_node_visits.checked_mul(d.max_chunks as u64)
         .ok_or_else(|| Failure::usage("source_document_job_work"))?

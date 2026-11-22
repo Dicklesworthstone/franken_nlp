@@ -79,7 +79,9 @@ fn check_encoding_quote(prepared: &PreparedJob, encoding: &UntrustedEncoding,
                 .map_err(|_| CandidateError::Planning)?),
         PreparedJob::Extract(planner) => (planner.document_encoding(), planner.encoding_work_limits(),
             planner.encoding_workspace_bytes().map_err(|_| CandidateError::Planning)?),
-        PreparedJob::Document { .. } | PreparedJob::SourceDocument { .. } => {
+        PreparedJob::SourceDocument { planner, .. } => (planner.document_encoding(), planner.encoding_work_limits(),
+            planner.encoding_workspace_bytes().map_err(|_| CandidateError::Planning)?),
+        PreparedJob::Document { .. } => {
             return if encoding == &UntrustedEncoding::ByteFallback && total.is_none() && expected == 0 {
                 Ok(())
             } else { Err(Failure::usage("document_job_input_encoding")) };

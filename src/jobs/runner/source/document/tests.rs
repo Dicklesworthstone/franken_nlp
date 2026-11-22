@@ -61,6 +61,144 @@ fn context(seq: u64) -> BatchRequestContext {
     BatchRequestContext { request_seq: seq, epoch: 1, input_line: seq, byte_offset: 0 }
 }
 
+const COMPACT_SOURCE: &str = "The quick brown fox jumps over the lazy dog. 上海 <think> <|im_start|> ▁";
+fn compact_policy() -> UntrustedEncoding {
+    UntrustedEncoding::SafeBpeV1(crate::tokenizer::untrusted::SafeBpeLimits {
+        max_input_bytes: 4096, max_output_tokens: 4096, max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 })
+}
+fn compact_work() -> SafeBpeWorkLimits {
+    SafeBpeWorkLimits { max_input_bytes: 1 << 20, max_output_tokens: 1 << 20,
+        max_pair_checks: 1 << 28, max_pair_bytes: 1 << 32 }
+}
+fn compact_mapping() -> Int8SourceMapLimits {
+    Int8SourceMapLimits { chunks: ChunkLimits { max_chunk_bytes: 4096, max_chunk_tokens: 4096,
+        ..mapping().chunks }, ..mapping() }
+}
+fn compact_factory(total: SafeBpeWorkLimits) -> Int8SourceDocumentJobPlanner {
+    build(SourceMapTask::Ner(NerOptions::default()), compact_mapping())
+        .with_document_encoding(compact_policy(), Some(total)).unwrap()
+}
+
+#[test]
+fn compact_jobs_keep_original_documents_and_exact_reconstruction_for_every_source_task() {
+    for task in [SourceMapTask::Ner(NerOptions::default()), SourceMapTask::Keyphrases(KeyphraseOptions::default()),
+        SourceMapTask::Summarize(SummaryOptions::default())] {
+        let byte = build(task, compact_mapping());
+        let old = byte.prepare_with_control(document(COMPACT_SOURCE), &mut Continue).unwrap();
+        let compact = byte.with_document_encoding(compact_policy(), Some(compact_work())).unwrap();
+        assert!(compact.owns(&old).is_err());
+        let first = compact.prepare_with_control(document(COMPACT_SOURCE), &mut Continue).unwrap();
+        assert_eq!(first.source, COMPACT_SOURCE);
+        assert_eq!(first.chunk_count(), old.chunk_count());
+        assert!(first.work.model.forward_positions < old.work.model.forward_positions);
+        assert_eq!(first.work.mask_node_visits, old.work.mask_node_visits);
+        let used = compact.encoding_work().unwrap().unwrap();
+        assert_eq!(used.input_bytes(), 2 * COMPACT_SOURCE.len());
+        assert!(used.output_tokens() < used.input_bytes());
+        let rebuilt = compact.plan(&first.source, &mut Continue).unwrap();
+        assert!(snapshot_matches(&rebuilt, &first));
+        assert_eq!(compact.encoding_work().unwrap().unwrap(), used.checked_add(used).unwrap());
+        drop(rebuilt);
+        let next = compact.prepare_with_control(document(COMPACT_SOURCE), &mut Continue).unwrap();
+        assert_eq!(first.identities, next.identities);
+        assert_eq!(compact.encoding_work().unwrap().unwrap(), used.checked_add(used).unwrap().checked_add(used).unwrap());
+        compact.check_job_limits(lifetime()).unwrap();
+    }
+}
+
+#[test]
+fn preparation_reconstruction_and_later_records_share_every_tokenizer_work_axis() {
+    let probe = compact_factory(compact_work());
+    let first = probe.prepare_with_control(document(COMPACT_SOURCE), &mut Continue).unwrap();
+    let plan = probe.plan(&first.source, &mut Continue).unwrap();
+    assert!(snapshot_matches(&plan, &first));
+    let used = probe.encoding_work().unwrap().unwrap();
+    let exact = SafeBpeWorkLimits { max_input_bytes: used.input_bytes() as u64,
+        max_output_tokens: used.output_tokens() as u64, max_pair_checks: used.pair_checks(), max_pair_bytes: used.pair_bytes() };
+    let factory = compact_factory(exact);
+    let first = factory.prepare_with_control(document(COMPACT_SOURCE), &mut Continue).unwrap();
+    let rebuilt = factory.plan(&first.source, &mut Continue).unwrap();
+    assert!(snapshot_matches(&rebuilt, &first));
+    drop(rebuilt);
+    assert_eq!(factory.encoding_work().unwrap(), Some(used));
+    assert!(factory.prepare_with_control(document(COMPACT_SOURCE), &mut Continue).is_err());
+    assert_eq!(factory.encoding_work().unwrap(), Some(used));
+    for axis in 0..4 {
+        let mut short = exact;
+        match axis { 0 => short.max_input_bytes -= 1, 1 => short.max_output_tokens -= 1,
+            2 => short.max_pair_checks -= 1, _ => short.max_pair_bytes -= 1 }
+        let limited = compact_factory(short);
+        let first = limited.prepare_with_control(document(COMPACT_SOURCE), &mut Continue).unwrap();
+        assert!(limited.plan(&first.source, &mut Continue).is_err(), "axis {axis}");
+        assert!(limited.encoding_work().unwrap().unwrap().input_bytes() >= 2 * COMPACT_SOURCE.len());
+    }
+}
+
+#[test]
+fn compact_configuration_cannot_reset_spent_work_or_accept_incomplete_admission() {
+    assert!(factory().with_document_encoding(compact_policy(), None).is_err());
+    assert!(factory().with_document_encoding(UntrustedEncoding::ByteFallback, Some(compact_work())).is_err());
+    let p = compact_factory(compact_work());
+    let first = p.prepare_with_control(document(COMPACT_SOURCE), &mut Continue).unwrap();
+    let spent = p.encoding_work().unwrap();
+    let p = p.with_document_encoding(compact_policy(), Some(compact_work())).unwrap();
+    p.owns(&first).unwrap(); assert_eq!(p.encoding_work().unwrap(), spent);
+    let mut changed = compact_work(); changed.max_input_bytes += 1;
+    assert_eq!(p.with_document_encoding(compact_policy(), Some(changed)).err().unwrap().code,
+        BatchCode::InvalidExecution);
+}
+
+#[test]
+fn compact_resume_authenticates_all_call_and_invocation_limits_without_persisting_tokenizer_counts() {
+    let original = compact_factory(compact_work());
+    let population = br#"{"id":"item","text":"private source"}"#;
+    let frozen = freeze(&original, population);
+    let prepared = original.prepare_with_control(document(COMPACT_SOURCE), &mut Continue).unwrap();
+    let resumed = compact_factory(compact_work());
+    frozen.binding.compare(&freeze(&resumed, population).binding).unwrap();
+    assert_eq!(resumed.encoding_work().unwrap().unwrap(), crate::tokenizer::untrusted::SafeBpeWork::default());
+    assert!(resumed.owns(&prepared).is_err());
+    original.check_job_limits(lifetime()).unwrap(); resumed.check_job_limits(lifetime()).unwrap();
+    for axis in 0..8 {
+        let UntrustedEncoding::SafeBpeV1(mut call) = compact_policy() else { unreachable!() };
+        let mut total = compact_work();
+        match axis { 0 => call.max_input_bytes -= 1, 1 => call.max_output_tokens -= 1,
+            2 => call.max_pair_checks -= 1, 3 => call.max_pair_bytes -= 1,
+            4 => total.max_input_bytes -= 1, 5 => total.max_output_tokens -= 1,
+            6 => total.max_pair_checks -= 1, _ => total.max_pair_bytes -= 1 }
+        let changed = build(SourceMapTask::Ner(NerOptions::default()), compact_mapping())
+            .with_document_encoding(UntrustedEncoding::SafeBpeV1(call), Some(total)).unwrap();
+        assert!(frozen.binding.compare(&freeze(&changed, population).binding).is_err(), "axis {axis}");
+    }
+    let byte = factory(); let original_recipe = canonjson::canonical_bytes(byte.job_recipe()).unwrap();
+    let byte = byte.with_document_encoding(UntrustedEncoding::ByteFallback, None).unwrap();
+    assert_eq!(canonjson::canonical_bytes(byte.job_recipe()).unwrap(), original_recipe);
+}
+
+#[test]
+fn rejected_compact_partition_probes_spend_work_and_original_cancellation_survives() {
+    let mut map = compact_mapping(); map.chunks.max_chunk_bytes = 64; map.chunks.max_chunk_tokens = 8;
+    let p = build(SourceMapTask::Ner(NerOptions::default()), map)
+        .with_document_encoding(compact_policy(), Some(compact_work())).unwrap();
+    let text = format!("{COMPACT_SOURCE}\r\n").repeat(3);
+    let prepared = p.prepare_with_control(document(&text), &mut Continue).unwrap();
+    assert!(prepared.chunk_count() > 1); assert_eq!(prepared.source, text);
+    assert!(p.encoding_work().unwrap().unwrap().input_bytes() > 2 * text.len());
+    struct Stop { calls: usize, cause: DecodeCancellationKind }
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.calls += 1; (self.calls >= 7).then_some(self.cause)
+        }
+    }
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let p = compact_factory(compact_work());
+        let error = p.prepare_with_control(document(&text), &mut Stop { calls: 0, cause }).err().unwrap();
+        assert!(error.stop); assert_eq!(error.fault.cancellation, Some(cause));
+    }
+}
+
 #[test]
 fn all_three_native_tasks_plan_complete_documents_and_bind_the_actual_assets() {
     for task in [SourceMapTask::Ner(NerOptions::default()), SourceMapTask::Keyphrases(KeyphraseOptions::default()),

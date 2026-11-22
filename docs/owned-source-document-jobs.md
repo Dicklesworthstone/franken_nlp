@@ -48,6 +48,51 @@ independent source mapper, and source failures must never become QA abstentions.
 `--schema`, `--source-membership`, and extraction's `--document-config` cannot be
 combined with the new source option.
 
+## Compact input
+
+All three complete-document tasks, including the exact summary and keyphrase
+reducers, accept explicit `--input-encoding safe-bpe-v1`. For example:
+
+```sh
+fnlp candidate job start documents.ndjson \
+  --task summarize --source-document-config source-document.json \
+  --input-encoding safe-bpe-v1 \
+  --max-total-tokenizer-input-bytes 16777216 \
+  --max-total-tokenizer-output-tokens 16777216 \
+  --max-total-tokenizer-pair-checks 1073741824 \
+  --max-total-tokenizer-pair-bytes 17179869184 \
+  --model local.fnlpq --memory-mib 16384 --preparation-mib 1024 \
+  --store-results --job-dir private/job --key-file private/key \
+  --job-id "$JOB_ID" --limits job-limits.json --materialize
+```
+
+The complete original UTF-8 text remains the authenticated input. Partitioning
+uses actual compact tokens to fit the native context; original byte limits and
+exact byte/scalar result coordinates remain independent. Literal control-looking
+source text cannot introduce chat control tokens. These limits are illustrative
+allowances, not measured workload requirements.
+
+One invocation-wide tokenizer ledger includes every document, discarded sizing
+probe, final chunk compilation and native reconstruction. Preparation and
+execution retain the same planner; neither handoff nor a repeated configuration
+renews consumed work. All four per-call limits and four total limits are bound
+into the authenticated recipe, alongside the actual tokenizer and template.
+Changing any cap rejects a resume with a mismatched recipe. Repeat the declared
+encoding and limits when resuming.
+
+Tokenizer accounting is invocation scoped: a new resume process receives the
+same declared allowance. Native work, grammar-mask work and attempt counts
+remain journaled across resumptions, including failed attempts. Tokenizer work
+does not become a new persisted lifetime counter. The host admits additional
+encoder workspace beside the entire retained-document frontier before private
+input IO, and checks that the runtime policy, limits and workspace match that
+admission exactly.
+
+Byte fallback remains the default with its existing recipe and output shape.
+Complete-document schema extraction with `--document-config` and question-aware
+QA jobs retain their separate admission boundaries. Compact tokens change the
+prompt; they do not establish identical outputs, model quality or a speedup.
+
 ## Fixed options and document settings
 
 Task defaults use the existing code-owned NER, keyphrase, or cited-summary

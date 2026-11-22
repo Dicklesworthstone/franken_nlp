@@ -102,6 +102,65 @@ impl Int8SourceDocumentJobPlanner {
     pub fn planning_limits(&self) -> SourcePlanningLimits { self.planning }
     pub fn document_limits(&self) -> Int8SourceMapLimits { self.mapping }
     pub fn job_recipe(&self) -> &Int8SourceDocumentJobRecipe { &self.recipe }
+    /// Admit one compact tokenizer allowance for this complete job invocation.
+    /// Partition probes, rejected candidates, every pending record and native
+    /// reconstruction borrow the SAME planner and never renew spent work.
+    /// Policy and total caps are authenticated on resume; tokenizer counters
+    /// are invocation-local, while native work and attempts remain journaled.
+    pub fn with_document_encoding(mut self, policy: UntrustedEncoding,
+        total: Option<SafeBpeWorkLimits>) -> Result<Self, BatchFault> {
+        self.check_document_encoding()?;
+        match (&policy, total) {
+            (UntrustedEncoding::ByteFallback, None) => {},
+            (UntrustedEncoding::SafeBpeV1(call), Some(work)) => {
+                call.requirements().map_err(|_| BatchCode::InvalidLimits)?;
+                work.validate().map_err(|_| BatchCode::InvalidLimits)?;
+            }
+            _ => return Err(BatchCode::InvalidLimits.into()),
+        }
+        // Reapplying the same configuration is not a reset operation. A new
+        // policy cannot replace a ledger after any successful or failed probe.
+        if self.document_encoding() == &policy && self.encoding_work_limits() == total {
+            return Ok(self);
+        }
+        if self.encoding_work()?.is_some_and(|work| work != crate::tokenizer::untrusted::SafeBpeWork::default()) {
+            return Err(BatchCode::InvalidExecution.into());
+        }
+        self.source = match total {
+            Some(work) => self.source.with_map_document_encoding(policy, work),
+            None => self.source.with_document_encoding(policy),
+        }.map_err(|_| BatchCode::InvalidLimits)?;
+        self.identity.template_digest = *self.source.template_digest();
+        self.identity.tokenizer_digest = self.source.tokenizer_digest();
+        self.recipe.source = self.recipe.source.with_document_encoding(&self.source)?;
+        quantized::check_configuration(&self.source, &self.identity, self.budget,
+            self.planning, self.recipe.source.defaults.as_ref())?;
+        self.check_document_encoding()?;
+        bounded_json(&self.recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
+        self.owner = Arc::new(());
+        Ok(self)
+    }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.source.document_encoding() }
+    pub fn encoding_work_limits(&self) -> Option<SafeBpeWorkLimits> { self.source.map_document_encoding_limits() }
+    pub fn encoding_work(&self) -> Result<Option<crate::tokenizer::untrusted::SafeBpeWork>, BatchFault> {
+        self.source.map_document_encoding_work().map_err(|_| BatchCode::Admission.into())
+    }
+    pub fn encoding_workspace_bytes(&self) -> Result<u64, BatchFault> {
+        self.check_document_encoding()?;
+        self.source.map_document_encoding_workspace_bytes().map_err(|_| BatchCode::InvalidLimits.into())
+    }
+    fn check_document_encoding(&self) -> Result<(), BatchFault> {
+        let recipe = &self.recipe.source;
+        let expected = recipe.input_encoding.as_ref().unwrap_or(&UntrustedEncoding::ByteFallback);
+        if matches!(recipe.input_encoding.as_ref(), Some(UntrustedEncoding::ByteFallback))
+            || self.document_encoding() != expected || self.encoding_work_limits() != recipe.encoding_work_limits
+            || self.identity.template_digest != *self.source.template_digest()
+            || self.identity.tokenizer_digest != self.source.tokenizer_digest() {
+            return Err(BatchCode::Admission.into());
+        }
+        self.source.map_document_encoding_workspace_bytes().map_err(|_| BatchCode::InvalidLimits)?;
+        Ok(())
+    }
     pub fn check_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> {
         // Exact immutable lifetime authority; reopening cannot raise any axis.
         if limits != self.limits { return Err(BatchCode::InvalidLimits.into()); }
@@ -110,6 +169,7 @@ impl Int8SourceDocumentJobPlanner {
     fn plan<'s, C: DecodeStepControl>(&self, source: &'s str, control: &mut C)
         -> Result<PreparedInt8SourceMap<'s>, BatchItemFailure> {
         poll(control)?;
+        self.check_document_encoding().map_err(BatchItemFailure::fatal)?;
         if source.is_empty() || source.len() > self.mapping.chunks.max_input_bytes {
             return Err(BatchItemFailure::fatal(BatchCode::DocumentLimit));
         }

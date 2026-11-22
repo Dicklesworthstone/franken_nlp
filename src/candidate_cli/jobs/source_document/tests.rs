@@ -36,6 +36,76 @@ fn all_three_start_and_resume_routes_accept_explicit_source_documents_without_a_
     assert!(single.source_document_config.is_none()); single.validate().unwrap();
 }
 #[test]
+fn compact_source_documents_admit_bounded_probes_for_start_resume_and_retained_input() {
+    for task in ["ner", "keyphrases", "summarize"] {
+        for mode in ["start", "resume"] {
+            for retained in [false, true] {
+                let mut extra = vec!["--source-document-config", "document.json", "--preparation-mib", "1024",
+                    "--input-encoding", "safe-bpe-v1"];
+                if retained {
+                    extra.extend_from_slice(&[if mode == "start" { "--spool-input" } else { "--use-retained-input" },
+                        "--max-retained-input-mib", "16"]);
+                }
+                let (run, a) = super::super::tests::command(mode, task, &extra).into_parts();
+                let (_, limits) = a.validate().unwrap();
+                a.input_retention.validate(run, &a.input).unwrap();
+                let UntrustedEncoding::SafeBpeV1(call) = a.encoding_policy(limits).unwrap() else { panic!("compact policy") };
+                assert_eq!(call.max_input_bytes, a.host.max_input_bytes);
+                assert_eq!(call.max_output_tokens, a.host.max_input_bytes);
+                assert!(call.max_output_tokens > limits.max_prompt_tokens,
+                    "oversized candidate probes must finish before the partitioner shrinks them");
+                let (mapping, _) = load_default(&a, &text(), lifetime()).unwrap();
+                assert_eq!(mapping.max_model_work, lifetime().max_work.model);
+                assert_eq!(mapping.mask_visits_per_chunk, a.host.max_mask_node_visits);
+                assert_eq!(a.encoding_work_limits().unwrap(), Some(SafeBpeWorkLimits {
+                    max_input_bytes: 64 * MIB, max_output_tokens: 4 * MIB,
+                    max_pair_checks: 256 * MIB, max_pair_bytes: 4096 * MIB }));
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_source_document_preparation_keeps_all_retained_plan_storage_beside_the_encoder() {
+    let byte = args("ner");
+    let compact = super::super::tests::args("ner", &["--source-document-config", "document.json",
+        "--preparation-mib", "1024", "--input-encoding", "safe-bpe-v1"]);
+    let (_, mut limits) = byte.validate().unwrap();
+    let budget = byte.host.task_budget(limits);
+    let d = settings();
+    let floor = (byte.host.context_tokens as u64 * 32 + u64::from(byte.host.max_grammar_states) * 512
+        + 2 * DEFAULT_BYTES as u64) * d.max_chunks as u64 + 256 * MIB
+        + byte.host.max_input_bytes as u64 * 64 + d.max_result_bytes as u64 * 2;
+    limits.preparation_bytes = floor;
+    load(&text(), &byte, budget, lifetime(), limits).unwrap();
+    assert_eq!(load(&text(), &compact, budget, lifetime(), limits).err().unwrap().code,
+        "source_document_job_preparation");
+    limits.preparation_bytes += compact.encoding_workspace_bytes(limits).unwrap();
+    load(&text(), &compact, budget, lifetime(), limits).unwrap();
+    limits.preparation_bytes -= 1;
+    assert_eq!(load(&text(), &compact, budget, lifetime(), limits).err().unwrap().code,
+        "source_document_job_preparation");
+}
+
+#[test]
+fn unsupported_compact_source_task_and_exhausted_caps_refuse_before_private_io() {
+    struct NoRead;
+    impl Read for NoRead { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("invalid compact document read") } }
+    for mode in ["start", "resume"] {
+        let c = super::super::tests::command(mode, "answer", &["--source-document-config", "document.json",
+            "--input-encoding", "safe-bpe-v1"]);
+        let mut out = Vec::new();
+        assert_eq!(c.execute_owned(NoRead, &mut out).err().unwrap().code, "source_document_job_options");
+        for flag in ["--max-total-tokenizer-input-bytes", "--max-total-tokenizer-output-tokens",
+            "--max-total-tokenizer-pair-checks", "--max-total-tokenizer-pair-bytes"] {
+            let c = super::super::tests::command(mode, "ner", &["--source-document-config", "document.json",
+                "--input-encoding", "safe-bpe-v1", flag, "0"]);
+            assert_eq!(c.execute_owned(NoRead, &mut out).err().unwrap().code, "job_tokenizer_work");
+            assert!(out.is_empty());
+        }
+    }
+}
+#[test]
 fn incompatible_task_schema_and_private_path_options_are_rejected() {
     for task in ["answer", "extract"] { assert!(args(task).validate().is_err()); }
     let mut a = args("ner"); a.schema = Some("schema.json".into()); assert!(a.validate().is_err());

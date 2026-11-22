@@ -59,6 +59,33 @@ fn both_reducers_preserve_native_work_and_change_recipe_and_prepared_owner() {
     }
 }
 #[test]
+fn compact_reducers_keep_one_invocation_ledger_across_preparation_and_reconstruction() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding};
+    let encoding = UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 4096, max_output_tokens: 4096, max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 });
+    let total = SafeBpeWorkLimits { max_input_bytes: 1 << 20, max_output_tokens: 1 << 20,
+        max_pair_checks: 1 << 28, max_pair_bytes: 1 << 32 };
+    for summary in [false, true] {
+        let p = factory(summary).with_document_encoding(encoding.clone(), Some(total)).unwrap();
+        let ordinary = p.prepare_with_control(document(), &mut Continue).unwrap();
+        let spent = p.encoding_work().unwrap().unwrap();
+        let p = p.with_reduction(policy(summary)).unwrap();
+        assert_eq!(p.encoding_work().unwrap(), Some(spent));
+        assert!(p.owns(&ordinary).is_err());
+        let prepared = p.prepare_with_control(document(), &mut Continue).unwrap();
+        assert_eq!(prepared.identities, ordinary.identities);
+        assert_eq!(prepared.work, ordinary.work);
+        let map = p.plan(&prepared.source, &mut Continue).unwrap();
+        assert!(snapshot_matches(&map, &prepared));
+        policy(summary).check_plan(&map).unwrap();
+        assert_eq!(p.encoding_work().unwrap().unwrap(), spent.checked_add(spent).unwrap().checked_add(spent).unwrap());
+        let reconstructed = factory(summary).with_reduction(policy(summary)).unwrap()
+            .with_document_encoding(encoding.clone(), Some(total)).unwrap();
+        assert_eq!(canonjson::canonical_bytes(p.job_recipe()).unwrap(),
+            canonjson::canonical_bytes(reconstructed.job_recipe()).unwrap());
+    }
+}
+#[test]
 fn different_reduction_policy_invalidates_prepared_ownership() {
     let p = factory(true).with_reduction(policy(true)).unwrap();
     let prepared = p.prepare_with_control(document(), &mut Continue).unwrap();

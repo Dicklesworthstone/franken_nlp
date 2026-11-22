@@ -12,6 +12,11 @@ fn args(task: &str) -> JobArgs {
     let mut a = command::tests::args(task, &["--source-document-config", "d.json", "--preparation-mib", "1024"]);
     a.host.context_tokens = 8192; a.host.max_new_tokens = 64; a.host.memory_mib = 16384; a
 }
+fn compact_args(task: &str) -> JobArgs {
+    let mut a = command::tests::args(task, &["--source-document-config", "d.json", "--preparation-mib", "1024",
+        "--input-encoding", "safe-bpe-v1"]);
+    a.host.context_tokens = 8192; a.host.max_new_tokens = 64; a.host.memory_mib = 16384; a
+}
 fn lifetime() -> JobLimits { let mut l = command::tests::lifetime(); l.max_result_bytes = 4 << 20; l }
 fn settings(reserve: u64) -> String {
     serde_json::json!({"schema_version":1,"max_chunks":8,"max_chunk_bytes":8,"max_tokenizer_calls":1024,
@@ -43,6 +48,31 @@ fn all_cli_source_families_reach_the_sealed_complete_document_factory() {
         assert_eq!(prepared.planned_work().mask_node_visits,
             a.host.max_mask_node_visits * prepared.chunk_count() as u64);
         assert!(prepared.execution_identities().iter().all(|id| id.task_spec == p.execution_identity().task_spec));
+    }
+}
+#[test]
+fn compact_source_document_factory_matches_cli_admission_and_keeps_spent_work_across_records() {
+    for task in ["ner", "keyphrases", "summarize"] {
+        let a = compact_args(task); let (_, limits) = a.validate().unwrap();
+        let encoding = a.encoding_policy(limits).unwrap(); let total = a.encoding_work_limits().unwrap();
+        let workspace = a.encoding_workspace_bytes(limits).unwrap();
+        let (prepared, _) = prepare(&a, &facts(), defaults(&a, limits), &settings(64), lifetime(), limits, &mut Continue).unwrap();
+        check_encoding_quote(&prepared, &encoding, total, workspace).unwrap();
+        assert_eq!(check_encoding_quote(&prepared, &encoding, total, workspace - 1).unwrap_err().code,
+            "job_encoding_quote_mismatch");
+        assert!(check_encoding_quote(&prepared, &UntrustedEncoding::ByteFallback, None, 0).is_err());
+        let PreparedJob::SourceDocument { planner, .. } = prepared else { panic!("source document route") };
+        let document = || BatchDocument::<SourceDocumentArgs> {
+            id: "original".into(), text: "é Alice\r\nBob 上海".into(), task_args: None };
+        let first = planner.prepare_with_control(document(), &mut Continue).unwrap();
+        let spent = planner.encoding_work().unwrap().unwrap();
+        let next = planner.prepare_with_control(document(), &mut Continue).unwrap();
+        assert_eq!(first.execution_identities(), next.execution_identities());
+        assert_eq!(first.planned_work(), next.planned_work());
+        assert_eq!(planner.encoding_work().unwrap().unwrap(), spent.checked_add(spent).unwrap());
+        assert_eq!(planner.document_encoding(), &encoding);
+        assert_eq!(planner.encoding_work_limits(), total);
+        planner.check_job_limits(lifetime()).unwrap();
     }
 }
 #[test]
@@ -117,6 +147,29 @@ fn cli_reductions_bind_the_native_reducers_without_changing_map_work() {
         let after = p.prepare_with_control(doc(), &mut Continue).unwrap();
         assert_eq!(before.planned_work(), after.planned_work()); assert_eq!(before.execution_identities(), after.execution_identities());
         assert_ne!(canonjson::canonical_bytes(plain.job_recipe()).unwrap(), canonjson::canonical_bytes(p.job_recipe()).unwrap());
+    }
+}
+#[test]
+fn compact_cli_reductions_authenticate_encoding_and_preserve_exact_native_map_work() {
+    for task in ["summarize", "keyphrases"] {
+        let a = compact_args(task); let (_, limits) = a.validate().unwrap();
+        let plain = factory(&a, 64, defaults(&a, limits));
+        let reduced = reduced_factory(&a, &reduced_settings(task, 8));
+        assert_eq!(plain.document_encoding(), reduced.document_encoding());
+        assert_eq!(plain.encoding_work_limits(), reduced.encoding_work_limits());
+        assert_eq!(plain.encoding_workspace_bytes().unwrap(), reduced.encoding_workspace_bytes().unwrap());
+        let doc = || BatchDocument::<SourceDocumentArgs> { id: "d".into(), text: "é Alice Bob 上海".into(), task_args: None };
+        let first = plain.prepare_with_control(doc(), &mut Continue).unwrap();
+        let other = reduced.prepare_with_control(doc(), &mut Continue).unwrap();
+        assert_eq!(first.planned_work(), other.planned_work());
+        assert_eq!(first.execution_identities(), other.execution_identities());
+        assert_eq!(plain.encoding_work().unwrap(), reduced.encoding_work().unwrap());
+        let again = reduced_factory(&a, &reduced_settings(task, 8));
+        assert_eq!(canonjson::canonical_bytes(reduced.job_recipe()).unwrap(),
+            canonjson::canonical_bytes(again.job_recipe()).unwrap());
+        let byte = args(task); let old = reduced_factory(&byte, &reduced_settings(task, 8));
+        assert_ne!(canonjson::canonical_bytes(reduced.job_recipe()).unwrap(),
+            canonjson::canonical_bytes(old.job_recipe()).unwrap());
     }
 }
 #[test]

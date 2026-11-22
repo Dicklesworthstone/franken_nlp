@@ -35,7 +35,9 @@ pub(super) fn prepare(args: &JobArgs, facts: &ArtifactIdentity, defaults: Defaul
     // Factory binds the actual pinned tokenizer/template; no second planner or
     // temporary document is needed to derive the exact source scaffold budget.
     let planner = Int8SourceDocumentJobPlanner::pinned(controls, eos, identity, task, budget,
-        args.host.planning(), mapping, lifetime, control).map_err(planner_failure)?;
+        args.host.planning(), mapping, lifetime, control).map_err(planner_failure)?
+        .with_document_encoding(args.encoding_policy(limits)?, args.encoding_work_limits()?)
+        .map_err(planner_failure)?;
     let planner = match reduction {
         None => planner,
         Some(settings::reduction::PreparedReduction::Summary { limits, max_lifetime_scan_work }) =>
