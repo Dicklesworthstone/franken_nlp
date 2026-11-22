@@ -401,8 +401,10 @@ Both physical schedules appear in event provenance, and terminal completion
 remains deferred until every worker joins. See the
 [resident scoring documentation](docs/candidate-scored-batch-cli.md#grouped-int4-scoring-streams).
 
-Other routes retain their existing restriction on combining worker teams with
-`--prefill-rows`. Worker teams cannot combine with `--cohort-heads`,
+Retained `text-job`, `score-job`, `extract-job`, `ner-job`, `keyphrases-job`,
+`summarize-job` and `answer-job` invocations also combine both schedules while
+preserving their authenticated recipes and lifetime work. Other routes retain
+their existing restrictions. Worker teams cannot combine with `--cohort-heads`,
 `--cohort-documents` or `--cohort-chunks`. The task sections below describe
 additional supported complete-document maps, corpora and retained jobs.
 Invalid widths, incompatible schedules and insufficient memory refuse before
@@ -951,7 +953,11 @@ the coordinator; one keeps the serial path. The admitted team spans the
 complete invocation, pending items, durable commits and optional
 materialization. Worker scratch and the process thread envelope are included
 in admission before private IO, and all workers join before progress returns.
-Prompt execution remains sequential.
+Add `--prefill-rows 1..64` to run bounded layer-major prompt morsels on the
+same team. Coordinator prompt storage and fixed worker batch buffers are
+admitted together before IO. Prompt width may change independently of worker
+width on authenticated resume without changing results, attempts or lifetime
+native/mask work.
 
 Add `--max-selected-rows N` to project every grammar-legal output row, including
 accepting EOS, under a fixed cap of 1 through 166144. A step whose complete
@@ -971,7 +977,9 @@ serial response shape is unchanged. Cancellation and the original deadline
 remain authoritative through metadata staging and final write/flush.
 
 Library callers select `NlpEngine::job_int4_extract_with_threads` for widths
-2 through 64, or keep the existing serial entry point.
+2 through 64, or `job_int4_extract_layer_major_with_threads` to share those
+workers with bounded prompt morsels. Existing serial entry points remain
+available. Combined completion reports include both physical schedules.
 
 Explicit `--input-encoding safe-bpe-v1` compacts the untrusted schema and
 source while preserving their original bytes and excluding template controls.
@@ -4295,9 +4303,15 @@ keeps its existing shape. Original cancellation and the invocation deadline
 cover final metadata staging, write and flush. A late delivery failure can
 follow durable progress and still requires authenticated status/resume.
 
-Library callers use `NlpEngine::job_int4_source_with_threads` for the same
-worker path. Byte-fallback input, full-vocabulary projection and sequential
-prompts remain the defaults.
+Add `--prefill-rows 1..64` to share that fixed team across bounded prompt morsels
+and constrained decoding. Both widths remain physical schedules; their combined
+worker and coordinator workspace is admitted before private IO, and both selected
+schedules appear in completion metadata after the workers join.
+
+Library callers use `NlpEngine::job_int4_source_with_threads` for the worker
+path or `job_int4_source_layer_major_with_threads` for combined prompt execution.
+Byte-fallback input, full-vocabulary projection and sequential prompts remain
+the defaults.
 
 All four retained source tasks accept `--max-selected-rows N` on `start` and
 `resume`, with `N` from 1 through 166144. Every grammar-legal row, including
@@ -4308,7 +4322,8 @@ allowances remain valid; complete KV, decoder, output, worker and encoder
 storage stay reserved. Existing jobs retain their full-head recipe and metadata
 when the option is omitted; selected completion metadata adds only the public
 `max_selected_rows` cap. The policy composes with compact input, retained-input
-replay and either a persistent CPU team or serial `--prefill-rows` execution.
+replay, persistent CPU teams and bounded `--prefill-rows` execution, including
+the combined prompt/team schedule.
 See [retained source-task selected rows](docs/int4-selected-rows.md#retained-single-context-source-tasks)
 for a concrete start/resume example. Summary and answer prose may require a
 wide legal set; the option does not imply a speed or quality claim.

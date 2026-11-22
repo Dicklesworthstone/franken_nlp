@@ -21,7 +21,8 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let input_memory = job.storage.input_retention.input_memory()?;
     // Recheck options at the owned boundary before private IO/runtime creation.
     let common = job.validate(&args)?;
-    if !super::super::prefill::matches(&args, common)? {
+    if !super::super::prefill::matches(&args, common)?
+        || common.compute != args.compute.admit_with_prefill(args.group_width, common.prefill)? {
         return Err(CandidateError::Arguments.into());
     }
     let encoding = job.extraction.encoding_policy(&args, common.max_prompt_tokens)?;
@@ -87,15 +88,15 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         mode: open_mode(mode, job.storage.input_retention)?, materialize };
     // Only the real host opens the protected job, authenticates the exact
     // population/recipe, skips committed ordinals and admits pending forwards.
-    let progress = if let Some(prefill) = common.prefill {
-        engine.job_int4_extract_layer_major(&model, planner, vocabulary, request, host,
-            common.kernel, prefill, reader, cancellation.clone())
-    } else if common.compute.threads == 1 {
-        engine.job_int4_extract(&model, planner, vocabulary, request, host,
-            common.kernel, reader, cancellation.clone())
-    } else {
-        engine.job_int4_extract_with_threads(&model, planner, vocabulary, request, host,
-            common.kernel, common.compute.threads, reader, cancellation.clone())
+    let progress = match (common.prefill, common.compute.threads) {
+        (Some(prefill), 1) => engine.job_int4_extract_layer_major(&model, planner, vocabulary, request, host,
+            common.kernel, prefill, reader, cancellation.clone()),
+        (Some(prefill), threads) => engine.job_int4_extract_layer_major_with_threads(&model, planner,
+            vocabulary, request, host, common.kernel, threads, prefill, reader, cancellation.clone()),
+        (None, 1) => engine.job_int4_extract(&model, planner, vocabulary, request, host,
+            common.kernel, reader, cancellation.clone()),
+        (None, threads) => engine.job_int4_extract_with_threads(&model, planner, vocabulary, request, host,
+            common.kernel, threads, reader, cancellation.clone()),
     }.map_err(execution_failure)?;
     if let Some(cause) = cancellation.cause() {
         return Err(job_failure(JobError::Cancelled(cause)));

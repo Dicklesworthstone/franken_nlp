@@ -72,22 +72,27 @@ fn all_source_tasks_keep_explicit_start_resume_and_both_model_routes() {
 #[test]
 fn all_source_jobs_admit_prompt_morsels_with_unchanged_lifetime_and_encoding_limits() {
     for kind in [Kind::Ner, Kind::Keyphrases, Kind::Summarize, Kind::Answer] {
-        for operation in ["start", "resume"] { for compact in [false, true] {
+        for operation in ["start", "resume"] { for compact in [false, true] { for selected in [false, true] {
             let mut extra = vec!["--preparation-mib", "1024"];
             if compact { extra.extend(["--input-encoding", "safe-bpe-v1"]); }
+            if selected { extra.extend(["--max-selected-rows", "4096"]); }
+            extra.extend([if operation == "start" { "--spool-input" } else { "--use-retained-input" },
+                "--max-retained-input-mib", "16"]);
             let (serial, serial_args) = command(kind, operation, &extra);
             let baseline = serial.args.validate(&serial_args).unwrap();
             let fixed = lifetime(&serial.args, &serial_args, baseline);
             let base_job = serial.args.lifetime_limits(&serial_args, baseline, fixed).unwrap();
-            for rows in ["1", "3", "64"] {
-                let mut scheduled = extra.clone(); scheduled.extend(["--prefill-rows", rows]);
+            for rows in ["1", "3", "64"] { for width in ["1", "2", "4", "64"] {
+                let mut scheduled = extra.clone();
+                scheduled.extend(["--prefill-rows", rows, "--compute-threads", width]);
                 let (c, args) = command(kind, operation, &scheduled);
                 let common = c.args.validate(&args).unwrap();
                 let prefill = common.prefill.unwrap();
                 assert_eq!(prefill.max_batch_rows, rows.parse::<usize>().unwrap());
                 assert_eq!(prefill.validate().unwrap(),
                     Int4PrefillLimits::required_extra_scratch_bytes(prefill.max_batch_rows).unwrap());
-                assert_eq!(common.compute.threads, 1);
+                assert_eq!(common.compute.threads, width.parse::<usize>().unwrap());
+                assert_eq!(common.compute, args.compute.admit_with_prefill(args.group_width, Some(prefill)).unwrap());
                 assert_eq!(common.native, baseline.native);
                 assert_eq!(c.args.source.budget(&args, common), serial.args.source.budget(&serial_args, baseline));
                 let admitted = c.args.lifetime_limits(&args, common, fixed).unwrap();
@@ -96,26 +101,36 @@ fn all_source_jobs_admit_prompt_morsels_with_unchanged_lifetime_and_encoding_lim
                 assert_eq!(admitted.native.masks.max_visits_per_run, fixed.max_work.mask_node_visits);
                 assert_eq!(admitted.encoding_workspace_bytes, base_job.encoding_workspace_bytes);
                 assert_eq!(admitted.buffer_bytes, base_job.buffer_bytes);
+                assert_eq!(c.args.encoding.limits(&args).unwrap(), serial.args.encoding.limits(&serial_args).unwrap());
                 assert!(admitted.common.minimum_memory_bytes >= base_job.common.minimum_memory_bytes);
                 let mut short = common; short.memory_bytes = admitted.common.minimum_memory_bytes - 1;
                 assert_eq!(c.args.lifetime_limits(&args, short, fixed).unwrap_err().code, "job_population_memory");
+            } }
+        } } }
+    }
+}
+
+#[test]
+fn invalid_prefill_refuses_before_any_source_job_io_even_with_workers() {
+    for kind in [Kind::Ner, Kind::Keyphrases, Kind::Summarize, Kind::Answer] {
+        for rows in ["0", "65", "18446744073709551615"] { for width in ["1", "4"] {
+            let mut words = argv(kind, "resume");
+            words.extend(["--prefill-rows", rows, "--compute-threads", width].into_iter().map(str::to_owned));
+            if let Ok((c, args)) = parse(kind, words) {
+                assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().exit, ErrorCode::Usage);
             }
         } }
     }
 }
 
 #[test]
-fn invalid_prefill_and_mixed_workers_refuse_before_any_source_job_io() {
+fn source_job_threaded_prefill_does_not_enable_unwired_composed_callers() {
     for kind in [Kind::Ner, Kind::Keyphrases, Kind::Summarize, Kind::Answer] {
-        for rows in ["0", "65", "18446744073709551615"] {
-            let mut words = argv(kind, "resume");
-            words.extend(["--prefill-rows", rows].into_iter().map(str::to_owned));
-            if let Ok((c, args)) = parse(kind, words) {
-                assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().exit, ErrorCode::Usage);
-            }
-        }
-        let (c, args) = command(kind, "start", &["--prefill-rows", "4", "--compute-threads", "2"]);
-        assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().exit, ErrorCode::Usage);
+        let (job, args) = command(kind, "start", &["--compute-threads", "4", "--prefill-rows", "3"]);
+        assert!(job.args.validate(&args).is_ok());
+        assert!(job.args.source.validate_with_prefill(&args).is_err());
+        assert!(job.args.source.validate_batch_with_prefill(&args).is_err());
+        assert!(job.args.source.validate(&args).is_err());
     }
 }
 
@@ -381,7 +396,7 @@ fn worker_width_and_incompatible_schedules_refuse_before_private_source_job_io()
                 assert!(c.execute_owned(args, NoRead, &mut NoWrite).is_err());
             }
         }
-        for option in ["--prefill-rows", "--cohort-heads", "--cohort-documents"] {
+        for option in ["--cohort-heads", "--cohort-documents"] {
             let mut words = argv(kind, "resume");
             words.extend(["--compute-threads", "4", option, "1"].into_iter().map(str::to_owned));
             if let Ok((c, args)) = parse(kind, words) {
@@ -398,9 +413,9 @@ fn worker_width_and_incompatible_schedules_refuse_before_private_source_job_io()
 fn resumed_source_jobs_keep_lifetime_work_when_worker_width_changes() {
     for kind in [Kind::Ner, Kind::Keyphrases, Kind::Summarize, Kind::Answer] {
         let (start, start_args) = command(kind, "start",
-            &["--compute-threads", "4", "--spool-input", "--max-retained-input-mib", "16"]);
+            &["--compute-threads", "4", "--prefill-rows", "3", "--spool-input", "--max-retained-input-mib", "16"]);
         let (resume, resume_args) = command(kind, "resume",
-            &["--compute-threads", "2", "--use-retained-input", "--max-retained-input-mib", "16"]);
+            &["--compute-threads", "2", "--prefill-rows", "64", "--use-retained-input", "--max-retained-input-mib", "16"]);
         let start_common = start.args.validate(&start_args).unwrap();
         let resume_common = resume.args.validate(&resume_args).unwrap();
         let fixed = lifetime(&start.args, &start_args, start_common);

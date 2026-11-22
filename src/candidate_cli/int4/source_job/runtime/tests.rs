@@ -151,11 +151,14 @@ fn all_tasks_publish_only_authenticated_progress_and_public_model_provenance() {
         assert_eq!(selected, value);
         let prefill = Int4PrefillLimits { max_batch_rows: 4,
             max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(4).unwrap() };
-        let scheduled = Response { prefill_schedule: Some(PrefillSchedule::new(prefill).unwrap()), ..compact };
+        let scheduled = Response { prefill_schedule: Some(PrefillSchedule::new(prefill).unwrap()),
+            compute_schedule: compute::Schedule::for_threads(4), ..compact };
         let mut metadata = serde_json::to_value(&scheduled).unwrap();
         let schedule = metadata.as_object_mut().unwrap().remove("prefill_schedule").unwrap();
         assert_eq!(schedule["max_batch_rows"], 4);
         assert_eq!(schedule["admitted_workspace_bytes"], prefill.max_extra_scratch_bytes);
+        assert_eq!(metadata.as_object_mut().unwrap().remove("compute_schedule"),
+            compute::Schedule::for_threads(4).map(serde_json::to_value).transpose().unwrap());
         metadata.as_object_mut().unwrap().remove("input_encoding");
         metadata.as_object_mut().unwrap().remove("encoding_work_limits");
         assert_eq!(metadata, value);
@@ -163,7 +166,7 @@ fn all_tasks_publish_only_authenticated_progress_and_public_model_provenance() {
         let mut metadata = serde_json::to_value(&selected_head).unwrap();
         assert_eq!(metadata.as_object_mut().unwrap().remove("max_selected_rows"),
             Some(serde_json::json!(4096)));
-        for field in ["prefill_schedule", "input_encoding", "encoding_work_limits"] {
+        for field in ["prefill_schedule", "compute_schedule", "input_encoding", "encoding_work_limits"] {
             metadata.as_object_mut().unwrap().remove(field);
         }
         assert_eq!(metadata, value);

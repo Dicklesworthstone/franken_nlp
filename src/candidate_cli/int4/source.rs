@@ -111,6 +111,16 @@ impl SourceArgs {
         self.validate_with_prefill(args)
     }
     pub(super) fn validate_with_prefill(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
+        self.validate_source_storage(args, false)
+    }
+    /// Retained single-context source jobs independently wire both schedules;
+    /// keep ordinary task/map/stream callers on their existing authority.
+    pub(super) fn validate_job_with_threaded_prefill(&self, args: &Int4Args)
+        -> Result<Int4Limits, CandidateError> {
+        self.validate_source_storage(args, true)
+    }
+    fn validate_source_storage(&self, args: &Int4Args, allow_threaded_prefill: bool)
+        -> Result<Int4Limits, CandidateError> {
         let _ = self.selected_rows()?;
         if self.options.as_ref().is_some_and(|path| path.as_os_str().is_empty() || path.as_os_str() == "-")
             || !(1..=MAX_CONTENT_BYTES).contains(&self.max_result_bytes)
@@ -131,8 +141,8 @@ impl SourceArgs {
             self.max_result_bytes as u64 * 16, u64::from(self.max_grammar_states) * 32])?;
         // The source prompt compiler reserves prompt + full output, including
         // EOS, against context. Keep its stricter bound in admission as well.
-        args.validate_source_storage(self.max_result_bytes, args.max_new_tokens,
-            args.context_tokens - args.max_new_tokens, extra)
+        args.validate_storage_with_team_prefill(self.max_result_bytes, args.max_new_tokens,
+            args.context_tokens - args.max_new_tokens, 0, extra, None, allow_threaded_prefill)
     }
     pub(super) fn budget(&self, args: &Int4Args, limits: Int4Limits) -> TaskBudget {
         TaskBudget { max_input_tokens: limits.max_prompt_tokens as u32,

@@ -68,7 +68,8 @@ impl NlpEngine {
     /// admitted before input and remains charged through native completion.
     /// Exact schema/source checks, selected rows and lifetime work remain
     /// unchanged. An explicit resume may change this physical row width.
-    /// This schedule owns one coordinator and cannot combine with a CPU team.
+    /// This entry owns one coordinator; the threaded variant shares a fixed
+    /// numerical team across prompt morsels and constrained decoding.
     #[allow(clippy::too_many_arguments)]
     pub fn job_int4_extract_layer_major<R>(&self, model: &ResidentInt4,
         planner: Int4ExtractionJobPlanner, vocabulary: Arc<ExtractionVocabulary>,
@@ -97,6 +98,23 @@ impl NlpEngine {
             kernel, None, Some(compute_threads), reader, cancellation)
     }
 
+    /// Combine bounded layer-major prompts with one persistent output-row
+    /// team across the complete authenticated extraction job. Worker buffers
+    /// are sized for the declared prompt row cap before population IO and
+    /// reused by single-token decoding. The coordinator prompt workspace is
+    /// admitted separately; neither width changes the frozen recipe, stored
+    /// results or lifetime work. Every worker joins before progress returns.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int4_extract_layer_major_with_threads<R>(&self, model: &ResidentInt4,
+        planner: Int4ExtractionJobPlanner, vocabulary: Arc<ExtractionVocabulary>,
+        request: SourceJobRequest, limits: JobHostLimits, kernel: PackedInt4Kernel,
+        compute_threads: usize, prefill: Int4PrefillLimits, reader: R,
+        cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        self.run_int4_extraction_job(model, planner, vocabulary, request, limits,
+            kernel, Some(prefill), Some(compute_threads), reader, cancellation)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_int4_extraction_job<R>(&self, model: &ResidentInt4,
         planner: Int4ExtractionJobPlanner, vocabulary: Arc<ExtractionVocabulary>,
@@ -104,9 +122,6 @@ impl NlpEngine {
         prefill: Option<Int4PrefillLimits>, compute_threads: Option<usize>, reader: R, cancellation: CancellationToken)
         -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        if prefill.is_some() && compute_threads.is_some() {
-            return Err(HostedError::Limits("INT4 extraction job team/prefill schedule").into());
-        }
         match compute_threads {
             Some(width) => dispatch::preflight_int4_team(self, limits.native.run, width)?,
             None => dispatch::preflight(self, limits.native.run)?,
@@ -125,8 +140,10 @@ impl NlpEngine {
         required.input_bytes = sum(&[required.input_bytes,
             planner.encoding_workspace_bytes().map_err(HostedError::BatchSetup)?])?;
         required = with_job_prefill_workspace(required, prefill)?;
+        let max_batch_rows = prefill.map_or(1, |limits| limits.max_batch_rows);
         let team_scratch = compute_threads.map(|width|
-            int4_task_team_workspace_bytes(width, model.model_identity().group_width())).transpose()?.unwrap_or(0);
+            dispatch::int4_prefill_team_workspace_bytes(width, model.model_identity().group_width(), max_batch_rows))
+            .transpose()?.unwrap_or(0);
         sum(&[required.input_bytes, required.native.kv_bytes, required.workspace_bytes, team_scratch])?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
@@ -138,8 +155,8 @@ impl NlpEngine {
         let completed = match compute_threads {
             None => dispatch::run(self, limits.native.run, cancellation, move |control|
                 execution.run(&model.inner.loaded.value, kernel, None, control)),
-            Some(width) => dispatch::run_int4_team(self, limits.native.run, cancellation,
-                model, width, kernel, move |weights, control, team|
+            Some(width) => dispatch::run_int4_prefill_team(self, limits.native.run, cancellation,
+                model, width, kernel, max_batch_rows, move |weights, control, team|
                     execution.run(weights, kernel, Some(team), control)),
         }?;
         // Runtime cancellation/drain failure takes precedence over job return.
@@ -329,6 +346,7 @@ mod tests {
         let _serial = NlpEngine::job_int4_extract::<std::io::Cursor<Vec<u8>>>;
         let _threaded = NlpEngine::job_int4_extract_with_threads::<std::io::Cursor<Vec<u8>>>;
         let _prefill = NlpEngine::job_int4_extract_layer_major::<std::io::Cursor<Vec<u8>>>;
+        let _threaded_prefill = NlpEngine::job_int4_extract_layer_major_with_threads::<std::io::Cursor<Vec<u8>>>;
     }
 
     mod team {
@@ -457,7 +475,7 @@ mod tests {
                 assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
                 drained(&host, &baseline);
             }
-            for width in [2, 4] {
+            for width in [2, 4] { for rows in [None, Some(3), Some(64)] {
                 for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
                     ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
                     let (planner, request, limits) = planner(&model);
@@ -466,8 +484,15 @@ mod tests {
                     let observed = Arc::new(Observation::default());
                     let reader = Reader { resources: Arc::clone(host.resources()), observed: Arc::clone(&observed),
                         action: Action::Refuse, stop: stop.clone() };
-                    let error = host.job_int4_extract_with_threads(&model, planner, Arc::clone(&vocabulary),
-                        request, limits, PackedInt4Kernel::scalar(), width, reader, stop).err().unwrap();
+                    let error = match rows {
+                        None => host.job_int4_extract_with_threads(&model, planner, Arc::clone(&vocabulary),
+                            request, limits, PackedInt4Kernel::scalar(), width, reader, stop),
+                        Some(rows) => host.job_int4_extract_layer_major_with_threads(
+                            &model, planner, Arc::clone(&vocabulary), request, limits,
+                            PackedInt4Kernel::scalar(), width, Int4PrefillLimits { max_batch_rows: rows,
+                                max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap() },
+                            reader, stop),
+                    }.err().unwrap();
                     let HostedJobError::Host(HostedError::Stopped { stop, .. }) = error
                         else { panic!("extraction pre-cancellation lost its typed cause"); };
                     assert_eq!(stop.kind, cause);
@@ -476,7 +501,7 @@ mod tests {
                     assert!(observed.input_at_drop.load(Ordering::SeqCst) >= PREPARATION + charge);
                     drained(&host, &baseline);
                 }
-            }
+            } }
             for width in [0, 1, 5, 65, usize::MAX] {
                 let (planner, request, limits) = planner(&model);
                 let stop = CancellationToken::default();
@@ -490,7 +515,7 @@ mod tests {
                 assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
                 drained(&host, &baseline);
             }
-            for compact in [false, true] {
+            for compact in [false, true] { for rows in [None, Some(3), Some(64)] {
                 let (planner, request, limits) = planner(&model);
                 let planner = if compact {
                     use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding};
@@ -500,11 +525,15 @@ mod tests {
                     }), Some(SafeBpeWorkLimits { max_input_bytes: 65536, max_output_tokens: 4096,
                         max_pair_checks: 1 << 22, max_pair_bytes: 1 << 26 })).unwrap()
                 } else { planner };
+                let prefill = rows.map(|rows| Int4PrefillLimits { max_batch_rows: rows,
+                    max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap() });
                 let mut required = job_requirements(32, planner.task_ceiling(), request.limits,
                     limits, request.mode.input_memory()).unwrap();
                 required.input_bytes = sum(&[required.input_bytes, planner.encoding_workspace_bytes().unwrap()]).unwrap();
+                let required = with_job_prefill_workspace(required, prefill).unwrap();
+                let worker_bytes = dispatch::int4_prefill_team_workspace_bytes(4, 32, rows.unwrap_or(1)).unwrap();
                 let room = sum(&[required.input_bytes, required.native.kv_bytes,
-                    required.workspace_bytes, int4_task_team_workspace_bytes(4, 32).unwrap() - 1]).unwrap();
+                    required.workspace_bytes, worker_bytes - 1]).unwrap();
                 let bytes = host.resources().config().memory_ceiling_bytes
                     .checked_sub(baseline.committed_bytes + baseline.reserved_bytes).unwrap().checked_sub(room).unwrap();
                 let lease = host.resources().acquire_lease();
@@ -513,39 +542,54 @@ mod tests {
                 let observed = Arc::new(Observation::default());
                 let reader = Reader { resources: Arc::clone(host.resources()), observed: Arc::clone(&observed),
                     action: Action::Refuse, stop: stop.clone() };
-                let error = host.job_int4_extract_with_threads(&model, planner, Arc::clone(&vocabulary),
-                    request, limits, PackedInt4Kernel::scalar(), 4, reader, stop).err().unwrap();
+                let error = match prefill {
+                    None => host.job_int4_extract_with_threads(&model, planner, Arc::clone(&vocabulary),
+                        request, limits, PackedInt4Kernel::scalar(), 4, reader, stop),
+                    Some(prefill) => host.job_int4_extract_layer_major_with_threads(
+                        &model, planner, Arc::clone(&vocabulary), request, limits,
+                        PackedInt4Kernel::scalar(), 4, prefill, reader, stop),
+                }.err().unwrap();
                 assert!(matches!(error, HostedJobError::Host(HostedError::Reservation(_))));
                 assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
                 assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
                 drop(held); drop(lease);
                 drained(&host, &baseline);
-            }
+            } }
             for action in [Action::Cancel(Deadline), Action::Panic, Action::Malformed] {
-                let (planner, request, limits) = planner(&model);
-                let charge = limits.required_buffer_bytes(request.limits).unwrap();
-                let stop = CancellationToken::default();
-                let observed = Arc::new(Observation::default());
-                let reader = Reader { resources: Arc::clone(host.resources()), observed: Arc::clone(&observed),
-                    action, stop: stop.clone() };
-                let error = host.job_int4_extract_with_threads(&model, planner, Arc::clone(&vocabulary),
-                    request, limits, PackedInt4Kernel::scalar(), 4, reader, stop).err().unwrap();
-                match action {
-                    Action::Cancel(cause) => {
-                        let HostedJobError::Host(HostedError::Stopped { stop, .. }) = error
-                            else { panic!("extraction reader cancellation lost its typed cause"); };
-                        assert_eq!(stop.kind, cause);
+                for rows in [None, Some(3), Some(64)] {
+                    let (planner, request, limits) = planner(&model);
+                    let charge = limits.required_buffer_bytes(request.limits).unwrap();
+                    let stop = CancellationToken::default();
+                    let observed = Arc::new(Observation::default());
+                    let reader = Reader { resources: Arc::clone(host.resources()), observed: Arc::clone(&observed),
+                        action, stop: stop.clone() };
+                    let error = match rows {
+                        None => host.job_int4_extract_with_threads(&model, planner, Arc::clone(&vocabulary),
+                            request, limits, PackedInt4Kernel::scalar(), 4, reader, stop),
+                        Some(rows) => host.job_int4_extract_layer_major_with_threads(
+                            &model, planner, Arc::clone(&vocabulary), request, limits,
+                            PackedInt4Kernel::scalar(), 4, Int4PrefillLimits { max_batch_rows: rows,
+                                max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap() },
+                            reader, stop),
+                    }.err().unwrap();
+                    match action {
+                        Action::Cancel(cause) => {
+                            let HostedJobError::Host(HostedError::Stopped { stop, .. }) = error
+                                else { panic!("extraction reader cancellation lost its typed cause"); };
+                            assert_eq!(stop.kind, cause);
+                        }
+                        Action::Panic => assert!(matches!(error,
+                            HostedJobError::Host(HostedError::Panicked | HostedError::Scope { .. }))),
+                        Action::Malformed => assert!(matches!(error, HostedJobError::Job(JobRunError::Storage(_)))),
+                        Action::Refuse => unreachable!(),
                     }
-                    Action::Panic => assert!(matches!(error,
-                        HostedJobError::Host(HostedError::Panicked | HostedError::Scope { .. }))),
-                    Action::Malformed => assert!(matches!(error, HostedJobError::Job(JobRunError::Storage(_)))),
-                    Action::Refuse => unreachable!(),
+                    assert_eq!(observed.reads.load(Ordering::SeqCst), 1);
+                    assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+                    assert!(observed.workers_at_read.load(Ordering::SeqCst) >=
+                        dispatch::int4_prefill_team_workspace_bytes(4, 32, rows.unwrap_or(1)).unwrap());
+                    assert!(observed.input_at_drop.load(Ordering::SeqCst) >= PREPARATION + charge);
+                    drained(&host, &baseline);
                 }
-                assert_eq!(observed.reads.load(Ordering::SeqCst), 1);
-                assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
-                assert!(observed.workers_at_read.load(Ordering::SeqCst) >= int4_task_team_workspace_bytes(4, 32).unwrap());
-                assert!(observed.input_at_drop.load(Ordering::SeqCst) >= PREPARATION + charge);
-                drained(&host, &baseline);
             }
             drop(vocabulary); drop(model); drop(preparation);
             drained(&host, &idle);

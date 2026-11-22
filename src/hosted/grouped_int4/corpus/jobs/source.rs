@@ -59,8 +59,8 @@ impl NlpEngine {
     /// bounded layer-major prompt morsels. One extra prompt workspace is
     /// admitted before input and retained through physical completion. All
     /// finalizers, private recipes and lifetime work/attempt debits stay fixed;
-    /// explicit resume may choose another physical row width. This schedule
-    /// uses one coordinator and cannot combine with a numerical CPU team.
+    /// explicit resume may choose another physical row width. This entry
+    /// uses one coordinator; the threaded variant also admits a numerical team.
     #[allow(clippy::too_many_arguments)]
     pub fn job_int4_source_layer_major<R>(&self, model: &ResidentInt4,
         planner: Int4SourceJobPlanner, vocabulary: Arc<ExtractionVocabulary>,
@@ -93,15 +93,29 @@ impl NlpEngine {
             kernel, None, Some(compute_threads), reader, cancellation)
     }
 
+    /// Reuse one bounded numerical team across layer-major prompts, every
+    /// constrained token and all durable attempts. Worker buffers retain the
+    /// declared prompt row capacity, separately from coordinator prefill
+    /// storage, and are admitted before private IO. Either physical width may
+    /// change on authenticated resume without changing task recipes, source
+    /// finalizers, committed results or spent work. Return waits for full join.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int4_source_layer_major_with_threads<R>(&self, model: &ResidentInt4,
+        planner: Int4SourceJobPlanner, vocabulary: Arc<ExtractionVocabulary>,
+        request: SourceJobRequest, limits: JobHostLimits, kernel: PackedInt4Kernel,
+        compute_threads: usize, prefill: Int4PrefillLimits, reader: R,
+        cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        self.run_int4_source_job(model, planner, vocabulary, request, limits,
+            kernel, Some(prefill), Some(compute_threads), reader, cancellation)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_int4_source_job<R>(&self, model: &ResidentInt4, planner: Int4SourceJobPlanner,
         vocabulary: Arc<ExtractionVocabulary>, request: SourceJobRequest,
         limits: JobHostLimits, kernel: PackedInt4Kernel, prefill: Option<Int4PrefillLimits>, compute_threads: Option<usize>,
         reader: R, cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        if prefill.is_some() && compute_threads.is_some() {
-            return Err(HostedError::Limits("INT4 source job team/prefill schedule").into());
-        }
         match compute_threads {
             Some(width) => dispatch::preflight_int4_team(self, limits.native.run, width)?,
             None => dispatch::preflight(self, limits.native.run)?,
@@ -120,8 +134,9 @@ impl NlpEngine {
                 request.limits, limits, request.mode.input_memory())?,
             planner.encoding_workspace_bytes())?;
         let required = with_job_prefill_workspace(required, prefill)?;
+        let max_batch_rows = prefill.map_or(1, |limits| limits.max_batch_rows);
         let team_scratch = compute_threads.map(|width|
-            int4_task_team_workspace_bytes(width, model.model_identity().group_width()))
+            dispatch::int4_prefill_team_workspace_bytes(width, model.model_identity().group_width(), max_batch_rows))
             .transpose()?.unwrap_or(0);
         // The dispatcher reserves this exact worker quote and retains it
         // through join. Check total arithmetic before reserving native inputs.
@@ -136,8 +151,8 @@ impl NlpEngine {
         let completed = match compute_threads {
             None => dispatch::run(self, limits.native.run, cancellation, move |control|
                 execution.run(&model.inner.loaded.value, kernel, None, control)),
-            Some(width) => dispatch::run_int4_team(self, limits.native.run, cancellation,
-                model, width, kernel, move |weights, control, team|
+            Some(width) => dispatch::run_int4_prefill_team(self, limits.native.run, cancellation,
+                model, width, kernel, max_batch_rows, move |weights, control, team|
                     execution.run(weights, kernel, Some(team), control)),
         }?;
         // Physical cancellation/drain failure takes precedence over a job
@@ -241,6 +256,7 @@ mod tests {
         let _entry = NlpEngine::job_int4_source::<Cursor<Vec<u8>>>;
         let _team_entry = NlpEngine::job_int4_source_with_threads::<Cursor<Vec<u8>>>;
         let _prefill_entry = NlpEngine::job_int4_source_layer_major::<Cursor<Vec<u8>>>;
+        let _threaded_prefill_entry = NlpEngine::job_int4_source_layer_major_with_threads::<Cursor<Vec<u8>>>;
     }
 
     #[test]
@@ -325,7 +341,9 @@ mod tests {
                         (None, Some(threads)) => engine.job_int4_extract_with_threads(model, planner,
                             Arc::clone(vocabulary), request, host, PackedInt4Kernel::scalar(), threads,
                             reader, CancellationToken::default()),
-                        _ => unreachable!(),
+                        (Some(prefill), Some(threads)) => engine.job_int4_extract_layer_major_with_threads(
+                            model, planner, Arc::clone(vocabulary), request, host, PackedInt4Kernel::scalar(),
+                            threads, prefill, reader, CancellationToken::default()),
                     }.unwrap()
                 }
                 Task::Source { task, selected } => {
@@ -365,7 +383,9 @@ mod tests {
                         (None, Some(threads)) => engine.job_int4_source_with_threads(model, planner,
                             Arc::clone(vocabulary), request, host, PackedInt4Kernel::scalar(), threads,
                             reader, CancellationToken::default()),
-                        _ => unreachable!(),
+                        (Some(prefill), Some(threads)) => engine.job_int4_source_layer_major_with_threads(
+                            model, planner, Arc::clone(vocabulary), request, host, PackedInt4Kernel::scalar(),
+                            threads, prefill, reader, CancellationToken::default()),
                     }.unwrap()
                 }
             }
@@ -445,7 +465,7 @@ mod tests {
                     };
                     let mut expected = None;
                     for (rows, threads) in [(None, None), (Some(3), None), (Some(64), None),
-                        (None, Some(2)), (None, Some(4))] {
+                        (None, Some(2)), (None, Some(4)), (Some(3), Some(2)), (Some(64), Some(4))] {
                         let root = parent.join(format!("{encoding_name}-{task_name}-{}-{}",
                             rows.unwrap_or(0), threads.unwrap_or(1)));
                         fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
@@ -465,7 +485,8 @@ mod tests {
                         // rerun native work or debit another attempt.
                         let replay = execute(&engine, &model, &vocabulary, task, &encoding, budget, work,
                             request(&root, job, JobOpenMode::ResumeRetained { tail: TailPolicy::Refuse, retention }),
-                            host, threads.is_some().then_some(3), threads.is_none().then_some(2), NeverRead);
+                            host, Some(if rows == Some(3) { 64 } else { 3 }),
+                            Some(if threads == Some(2) { 4 } else { 2 }), NeverRead);
                         assert_eq!(replay, progress);
                         assert_eq!(fs::read(root.join("materialized.ndjson")).unwrap(), bytes);
                         drained(&engine, &baseline);

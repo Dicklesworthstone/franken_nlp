@@ -20,7 +20,8 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     job.storage.input_retention.validate(mode, &args.input)?;
     let input_memory = job.storage.input_retention.input_memory()?;
     let common = job.validate(&args)?;
-    if !super::super::prefill::matches(&args, common)? {
+    if !super::super::prefill::matches(&args, common)?
+        || common.compute != args.compute.admit_with_prefill(args.group_width, common.prefill)? {
         return Err(CandidateError::Arguments.into());
     }
     let deadline = Duration::from_secs(args.timeout_seconds);
@@ -91,15 +92,15 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     // Host authenticates the exact complete population and private recipe,
     // skips committed items and retains each output guard through spool sync
     // and journal acknowledgement. No native result is fabricated here.
-    let progress = if let Some(prefill) = common.prefill {
-        engine.job_int4_source_layer_major(&model, planner, Arc::new(vocabulary), request, host,
-            common.kernel, prefill, reader, cancellation.clone())
-    } else if common.compute.threads == 1 {
-        engine.job_int4_source(&model, planner, Arc::new(vocabulary), request, host,
-            common.kernel, reader, cancellation.clone())
-    } else {
-        engine.job_int4_source_with_threads(&model, planner, Arc::new(vocabulary), request, host,
-            common.kernel, common.compute.threads, reader, cancellation.clone())
+    let progress = match (common.prefill, common.compute.threads) {
+        (Some(prefill), 1) => engine.job_int4_source_layer_major(&model, planner, Arc::new(vocabulary), request, host,
+            common.kernel, prefill, reader, cancellation.clone()),
+        (Some(prefill), threads) => engine.job_int4_source_layer_major_with_threads(&model, planner,
+            Arc::new(vocabulary), request, host, common.kernel, threads, prefill, reader, cancellation.clone()),
+        (None, 1) => engine.job_int4_source(&model, planner, Arc::new(vocabulary), request, host,
+            common.kernel, reader, cancellation.clone()),
+        (None, threads) => engine.job_int4_source_with_threads(&model, planner, Arc::new(vocabulary), request, host,
+            common.kernel, threads, reader, cancellation.clone()),
     }.map_err(execution_failure)?;
     if let Some(cause) = cancellation.cause() {
         return Err(job_failure(JobError::Cancelled(cause)));

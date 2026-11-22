@@ -122,6 +122,17 @@ impl ExtractionArgs {
         self.validate_one_off_with_prefill(args)
     }
     pub(super) fn validate_one_off_with_prefill(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
+        self.validate_extraction_storage(args, false)
+    }
+    /// Retained single-context jobs bind both schedules and own the expanded
+    /// worker buffers through physical join. Other composed routes keep their
+    /// existing refusal until their own native execution supports the pair.
+    pub(super) fn validate_job_with_threaded_prefill(&self, args: &Int4Args)
+        -> Result<Int4Limits, CandidateError> {
+        self.validate_extraction_storage(args, true)
+    }
+    fn validate_extraction_storage(&self, args: &Int4Args, allow_threaded_prefill: bool)
+        -> Result<Int4Limits, CandidateError> {
         let _ = self.selected_rows()?;
         crate::candidate_cli::extract::check_schema_path(&self.schema)?;
         if !(1..=MAX_CONTENT_BYTES).contains(&self.max_result_bytes)
@@ -143,8 +154,8 @@ impl ExtractionArgs {
         let encoding_extra = self.encoding_workspace_extra(args, max_prompt_tokens)?;
         let extra = sum(&[128 * MIB, crate::candidate_cli::extract::SCHEMA_BYTES as u64 * 16,
             self.max_result_bytes as u64 * 16, u64::from(self.max_grammar_states) * 32, encoding_extra])?;
-        args.validate_source_storage(self.max_result_bytes, args.max_new_tokens,
-            max_prompt_tokens, extra)
+        args.validate_storage_with_team_prefill(self.max_result_bytes, args.max_new_tokens,
+            max_prompt_tokens, 0, extra, None, allow_threaded_prefill)
     }
     /// The exact schema and document are two untrusted segments in one prompt.
     /// Their aggregate cap cannot exceed the tokenizer's complete-request

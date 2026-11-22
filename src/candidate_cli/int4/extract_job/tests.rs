@@ -101,15 +101,17 @@ fn prompt_morsels_compose_with_selected_compact_jobs_without_renewing_work() {
         let baseline = serial.args.validate(&serial_args).unwrap();
         let fixed = lifetime(&serial.args, &serial_args, baseline);
         let base_job = serial.args.lifetime_limits(&serial_args, baseline, fixed).unwrap();
-        for rows in ["1", "3", "64"] {
-            let mut scheduled = extra.clone(); scheduled.extend(["--prefill-rows", rows]);
+        for rows in ["1", "3", "64"] { for width in ["1", "2", "4", "64"] {
+            let mut scheduled = extra.clone();
+            scheduled.extend(["--prefill-rows", rows, "--compute-threads", width]);
             let (c, args) = command(operation, &scheduled);
             let common = c.args.validate(&args).unwrap();
             let prefill = common.prefill.unwrap();
             assert_eq!(prefill.max_batch_rows, rows.parse::<usize>().unwrap());
             assert_eq!(prefill.validate().unwrap(),
                 Int4PrefillLimits::required_extra_scratch_bytes(prefill.max_batch_rows).unwrap());
-            assert_eq!(common.compute.threads, 1);
+            assert_eq!(common.compute.threads, width.parse::<usize>().unwrap());
+            assert_eq!(common.compute, args.compute.admit_with_prefill(args.group_width, Some(prefill)).unwrap());
             assert_eq!(common.native, baseline.native);
             assert_eq!(c.args.extraction.budget(&args, common),
                 serial.args.extraction.budget(&serial_args, baseline));
@@ -123,21 +125,19 @@ fn prompt_morsels_compose_with_selected_compact_jobs_without_renewing_work() {
             assert!(admitted.common.minimum_memory_bytes >= base_job.common.minimum_memory_bytes);
             let mut short = common; short.memory_bytes = admitted.common.minimum_memory_bytes - 1;
             assert_eq!(c.args.lifetime_limits(&args, short, fixed).unwrap_err().code, "job_population_memory");
-        }
+        } }
     } } }
 }
 
 #[test]
-fn invalid_prompt_rows_and_mixed_workers_refuse_before_extraction_job_io() {
-    for rows in ["0", "65", "18446744073709551615"] {
+fn invalid_prompt_rows_refuse_before_extraction_job_io_even_with_workers() {
+    for rows in ["0", "65", "18446744073709551615"] { for width in ["1", "4"] {
         let mut words = argv("resume");
-        words.extend(["--prefill-rows", rows].into_iter().map(str::to_owned));
+        words.extend(["--prefill-rows", rows, "--compute-threads", width].into_iter().map(str::to_owned));
         if let Ok((c, args)) = parse(words) {
             assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().exit, ErrorCode::Usage);
         }
-    }
-    let (c, args) = command("start", &["--prefill-rows", "4", "--compute-threads", "2"]);
-    assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().exit, ErrorCode::Usage);
+    } }
 }
 
 #[test]
@@ -150,8 +150,8 @@ fn invalid_worker_widths_and_unsupported_schedules_refuse_before_private_io() {
         }
     }
     for extra in [
-        vec!["--compute-threads", "2", "--prefill-rows", "2"],
         vec!["--compute-threads", "2", "--cohort-documents", "2"],
+        vec!["--compute-threads", "2", "--prefill-rows", "2", "--cohort-documents", "2"],
     ] {
         let mut words = argv("resume");
         words.extend(extra.into_iter().map(str::to_owned));
@@ -162,29 +162,47 @@ fn invalid_worker_widths_and_unsupported_schedules_refuse_before_private_io() {
 }
 
 #[test]
+fn threaded_prompt_storage_is_available_only_to_the_wired_job_validator() {
+    let (job, args) = command("start", &["--compute-threads", "4", "--prefill-rows", "3"]);
+    assert!(job.args.validate(&args).is_ok());
+    assert!(job.args.extraction.validate_one_off_with_prefill(&args).is_err());
+    assert!(job.args.extraction.validate_batch_with_prefill(&args).is_err());
+    assert!(job.args.extraction.validate_with_projection(&args).is_err());
+}
+
+#[test]
 fn snapshot_execution_prices_worker_scratch_before_admitting_job_population() {
-    let (serial, mut serial_args) = command("start", &[]);
-    let (parallel, mut parallel_args) = command("start", &["--compute-threads", "4"]);
-    for args in [&mut serial_args, &mut parallel_args] {
-        args.source_dir = None;
-        args.source_manifest = None;
-        args.snapshot = Some(PathBuf::from("model.int4"));
-        args.expected_model_sha256 = Some("a".repeat(64));
+    for rows in [None, Some("1"), Some("3"), Some("64")] {
+        let mut extra = Vec::new();
+        if let Some(rows) = rows { extra.extend(["--prefill-rows", rows]); }
+        let (serial, mut serial_args) = command("start", &extra);
+        extra.extend(["--compute-threads", "4"]);
+        let (parallel, mut parallel_args) = command("resume", &extra);
+        for args in [&mut serial_args, &mut parallel_args] {
+            args.source_dir = None;
+            args.source_manifest = None;
+            args.snapshot = Some(PathBuf::from("model.int4"));
+            args.expected_model_sha256 = Some("a".repeat(64));
+        }
+        let serial_common = serial.args.validate(&serial_args).unwrap();
+        let parallel_common = parallel.args.validate(&parallel_args).unwrap();
+        assert_eq!(parallel_common.minimum_memory_bytes - serial_common.minimum_memory_bytes,
+            parallel_common.compute.workspace_bytes);
+        let fixed = lifetime(&serial.args, &serial_args, serial_common);
+        let serial_job = serial.args.lifetime_limits(&serial_args, serial_common, fixed).unwrap();
+        let parallel_job = parallel.args.lifetime_limits(&parallel_args, parallel_common, fixed).unwrap();
+        assert_eq!(serial_job.buffer_bytes, parallel_job.buffer_bytes);
+        assert_eq!(parallel_job.common.minimum_memory_bytes - serial_job.common.minimum_memory_bytes,
+            parallel_common.compute.workspace_bytes);
+        let mut insufficient = parallel_common;
+        insufficient.memory_bytes = parallel_job.common.minimum_memory_bytes - 1;
+        assert_eq!(parallel.args.lifetime_limits(&parallel_args, insufficient, fixed).unwrap_err().code,
+            "job_population_memory");
+        if rows.is_some_and(|rows| rows != "1") {
+            assert!(parallel_common.compute.workspace_bytes
+                > parallel_args.compute.admit(parallel_args.group_width).unwrap().workspace_bytes);
+        }
     }
-    let serial_common = serial.args.validate(&serial_args).unwrap();
-    let parallel_common = parallel.args.validate(&parallel_args).unwrap();
-    assert_eq!(parallel_common.minimum_memory_bytes - serial_common.minimum_memory_bytes,
-        parallel_common.compute.workspace_bytes);
-    let fixed = lifetime(&serial.args, &serial_args, serial_common);
-    let serial_job = serial.args.lifetime_limits(&serial_args, serial_common, fixed).unwrap();
-    let parallel_job = parallel.args.lifetime_limits(&parallel_args, parallel_common, fixed).unwrap();
-    assert_eq!(serial_job.buffer_bytes, parallel_job.buffer_bytes);
-    assert_eq!(parallel_job.common.minimum_memory_bytes - serial_job.common.minimum_memory_bytes,
-        parallel_common.compute.workspace_bytes);
-    let mut insufficient = parallel_common;
-    insufficient.memory_bytes = parallel_job.common.minimum_memory_bytes - 1;
-    assert_eq!(parallel.args.lifetime_limits(&parallel_args, insufficient, fixed).unwrap_err().code,
-        "job_population_memory");
 }
 
 #[test]

@@ -31,7 +31,7 @@ pub(super) struct Admission { pub threads: usize, pub workspace_bytes: u64 }
 pub(super) fn definition(command: clap::Command) -> clap::Command {
     command.arg(clap::Arg::new("compute_threads").long("compute-threads")
         .value_name("N").value_parser(clap::value_parser!(usize)).default_value("1")
-        .help("Coordinator plus persistent INT4 row workers, 1..=64; 1 is serial. One team serves the complete request or supported resident batch across all documents, heads, tokens and flushes. Generate/chat, live text streams, score-batch and retained text-job/score-job invocations can also use --prefill-rows; other routes cannot combine these schedules. Cannot combine with --cohort-heads or --cohort-documents. Runtime threads are additional. Worker scratch is admitted before IO"))
+        .help("Coordinator plus persistent INT4 row workers, 1..=64; 1 is serial. One team serves the complete request or supported resident batch across all documents, heads, tokens and flushes. Generate/chat, live text streams, score-batch and retained text/scored/extraction/source jobs can also use --prefill-rows; other routes cannot combine these schedules. Cannot combine with --cohort-heads or --cohort-documents. Runtime threads are additional. Worker scratch is admitted before IO"))
 }
 
 /// The same admitted team width determines the process envelope for every

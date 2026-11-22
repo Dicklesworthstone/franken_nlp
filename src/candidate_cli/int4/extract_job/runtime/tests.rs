@@ -152,7 +152,6 @@ fn completion_envelope_contains_candidate_identity_and_authenticated_progress_on
     selected_value.as_object_mut().unwrap().remove("input_encoding");
     selected_value.as_object_mut().unwrap().remove("encoding_work_limits");
     assert_eq!(selected_value, value);
-    threaded.compute_schedule = None;
     let prefill = Int4PrefillLimits { max_batch_rows: 4,
         max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(4).unwrap() };
     threaded.prefill_schedule = Some(PrefillSchedule::new(prefill).unwrap());
@@ -160,6 +159,8 @@ fn completion_envelope_contains_candidate_identity_and_authenticated_progress_on
     let schedule = scheduled.as_object_mut().unwrap().remove("prefill_schedule").unwrap();
     assert_eq!(schedule["max_batch_rows"], 4);
     assert_eq!(schedule["admitted_workspace_bytes"], prefill.max_extra_scratch_bytes);
+    assert_eq!(scheduled.as_object_mut().unwrap().remove("compute_schedule"),
+        compute::Schedule::for_threads(4).map(serde_json::to_value).transpose().unwrap());
     scheduled.as_object_mut().unwrap().remove("max_selected_rows");
     scheduled.as_object_mut().unwrap().remove("input_encoding");
     scheduled.as_object_mut().unwrap().remove("encoding_work_limits");

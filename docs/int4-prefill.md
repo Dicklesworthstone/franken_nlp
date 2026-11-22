@@ -150,14 +150,16 @@ The `extract-job`, `ner-job`, `keyphrases-job`, `summarize-job` and `answer-job`
 commands accept `--prefill-rows N` on both `start` and `resume`, with the same
 range of 1 through 64. Each retained item uses bounded prompt morsels within
 its own exclusive session. This option also works with `--input-encoding
-safe-bpe-v1`; extraction additionally supports its existing exact selected-row
-projection. Source-task jobs retain full-vocabulary projection.
+safe-bpe-v1` and the existing exact selected-row projection for extraction and
+source tasks. The complete legal-row cap remains authenticated on resume.
 
-Use `--compute-threads 1` with this option. The CLI validates the full memory
-envelope before reading private inputs. Hosted execution independently admits
-the extra prompt workspace, compact-encoder workspace, native allocation and
-retained-input buffers before dispatch. These reservations remain owned until
-the worker has physically finished.
+Use serial compute or `--compute-threads 2..64` with this option. One fixed
+batch-capable team serves all prompt morsels and constrained-decoding steps
+across pending items, durable commits and materialization. The CLI validates
+the full memory envelope before reading private inputs. Hosted execution
+independently admits coordinator prompt storage, fixed worker batch buffers,
+compact-encoder workspace, native allocation and retained-input buffers before
+dispatch. These reservations remain owned through physical worker join.
 
 Prompt width is a physical schedule and may change on authenticated resume,
 including switching between serial and layer-major execution. It does not
@@ -165,13 +167,16 @@ change the job recipe, result schema, input policy, lifetime native/mask-work
 limits or tokenizer allowance. Committed items remain skipped. Pending items
 retain their original cumulative debits and restart with empty logical KV.
 Completion reports add the same optional `prefill_schedule` object described
-above; serial reports omit it.
+above and `compute_schedule` when workers are selected. Default reports stay
+unchanged.
 
 Library callers can opt into `NativeInt4ExtractionBatch::new_layer_major`,
 `NativeInt4SourceBatch::new_layer_major`, and the corresponding
 `Int4ExtractionJobProcessor` and `Int4SourceJobProcessor` constructors. The
 hosted entry points are `NlpEngine::job_int4_extract_layer_major` and
-`NlpEngine::job_int4_source_layer_major`. Existing constructors keep serial
+`NlpEngine::job_int4_source_layer_major`; the corresponding combined entries
+are `job_int4_extract_layer_major_with_threads` and
+`job_int4_source_layer_major_with_threads`. Existing constructors keep serial
 execution. The ignored pinned-model gate
 `complete_structured_jobs_match_serial_results_and_resume_without_reexecution`
 covers complete output/work equivalence and retained replay across schedules;
