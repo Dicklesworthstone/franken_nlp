@@ -155,6 +155,9 @@ impl SourceTaskPlanner {
         planning: SourcePlanningLimits, mapping: Int8SourceMapLimits, control: &mut C)
         -> Result<PreparedInt8SummarySynthesis<'s>, Int8SourceMapError> {
         checkpoint(control)?;
+        // Evidence-fit probes and the later generated-evidence pass do not yet
+        // share the complete compact-input contract of plain source maps.
+        self.encoder.require_byte_encoding().map_err(Int8SourceError::from)?;
         request.validate(planning)?;
         let (discovery_limits, reserve) = reserve(budget, planning, mapping)?;
         // Derive the real summary scaffold, rather than relying on a caller's

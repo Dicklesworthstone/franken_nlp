@@ -27,7 +27,7 @@ impl NlpEngine {
         validate(&config, source.len(), required.kv_bytes)?;
         validate_summary(&config.task, config.mapping, summary)?;
         check_assets(&config.identity, planner.tokenizer_digest(), *planner.template_digest())?;
-        let bytes = sum(&[source.capacity() as u64, config.preparation_reserve_bytes])?;
+        let bytes = input_bytes(&config, source.capacity(), &planner)?;
         let run = config.native.run;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,

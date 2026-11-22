@@ -30,12 +30,15 @@ existing map/reduce lineage. All output retains `evidence=non_authoritative`.
 No partial document success is published after cancellation or a failed chunk.
 
 NER does not claim a global entity census or cross-chunk entity resolution.
-Keyphrases retain per-chunk rankings, not a global reranking. Summarization
-retains independently cited chunk summaries, not a new global synthesis pass.
+By default, keyphrases retain per-chunk rankings and summaries retain independently
+cited chunk results. Explicit `--reduce-keyphrases` and `--reduce-summary` combine
+existing candidates and verified evidence into document-wide results without an
+additional neural pass.
 Non-overlapping chunk boundaries can split entities or semantic context; exact
 source preservation does not establish recall or single-context equivalence.
-Source membership is not semantic entailment. QA, arbitrary extraction schemas,
-classification and generation are deliberately not accepted by this command.
+Source membership is not semantic entailment. Passage QA and schema extraction
+have separate task-specific routes under this command; compact input below is
+limited to NER, keyphrases and cited-summary maps.
 
 ## Exact capacity instead of a guessed scaffold reserve
 
@@ -47,8 +50,10 @@ source, model call or assumed general-purpose characters/token ratio is used.
 Its `Int8SourceMapCapacity::constrain_chunks` method only tightens caller limits.
 All actual source chunks still pass the real source encoder and task compiler.
 
-`--max-chunk-bytes` optionally adds a byte ceiling; omitted, it is chosen from
-that task's available capacity. The existing partitioner verifies actual token
+`--max-chunk-bytes` optionally adds a byte ceiling. In default byte mode it is
+chosen from that task's available source-token capacity; in compact mode the
+default is `--context-tokens` bytes. The explicit byte ceiling may exceed the
+source-token ceiling: the existing partitioner verifies actual encoded token
 counts and can shrink chunks geometrically. It preserves every source byte,
 Unicode scalar boundaries and CRLF pairs. Boundaries are not promised to be
 linguistic sentences or the longest possible fitting chunks.
@@ -61,6 +66,49 @@ source-bound grammars before the first native forward. Full source-grammar
 compilation is therefore pre-inference, not pre-weight-loading. Completed work,
 chunk counts and whole-source coordinates must agree with the CLI preflight.
 No second model, alternate tokenizer or inference retry is introduced.
+
+## Bounded compact input
+
+Use `--input-encoding safe-bpe-v1` for `--task ner`, `--task keyphrases`
+or `--task summarize`. Exact `--reduce-keyphrases` and `--reduce-summary`
+remain available with the same policy:
+
+```sh
+fnlp candidate map report.txt --task summarize --reduce-summary \
+  --model ./model.fnlpq --memory-mib 8192 \
+  --input-encoding safe-bpe-v1 --max-chunk-bytes 4096
+```
+
+The bounded encoder preserves original source bytes and excludes template-control
+tokens. Its changed prompt tokens bind execution identity and make no
+identical-output, tokenizer-parity, task-quality or speed claim.
+
+One cumulative work ledger survives CLI sizing and hosted compilation. Every
+accepted and discarded partition probe and actual chunk plan spends from it.
+The CLI retains the same planner through hosted execution and final reporting;
+another chunk, rejected candidate or hosted replan cannot renew the budget.
+
+| Complete-invocation option | Default |
+| --- | --- |
+| `--max-total-tokenizer-input-bytes` | Eight times `--max-input-bytes` |
+| `--max-total-tokenizer-output-tokens` | Eight times `--max-input-bytes` |
+| `--max-total-tokenizer-pair-checks` | 268435456 |
+| `--max-total-tokenizer-pair-bytes` | 4294967296 |
+
+These are finite limits for the entire invocation; per-call
+`--max-tokenizer-pair-checks` and `--max-tokenizer-pair-bytes` also apply.
+Set explicit total limits when the complete document needs more probing work.
+Exhaustion fails the whole document without byte fallback, retry or partial
+success. The policy and all four total limits participate in execution identity.
+
+Successful compact responses add `input_encoding` with the policy, complete
+operation limits and cumulative work used. Default byte responses retain their
+existing shape. Encoder workspace is admitted before private input/model IO and
+charged beside the full retained-plan preparation reserve.
+
+Compact passage QA, schema extraction and `--synthesize-summary` are refused
+during option validation. Their distinct planning work requires separate
+admission. The default byte routes retain their existing behavior.
 
 ## Limits and ownership
 

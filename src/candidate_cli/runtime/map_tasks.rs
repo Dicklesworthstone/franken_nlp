@@ -5,13 +5,13 @@ mod question;
 mod extraction;
 mod synthesis;
 mod keyphrase_reduction;
-use std::sync::Arc;
+use std::{cell::RefCell, sync::Arc};
 use super::source_tasks::{Session, planner, source_identity};
-use crate::{candidate_cli::map::MapCommand,
-    hosted::SourceMapConfig,
-    native_engine::{constrained_int8, decode::DecodeStepControl, strict_int8::Int8Work},
+use crate::{candidate_cli::map::{MapCommand, encoding},
+    hosted::{HostedError, SourceMapConfig},
+    native_engine::{constrained_int8, decode::{DecodeCancellationKind, DecodeStepControl}, strict_int8::Int8Work},
     tasks::{ir::PlanContext, mapreduce::{ChunkPlan, MapReduceError},
-        source_planning::{SourceTaskPlanner, quantized::{capacity::Int8SourceMapCapacity,
+        source_planning::{SourceTaskPlanner, quantized::{Int8SourceError, capacity::Int8SourceMapCapacity,
             long::{Int8SourceMapLimits, Int8SourceMapRun}}}}};
 
 /// Geometry/work only; no source bytes, prompt commitments or native receipt.
@@ -26,12 +26,24 @@ fn preflight(source: &str, planner: &SourceTaskPlanner, command: &MapCommand,
     // This temporary metadata plan drops before loading and retains no source
     // grammar or second prepared task. The host independently compiles every
     // actual chunk before the first native forward.
-    let chunks = ChunkPlan::build_with_checkpoints(source, mapping.chunks, |text| {
-        planner.source_encoder().encode(text, mapping.chunks.max_chunk_bytes, mapping.chunks.max_chunk_bytes)
-            .map(|s| s.total_token_count()).map_err(|_| MapReduceError::Tokenizer)
-    }, || {
-        if control.prefill_checkpoint(0).is_some() { Err(MapReduceError::Cancelled) } else { Ok(()) }
-    }).map_err(|_| CandidateError::Planning)?;
+    planner.map_document_encoding_workspace_bytes().map_err(|_| CandidateError::Planning)?;
+    let mut failure = None;
+    let mut cancellation = None;
+    let chunks = {
+        let control = RefCell::new(&mut *control);
+        ChunkPlan::build_with_checkpoints(source, mapping.chunks, |text| {
+            planner.source_encoder().encode_with_control(text, mapping.chunks.max_chunk_bytes,
+                mapping.chunks.max_chunk_bytes, &mut || control.borrow_mut().prefill_checkpoint(0))
+                .map(|s| s.total_token_count()).map_err(|error| {
+                    failure = Some(Int8SourceError::from(error)); MapReduceError::Tokenizer
+                })
+        }, || match control.borrow_mut().prefill_checkpoint(0) {
+            Some(cause) => { cancellation = Some(cause); Err(MapReduceError::Cancelled) }, None => Ok(()),
+        })
+    };
+    if let Some(cause) = cancellation { return Err(cancelled(cause)); }
+    if let Some(error) = failure { return Err(source_error(error)); }
+    let chunks = chunks.map_err(|_| CandidateError::Planning)?;
     let mut work = Int8Work::default();
     let mut masks = 0_u64;
     for chunk in chunks.chunks() {
@@ -50,7 +62,25 @@ fn preflight(source: &str, planner: &SourceTaskPlanner, command: &MapCommand,
         source_scalars: source.chars().count(), work, masks })
 }
 fn poll(control: &mut impl DecodeStepControl) -> Result<(), CandidateError> {
-    if control.prefill_checkpoint(0).is_some() { Err(CandidateError::Planning) } else { Ok(()) }
+    match control.prefill_checkpoint(0) { Some(cause) => Err(cancelled(cause)), None => Ok(()) }
+}
+fn cancelled(cause: DecodeCancellationKind) -> CandidateError {
+    match cause { DecodeCancellationKind::Deadline | DecodeCancellationKind::Timeout => CandidateError::Timeout,
+        _ => CandidateError::Execution }
+}
+fn source_error(error: Int8SourceError) -> CandidateError {
+    error.cancellation().map(cancelled).unwrap_or(CandidateError::Planning)
+}
+fn host_error(error: HostedError) -> CandidateError {
+    match error {
+        HostedError::Stopped { stop, .. } => cancelled(stop.kind),
+        HostedError::Join { physical_error: Some(error), .. }
+            | HostedError::Scope { physical_error: Some(error), .. } => host_error(*error),
+        HostedError::SourceMap(error) => error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution),
+        HostedError::Source(error) => error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution),
+        HostedError::Reservation(_) => CandidateError::Memory,
+        _ => CandidateError::Execution,
+    }
 }
 
 pub(in crate::candidate_cli) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
@@ -73,11 +103,16 @@ pub(in crate::candidate_cli) fn execute(command: MapCommand, args: CandidateArgs
     session.remaining()?;
     let facts = session.facts(&args)?;
     let (planner, vocabulary) = planner()?;
+    let planner = match command.encoding.limits(&command)? {
+        Some(encoding) => planner.with_map_document_encoding(encoding.policy(), encoding.complete)
+            .map_err(|_| CandidateError::Planning)?,
+        None => planner,
+    };
     let budget = command.host.task_budget(limits);
     let identity = source_identity(&facts, &planner, command.kind()?)?;
     let context = PlanContext::new(&identity, budget).map_err(|_| CandidateError::Planning)?;
     let capacity = planner.int8_map_capacity_with_control(&task, budget, &context,
-        command.host.planning(), &mut session.control()).map_err(|_| CandidateError::Planning)?;
+        command.host.planning(), &mut session.control()).map_err(source_error)?;
     let mapping = command.mapping(capacity)?;
     let summary = command.summary.limits(command.max_map_result_bytes)?;
     if let Some(limits) = summary { limits.validate(mapping).map_err(|_| CandidateError::Planning)?; }
@@ -91,25 +126,36 @@ pub(in crate::candidate_cli) fn execute(command: MapCommand, args: CandidateArgs
     let config = SourceMapConfig { identity, task, budget, planning: command.host.planning(), mapping,
         native: session.native(&args)?, preparation_reserve_bytes: limits.preparation_bytes,
         reduction_reserve_bytes: command.reduction_reserve_mib.checked_mul(MIB).ok_or(CandidateError::Arguments)? };
+    // Retain the exact planner, not a fresh ledger, through hosted recompilation
+    // and final usage reporting. All private source storage stays charged.
+    let planner = Arc::new(planner);
     if let Some(limits) = summary {
-        let result = session.engine.summarize_int8_source(&model, text, Arc::new(planner), Arc::new(vocabulary),
-            config, limits, cancellation).map_err(|_| CandidateError::Execution)?;
+        let result = session.engine.summarize_int8_source(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
+            config, limits, cancellation).map_err(host_error)?;
         summary::check_completed(&expected, result.result(), limits.max_bullets)?;
-        return deliver(&session, &facts, &result, command.max_map_result_bytes + 4096, output);
+        return deliver_encoded(&session, &facts, &result, encoding::report(&planner)?.as_ref(),
+            command.max_map_result_bytes + 4096, output);
     }
     if let Some(limits) = keyphrases {
-        let result = session.engine.keyphrases_int8_source(&model, text, Arc::new(planner), Arc::new(vocabulary),
-            config, limits, cancellation).map_err(|_| CandidateError::Execution)?;
+        let result = session.engine.keyphrases_int8_source(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
+            config, limits, cancellation).map_err(host_error)?;
         keyphrase_reduction::check_completed(&expected, result.result(), limits)?;
-        return deliver(&session, &facts, &result, command.max_map_result_bytes + 4096, output);
+        return deliver_encoded(&session, &facts, &result, encoding::report(&planner)?.as_ref(),
+            command.max_map_result_bytes + 4096, output);
     }
-    let result = session.engine.map_int8_source(&model, text, Arc::new(planner), Arc::new(vocabulary),
-        config, cancellation).map_err(|_| CandidateError::Execution)?;
+    let result = session.engine.map_int8_source(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
+        config, cancellation).map_err(host_error)?;
     check_completed(&expected, result.result())?;
-    deliver(&session, &facts, &result, command.max_map_result_bytes + 4096, output)
+    deliver_encoded(&session, &facts, &result, encoding::report(&planner)?.as_ref(),
+        command.max_map_result_bytes + 4096, output)
 }
 fn deliver<T: Serialize>(session: &Session, facts: &ArtifactIdentity, result: &T,
     cap: usize, output: &mut impl Write) -> Result<(), CandidateError> {
+    deliver_encoded(session, facts, result, None, cap, output)
+}
+fn deliver_encoded<T: Serialize>(session: &Session, facts: &ArtifactIdentity, result: &T,
+    input_encoding: Option<&encoding::EncodingReport>, cap: usize, output: &mut impl Write)
+    -> Result<(), CandidateError> {
     session.remaining()?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
         evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
@@ -117,6 +163,7 @@ fn deliver<T: Serialize>(session: &Session, facts: &ArtifactIdentity, result: &T
         quant_recipe: &facts.recipe_id, output: result };
     // Both host output ownership and the CLI's aggregate staging reservation
     // remain live through complete serialization, external write and flush.
+    let response = encoding::EncodedResponse { response, input_encoding };
     publish_checked(&response, cap, output, &|| session.remaining().map(|_| ()))
 }
 

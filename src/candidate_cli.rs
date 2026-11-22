@@ -169,7 +169,7 @@ impl CandidateCommand {
             return judge::JudgeCommand::from_arg_matches(matches).map(Self::Judge);
         }
         if name == "map" {
-            return map::MapCommand::from_arg_matches(matches).map(Self::Map);
+            return map::MapCommand::from_matches(matches).map(Self::Map);
         }
         if name == "score-job" {
             return jobs::scored::ScoreJobCommand::from_arg_matches(matches).map(Self::ScoreJob);

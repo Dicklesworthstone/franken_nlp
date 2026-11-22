@@ -97,6 +97,9 @@ pub struct Int8DocumentRedactor<'p> {
 impl<'p> Int8DocumentRedactor<'p> {
     pub fn new(planner: &'p SourceTaskPlanner, identity: ExecutionIdentity, config: LongRedactionConfig)
         -> Result<Self, LongRedactionError> {
+        // Fresh redaction verification has its own second source frontier.
+        // Plain-map compact admission does not price this composed operation.
+        planner.source_encoder().require_byte_encoding().map_err(|_| RedactError::InvalidOptions)?;
         config.ner.validate().map_err(|_| RedactError::InvalidOptions)?;
         config.per_chunk.validate().map_err(|_| RedactError::InvalidOptions)?;
         config.mapping.chunks.effective_token_limit().map_err(Int8SourceMapError::Chunk)?;

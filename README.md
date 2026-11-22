@@ -59,6 +59,8 @@
 > when the collected quotations exceed one context.
 > Native `eval` and `qualify` routes also support
 > [held-out sentiment ratings and paired model comparison](#native-int4-sentiment-evaluation-and-comparison).
+> INT8 `candidate map` also supports [bounded compact input for complete
+> NER, keyphrase and cited-summary documents](#implemented-candidate-int8-compact-document-maps).
 > Candidate results retain their explicit provenance; build verification,
 > model quality and release qualification remain separate pending gates.
 > The top-level task, batch and job examples below remain the disclosed 1.0
@@ -653,6 +655,34 @@ byte-fallback contract; complete-document INT4 extraction has the explicit
 policy described below. These encoding and
 planner tests still require
 the repository's authorized DSR checkpoint and model-present qualification.
+
+## Implemented candidate INT8 compact document maps
+
+`fnlp candidate map` accepts `--input-encoding safe-bpe-v1` for NER,
+keyphrases and cited summaries, including exact `--reduce-keyphrases` and
+`--reduce-summary` reductions:
+
+```sh
+fnlp candidate map document.txt --task ner \
+  --model ./model.fnlpq --memory-mib 8192 \
+  --input-encoding safe-bpe-v1 --max-chunk-bytes 4096
+```
+
+The source remains byte-exact, with original UTF-8 byte and Unicode-scalar
+coordinates. Actual encoded token counts decide native context fit. One
+nonrenewable tokenizer ledger covers CLI preflight, accepted and discarded
+sizing probes, hosted repartitioning and actual chunk compilation. The four
+`--max-total-tokenizer-*` ceilings bound cumulative input bytes, output tokens,
+pair checks and examined pair bytes. Compact responses report the policy,
+limits and actual work; byte fallback remains the default output contract.
+
+Encoder workspace is charged alongside retained source, prompts and grammars.
+Compact input on this INT8 route currently excludes passage QA, arbitrary
+schema extraction and neural summary synthesis. All output remains candidate
+evidence; changed prompt tokens establish no output-parity, quality or speed
+claim. See the [CLI contract](docs/candidate-long-document-cli.md#bounded-compact-input)
+and [library contract](docs/int8-long-source.md#compact-source-encoding).
+Rust and model qualification remain pending.
 
 ## Implemented candidate INT4 token streaming
 

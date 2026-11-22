@@ -132,3 +132,25 @@ fn owned_inputs_and_guarded_results_cross_the_physical_completion_boundary() {
     fn send<T: Send + 'static>() {}
     send::<SourceMapInput>(); send::<Int8SourceMapRun>(); send::<HostedOutput<Int8SourceMapRun>>();
 }
+
+#[test]
+fn compact_map_workspace_is_additional_to_retained_plans_and_rejects_one_request_admission() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding};
+    let controls = crate::tokenizer::pinned_controls::pinned().unwrap();
+    let planner = || SourceTaskPlanner::pinned(controls.template_controls(), 166_101).unwrap();
+    let c = config();
+    let byte = planner();
+    assert_eq!(input_bytes(&c, 1234, &byte).unwrap(), c.preparation_reserve_bytes + 1234);
+    let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 4096,
+        max_output_tokens: 4096, max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 });
+    let complete = SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 };
+    let compact = planner().with_map_document_encoding(policy.clone(), complete).unwrap();
+    let workspace = compact.map_document_encoding_workspace_bytes().unwrap();
+    assert!(workspace > 0);
+    assert_eq!(input_bytes(&c, 1234, &compact).unwrap(),
+        c.preparation_reserve_bytes + 1234 + workspace);
+    assert!(input_bytes(&c, 1234, &planner().with_document_encoding(policy).unwrap()).is_err());
+    let mut overflow = config(); overflow.preparation_reserve_bytes = u64::MAX;
+    assert!(input_bytes(&overflow, 1234, &compact).is_err());
+}

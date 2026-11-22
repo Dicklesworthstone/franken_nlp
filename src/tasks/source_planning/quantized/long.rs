@@ -7,7 +7,7 @@
 //! the first forward. There is no alternate tokenizer, runtime, retry or model.
 
 use super::*;
-use std::sync::Arc;
+use std::{cell::RefCell, sync::Arc};
 use crate::{
     grammar::mask::MaskWorkLimits,
     native_engine::{constrained::JsonWorkBudget, kv::KV_BYTES_PER_TOKEN,
@@ -174,21 +174,31 @@ impl SourceTaskPlanner {
         -> Result<PreparedInt8SourceMap<'s>, Int8SourceMapError> {
         limits.validate(budget, planning)?;
         checkpoint(control)?;
-        self.encoder.require_byte_encoding().map_err(Int8SourceError::from)?;
+        // Compact sizing probes and final plans must share one nonrenewable
+        // document ledger. A one-request encoder alone cannot authorize a map.
+        self.map_document_encoding_workspace_bytes().map_err(Int8SourceError::from)?;
         constrained_int8::check_profile(context.execution_identity()).map_err(Int8SourceError::from)?;
         if source.is_empty() { return Err(Int8SourceMapError::EmptySource); }
         let mut cancelled = None;
-        let chunks = ChunkPlan::build_with_checkpoints(source, limits.chunks, |text| {
-            // Count REAL encoded ids. This cap admits the encoder's entire
-            // bounded candidate before ChunkPlan shrinks it to its token cap.
-            self.encoder.encode(text, limits.chunks.max_chunk_bytes, limits.chunks.max_chunk_bytes)
-                .map(|document| document.total_token_count()).map_err(|_| MapReduceError::Tokenizer)
-        }, || {
-            if let Some(cause) = control.prefill_checkpoint(0) {
-                cancelled = Some(cause); Err(MapReduceError::Cancelled)
-            } else { Ok(()) }
-        });
+        let mut encoding_error = None;
+        let chunks = {
+            let control = RefCell::new(&mut *control);
+            ChunkPlan::build_with_checkpoints(source, limits.chunks, |text| {
+                // Count the complete candidate before the lossless partitioner
+                // shrinks it. Rejected probes remain charged to the same ledger.
+                self.encoder.encode_with_control(text, limits.chunks.max_chunk_bytes,
+                    limits.chunks.max_chunk_bytes, &mut || control.borrow_mut().prefill_checkpoint(0))
+                    .map(|document| document.total_token_count()).map_err(|error| {
+                        encoding_error = Some(error); MapReduceError::Tokenizer
+                    })
+            }, || {
+                if let Some(cause) = control.borrow_mut().prefill_checkpoint(0) {
+                    cancelled = Some(cause); Err(MapReduceError::Cancelled)
+                } else { Ok(()) }
+            })
+        };
         if let Some(cause) = cancelled { return Err(Int8SourceError::Cancelled(cause).into()); }
+        if let Some(error) = encoding_error { return Err(Int8SourceError::from(error).into()); }
         let chunks = chunks.map_err(Int8SourceMapError::Chunk)?;
         let masks = limits.mask_visits_per_chunk.checked_mul(chunks.chunks().len() as u64)
             .filter(|&n| n <= limits.max_mask_visits).ok_or(Int8SourceMapError::WorkLimit)?;

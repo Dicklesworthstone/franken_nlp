@@ -48,7 +48,7 @@ impl NlpEngine {
         let required = requirements(config.native)?;
         validate(&config, source.len(), required.kv_bytes)?;
         check_assets(&config.identity, planner.tokenizer_digest(), *planner.template_digest())?;
-        let input_bytes = sum(&[source.capacity() as u64, config.preparation_reserve_bytes])?;
+        let input_bytes = input_bytes(&config, source.capacity(), &planner)?;
         let run = config.native.run;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, input_bytes)?,
@@ -105,6 +105,15 @@ fn validate(config: &SourceMapConfig, source_bytes: usize, kv_bytes: u64) -> Res
     };
     if config.identity.task_spec != task { return Err(HostedError::ModelIdentity); }
     Ok(())
+}
+// Encoder workspace coexists with every retained prompt, source automaton and
+// result buffer. Charge it in addition to the caller's preparation reserve;
+// a small compact token count never discounts original source storage.
+fn input_bytes(config: &SourceMapConfig, source_capacity: usize, planner: &SourceTaskPlanner)
+    -> Result<u64, HostedError> {
+    let encoding = planner.map_document_encoding_workspace_bytes()
+        .map_err(|_| HostedError::Limits("INT8 source map encoding admission"))?;
+    sum(&[source_capacity as u64, config.preparation_reserve_bytes, encoding])
 }
 fn validate_common<T>(config: &SourceMapConfig<T>, source_bytes: usize, kv_bytes: u64) -> Result<(), HostedError> {
     config.native.run.validate()?;

@@ -23,6 +23,10 @@ fn assets(command: &MapCommand) -> (SourceTaskPlanner, ExecutionIdentity, TaskBu
     let (_, limits) = command.validate().unwrap();
     let controls = pinned_controls::pinned().unwrap();
     let p = SourceTaskPlanner::pinned(controls.template_controls(), 166_101).unwrap();
+    let p = match command.encoding.limits(command).unwrap() {
+        Some(encoding) => p.with_map_document_encoding(encoding.policy(), encoding.complete).unwrap(),
+        None => p,
+    };
     let id = source_identity(&facts(), &p, command.kind().unwrap()).unwrap();
     let b = command.host.task_budget(limits); let task = command.map_task(None).unwrap();
     let cap = p.int8_map_capacity_with_control(&task, b, &PlanContext::new(&id, b).unwrap(),
@@ -117,4 +121,72 @@ fn caller_chunk_byte_ceiling_is_retained_without_guessing_source_tokens() {
     assert_eq!(mapping.chunks.max_chunk_tokens, cap.max_source_tokens());
     let tiny = ChunkLimits { context_tokens: cap.reserved_tokens(), ..mapping.chunks };
     assert!(cap.constrain_chunks(tiny).is_err());
+}
+
+#[test]
+fn compact_preflight_and_hosted_replanning_share_one_counter_and_exact_native_work() {
+    let text = "The quick brown fox jumps over the lazy dog. 上海 <think> <|im_start|> ▁\r\n".repeat(5);
+    for name in ["ner", "keyphrases", "summarize"] {
+        let cmd = command(name, &["--input-encoding", "safe-bpe-v1", "--max-chunk-bytes", "4096",
+            "--context-tokens", "8192"]);
+        let (p, id, b, task, cap, mapping) = assets(&cmd);
+        let expected = preflight(&text, &p, &cmd, cap, mapping, b, &mut go()).unwrap();
+        assert_eq!(p.map_document_encoding_work().unwrap().unwrap().input_bytes(), text.len());
+        let actual = p.plan_int8_map_with_control(&text, &task, b, &PlanContext::new(&id, b).unwrap(),
+            cmd.host.planning(), mapping, &mut go()).unwrap();
+        assert_eq!(expected.chunks, actual.chunk_count());
+        assert_eq!(expected.work, actual.planned_work());
+        assert_eq!(expected.masks, actual.reserved_mask_visits());
+        let used = p.map_document_encoding_work().unwrap().unwrap();
+        assert_eq!(used.input_bytes(), 3 * text.len(), "preflight, hosted sizing and actual compilation");
+        assert!(used.output_tokens() < used.input_bytes());
+        let report = serde_json::to_value(encoding::report(&p).unwrap().unwrap()).unwrap();
+        assert_eq!(report["work_used"], serde_json::to_value(used).unwrap());
+        assert_eq!(report["complete_operation_limits"],
+            serde_json::to_value(cmd.encoding.limits(&cmd).unwrap().unwrap().complete).unwrap());
+    }
+}
+#[test]
+fn cli_preflight_does_not_refund_or_renew_compact_allowance_for_actual_plans() {
+    let text = "The quick brown fox jumps over the lazy dog. 上海 <think>";
+    let limit = (2 * text.len()).to_string();
+    let cmd = command("ner", &["--input-encoding", "safe-bpe-v1", "--context-tokens", "8192",
+        "--max-total-tokenizer-input-bytes", &limit]);
+    let (p, id, b, task, cap, mapping) = assets(&cmd);
+    preflight(text, &p, &cmd, cap, mapping, b, &mut go()).unwrap();
+    assert_eq!(p.map_document_encoding_work().unwrap().unwrap().input_bytes(), text.len());
+    assert!(p.plan_int8_map_with_control(text, &task, b, &PlanContext::new(&id, b).unwrap(),
+        cmd.host.planning(), mapping, &mut go()).is_err());
+    assert_eq!(p.map_document_encoding_work().unwrap().unwrap().input_bytes(), 2 * text.len());
+}
+#[test]
+fn compact_document_policy_never_changes_byte_default_response_shape() {
+    let cmd = command("ner", &[]);
+    let (p, _, _, _, _, _) = assets(&cmd);
+    assert!(encoding::report(&p).unwrap().is_none());
+    let response = serde_json::json!({"schema_version": 1, "output": {"fixture": true}});
+    let wrapped = encoding::EncodedResponse { response: &response, input_encoding: None };
+    assert_eq!(canonjson::canonical_bytes(&wrapped).unwrap(), canonjson::canonical_bytes(&response).unwrap());
+}
+#[test]
+fn compact_preparation_preserves_cancellation_at_cli_policy_boundary() {
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let expected = match cause { Deadline | Timeout => CandidateError::Timeout, _ => CandidateError::Execution };
+        assert_eq!(source_error(Int8SourceError::Cancelled(cause)), expected);
+        assert_eq!(host_error(HostedError::SourceMap(
+            crate::tasks::source_planning::quantized::long::Int8SourceMapError::Source(
+                Int8SourceError::Cancelled(cause)))), expected);
+    }
+    let cmd = command("ner", &["--input-encoding", "safe-bpe-v1"]);
+    let text = "The quick brown fox jumps over the lazy dog. 上海 <think> <|im_start|> ▁";
+    let (p, _, b, _, cap, mapping) = assets(&cmd);
+    let mut count = go();
+    preflight(text, &p, &cmd, cap, mapping, b, &mut count).unwrap();
+    for stop_at in [1, 3, count.calls] {
+        let (p, _, b, _, cap, mapping) = assets(&cmd);
+        assert!(matches!(preflight(text, &p, &cmd, cap, mapping, b,
+            &mut Control { calls: 0, stop_at }), Err(CandidateError::Timeout)));
+    }
 }

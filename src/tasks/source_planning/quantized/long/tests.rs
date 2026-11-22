@@ -190,6 +190,139 @@ fn cancellation_during_partitioning_retains_its_exact_cause() {
         SourcePlanningLimits::default(), limits(), &mut Stop { calls: 0 }).err().unwrap();
     assert_eq!(error.cancellation(), Some(DecodeCancellationKind::Deadline));
 }
+
+fn compact_policy() -> crate::tokenizer::untrusted::UntrustedEncoding {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 4096,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 })
+}
+fn compact_work() -> crate::tokenizer::untrusted::SafeBpeWorkLimits {
+    crate::tokenizer::untrusted::SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 }
+}
+fn compact_limits() -> Int8SourceMapLimits {
+    let mut limit = limits(); limit.chunks.max_chunk_bytes = 4096; limit.chunks.max_chunk_tokens = 4096; limit
+}
+const COMPACT_SOURCE: &str = "The quick brown fox jumps over the lazy dog. 上海 <think> <|im_start|> ▁";
+
+#[test]
+fn compact_maps_preserve_exact_source_and_reduce_native_prompt_work_for_all_three_tasks() {
+    for task in [SourceMapTask::Ner(NerOptions::default()), SourceMapTask::Keyphrases(KeyphraseOptions::default()),
+        SourceMapTask::Summarize(SummaryOptions::default())] {
+        let byte = planner(); let byte_id = identity(&byte, &task);
+        let original = byte.plan_int8_map_with_control(COMPACT_SOURCE, &task, budget(),
+            &PlanContext::new(&byte_id, budget()).unwrap(), SourcePlanningLimits::default(),
+            compact_limits(), &mut Continue).unwrap();
+        let compact = planner().with_map_document_encoding(compact_policy(), compact_work()).unwrap();
+        let id = identity(&compact, &task);
+        let plan = compact.plan_int8_map_with_control(COMPACT_SOURCE, &task, budget(),
+            &PlanContext::new(&id, budget()).unwrap(), SourcePlanningLimits::default(),
+            compact_limits(), &mut Continue).unwrap();
+        assert_eq!(plan.chunk_count(), original.chunk_count());
+        assert_eq!(plan.chunks.chunks().iter().map(SourceChunk::text).collect::<String>(), COMPACT_SOURCE);
+        assert_eq!(plan.chunks.chunks()[0].span(), original.chunks.chunks()[0].span());
+        assert!(plan.planned_work().forward_positions < original.planned_work().forward_positions);
+        assert_ne!(plan.execution_identities().next().unwrap().template_digest,
+            original.execution_identities().next().unwrap().template_digest);
+        let used = compact.map_document_encoding_work().unwrap().unwrap();
+        assert_eq!(used.input_bytes(), 2 * COMPACT_SOURCE.len(), "sizing probe and real native plan");
+        assert!(used.output_tokens() < used.input_bytes());
+        assert!(used.pair_checks() > 0 && used.pair_bytes() > 0);
+        assert!(byte.map_document_encoding_work().unwrap().is_none());
+    }
+}
+
+#[test]
+fn compact_token_fit_probes_preserve_multichunk_unicode_and_spend_rejected_work() {
+    let source = format!("{COMPACT_SOURCE}\r\n").repeat(3);
+    let compact = planner().with_map_document_encoding(compact_policy(), compact_work()).unwrap();
+    let mut mapping = compact_limits();
+    mapping.chunks.max_chunk_bytes = 64;
+    mapping.chunks.max_chunk_tokens = 8;
+    let prepared = prepare(&compact, &source, mapping);
+    assert!(prepared.chunk_count() > 1);
+    assert_eq!(prepared.chunks.chunks().iter().map(SourceChunk::text).collect::<String>(), source);
+    let (mut byte_end, mut scalar_end) = (0, 0);
+    for chunk in prepared.chunks.chunks() {
+        let span = chunk.span();
+        assert_eq!((span.byte_start, span.scalar_start), (byte_end, scalar_end));
+        assert_eq!(&source[span.byte_start..span.byte_end], chunk.text());
+        assert!(chunk.tokens() <= 8);
+        assert!(!(source.as_bytes().get(span.byte_end.wrapping_sub(1)) == Some(&b'\r')
+            && source.as_bytes().get(span.byte_end) == Some(&b'\n')));
+        byte_end = span.byte_end; scalar_end = span.scalar_end;
+    }
+    assert_eq!((byte_end, scalar_end), (source.len(), source.chars().count()));
+    assert!(compact.map_document_encoding_work().unwrap().unwrap().input_bytes() > 2 * source.len(),
+        "discarded token-fit probes remain charged beside accepted probes and actual plans");
+}
+
+#[test]
+fn compact_probes_plans_and_repeated_preparation_never_reset_the_operation_allowance() {
+    let mut exact = compact_work(); exact.max_input_bytes = 2 * COMPACT_SOURCE.len() as u64;
+    let compact = planner().with_map_document_encoding(compact_policy(), exact).unwrap();
+    let first = prepare(&compact, COMPACT_SOURCE, compact_limits());
+    assert_eq!(first.chunk_count(), 1);
+    let used = compact.map_document_encoding_work().unwrap().unwrap();
+    let task = SourceMapTask::Ner(NerOptions::default()); let id = identity(&compact, &task);
+    assert!(compact.plan_int8_map_with_control(COMPACT_SOURCE, &task, budget(),
+        &PlanContext::new(&id, budget()).unwrap(), SourcePlanningLimits::default(),
+        compact_limits(), &mut Continue).is_err());
+    assert_eq!(compact.map_document_encoding_work().unwrap().unwrap(), used);
+
+    exact.max_input_bytes -= 1;
+    let short = planner().with_map_document_encoding(compact_policy(), exact).unwrap();
+    let id = identity(&short, &task);
+    assert!(short.plan_int8_map_with_control(COMPACT_SOURCE, &task, budget(),
+        &PlanContext::new(&id, budget()).unwrap(), SourcePlanningLimits::default(),
+        compact_limits(), &mut Continue).is_err());
+    assert_eq!(short.map_document_encoding_work().unwrap().unwrap().input_bytes(), COMPACT_SOURCE.len());
+}
+
+#[test]
+fn compact_maps_require_cumulative_admission_and_bind_all_four_operation_ceilings() {
+    let task = SourceMapTask::Ner(NerOptions::default());
+    let one = planner().with_document_encoding(compact_policy()).unwrap(); let id = identity(&one, &task);
+    let context = PlanContext::new(&id, budget()).unwrap();
+    assert!(one.plan_int8_map_with_control(COMPACT_SOURCE, &task, budget(), &context,
+        SourcePlanningLimits::default(), compact_limits(), &mut Continue).is_err());
+    assert!(one.int8_map_capacity_with_control(&task, budget(), &context,
+        SourcePlanningLimits::default(), &mut Continue).is_err());
+    let original = planner().with_map_document_encoding(compact_policy(), compact_work()).unwrap();
+    let original = prepare(&original, COMPACT_SOURCE, compact_limits());
+    for axis in 0..4 {
+        let mut work = compact_work();
+        match axis { 0 => work.max_input_bytes -= 1, 1 => work.max_output_tokens -= 1,
+            2 => work.max_pair_checks -= 1, _ => work.max_pair_bytes -= 1 }
+        let next = planner().with_map_document_encoding(compact_policy(), work).unwrap();
+        let next = prepare(&next, COMPACT_SOURCE, compact_limits());
+        assert_eq!(next.planned_work(), original.planned_work());
+        assert_ne!(next.execution_identities().next().unwrap().template_digest,
+            original.execution_identities().next().unwrap().template_digest);
+    }
+}
+
+#[test]
+fn cancellation_inside_compact_probes_retains_every_original_cause_and_spent_work() {
+    struct Stop { calls: usize, cause: DecodeCancellationKind }
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.calls += 1; (self.calls >= 7).then_some(self.cause)
+        }
+    }
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let compact = planner().with_map_document_encoding(compact_policy(), compact_work()).unwrap();
+        let task = SourceMapTask::Ner(NerOptions::default()); let id = identity(&compact, &task);
+        let error = compact.plan_int8_map_with_control(&COMPACT_SOURCE.repeat(8), &task, budget(),
+            &PlanContext::new(&id, budget()).unwrap(), SourcePlanningLimits::default(),
+            compact_limits(), &mut Stop { calls: 0, cause }).err().unwrap();
+        assert_eq!(error.cancellation(), Some(cause));
+        let used = compact.map_document_encoding_work().unwrap().unwrap();
+        assert!(used.input_bytes() <= 8 * COMPACT_SOURCE.len());
+    }
+}
 fn small_chunks(source: &str) -> ChunkPlan<'_> {
     let mut l = limits().chunks; l.max_chunk_bytes = 4; l.max_chunk_tokens = 4;
     ChunkPlan::build(source, l, |s| Ok(s.len())).unwrap()

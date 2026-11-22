@@ -106,3 +106,66 @@ fn disabled_feature_never_opens_input_options_model_or_output() {
             Err(CandidateError::Unavailable));
     }
 }
+
+#[test]
+fn compact_source_maps_and_exact_reducers_price_one_encoder_beside_all_retained_chunks() {
+    for (task, extra) in [("ner", vec![]), ("keyphrases", vec!["--reduce-keyphrases"]),
+        ("summarize", vec!["--reduce-summary"])] {
+        let mut options = vec!["--input-encoding", "safe-bpe-v1", "--max-chunk-bytes", "4096"];
+        options.extend(extra);
+        let mut cmd = command(task, &options);
+        let (_, limits) = cmd.validate().unwrap();
+        let encoding = cmd.encoding.limits(&cmd).unwrap().unwrap();
+        assert_eq!(encoding.call.max_input_bytes, 4096);
+        assert_eq!(encoding.call.max_output_tokens, 4096);
+        assert_eq!(encoding.complete.max_input_bytes, 8 * cmd.host.max_input_bytes as u64);
+        assert!(encoding.workspace_bytes().unwrap() > 0);
+        assert!(encoding.workspace_bytes().unwrap() < limits.preparation_bytes);
+        cmd.max_chunk_bytes = Some(1_048_576);
+        cmd.host.max_input_bytes = 1_048_576;
+        cmd.host.preparation_mib = 512;
+        assert!(cmd.validate().is_err());
+    }
+    let byte = command("ner", &[]);
+    assert!(byte.encoding.limits(&byte).unwrap().is_none());
+}
+#[test]
+fn compact_source_map_totals_are_finite_explicit_and_not_available_to_byte_input() {
+    for flag in ["--max-total-tokenizer-input-bytes", "--max-total-tokenizer-output-tokens",
+        "--max-total-tokenizer-pair-checks", "--max-total-tokenizer-pair-bytes"] {
+        assert!(command("ner", &[flag, "1"]).validate().is_err());
+        for value in ["0", "18446744073709551615"] {
+            assert!(command("ner", &["--input-encoding", "safe-bpe-v1", flag, value]).validate().is_err());
+        }
+    }
+    let cmd = command("ner", &["--input-encoding", "safe-bpe-v1",
+        "--max-tokenizer-pair-checks", "1234", "--max-tokenizer-pair-bytes", "9999",
+        "--max-total-tokenizer-input-bytes", "54321", "--max-total-tokenizer-output-tokens", "12345",
+        "--max-total-tokenizer-pair-checks", "77777", "--max-total-tokenizer-pair-bytes", "888888"]);
+    let limits = cmd.encoding.limits(&cmd).unwrap().unwrap();
+    assert_eq!(limits.call.max_pair_checks, 1234);
+    assert_eq!(limits.call.max_pair_bytes, 9999);
+    assert_eq!(limits.complete.max_input_bytes, 54321);
+    assert_eq!(limits.complete.max_output_tokens, 12345);
+    assert_eq!(limits.complete.max_pair_checks, 77777);
+    assert_eq!(limits.complete.max_pair_bytes, 888888);
+}
+#[test]
+fn unsupported_compact_compositions_refuse_before_private_io() {
+    struct NoRead;
+    impl Read for NoRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private input read") }
+    }
+    struct NoWrite;
+    impl Write for NoWrite {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("output written") }
+        fn flush(&mut self) -> io::Result<()> { panic!("output flushed") }
+    }
+    for (task, extra) in [("answer", vec!["--question", "never-open.txt"]),
+        ("extract", vec!["--schema", "never-open.json"]),
+        ("summarize", vec!["--synthesize-summary"])] {
+        let mut flags = vec!["--input-encoding", "safe-bpe-v1"];
+        flags.extend(extra);
+        assert_eq!(command(task, &flags).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+    }
+}

@@ -64,6 +64,31 @@ Any failure returns no partial document result. The host must discard a failed
 native invocation and retain its resource/output ownership through actual
 delivery, as for the existing single-source task.
 
+## Compact source encoding
+
+A planner configured through
+`SourceTaskPlanner::with_map_document_encoding(UntrustedEncoding::SafeBpeV1(...), SafeBpeWorkLimits { ... })`
+supports compact NER, keyphrase and cited-summary maps, including the existing
+exact keyphrase and summary reducers. A one-request encoding policy without a
+complete-operation ledger is refused by both map capacity and map planning.
+
+All candidate partition probes, including candidates discarded while shrinking,
+and every final chunk compilation debit the same cumulative input-byte,
+output-token, pair-check and pair-byte limits. Reusing the planner for hosted
+replanning preserves spent work. The policy and complete limits bind each
+execution identity. Actual encoded counts determine context fit; byte/scalar
+source coordinates and verified citation lifting retain the original document.
+
+Use `map_document_encoding_work()` for cumulative usage and
+`map_document_encoding_limits()` for the admitted totals. The hosted map and
+exact reducers add `map_document_encoding_workspace_bytes()` to their input
+reservation, alongside source capacity and the caller's full preparation reserve.
+
+Neural summary synthesis and long-redaction compositions remain explicitly
+byte-only on these INT8 library paths. This change does not extend their
+multi-stage accounting. Compact tokens may change native output; implementation
+and regression definitions establish no model-quality or parity result.
+
 ## Process-hosted entrypoint
 
 `NlpEngine::map_int8_source` accepts an owned original `String`, the resident
