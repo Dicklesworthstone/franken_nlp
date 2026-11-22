@@ -2003,14 +2003,15 @@ attempts and commits, and optional materialization. The team works with both
 byte fallback and explicit safe-BPE input. Native cohorts remain unavailable
 on this job route.
 
-As a separate schedule, add `--prefill-rows N` with serial compute for bounded
-layer-major prompt execution in `score-job start` or `resume`. The host
-reserves one additional prompt workspace before private input and keeps it
-through native completion and durable storage. Prompt row width is physical
-scheduling: it may change on authenticated resume without changing the recipe,
-replaying committed records or renewing any attempt/native-work allowance.
-Nondefault completion reports include only public `prefill_schedule` metadata;
-default reports and stored scoring results retain their existing shapes.
+Add `--prefill-rows N` for bounded layer-major prompt execution in
+`score-job start` or `resume`, with serial compute or the same persistent
+worker team. The host admits the coordinator's prompt workspace and fixed
+worker batch buffers together before private input, and retains native and
+input claims through worker join. Both physical widths may change on
+authenticated resume without changing the recipe, replaying committed records
+or renewing any attempt/native-work allowance. Completion reports include the
+selected public `prefill_schedule` and `compute_schedule`; default reports and
+stored scoring results retain their existing shapes.
 See [retained scored jobs](docs/candidate-scored-jobs.md) for details.
 
 Worker scratch and the process thread envelope are priced alongside the

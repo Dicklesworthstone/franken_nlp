@@ -345,9 +345,11 @@ fn prompt_width_is_physical_while_item_lifetime_and_tokenizer_limits_stay_fixed(
             let common = serial.args.validate(&args).unwrap();
             let fixed = lifetime(&serial.args, &args, common);
             let baseline = serial.args.lifetime_limits(&args, common, fixed).unwrap();
-            for operation in ["start", "resume"] { for rows in [1, 3, 64] {
+            for operation in ["start", "resume"] { for rows in [1, 3, 64] { for threads in [1, 2, 4, 64] {
                 let row = rows.to_string();
-                let (c, args) = command(operation, task, &["--input-encoding", encoding, "--prefill-rows", &row]);
+                let width = threads.to_string();
+                let (c, args) = command(operation, task, &["--input-encoding", encoding,
+                    "--prefill-rows", &row, "--compute-threads", &width]);
                 let common = c.args.validate(&args).unwrap();
                 let limits = c.args.lifetime_limits(&args, common, fixed).unwrap();
                 let selected = common.prefill.unwrap();
@@ -358,11 +360,20 @@ fn prompt_width_is_physical_while_item_lifetime_and_tokenizer_limits_stay_fixed(
                 assert_eq!(limits.buffer_bytes, baseline.buffer_bytes);
                 assert_eq!(limits.encoding_workspace_bytes, baseline.encoding_workspace_bytes);
                 assert_eq!(c.args.scoring.budget(common), serial.args.scoring.budget(baseline.common));
-                assert_eq!(common.compute.threads, 1);
+                assert_eq!(common.compute.threads, threads);
+                assert_eq!(common.compute, args.compute.admit_with_prefill(args.group_width, Some(selected)).unwrap());
+                // Loading and execution are separate peaks. Extra prompt and
+                // worker buffers can only increase the latter, never be charged
+                // again per item or head.
+                let growth = limits.common.minimum_memory_bytes - baseline.common.minimum_memory_bytes;
+                assert!(growth <= selected.validate().unwrap() + common.compute.workspace_bytes);
+                if threads > 1 && rows > 1 {
+                    assert!(common.compute.workspace_bytes > args.compute.admit(args.group_width).unwrap().workspace_bytes);
+                }
                 assert!(super::super::prefill::matches(&args, common).unwrap());
                 let mut tight = common; tight.memory_bytes = limits.common.minimum_memory_bytes - 1;
                 assert_eq!(c.args.lifetime_limits(&args, tight, fixed).unwrap_err().code, "job_population_memory");
-            } }
+            } } }
         }
         for rows in [0, 65, usize::MAX] {
             let (c, mut args) = command("resume", task, &[]);
@@ -382,9 +393,16 @@ fn invalid_worker_widths_and_incompatible_native_schedules_refuse_before_job_io(
                 assert!(c.execute_owned(args, NoIo, &mut NoIo).is_err());
             }
         }
-        for schedule in ["--cohort-heads", "--prefill-rows"] {
+        {
             let mut words = argv("start", task);
-            words.extend(["--compute-threads", "4", schedule, "1"].into_iter().map(str::to_owned));
+            words.extend(["--compute-threads", "4", "--cohort-heads", "1"].into_iter().map(str::to_owned));
+            if let Ok((c, args)) = parse(words) {
+                assert!(c.execute_owned(args, NoIo, &mut NoIo).is_err());
+            }
+        }
+        for rows in ["0", "65", "18446744073709551615"] {
+            let mut words = argv("start", task);
+            words.extend(["--compute-threads", "4", "--prefill-rows", rows].into_iter().map(str::to_owned));
             if let Ok((c, args)) = parse(words) {
                 assert!(c.execute_owned(args, NoIo, &mut NoIo).is_err());
             }

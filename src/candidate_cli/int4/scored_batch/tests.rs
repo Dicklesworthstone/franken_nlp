@@ -145,7 +145,7 @@ fn compact_scored_tasks_admit_serial_prefill_and_cohort_streams_with_one_encoder
             } else {
                 let mut native_args = args.clone();
                 native_args.input_encoding = input_encoding::InputEncodingArgs::default();
-                let common = batch.scoring.validate_batch_with_threaded_prefill(&native_args).unwrap();
+                let common = batch.scoring.validate_with_threaded_prefill(&native_args).unwrap();
                 let t = limits.transport;
                 let corpus = 8 * t.max_line_bytes as u64 + 4 * t.max_output_line_bytes as u64
                     + 128 * t.max_epoch_ids as u64 + t.max_epoch_id_bytes as u64

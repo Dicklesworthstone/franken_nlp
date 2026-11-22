@@ -302,8 +302,8 @@ all of its heads, durable attempts and commits, and optional materialization.
 The existing strict INT4 projection executor divides numerical output rows
 among workers. Input order, scored-language semantics, both pairwise orders,
 result validation and journal acknowledgement keep their existing authority.
-Native cohorts remain unavailable for jobs. The separate bounded prompt schedule
-below requires serial compute and cannot combine with this CPU team.
+Native cohorts remain unavailable for jobs. The bounded prompt schedule below
+can reuse the same CPU team after its fixed batch buffers are admitted.
 
 The process envelope admits the selected children and their modeled scratch
 before execution. The host retains the input, private recipe and key owner,
@@ -355,8 +355,9 @@ The grouped INT4 `score-job start` and `resume` routes accept
 `--prefill-rows N` for classification, sentiment, and all three judgment modes.
 The row ceiling is 1 through 64. It selects the same existing bounded prompt
 executor as one-off scoring and resident `source-int4 score-batch`.
-Use `--compute-threads 1` or omit the compute option. A nonserial CPU team or
-native head cohort cannot be combined with prompt morsels.
+Use serial compute or add `--compute-threads 2..64` to reuse one persistent
+team across every prompt morsel and candidate-scoring step. Native head cohorts
+remain incompatible with prompt morsels.
 
 For example, with the protected job setup and immutable lifetime limits from
 the earlier sections:
@@ -367,7 +368,7 @@ fnlp candidate source-int4 score-job start corpus.ndjson \
   --snapshot ./model.int4.snapshot \
   --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
   --memory-mib 16384 --group-width 128 \
-  --prefill-rows 32 --compute-threads 1 \
+  --prefill-rows 32 --compute-threads 4 \
   --store-results --job-dir ./protected-job \
   --job-id "$JOB_ID" --key-file ./protected.key \
   --limits ./job-limits.json --materialize
@@ -376,14 +377,16 @@ fnlp candidate source-int4 score-job start corpus.ndjson \
 One additional validated workspace is admitted before private input is read.
 It coexists with retained population or retained-record replay, optional
 safe-BPE encoding, native KV and ordinary scratch, journal staging and guarded
-complete results. The same workspace serves every head and pending item.
-An insufficient workspace or process memory ceiling refuses before population
+complete results. Combined execution also admits fixed per-worker batch buffers
+for the declared prompt row ceiling. These workspaces serve every head and pending
+item without growing or renewing native work. An insufficient workspace or process
+memory ceiling refuses before population
 access. There is no cross-request document cache or reordered prompt template.
 
 The row count is physical scheduling and is excluded from the authenticated
 semantic recipe, consistently with INT4 text-job prefill and scored CPU-team
-width. An explicit resume may change the row count, select serial execution, or
-switch to a supported CPU-team schedule after omitting `--prefill-rows`.
+width. An explicit resume may independently change the row count and worker
+width, including switching between serial and combined execution.
 Input bytes, task settings, candidate language, model identity, tokenizer caps,
 task budgets and lifetime limits remain authenticated and must match.
 Previously committed results are reused exactly as stored. Every failed or
@@ -402,12 +405,14 @@ The metadata-only completion wrapper adds the optional `prefill_schedule`
 object only when selected. Its `execution` is
 `grouped-int4-layer-major-causal-prefill-v1`, `max_batch_rows` is the declared
 row ceiling, and `admitted_workspace_bytes` is the exact validated extra prompt
-payload. Ordinary serial metadata remains unchanged; no prompt, label, score or
-private recipe is added to stdout.
+payload. Combined execution also reports the existing `compute_schedule` after
+all workers have joined. Ordinary serial metadata remains unchanged; no prompt,
+label, score or private recipe is added to stdout.
 
 Library callers use
-`NlpEngine::job_int4_scored_layer_major(model, planner, request, limits, kernel, prefill, reader, cancellation)`.
-The existing immutable `Int4ScoredJobPlanner` works with either physical route;
+`NlpEngine::job_int4_scored_layer_major(model, planner, request, limits, kernel, prefill, reader, cancellation)`
+or `NlpEngine::job_int4_scored_layer_major_with_threads(model, planner, request, limits, kernel, compute_threads, prefill, reader, cancellation)`.
+The existing immutable `Int4ScoredJobPlanner` works with every physical route;
 there is no new semantic recipe version for row width.
 `Int4ScoredJobProcessor::new_layer_major` is available for an embedding that
 separately admits the validated extra workspace.
@@ -415,7 +420,7 @@ separately admits the validated extra workspace.
 Regression definitions cover complete and retained-record memory quotes,
 one-byte-short workspace admission before IO, all original cancellation causes,
 schedule metadata, and controller-only stored-result/work comparisons across
-serial, team and prompt schedules for all five scored record shapes and both
+serial, team, prompt and combined schedules for all five scored record shapes and both
 input encodings. Executable validation remains **UNRUN** in this editing session.
 This extension claims no measured speedup, demonstrated output parity, crash
 qualification or task-quality improvement.

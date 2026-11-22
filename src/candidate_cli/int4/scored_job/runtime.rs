@@ -86,7 +86,8 @@ fn run<P: Int4ScoredJobTask>(engine: &NlpEngine, model: &ResidentInt4, planner: 
     started: Instant, deadline: Duration, cancellation: CancellationToken) -> Result<(), Failure> {
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
-    if !super::super::prefill::matches(args, limits.common)? {
+    if !super::super::prefill::matches(args, limits.common)?
+        || limits.common.compute != args.compute.admit_with_prefill(args.group_width, limits.common.prefill)? {
         return Err(CandidateError::Arguments.into());
     }
     planner.check_job_limits(lifetime).map_err(|_| CandidateError::Planning)?;
@@ -110,14 +111,15 @@ fn run<P: Int4ScoredJobTask>(engine: &NlpEngine, model: &ResidentInt4, planner: 
     let materialize = job.storage.materialize;
     let request = SourceJobRequest { root: job.storage.job_dir, key, job_id, limits: lifetime,
         mode: open_mode(mode, job.storage.input_retention)?, materialize };
-    let progress = if let Some(prefill) = common.prefill {
-        engine.job_int4_scored_layer_major(model, planner, request, host, common.kernel,
-            prefill, reader, cancellation.clone())
-    } else if common.compute.threads == 1 {
-        engine.job_int4_scored(model, planner, request, host, common.kernel, reader, cancellation.clone())
-    } else {
-        engine.job_int4_scored_with_threads(model, planner, request, host, common.kernel,
-            common.compute.threads, reader, cancellation.clone())
+    let progress = match (common.prefill, common.compute.threads) {
+        (Some(prefill), 1) => engine.job_int4_scored_layer_major(model, planner, request, host,
+            common.kernel, prefill, reader, cancellation.clone()),
+        (Some(prefill), threads) => engine.job_int4_scored_layer_major_with_threads(model, planner,
+            request, host, common.kernel, threads, prefill, reader, cancellation.clone()),
+        (None, 1) => engine.job_int4_scored(model, planner, request, host,
+            common.kernel, reader, cancellation.clone()),
+        (None, threads) => engine.job_int4_scored_with_threads(model, planner, request, host,
+            common.kernel, threads, reader, cancellation.clone()),
     }.map_err(execution_failure)?;
     if let Some(cause) = cancellation.cause() {
         return Err(job_failure(JobError::Cancelled(cause)));

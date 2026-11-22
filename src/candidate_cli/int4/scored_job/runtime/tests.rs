@@ -143,6 +143,14 @@ fn completion_metadata_is_task_and_candidate_bound_without_private_scores_or_rec
             Some(serde_json::to_value(PrefillSchedule::new(prompt).unwrap()).unwrap()));
         grouped.as_object_mut().unwrap().remove("input_encoding");
         assert_eq!(grouped, value, "prompt schedule does not alter authenticated durable metadata");
+        compact.compute_schedule = compute::Schedule::for_threads(4);
+        let mut combined = serde_json::to_value(&compact).unwrap();
+        assert_eq!(combined.as_object_mut().unwrap().remove("compute_schedule"),
+            compute::Schedule::for_threads(4).map(serde_json::to_value).transpose().unwrap());
+        assert_eq!(combined.as_object_mut().unwrap().remove("prefill_schedule"),
+            Some(serde_json::to_value(PrefillSchedule::new(prompt).unwrap()).unwrap()));
+        combined.as_object_mut().unwrap().remove("input_encoding");
+        assert_eq!(combined, value, "combined physical schedules do not change durable metadata");
     }
 }
 

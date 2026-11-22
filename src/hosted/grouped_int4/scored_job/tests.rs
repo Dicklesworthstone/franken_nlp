@@ -148,6 +148,7 @@ fn all_three_real_task_factories_cross_the_existing_owned_host_boundary() {
         let _entrypoint = NlpEngine::job_int4_scored::<P, std::io::Cursor<Vec<u8>>>;
         let _threaded = NlpEngine::job_int4_scored_with_threads::<P, std::io::Cursor<Vec<u8>>>;
         let _prefill = NlpEngine::job_int4_scored_layer_major::<P, std::io::Cursor<Vec<u8>>>;
+        let _prefill_team = NlpEngine::job_int4_scored_layer_major_with_threads::<P, std::io::Cursor<Vec<u8>>>;
         send::<ScoredJobExecution<P, std::io::Cursor<Vec<u8>>>>();
     }
     binding::<Int4ClassificationPlanner>();
@@ -381,6 +382,16 @@ mod team {
         let model = ResidentInt4 { inner: Arc::new(ResidentModel { loaded, lease }) };
         let baseline = host.resources().memory_snapshot();
         use DecodeCancellationKind::*;
+        for prefill_rows in [None, Some(1), Some(3), Some(64)] {
+        let prefill = prefill_rows.map(|rows| Int4PrefillLimits { max_batch_rows: rows,
+            max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap() });
+        let run = |planner, request, limits, width, reader, stop| match prefill {
+            None => host.job_int4_scored_with_threads(&model, planner, request, limits,
+                PackedInt4Kernel::scalar(), width, reader, stop),
+            Some(prefill) => host.job_int4_scored_layer_major_with_threads(&model, planner, request, limits,
+                PackedInt4Kernel::scalar(), width, prefill, reader, stop),
+        };
+        let worker_bytes = dispatch::int4_prefill_team_workspace_bytes(4, 32, prefill_rows.unwrap_or(1)).unwrap();
         for width in [2, 4] {
             for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
                 ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
@@ -390,8 +401,7 @@ mod team {
                 let observed = Arc::new(Observation::default());
                 let reader = Reader { resources: Arc::clone(host.resources()), observed: Arc::clone(&observed),
                     action: Action::Refuse, stop: stop.clone() };
-                let error = host.job_int4_scored_with_threads(&model, planner,
-                    request, limits, PackedInt4Kernel::scalar(), width, reader, stop).err().unwrap();
+                let error = run(planner, request, limits, width, reader, stop).err().unwrap();
                 let HostedJobError::Host(HostedError::Stopped { stop, .. }) = error
                     else { panic!("scored pre-cancellation lost its typed cause"); };
                 assert_eq!(stop.kind, cause); assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
@@ -406,8 +416,7 @@ mod team {
             let observed = Arc::new(Observation::default());
             let reader = Reader { resources: Arc::clone(host.resources()), observed: Arc::clone(&observed),
                 action: Action::Refuse, stop: stop.clone() };
-            let error = host.job_int4_scored_with_threads(&model, planner,
-                request, limits, PackedInt4Kernel::scalar(), width, reader, stop).err().unwrap();
+            let error = run(planner, request, limits, width, reader, stop).err().unwrap();
             assert!(matches!(error, HostedJobError::Host(HostedError::Limits(_))));
             assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
             assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
@@ -416,9 +425,10 @@ mod team {
         {
             let (planner, request, limits) = planner(&model, true);
             let required = requirements(32, planner.task_ceiling(), planner.native_limits(), request.limits,
-                limits, request.mode.input_memory()).unwrap().with_encoding_workspace(planner.encoding_workspace_bytes()).unwrap();
+                limits, request.mode.input_memory()).unwrap().with_encoding_workspace(planner.encoding_workspace_bytes()).unwrap()
+                .with_prefill_workspace(prefill).unwrap();
             let room = sum(&[required.input_bytes, required.native.kv_bytes,
-                required.workspace_bytes, int4_task_team_workspace_bytes(4, 32).unwrap() - 1]).unwrap();
+                required.workspace_bytes, worker_bytes - 1]).unwrap();
             let bytes = host.resources().config().memory_ceiling_bytes
                 .checked_sub(baseline.committed_bytes + baseline.reserved_bytes).unwrap().checked_sub(room).unwrap();
             let lease = host.resources().acquire_lease();
@@ -427,8 +437,7 @@ mod team {
             let observed = Arc::new(Observation::default());
             let reader = Reader { resources: Arc::clone(host.resources()), observed: Arc::clone(&observed),
                 action: Action::Refuse, stop: stop.clone() };
-            let error = host.job_int4_scored_with_threads(&model, planner,
-                request, limits, PackedInt4Kernel::scalar(), 4, reader, stop).err().unwrap();
+            let error = run(planner, request, limits, 4, reader, stop).err().unwrap();
             assert!(matches!(error, HostedJobError::Host(HostedError::Reservation(_))));
             assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
             assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
@@ -442,8 +451,7 @@ mod team {
             let observed = Arc::new(Observation::default());
             let reader = Reader { resources: Arc::clone(host.resources()), observed: Arc::clone(&observed),
                 action, stop: stop.clone() };
-            let error = host.job_int4_scored_with_threads(&model, planner,
-                request, limits, PackedInt4Kernel::scalar(), 4, reader, stop).err().unwrap();
+            let error = run(planner, request, limits, 4, reader, stop).err().unwrap();
             match action {
                 Action::Cancel(cause) => {
                     let HostedJobError::Host(HostedError::Stopped { stop, .. }) = error
@@ -457,9 +465,10 @@ mod team {
             }
             assert_eq!(observed.reads.load(Ordering::SeqCst), 1);
             assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
-            assert!(observed.workers_at_read.load(Ordering::SeqCst) >= int4_task_team_workspace_bytes(4, 32).unwrap());
+            assert!(observed.workers_at_read.load(Ordering::SeqCst) >= worker_bytes);
             assert!(observed.input_at_drop.load(Ordering::SeqCst) >= PREPARATION + charge);
             drained(&host, &baseline);
+        }
         }
         drop(model); drop(preparation);
         drained(&host, &idle);
@@ -512,6 +521,7 @@ mod native_team {
         for (schedule, width, rows) in [
             ("serial", 1, 0), ("team2", 2, 0), ("team4", 4, 0),
             ("prefill3", 1, 3), ("prefill64", 1, 64),
+            ("team2-prefill3", 2, 3), ("team4-prefill64", 4, 64),
         ] {
             let root = parent.join(format!("{name}-{schedule}"));
             fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
@@ -520,8 +530,13 @@ mod native_team {
             let progress = if rows != 0 {
                 let prefill = Int4PrefillLimits { max_batch_rows: rows,
                     max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap() };
-                engine.job_int4_scored_layer_major(model, make(), req, host, PackedInt4Kernel::scalar(),
-                    prefill, reader, CancellationToken::default())
+                if width == 1 {
+                    engine.job_int4_scored_layer_major(model, make(), req, host, PackedInt4Kernel::scalar(),
+                        prefill, reader, CancellationToken::default())
+                } else {
+                    engine.job_int4_scored_layer_major_with_threads(model, make(), req, host,
+                        PackedInt4Kernel::scalar(), width, prefill, reader, CancellationToken::default())
+                }
             } else if width == 1 {
                 engine.job_int4_scored(model, make(), req, host, PackedInt4Kernel::scalar(),
                     reader, CancellationToken::default())
@@ -547,8 +562,8 @@ mod native_team {
                 engine.job_int4_scored(model, make(), req, host, PackedInt4Kernel::scalar(),
                     NeverRead, CancellationToken::default())
             } else {
-                engine.job_int4_scored_layer_major(model, make(), req, host, PackedInt4Kernel::scalar(),
-                    next, NeverRead, CancellationToken::default())
+                engine.job_int4_scored_layer_major_with_threads(model, make(), req, host, PackedInt4Kernel::scalar(),
+                    4, next, NeverRead, CancellationToken::default())
             }.unwrap();
             assert_eq!(replay, progress);
             assert_eq!(fs::read(root.join("materialized.ndjson")).unwrap(), bytes);

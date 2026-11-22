@@ -113,7 +113,7 @@ impl BatchArgs {
         // policy refusal ahead of defaults, document or model IO.
         let mut native_args = args.clone();
         native_args.input_encoding = input_encoding::InputEncodingArgs::default();
-        let mut common = self.scoring.validate_batch_with_threaded_prefill(&native_args)?;
+        let mut common = self.scoring.validate_with_threaded_prefill(&native_args)?;
         let encoding = self.input_encoding(args, common)?;
         let encoding_workspace_bytes = match &encoding {
             crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback => 0,
