@@ -38,7 +38,7 @@ Non-overlapping chunk boundaries can split entities or semantic context; exact
 source preservation does not establish recall or single-context equivalence.
 Source membership is not semantic entailment. Passage QA and schema extraction
 have separate task-specific routes under this command; compact input below is
-limited to NER, keyphrases and cited-summary maps.
+available for NER, keyphrases, cited-summary maps and independent passage QA.
 
 ## Exact capacity instead of a guessed scaffold reserve
 
@@ -69,8 +69,8 @@ No second model, alternate tokenizer or inference retry is introduced.
 
 ## Bounded compact input
 
-Use `--input-encoding safe-bpe-v1` for `--task ner`, `--task keyphrases`
-or `--task summarize`. Exact `--reduce-keyphrases` and `--reduce-summary`
+Use `--input-encoding safe-bpe-v1` for `--task ner`, `--task keyphrases`,
+`--task summarize` or `--task answer --question FILE`. Exact `--reduce-keyphrases` and `--reduce-summary`
 remain available with the same policy:
 
 ```sh
@@ -85,6 +85,10 @@ identical-output, tokenizer-parity, task-quality or speed claim.
 
 One cumulative work ledger survives CLI sizing and hosted compilation. Every
 accepted and discarded partition probe and actual chunk plan spends from it.
+Passage QA additionally charges question sizing and the repeated question and
+passage manifest in every actual prompt. Its per-prompt byte ceiling is
+`--max-input-bytes` across all three untrusted segments; actual encoded tokens
+determine native context fit. Original passage bytes alone authorize citations.
 The CLI retains the same planner through hosted execution and final reporting;
 another chunk, rejected candidate or hosted replan cannot renew the budget.
 
@@ -106,9 +110,11 @@ operation limits and cumulative work used. Default byte responses retain their
 existing shape. Encoder workspace is admitted before private input/model IO and
 charged beside the full retained-plan preparation reserve.
 
-Compact passage QA, schema extraction and `--synthesize-summary` are refused
-during option validation. Their distinct planning work requires separate
-admission. The default byte routes retain their existing behavior.
+Compact schema extraction, `--synthesize-answer` and `--synthesize-summary` are
+refused during option validation. Their distinct planning work requires separate
+admission. Compact passage QA retains independent passage answers and every
+verified source occurrence; it adds no answer vote or global synthesis pass.
+The default byte routes retain their existing behavior.
 
 ## Limits and ownership
 

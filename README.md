@@ -659,7 +659,7 @@ the repository's authorized DSR checkpoint and model-present qualification.
 ## Implemented candidate INT8 compact document maps
 
 `fnlp candidate map` accepts `--input-encoding safe-bpe-v1` for NER,
-keyphrases and cited summaries, including exact `--reduce-keyphrases` and
+keyphrases, cited summaries and passage QA, including exact `--reduce-keyphrases` and
 `--reduce-summary` reductions:
 
 ```sh
@@ -676,9 +676,14 @@ sizing probes, hosted repartitioning and actual chunk compilation. The four
 pair checks and examined pair bytes. Compact responses report the policy,
 limits and actual work; byte fallback remains the default output contract.
 
+For passage QA, use `--task answer --question question.txt` with the same compact
+flag. The repeated question, passage manifests, discarded source probes and
+actual passage plans all spend the same cumulative tokenizer allowance. Each
+answer retains passage-scoped evidence in original-document coordinates.
+
 Encoder workspace is charged alongside retained source, prompts and grammars.
-Compact input on this INT8 route currently excludes passage QA, arbitrary
-schema extraction and neural summary synthesis. All output remains candidate
+Compact input on this INT8 route currently excludes arbitrary schema extraction
+and neural answer/summary synthesis. All output remains candidate
 evidence; changed prompt tokens establish no output-parity, quality or speed
 claim. See the [CLI contract](docs/candidate-long-document-cli.md#bounded-compact-input)
 and [library contract](docs/int8-long-source.md#compact-source-encoding).

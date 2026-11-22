@@ -3,6 +3,7 @@ use super::*;
 use crate::{execution_identity::{NumericsProfile, ThinkingMode, ToolMode},
     native_engine::{decode::DecodeCancellationKind, strict_int8::{Int8Work, STRICT_INT8_EXECUTION}},
     tasks::{answer::AnswerOptions, mapreduce::{ChunkLimits, ExecutionLimits}},
+    tokenizer::{pinned_controls, untrusted::{SafeBpeLimits, SafeBpeWorkLimits}},
     validation::grounded_fields::GroundingBudget};
 
 fn config() -> SourceMapConfig<SourceQuestion> {
@@ -30,18 +31,25 @@ fn config() -> SourceMapConfig<SourceQuestion> {
             run: RunLimits { max_elapsed: Duration::from_secs(1), max_checkpoints: 100, cleanup_reserve_bytes: 4096 } },
         preparation_reserve_bytes: 4096, reduction_reserve_bytes: 4096 }
 }
+fn planner() -> SourceTaskPlanner {
+    let controls = pinned_controls::pinned().unwrap();
+    let eos = controls.template_controls().entries().iter()
+        .find(|e| e.special && e.surface == "<|im_end|>").unwrap().id;
+    SourceTaskPlanner::pinned(controls.template_controls(), eos).unwrap()
+}
 #[test]
 fn question_host_keeps_task_profile_and_complete_resident_capacity_admission() {
-    validate_question(&config(), 10, 1024).unwrap();
-    assert!(validate_question(&config(), 0, 1024).is_err());
-    assert!(validate_question(&config(), 1025, 1024).is_err());
-    assert!(validate_question(&config(), 10, 1025).is_err());
+    let byte = UntrustedEncoding::ByteFallback;
+    validate_question(&config(), 10, 1024, &byte).unwrap();
+    assert!(validate_question(&config(), 0, 1024, &byte).is_err());
+    assert!(validate_question(&config(), 1025, 1024, &byte).is_err());
+    assert!(validate_question(&config(), 10, 1025, &byte).is_err());
     let mut c = config(); c.identity.task_spec = "ner-v1".to_owned();
-    assert!(validate_question(&c, 10, 1024).is_err());
+    assert!(validate_question(&c, 10, 1024, &byte).is_err());
     let mut c = config(); c.identity.numerics_profile = NumericsProfile::HfBf16Eager;
-    assert!(validate_question(&c, 10, 1024).is_err());
+    assert!(validate_question(&c, 10, 1024, &byte).is_err());
     let mut c = config(); c.planning.max_context_tokens = 129;
-    assert!(validate_question(&c, 10, 1024).is_err());
+    assert!(validate_question(&c, 10, 1024, &byte).is_err());
 }
 #[test]
 fn invalid_question_options_and_whole_document_evidence_limits_are_refused() {
@@ -51,17 +59,38 @@ fn invalid_question_options_and_whole_document_evidence_limits_are_refused() {
             2 => c.task.options.max_citations = 0, 3 => c.task.verification.max_fields = 0,
             4 => c.task.verification.max_matches = 1_000_001, 5 => c.task.verification.max_scan_steps = 0,
             _ => c.planning.max_input_bytes = 3 }
-        assert!(validate_question(&c, 10, 1024).is_err(), "{axis}");
+        assert!(validate_question(&c, 10, 1024, &UntrustedEncoding::ByteFallback).is_err(), "{axis}");
     }
 }
 #[test]
 fn original_question_capacity_is_charged_not_just_length_or_source_capacity() {
+    let planner = planner();
     let mut c = config(); let mut question = String::with_capacity(8192); question.push_str("Who?");
     c.task.question = question;
     assert!(c.task.question.capacity() > c.task.question.len());
-    assert_eq!(input_bytes(1024, &c).unwrap(), 1024 + c.task.question.capacity() as u64 + 4096);
+    assert_eq!(input_bytes(1024, &c, &planner).unwrap(), 1024 + c.task.question.capacity() as u64 + 4096);
     c.preparation_reserve_bytes = u64::MAX;
-    assert!(input_bytes(1024, &c).is_err());
+    assert!(input_bytes(1024, &c, &planner).is_err());
+}
+#[test]
+fn compact_question_bytes_and_workspace_are_admitted_separately_from_native_tokens() {
+    let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 4096,
+        max_output_tokens: 4096, max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 });
+    let work = SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 1 << 26, max_pair_bytes: 1 << 30 };
+    let byte = planner(); let compact = planner().with_map_document_encoding(policy.clone(), work).unwrap();
+    let mut c = config(); c.task.question = " the".repeat(32);
+    assert!(c.task.question.len() > c.budget.max_input_tokens as usize);
+    validate_question(&c, 10, 1024, &policy).unwrap();
+    assert!(validate_question(&c, 10, 1024, &UntrustedEncoding::ByteFallback).is_err());
+    assert_eq!(input_bytes(1024, &c, &compact).unwrap() - input_bytes(1024, &c, &byte).unwrap(),
+        compact.map_document_encoding_workspace_bytes().unwrap());
+    let unbudgeted = planner().with_document_encoding(policy.clone()).unwrap();
+    assert!(input_bytes(1024, &c, &unbudgeted).is_err());
+    c.task.question = "q".repeat(4097);
+    assert!(validate_question(&c, 10, 1024, &policy).is_err());
+    c.preparation_reserve_bytes = u64::MAX;
+    assert!(input_bytes(1024, &c, &compact).is_err());
 }
 #[test]
 fn complete_native_evidence_frontier_is_priced_even_for_blank_source_ranges() {

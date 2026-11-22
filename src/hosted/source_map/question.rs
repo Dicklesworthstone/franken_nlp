@@ -3,7 +3,8 @@
 use super::*;
 use crate::{native_engine::decode::DecodeStepControl,
     tasks::{answer::ANSWER_TASK_VERSION, source_planning::quantized::{Int8SourceError,
-        long::question::{SourceQuestion, Int8QuestionRun}}}};
+        long::question::{SourceQuestion, Int8QuestionRun}}},
+    tokenizer::untrusted::UntrustedEncoding};
 mod synthesis;
 
 impl NlpEngine {
@@ -20,9 +21,9 @@ impl NlpEngine {
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), &config.identity)?;
         let required = requirements(config.native)?;
-        validate_question(&config, source.len(), required.kv_bytes)?;
+        validate_question(&config, source.len(), required.kv_bytes, planner.document_encoding())?;
         check_assets(&config.identity, planner.tokenizer_digest(), *planner.template_digest())?;
-        let bytes = input_bytes(source.capacity(), &config)?;
+        let bytes = input_bytes(source.capacity(), &config, &planner)?;
         let run = config.native.run;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
@@ -72,19 +73,27 @@ impl NlpEngine {
         })
     }
 }
-fn validate_question(config: &SourceMapConfig<SourceQuestion>, source_bytes: usize, kv_bytes: u64)
+fn validate_question(config: &SourceMapConfig<SourceQuestion>, source_bytes: usize, kv_bytes: u64,
+    encoding: &UntrustedEncoding)
     -> Result<(), HostedError> {
     validate_common(config, source_bytes, kv_bytes)?;
     if config.identity.task_spec != ANSWER_TASK_VERSION { return Err(HostedError::ModelIdentity); }
     config.task.validate().map_err(HostedError::SourceMap)?;
-    if config.task.question.len() > config.planning.max_input_bytes
-        || config.task.question.len() > config.budget.max_input_tokens as usize {
+    let byte_limit = match encoding {
+        UntrustedEncoding::ByteFallback => config.planning.max_input_bytes.min(config.budget.max_input_tokens as usize),
+        UntrustedEncoding::SafeBpeV1(policy) => config.planning.max_input_bytes.min(policy.max_input_bytes),
+    };
+    if config.task.question.len() > byte_limit {
         return Err(HostedError::Limits("document question input budget"));
     }
     Ok(())
 }
-fn input_bytes(source_capacity: usize, config: &SourceMapConfig<SourceQuestion>) -> Result<u64, HostedError> {
-    sum(&[source_capacity as u64, config.task.question.capacity() as u64, config.preparation_reserve_bytes])
+fn input_bytes(source_capacity: usize, config: &SourceMapConfig<SourceQuestion>, planner: &SourceTaskPlanner)
+    -> Result<u64, HostedError> {
+    let encoding = planner.map_document_encoding_workspace_bytes()
+        .map_err(|_| HostedError::Limits("INT8 question map encoding admission"))?;
+    sum(&[source_capacity as u64, config.task.question.capacity() as u64,
+        config.preparation_reserve_bytes, encoding])
 }
 
 #[cfg(test)] mod tests;

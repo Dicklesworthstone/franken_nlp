@@ -151,6 +151,19 @@ fn compact_source_map_totals_are_finite_explicit_and_not_available_to_byte_input
     assert_eq!(limits.complete.max_pair_bytes, 888888);
 }
 #[test]
+fn compact_passage_qa_admits_auxiliary_context_beside_source_before_io() {
+    let cmd = command("answer", &["--question", "question.txt",
+        "--input-encoding", "safe-bpe-v1", "--max-chunk-bytes", "4096"]);
+    let (_, limits) = cmd.validate().unwrap();
+    let encoding = cmd.encoding.limits(&cmd).unwrap().unwrap();
+    assert_eq!(encoding.call.max_input_bytes, cmd.host.max_input_bytes);
+    assert_eq!(encoding.call.max_output_tokens, cmd.host.max_input_bytes);
+    assert!(encoding.workspace_bytes().unwrap() < limits.preparation_bytes);
+    assert_eq!(cmd.question_mapping().unwrap().chunks.max_chunk_bytes, 4096);
+    let byte = command("answer", &["--question", "question.txt"]);
+    assert!(byte.encoding.limits(&byte).unwrap().is_none());
+}
+#[test]
 fn unsupported_compact_compositions_refuse_before_private_io() {
     struct NoRead;
     impl Read for NoRead {
@@ -161,7 +174,7 @@ fn unsupported_compact_compositions_refuse_before_private_io() {
         fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("output written") }
         fn flush(&mut self) -> io::Result<()> { panic!("output flushed") }
     }
-    for (task, extra) in [("answer", vec!["--question", "never-open.txt"]),
+    for (task, extra) in [("answer", vec!["--question", "never-open.txt", "--synthesize-answer"]),
         ("extract", vec!["--schema", "never-open.json"]),
         ("summarize", vec!["--synthesize-summary"])] {
         let mut flags = vec!["--input-encoding", "safe-bpe-v1"];

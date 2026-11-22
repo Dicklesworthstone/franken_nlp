@@ -105,6 +105,9 @@ impl SourceTaskPlanner {
         planning: SourcePlanningLimits, mapping: Int8SourceMapLimits, control: &mut C)
         -> Result<Int8QuestionSynthesisPreflight, Int8SourceMapError> {
         checkpoint(control)?;
+        // Plain passage maps admit one shared compact ledger. Evidence
+        // synthesis has additional probes and retains its byte-only contract.
+        self.encoder.require_byte_encoding().map_err(Int8SourceError::from)?;
         let (discovery_limits, reserve) = reserve(request.limits, budget, planning, mapping)?;
         let discovery = self.preflight_int8_question_with_control(source, &request.question, budget, context,
             planning, discovery_limits, control)?;
@@ -116,6 +119,7 @@ impl SourceTaskPlanner {
         planning: SourcePlanningLimits, mapping: Int8SourceMapLimits, control: &mut C)
         -> Result<PreparedInt8QuestionSynthesis<'s>, Int8SourceMapError> {
         checkpoint(control)?;
+        self.encoder.require_byte_encoding().map_err(Int8SourceError::from)?;
         let (discovery_limits, reserve) = reserve(request.limits, budget, planning, mapping)?;
         let map = self.plan_int8_question_with_control(source, &request.question, budget, context,
             planning, discovery_limits, control)?;

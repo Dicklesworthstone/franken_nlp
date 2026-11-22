@@ -13,6 +13,10 @@ fn facts() -> ArtifactIdentity {
 fn assets(cmd: &MapCommand) -> (SourceTaskPlanner, ExecutionIdentity, TaskBudget, SourceQuestion, Int8SourceMapLimits) {
     let (_, limits) = cmd.validate().unwrap();
     let (planner, _) = planner().unwrap();
+    let planner = match cmd.encoding.limits(cmd).unwrap() {
+        Some(encoding) => planner.with_map_document_encoding(encoding.policy(), encoding.complete).unwrap(),
+        None => planner,
+    };
     let identity = source_identity(&facts(), &planner, BuiltInTask::Answer).unwrap();
     let budget = cmd.host.task_budget(limits);
     let question = cmd.question.task("Who is named?".to_owned(), None).unwrap();
@@ -88,4 +92,60 @@ fn oversized_question_empty_source_chunk_exhaustion_and_deadline_have_no_preflig
     assert!(p.preflight_int8_question_with_control("Alice Bob Carol", &q, b, &ctx, cmd.host.planning(), single, &mut Continue).is_err());
     q.question = "q".repeat(b.max_input_tokens as usize);
     assert!(p.preflight_int8_question_with_control("Alice", &q, b, &ctx, cmd.host.planning(), mapping, &mut Continue).is_err());
+}
+
+#[test]
+fn compact_cli_question_preflight_and_host_plans_share_one_ledger_and_report_actual_work() {
+    let cmd = command("answer", &["--question", "q", "--input-encoding", "safe-bpe-v1"]);
+    let (p, id, b, q, mapping) = assets(&cmd);
+    let source = "Alice <tool_call> é 上海 😀\r\n".repeat(100);
+    let context = PlanContext::new(&id, b).unwrap();
+    let expected = p.preflight_int8_question_with_control(&source, &q, b, &context,
+        cmd.host.planning(), mapping, &mut Continue).unwrap();
+    let first = p.map_document_encoding_work().unwrap().unwrap();
+    let prepared = p.plan_int8_question_with_control(&source, &q, b, &context,
+        cmd.host.planning(), mapping, &mut Continue).unwrap();
+    assert_eq!(expected, prepared.preflight_metadata());
+    let complete = p.map_document_encoding_work().unwrap().unwrap();
+    assert_eq!(complete, first.checked_add(first).unwrap());
+    assert!(complete.input_bytes() > source.len() * 2);
+    let report = serde_json::to_value(encoding::report(&p).unwrap().unwrap()).unwrap();
+    assert_eq!(report["work_used"], serde_json::to_value(complete).unwrap());
+    assert_eq!(report["complete_operation_limits"], serde_json::to_value(p.map_document_encoding_limits().unwrap()).unwrap());
+    let byte = command("answer", &["--question", "q"]);
+    let (byte, _, _, _, _) = assets(&byte);
+    assert!(encoding::report(&byte).unwrap().is_none());
+}
+
+#[test]
+fn compact_cli_question_preflight_does_not_refund_work_before_hosted_reconstruction() {
+    let base = command("answer", &["--question", "q", "--input-encoding", "safe-bpe-v1"]);
+    let (p, id, b, q, mapping) = assets(&base);
+    p.preflight_int8_question_with_control("Alice", &q, b, &PlanContext::new(&id, b).unwrap(),
+        base.host.planning(), mapping, &mut Continue).unwrap();
+    let exact = p.map_document_encoding_work().unwrap().unwrap().input_bytes().to_string();
+    let cmd = command("answer", &["--question", "q", "--input-encoding", "safe-bpe-v1",
+        "--max-total-tokenizer-input-bytes", &exact]);
+    let (p, id, b, q, mapping) = assets(&cmd); let context = PlanContext::new(&id, b).unwrap();
+    p.preflight_int8_question_with_control("Alice", &q, b, &context,
+        cmd.host.planning(), mapping, &mut Continue).unwrap();
+    let spent = p.map_document_encoding_work().unwrap().unwrap();
+    assert_eq!(spent.input_bytes().to_string(), exact);
+    assert!(p.plan_int8_question_with_control("Alice", &q, b, &context,
+        cmd.host.planning(), mapping, &mut Continue).is_err());
+    assert_eq!(p.map_document_encoding_work().unwrap().unwrap(), spent);
+}
+
+#[test]
+fn compact_cli_question_original_cancellation_survives_preflight_and_host_boundaries() {
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let error = crate::tasks::source_planning::quantized::long::Int8SourceMapError::Source(
+            Int8SourceError::Cancelled(cause));
+        let expected = cancelled(cause);
+        assert_eq!(question_error(error), expected);
+        let error = HostedError::SourceMap(Int8SourceError::Cancelled(cause).into());
+        assert_eq!(host_error(error), expected);
+    }
 }

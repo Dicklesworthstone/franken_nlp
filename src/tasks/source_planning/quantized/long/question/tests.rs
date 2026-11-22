@@ -261,3 +261,198 @@ fn complete_envelope_is_bounded_without_exporting_question_or_generated_tokens()
         assert_eq!(run(prepared, driver).is_ok(), delta == 0);
     }
 }
+
+const COMPACT_SOURCE: &str = "The quick brown fox jumps over the lazy dog. 上海 <think> <|im_start|> ▁\r\n";
+fn compact_policy() -> crate::tokenizer::untrusted::UntrustedEncoding {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 4096,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 })
+}
+fn encoding_allowance() -> crate::tokenizer::untrusted::SafeBpeWorkLimits {
+    crate::tokenizer::untrusted::SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 1 << 26, max_pair_bytes: 1 << 30 }
+}
+fn compact(work: crate::tokenizer::untrusted::SafeBpeWorkLimits) -> SourceTaskPlanner {
+    planner().with_map_document_encoding(compact_policy(), work).unwrap()
+}
+fn compact_mapping() -> Int8SourceMapLimits {
+    let mut limits = limits();
+    limits.chunks.max_chunk_bytes = 4096; limits.chunks.max_chunk_tokens = 4096;
+    limits
+}
+fn encoding_used(planner: &SourceTaskPlanner) -> crate::tokenizer::untrusted::SafeBpeWork {
+    planner.map_document_encoding_work().unwrap().unwrap()
+}
+
+#[test]
+fn compact_question_preflight_and_planning_share_all_question_manifest_and_source_work() {
+    let q = question(); let byte = planner(); let p = compact(encoding_allowance());
+    let id = identity(&p); let context = PlanContext::new(&id, budget()).unwrap();
+    let original = prepare(&byte, COMPACT_SOURCE, &q, compact_mapping());
+    let expected = p.preflight_int8_question_with_control(COMPACT_SOURCE, &q, budget(), &context,
+        SourcePlanningLimits::default(), compact_mapping(), &mut Continue).unwrap();
+    let preflight_work = encoding_used(&p);
+    let prepared = prepare(&p, COMPACT_SOURCE, &q, compact_mapping());
+    assert_eq!(expected, prepared.preflight_metadata());
+    assert_eq!(encoding_used(&p), preflight_work.checked_add(preflight_work).unwrap());
+    assert_eq!(expected.source_span(), original.preflight_metadata().source_span());
+    assert!(expected.planned_work().forward_positions < original.preflight_metadata().planned_work().forward_positions);
+    assert_ne!(prepared.execution_identities().next().unwrap().prompt_digest,
+        original.execution_identities().next().unwrap().prompt_digest);
+    let passages = [AnswerPassage { id: PASSAGE_ID.to_owned(), text: COMPACT_SOURCE.to_owned() }];
+    let complete = AnswerContext::encode(&byte.encoder, &q.question, &passages,
+        AnswerInputLimits { max_passages: 1, max_input_bytes: 4096, max_input_tokens: 8192 }).unwrap();
+    assert_eq!(preflight_work.input_bytes(), q.question.len() + COMPACT_SOURCE.len()
+        + complete.document().total_input_bytes());
+    assert!(preflight_work.output_tokens() < preflight_work.input_bytes());
+    assert!(preflight_work.pair_checks() > 0 && preflight_work.pair_bytes() > 0);
+    let mut driver = script(&prepared);
+    let start = COMPACT_SOURCE.find("上海").unwrap(); let end = start + "上海".len();
+    driver.outputs[0].citations = vec![PassageCitation { quote: "上海".to_owned(),
+        occurrence: SourceOccurrence::Anchored, spans: vec![PassageOccurrence {
+            passage_id: PASSAGE_ID.to_owned(), span: VerifiedSourceSpan { byte_start: start, byte_end: end,
+                scalar_start: COMPACT_SOURCE[..start].chars().count(), scalar_end: COMPACT_SOURCE[..end].chars().count() } }] }];
+    let result = run(prepared, driver).unwrap(); expected.verify_completed(&result).unwrap();
+    for chunk in result.mapped.root().value().chunks() {
+        for citation in &chunk.citations { for span in &citation.spans {
+            assert_eq!(&COMPACT_SOURCE[span.byte_start..span.byte_end], citation.quote);
+            assert_eq!(COMPACT_SOURCE[..span.byte_start].chars().count(), span.scalar_start);
+        } }
+    }
+}
+
+#[test]
+fn compact_question_total_limits_are_exact_and_never_renew_after_failed_preparation() {
+    use crate::tokenizer::untrusted::SafeBpeWorkLimits;
+    let q = question(); let baseline = compact(encoding_allowance());
+    let _ = prepare(&baseline, COMPACT_SOURCE, &q, compact_mapping());
+    let consumed = encoding_used(&baseline);
+    let exact = SafeBpeWorkLimits { max_input_bytes: consumed.input_bytes() as u64,
+        max_output_tokens: consumed.output_tokens() as u64, max_pair_checks: consumed.pair_checks(),
+        max_pair_bytes: consumed.pair_bytes() };
+    for axis in 0..5 {
+        let mut allowance = exact;
+        match axis { 0 => allowance.max_input_bytes -= 1, 1 => allowance.max_output_tokens -= 1,
+            2 => allowance.max_pair_checks -= 1, 3 => allowance.max_pair_bytes -= 1, _ => {} }
+        let p = compact(allowance); let id = identity(&p); let context = PlanContext::new(&id, budget()).unwrap();
+        let first = p.plan_int8_question_with_control(COMPACT_SOURCE, &q, budget(), &context,
+            SourcePlanningLimits::default(), compact_mapping(), &mut Continue);
+        assert_eq!(first.is_ok(), axis == 4); drop(first);
+        let failed = encoding_used(&p);
+        assert!(failed.input_bytes() > 0);
+        if axis == 4 { assert_eq!(failed, consumed); }
+        assert!(p.plan_int8_question_with_control(COMPACT_SOURCE, &q, budget(), &context,
+            SourcePlanningLimits::default(), compact_mapping(), &mut Continue).is_err());
+        let repeated = encoding_used(&p);
+        assert!(repeated.input_bytes() >= failed.input_bytes() && repeated.output_tokens() >= failed.output_tokens());
+        assert!(repeated.pair_checks() >= failed.pair_checks() && repeated.pair_bytes() >= failed.pair_bytes());
+        assert!(repeated.input_bytes() as u64 <= allowance.max_input_bytes);
+        assert!(repeated.output_tokens() as u64 <= allowance.max_output_tokens);
+        assert!(repeated.pair_checks() <= allowance.max_pair_checks && repeated.pair_bytes() <= allowance.max_pair_bytes);
+    }
+}
+
+#[test]
+fn compact_question_byte_budget_is_independent_of_actual_prompt_token_capacity() {
+    let mut q = question(); q.question = " the".repeat(600);
+    let mut b = budget(); b.max_input_tokens = 2048;
+    assert!(q.question.len() > b.max_input_tokens as usize);
+    let p = compact(encoding_allowance()); let id = identity(&p);
+    let plan = p.plan_int8_question_with_control("Alice", &q, b, &PlanContext::new(&id, b).unwrap(),
+        SourcePlanningLimits::default(), compact_mapping(), &mut Continue).unwrap();
+    assert!(plan.plans.iter().all(|plan| plan.prompt_tokens() <= b.max_input_tokens as usize));
+    let p = planner(); let id = identity(&p);
+    assert!(p.plan_int8_question_with_control("Alice", &q, b, &PlanContext::new(&id, b).unwrap(),
+        SourcePlanningLimits::default(), compact_mapping(), &mut Continue).is_err());
+}
+
+#[test]
+fn compact_question_discarded_probes_preserve_utf8_crlf_and_spend_the_same_ledger() {
+    let p = compact(encoding_allowance()); let mut l = compact_mapping(); l.chunks.max_chunk_tokens = 4;
+    let prepared = prepare(&p, COMPACT_SOURCE, &question(), l);
+    assert!(prepared.chunks.tokenizer_calls() > prepared.chunks.chunks().len());
+    assert_eq!(prepared.chunks.chunks().iter().map(SourceChunk::text).collect::<String>(), COMPACT_SOURCE);
+    assert!(encoding_used(&p).input_bytes() > COMPACT_SOURCE.len() * 2 + question().question.len());
+    for chunk in prepared.chunks.chunks() {
+        assert!(chunk.tokens() <= 4);
+        assert!(!chunk.text().ends_with('\r'));
+    }
+}
+
+#[test]
+fn compact_question_identity_binds_declared_encoding_caps_without_hashing_remaining_work() {
+    use crate::tokenizer::untrusted::UntrustedEncoding;
+    let q = question(); let p = compact(encoding_allowance());
+    let first = prepare(&p, COMPACT_SOURCE, &q, compact_mapping());
+    let original: Vec<_> = first.execution_identities().cloned().collect();
+    let second = prepare(&p, COMPACT_SOURCE, &q, compact_mapping());
+    assert_eq!(original, second.execution_identities().cloned().collect::<Vec<_>>());
+    for axis in 0..8 {
+        let UntrustedEncoding::SafeBpeV1(mut call) = compact_policy() else { panic!("compact policy") };
+        let mut work = encoding_allowance();
+        match axis { 0 => call.max_input_bytes -= 1, 1 => call.max_output_tokens -= 1,
+            2 => call.max_pair_checks -= 1, 3 => call.max_pair_bytes -= 1,
+            4 => work.max_input_bytes -= 1, 5 => work.max_output_tokens -= 1,
+            6 => work.max_pair_checks -= 1, _ => work.max_pair_bytes -= 1 }
+        let changed = planner().with_map_document_encoding(UntrustedEncoding::SafeBpeV1(call), work).unwrap();
+        let actual = prepare(&changed, COMPACT_SOURCE, &q, compact_mapping());
+        assert_eq!(first.preflight_metadata().planned_work(), actual.preflight_metadata().planned_work());
+        for (a, b) in original.iter().zip(actual.execution_identities()) {
+            assert_ne!(a.template_digest, b.template_digest);
+            assert_eq!(a.taskir_digest, b.taskir_digest);
+        }
+    }
+}
+
+#[test]
+fn compact_question_requires_a_whole_operation_budget_and_keeps_synthesis_explicitly_byte_only() {
+    let q = question(); let p = planner().with_document_encoding(compact_policy()).unwrap();
+    let id = identity(&p); let context = PlanContext::new(&id, budget()).unwrap();
+    assert!(p.plan_int8_question_with_control(COMPACT_SOURCE, &q, budget(), &context,
+        SourcePlanningLimits::default(), compact_mapping(), &mut Continue).is_err());
+    let p = compact(encoding_allowance()); let id = identity(&p); let context = PlanContext::new(&id, budget()).unwrap();
+    let request = synthesis::SourceQuestionSynthesis { question: q,
+        limits: synthesis::QuestionSynthesisLimits { max_evidence_passages: 8, max_evidence_bytes: 1024 } };
+    assert!(p.preflight_int8_question_synthesis_with_control(COMPACT_SOURCE, &request, budget(), &context,
+        SourcePlanningLimits::default(), compact_mapping(), &mut Continue).is_err());
+    assert!(p.plan_int8_question_synthesis_with_control(COMPACT_SOURCE, &request, budget(), &context,
+        SourcePlanningLimits::default(), compact_mapping(), &mut Continue).is_err());
+    assert_eq!(encoding_used(&p).input_bytes(), 0);
+}
+
+struct StopInsideQuestionEncoding<'a> {
+    planner: &'a SourceTaskPlanner, cause: DecodeCancellationKind,
+    wait_for_question: bool, armed: bool, busy_polls: usize,
+}
+impl DecodeStepControl for StopInsideQuestionEncoding<'_> {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+        match self.planner.map_document_encoding_work() {
+            Ok(Some(work)) if work.input_bytes() > 0 => self.armed = true,
+            Err(_) if !self.wait_for_question || self.armed => {
+                self.busy_polls += 1;
+                if self.busy_polls == 8 { return Some(self.cause); }
+            },
+            _ => {},
+        }
+        None
+    }
+}
+#[test]
+fn compact_question_and_chunk_encoding_preserve_every_original_cancellation_cause() {
+    use DecodeCancellationKind::*;
+    for wait_for_question in [false, true] {
+        for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+            ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+            let p = compact(encoding_allowance()); let mut q = question(); q.question = " the".repeat(200);
+            let id = identity(&p); let context = PlanContext::new(&id, budget()).unwrap();
+            let mut control = StopInsideQuestionEncoding { planner: &p, cause, wait_for_question,
+                armed: false, busy_polls: 0 };
+            let error = p.plan_int8_question_with_control(COMPACT_SOURCE, &q, budget(), &context,
+                SourcePlanningLimits::default(), compact_mapping(), &mut control).err().unwrap();
+            assert_eq!(error.cancellation(), Some(cause));
+            assert_eq!(control.busy_polls, 8);
+            assert!(encoding_used(&p).input_bytes() > 0);
+            if wait_for_question { assert!(encoding_used(&p).input_bytes() > q.question.len()); }
+        }
+    }
+}
