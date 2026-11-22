@@ -73,7 +73,8 @@ impl NlpEngine {
     ///
     /// Prompt row width is physical scheduling only and may change on resume;
     /// it neither changes the frozen recipe nor refunds lifetime work. This
-    /// route uses one coordinator and does not combine prefill with a CPU team.
+    /// entrypoint uses one coordinator; the threaded variant admits a fixed
+    /// output-row team for the same prompt and decode schedule.
     #[allow(clippy::too_many_arguments)]
     pub fn job_int4_generation_layer_major<R>(&self, model: &ResidentInt4,
         planner: Int4GenerationJobPlanner, request: SourceJobRequest, limits: JobHostLimits,
@@ -105,6 +106,24 @@ impl NlpEngine {
             None, Some(compute_threads), reader, cancellation)
     }
 
+    /// Run bounded layer-major prompt morsels and decode on one persistent
+    /// output-row team across the complete authenticated generation/chat job.
+    /// The fixed worker buffers and coordinator prompt workspace are admitted
+    /// together before input access and stay owned through physical join.
+    ///
+    /// Prompt row count and team width are physical schedules. Explicit resume
+    /// may change either without changing the recipe, addressed samples,
+    /// committed items or any accumulated attempt and native-work debit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int4_generation_layer_major_with_threads<R>(&self, model: &ResidentInt4,
+        planner: Int4GenerationJobPlanner, request: SourceJobRequest, limits: JobHostLimits,
+        kernel: PackedInt4Kernel, compute_threads: usize, prefill: Int4PrefillLimits,
+        reader: R, cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        self.run_int4_generation_job(model, planner, request, limits, kernel,
+            Some(prefill), Some(compute_threads), reader, cancellation)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_int4_generation_job<R>(&self, model: &ResidentInt4, planner: Int4GenerationJobPlanner,
         request: SourceJobRequest, limits: JobHostLimits, kernel: PackedInt4Kernel,
@@ -112,9 +131,6 @@ impl NlpEngine {
         cancellation: CancellationToken)
         -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        if prefill.is_some() && compute_threads.is_some() {
-            return Err(HostedError::Limits("INT4 generation job team/prefill schedule").into());
-        }
         match compute_threads {
             Some(width) => dispatch::preflight_int4_team(self, limits.native.run, width)?,
             None => dispatch::preflight(self, limits.native.run)?,
@@ -140,8 +156,10 @@ impl NlpEngine {
             planner.encoding_workspace_bytes())?, prefill)?;
         // The dispatcher owns and charges this additional worker storage.
         // Check the simultaneous quote before reserving or reading input.
+        let max_batch_rows = prefill.map_or(1, |limits| limits.max_batch_rows);
         let team_scratch = compute_threads.map(|width|
-            int4_task_team_workspace_bytes(width, model.model_identity().group_width()))
+            dispatch::int4_prefill_team_workspace_bytes(width,
+                model.model_identity().group_width(), max_batch_rows))
             .transpose()?.unwrap_or(0);
         sum(&[required.input_bytes, required.native.kv_bytes, required.workspace_bytes, team_scratch])?;
         let lease = self.resources().acquire_lease();
@@ -155,8 +173,8 @@ impl NlpEngine {
         let completed = match compute_threads {
             None => dispatch::run(self, limits.native.run, cancellation, move |control|
                 execution.run(&model.inner.loaded.value, kernel, None, control)),
-            Some(width) => dispatch::run_int4_team(self, limits.native.run, cancellation,
-                model, width, kernel, move |weights, control, team|
+            Some(width) => dispatch::run_int4_prefill_team(self, limits.native.run, cancellation,
+                model, width, kernel, max_batch_rows, move |weights, control, team|
                     execution.run(weights, kernel, Some(team), control)),
         }?;
         // Runtime cancellation/drain failure takes precedence over a job return;

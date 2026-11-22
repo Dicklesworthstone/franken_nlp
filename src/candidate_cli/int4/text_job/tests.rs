@@ -105,7 +105,7 @@ fn retained_route_never_accepts_ignored_cohort_or_per_record_policy_flags() {
 }
 
 #[test]
-fn retained_prefill_preserves_model_routes_and_native_lifetime_authority() {
+fn retained_prefill_teams_preserve_model_routes_and_native_lifetime_authority() {
     for operation in ["start", "resume"] { for task in ["generate", "chat"] { for route in 0..3 {
         let mut words = argv(operation, task);
         match route {
@@ -124,17 +124,21 @@ fn retained_prefill_preserves_model_routes_and_native_lifetime_authority() {
         let job = lifetime(&args, common);
         let baseline = serial.args.lifetime_limits(&args, common, job).unwrap();
         let generation = args.options(166_101).unwrap();
-        for rows in [1, 4, 64] {
+        for threads in [1, 2, 4, 64] { for rows in [1, 4, 64] {
             let mut selected = words.clone();
             selected.extend(["--prefill-rows".to_owned(), rows.to_string(),
-                "--compute-threads".to_owned(), "1".to_owned()]);
+                "--compute-threads".to_owned(), threads.to_string()]);
             let (c, args) = parse(selected).unwrap();
             let common = c.args.validate(&args).unwrap();
             let prefill = common.prefill.unwrap();
             let workspace = Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
             assert_eq!(prefill.max_batch_rows, rows);
             assert_eq!(prefill.validate().unwrap(), workspace);
-            assert_eq!(common.compute, compute::Admission { threads: 1, workspace_bytes: 0 });
+            let worker_bytes = if threads == 1 { 0 } else {
+                crate::native_engine::strict_int4::projection::int4_prefill_team_workspace_bytes(
+                    threads, args.group_width, rows).unwrap()
+            };
+            assert_eq!(common.compute, compute::Admission { threads, workspace_bytes: worker_bytes });
             assert_eq!(common.snapshot_pin, baseline.common.snapshot_pin);
             assert_eq!(common.load, baseline.common.load);
             assert_eq!(common.native, baseline.common.native);
@@ -152,25 +156,25 @@ fn retained_prefill_preserves_model_routes_and_native_lifetime_authority() {
             let save = if args.save_snapshot.is_some() { common.snapshot_need.scratch_bytes } else { 0 };
             let execute = common.native.kv_bytes + common.native.rope_bytes + common.native.scratch_payload_bound
                 + SAMPLER_BYTES + ALLOCATOR_BYTES + common.result_bytes as u64 * 4
-                + args.max_new_tokens as u64 * 8 + 4096 + workspace;
+                + args.max_new_tokens as u64 * 8 + 4096 + workspace + worker_bytes;
             assert_eq!(scheduled.common.minimum_memory_bytes, common.preparation_bytes
                 + common.load.weight_payload_bytes + ALLOCATOR_BYTES + load.max(save).max(execute)
                 + CLEANUP_BYTES + scheduled.buffer_bytes);
-        }
+        } }
     } } }
 }
 
 #[test]
-fn invalid_prefill_mixed_teams_and_small_memory_refuse_before_private_io() {
+fn invalid_prefill_team_widths_and_small_memory_refuse_before_private_io() {
     for task in ["generate", "chat"] {
         for extra in [vec!["--prefill-rows", "0"], vec!["--prefill-rows", "65"],
             vec!["--prefill-rows", "18446744073709551615"],
-            vec!["--prefill-rows", "1", "--compute-threads", "2"],
-            vec!["--prefill-rows", "64", "--compute-threads", "64"]] {
+            vec!["--prefill-rows", "1", "--compute-threads", "0"],
+            vec!["--prefill-rows", "64", "--compute-threads", "65"]] {
             let (c, args) = command("resume", task, &extra);
             assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().exit, ErrorCode::Usage);
         }
-        let (c, mut args) = command("start", task, &["--prefill-rows", "64"]);
+        let (c, mut args) = command("start", task, &["--prefill-rows", "64", "--compute-threads", "4"]);
         let common = c.args.validate(&args).unwrap();
         args.memory_mib = common.minimum_memory_bytes.div_ceil(MIB);
         c.args.validate(&args).unwrap();
@@ -467,14 +471,14 @@ fn compact_workspaces_are_admitted_without_changing_native_lifetime_or_input_own
 fn compact_prefill_retained_replay_keeps_one_record_and_the_exact_job_memory_boundary() {
     for task in ["generate", "chat"] {
         let (start, args) = command("start", task, &["--input-encoding", "safe-bpe-v1",
-            "--prefill-rows", "4", "--spool-input", "--max-retained-input-mib", "8"]);
+            "--prefill-rows", "4", "--compute-threads", "4", "--spool-input", "--max-retained-input-mib", "8"]);
         let common = start.args.validate(&args).unwrap();
         let job = lifetime(&args, common);
         let full = start.args.lifetime_limits(&args, common, job).unwrap();
         let encoding = args.input_encoding.policy(args.max_input_bytes, common.max_prompt_tokens).unwrap();
         let work = start.args.encoding.limits(&args).unwrap();
         let (resume, args) = command("resume", task, &["--input-encoding", "safe-bpe-v1",
-            "--prefill-rows", "4", "--use-retained-input", "--max-retained-input-mib", "8"]);
+            "--prefill-rows", "4", "--compute-threads", "4", "--use-retained-input", "--max-retained-input-mib", "8"]);
         let common = resume.args.validate(&args).unwrap();
         let replay = resume.args.lifetime_limits(&args, common, job).unwrap();
         assert!(replay.encoding_workspace_bytes > 0);

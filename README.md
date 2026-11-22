@@ -4981,14 +4981,16 @@ item and token while preserving ordered whole-item commits. Width is a physical
 schedule, so it may change on resume without changing the authenticated task
 recipe, original sample addresses or lifetime work allowances.
 
-Alternatively, `--prefill-rows 1..64` processes each prompt in bounded causal
-layer-major morsels with serial compute. It uses the existing complete-result
+`--prefill-rows 1..64` processes each prompt in bounded causal layer-major
+morsels and can share that persistent CPU team. It uses the existing complete-result
 decoder and keeps every native lifetime debit unchanged. Prompt rows may change
 on resume, including switching between sequential and layer-major prompts;
 they are a physical schedule, like compute width, and do not change the private
-task recipe. This option cannot combine with `--compute-threads` greater than
-one. Source conversion, pinned snapshots, compact BPE and retained-input replay
-all use the same admission and recovery paths.
+task recipe. The coordinator's prompt workspace and fixed worker batch buffers
+are admitted together before private input is read and remain charged through
+physical worker drain. Source conversion, pinned snapshots, compact BPE and
+retained-input replay all use the same admission and recovery paths. The
+metadata report names both selected schedules; private result schemas stay fixed.
 
 Explicit `--input-encoding safe-bpe-v1` also supports these retained jobs.
 It compacts untrusted prompt/history bytes losslessly without admitting template

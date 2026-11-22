@@ -239,6 +239,7 @@ fn owned_population_factory_and_native_result_fit_the_existing_blocking_boundary
     let _entry = NlpEngine::job_int4_generation::<Cursor<Vec<u8>>>;
     let _prefill_entry = NlpEngine::job_int4_generation_layer_major::<Cursor<Vec<u8>>>;
     let _team_entry = NlpEngine::job_int4_generation_with_threads::<Cursor<Vec<u8>>>;
+    let _prefill_team_entry = NlpEngine::job_int4_generation_layer_major_with_threads::<Cursor<Vec<u8>>>;
 }
 
 mod team {
@@ -345,12 +346,17 @@ mod team {
     #[allow(clippy::too_many_arguments)]
     fn execute(host: &NlpEngine, model: &ResidentInt4, planner: Int4GenerationJobPlanner,
         request: SourceJobRequest, limits: JobHostLimits, reader: Reader,
-        stop: CancellationToken, prefill: Option<Int4PrefillLimits>) -> Result<JobProgress, HostedJobError> {
-        match prefill {
-            None => host.job_int4_generation_with_threads(model, planner, request, limits,
-                PackedInt4Kernel::scalar(), 3, reader, stop),
-            Some(prefill) => host.job_int4_generation_layer_major(model, planner, request, limits,
+        stop: CancellationToken, prefill: Option<Int4PrefillLimits>, threads: Option<usize>)
+        -> Result<JobProgress, HostedJobError> {
+        match (threads, prefill) {
+            (None, None) => host.job_int4_generation(model, planner, request, limits,
+                PackedInt4Kernel::scalar(), reader, stop),
+            (Some(threads), None) => host.job_int4_generation_with_threads(model, planner, request, limits,
+                PackedInt4Kernel::scalar(), threads, reader, stop),
+            (None, Some(prefill)) => host.job_int4_generation_layer_major(model, planner, request, limits,
                 PackedInt4Kernel::scalar(), prefill, reader, stop),
+            (Some(threads), Some(prefill)) => host.job_int4_generation_layer_major_with_threads(
+                model, planner, request, limits, PackedInt4Kernel::scalar(), threads, prefill, reader, stop),
         }
     }
 
@@ -372,7 +378,8 @@ mod team {
         let model = ResidentInt4 { inner: Arc::new(ResidentModel { loaded, lease: model_lease }) };
         let baseline = host.resources().memory_snapshot();
         use DecodeCancellationKind::*;
-        for prefill in [None, Some(prefill(4))] { for task in [GenerationJobTask::Generate, GenerationJobTask::Chat] {
+        let schedules = [(Some(3), None), (None, Some(prefill(4))), (Some(3), Some(prefill(4)))];
+        for (threads, prefill) in schedules { for task in [GenerationJobTask::Generate, GenerationJobTask::Chat] {
             for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
                 ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
                 let (planner, request, limits) = planner(&model, task);
@@ -380,7 +387,7 @@ mod team {
                 let stop = CancellationToken::default(); stop.cancel(cause);
                 let (reader, observed) = reader(&host, ReadAction::Refuse, stop.clone());
                 let error = execute(&host, &model, planner, request, limits,
-                    reader, stop, prefill).err().unwrap();
+                    reader, stop, prefill, threads).err().unwrap();
                 let HostedJobError::Host(HostedError::Stopped { stop, .. }) = error
                     else { panic!("job pre-cancellation lost its typed cause"); };
                 assert_eq!(stop.kind, cause);
@@ -394,49 +401,36 @@ mod team {
                 drained(&host, &baseline);
             }
         } }
-        for width in [0, 1, 4, 65, usize::MAX] {
+        for prefill in [None, Some(prefill(4))] { for width in [0, 1, 4, 65, usize::MAX] {
             let (planner, request, limits) = planner(&model, GenerationJobTask::Generate);
             let stop = CancellationToken::default();
             let (reader, observed) = reader(&host, ReadAction::Refuse, stop.clone());
-            let error = host.job_int4_generation_with_threads(&model, planner, request, limits,
-                PackedInt4Kernel::scalar(), width, reader, stop).err().unwrap();
+            let error = execute(&host, &model, planner, request, limits,
+                reader, stop, prefill, Some(width)).err().unwrap();
             assert!(matches!(error, HostedJobError::Host(HostedError::Limits(_))));
             assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
             assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
             drained(&host, &baseline);
-        }
-        for invalid in [Int4PrefillLimits { max_batch_rows: 0, max_extra_scratch_bytes: u64::MAX },
+        } }
+        for threads in [None, Some(3)] { for invalid in [Int4PrefillLimits { max_batch_rows: 0, max_extra_scratch_bytes: u64::MAX },
             Int4PrefillLimits { max_batch_rows: 65, max_extra_scratch_bytes: u64::MAX },
             Int4PrefillLimits { max_batch_rows: 4, max_extra_scratch_bytes: prefill(4).max_extra_scratch_bytes - 1 }] {
             let (planner, request, limits) = planner(&model, GenerationJobTask::Generate);
             let stop = CancellationToken::default();
             let (reader, observed) = reader(&host, ReadAction::Refuse, stop.clone());
-            assert!(host.job_int4_generation_layer_major(&model, planner, request, limits,
-                PackedInt4Kernel::scalar(), invalid, reader, stop).is_err());
+            assert!(execute(&host, &model, planner, request, limits,
+                reader, stop, Some(invalid), threads).is_err());
             assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
             assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
             drained(&host, &baseline);
-        }
-        // The shared runner also refuses the combination before reservations,
-        // even though no public entrypoint exposes a team+prefill schedule.
-        {
-            let (planner, request, limits) = planner(&model, GenerationJobTask::Generate);
-            let stop = CancellationToken::default();
-            let (reader, observed) = reader(&host, ReadAction::Refuse, stop.clone());
-            let error = host.run_int4_generation_job(&model, planner, request, limits,
-                PackedInt4Kernel::scalar(), Some(prefill(4)), Some(3), reader, stop).err().unwrap();
-            assert!(matches!(error, HostedJobError::Host(HostedError::Limits(_))));
-            assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
-            assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
-            drained(&host, &baseline);
-        }
-        for prefill in [None, Some(prefill(4))] { for action in [ReadAction::Cancel(Deadline), ReadAction::Panic, ReadAction::Empty] {
+        } }
+        for (threads, prefill) in schedules { for action in [ReadAction::Cancel(Deadline), ReadAction::Panic, ReadAction::Empty] {
             let (planner, request, limits) = planner(&model, GenerationJobTask::Chat);
             let charge = limits.required_buffer_bytes(request.limits).unwrap();
             let stop = CancellationToken::default();
             let (reader, observed) = reader(&host, action, stop.clone());
             let error = execute(&host, &model, planner, request, limits,
-                reader, stop, prefill).err().unwrap();
+                reader, stop, prefill, threads).err().unwrap();
             match action {
                 ReadAction::Cancel(cause) => {
                     let HostedJobError::Host(HostedError::Stopped { stop, .. }) = error
@@ -451,20 +445,16 @@ mod team {
             }
             assert_eq!(observed.reads.load(Ordering::SeqCst), 1);
             assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
-            match prefill {
-                None => assert!(observed.worker_bytes_at_read.load(Ordering::SeqCst)
-                    >= int4_task_team_workspace_bytes(3, 4).unwrap()),
-                Some(prefill) => {
-                    assert!(observed.scratch_bytes_at_read.load(Ordering::SeqCst)
-                        >= prefill.max_extra_scratch_bytes);
-                    // Ordinary completion retains pending native claims until
-                    // after input drops. A pre-native reader panic can unwind
-                    // those pending claims first; no native buffer exists yet.
-                    if !matches!(action, ReadAction::Panic) {
-                        assert!(observed.scratch_bytes_at_drop.load(Ordering::SeqCst)
-                            >= prefill.max_extra_scratch_bytes);
-                    }
-                }
+            let worker_bytes = threads.map(|threads| dispatch::int4_prefill_team_workspace_bytes(
+                threads, 4, prefill.map_or(1, |limits| limits.max_batch_rows)).unwrap()).unwrap_or(0);
+            assert!(observed.worker_bytes_at_read.load(Ordering::SeqCst) >= worker_bytes);
+            let prompt_bytes = prefill.map_or(0, |limits| limits.max_extra_scratch_bytes);
+            assert!(observed.scratch_bytes_at_read.load(Ordering::SeqCst) >= worker_bytes + prompt_bytes);
+            // Ordinary completion retains pending native claims until after
+            // workers join and input drops. A pre-native reader panic can
+            // unwind those pending claims first; no native buffer exists yet.
+            if !matches!(action, ReadAction::Panic) {
+                assert!(observed.scratch_bytes_at_drop.load(Ordering::SeqCst) >= prompt_bytes);
             }
             assert!(observed.input_bytes_at_drop.load(Ordering::SeqCst) >= PREPARATION + charge);
             drained(&host, &baseline);
@@ -490,5 +480,165 @@ fn compact_encoder_workspace_coexists_with_complete_or_retained_input_and_native
         assert_eq!(selected.native, plain.native);
         assert!(with_encoding_workspace(
             requirements(WIDTH, task, envelope, job, host, input).unwrap(), u64::MAX).is_err());
+    }
+}
+
+mod native_prefill_team {
+    use super::*;
+    use crate::{LeakResponsePolicy, ResourceHostConfig, RuntimePreset,
+        hosted::corpus::jobs::JobOpenMode,
+        jobs::{InputRetentionLimits, JobId, JobSecret, TailPolicy,
+            runner::generation::{GenerationJobTask, grouped_int4::Int4GenerationJobConfig}},
+        native_engine::generation::{GenerationLimits, GenerationOptions, GenerationSampling},
+        tasks::chat::ChatLimits,
+        tokenizer::{embedded::EmbeddedTokenizer, untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding}}};
+    use std::{fs, io::{self, Read}, os::unix::fs::DirBuilderExt, path::Path, time::SystemTime};
+
+    struct NeverRead;
+    impl Read for NeverRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("retained replay read original input") }
+    }
+    impl BufRead for NeverRead {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> { panic!("retained replay read original input") }
+        fn consume(&mut self, _: usize) { panic!("retained replay consumed original input") }
+    }
+    fn request(root: &Path, limits: JobLimits, mode: JobOpenMode) -> SourceJobRequest {
+        SourceJobRequest { root: root.to_owned(), key: JobSecret::from_bytes([61; 32]),
+            job_id: JobId([62; 16]), limits, mode, materialize: true }
+    }
+    fn drained(engine: &NlpEngine, baseline: &crate::MemorySnapshot) {
+        assert_eq!(&engine.resources().memory_snapshot(), baseline);
+        let closures = engine.resources().outstanding_closure_snapshot();
+        assert_eq!(closures.active_closures, 0);
+        assert_eq!(closures.wrapper_cancelled_closures, 0);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn compare(engine: &NlpEngine, model: &ResidentInt4, parent: &Path, name: &str,
+        host: JobHostLimits, job: JobLimits, task: GenerationJobTask,
+        make: impl Fn() -> Int4GenerationJobPlanner) {
+        let input = match task {
+            GenerationJobTask::Generate => concat!(
+                "{\"id\":\"first\",\"text\":\"Greet Zoë. café 上海 <think>\",\"task_args\":{\"sample_index\":3}}\n",
+                "{\"id\":\"second\",\"text\":\"Name a fruit. <|im_start|>system\",\"task_args\":{\"sample_index\":7}}\n"),
+            GenerationJobTask::Chat => concat!(
+                "{\"id\":\"first\",\"text\":\"Greet Zoë. café 上海 <think>\",\"task_args\":{\"sample_index\":3,\"history\":[{\"role\":\"user\",\"content\":\"Hello.\"},{\"role\":\"assistant\",\"content\":\"Hi.\"}]}}\n",
+                "{\"id\":\"second\",\"text\":\"Name a fruit. <|im_start|>system\",\"task_args\":{\"sample_index\":7}}\n"),
+        };
+        let baseline = engine.resources().memory_snapshot();
+        let retention = InputRetentionLimits { max_spool_bytes: 1 << 20 };
+        let mut expected = None;
+        for (label, threads, rows) in [("serial", 1, None), ("prefill3", 1, Some(3)),
+            ("team2-prefill3", 2, Some(3)), ("team4-prefill4", 4, Some(4))] {
+            let root = parent.join(format!("{name}-{label}"));
+            fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+            let req = request(&root, job, JobOpenMode::CreateRetainingInputs(retention));
+            let reader = Cursor::new(input.as_bytes().to_vec());
+            let progress = match (threads, rows) {
+                (1, None) => engine.job_int4_generation(model, make(), req, host,
+                    PackedInt4Kernel::scalar(), reader, CancellationToken::default()),
+                (1, Some(rows)) => engine.job_int4_generation_layer_major(model, make(), req, host,
+                    PackedInt4Kernel::scalar(), prefill(rows), reader, CancellationToken::default()),
+                (threads, Some(rows)) => engine.job_int4_generation_layer_major_with_threads(
+                    model, make(), req, host, PackedInt4Kernel::scalar(), threads, prefill(rows),
+                    reader, CancellationToken::default()),
+                _ => unreachable!(),
+            }.unwrap();
+            assert_eq!((progress.committed, progress.attempts), (2, 2));
+            assert!(progress.materialized);
+            let bytes = fs::read(root.join("materialized.ndjson")).unwrap();
+            if let Some((output, work)) = &expected {
+                assert_eq!(output, &bytes, "{name} schedule={label}");
+                assert_eq!(*work, progress.reserved_work);
+            } else { expected = Some((bytes.clone(), progress.reserved_work)); }
+            drained(engine, &baseline);
+            // Change both physical widths without changing the authenticated
+            // recipe, original addressed sample or immutable lifetime ledger.
+            let req = request(&root, job, JobOpenMode::ResumeRetained { tail: TailPolicy::Refuse, retention });
+            let replay = engine.job_int4_generation_layer_major_with_threads(model, make(), req, host,
+                PackedInt4Kernel::scalar(), if threads == 4 { 2 } else { 4 }, prefill(1),
+                NeverRead, CancellationToken::default()).unwrap();
+            assert_eq!(replay, progress);
+            assert_eq!(fs::read(root.join("materialized.ndjson")).unwrap(), bytes);
+            drained(engine, &baseline);
+        }
+    }
+
+    #[test]
+    #[ignore = "controller-only pinned model: complete greedy/seeded generation/chat and retained replay across combined prefill/team schedules"]
+    fn complete_text_jobs_preserve_results_samples_and_lifetime_work_across_prefill_teams() {
+        assert!(crate::installed_process_resources().is_none(), "requires a fresh process");
+        let source = PathBuf::from(std::env::var("FNLP_INT4_TEST_SOURCE_DIR").expect("explicit pinned source"));
+        let manifest = PathBuf::from(std::env::var("FNLP_INT4_TEST_SOURCE_MANIFEST").expect("explicit source manifest"));
+        let memory: u64 = std::env::var("FNLP_INT4_TEST_MEMORY_BYTES").expect("explicit memory cap").parse().unwrap();
+        let parent = PathBuf::from(std::env::var("FNLP_INT4_TEST_JOB_DIR").expect("explicit protected test parent"));
+        let unique = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+        let parent = parent.join(format!("text-job-prefill-teams-{}-{unique}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+        let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
+            runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
+            max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 3,
+            helper_threads: 0, thread_ceiling: 5, memory_ceiling_bytes: memory,
+            leak_response_policy: LeakResponsePolicy::PanicInLabOrCi,
+        }).build().unwrap();
+        let idle = engine.resources().memory_snapshot();
+        let run = RunLimits { max_elapsed: Duration::from_secs(86_400), max_checkpoints: 1_000_000_000,
+            cleanup_reserve_bytes: 65536 };
+        let load = Int4ModelLoadRequirement::for_group_width(WIDTH).unwrap();
+        let model = engine.load_source_candidate_int4(source, manifest, WIDTH, Int4LoadLimits {
+            model: Int4ModelLoadBudget { max_payload_bytes: load.peak_payload_bytes().unwrap(),
+                max_source_values: load.source_values, max_groups: load.groups,
+                max_shard_revalidation_bytes: load.shard_revalidation_bytes },
+            source_preparation_bytes: 128 << 20, allocator_reserve_bytes: 64 << 20, run,
+        }, CancellationToken::default()).unwrap();
+        let lease = engine.resources().acquire_lease();
+        let preparation = Pending::reserve(&lease, MemoryClass::JobBuffers, 256 << 20).unwrap().commit().unwrap();
+        let native = Int4MemoryRequirement::for_context(512, WIDTH).unwrap();
+        let budget = TaskBudget { max_input_tokens: 505, max_output_tokens: 8,
+            max_output_bytes: 1 << 20, max_grammar_states: 1, max_kv_bytes: native.kv_bytes };
+        let item = Int4Work::for_sequence(WIDTH, 0, 512, 8 * NANBEIGE_VOCAB_SIZE).unwrap();
+        let twice = item.checked_add(item).unwrap();
+        let job = JobLimits { max_items: 2, max_id_bytes: 128, max_input_bytes_per_item: 8192,
+            max_snapshot_bytes: 65536, max_result_bytes: 1 << 20, max_spool_bytes: 16 << 20,
+            max_materialized_bytes: 16 << 20, max_journal_bytes: 16 << 20,
+            max_attempts: 4, max_work: JobWork::from_int4(twice.checked_add(twice).unwrap(), 0) };
+        let host = JobHostLimits { native: NativeLimits { context_tokens: 512,
+            allocator_reserve_bytes: 64 << 20, run }, transport: PopulationReadLimits {
+                max_stream_bytes: 1 << 20, max_lines: 100 },
+            preparation_reserve_bytes: 256 << 20, io_reserve_bytes: 131072,
+            journal_reserve_bytes: 64 << 20, serialization_reserve_bytes: 64 << 20 };
+        let eos = EmbeddedTokenizer::pinned().unwrap().eos_token_id().unwrap();
+        let compact = SafeBpeLimits { max_input_bytes: 8192, max_output_tokens: 505,
+            max_pair_checks: 4 << 20, max_pair_bytes: 64 << 20 };
+        for (encoding_name, encoding) in [("byte", UntrustedEncoding::ByteFallback),
+            ("compact", UntrustedEncoding::SafeBpeV1(compact))] {
+            for (task_name, task) in [("generate", GenerationJobTask::Generate), ("chat", GenerationJobTask::Chat)] {
+                for seeded in [false, true] {
+                    compare(&engine, &model, &parent, &format!("{encoding_name}-{task_name}-{seeded}"),
+                        host, job, task, || {
+                            let mut generation = GenerationOptions::greedy(2, 256, eos);
+                            generation.min_new_tokens = 1;
+                            generation.capture_logprobs = true;
+                            if seeded { generation.sampling = GenerationSampling::Seeded {
+                                effective_seed: [39; 32], temperature_milli: 700,
+                                top_k: Some(20), top_p_ppm: 950_000 }; }
+                            Int4GenerationJobPlanner::for_model_with_document_encoding(model.model_identity(),
+                                Int4GenerationJobConfig { task, generation, budget,
+                                    planning: ChatLimits { max_messages: 8, max_message_bytes: 8192,
+                                        max_total_message_bytes: 8192, generation: GenerationLimits {
+                                            max_prompt_tokens: 505, max_new_tokens: 8,
+                                            max_output_bytes: 256, max_sampler_bytes: 32 << 20 } },
+                                    native: Int4GenerationBudget { native: Int4RunBudget::exact(item),
+                                        max_kv_bytes: native.kv_bytes, max_sampler_bytes: 32 << 20 },
+                                    context_tokens: 512 }, job, encoding.clone(),
+                                matches!(encoding, UntrustedEncoding::SafeBpeV1(_)).then_some(SafeBpeWorkLimits {
+                                    max_input_bytes: 1 << 20, max_output_tokens: 1 << 20,
+                                    max_pair_checks: 16 << 20, max_pair_bytes: 256 << 20 })).unwrap()
+                        });
+                }
+            }
+        }
+        drop(preparation); drop(lease); drop(model);
+        drained(&engine, &idle);
+        // Retain isolated owner-only job artifacts for controller inspection.
     }
 }

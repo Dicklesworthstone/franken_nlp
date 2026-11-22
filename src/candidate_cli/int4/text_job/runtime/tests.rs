@@ -142,7 +142,7 @@ fn persistent_team_scratch_and_process_threads_are_priced_without_changing_the_r
 }
 
 #[test]
-fn prefill_scratch_is_simultaneous_while_resumed_task_and_work_authority_stay_fixed() {
+fn prefill_and_worker_scratch_coexist_while_resumed_task_and_work_authority_stay_fixed() {
     let seed = "cd".repeat(32);
     for task in ["generate", "chat"] {
         let (serial, args) = command("start", task, &["--seed", &seed, "--input-encoding", "safe-bpe-v1"]);
@@ -154,9 +154,10 @@ fn prefill_scratch_is_simultaneous_while_resumed_task_and_work_authority_stay_fi
         for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
             let serial_bytes = simultaneous_memory(args.group_width, baseline.native,
                 baseline.budget, host, job, common, input).unwrap();
-            for rows in [1, 4, 64] {
+            for threads in [1, 2, 4, 64] { for rows in [1, 4, 64] {
                 let (selected, args) = command("resume", task, &["--seed", &seed,
-                    "--input-encoding", "safe-bpe-v1", "--prefill-rows", &rows.to_string()]);
+                    "--input-encoding", "safe-bpe-v1", "--prefill-rows", &rows.to_string(),
+                    "--compute-threads", &threads.to_string()]);
                 let common = selected.args.validate(&args).unwrap();
                 let limits = selected.args.lifetime_limits(&args, common, job).unwrap();
                 let config = configuration(&selected.args, &args, limits, 166_101).unwrap();
@@ -175,18 +176,23 @@ fn prefill_scratch_is_simultaneous_while_resumed_task_and_work_authority_stay_fi
                 let required = Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
                 let selected_bytes = simultaneous_memory(args.group_width, config.native,
                     config.budget, host, job, common, input).unwrap();
-                assert_eq!(selected_bytes, serial_bytes + required);
+                let worker_bytes = if threads == 1 { 0 } else {
+                    crate::native_engine::strict_int4::projection::int4_prefill_team_workspace_bytes(
+                        threads, args.group_width, rows).unwrap()
+                };
+                assert_eq!(common.compute.workspace_bytes, worker_bytes);
+                assert_eq!(selected_bytes, serial_bytes + required + worker_bytes);
                 assert!(selected_bytes + limits.encoding_workspace_bytes <= limits.common.minimum_memory_bytes);
-                let threads = compute::resource_config(common);
-                assert_eq!(threads.scoped_cpu_children_per_coordinator, 0);
-                assert_eq!(threads.thread_ceiling, 2);
-            }
+                let host_threads = compute::resource_config(common);
+                assert_eq!(host_threads.scoped_cpu_children_per_coordinator, threads - 1);
+                assert_eq!(host_threads.thread_ceiling, threads + 1);
+            } }
         }
     }
 }
 
 #[test]
-fn native_quote_refuses_invalid_prefill_workspace_and_mixed_execution_teams() {
+fn native_quote_refuses_invalid_prefill_and_stale_single_row_worker_capacity() {
     let (c, args) = command("resume", "generate", &["--prefill-rows", "4"]);
     let common = c.args.validate(&args).unwrap();
     let job = lifetime(&args, common);
@@ -207,6 +213,21 @@ fn native_quote_refuses_invalid_prefill_workspace_and_mixed_execution_teams() {
         crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(2, args.group_width).unwrap() };
     assert_eq!(simultaneous_memory(args.group_width, config.native, config.budget, host,
         job, mixed, JobInputMemory::RetainedRecord).unwrap_err().code, "text_job_native_quote");
+    mixed.compute.workspace_bytes = crate::native_engine::strict_int4::projection::int4_prefill_team_workspace_bytes(
+        2, args.group_width, common.prefill.unwrap().max_batch_rows).unwrap();
+    let exact = simultaneous_memory(args.group_width, config.native, config.budget, host,
+        job, mixed, JobInputMemory::RetainedRecord).unwrap();
+    let serial = simultaneous_memory(args.group_width, config.native, config.budget, host,
+        job, common, JobInputMemory::RetainedRecord).unwrap();
+    assert_eq!(exact, serial + mixed.compute.workspace_bytes);
+    for forged in [compute::Admission { workspace_bytes: mixed.compute.workspace_bytes - 1, ..mixed.compute },
+        compute::Admission { workspace_bytes: mixed.compute.workspace_bytes + 1, ..mixed.compute },
+        compute::Admission { threads: 0, workspace_bytes: 0 },
+        compute::Admission { threads: 1, workspace_bytes: mixed.compute.workspace_bytes }] {
+        let mut altered = mixed; altered.compute = forged;
+        assert_eq!(simultaneous_memory(args.group_width, config.native, config.budget, host,
+            job, altered, JobInputMemory::RetainedRecord).unwrap_err().code, "text_job_native_quote");
+    }
 }
 
 #[test]
@@ -275,13 +296,14 @@ fn complete_envelope_publishes_only_public_model_identity_and_authenticated_prog
     let (compact_command, compact_args) = command("resume", "chat", &["--input-encoding", "safe-bpe-v1"]);
     let policy = compact_args.input_encoding.policy(compact_args.max_input_bytes, common.max_prompt_tokens).unwrap();
     let total = compact_command.args.encoding.limits(&compact_args).unwrap();
-    let compact = Response { input_encoding: Some(&policy), encoding_work_limits: total, ..grouped };
+    let compact = Response { input_encoding: Some(&policy), encoding_work_limits: total,
+        compute_schedule: compute::Schedule::for_threads(4), ..grouped };
     let mut bytes = Vec::new(); publish(&compact, job_cli::REPORT_BYTES, &mut bytes).unwrap();
     let compact_value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(compact_value["input_encoding"], serde_json::to_value(policy).unwrap());
     assert_eq!(compact_value["encoding_work_limits"], serde_json::to_value(total).unwrap());
     assert_eq!(compact_value["prefill_schedule"], schedule);
-    assert!(compact_value.get("compute_schedule").is_none());
+    assert_eq!(compact_value["compute_schedule"], selected["compute_schedule"]);
     assert_eq!(compact_value["output"], value["output"]);
 }
 

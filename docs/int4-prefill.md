@@ -70,8 +70,8 @@ sentiment or judgment heads, records and flushes. Its hosted entry is
 `NlpEngine::batch_int4_scored_layer_major_with_threads`; the terminal footer
 uses the original run control after every worker joins. See the
 [scoring stream contract](candidate-scored-batch-cli.md#grouped-int4-scoring-streams)
-for combined memory admission and per-frame schedule metadata. Structured and
-retained-job routes keep their existing schedule restrictions.
+for combined memory admission and per-frame schedule metadata. The retained-job
+sections below describe which durable routes support combined schedules.
 
 Live streams retain directly backpressured provisional token events. Their
 `run_complete` remains unavailable until prompt/decode execution, independent
@@ -111,7 +111,7 @@ fnlp candidate source-int4 text-job resume generate prompts.ndjson \
   --snapshot /models/nanbeige-g128.int4snap \
   --expected-model-sha256 "$MODEL_CONTENT_SHA256_FROM_TRUSTED_CONVERSION" \
   --memory-mib 8192 --context-tokens 512 --max-new-tokens 32 \
-  --max-output-bytes 4096 --prefill-rows 4 \
+  --max-output-bytes 4096 --prefill-rows 4 --compute-threads 4 \
   --store-results --job-dir /private/text-job \
   --job-id "$JOB_ID" --key-file /private/text-job.key \
   --limits text-job-limits.json --materialize
@@ -129,13 +129,16 @@ reserves its full cold native work before execution; earlier attempts and
 committed results never renew that allowance. Committed items are skipped, and
 pending items restart from their own empty logical KV. No KV is persisted.
 
-Use serial compute with prompt morsels; `--compute-threads` greater than one
-cannot be combined with `--prefill-rows`. Extra prompt workspace is admitted
-with the full job envelope before input access, including source/snapshot/save,
-compact BPE, and retained-input replay routes. The completion report adds an
+`--compute-threads 2..64` combines prompt morsels with one persistent team across
+all pending prompts and decoded tokens. The coordinator's prompt workspace and
+the team's fixed batch buffers are admitted together with the full job envelope
+before input access, including source/snapshot/save, compact BPE, and retained-input
+replay routes. Both physical widths may change on authenticated resume without
+renewing attempts or lifetime native work. The completion report adds an
 optional `prefill_schedule` containing `grouped-int4-layer-major-causal-prefill-v1`,
-the maximum row count and admitted workspace bytes. Sequential reports omit
-that field; private stored results keep their existing schema.
+the maximum row count and admitted workspace bytes, plus `compute_schedule`
+when a worker team is selected. Successful metadata follows physical worker
+drain; private stored results keep their existing schema.
 
 The [sampled-sentiment commands](native-sampled-sentiment-int4.md) have their own
 explicit prompt schedule. Their durable recipe freezes that choice; the
@@ -297,7 +300,8 @@ The explicit alternatives are:
 - `NlpEngine::execute_int4_chat_layer_major` for charged hosted execution.
 - `Int4GenerationJobProcessor::new_layer_major` for a durable generation/chat
   adapter with separately admitted prompt workspace.
-- `NlpEngine::job_int4_generation_layer_major` for charged retained execution,
+- `NlpEngine::job_int4_generation_layer_major` and
+  `job_int4_generation_layer_major_with_threads` for charged retained execution,
   authenticated original or retained inputs, and complete-item commits.
 - `Int4CandidatePlan::execute_layer_major` for exact finite-language scoring.
 - `PreparedInt4Classification`, `PreparedInt4Sentiment` and `PreparedInt4Judge`
@@ -352,11 +356,13 @@ static scratch admission, all model-loading routes and unsupported workflow
 boundaries. These are source fixtures, not executed proof.
 
 Retained generation/chat additions cover unchanged recipes and native lifetime
-work, exact extra workspace for complete and retained inputs, invalid or mixed
-schedules before IO, cancellation and physical drain, all model-input routes,
+work, exact coordinator and worker workspace for complete and retained inputs,
+invalid schedules before IO, cancellation and physical drain, all model-input routes,
 and optional metadata without private content. These regression definitions
-remain unexecuted; durable real-model replay across prompt schedules is a
-separate controller gate.
+remain unexecuted. The explicit pinned-model gate compares complete greedy and
+seeded generation/chat results and lifetime work across serial, layer-major and
+combined worker schedules, then authenticates retained-input replay after both
+physical widths change. That durable real-model gate remains pending.
 
 Compilation, Rust tests, full-model parity and performance remain unrun pending
 the repository's controller-selected immutable-SHA DSR checkpoint. Source review,

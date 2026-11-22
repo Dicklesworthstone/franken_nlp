@@ -66,14 +66,15 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         mode: open_mode(mode, job.storage.input_retention)?, materialize };
     // The host authenticates the complete population and exact recipe before
     // replay/repair, executes only pending whole items and drains physically.
-    let progress = if let Some(prefill) = common.prefill {
-        engine.job_int4_generation_layer_major(&model, planner, request, host,
-            common.kernel, prefill, reader, cancellation.clone())
-    } else if common.compute.threads == 1 {
-        engine.job_int4_generation(&model, planner, request, host, common.kernel, reader, cancellation.clone())
-    } else {
-        engine.job_int4_generation_with_threads(&model, planner, request, host,
-            common.kernel, common.compute.threads, reader, cancellation.clone())
+    let progress = match (common.compute.threads, common.prefill) {
+        (1, None) => engine.job_int4_generation(&model, planner, request, host,
+            common.kernel, reader, cancellation.clone()),
+        (1, Some(prefill)) => engine.job_int4_generation_layer_major(&model, planner, request, host,
+            common.kernel, prefill, reader, cancellation.clone()),
+        (threads, None) => engine.job_int4_generation_with_threads(&model, planner, request, host,
+            common.kernel, threads, reader, cancellation.clone()),
+        (threads, Some(prefill)) => engine.job_int4_generation_layer_major_with_threads(
+            &model, planner, request, host, common.kernel, threads, prefill, reader, cancellation.clone()),
     }.map_err(host_failure)?;
     if let Some(cause) = cancellation.cause() {
         return Err(job_failure(JobError::Cancelled(cause)));
@@ -172,6 +173,7 @@ fn check_native_quote(planner: &Int4GenerationJobPlanner, args: &Int4Args,
     let native = planner.native_limits();
     let work = job.max_work.int4_model_work();
     if !super::super::prefill::matches(args, limits.common)?
+        || limits.common.compute != args.compute.admit_with_prefill(args.group_width, limits.common.prefill)?
         || planner.document_encoding() != &args.input_encoding.policy(args.max_input_bytes, limits.common.max_prompt_tokens)?
         || planner.encoding_workspace_bytes() != limits.encoding_workspace_bytes
         || planner.context_tokens() != host.native.context_tokens || planner.context_tokens() != args.context_tokens
@@ -200,7 +202,13 @@ fn simultaneous_memory(width: usize, native: Int4GenerationBudget, task: TaskBud
     host: JobHostLimits, job: JobLimits, common: Int4Limits, input: JobInputMemory) -> Result<u64, Failure> {
     let need = Int4MemoryRequirement::for_context(host.native.context_tokens, width)
         .map_err(|_| Failure::usage("text_job_native_quote"))?;
-    if (common.prefill.is_some() && common.compute.threads != 1)
+    let team_bytes = match common.compute.threads {
+        1 => 0,
+        threads => crate::native_engine::strict_int4::projection::int4_prefill_team_workspace_bytes(
+            threads, width, common.prefill.map_or(1, |limits| limits.max_batch_rows))
+            .map_err(|_| Failure::usage("text_job_native_quote"))?,
+    };
+    if team_bytes != common.compute.workspace_bytes
         || need != common.native || native.max_kv_bytes != need.kv_bytes || task.max_kv_bytes != need.kv_bytes
         || native.max_sampler_bytes == 0 || host.native.allocator_reserve_bytes == 0 {
         return Err(Failure::usage("text_job_native_quote"));
