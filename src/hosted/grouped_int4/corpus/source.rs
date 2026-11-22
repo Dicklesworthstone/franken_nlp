@@ -76,7 +76,21 @@ impl NlpEngine {
         reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
         self.run_int4_source_batch(model, planner, vocabulary, config, limits, kernel,
-            None, reader, writer, cancellation)
+            None, None, reader, writer, cancellation)
+    }
+
+    /// Process each source-task prompt in bounded layer-major morsels with
+    /// one admitted workspace for the complete stream. Independent records
+    /// execute immediately without waiting for a document cohort to fill.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int4_source_layer_major<R, W>(&self, model: &ResidentInt4,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: Int4SourceCorpusConfig, limits: CorpusLimits, kernel: PackedInt4Kernel,
+        prefill: Int4PrefillLimits, reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        self.run_int4_source_batch(model, planner, vocabulary, config, limits, kernel,
+            Some(prefill), None, reader, writer, cancellation)
     }
 
     /// Serve the same fixed NER, keyphrase, cited-summary or passage-QA stream
@@ -88,7 +102,8 @@ impl NlpEngine {
     /// every document and flush. Worker scratch is charged separately. Owned
     /// IO survives physical worker join and final run_complete publication
     /// under the original run control; callbacks cannot reenter the host.
-    /// This route does not combine with native cohorts or packed prefill.
+    /// This route uses single-row prompts; the layer-major variant also
+    /// admits bounded prompt rows. Native cohorts remain a separate schedule.
     #[allow(clippy::too_many_arguments)]
     pub fn batch_int4_source_with_threads<R, W>(&self, model: &ResidentInt4,
         planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
@@ -97,14 +112,31 @@ impl NlpEngine {
         -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
         self.run_int4_source_batch(model, planner, vocabulary, config, limits, kernel,
-            Some(compute_threads), reader, writer, cancellation)
+            None, Some(compute_threads), reader, writer, cancellation)
+    }
+
+    /// Keep one fixed numerical team across bounded prompt morsels and every
+    /// constrained token in all source records. The coordinator workspace and
+    /// each worker's declared row capacity are admitted together. Source and
+    /// citation finalizers, selected-row policy and lifetime work are intact;
+    /// terminal publication follows physical worker join.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int4_source_layer_major_with_threads<R, W>(&self, model: &ResidentInt4,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: Int4SourceCorpusConfig, limits: CorpusLimits, kernel: PackedInt4Kernel,
+        compute_threads: usize, prefill: Int4PrefillLimits, reader: R, writer: W,
+        cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        self.run_int4_source_batch(model, planner, vocabulary, config, limits, kernel,
+            Some(prefill), Some(compute_threads), reader, writer, cancellation)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn run_int4_source_batch<R, W>(&self, model: &ResidentInt4,
         planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
         config: Int4SourceCorpusConfig, limits: CorpusLimits, kernel: PackedInt4Kernel,
-        compute_threads: Option<usize>, reader: R, writer: W, cancellation: CancellationToken)
+        prefill: Option<Int4PrefillLimits>, compute_threads: Option<usize>,
+        reader: R, writer: W, cancellation: CancellationToken)
         -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
         match compute_threads {
@@ -114,9 +146,10 @@ impl NlpEngine {
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
         let width = model.model_identity().group_width();
         let required = requirements_with_document_encoding(width, config.native_work, limits,
-            planner.document_encoding())?;
+            planner.document_encoding())?.with_prefill_workspace(prefill)?;
         config.validate(&planner, model.model_identity(), required.native.kv_bytes)?;
-        required.check_team_workspace(compute_threads, width)?;
+        let max_batch_rows = prefill.map_or(1, |limits| limits.max_batch_rows);
+        required.check_team_workspace(compute_threads, width, max_batch_rows)?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(SourceInput { preparation: Some((planner, vocabulary, config)), reader, writer }))?;
@@ -147,8 +180,12 @@ impl NlpEngine {
                 selected_rows: config.selected_rows,
             }, task_spec: &task_spec };
             let result = {
-                let mut processor = NativeInt4SourceBatch::new_with_document_encoding(compiler, &mut engine.value,
-                    &vocabulary, admission, config.native_work).map_err(HostedError::BatchSetup)?;
+                let mut processor = match prefill {
+                    None => NativeInt4SourceBatch::new_with_document_encoding(compiler, &mut engine.value,
+                        &vocabulary, admission, config.native_work),
+                    Some(prefill) => NativeInt4SourceBatch::new_layer_major(compiler, &mut engine.value,
+                        &vocabulary, admission, config.native_work, prefill),
+                }.map_err(HostedError::BatchSetup)?;
                 stream::run_ndjson(&mut input.value.reader, &mut input.value.writer,
                     &mut processor, limits.transport, control).map_err(HostedError::Batch)
             };
@@ -159,41 +196,50 @@ impl NlpEngine {
             drop(lease);
             result
         }),
-        Some(threads) => dispatch::run_int4_team_with_finalize(self, limits.native.run, cancellation,
-            model, threads, kernel, move |weights, control, team| {
+        Some(threads) => dispatch::run_int4_prefill_team_with_finalize(self, limits.native.run, cancellation,
+            model, threads, kernel, max_batch_rows, move |weights, control, team| {
                 let mut input = input;
-                checkpoint(control)?;
-                let (planner, vocabulary, config) = input.value.preparation.take().ok_or(HostedError::CompletionMissing)?;
-                let task_spec = config.identity.task_spec.clone();
-                let compiler = Int4SourceBatchPlanner::new_with_document_encoding(&planner, config.identity, config.task_ceiling,
-                    config.planning, config.defaults, width).map_err(HostedError::BatchSetup)?;
-                let compiler = match config.selected_rows {
-                    Some(limits) => compiler.with_selected_rows(limits).map_err(HostedError::BatchSetup)?,
-                    None => compiler,
-                };
-                let mut engine = allocate_native(kv, workspace, || {
-                    StrictInt4Engine::new(weights, limits.native.context_tokens, Int4MemoryBudget {
-                        max_kv_bytes: required.native.kv_bytes, max_rope_bytes: required.native.rope_bytes,
-                        max_scratch_payload_bytes: required.native.scratch_payload_bound,
-                    }).map_err(native_error)?.with_kernel(kernel)
-                        .with_projection_executor(team).map_err(native_error)
-                })?;
-                let admission = SourceAdmission { inner: CorpusAdmission {
-                    lease: &lease, model: weights.identity(), kv_bytes: required.native.kv_bytes,
-                    masks: config.native_work.masks, output_bytes: limits.transport.max_output_line_bytes as u64,
-                    selected_rows: config.selected_rows,
-                }, task_spec: &task_spec };
-                let completion = {
-                    let mut processor = NativeInt4SourceBatch::new_with_document_encoding(compiler, &mut engine.value,
-                        &vocabulary, admission, config.native_work).map_err(HostedError::BatchSetup)?;
-                    stream::deferred::run_ndjson_deferred(&mut input.value.reader, &mut input.value.writer,
-                        &mut processor, limits.transport, control).map_err(HostedError::Batch)?
-                };
-                drop(engine);
-                drop(vocabulary);
-                drop(planner);
-                drop(lease);
-                Ok(DeferredStream { completion, input })
+                let mut native = None;
+                let completion = (|| {
+                    checkpoint(control)?;
+                    let (planner, vocabulary, config) = input.value.preparation.take().ok_or(HostedError::CompletionMissing)?;
+                    let task_spec = config.identity.task_spec.clone();
+                    let compiler = Int4SourceBatchPlanner::new_with_document_encoding(&planner, config.identity, config.task_ceiling,
+                        config.planning, config.defaults, width).map_err(HostedError::BatchSetup)?;
+                    let compiler = match config.selected_rows {
+                        Some(limits) => compiler.with_selected_rows(limits).map_err(HostedError::BatchSetup)?,
+                        None => compiler,
+                    };
+                    let mut engine = allocate_native(kv, workspace, || {
+                        StrictInt4Engine::new(weights, limits.native.context_tokens, Int4MemoryBudget {
+                            max_kv_bytes: required.native.kv_bytes, max_rope_bytes: required.native.rope_bytes,
+                            max_scratch_payload_bytes: required.native.scratch_payload_bound,
+                        }).map_err(native_error)?.with_kernel(kernel)
+                            .with_projection_executor(team).map_err(native_error)
+                    })?;
+                    let admission = SourceAdmission { inner: CorpusAdmission {
+                        lease: &lease, model: weights.identity(), kv_bytes: required.native.kv_bytes,
+                        masks: config.native_work.masks, output_bytes: limits.transport.max_output_line_bytes as u64,
+                        selected_rows: config.selected_rows,
+                    }, task_spec: &task_spec };
+                    let completion = (|| {
+                        let mut processor = match prefill {
+                            None => NativeInt4SourceBatch::new_with_document_encoding(compiler, &mut engine.value,
+                                &vocabulary, admission, config.native_work),
+                            Some(prefill) => NativeInt4SourceBatch::new_layer_major(compiler, &mut engine.value,
+                                &vocabulary, admission, config.native_work, prefill),
+                        }.map_err(HostedError::BatchSetup)?;
+                        stream::deferred::run_ndjson_deferred(&mut input.value.reader, &mut input.value.writer,
+                            &mut processor, limits.transport, control).map_err(HostedError::Batch)
+                    })();
+                    let ChargedNative { value, _kv, _scratch } = engine;
+                    drop(value);
+                    native = Some((_kv, _scratch));
+                    drop(vocabulary);
+                    drop(planner);
+                    completion
+                })();
+                Ok(DeferredStream { completion, input, native, lease })
             }, |pending, control| pending.publish(control, |input| &mut input.writer)),
         }
     }

@@ -14,7 +14,7 @@ fn compact_source_policy_is_reported_on_results_flush_and_empty_completion_with_
             source_root_sha256: "fixture-source", model_content_sha256: "fixture-content",
             candidate_format: "fnlp-int4-source-candidate-v1", quant_recipe: "fixture:group=128",
             group_width: 128, integer_kernel: "s_scalar_i32", task, snapshot: None,
-            cohort_schedule: None, max_selected_rows: Some(7), compute_schedule: None, input_encoding: None,
+            cohort_schedule: None, max_selected_rows: Some(7), compute_schedule: None, prefill_schedule: None, input_encoding: None,
         };
         let byte = serde_json::to_value(&provenance).unwrap();
         provenance.input_encoding = Some(&encoding);
@@ -48,6 +48,7 @@ fn compact_source_policy_is_reported_on_results_flush_and_empty_completion_with_
 fn owned_source_stream_rechecks_compact_policy_before_defaults_or_runtime_io() {
     for name in ["ner-batch", "keyphrases-batch", "summarize-batch", "answer-batch"] {
         for schedule in [&[][..], &["--compute-threads", "3"][..],
+            &["--prefill-rows", "3", "--compute-threads", "4"][..],
             &["--cohort-documents", "2", "--prefill-rows", "1"][..]] {
             let mut flags = schedule.to_vec();
             flags.extend(["--input-encoding", "safe-bpe-v1", "--defaults", "private-defaults.json"]);

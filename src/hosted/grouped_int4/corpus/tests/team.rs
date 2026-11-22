@@ -19,7 +19,7 @@ struct Observation {
 }
 struct Writer {
     host: Arc<NlpEngine>, observation: Arc<Mutex<Observation>>, run: RunLimits,
-    threads: usize, delivery: Delivery, cancellation: CancellationToken,
+    threads: usize, max_batch_rows: usize, delivery: Delivery, cancellation: CancellationToken,
     last_terminal: bool, last_eof: bool,
 }
 impl Write for Writer {
@@ -36,7 +36,7 @@ impl Write for Writer {
             if self.threads > 1 {
                 assert_eq!(kv, 0, "native engine must drop before post-join terminal delivery");
                 assert_eq!(snapshot.by_class[&MemoryClass::ActivationScratch].committed_bytes,
-                    int4_task_team_workspace_bytes(self.threads, 4).unwrap(),
+                    dispatch::int4_prefill_team_workspace_bytes(self.threads, 4, self.max_batch_rows).unwrap(),
                     "dispatcher must retain its worker charge through final delivery");
             } else {
                 assert!(kv > 0, "legacy serial completion schedule changed");
@@ -84,17 +84,24 @@ impl BufRead for NoRead {
     fn consume(&mut self, _: usize) { panic!("unadmitted stream consumed input"); }
 }
 
-fn writer(host: &Arc<NlpEngine>, threads: usize, delivery: Delivery, cancellation: &CancellationToken)
+fn writer(host: &Arc<NlpEngine>, threads: usize, prefill: Option<Int4PrefillLimits>,
+    delivery: Delivery, cancellation: &CancellationToken)
     -> (Writer, Arc<Mutex<Observation>>) {
     let observation = Arc::new(Mutex::new(Observation::default()));
     (Writer { host: Arc::clone(host), observation: Arc::clone(&observation), run: limits().native.run,
-        threads, delivery, cancellation: cancellation.clone(), last_terminal: false, last_eof: false }, observation)
+        threads, max_batch_rows: prefill.map_or(1, |limits| limits.max_batch_rows),
+        delivery, cancellation: cancellation.clone(), last_terminal: false, last_eof: false }, observation)
+}
+
+fn prompt_limits(rows: usize) -> Int4PrefillLimits {
+    Int4PrefillLimits { max_batch_rows: rows,
+        max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap_or(0) }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn execute<R: BufRead + Send + 'static>(host: &NlpEngine, model: &ResidentInt4,
     vocabulary: &Arc<ExtractionVocabulary>, source: &Arc<SourceTaskPlanner>, task: Option<BuiltInTask>,
-    threads: usize, selected_rows: Option<Int4JsonSparseLimits>, input: R, writer: Writer,
+    threads: usize, prefill: Option<Int4PrefillLimits>, selected_rows: Option<Int4JsonSparseLimits>, input: R, writer: Writer,
     cancellation: CancellationToken) -> Result<BatchSummary, HostedError> {
     let limits = limits();
     let ceiling = TaskBudget { max_input_tokens: 32, max_output_tokens: 4, max_output_bytes: 8192,
@@ -113,21 +120,27 @@ fn execute<R: BufRead + Send + 'static>(host: &NlpEngine, model: &ResidentInt4,
         drop(planner);
         let config = Int4SourceCorpusConfig { identity, task_ceiling: ceiling,
             planning: SourcePlanningLimits::default(), defaults: None, native_work: native, selected_rows };
-        if threads == 1 {
-            host.batch_int4_source(model, Arc::clone(source), Arc::clone(vocabulary), config, limits,
-                PackedInt4Kernel::scalar(), input, writer, cancellation)
-        } else {
-            host.batch_int4_source_with_threads(model, Arc::clone(source), Arc::clone(vocabulary), config,
-                limits, PackedInt4Kernel::scalar(), threads, input, writer, cancellation)
+        match (prefill, threads) {
+            (None, 1) => host.batch_int4_source(model, Arc::clone(source), Arc::clone(vocabulary), config,
+                limits, PackedInt4Kernel::scalar(), input, writer, cancellation),
+            (None, _) => host.batch_int4_source_with_threads(model, Arc::clone(source), Arc::clone(vocabulary), config,
+                limits, PackedInt4Kernel::scalar(), threads, input, writer, cancellation),
+            (Some(prefill), 1) => host.batch_int4_source_layer_major(model, Arc::clone(source), Arc::clone(vocabulary), config,
+                limits, PackedInt4Kernel::scalar(), prefill, input, writer, cancellation),
+            (Some(prefill), _) => host.batch_int4_source_layer_major_with_threads(model, Arc::clone(source),
+                Arc::clone(vocabulary), config, limits, PackedInt4Kernel::scalar(), threads, prefill, input, writer, cancellation),
         }
     } else {
         let planner = match selected_rows { Some(limits) => planner.with_selected_rows(limits).unwrap(), None => planner };
-        if threads == 1 {
-            host.batch_int4_extract(model, planner, Arc::clone(vocabulary), native, limits,
-                PackedInt4Kernel::scalar(), input, writer, cancellation)
-        } else {
-            host.batch_int4_extract_with_threads(model, planner, Arc::clone(vocabulary), native, limits,
-                PackedInt4Kernel::scalar(), threads, input, writer, cancellation)
+        match (prefill, threads) {
+            (None, 1) => host.batch_int4_extract(model, planner, Arc::clone(vocabulary), native, limits,
+                PackedInt4Kernel::scalar(), input, writer, cancellation),
+            (None, _) => host.batch_int4_extract_with_threads(model, planner, Arc::clone(vocabulary), native, limits,
+                PackedInt4Kernel::scalar(), threads, input, writer, cancellation),
+            (Some(prefill), 1) => host.batch_int4_extract_layer_major(model, planner, Arc::clone(vocabulary), native, limits,
+                PackedInt4Kernel::scalar(), prefill, input, writer, cancellation),
+            (Some(prefill), _) => host.batch_int4_extract_layer_major_with_threads(model, planner, Arc::clone(vocabulary),
+                native, limits, PackedInt4Kernel::scalar(), threads, prefill, input, writer, cancellation),
         }
     }
 }
@@ -165,10 +178,11 @@ fn structured_stream_team_delivery_refusal_cancellation_and_panic_keep_owned_io_
         Some(BuiltInTask::Summarize), Some(BuiltInTask::Answer)] {
         for selected in [None, Some(Int4JsonSparseLimits { max_rows_per_step: 7 })] {
             let mut expected = None;
-            for threads in [1, 2, 3] {
+            for (threads, prefill) in [(1, None), (2, None), (3, None),
+                (1, Some(prompt_limits(1))), (2, Some(prompt_limits(4))), (3, Some(prompt_limits(64)))] {
                 let cancellation = CancellationToken::default();
-                let (writer, observed) = writer(&host, threads, Delivery::Complete, &cancellation);
-                let summary = execute(&host, &model, &vocabulary, &source, task, threads,
+                let (writer, observed) = writer(&host, threads, prefill, Delivery::Complete, &cancellation);
+                let summary = execute(&host, &model, &vocabulary, &source, task, threads, prefill,
                     selected, Cursor::new(INPUT.to_vec()), writer, cancellation).unwrap();
                 assert_eq!(summary.failed, 1); assert_eq!(summary.succeeded, 0); assert_eq!(summary.flushes, 2);
                 assert_eq!(summary.reserved_work, crate::batch::BatchWork::default());
@@ -180,11 +194,13 @@ fn structured_stream_team_delivery_refusal_cancellation_and_panic_keep_owned_io_
                 drained(&host, &baseline);
             }
         }
-        for delivery in [Delivery::PartialTerminal, Delivery::CancelAtEof,
-            Delivery::CancelAtTerminalFlush, Delivery::PanicAtTerminal] {
+        for (prefill, delivery) in [
+            (None, Delivery::PartialTerminal), (None, Delivery::CancelAtEof),
+            (Some(prompt_limits(4)), Delivery::PartialTerminal), (Some(prompt_limits(4)), Delivery::CancelAtEof),
+            (Some(prompt_limits(4)), Delivery::CancelAtTerminalFlush), (Some(prompt_limits(4)), Delivery::PanicAtTerminal)] {
             let cancellation = CancellationToken::default();
-            let (writer, observed) = writer(&host, 3, delivery, &cancellation);
-            let error = execute(&host, &model, &vocabulary, &source, task, 3,
+            let (writer, observed) = writer(&host, 3, prefill, delivery, &cancellation);
+            let error = execute(&host, &model, &vocabulary, &source, task, 3, prefill,
                 Some(Int4JsonSparseLimits { max_rows_per_step: 7 }), Cursor::new(INPUT.to_vec()),
                 writer, cancellation).unwrap_err();
             match delivery {
@@ -212,10 +228,22 @@ fn structured_stream_team_delivery_refusal_cancellation_and_panic_keep_owned_io_
         }
         for threads in [0, 4, 65] {
             let cancellation = CancellationToken::default();
-            let (writer, observed) = writer(&host, threads, Delivery::Complete, &cancellation);
-            let error = execute(&host, &model, &vocabulary, &source, task, threads, None,
+            let prefill = Some(prompt_limits(4));
+            let (writer, observed) = writer(&host, threads, prefill, Delivery::Complete, &cancellation);
+            let error = execute(&host, &model, &vocabulary, &source, task, threads, prefill, None,
                 NoRead, writer, cancellation).unwrap_err();
             assert!(matches!(error, HostedError::Limits(_)));
+            let observed = observed.lock().unwrap();
+            assert_eq!(observed.writes, 0); assert_eq!(observed.dropped, 1);
+            drained(&host, &baseline);
+        }
+        let mut short = prompt_limits(4); short.max_extra_scratch_bytes -= 1;
+        for prefill in [prompt_limits(0), prompt_limits(65), short] {
+            let cancellation = CancellationToken::default();
+            let (writer, observed) = writer(&host, 3, Some(prefill), Delivery::Complete, &cancellation);
+            let error = execute(&host, &model, &vocabulary, &source, task, 3, Some(prefill), None,
+                NoRead, writer, cancellation).unwrap_err();
+            assert!(matches!(error, HostedError::Int4(Int4HostError::Native(StrictInt4Error::Memory))));
             let observed = observed.lock().unwrap();
             assert_eq!(observed.writes, 0); assert_eq!(observed.dropped, 1);
             drained(&host, &baseline);

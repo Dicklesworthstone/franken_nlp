@@ -1,7 +1,8 @@
 //! Controller-only full-model stream parity; fixture source is not execution evidence.
 use super::*;
 
-fn command(threads: usize, selected: bool, snapshot: &str, pin: &str, schema: &str,
+#[allow(clippy::too_many_arguments)]
+fn command(threads: usize, prefill_rows: Option<usize>, selected: bool, compact: bool, snapshot: &str, pin: &str, schema: &str,
     memory: &str, kernel: &str) -> (BatchArgs, Int4Args, BatchLimits) {
     let width = threads.to_string();
     let mut argv = vec!["candidate", "source-int4", "extract-batch",
@@ -10,6 +11,9 @@ fn command(threads: usize, selected: bool, snapshot: &str, pin: &str, schema: &s
         "--context-tokens", "2048", "--max-new-tokens", "128",
         "--max-requests", "7", "--timeout-seconds", "86400"];
     if selected { argv.extend(["--max-selected-rows", "166144"]); }
+    let rows = prefill_rows.map(|rows| rows.to_string());
+    if let Some(rows) = rows.as_deref() { argv.extend(["--prefill-rows", rows]); }
+    if compact { argv.extend(["--input-encoding", "safe-bpe-v1"]); }
     let matches = crate::candidate_cli::definition().try_get_matches_from(argv).unwrap();
     let CandidateCommand::SourceInt4(command) = CandidateCommand::from_matches(&matches).unwrap()
         else { panic!("wrong extraction route"); };
@@ -29,9 +33,10 @@ fn snapshot_extraction_teams_preserve_every_record_work_policy_and_flush_and_rel
     let memory = std::env::var("FNLP_INT4_TEST_MEMORY_MIB").expect("explicit memory ceiling required");
     let kernel = std::env::var("FNLP_INT4_TEST_KERNEL").expect("explicit kernel required");
     PackedInt4Kernel::detect(kernel.parse::<Int8KernelKind>().unwrap()).unwrap();
-    let (base_batch, base_args, base_limits) = command(4, false, &snapshot, &pin, &schema, &memory, &kernel);
-    let preparation_bytes = [false, true].into_iter().map(|selected|
-        command(4, selected, &snapshot, &pin, &schema, &memory, &kernel).2.common.preparation_bytes)
+    let (base_batch, base_args, base_limits) = command(4, Some(64), false, true, &snapshot, &pin, &schema, &memory, &kernel);
+    let policies = [(false, false), (false, true), (true, false), (true, true)];
+    let preparation_bytes = policies.into_iter().map(|(selected, compact)|
+        command(4, Some(64), selected, compact, &snapshot, &pin, &schema, &memory, &kernel).2.common.preparation_bytes)
         .max().unwrap();
     let engine = NlpEngine::builder().resource_config(compute::resource_config(base_limits.common)).build().unwrap();
     let idle = engine.resources().memory_snapshot();
@@ -47,12 +52,12 @@ fn snapshot_extraction_teams_preserve_every_record_work_policy_and_flush_and_rel
         let model = crate::candidate_cli::int4::runtime::load_model(&engine, &base_args, base_limits.common,
             Duration::from_secs(3600), CancellationToken::default()).unwrap();
         let resident = engine.resources().memory_snapshot();
-        for selected in [false, true] {
+        for (selected, compact) in policies {
             let mut expected: Option<Vec<u8>> = None;
             let mut expected_summary = None;
-            let (_, _, serial_limits) = command(1, selected, &snapshot, &pin, &schema, &memory, &kernel);
-            for threads in [1, 2, 4] {
-                let (batch, args, limits) = command(threads, selected, &snapshot, &pin, &schema, &memory, &kernel);
+            let (_, _, serial_limits) = command(1, None, selected, compact, &snapshot, &pin, &schema, &memory, &kernel);
+            for (threads, rows) in [(1, None), (2, None), (4, None), (1, Some(1)), (2, Some(3)), (4, Some(64))] {
+                let (batch, args, limits) = command(threads, rows, selected, compact, &snapshot, &pin, &schema, &memory, &kernel);
                 assert_eq!(limits.transport, serial_limits.transport);
                 assert_eq!(limits.native.max_model_work, serial_limits.native.max_model_work);
                 assert_eq!(limits.native.masks.max_visits_per_run, serial_limits.native.masks.max_visits_per_run);
@@ -62,7 +67,8 @@ fn snapshot_extraction_teams_preserve_every_record_work_policy_and_flush_and_rel
                 let planner = Int4ExtractionBatchPlanner::for_model(model.model_identity(), budget,
                     batch.extraction.compiler(), batch.extraction.source_limits(), Some(defaults))
                     .and_then(Int4ExtractionBatchPlanner::require_shared_defaults).unwrap();
-                let planner = batch.configure_planner(planner).unwrap();
+                let policy = batch.extraction.encoding_policy(&args, limits.common.max_prompt_tokens).unwrap();
+                let planner = batch.configure_planner(planner).unwrap().with_document_encoding(policy).unwrap();
                 let controls = crate::tokenizer::pinned_controls::pinned().unwrap();
                 let vocabulary = Arc::new(ExtractionVocabulary::pinned(controls.template_controls()).unwrap());
                 let corpus = CorpusLimits {
@@ -75,12 +81,15 @@ fn snapshot_extraction_teams_preserve_every_record_work_policy_and_flush_and_rel
                 let output = SharedOutput::default();
                 let reader = Cursor::new(input.clone());
                 let cancellation = CancellationToken::default();
-                let summary = if threads == 1 {
-                    engine.batch_int4_extract(&model, planner, vocabulary, limits.native, corpus,
-                        limits.common.kernel, reader, output.clone(), cancellation)
-                } else {
-                    engine.batch_int4_extract_with_threads(&model, planner, vocabulary, limits.native, corpus,
-                        limits.common.kernel, threads, reader, output.clone(), cancellation)
+                let summary = match (limits.common.prefill, threads) {
+                    (None, 1) => engine.batch_int4_extract(&model, planner, vocabulary, limits.native, corpus,
+                        limits.common.kernel, reader, output.clone(), cancellation),
+                    (None, _) => engine.batch_int4_extract_with_threads(&model, planner, vocabulary, limits.native, corpus,
+                        limits.common.kernel, threads, reader, output.clone(), cancellation),
+                    (Some(prefill), 1) => engine.batch_int4_extract_layer_major(&model, planner, vocabulary,
+                        limits.native, corpus, limits.common.kernel, prefill, reader, output.clone(), cancellation),
+                    (Some(prefill), _) => engine.batch_int4_extract_layer_major_with_threads(&model, planner, vocabulary,
+                        limits.native, corpus, limits.common.kernel, threads, prefill, reader, output.clone(), cancellation),
                 }.expect("malformed records must be reported while the protocol still drains");
                 let bytes = output.0.lock().unwrap().clone();
                 assert!(bytes.ends_with(b"\n"));
@@ -115,9 +124,9 @@ fn snapshot_extraction_teams_preserve_every_record_work_policy_and_flush_and_rel
                 assert_eq!(summary.failed, 1); assert_eq!(summary.flushes, 2);
                 // Compare the canonical bytes, including every output token,
                 // observed/reserved work counter, source offset, error and epoch.
-                // Each head policy has its own serial authority; no field is removed.
+                // Each encoding/head policy has its own serial authority; no field is removed.
                 if let Some(expected) = &expected {
-                    assert!(bytes.as_slice() == expected.as_slice(), "selected={selected}, threads={threads}");
+                    assert!(bytes.as_slice() == expected.as_slice(), "selected={selected}, compact={compact}, threads={threads}, rows={rows:?}");
                     assert_eq!(Some(summary), expected_summary);
                 } else { expected = Some(bytes); expected_summary = Some(summary); }
                 assert_eq!(engine.resources().memory_snapshot(), resident);

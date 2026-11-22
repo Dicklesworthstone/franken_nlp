@@ -174,6 +174,8 @@ fn input_storage_and_public_corpus_entrypoint_cross_one_owned_boundary() {
     send::<Int4SourceCorpusConfig>();
     let _entry = NlpEngine::batch_int4_source::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
     let _team = NlpEngine::batch_int4_source_with_threads::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    let _prefill = NlpEngine::batch_int4_source_layer_major::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    let _combined = NlpEngine::batch_int4_source_layer_major_with_threads::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
     let planner = planner(); let config = config(&planner, BuiltInTask::Keyphrases, 32);
     let limits = CorpusLimits { native: NativeLimits { context_tokens: 4096, allocator_reserve_bytes: 65_536,
         run: RunLimits { max_elapsed: Duration::from_secs(10), max_checkpoints: 1000, cleanup_reserve_bytes: 65_536 } },
@@ -302,8 +304,14 @@ fn source_team_width_never_changes_legal_row_caps_output_tokens_or_task_budgets(
                 transport: BatchLimits::default(), preparation_reserve_bytes: 1 << 20, io_reserve_bytes: 65_536 };
             let required = requirements(127, config.native_work, limits).unwrap();
             let budget = config.task_ceiling;
-            for threads in [2, 3, 64] {
-                required.check_team_workspace(Some(threads), 127).unwrap();
+            for (threads, rows) in [(2, 1), (3, 4), (64, 64)] {
+                let packed = required.with_prefill_workspace(Some(Int4PrefillLimits {
+                    max_batch_rows: rows,
+                    max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap(),
+                })).unwrap();
+                packed.check_team_workspace(Some(threads), 127, rows).unwrap();
+                assert_eq!(packed.native, required.native);
+                assert_eq!(packed.input_bytes, required.input_bytes);
                 config.validate_planning(&planner, 127, required.native.kv_bytes).unwrap();
                 let request = request(&config);
                 assert_eq!(check_request_for_projection(127, required.native.kv_bytes, 65_536,

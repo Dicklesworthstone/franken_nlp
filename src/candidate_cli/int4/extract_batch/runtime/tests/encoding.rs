@@ -13,7 +13,7 @@ fn compact_extraction_policy_survives_every_frame_without_rewriting_exact_json()
         source_root_sha256: "fixture-source", model_content_sha256: "fixture-content",
         candidate_format: "fnlp-int4-source-candidate-v1", quant_recipe: "fixture:group=128",
         group_width: 128, integer_kernel: "s_scalar_i32", task: "extract", snapshot: None,
-        cohort_schedule: None, max_selected_rows: Some(7), compute_schedule: None, input_encoding: None,
+        cohort_schedule: None, max_selected_rows: Some(7), compute_schedule: None, prefill_schedule: None, input_encoding: None,
     };
     let byte = serde_json::to_value(&provenance).unwrap();
     provenance.input_encoding = Some(&encoding);
@@ -44,6 +44,7 @@ fn compact_extraction_policy_survives_every_frame_without_rewriting_exact_json()
 #[test]
 fn owned_extraction_stream_rechecks_compact_policy_even_after_an_earlier_quote() {
     for schedule in [&[][..], &["--compute-threads", "3"][..],
+        &["--prefill-rows", "3", "--compute-threads", "4"][..],
         &["--cohort-documents", "2", "--prefill-rows", "1"][..]] {
         let mut flags = schedule.to_vec(); flags.extend(["--input-encoding", "safe-bpe-v1"]);
         let Int4Command { task: Int4Task::ExtractBatch(batch), mut args, batch: None, job: None } = command(&flags)

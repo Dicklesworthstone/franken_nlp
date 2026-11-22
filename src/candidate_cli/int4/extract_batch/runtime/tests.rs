@@ -42,7 +42,7 @@ fn extraction_stream_provenance_preserves_exact_inner_json_and_snapshot_identity
         candidate_format: "fnlp-int4-source-candidate-v1", quant_recipe: "fixture:group=128",
         group_width: 128, integer_kernel: "s_scalar_i32", task: "extract",
         snapshot: Some(SnapshotRecord::new("loaded", need)),
-        cohort_schedule: None, max_selected_rows: None, compute_schedule: None, input_encoding: None,
+        cohort_schedule: None, max_selected_rows: None, compute_schedule: None, prefill_schedule: None, input_encoding: None,
     };
     // A transport fixture, not a fabricated inference result. The exact inner
     // bytes remain intact even if a consumer cannot represent this number.
@@ -66,7 +66,7 @@ fn extraction_stream_provenance_preserves_exact_inner_json_and_snapshot_identity
     assert_eq!(value["snapshot"]["format"], INT4_SNAPSHOT_VERSION);
     assert_eq!(value["snapshot"]["file_bytes"], need.file_bytes);
     for absent in ["logical_model_sha256", "prompt_digest", "schema_digest", "taskir_digest",
-        "source_dir", "source_manifest", "schema", "snapshot_path", "max_selected_rows", "compute_schedule", "input_encoding"] {
+        "source_dir", "source_manifest", "schema", "snapshot_path", "max_selected_rows", "compute_schedule", "prefill_schedule", "input_encoding"] {
         assert!(value.get(absent).is_none());
     }
     provenance.max_selected_rows = Some(7);
@@ -74,11 +74,18 @@ fn extraction_stream_provenance_preserves_exact_inner_json_and_snapshot_identity
     assert_eq!(selected["max_selected_rows"], 7);
     assert!(selected.get("decision_policy_digest").is_none());
     assert!(selected.get("prompt_digest").is_none());
-    for threads in [2, 4, 64] {
+    for (threads, rows) in [(2, 1), (4, 3), (64, 64)] {
         provenance.compute_schedule = compute::Schedule::for_threads(threads);
+        let extra = crate::native_engine::strict_int4::prefill::Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+        provenance.prefill_schedule = Some(PrefillSchedule::new(crate::native_engine::strict_int4::prefill::Int4PrefillLimits {
+            max_batch_rows: rows, max_extra_scratch_bytes: extra,
+        }).unwrap());
         let mut scheduled = serde_json::to_value(&provenance).unwrap();
         assert_eq!(scheduled.as_object_mut().unwrap().remove("compute_schedule"),
             Some(serde_json::json!({"execution":"int4-output-row-team-v1", "declared_compute_threads":threads})));
+        assert_eq!(scheduled.as_object_mut().unwrap().remove("prefill_schedule"),
+            Some(serde_json::json!({"execution":"grouped-int4-layer-major-causal-prefill-v1", "max_batch_rows":rows,
+                "admitted_workspace_bytes":extra})));
         assert_eq!(scheduled, selected);
     }
 }
@@ -125,7 +132,7 @@ fn owned_stream_rechecks_packed_schedule_before_schema_model_or_io() {
         command(&["--cohort-documents", "3", "--prefill-rows", "2"]) else { panic!("wrong task"); };
     args.memory_mib = 262_144;
     let quoted = batch.validate(&args).unwrap();
-    batch.stream.cohort_documents = None;
+    batch.stream.cohort_documents = Some(0);
     assert_eq!(execute(args, batch, quoted, NoIo, NoIo), Err(CandidateError::Arguments));
 }
 

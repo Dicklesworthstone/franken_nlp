@@ -142,7 +142,7 @@ impl JobArgs {
         // The prompt workspace and complete worker row capacity are admitted
         // together before either population IO or retained-input replay.
         self.encoding.limits(args)?;
-        let common = self.source.validate_job_with_threaded_prefill(args).map_err(Failure::from)?;
+        let common = self.source.validate_population_with_threaded_prefill(args).map_err(Failure::from)?;
         for mib in [s.journal_memory_mib, s.serialization_memory_mib] {
             if mib.checked_mul(MIB).is_none_or(|bytes| bytes > common.memory_bytes) {
                 return Err(Failure::usage("job_memory_options"));

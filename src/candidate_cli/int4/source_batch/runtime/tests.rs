@@ -60,7 +60,7 @@ fn every_source_task_stream_preserves_inner_spans_and_explicit_snapshot_provenan
             candidate_format: "fnlp-int4-source-candidate-v1", quant_recipe: "fixture:group=128",
             group_width: 128, integer_kernel: "s_scalar_i32", task,
             snapshot: Some(SnapshotRecord::new("loaded", need)),
-            cohort_schedule: None, max_selected_rows: None, compute_schedule: None, input_encoding: None,
+            cohort_schedule: None, max_selected_rows: None, compute_schedule: None, prefill_schedule: None, input_encoding: None,
         };
         // Publication fixture only: it is not neural inference authority.
         let inner = "{\"event\":\"fixture\",\"text\":\"上海\",\"byte_start\":4,\"scalar_start\":3,\"exact\":12345678901234567890123456789012345678}\n";
@@ -82,7 +82,7 @@ fn every_source_task_stream_preserves_inner_spans_and_explicit_snapshot_provenan
         assert_eq!(value["snapshot"]["format"], INT4_SNAPSHOT_VERSION);
         assert_eq!(value["snapshot"]["file_bytes"], need.file_bytes);
         for absent in ["source_dir", "source_manifest", "snapshot_path", "defaults_path", "prompt_digest", "taskir_digest",
-            "cohort_schedule", "max_selected_rows", "compute_schedule", "input_encoding"] {
+            "cohort_schedule", "max_selected_rows", "compute_schedule", "prefill_schedule", "input_encoding"] {
             assert!(value.get(absent).is_none());
         }
     }
@@ -101,7 +101,7 @@ fn source_schedule_provenance_declares_policy_without_private_bindings_or_work_c
             source_root_sha256: "fixture-source", model_content_sha256: "fixture-content",
             candidate_format: "fnlp-int4-source-candidate-v1", quant_recipe: "fixture:group=128",
             group_width: 128, integer_kernel: "s_scalar_i32", task, snapshot: None, cohort_schedule: None,
-            max_selected_rows: None, compute_schedule: None, input_encoding: None,
+            max_selected_rows: None, compute_schedule: None, prefill_schedule: None, input_encoding: None,
         };
         let serial = serde_json::to_value(&provenance).unwrap();
         provenance.max_selected_rows = Some(7);
@@ -117,11 +117,18 @@ fn source_schedule_provenance_declares_policy_without_private_bindings_or_work_c
         assert_eq!(grouped.as_object_mut().unwrap().remove("cohort_schedule"), Some(schedule.clone()));
         assert_eq!(grouped, serial);
         provenance.cohort_schedule = None;
-        for threads in [2, 4, 64] {
+        for (threads, rows) in [(2, 1), (4, 3), (64, 64)] {
             provenance.compute_schedule = compute::Schedule::for_threads(threads);
+            let extra = crate::native_engine::strict_int4::prefill::Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+            provenance.prefill_schedule = Some(PrefillSchedule::new(crate::native_engine::strict_int4::prefill::Int4PrefillLimits {
+                max_batch_rows: rows, max_extra_scratch_bytes: extra,
+            }).unwrap());
             let mut scheduled = serde_json::to_value(&provenance).unwrap();
             assert_eq!(scheduled.as_object_mut().unwrap().remove("compute_schedule"),
                 Some(serde_json::json!({"execution":"int4-output-row-team-v1", "declared_compute_threads":threads})));
+            assert_eq!(scheduled.as_object_mut().unwrap().remove("prefill_schedule"),
+                Some(serde_json::json!({"execution":"grouped-int4-layer-major-causal-prefill-v1", "max_batch_rows":rows,
+                    "admitted_workspace_bytes":extra})));
             assert_eq!(scheduled, serial);
         }
     }
@@ -161,7 +168,7 @@ fn owned_source_stream_rechecks_packed_schedule_before_defaults_model_or_io() {
             else { panic!("wrong task"); };
         args.memory_mib = 262_144;
         let quoted = batch.validate(&args).unwrap();
-        batch.stream.cohort_documents = None;
+        batch.stream.cohort_documents = Some(0);
         assert_eq!(execute(args, batch, quoted, NoIo, NoIo), Err(CandidateError::Arguments));
     }
 }

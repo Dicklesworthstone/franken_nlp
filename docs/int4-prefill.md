@@ -89,17 +89,63 @@ envelope remain unchanged. A snapshot failure never starts source conversion.
 One-off scored and structured tasks use the same explicit scheduling option
 with complete task and native work admission. The five structured batch commands
 `extract-batch`, `ner-batch`, `keyphrases-batch`, `summarize-batch` and
-`answer-batch` also accept it when `--cohort-documents N` is explicit. In those
-streams `P` bounds total prompt/feedback token positions across the live window,
+`answer-batch` accept it for independent records as described below. When
+`--cohort-documents N` is explicit, `P` instead bounds total prompt/feedback
+token positions across the live window,
 and the CLI and host reserve the extra scratch once. See
 [structured cohort packing](int4-structured-cohorts.md#packed-prompt-and-feedback-passes)
 for the schedule, memory quote and ordered delivery contract.
 
-Serial structured streams, maps, complete-document retained jobs, resolution, redaction and
+Maps, complete-document retained jobs, resolution, redaction and
 semantic extraction keep their existing prompt schedules and reject this option,
 including programmatically constructed requests. Their independent
 document/head/chunk cohort options remain separate. Generation/chat retain
 their existing packed batch and corpus interfaces.
+
+### Independent extraction and source streams
+
+All five structured batch commands accept `--prefill-rows 1..=64` with serial
+compute or `--compute-threads 2..=64`. Each complete record executes as it
+arrives; this schedule needs no document cohort or producer-side fill/flush
+coordination. For example:
+
+```sh
+fnlp candidate source-int4 extract-batch documents.ndjson \
+  --schema extraction.schema.json --source-membership \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256_FROM_TRUSTED_CONVERSION" \
+  --memory-mib 8192 --prefill-rows 4 --compute-threads 4 \
+  --input-encoding safe-bpe-v1 --max-selected-rows 4096
+```
+
+`ner-batch`, `keyphrases-batch`, `summarize-batch` and `answer-batch` accept
+the same scheduling flags with their existing typed input formats. The complete
+legal-row set must fit an explicit selected-row ceiling; the command does not
+prune that set to make a smaller ceiling succeed. Source conversion, pinned
+snapshots and optional snapshot saving retain their existing rules.
+
+The host admits one coordinator prompt workspace plus fixed worker row buffers
+for the declared width, beside the complete input/transport envelope, compact
+encoder workspace, native KV and scratch. One native processor and team span
+every record, constrained token and flush. Native and mask work remain
+whole-stream allowances; neither scheduling width increases them.
+
+Each event reports `prefill_schedule` and, when selected, `compute_schedule`.
+The original schema/source finalizers, source coordinates, per-record encoding
+policy and result identities remain in force. Charged input and committed native
+reservations survive physical worker join on both success and ordinary stream
+errors. Only after joining may the existing deferred `run_complete` be published,
+under the original deadline and checkpoint control. Whole-run success still
+requires that footer and process exit zero.
+
+Library callers use `NlpEngine::batch_int4_extract_layer_major` and
+`NlpEngine::batch_int4_source_layer_major`, or their
+`_layer_major_with_threads` variants. Document cohorts retain a separate packed
+schedule and cannot combine with worker teams. Regression definitions cover
+combined admission, exact memory boundaries, all task routes and completion
+ownership; controller-only model fixtures cover full canonical stream results
+across schedules. These definitions remain unexecuted and do not establish
+numerical parity, task quality or a performance gain.
 
 ### Retained generation and chat
 

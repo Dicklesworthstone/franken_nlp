@@ -53,13 +53,13 @@ pub(super) fn definitions() -> Vec<clap::Command> {
             .long_about(concat!(
                 "Run one fixed source task over ordered {id,text,task_args?} NDJSON and exact {\"flush\":true} controls. NER, keyphrases and summarize use shipped options unless --defaults or per-record typed task_args supplies explicit bounded options. For answer, text is the question and task_args supplies separately typed passages, options and budget; no passage set is invented or reused implicitly. Defaults files use complete SourceBatchArgs JSON, including its task selector and budget. A record cannot switch tasks or raise the CLI ceilings. ",
                 "Execution is serial by default. --compute-threads N selects one persistent output-row team for the ENTIRE stream, including every document, token and flush. Worker scratch and the process thread envelope are admitted before IO; run_complete is published after all workers join under the original deadline and checkpoint budget. ",
-                "Alternatively, --cohort-documents N groups up to N complete documents through shared native decoder layers, preserving each task budget, grammar, source/passages and causal KV. Teams cannot combine with cohorts or --prefill-rows. The entire cohort window plus one lookahead is memory-admitted before IO. Partial windows execute at flush or EOF; interactive producers must fill a window or send a flush before waiting. ",
+                "Add --prefill-rows P for bounded layer-major prompts on independent records, with or without the persistent team. The coordinator workspace and fixed worker row capacity are admitted together and reused across every record; no cohort fill is required. Alternatively, --cohort-documents N groups up to N complete documents through shared native decoder layers, preserving each task budget, grammar, source/passages and causal KV. Teams cannot combine with document cohorts. The entire cohort window plus one lookahead is memory-admitted before IO. Partial windows execute at flush or EOF; interactive producers must fill a window or send a flush before waiting. ",
                 "Results and rejected records remain ordered, and IDs reset only after a drained flush. Every completed event carries candidate provenance. Require run_complete AND exit 0 for whole-run success; earlier completed groups remain valid if a later record fails. Native work, masks, checkpoints and transport ceilings span all documents, workers, cohorts and epochs. ",
                 "Full-vocabulary projection remains the default. Explicit --max-selected-rows N fixes all-legal-row projection for serial, worker-team, cohort or packed-cohort execution; N must be 1..=166144. Every item binds the cap and original built-in finalizer before admission. Per-record arguments cannot override projection policy. A legal set exceeding the cap returns no result, never a pruned language or an automatic retry. Summary prose and answer text may need a wide ceiling. This path checks only selected logits; native parity and performance require separate evidence. ",
                 "With --cohort-documents, explicit --prefill-rows P packs at most P TOTAL prompt and already sampled feedback positions per native pass, 1..=64, with independent extra scratch admission. P may be smaller than the document window. Omitting it retains the existing cohort schedule. No sampling or repair retry. Structural citations do not certify semantic support; failed inference is never abstention. Input/writer ownership survives cancellation until hosted cleanup. Blocking IO is cooperative, not preemptible."))
             .mut_arg("options", |arg| arg.hide(true))
-            .mut_arg("prefill_rows", |arg| arg.hide(false).requires("cohort_documents")
-                .help("With --cohort-documents: maximum TOTAL prompt/feedback token rows per packed pass, 1..=64; extra scratch is admitted"))
+            .mut_arg("prefill_rows", |arg| arg.hide(false)
+                .help("Bounded prompt rows, 1..=64, with optional CPU team; with --cohort-documents, TOTAL prompt/feedback rows per packed pass"))
             .mut_arg("input", |arg| arg.help("NDJSON file or '-' for stdin; each source record is bounded and read incrementally"))
             .mut_arg("max_input_bytes", |arg| arg.help("Maximum decoded document/question and passage input bytes per record"))
             .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoint allowance for the ENTIRE corpus execution"))))
@@ -97,11 +97,15 @@ impl BatchArgs {
             || !(1..=16 * 1024 * MIB).contains(&stream.max_total_output_bytes)
             || self.source.options_path().is_some()
             || (args.compute.threads() != 1 && stream.cohort_documents.is_some())
-            || (prefill.is_some() && stream.cohort_documents.is_none())
+            || self.source.selected_rows()?.is_some()
             || stream.defaults.as_ref().is_some_and(|path| path.as_os_str().is_empty() || path.as_os_str() == "-") {
             return Err(CandidateError::Arguments);
         }
-        let mut common = self.source.validate_batch_with_prefill(args)?;
+        let mut common = if stream.cohort_documents.is_some() {
+            self.source.validate_batch_with_prefill(args)?
+        } else {
+            self.source.validate_population_with_threaded_prefill(args)?
+        };
         let encoding = args.input_encoding.policy(args.max_input_bytes, common.max_prompt_tokens)?;
         let encoding_workspace_bytes = args.input_encoding.workspace_bytes(args.max_input_bytes, common.max_prompt_tokens)?;
         let one = match selected_rows {

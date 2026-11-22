@@ -1,5 +1,6 @@
 //! One owned stream and resident model for all four INT4 source task families.
 use super::*;
+use super::super::scored_batch::runtime::PrefillSchedule;
 use std::{fs::File, io::{BufRead, BufReader}, sync::Arc, time::{Duration, Instant}};
 use crate::{
     NlpEngine, MemoryClass,
@@ -15,6 +16,10 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     // Internal callers cannot reuse a quote after changing options or model.
     let limits = batch.validate(&args)?;
     let common = limits.common;
+    if !super::super::prefill::matches(&args, common)?
+        || common.compute != args.compute.admit_with_prefill(args.group_width, common.prefill)? {
+        return Err(CandidateError::Arguments);
+    }
     let encoding = args.input_encoding.policy(args.max_input_bytes, common.max_prompt_tokens)?;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
@@ -74,6 +79,8 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
             CohortSchedule::new(documents, common.prefill.map(|prefill| prefill.max_batch_rows))),
         max_selected_rows: limits.selected_rows.map(|limits| limits.max_rows_per_step),
         compute_schedule: compute::Schedule::for_threads(common.compute.threads),
+        prefill_schedule: common.prefill.filter(|_| limits.cohort_documents.is_none())
+            .map(PrefillSchedule::new).transpose()?,
         input_encoding: input_encoding::reported_policy(&encoding),
     };
     let writer = CandidateWriter::new(output, &provenance, limits.transport.max_output_line_bytes, limits.output_bytes)?;
@@ -93,13 +100,19 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
                 corpus, max_documents, common.kernel, reader, writer, cancellation),
         };
         result.map_err(|_| CandidateError::Batch)?.summary
-    } else if common.compute.threads > 1 {
-        engine.batch_int4_source_with_threads(&model, Arc::new(planner), Arc::new(vocabulary), config,
-            corpus, common.kernel, common.compute.threads, reader, writer, cancellation)
-            .map_err(|_| CandidateError::Batch)?
     } else {
-        engine.batch_int4_source(&model, Arc::new(planner), Arc::new(vocabulary), config,
-            corpus, common.kernel, reader, writer, cancellation).map_err(|_| CandidateError::Batch)?
+        let planner = Arc::new(planner); let vocabulary = Arc::new(vocabulary);
+        match (common.prefill, common.compute.threads) {
+            (Some(prefill), 1) => engine.batch_int4_source_layer_major(&model, planner, vocabulary,
+                config, corpus, common.kernel, prefill, reader, writer, cancellation),
+            (Some(prefill), threads) => engine.batch_int4_source_layer_major_with_threads(&model,
+                planner, vocabulary, config, corpus, common.kernel, threads, prefill,
+                reader, writer, cancellation),
+            (None, 1) => engine.batch_int4_source(&model, planner, vocabulary, config,
+                corpus, common.kernel, reader, writer, cancellation),
+            (None, threads) => engine.batch_int4_source_with_threads(&model, planner, vocabulary,
+                config, corpus, common.kernel, threads, reader, writer, cancellation),
+        }.map_err(|_| CandidateError::Batch)?
     };
     // The host already emitted the sole terminal protocol record; a failed
     // document changes process status without appending another stdout frame.
@@ -126,6 +139,8 @@ struct Provenance<'a> {
     max_selected_rows: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compute_schedule: Option<compute::Schedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefill_schedule: Option<PrefillSchedule>,
     #[serde(skip_serializing_if = "Option::is_none")]
     input_encoding: Option<&'a crate::tokenizer::untrusted::UntrustedEncoding>,
 }

@@ -113,9 +113,9 @@ impl SourceArgs {
     pub(super) fn validate_with_prefill(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
         self.validate_source_storage(args, false)
     }
-    /// Retained single-context source jobs independently wire both schedules;
-    /// keep ordinary task/map/stream callers on their existing authority.
-    pub(super) fn validate_job_with_threaded_prefill(&self, args: &Int4Args)
+    /// Independent-record streams and retained single-context jobs wire both
+    /// schedules. Other composed callers retain their own execution authority.
+    pub(super) fn validate_population_with_threaded_prefill(&self, args: &Int4Args)
         -> Result<Int4Limits, CandidateError> {
         self.validate_source_storage(args, true)
     }

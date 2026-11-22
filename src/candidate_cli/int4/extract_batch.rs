@@ -58,13 +58,13 @@ pub(super) fn definition() -> clap::Command {
             "Process ordered {id,text} NDJSON and exact {\"flush\":true} controls with one resident source-converted or digest-pinned snapshot INT4 model. ",
             "--schema supplies one exact shared schema; --source-membership binds its annotated verbatim fields to EACH original document. Any non-null task_args is rejected before document tokenization, even if it repeats the shared schema or budgets. ",
             "Execution is serial by default. --compute-threads N selects one persistent output-row team for the ENTIRE stream, including every document, token and flush. Worker scratch and the process thread envelope are admitted before IO; the terminal run_complete is published after all workers join under the original deadline and checkpoint budget. ",
-            "Alternatively, --cohort-documents N groups up to N complete documents through shared native decoder layers, with independent grammars, source masks and causal KV. Teams cannot combine with cohorts or --prefill-rows. The entire cohort window and a lookahead plan are memory-admitted before IO. A partial window executes at flush or EOF; interactive producers must fill the window or send a flush before waiting. ",
+            "Add --prefill-rows P for bounded layer-major prompts on independent records, with or without the persistent team. One coordinator workspace and fixed per-worker row capacity are admitted together and reused across the stream. This route does not wait for other documents to arrive. Alternatively, --cohort-documents N groups up to N complete documents through shared native decoder layers, with independent grammars, source masks and causal KV. Teams cannot combine with document cohorts. The entire cohort window and a lookahead plan are memory-admitted before IO. A partial window executes at flush or EOF; interactive producers must fill the window or send a flush before waiting. ",
             "Results remain ordered. IDs are unique within each bounded epoch and reset only after a drained flush. Every event has candidate provenance. Require run_complete AND exit 0 for whole-run success; run_complete alone reports a drained protocol and can include failed documents. Earlier complete results remain valid after a later failure. Native work, mask visits, checkpoints, input and output ceilings never renew per document, thread, cohort or epoch. ",
             "Full-vocabulary greedy decoding remains the default. Explicit --max-selected-rows N projects every legal grammar row under a fixed ceiling of 1..=166144 rows including accepted EOS. It supports serial, worker-team, cohort and packed-cohort execution. A complete legal set exceeding the cap refuses; no pruning or dense fallback occurs. The strategy and ceiling bind each document's execution identity before admission. Output-token, result-byte, KV, mask and independent source/schema validation limits remain unchanged. ",
             "With --cohort-documents, explicit --prefill-rows P packs at most P TOTAL prompt and already sampled feedback positions per native pass, 1..=64, with independent extra scratch admission. P may be smaller than the document window. Omitting it retains the existing cohort schedule. No sampler, repair retry, durable resume, native parity, speed or semantic-accuracy claim. Blocking IO is cooperative, not preemptible."))
         .mut_arg("input", |arg| arg.help("NDJSON file, or '-' for stdin; read one bounded record at a time"))
-        .mut_arg("prefill_rows", |arg| arg.hide(false).requires("cohort_documents")
-            .help("With --cohort-documents: maximum TOTAL prompt/feedback token rows per packed pass, 1..=64; extra scratch is admitted"))
+        .mut_arg("prefill_rows", |arg| arg.hide(false)
+            .help("Bounded prompt rows, 1..=64, with optional CPU team; with --cohort-documents, TOTAL prompt/feedback rows per packed pass"))
         .mut_arg("max_input_bytes", |arg| arg.help("Maximum decoded UTF-8 document bytes per record"))
         .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoint allowance for the ENTIRE corpus execution"))))
         .after_long_help("--input-encoding safe-bpe-v1 selects compact, byte-preserving input for every record. Exact schema bytes and source text share one tokenizer-work allowance per record; neither segment renews it. The immutable policy and all limits bind each prepared request. The full transient tokenizer workspace is admitted alongside retained serial/team/cohort plans and lookahead before schema, input or model IO. It composes with the stream's selected-row and scheduling choices. Byte-fallback remains the default. Input byte bounds, complete token context, original source coordinates, native/mask budgets and the whole-stream deadline remain independent limits. No truncation, encoding fallback or claim of byte/BPE model-output equivalence. Maps and durable jobs retain their separate byte-only capacity contract.")
@@ -98,12 +98,16 @@ impl BatchArgs {
             || !(1..=MAX_TRANSPORT_BYTES).contains(&stream.max_total_input_bytes)
             || !(1..=MAX_TRANSPORT_BYTES).contains(&stream.max_total_output_bytes)
             || (args.compute.threads() != 1 && stream.cohort_documents.is_some())
-            || (prefill.is_some() && stream.cohort_documents.is_none()) {
+            || self.extraction.selected_rows()?.is_some() {
             return Err(CandidateError::Arguments);
         }
         // Retain source/snapshot exclusivity, real hardware detection, schema
         // path checks and the extraction-only decoder policy before any IO.
-        let mut common = self.extraction.validate_batch_with_prefill(args)?;
+        let mut common = if stream.cohort_documents.is_some() {
+            self.extraction.validate_batch_with_prefill(args)?
+        } else {
+            self.extraction.validate_population_with_threaded_prefill(args)?
+        };
         let encoding = self.extraction.encoding_policy(args, common.max_prompt_tokens)?;
         let encoding_workspace_bytes = match &encoding {
             crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback => 0,

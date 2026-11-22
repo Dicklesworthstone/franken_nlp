@@ -5,6 +5,8 @@ use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
 fn compact_extraction_stream_admits_schema_and_source_for_every_execution_schedule() {
     for schedule in [
         &[][..], &["--compute-threads", "3"][..],
+        &["--prefill-rows", "3"][..],
+        &["--prefill-rows", "3", "--compute-threads", "4"][..],
         &["--cohort-documents", "3"][..],
         &["--cohort-documents", "3", "--prefill-rows", "2"][..],
     ] {
@@ -49,7 +51,7 @@ fn compact_extraction_stream_admits_schema_and_source_for_every_execution_schedu
                     + compact.output_reservation_bytes;
                 assert_eq!(admitted.common.minimum_memory_bytes, grouped_memory_floor(&args, admitted.common, peak).unwrap());
             } else {
-                let common = batch.extraction.validate_batch_with_prefill(&args).unwrap();
+                let common = batch.extraction.validate_population_with_threaded_prefill(&args).unwrap();
                 let t = admitted.transport;
                 let corpus = 8 * t.max_line_bytes as u64 + 4 * t.max_output_line_bytes as u64
                     + 128 * t.max_epoch_ids as u64 + t.max_epoch_id_bytes as u64

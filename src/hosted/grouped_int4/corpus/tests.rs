@@ -211,6 +211,8 @@ fn owned_corpus_inputs_can_cross_the_existing_blocking_boundary() {
     send::<DeferredStream<StreamInput<std::io::Cursor<Vec<u8>>, Vec<u8>>>>();
     let _serial = NlpEngine::batch_int4_extract::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
     let _team = NlpEngine::batch_int4_extract_with_threads::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    let _prefill = NlpEngine::batch_int4_extract_layer_major::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    let _combined = NlpEngine::batch_int4_extract_layer_major_with_threads::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
 }
 
 #[test]
@@ -219,20 +221,36 @@ fn stream_team_scratch_is_additional_without_multiplying_context_or_work_authori
         let limits = limits();
         let native = native_work(group_width);
         let required = requirements(group_width, native, limits).unwrap();
-        required.check_team_workspace(None, group_width).unwrap();
-        for threads in [2, 3, 7, 64] {
-            required.check_team_workspace(Some(threads), group_width).unwrap();
-            assert_eq!(requirements(group_width, native, limits).unwrap(), required);
-            let mut overflow = required; overflow.workspace_bytes = u64::MAX;
-            assert!(overflow.check_team_workspace(Some(threads), group_width).is_err());
-            let extra = int4_task_team_workspace_bytes(threads, group_width).unwrap();
-            overflow.workspace_bytes = u64::MAX - extra;
-            overflow.check_team_workspace(Some(threads), group_width).unwrap();
-            overflow.workspace_bytes += 1;
-            assert!(overflow.check_team_workspace(Some(threads), group_width).is_err());
+        assert_eq!(required.with_prefill_workspace(None).unwrap(), required);
+        required.check_team_workspace(None, group_width, 1).unwrap();
+        for rows in [1, 3, 64] {
+            let extra_prompt = Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+            let prefill = Int4PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: extra_prompt };
+            let packed = required.with_prefill_workspace(Some(prefill)).unwrap();
+            assert_eq!(packed.native, required.native);
+            assert_eq!(packed.input_bytes, required.input_bytes);
+            assert_eq!(packed.workspace_bytes, required.workspace_bytes + extra_prompt);
+            for threads in [2, 3, 7, 64] {
+                packed.check_team_workspace(Some(threads), group_width, rows).unwrap();
+                assert_eq!(requirements(group_width, native, limits).unwrap(), required);
+                let mut overflow = packed; overflow.workspace_bytes = u64::MAX;
+                assert!(overflow.check_team_workspace(Some(threads), group_width, rows).is_err());
+                let extra = dispatch::int4_prefill_team_workspace_bytes(threads, group_width, rows).unwrap();
+                overflow.workspace_bytes = u64::MAX - extra - packed.input_bytes - packed.native.kv_bytes;
+                overflow.check_team_workspace(Some(threads), group_width, rows).unwrap();
+                overflow.workspace_bytes += 1;
+                assert!(overflow.check_team_workspace(Some(threads), group_width, rows).is_err());
+            }
+            assert!(required.with_prefill_workspace(Some(Int4PrefillLimits {
+                max_extra_scratch_bytes: extra_prompt - 1, ..prefill })).is_err());
         }
         for threads in [0, 1, 65, usize::MAX] {
-            assert!(required.check_team_workspace(Some(threads), group_width).is_err());
+            assert!(required.check_team_workspace(Some(threads), group_width, 1).is_err());
+        }
+        for rows in [0, 65, usize::MAX] {
+            assert!(required.with_prefill_workspace(Some(Int4PrefillLimits {
+                max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX })).is_err());
+            assert!(required.check_team_workspace(Some(2), group_width, rows).is_err());
         }
     }
 }

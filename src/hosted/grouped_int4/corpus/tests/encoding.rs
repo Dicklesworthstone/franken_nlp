@@ -41,13 +41,16 @@ fn serial_and_persistent_teams_charge_one_encoder_without_replacing_native_or_in
         assert_eq!(compact.native, byte.native);
         assert_eq!(compact.workspace_bytes, byte.workspace_bytes);
         assert_eq!(compact.input_bytes, byte.input_bytes + expected);
-        compact.check_team_workspace(None, group_width).unwrap();
-        for threads in [2, 4, 64] {
-            compact.check_team_workspace(Some(threads), group_width).unwrap();
-            let workers = int4_task_team_workspace_bytes(threads, group_width).unwrap();
+        compact.check_team_workspace(None, group_width, 1).unwrap();
+        for (threads, rows) in [(2, 1), (4, 3), (64, 64)] {
+            let prefill = Int4PrefillLimits { max_batch_rows: rows,
+                max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap() };
+            let packed = compact.with_prefill_workspace(Some(prefill)).unwrap();
+            packed.check_team_workspace(Some(threads), group_width, rows).unwrap();
+            let workers = dispatch::int4_prefill_team_workspace_bytes(threads, group_width, rows).unwrap();
             assert!(workers > 0);
-            assert_eq!(compact.input_bytes + compact.workspace_bytes + workers,
-                byte.input_bytes + byte.workspace_bytes + workers + expected);
+            assert_eq!(packed.input_bytes + packed.workspace_bytes + workers,
+                byte.input_bytes + byte.workspace_bytes + workers + expected + prefill.validate().unwrap());
         }
     }
 }

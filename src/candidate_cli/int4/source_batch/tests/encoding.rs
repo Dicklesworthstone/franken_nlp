@@ -6,6 +6,8 @@ fn all_source_streams_price_one_compact_encoder_for_serial_team_and_packed_cohor
     for name in ["ner-batch", "keyphrases-batch", "summarize-batch", "answer-batch"] {
         for schedule in [
             &[][..], &["--compute-threads", "3"][..],
+            &["--prefill-rows", "3"][..],
+            &["--prefill-rows", "3", "--compute-threads", "4"][..],
             &["--cohort-documents", "3"][..],
             &["--cohort-documents", "3", "--prefill-rows", "2"][..],
         ] {
@@ -49,7 +51,7 @@ fn all_source_streams_price_one_compact_encoder_for_serial_team_and_packed_cohor
                         + compact.output_reservation_bytes;
                     assert_eq!(admitted.common.minimum_memory_bytes, grouped_memory_floor(&args, admitted.common, peak).unwrap());
                 } else {
-                    let common = batch.source.validate_batch_with_prefill(&args).unwrap();
+                    let common = batch.source.validate_population_with_threaded_prefill(&args).unwrap();
                     let t = admitted.transport;
                     let corpus = 8 * t.max_line_bytes as u64 + 4 * t.max_output_line_bytes as u64
                         + 128 * t.max_epoch_ids as u64 + t.max_epoch_id_bytes as u64

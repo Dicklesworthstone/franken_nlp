@@ -403,6 +403,14 @@ Both physical schedules appear in event provenance, and terminal completion
 remains deferred until every worker joins. See the
 [resident scoring documentation](docs/candidate-scored-batch-cli.md#grouped-int4-scoring-streams).
 
+Independent `extract-batch`, `ner-batch`, `keyphrases-batch`, `summarize-batch`
+and `answer-batch` streams now expose the same combined prompt/worker schedule.
+They execute each arriving record without waiting for a document cohort.
+Compact input and exact selected rows compose with both schedules; input,
+native reservations and worker storage remain owned through physical join.
+See [independent structured streams](docs/int4-prefill.md#independent-extraction-and-source-streams)
+for CLI and library entry points.
+
 Retained `text-job`, `score-job`, `extract-job`, `ner-job`, `keyphrases-job`,
 `summarize-job` and `answer-job` invocations also combine both schedules while
 preserving their authenticated recipes and lifetime work. Other routes retain
@@ -833,22 +841,31 @@ grammar and source finalizer, logical KV, mask ledger and all five native work
 counters. Worker scratch is admitted once in addition to normal stream memory;
 documents and flushes never create another team or renew work allowances.
 The existing `--max-selected-rows` policy can use these workers while retaining
-every legal row and its exact admission ceiling. Team selection cannot combine
-with `--cohort-documents` or `--prefill-rows`.
+every legal row and its exact admission ceiling. Add `--prefill-rows 1..64`
+to process each prompt in bounded layer-major morsels on that same team.
+Coordinator prompt storage and each worker's complete row capacity are admitted
+alongside normal stream memory. Team selection cannot combine with
+`--cohort-documents`.
 
 ```bash
 fnlp candidate source-int4 extract-batch documents.ndjson \
   --snapshot nanbeige.int4.snapshot --expected-model-sha256 "$MODEL_SHA256" \
-  --schema extraction.schema.json --memory-mib 8192 --compute-threads 4
+  --schema extraction.schema.json --memory-mib 8192 --compute-threads 4 \
+  --prefill-rows 4 --input-encoding safe-bpe-v1
 ```
 
 Team events add `compute_schedule`, describing the selected schedule and width.
+Independent layer-major streams additionally report `prefill_schedule`, and can
+use serial compute when `--compute-threads` is omitted. Neither mode needs a
+cohort to fill before processing an input record.
 The terminal `run_complete` is staged within the existing transport budget and
 published after every worker joins, under the same invocation deadline,
 checkpoint budget and re-entry guard. Charged input/writer storage remains
 owned through final delivery, and partial writes are never retried. Library
-callers use `batch_int4_extract_with_threads` with a compatible installed
-child-thread envelope. Model parity and performance still require the retained
+callers use `batch_int4_extract_with_threads` or
+`batch_int4_extract_layer_major_with_threads` with a compatible installed
+child-thread envelope; source streams expose the corresponding
+`batch_int4_source` variants. Model parity and performance still require the retained
 controller-only fixtures and authorized validation; this is an explicit schedule.
 
 Each input document supplies `id` and exact UTF-8 `text`. IDs must be unique

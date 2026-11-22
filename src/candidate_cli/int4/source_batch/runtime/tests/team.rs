@@ -1,7 +1,8 @@
 //! Controller-only full-model stream parity; fixture source is not execution evidence.
 use super::*;
 
-fn command(task: &str, threads: usize, selected: bool, snapshot: &str, pin: &str,
+#[allow(clippy::too_many_arguments)]
+fn command(task: &str, threads: usize, prefill_rows: Option<usize>, selected: bool, compact: bool, snapshot: &str, pin: &str,
     memory: &str, kernel: &str) -> (BatchArgs, Int4Args, BatchLimits) {
     let width = threads.to_string();
     let mut argv = vec!["candidate", "source-int4", task, "--snapshot", snapshot,
@@ -9,6 +10,9 @@ fn command(task: &str, threads: usize, selected: bool, snapshot: &str, pin: &str
         "--compute-threads", &width, "--context-tokens", "2048", "--max-new-tokens", "512",
         "--max-requests", "8", "--timeout-seconds", "86400"];
     if selected { argv.extend(["--max-selected-rows", "166144"]); }
+    let rows = prefill_rows.map(|rows| rows.to_string());
+    if let Some(rows) = rows.as_deref() { argv.extend(["--prefill-rows", rows]); }
+    if compact { argv.extend(["--input-encoding", "safe-bpe-v1"]); }
     let matches = crate::candidate_cli::definition().try_get_matches_from(argv).unwrap();
     let CandidateCommand::SourceInt4(command) = CandidateCommand::from_matches(&matches).unwrap()
         else { panic!("wrong source route"); };
@@ -28,10 +32,11 @@ fn snapshot_source_teams_preserve_all_tasks_evidence_work_errors_and_flushes_and
     let kernel = std::env::var("FNLP_INT4_TEST_KERNEL").expect("explicit kernel required");
     PackedInt4Kernel::detect(kernel.parse::<Int8KernelKind>().unwrap()).unwrap();
     let tasks = ["ner-batch", "keyphrases-batch", "summarize-batch", "answer-batch"];
-    let preparation_bytes = tasks.iter().flat_map(|task| [false, true].map(|selected|
-        command(task, 4, selected, &snapshot, &pin, &memory, &kernel).2.common.preparation_bytes))
+    let policies = [(false, false), (false, true), (true, false), (true, true)];
+    let preparation_bytes = tasks.iter().flat_map(|task| policies.map(|(selected, compact)|
+        command(task, 4, Some(64), selected, compact, &snapshot, &pin, &memory, &kernel).2.common.preparation_bytes))
         .max().unwrap();
-    let (_, base_args, base_limits) = command(tasks[0], 4, false, &snapshot, &pin, &memory, &kernel);
+    let (_, base_args, base_limits) = command(tasks[0], 4, Some(64), false, true, &snapshot, &pin, &memory, &kernel);
     let engine = NlpEngine::builder().resource_config(compute::resource_config(base_limits.common)).build().unwrap();
     let idle = engine.resources().memory_snapshot();
     let lease = engine.resources().acquire_lease();
@@ -44,14 +49,16 @@ fn snapshot_source_teams_preserve_all_tasks_evidence_work_errors_and_flushes_and
             Duration::from_secs(3600), CancellationToken::default()).unwrap();
         let resident = engine.resources().memory_snapshot();
         for task in tasks {
-            for selected in [false, true] {
+            for (selected, compact) in policies {
                 let mut expected: Option<Vec<u8>> = None;
                 let mut expected_summary = None;
-                let (serial_batch, serial_args, serial_limits) = command(task, 1, selected, &snapshot, &pin, &memory, &kernel);
+                let (serial_batch, serial_args, serial_limits) = command(task, 1, None, selected, compact,
+                    &snapshot, &pin, &memory, &kernel);
                 let task_budget = serial_batch.source.budget(&serial_args, serial_limits.common);
                 let input = source_parity_input(serial_batch.kind, task_budget);
-                for threads in [1, 2, 4] {
-                    let (batch, args, limits) = command(task, threads, selected, &snapshot, &pin, &memory, &kernel);
+                for (threads, rows) in [(1, None), (2, None), (4, None), (1, Some(1)), (2, Some(3)), (4, Some(64))] {
+                    let (batch, args, limits) = command(task, threads, rows, selected, compact,
+                        &snapshot, &pin, &memory, &kernel);
                     let budget = batch.source.budget(&args, limits.common);
                     assert_eq!(budget, task_budget);
                     assert_eq!(limits.transport, serial_limits.transport);
@@ -60,6 +67,8 @@ fn snapshot_source_teams_preserve_all_tasks_evidence_work_errors_and_flushes_and
                     assert_eq!(limits.selected_rows.map(|rows| rows.max_rows_per_step), selected.then_some(166144));
                     let defaults = batch.load_defaults(None, budget, args.max_input_bytes).unwrap();
                     let (planner, vocabulary) = source::planner().unwrap();
+                    let policy = args.input_encoding.policy(args.max_input_bytes, limits.common.max_prompt_tokens).unwrap();
+                    let planner = planner.with_document_encoding(policy).unwrap();
                     let identity = source::identity(model.model_identity(), &planner, source::task(batch.kind)).unwrap();
                     let config = Int4SourceCorpusConfig { identity, task_ceiling: budget,
                         planning: batch.source.planning(&args), defaults, native_work: limits.native,
@@ -74,12 +83,15 @@ fn snapshot_source_teams_preserve_all_tasks_evidence_work_errors_and_flushes_and
                     let output = SharedOutput::default();
                     let reader = Cursor::new(input.clone());
                     let cancellation = CancellationToken::default();
-                    let summary = if threads == 1 {
-                        engine.batch_int4_source(&model, Arc::new(planner), Arc::new(vocabulary), config,
-                            corpus, limits.common.kernel, reader, output.clone(), cancellation)
-                    } else {
-                        engine.batch_int4_source_with_threads(&model, Arc::new(planner), Arc::new(vocabulary), config,
-                            corpus, limits.common.kernel, threads, reader, output.clone(), cancellation)
+                    let summary = match (limits.common.prefill, threads) {
+                        (None, 1) => engine.batch_int4_source(&model, Arc::new(planner), Arc::new(vocabulary), config,
+                            corpus, limits.common.kernel, reader, output.clone(), cancellation),
+                        (None, _) => engine.batch_int4_source_with_threads(&model, Arc::new(planner), Arc::new(vocabulary), config,
+                            corpus, limits.common.kernel, threads, reader, output.clone(), cancellation),
+                        (Some(prefill), 1) => engine.batch_int4_source_layer_major(&model, Arc::new(planner), Arc::new(vocabulary),
+                            config, corpus, limits.common.kernel, prefill, reader, output.clone(), cancellation),
+                        (Some(prefill), _) => engine.batch_int4_source_layer_major_with_threads(&model, Arc::new(planner),
+                            Arc::new(vocabulary), config, corpus, limits.common.kernel, threads, prefill, reader, output.clone(), cancellation),
                     }.expect("invalid records must be reported while the protocol still drains");
                     let bytes = output.0.lock().unwrap().clone();
                     assert!(bytes.ends_with(b"\n"));
@@ -116,9 +128,9 @@ fn snapshot_source_teams_preserve_all_tasks_evidence_work_errors_and_flushes_and
                     assert_eq!(summary.failed, 2); assert_eq!(summary.flushes, 2);
                     // Raw byte equality retains task-finalized evidence, passage
                     // IDs, UTF-8/scalar offsets, tokens, exact work and all errors.
-                    // Dense and selected-row policies each retain their own baseline.
+                    // Each encoding and selected-row policy retains its own baseline.
                     if let Some(expected) = &expected {
-                        assert!(bytes.as_slice() == expected.as_slice(), "{task}, selected={selected}, threads={threads}");
+                        assert!(bytes.as_slice() == expected.as_slice(), "{task}, selected={selected}, compact={compact}, threads={threads}, rows={rows:?}");
                         assert_eq!(Some(summary), expected_summary);
                     } else { expected = Some(bytes); expected_summary = Some(summary); }
                     assert_eq!(engine.resources().memory_snapshot(), resident);

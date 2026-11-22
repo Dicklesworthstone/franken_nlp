@@ -1,5 +1,6 @@
 //! One owned ordered stream, one resident INT4 model and one hosted invocation.
 use super::*;
+use super::super::scored_batch::runtime::PrefillSchedule;
 use std::{fs::File, io::{BufRead, BufReader}, sync::Arc, time::{Duration, Instant}};
 use crate::{
     NlpEngine, MemoryClass,
@@ -18,6 +19,10 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     // or allocating the runtime, even for an internal programmatic caller.
     let limits = batch.validate(&args)?;
     let common = limits.common;
+    if !super::super::prefill::matches(&args, common)?
+        || common.compute != args.compute.admit_with_prefill(args.group_width, common.prefill)? {
+        return Err(CandidateError::Arguments);
+    }
     let encoding = batch.extraction.encoding_policy(&args, common.max_prompt_tokens)?;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
@@ -83,6 +88,8 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
             CohortSchedule::new(documents, common.prefill.map(|prefill| prefill.max_batch_rows))),
         max_selected_rows: limits.selected_rows.map(|limits| limits.max_rows_per_step),
         compute_schedule: compute::Schedule::for_threads(common.compute.threads),
+        prefill_schedule: common.prefill.filter(|_| limits.cohort_documents.is_none())
+            .map(PrefillSchedule::new).transpose()?,
         input_encoding: input_encoding::reported_policy(&encoding),
     };
     // This writer copies the canonical inner event without parsing its JSON
@@ -104,13 +111,18 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
                 corpus, max_documents, common.kernel, reader, writer, cancellation),
         };
         result.map_err(|_| CandidateError::Batch)?.summary
-    } else if common.compute.threads > 1 {
-        engine.batch_int4_extract_with_threads(&model, planner, vocabulary, limits.native,
-            corpus, common.kernel, common.compute.threads, reader, writer, cancellation)
-            .map_err(|_| CandidateError::Batch)?
     } else {
-        engine.batch_int4_extract(&model, planner, vocabulary, limits.native,
-            corpus, common.kernel, reader, writer, cancellation).map_err(|_| CandidateError::Batch)?
+        match (common.prefill, common.compute.threads) {
+            (Some(prefill), 1) => engine.batch_int4_extract_layer_major(&model, planner, vocabulary,
+                limits.native, corpus, common.kernel, prefill, reader, writer, cancellation),
+            (Some(prefill), threads) => engine.batch_int4_extract_layer_major_with_threads(&model,
+                planner, vocabulary, limits.native, corpus, common.kernel, threads, prefill,
+                reader, writer, cancellation),
+            (None, 1) => engine.batch_int4_extract(&model, planner, vocabulary, limits.native,
+                corpus, common.kernel, reader, writer, cancellation),
+            (None, threads) => engine.batch_int4_extract_with_threads(&model, planner, vocabulary,
+                limits.native, corpus, common.kernel, threads, reader, writer, cancellation),
+        }.map_err(|_| CandidateError::Batch)?
     };
     // Draining the protocol can still report failed documents. Never append
     // another stdout completion/error after the host's terminal frame.
@@ -150,6 +162,8 @@ struct Provenance<'a> {
     max_selected_rows: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compute_schedule: Option<compute::Schedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefill_schedule: Option<PrefillSchedule>,
     #[serde(skip_serializing_if = "Option::is_none")]
     input_encoding: Option<&'a crate::tokenizer::untrusted::UntrustedEncoding>,
 }
