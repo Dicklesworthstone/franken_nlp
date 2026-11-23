@@ -220,6 +220,20 @@ network reservation is additional to the 128 MiB local workspace; a cache hit
 needs only the local reservation. An insufficient local memory ceiling is
 refused before opening the manifest or artifact, with exit category 9.
 
+Both commands accept `--timeout-seconds` (default 3600, minimum 1) for the
+complete invocation. One deadline starts before runtime and file work and
+spans cache verification, every mirror and range, reconstruction when needed,
+and final publication. `--request-timeout-seconds` still bounds an individual
+transfer attempt; a retry does not renew the whole-operation deadline.
+Deadline checks are cooperative, including periodic checks while a transfer
+is pending. If cancellation wins after a verified file has been published,
+the command refuses success and preserves that file for authenticated retry.
+
+The hosted and low-level network APIs take a final `&mut impl DecodeStepControl`
+argument. Library callers retain and reuse that control through the complete
+acquisition workflow, including any subsequent local reconstruction, so caller
+cancellation and work limits retain their original cause and allowance.
+
 A successful command prints metadata only to stderr. `download-parts` exits
 zero after every part has a complete manifest digest; `acquire` exits zero only
 after the complete final artifact is verified or reconstructed. Both retain

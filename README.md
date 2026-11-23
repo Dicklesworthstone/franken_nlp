@@ -393,6 +393,15 @@ For live token delivery, the corresponding hosted entry is
 `execute_int4_chat_stream_layer_major_with_threads`; its sink remains charged
 until physical join and final publication.
 
+One-shot `classify`, `sentiment`, `judge`, `extract`, `ner`, `keyphrases`,
+`summarize` and `answer` also combine `--prefill-rows 1..=64` with
+`--compute-threads 2..=64`. One team spans the complete task, including every
+scoring head or constrained decode step. Admission includes both coordinator
+prompt scratch and batch-capable worker storage; the original task-wide work
+limits and result validation still apply. See
+[one-shot task prefill](docs/int4-prefill.md#one-shot-scored-and-structured-tasks)
+for the hosted entry points.
+
 Resident `score-batch --task classify|sentiment|judge` also combines
 `--prefill-rows 1..=64` with `--compute-threads 2..=64`. One fixed team spans
 prompt morsels, finite candidate scoring, records and flushes. Admission

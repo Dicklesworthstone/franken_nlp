@@ -81,6 +81,35 @@ The same team handles each short prompt morsel and each decoded token without
 reallocating its admitted capacity or renewing any work allowance. See the
 [token-stream contract](candidate-streaming.md#grouped-int4-streams-with-packed-prompts-and-workers).
 
+### One-shot scored and structured tasks
+
+`classify`, `sentiment`, `judge`, `extract`, `ner`, `keyphrases`, `summarize`
+and `answer` can combine `--prefill-rows 1..=64` with
+`--compute-threads 2..=64`. Add both flags to the existing one-shot command;
+the task's input format, source or snapshot pin and other limits still apply.
+One fixed team serves every prompt morsel and continuation across the complete
+task. For sentiment this includes every axis; for judgment it includes both
+pairwise orders, all rubric criteria or all source/evidence heads.
+
+Library callers use `NlpEngine::execute_int4_classify_layer_major_with_threads`,
+`execute_int4_sentiment_layer_major_with_threads`,
+`execute_int4_judge_layer_major_with_threads`,
+`execute_int4_extract_layer_major_with_threads` or
+`execute_int4_source_task_layer_major_with_threads`.
+The public `int4_chat_prefill_team_workspace_bytes` quote also covers these
+tasks' shared worker layout; ordinary native reservations and coordinator
+prompt workspace remain separate.
+The shared `HostedInt4TeamResult<T>` retains ownership through publication.
+
+Combined scheduling supports each task's existing compact-input and exact
+selected-row options. It preserves full-vocabulary scoring for scored tasks,
+the complete legal row set for constrained decoding, and the original aggregate
+work allowance. It cannot combine with `--cohort-heads`. Invalid widths,
+insufficient memory and stale worker quotations refuse before private IO.
+Cancellation drains the team before its model and scratch owners can release.
+The `compute` receipt records actual work; model parity and speed still require
+controller-admitted verification.
+
 ### Other task routes
 
 Source verification, independent snapshot pins, optional create-new snapshot

@@ -159,7 +159,7 @@ fn unavailable_runtime_never_opens_input_or_sources_or_publishes() {
 
 #[cfg(feature = "asupersync-runtime")]
 #[test]
-#[ignore = "requires controller-admitted pinned sources, a fresh snapshot and an available explicit SIMD kernel"]
+#[ignore = "requires controller-admitted pinned sources, a fresh snapshot and explicit SIMD/CPU-team inference"]
 fn source_scalar_and_pinned_snapshot_simd_complete_the_same_independent_axes() {
     let source = std::env::var("FNLP_INT4_TEST_SOURCE_DIR").expect("explicit pinned source directory required");
     let manifest = std::env::var("FNLP_INT4_TEST_SOURCE_MANIFEST").expect("explicit source manifest required");
@@ -190,13 +190,28 @@ fn source_scalar_and_pinned_snapshot_simd_complete_the_same_independent_axes() {
     // Obtain the independent pin from successful source conversion, never
     // from the snapshot header whose authenticity it is intended to establish.
     let pin = scalar["model_content_sha256"].as_str().unwrap();
-    let mut reload = parsed(&["--snapshot", &snapshot, "--expected-model-sha256", pin,
-        "--kernel", kernel.id()]).unwrap();
-    reload.args.memory_mib = memory;
-    let mut bytes = Vec::new(); reload.execute(&mut request.as_bytes(), &mut bytes).unwrap();
-    let selected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(selected["snapshot"]["operation"], "loaded");
-    assert_eq!(selected["integer_kernel"], kernel.id());
-    assert_eq!(selected["output"], scalar["output"]);
+    for (width, prefill) in [("1", None), ("1", Some("3")),
+        ("2", Some("1")), ("2", Some("2")), ("4", Some("3"))] {
+        let mut flags = vec!["--snapshot", &snapshot, "--expected-model-sha256", pin,
+            "--kernel", kernel.id(), "--compute-threads", width];
+        if let Some(rows) = prefill { flags.extend(["--prefill-rows", rows]); }
+        let mut reload = parsed(&flags).unwrap();
+        reload.args.memory_mib = memory;
+        let mut bytes = Vec::new(); reload.execute(&mut request.as_bytes(), &mut bytes).unwrap();
+        let selected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(selected["snapshot"]["operation"], "loaded");
+        assert_eq!(selected["integer_kernel"], kernel.id());
+        assert_eq!(selected["model_content_sha256"], pin);
+        // Includes all five work axes, every independent distribution and
+        // abstention, terminal EOS and the full-vocabulary denominators.
+        assert_eq!(selected["output"], scalar["output"], "width={width} prefill={prefill:?}");
+        if width == "1" { assert!(selected.get("compute").is_none()); }
+        else {
+            assert_eq!(selected["compute"]["compute_threads"], width.parse::<u64>().unwrap());
+            assert_eq!(selected["compute"]["schedule"], "int4-output-row-team-v1");
+            let workers = selected["compute"]["completed_worker_rows"].as_u64().unwrap();
+            assert!(workers > 0 && workers < selected["compute"]["completed_rows"].as_u64().unwrap());
+        }
+    }
     // The caller-requested snapshot is preserved on success and failure.
 }

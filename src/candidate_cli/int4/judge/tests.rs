@@ -195,7 +195,7 @@ fn unavailable_runtime_never_opens_private_input_or_sources_or_publishes() {
 
 #[cfg(feature = "asupersync-runtime")]
 #[test]
-#[ignore = "requires controller-admitted pinned sources, a fresh snapshot and an available explicit SIMD kernel"]
+#[ignore = "requires controller-admitted pinned sources, a fresh snapshot and explicit SIMD/CPU-team inference"]
 fn all_three_modes_match_between_source_scalar_and_pinned_snapshot_simd() {
     let source = std::env::var("FNLP_INT4_TEST_SOURCE_DIR").expect("explicit pinned source directory required");
     let manifest = std::env::var("FNLP_INT4_TEST_SOURCE_MANIFEST").expect("explicit source manifest required");
@@ -230,14 +230,29 @@ fn all_three_modes_match_between_source_scalar_and_pinned_snapshot_simd() {
         }
         assert_eq!(trusted_pin.as_deref(), Some(pin.as_str()));
         // The independent pin comes from source conversion, not the snapshot header.
-        let mut reload = parsed(&["--snapshot", &snapshot, "--expected-model-sha256", &pin,
-            "--kernel", kernel.id()]).unwrap();
-        reload.args.memory_mib = memory;
-        let mut bytes = Vec::new(); reload.execute(&mut request.as_bytes(), &mut bytes).unwrap();
-        let selected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(selected["snapshot"]["operation"], "loaded");
-        assert_eq!(selected["integer_kernel"], kernel.id());
-        assert_eq!(selected["output"], scalar["output"]);
+        for (width, prefill) in [("1", None), ("1", Some("3")),
+            ("2", Some("1")), ("2", Some("2")), ("4", Some("3"))] {
+            let mut flags = vec!["--snapshot", &snapshot, "--expected-model-sha256", &pin,
+                "--kernel", kernel.id(), "--compute-threads", width];
+            if let Some(rows) = prefill { flags.extend(["--prefill-rows", rows]); }
+            let mut reload = parsed(&flags).unwrap();
+            reload.args.memory_mib = memory;
+            let mut bytes = Vec::new(); reload.execute(&mut request.as_bytes(), &mut bytes).unwrap();
+            let selected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(selected["snapshot"]["operation"], "loaded");
+            assert_eq!(selected["integer_kernel"], kernel.id());
+            assert_eq!(selected["model_content_sha256"], pin);
+            // Both pairwise orders, all rubric criteria and every complete
+            // source/evidence head retain their result and exact native work.
+            assert_eq!(selected["output"], scalar["output"], "mode={mode} width={width} prefill={prefill:?}");
+            if width == "1" { assert!(selected.get("compute").is_none()); }
+            else {
+                assert_eq!(selected["compute"]["compute_threads"], width.parse::<u64>().unwrap());
+                assert_eq!(selected["compute"]["schedule"], "int4-output-row-team-v1");
+                let workers = selected["compute"]["completed_worker_rows"].as_u64().unwrap();
+                assert!(workers > 0 && workers < selected["compute"]["completed_rows"].as_u64().unwrap());
+            }
+        }
     }
     // The caller-owned snapshot is preserved on success and on failure.
 }
@@ -245,7 +260,8 @@ fn all_three_modes_match_between_source_scalar_and_pinned_snapshot_simd() {
 #[test]
 fn compact_judgment_admits_one_encoder_independently_of_head_scheduling() {
     for schedule in [&[][..], &["--prefill-rows", "4"][..],
-        &["--cohort-heads", "4"][..], &["--compute-threads", "3"][..]] {
+        &["--cohort-heads", "4"][..], &["--compute-threads", "3"][..],
+        &["--compute-threads", "3", "--prefill-rows", "3"][..]] {
         let plain = command(schedule);
         let base = options(&plain).validate(&plain.args).unwrap();
         let mut flags = schedule.to_vec();

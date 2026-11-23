@@ -93,9 +93,9 @@ impl ScoringArgs {
     pub(super) fn validate_one_off_with_prefill(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
         self.validate_scored_storage(args, false)
     }
-    /// One-shot classification, resident streams and authenticated scoring jobs
-    /// install batch-capable row teams. Other composed workflows keep their
-    /// scheduling contract.
+    /// One-shot classification, sentiment and judgment, resident streams and
+    /// authenticated scoring jobs install batch-capable row teams. Other
+    /// composed workflows keep their scheduling contract.
     pub(super) fn validate_with_threaded_prefill(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
         self.validate_scored_storage(args, true)
     }

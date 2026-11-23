@@ -28,7 +28,7 @@ fn judge_teams_admit_scratch_and_refuse_unsupported_composition() {
     under.args.memory_mib = limits.minimum_memory_bytes.saturating_sub(1) / MIB;
     assert_eq!(under.execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
     for flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
-        vec!["--compute-threads", "2", "--prefill-rows", "2"],
+        vec!["--compute-threads", "2", "--prefill-rows", "65"],
         vec!["--compute-threads", "2", "--cohort-heads", "4"]] {
         let mut output = Vec::new();
         assert_eq!(team_command(&flags).execute(&mut NoRead, &mut output), Err(CandidateError::Arguments));

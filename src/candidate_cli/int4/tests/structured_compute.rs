@@ -71,7 +71,7 @@ fn invalid_worker_widths_and_unbounded_prompt_schedules_refuse_before_private_io
 
 #[test]
 fn one_shot_prefill_teams_charge_both_prompt_and_worker_storage_before_io() {
-    for task in ["classify", "extract", "ner", "keyphrases", "summarize", "answer"] {
+    for task in TASKS {
         for rows in ["1", "2", "3", "64"] {
             let mut serial = parsed(task, &["--prefill-rows", rows]);
             snapshot(&mut serial);
@@ -99,19 +99,11 @@ fn one_shot_prefill_teams_charge_both_prompt_and_worker_storage_before_io() {
             }
         }
     }
-    // Broader scored workflows retain their separate scheduling gate until
-    // their own hosted drivers are composed.
-    for task in ["sentiment", "judge"] {
-        let mut output = Vec::new();
-        assert_eq!(parsed(task, &["--compute-threads", "2", "--prefill-rows", "1"])
-            .execute(&mut NoRead, &mut output), Err(CandidateError::Arguments));
-        assert!(output.is_empty());
-    }
 }
 
 #[test]
 fn worker_teams_compose_with_supported_compact_and_exact_selected_row_policies() {
-    for task in TASKS.iter().copied().filter(|task| *task != "judge") {
+    for task in TASKS {
         let command = parsed(task, &["--compute-threads", "4", "--input-encoding", "safe-bpe-v1"]);
         limits(&command).unwrap();
         assert!(!command.args.input_encoding.is_default());
@@ -161,7 +153,7 @@ fn stale_structured_worker_admission_refuses_before_runtime_or_private_input() {
             Err(CandidateError::Arguments));
         assert!(output.is_empty());
     }
-    for task in ["classify", "extract", "ner", "keyphrases", "summarize", "answer"] {
+    for task in TASKS {
         let command = parsed(task, &["--compute-threads", "4", "--prefill-rows", "3"]);
         let mut admitted = limits(&command).unwrap();
         assert!(compute::matches(&command.task, &command.args, admitted).unwrap());

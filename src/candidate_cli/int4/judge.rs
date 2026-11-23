@@ -70,7 +70,7 @@ impl JudgeArgs {
         // the host receives the prepared plan and performs no tokenization.
         let mut native_args = args.clone();
         native_args.input_encoding = input_encoding::InputEncodingArgs::default();
-        let mut limits = self.scoring.validate_one_off_with_prefill(&native_args)?;
+        let mut limits = self.scoring.validate_with_threaded_prefill(&native_args)?;
         // CLI input/planning/publication and hosted compiled input remain
         // separate charged owners during the complete native invocation.
         if limits.cohort.is_none() {

@@ -21,6 +21,8 @@ fn every_complete_task_result_retains_the_same_sendable_guarded_team_container()
     let _source = NlpEngine::execute_int4_source_task_with_threads;
     let _classify_prefill = NlpEngine::execute_int4_classify_layer_major_with_threads;
     let _extract_prefill = NlpEngine::execute_int4_extract_layer_major_with_threads;
+    let _judge_prefill = NlpEngine::execute_int4_judge_layer_major_with_threads;
+    let _sentiment_prefill = NlpEngine::execute_int4_sentiment_layer_major_with_threads;
     let _source_prefill = NlpEngine::execute_int4_source_task_layer_major_with_threads;
 }
 

@@ -109,8 +109,12 @@ pub(super) fn execute(args: Int4Args, command: JudgeArgs, _admitted: Int4Limits,
         preparation_reserve_bytes: limits.preparation_bytes, max_model_work: command.scoring.work_ceiling(),
     };
     let result = if limits.compute.threads > 1 {
-        engine.execute_int4_judge_with_threads(&model, plan, host, limits.kernel,
-            limits.compute.threads, cancellation).map(compute::Completion::Team)
+        match limits.prefill {
+            None => engine.execute_int4_judge_with_threads(&model, plan, host, limits.kernel,
+                limits.compute.threads, cancellation),
+            Some(prefill) => engine.execute_int4_judge_layer_major_with_threads(&model, plan, host,
+                limits.kernel, limits.compute.threads, prefill, cancellation),
+        }.map(compute::Completion::Team)
     } else {
         match limits.cohort {
             Some(_) => engine.execute_int4_judge_cohort(&model, plan, host.native,
