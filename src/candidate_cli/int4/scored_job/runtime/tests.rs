@@ -59,7 +59,10 @@ fn invalid_prompt_schedule_refuses_before_runtime_and_any_private_job_io() {
     for rows in [0, 65, usize::MAX] {
         let (c, mut args) = parts();
         let common = c.args.validate(&args).unwrap();
-        args.prefill_rows = Some(rows);
+        let row = rows.to_string();
+        let matches = generation_policy::GenerationPolicyArgs::augment_args(clap::Command::new("schedule"))
+            .try_get_matches_from(["schedule", "--prefill-rows", &row]).unwrap();
+        args.policy = generation_policy::GenerationPolicyArgs::from_arg_matches(&matches).unwrap();
         assert_eq!(execute(c.mode, args, c.args, common, NoIo, &mut NoIo).unwrap_err().code,
             "invalid_job_options");
     }

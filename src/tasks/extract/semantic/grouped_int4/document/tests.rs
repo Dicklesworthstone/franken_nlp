@@ -396,7 +396,7 @@ fn all_field_maps_are_prepared_before_any_review_and_share_native_prompt_and_log
     let reviews = prepare_reviews(&fixture.judge, &requests, &fixture.expected,
         &fixture.options, fixture.mapping, &mut Continue).unwrap();
     assert_eq!(reviews.maps.len(), 2);
-    assert_eq!(reviews.prompt_tokens, reviews.maps.iter().map(|map| map.total_prompt_tokens().unwrap()).sum());
+    assert_eq!(reviews.prompt_tokens, reviews.maps.iter().map(|map| map.total_prompt_tokens().unwrap()).sum::<usize>());
     let complete = fixture.expected.extraction.planned_work().checked_add(reviews.work).unwrap();
     let first = fixture.expected.extraction.planned_work().checked_add(reviews.maps[0].planned_work()).unwrap();
     for axis in 0..5 {

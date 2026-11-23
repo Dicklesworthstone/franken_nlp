@@ -39,7 +39,7 @@ fn unequal_group_scales_are_applied_before_summing() {
 
 #[test]
 fn odd_group_and_row_boundaries_and_model_widths_match_independent_i64_reference() {
-    for k in [1, 2, 3, 7, 8, 15, 16, 17, 33, 65, 3072, 6144, 10752] {
+    for k in [1_usize, 2, 3, 7, 8, 15, 16, 17, 33, 65, 3072, 6144, 10752] {
         let n = 4;
         let weights: Vec<_> = (0..n * k).map(|i| ((i * 7 + 3) % 16) as i8 - 8).collect();
         let packed = pack(&weights);

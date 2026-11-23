@@ -1,7 +1,43 @@
 //! Pure complete-population accounting; no native allocation or execution.
 use super::*;
-use super::super::tests::{config, limits, WIDTH};
-use crate::native_engine::strict_int4::Int4MemoryRequirement;
+use crate::{
+    grammar::mask::MaskWorkLimits,
+    native_engine::{constrained_int4, strict_int4::Int4MemoryRequirement},
+    tasks::{answer::AnswerOptions, ir::TaskBudget, mapreduce::{ChunkLimits, ExecutionLimits},
+        source_planning::{SourcePlanningLimits, grouped_int4::long::{Int4SourceMapLimits,
+            question::synthesis::{QuestionSynthesisLimits, hierarchy::QuestionHierarchyLimits}}}},
+};
+
+const WIDTH: usize = 127;
+fn config(mode: usize) -> Int4QuestionDocumentBatchConfig {
+    let mut item = constrained_int4::planned_work(WIDTH, 8128, 64).unwrap();
+    for _ in 0..8 { item = item.checked_add(item).unwrap(); }
+    let total = item.checked_add(item).unwrap();
+    let verification = GroundingBudget::default();
+    let lifetime = GroundingBudget { max_fields: verification.max_fields * 4,
+        max_matches: verification.max_matches * 4, max_scan_steps: verification.max_scan_steps * 4 };
+    Int4QuestionDocumentBatchConfig { options: AnswerOptions::default(),
+        budget: TaskBudget { max_input_tokens: 8192, max_output_tokens: 64, max_output_bytes: 65_536,
+            max_grammar_states: 4096, max_kv_bytes: Int4MemoryRequirement::for_context(8192, WIDTH).unwrap().kv_bytes },
+        planning: SourcePlanningLimits::default(), mapping: Int4SourceMapLimits {
+            chunks: ChunkLimits { max_input_bytes: 4096, max_chunk_bytes: 12, max_chunk_tokens: 12,
+                context_tokens: 8192, reserved_tokens: 64, max_chunks: 64, max_tokenizer_calls: 1024 },
+            reduction: ExecutionLimits { map_batch_chunks: 3, reduce_fan_in: 2, ..ExecutionLimits::default() },
+            max_model_work: item, mask_limits: MaskWorkLimits::default(),
+            mask_visits_per_chunk: 1000, max_mask_visits: 256000, verification },
+        verification, synthesis: (mode > 0).then_some(QuestionSynthesisLimits {
+            max_evidence_passages: 32, max_evidence_bytes: 4096 }),
+        hierarchy: (mode > 1).then_some(QuestionHierarchyLimits {
+            max_levels: 3, max_passes: 4, ..QuestionHierarchyLimits::default() }),
+        max_question_bytes: 1024, max_model_work: total.checked_add(total).unwrap(),
+        max_mask_visits: 1_024_000, max_map_verification: lifetime, max_verification: lifetime }
+}
+fn limits(config: Int4QuestionDocumentBatchConfig) -> JobLimits {
+    JobLimits { max_items: 2, max_id_bytes: 128, max_input_bytes_per_item: 8192,
+        max_snapshot_bytes: 65_536, max_result_bytes: 8 << 20, max_spool_bytes: 32 << 20,
+        max_materialized_bytes: 32 << 20, max_journal_bytes: 1 << 20, max_attempts: 4,
+        max_work: JobWork::from_int4(config.max_model_work, config.max_mask_visits) }
+}
 
 fn memory(chunks: Option<usize>, groups: Option<usize>) -> Int4QuestionDocumentJobMemoryLimits {
     Int4QuestionDocumentJobMemoryLimits {

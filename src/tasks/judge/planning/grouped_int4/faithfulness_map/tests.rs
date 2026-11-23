@@ -65,7 +65,7 @@ fn run(plan: &PreparedInt4Judge, favorite: Option<&str>) -> Int4JudgeRun {
         } else { head.scorer.score(&mut fixtures::Constant, ScoringMode::FullVocabulary).unwrap() };
         Ok(Int4CandidateRun { schema_version: 1, execution: INT4_SCORING_EXECUTION.to_owned(),
             numerics_profile: STRICT_INT4_PROFILE.to_owned(), group_width: 32,
-            scores, model_work: schedule.model, rewound_positions: schedule.rewound })
+            scores, model_work: schedule.model, rewound_positions: schedule.rewound_positions() })
     }).unwrap()
 }
 fn finish(plan: &PreparedInt4FaithfulnessMap<'_>) -> Result<Int4FaithfulnessMapRun, Int4FaithfulnessMapError> {

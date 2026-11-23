@@ -119,6 +119,10 @@ fn bind_request(output: &mut RedactionResult, request: &RedactionRequest) -> Res
         &crate::canonjson::canonical_bytes(&binding).map_err(|_| RedactError::Serialization)?);
     Ok(())
 }
+#[cfg(test)]
+pub(super) fn bind_request_fixture(output: &mut RedactionResult, request: &RedactionRequest) -> Result<(), RedactError> {
+    bind_request(output, request)
+}
 fn require_clean<E>(document: DetectedDocument<'_>, report_cap: usize) -> Result<(), PipelineError<E>> {
     if !document.regions.is_empty() {
         let report = LeakReport { schema_version: 1, residuals: document.regions,

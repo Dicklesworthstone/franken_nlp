@@ -294,7 +294,7 @@ impl ResolutionProgress {
         if run.schema_version != 1 || run.execution != INT4_SCORING_EXECUTION
             || run.numerics_profile != STRICT_INT4_PROFILE || run.group_width != width
             || run.model_work != schedule.model || run.scores.work != schedule.scoring
-            || run.rewound_positions != 2 || schedule.rewound != 2 {
+            || run.rewound_positions != 2 || schedule.rewound_positions() != 2 {
             return Err(Int4ResolveError::Accounting);
         }
         let result = validate_scores(&run.scores, eos)?;

@@ -151,6 +151,8 @@ impl CandidateSchedule {
             scored_edges: usize::try_from(scored_edges).map_err(|_| StrictInt4Error::Work)?, projected_logits: rows,
         }, model, context, group_width, max_prefix: maximum, rewound: edges - previous.len() as u64 })
     }
+    pub(crate) fn group_width(&self) -> usize { self.group_width }
+    pub(crate) fn rewound_positions(&self) -> u64 { self.rewound }
     pub(crate) fn preflight(self, engine: &StrictInt4Engine<'_>, budget: Int4ScoringBudget) -> Result<(), Int4ScoringError> {
         if engine.model_identity().group_width() != self.group_width { return Err(Int4ScoringError::Identity); }
         if engine.state.active || engine.state.poisoned || !engine.cache.all_slots_have_len(0) {

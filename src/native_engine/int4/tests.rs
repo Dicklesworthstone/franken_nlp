@@ -45,7 +45,7 @@ fn available_native_leaves_match_i64_and_existing_scalar_across_tails() {
             Err(error) => panic!("unexpected detection error: {error}"),
         };
         assert_eq!(kernel.kind(), kind);
-        for k in [0, 1, 2, 7, 8, 15, 16, 31, 32, 33, 63, 64, 65, 3072, 6144, 10752] {
+        for k in [0_usize, 1, 2, 7, 8, 15, 16, 31, 32, 33, 63, 64, 65, 3072, 6144, 10752] {
             for m in [1, 4, 5] {
                 // Odd K deliberately places alternating row starts in the
                 // high nibble. The exact flat layout contains no row padding.

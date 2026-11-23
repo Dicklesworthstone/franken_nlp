@@ -1,4 +1,6 @@
 #![deny(unsafe_code)]
+// The complete assay-discovery JSON schema exceeds the default macro depth.
+#![recursion_limit = "256"]
 #![cfg_attr(all(target_arch = "aarch64", target_endian = "little"), feature(stdarch_neon_i8mm))]
 
 pub mod artifact;

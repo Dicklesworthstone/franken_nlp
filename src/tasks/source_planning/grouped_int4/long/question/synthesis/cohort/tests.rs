@@ -63,7 +63,7 @@ fn shared_continuation_preserves_answer_abstention_and_zero_allocation_no_eviden
         let (_, original) = fixtures::synthetic(mode);
         let original_json = serde_json::to_value(&original).unwrap();
         let mut calls = 0;
-        let document = continuation.execute(original.discovery, &planner, &mut fixtures::continuing(), |plan, _| {
+        let document = continuation.execute(original.discovery, &mut fixtures::continuing(), |plan, _| {
             calls += 1;
             let raw = fixtures::raw(plan, &[("evidence_0", "é"), ("evidence_1", "é")],
                 (mode != 2).then_some("é"), "final answer");

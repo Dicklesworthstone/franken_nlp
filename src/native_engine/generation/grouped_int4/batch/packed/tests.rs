@@ -100,15 +100,15 @@ impl PackedDriver for Model {
 }
 struct Decoder;
 impl DecodeByteDecoder for Decoder {
-    type Error = ();
-    fn decode_token_ids(&self, ids: &[u32]) -> Result<Vec<u8>, ()> { Ok(ids.iter().map(|&id| b'a' + id as u8).collect()) }
+    type Error = std::convert::Infallible;
+    fn decode_token_ids(&self, ids: &[u32]) -> Result<Vec<u8>, Self::Error> { Ok(ids.iter().map(|&id| b'a' + id as u8).collect()) }
 }
 #[derive(Default)] struct Sink { events: Vec<DecodeTokenEvent>, fail: bool }
 impl DecodeEventSink for Sink {
-    type Error = (); type Permit = ();
-    fn reserve(&mut self, _: &DecodeTokenEvent) -> Result<(), ()> { Ok(()) }
-    fn permit(&mut self, _: (), event: DecodeTokenEvent) -> Result<(), ()> {
-        self.events.push(event); if self.fail { Err(()) } else { Ok(()) }
+    type Error = &'static str; type Permit = ();
+    fn reserve(&mut self, _: &DecodeTokenEvent) -> Result<(), Self::Error> { Ok(()) }
+    fn permit(&mut self, _: (), event: DecodeTokenEvent) -> Result<(), Self::Error> {
+        self.events.push(event); if self.fail { Err("fixture delivery refusal") } else { Ok(()) }
     }
 }
 fn run(plans: &[Int4GenerationPlan], width: Option<usize>, model: &mut Model, sink: &mut Sink)

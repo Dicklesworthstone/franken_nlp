@@ -376,8 +376,8 @@ fn prompt_width_is_physical_while_item_lifetime_and_tokenizer_limits_stay_fixed(
             } } }
         }
         for rows in [0, 65, usize::MAX] {
-            let (c, mut args) = command("resume", task, &[]);
-            args.prefill_rows = Some(rows);
+            let row = rows.to_string();
+            let (c, args) = command("resume", task, &["--prefill-rows", &row]);
             assert!(c.execute_owned(args, NoIo, &mut NoIo).is_err());
         }
     }

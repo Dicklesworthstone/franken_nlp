@@ -7,7 +7,7 @@ use super::*;
 use super::extract_job::StorageArgs;
 use crate::{
     candidate_cli::{batch::IO_BUFFER_BYTES, jobs::{self as job_cli, Failure, RunMode}},
-    jobs::{JobLimits, population::PopulationReadLimits, runner::generation::GenerationJobTask},
+    jobs::{GenerationJobTask, JobLimits, population::PopulationReadLimits},
     native_engine::{generation::grouped_int4::Int4GenerationBudget, strict_int4::Int4RunBudget},
     tokenizer::untrusted::SafeBpeWorkLimits,
 };

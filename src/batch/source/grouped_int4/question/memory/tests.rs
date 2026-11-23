@@ -212,6 +212,16 @@ fn input_document_and_native_reservations_must_coexist_without_overflow() {
             1 => memory.io_reserve_bytes = u64::MAX, 2 => memory.allocator_reserve_bytes = u64::MAX,
             3 => memory.reduction_reserve_bytes = u64::MAX,
             _ => config.budget.max_output_bytes = u64::MAX }
+        assert!(memory.requirements(32, config, transport).is_err(), "owner {owner}");
+    }
+    let (mut memory, config, transport) = fixture();
+    let ordinary = memory.requirements(32, config, transport).unwrap();
+    let other_input = ordinary.input_bytes - memory.preparation_reserve_bytes;
+    memory.preparation_reserve_bytes = u64::MAX - other_input - 1024;
+    assert!(memory.requirements(32, config, transport).is_err(),
+        "representable input alone must not authorize an overflowing simultaneous peak");
+}
+
 #[test]
 fn hierarchy_prices_every_retained_pass_question_copy_and_native_window() {
     let (mut memory, mut config, transport) = fixture(); synthesize(&mut config);
@@ -242,13 +252,4 @@ fn hierarchy_prices_every_retained_pass_question_copy_and_native_window() {
     }
     memory.hierarchy_groups = Some(1); config.hierarchy = None;
     assert!(memory.requirements(32, config, transport).is_err());
-}
-        assert!(memory.requirements(32, config, transport).is_err(), "owner {owner}");
-    }
-    let (mut memory, config, transport) = fixture();
-    let ordinary = memory.requirements(32, config, transport).unwrap();
-    let other_input = ordinary.input_bytes - memory.preparation_reserve_bytes;
-    memory.preparation_reserve_bytes = u64::MAX - other_input - 1024;
-    assert!(memory.requirements(32, config, transport).is_err(),
-        "representable input alone must not authorize an overflowing simultaneous peak");
 }

@@ -5,7 +5,7 @@ use super::*;
 use crate::{
     candidate_cli::{int4::extract_job::StorageArgs, jobs::{self as job_cli, Failure, RunMode}},
     jobs::{JobLimits, population::PopulationReadLimits,
-        runner::source::grouped_int4::question_document::memory::{
+        question_document::{
             Int4QuestionDocumentJobMemoryLimits, Int4QuestionDocumentJobMemoryRequirement}},
 };
 

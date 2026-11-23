@@ -16,7 +16,7 @@ impl PreparedInt4SentimentMap<'_> {
             plan.preflight(identity, engine, Int4ScoringBudget {
                 native: Int4RunBudget::exact(plan.planned_work()), max_kv_bytes: budget.max_kv_bytes })?;
         }
-        checkpoint(control)
+        checkpoint(control)?; Ok(())
     }
 
     /// Every document and every counter is preflighted before any forward.
@@ -45,7 +45,7 @@ impl PreparedInt4SentimentMap<'_> {
         control: &mut C) -> Result<(), Int4SentimentMapError> {
         checkpoint(control)?; self.check_identities(admitted, weights.identity(), budget.native, control)?;
         self.cohort_windows(admitted, cohort_chunks, budget, control)?;
-        checkpoint(control)
+        checkpoint(control)?; Ok(())
     }
 
     /// Real simultaneous chunk × axis heads, with separate KV and original

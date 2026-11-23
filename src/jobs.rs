@@ -14,10 +14,21 @@ mod frame;
 mod retained;
 mod memory;
 pub mod population;
+pub mod question_document;
 pub use commitment::{Commitment, JobId, JobSecret};
 pub use manifest::{FrozenManifest, JobContract, JobInput, JobLimits, JobWork};
 pub use retained::{InputRetentionLimits, RetainedInputReport};
 pub use memory::JobInputMemory;
+
+/// Pure task identity shared by option validation and the optional runner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationJobTask { Generate, Chat }
+impl GenerationJobTask {
+    pub fn identity(self) -> &'static str {
+        match self { Self::Generate => "generate-v1", Self::Chat => "chat-v1" }
+    }
+}
 
 #[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod journal;

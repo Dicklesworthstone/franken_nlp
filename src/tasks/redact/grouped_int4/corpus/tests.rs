@@ -365,7 +365,7 @@ fn receipt(c: &Int4DocumentRedactionBatchConfig, pseudonyms: Option<&Pseudonyms<
     document.model_types = c.detector.ner.types.iter().copied().collect();
     let mut result = actions::apply(&document, &c.request.actions, pseudonyms, c.request.edit_budget).unwrap();
     if c.request.verify { result.verification = VerificationStatus::CleanDeclaredUnion; }
-    pipeline::bind_request(&mut result, &c.request).unwrap();
+    pipeline::bind_request_fixture(&mut result, &c.request).unwrap();
     let one = constrained_int4::planned_work(WIDTH, 128, 16).unwrap(); let two = one.checked_add(one).unwrap();
     let used = SourceMapVerification { fields: 2, matches: 3, scan_steps: 7 };
     let stage = || Int4LongRedactionStage { preflight: Int4LongRedactionPreflight {

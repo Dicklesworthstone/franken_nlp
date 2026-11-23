@@ -298,7 +298,8 @@ fn exact_host_detection_authorizes_a_kernel_or_refuses_before_any_input() {
                 Int4Task::RedactCorpus(redact) => redact.validate(&command.args).map(|limits| limits.common),
                 Int4Task::Extract(extraction) => extraction.validate(&command.args),
                 Int4Task::Semantic(semantic) => semantic.validate(&command.args),
-                Int4Task::SemanticJob | Int4Task::SourceSemanticJob | Int4Task::SemanticObjectMap(_) => Err(CandidateError::Arguments),
+                Int4Task::SemanticJob | Int4Task::SourceSemanticJob | Int4Task::SemanticObjectMap(_)
+                    | Int4Task::SemanticObjectCorpus(_) | Int4Task::SemanticObjectDocumentJob => Err(CandidateError::Arguments),
                 Int4Task::Source(_, source) => source.validate(&command.args),
                 Int4Task::ExtractBatch(batch) => batch.validate(&command.args).map(|limits| limits.common),
                 Int4Task::ExtractMap(map) => map.validate(&command.args).map(|limits| limits.common),
@@ -343,7 +344,8 @@ fn physical_kernel_selection_does_not_change_layout_memory_or_generation_options
             Int4Task::RedactCorpus(redact) => redact.validate(&command.args).unwrap().common,
             Int4Task::Extract(extraction) => extraction.validate(&command.args).unwrap(),
             Int4Task::Semantic(semantic) => semantic.validate(&command.args).unwrap(),
-            Int4Task::SemanticJob | Int4Task::SourceSemanticJob | Int4Task::SemanticObjectMap(_) => panic!("semantic compositions require typed execution"),
+            Int4Task::SemanticJob | Int4Task::SourceSemanticJob | Int4Task::SemanticObjectMap(_)
+                | Int4Task::SemanticObjectCorpus(_) | Int4Task::SemanticObjectDocumentJob => panic!("semantic compositions require typed execution"),
             Int4Task::Source(_, source) => source.validate(&command.args).unwrap(),
             Int4Task::ExtractBatch(batch) => batch.validate(&command.args).unwrap().common,
             Int4Task::ExtractMap(map) => map.validate(&command.args).unwrap().common,

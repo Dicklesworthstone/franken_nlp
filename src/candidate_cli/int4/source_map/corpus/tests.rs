@@ -203,6 +203,8 @@ fn invalid_population_and_native_windows_refuse_before_private_options_model_or_
         let (command, args) = arguments(&flags);
         assert_eq!(command.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments), "{flags:?}");
     }
+}
+
 #[test]
 fn per_record_hierarchy_supports_independent_discovery_and_group_windows() {
     let (flat, args) = arguments(&["--synthesize-answer"]);
@@ -238,7 +240,6 @@ fn per_record_hierarchy_supports_independent_discovery_and_group_windows() {
         selection.extend(flags); let (command, args) = arguments(&selection);
         assert_eq!(command.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
     }
-}
 }
 
 #[cfg(not(feature = "asupersync-runtime"))]

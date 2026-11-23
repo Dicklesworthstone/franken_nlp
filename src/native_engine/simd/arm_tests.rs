@@ -54,13 +54,13 @@ fn safe_autovec_rejects_every_bad_row_before_writing_any_output() {
     assert_eq!(autovec::dot_rows_into(&[&good, &good, &good, &short], &good, &mut output),
         Err(CpuKernelError::LengthMismatch));
     assert_eq!(output, [123; 4]);
-    assert_eq!(autovec::dot_rows_into(&[&good; 4], &good, &mut output[..3]), Err(CpuKernelError::Shape));
+    assert_eq!(autovec::dot_rows_into(&[&good[..]; 4], &good, &mut output[..3]), Err(CpuKernelError::Shape));
     assert_eq!(output, [123; 4]);
     let long = vec![0; MAX_MODEL_K + 1];
     assert_eq!(autovec::dot_rows_into(&[&long], &long, &mut output[..1]), Err(CpuKernelError::ReductionTooLong));
     assert_eq!(output, [123; 4]);
     let mut too_many = [123; 5];
-    assert_eq!(autovec::dot_rows_into(&[&good; 5], &good, &mut too_many), Err(CpuKernelError::Shape));
+    assert_eq!(autovec::dot_rows_into(&[&good[..]; 5], &good, &mut too_many), Err(CpuKernelError::Shape));
     assert_eq!(too_many, [123; 5]);
 }
 #[test]

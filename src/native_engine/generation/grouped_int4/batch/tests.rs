@@ -81,16 +81,16 @@ impl BatchDriver for Model {
 }
 struct Decoder;
 impl DecodeByteDecoder for Decoder {
-    type Error = ();
-    fn decode_token_ids(&self, ids: &[u32]) -> Result<Vec<u8>, ()> {
+    type Error = std::convert::Infallible;
+    fn decode_token_ids(&self, ids: &[u32]) -> Result<Vec<u8>, Self::Error> {
         Ok(ids.iter().map(|&id| b'a' + id as u8).collect())
     }
 }
 #[derive(Default)] struct Sink(Vec<DecodeTokenEvent>);
 impl DecodeEventSink for Sink {
-    type Permit = (); type Error = ();
-    fn reserve(&mut self, _: &DecodeTokenEvent) -> Result<(), ()> { Ok(()) }
-    fn permit(&mut self, _: (), event: DecodeTokenEvent) -> Result<(), ()> { self.0.push(event); Ok(()) }
+    type Permit = (); type Error = std::convert::Infallible;
+    fn reserve(&mut self, _: &DecodeTokenEvent) -> Result<(), Self::Error> { Ok(()) }
+    fn permit(&mut self, _: (), event: DecodeTokenEvent) -> Result<(), Self::Error> { self.0.push(event); Ok(()) }
 }
 fn run(plans: &[Int4GenerationPlan], model: &mut Model, sink: &mut impl DecodeEventSink)
     -> Result<Int4BatchGenerationOutput, Int4GenerationError> {
@@ -192,9 +192,9 @@ fn native_cancellation_delivery_and_work_failures_abort_the_entire_run() {
     }
     struct FailedSink(usize);
     impl DecodeEventSink for FailedSink {
-        type Permit = (); type Error = ();
-        fn reserve(&mut self, _: &DecodeTokenEvent) -> Result<(), ()> { Ok(()) }
-        fn permit(&mut self, _: (), _: DecodeTokenEvent) -> Result<(), ()> { self.0 += 1; Err(()) }
+        type Permit = (); type Error = &'static str;
+        fn reserve(&mut self, _: &DecodeTokenEvent) -> Result<(), Self::Error> { Ok(()) }
+        fn permit(&mut self, _: (), _: DecodeTokenEvent) -> Result<(), Self::Error> { self.0 += 1; Err("fixture delivery refusal") }
     }
     let mut model = Model::new(&[&[1], &[2]]); let mut sink = FailedSink(0);
     assert!(run(&plans, &mut model, &mut sink).is_err()); assert_eq!(sink.0, 1); assert!(model.aborted);

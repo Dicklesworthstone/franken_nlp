@@ -279,7 +279,7 @@ impl Int4SentimentMapPreflight {
         }
         if byte != self.source_span.byte_end || scalar != self.source_span.scalar_end
             || work != self.work || retained != run.retained_result_bytes { return Err(Int4SentimentMapError::Admission); }
-        execution::value_bytes(run, self.max_result_bytes)?; checkpoint(control)
+        execution::value_bytes(run, self.max_result_bytes)?; checkpoint(control)?; Ok(())
     }
     /// Cohort diagnostics belong to this exact completed request as well as
     /// its semantic output; valid-looking replacement counters are refused.
@@ -303,7 +303,7 @@ impl Int4SentimentMapPreflight {
         }
         self.verify_completed_with_control(&run.output, control)?;
         execution::value_bytes(run, cap)?;
-        checkpoint(control)
+        checkpoint(control)?; Ok(())
     }
 }
 

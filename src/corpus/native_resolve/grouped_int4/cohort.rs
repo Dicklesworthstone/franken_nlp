@@ -251,8 +251,8 @@ impl Window {
         for pair in schedules {
             for &schedule in pair {
                 resolve::checkpoint(control)?;
-                if schedule.group_width != width || schedule.scoring.prefix_evaluations != 4
-                    || schedule.scoring.scored_edges != 6 || schedule.rewound != 2 {
+                if schedule.group_width() != width || schedule.scoring.prefix_evaluations != 4
+                    || schedule.scoring.scored_edges != 6 || schedule.rewound_positions() != 2 {
                     return Err(Int4ResolveError::Accounting);
                 }
                 contexts.push(schedule.context); flat.push(schedule);

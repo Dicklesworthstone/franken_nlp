@@ -17,15 +17,7 @@ use crate::{
 mod recipe;
 pub use recipe::GenerationJobRecipe;
 pub mod grouped_int4;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GenerationJobTask { Generate, Chat }
-impl GenerationJobTask {
-    pub fn identity(self) -> &'static str {
-        match self { Self::Generate => "generate-v1", Self::Chat => "chat-v1" }
-    }
-}
+pub use crate::jobs::GenerationJobTask;
 
 /// Fixed caller-owned configuration. All effective generation options,
 /// including an explicit seed, are frozen once, not read again per attempt.

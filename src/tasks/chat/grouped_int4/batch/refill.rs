@@ -73,4 +73,11 @@ fn finalize(requests: &[Int4ChatBatchRequest<'_>], raw: Int4BatchGenerationOutpu
     Ok(result)
 }
 
+struct Discard;
+impl DecodeEventSink for Discard {
+    type Permit = (); type Error = std::convert::Infallible;
+    fn reserve(&mut self, _: &crate::native_engine::decode::DecodeTokenEvent) -> Result<(), Self::Error> { Ok(()) }
+    fn permit(&mut self, _: (), _: crate::native_engine::decode::DecodeTokenEvent) -> Result<(), Self::Error> { Ok(()) }
+}
+
 #[cfg(test)] mod tests;

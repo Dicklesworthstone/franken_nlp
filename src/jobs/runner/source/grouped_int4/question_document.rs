@@ -19,6 +19,7 @@ use crate::{
     tokenizer::untrusted::{SafeBpeWorkLimits, UntrustedEncoding},
 };
 pub use crate::batch::source::grouped_int4::question::QuestionDocumentArgs;
+pub(crate) use crate::jobs::question_document::check_limits;
 pub mod memory;
 
 const RECIPE_BYTES: usize = 1024 * 1024 - 1024;
@@ -239,31 +240,6 @@ impl<A: Int4QuestionDocumentBatchAdmission> DurableBatchProcessor for Int4Questi
         self.planner.durable_work(prepared)
     }
     fn max_result_bytes(&self, _: &Self::Prepared) -> u64 { self.planner.max_result_bytes() }
-}
-
-pub(crate) fn check_limits(config: Int4QuestionDocumentBatchConfig, limits: JobLimits) -> Result<(), BatchFault> {
-    limits.validate().map_err(|_| BatchCode::InvalidLimits)?;
-    config.validate()?;
-    if limits.max_work != JobWork::from_int4(config.max_model_work, config.max_mask_visits)
-        || config.mapping.chunks.max_input_bytes > limits.max_input_bytes_per_item
-        || config.max_question_bytes > limits.max_input_bytes_per_item
-        || config.mapping.reduction.max_result_bytes > limits.max_result_bytes {
-        return Err(BatchCode::InvalidLimits.into());
-    }
-    // These six counters are not journal columns. The immutable attempt cap
-    // therefore bounds their total across every process, including failures;
-    // reopening a fresh invocation ledger cannot create more authority.
-    verification_lifetime(config.mapping.verification, config.max_map_verification, limits.max_attempts)?;
-    verification_lifetime(config.verification, config.max_verification, limits.max_attempts)
-}
-fn verification_lifetime(per: GroundingBudget, lifetime: GroundingBudget, attempts: u64) -> Result<(), BatchFault> {
-    let count = usize::try_from(attempts).map_err(|_| BatchCode::InvalidLimits)?;
-    if count == 0 || per.max_fields.checked_mul(count).is_none_or(|n| n > lifetime.max_fields)
-        || per.max_matches.checked_mul(count).is_none_or(|n| n > lifetime.max_matches)
-        || per.max_scan_steps.checked_mul(attempts).is_none_or(|n| n > lifetime.max_scan_steps) {
-        return Err(BatchCode::InvalidLimits.into());
-    }
-    Ok(())
 }
 
 #[cfg(test)] mod tests;

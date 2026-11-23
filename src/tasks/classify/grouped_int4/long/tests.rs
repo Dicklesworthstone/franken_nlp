@@ -49,7 +49,7 @@ fn run(plan: &PreparedInt4Classification) -> Int4ClassificationRun {
     plan.execute_heads(&mut Continue, |_, head, schedule, _| Ok(Int4CandidateRun {
         schema_version: 1, execution: INT4_SCORING_EXECUTION.to_owned(), numerics_profile: STRICT_INT4_PROFILE.to_owned(),
         group_width: 32, scores: head.classifier.scorer.score(&mut fixtures::Constant, ScoringMode::FullVocabulary).unwrap(),
-        model_work: schedule.model, rewound_positions: schedule.rewound })).unwrap()
+        model_work: schedule.model, rewound_positions: schedule.rewound_positions() })).unwrap()
 }
 fn finish(plan: &PreparedInt4ClassificationMap<'_>) -> Result<Int4ClassificationMapRun, Int4ClassificationMapError> {
     plan.collect_with_control(&mut Continue, |_, row, _| Ok(run(row)))
