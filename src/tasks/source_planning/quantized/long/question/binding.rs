@@ -1,4 +1,4 @@
-//! Private, bounded request/result commitments for complete-document QA.
+//! Private, bounded request/result commitments for complete-document tasks.
 //! These hashes never enter serialized output or diagnostic formatting.
 use super::*;
 use sha2::{Digest, Sha256};
@@ -38,14 +38,14 @@ pub(super) fn result_with_checkpoints<F>(run: &Int8QuestionRun, cap: u64, check:
     writer.finish()
 }
 
-pub(super) struct Continue;
+pub(in crate::tasks::source_planning::quantized::long) struct Continue;
 impl DecodeStepControl for Continue {
     fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
 }
 
 /// Preserve the original complete allowance before a synthesis reservation
 /// subtracts from it. The nested request already binds source and question.
-pub(super) fn composed_request<C: DecodeStepControl>(domain: &[u8], nested: [u8; 32],
+pub(in crate::tasks::source_planning::quantized::long) fn composed_request<C: DecodeStepControl>(domain: &[u8], nested: [u8; 32],
     authority: &(impl Serialize + ?Sized), mapping: Int8SourceMapLimits, control: &mut C)
     -> Result<[u8; 32], Int8SourceMapError> {
     let mut check = || checkpoint(control).map_err(Int8SourceMapError::from);
@@ -60,7 +60,7 @@ pub(super) fn composed_request<C: DecodeStepControl>(domain: &[u8], nested: [u8;
 
 /// The public result omits private child commitments. Bind those explicitly
 /// so a foreign discovery result with identical visible bytes cannot be used.
-pub(super) fn composed_result<C: DecodeStepControl>(domain: &[u8], request: [u8; 32],
+pub(in crate::tasks::source_planning::quantized::long) fn composed_result<C: DecodeStepControl>(domain: &[u8], request: [u8; 32],
     nested: &[[u8; 32]], value: &(impl Serialize + ?Sized), cap: u64, control: &mut C)
     -> Result<[u8; 32], Int8SourceMapError> {
     let mut check = || checkpoint(control).map_err(Int8SourceMapError::from);
@@ -69,6 +69,34 @@ pub(super) fn composed_result<C: DecodeStepControl>(domain: &[u8], request: [u8;
     writer.hash.update((nested.len() as u64).to_le_bytes());
     for binding in nested { writer.hash.update(binding); }
     writer.value(value)?;
+    writer.finish()
+}
+
+/// Bind a document-mode request before inference, including all caller
+/// allowances and the exact partition produced by the source planner.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::tasks::source_planning::quantized::long) fn document_request<C: DecodeStepControl>(domain: &[u8],
+    source: &str, authority: &(impl Serialize + ?Sized), budget: TaskBudget,
+    context: &PlanContext<'_>, planning: SourcePlanningLimits, mapping: Int8SourceMapLimits,
+    planner: &SourceTaskPlanner, chunks: &ChunkPlan<'_>, control: &mut C)
+    -> Result<[u8; 32], Int8SourceMapError> {
+    let mut check = || checkpoint(control).map_err(Int8SourceMapError::from);
+    let mut writer = PrivateBinding::new(domain, u64::MAX, &mut check)?;
+    let identity = context.execution_identity().receipt_identity().map_err(|_| Int8SourceMapError::Admission)?;
+    let compiler = planning.compiler;
+    writer.value(&(identity, source, authority, budget, context.budget_ceiling()))?;
+    writer.value(&(mapping.chunks, mapping.reduction, mapping.max_model_work,
+        (mapping.mask_limits.max_trie_node_visits, mapping.mask_limits.checkpoint_interval_nodes),
+        mapping.mask_visits_per_chunk, mapping.max_mask_visits))?;
+    writer.value(&((planning.max_input_bytes, planning.max_context_tokens, planning.max_passages),
+        (compiler.max_schema_bytes, compiler.max_string_bytes, compiler.max_array_items, compiler.max_output_bytes,
+            compiler.max_states, compiler.max_transitions, compiler.max_mask_bytes),
+        planning.source, planner.document_encoding(), planner.map_document_encoding_limits()))?;
+    writer.value(&chunks.chunks().len())?;
+    for chunk in chunks.chunks() {
+        writer.poll()?;
+        writer.value(&(chunk.id(), chunk.span(), chunk.tokens()))?;
+    }
     writer.finish()
 }
 

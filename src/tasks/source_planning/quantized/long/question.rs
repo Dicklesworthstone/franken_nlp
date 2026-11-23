@@ -14,7 +14,7 @@ use crate::{
 
 mod planning;
 mod execution;
-mod binding;
+pub(super) mod binding;
 /// Explicit evidence-only neural synthesis; independent passage QA is unchanged.
 pub mod synthesis;
 

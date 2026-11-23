@@ -2,6 +2,7 @@
 //! Generated map bullets are retained, never promoted to source facts. Every
 //! quote must fit the final context; this is not full-document equivalence.
 use super::*;
+use crate::tasks::source_planning::quantized::long::question::binding;
 use crate::{
     native_engine::portable_int8::ProjectionWork,
     tasks::{ir::ScoreSpace, summarize::{CitedBullet, CitationGuarantee, SourceCitation, SummarySemanticSupport}},
@@ -49,8 +50,8 @@ impl SourceSummarySynthesis {
     }
 }
 
-/// Content-free accounting commitment. This is not a native execution receipt.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Private request and accounting commitment. This is not a native execution receipt.
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Int8SummarySynthesisPreflight {
     chunks: usize,
     source_span: VerifiedSourceSpan,
@@ -60,6 +61,22 @@ pub struct Int8SummarySynthesisPreflight {
     synthesis_masks: u64,
     limits: SummarySynthesisLimits,
     options: SummaryOptions,
+    request_binding: [u8; 32],
+    max_result_bytes: u64,
+}
+impl std::fmt::Debug for Int8SummarySynthesisPreflight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Int8SummarySynthesisPreflight")
+            .field("chunks", &self.chunks)
+            .field("source_span", &self.source_span)
+            .field("discovery_work", &self.discovery_work)
+            .field("discovery_masks", &self.discovery_masks)
+            .field("synthesis_reserve", &self.synthesis_reserve)
+            .field("synthesis_masks", &self.synthesis_masks)
+            .field("limits", &self.limits)
+            .field("options", &self.options)
+            .finish_non_exhaustive()
+    }
 }
 impl Int8SummarySynthesisPreflight {
     pub fn chunk_count(&self) -> usize { self.chunks }
@@ -72,6 +89,15 @@ impl Int8SummarySynthesisPreflight {
         self.discovery_masks.checked_add(self.synthesis_masks).ok_or(Int8SourceMapError::WorkLimit)
     }
     pub fn verify_completed(&self, run: &Int8SummarySynthesisRun) -> Result<(), Int8SourceMapError> {
+        self.verify_completed_with_control(run, &mut binding::Continue)
+    }
+    pub fn verify_completed_with_control<C: DecodeStepControl>(&self, run: &Int8SummarySynthesisRun,
+        control: &mut C) -> Result<(), Int8SourceMapError> {
+        checkpoint(control)?;
+        if run.request_binding != self.request_binding || run.result_binding != binding::composed_result(
+            b"fnlp-int8-summary-synthesis-result-v1", self.request_binding, &[], run, self.max_result_bytes, control)? {
+            return Err(invalid());
+        }
         let map = &run.discovery; let root = map.mapped.root();
         let actual = add_work(map.model_work, run.synthesis_model_work).ok_or(Int8SourceMapError::WorkLimit)?;
         let masks = map.mask_node_visit_charge.checked_add(run.synthesis_mask_node_visits)
@@ -104,9 +130,12 @@ impl Int8SummarySynthesisPreflight {
                 if run.status != SummarySynthesisStatus::NoEvidenceCollected || run.evidence_segments != 0
                     || run.evidence_bytes != 0 || !run.bullets.is_empty()
                     || run.synthesis_planned_work != Int8Work::default() || run.synthesis_model_work != Int8Work::default()
-                    || run.synthesis_mask_node_visits != 0 || map.mapped.root().value().chunks().any(|c|
-                        !matches!(&c.native.result, SourceTaskResult::Summarize(r) if r.bullets.is_empty())) {
-                    return Err(invalid());
+                    || run.synthesis_mask_node_visits != 0 { return Err(invalid()); }
+                for chunk in root.value().chunks() {
+                    checkpoint(control)?;
+                    if !matches!(&chunk.native.result, SourceTaskResult::Summarize(r) if r.bullets.is_empty()) {
+                        return Err(invalid());
+                    }
                 }
             }
             Some(native) => {
@@ -122,16 +151,23 @@ impl Int8SummarySynthesisPreflight {
                     || run.status != if raw.bullets.is_empty() { SummarySynthesisStatus::NoBulletsProduced }
                         else { SummarySynthesisStatus::Synthesized } { return Err(invalid()); }
                 for (raw, lifted) in raw.bullets.iter().zip(&run.bullets) {
+                    checkpoint(control)?;
                     if raw.text != lifted.text || raw.citations.len() != lifted.citations.len() { return Err(invalid()); }
                     for (local, original) in raw.citations.iter().zip(&lifted.citations) {
+                        checkpoint(control)?;
                         if local.quote != original.quote { return Err(invalid()); }
                         evidence::check_citation(original, self.options.max_quote_scalars)?;
-                        if original.spans.iter().any(|s| s.byte_end > self.source_span.byte_end
-                            || s.scalar_end > self.source_span.scalar_end) { return Err(invalid()); }
+                        for span in &original.spans {
+                            checkpoint(control)?;
+                            if span.byte_end > self.source_span.byte_end || span.scalar_end > self.source_span.scalar_end {
+                                return Err(invalid());
+                            }
+                        }
                     }
                 }
             }
         }
+        checkpoint(control)?;
         Ok(())
     }
 }
@@ -168,11 +204,16 @@ impl SourceTaskPlanner {
         discovery_limits.chunks = capacity.constrain_chunks(discovery_limits.chunks)?;
         let map = self.plan_int8_map_with_control(source, &task, budget, context, planning, discovery_limits, control)?;
         let last = map.chunks.chunks().last().ok_or(Int8SourceMapError::EmptySource)?.span();
+        let request_binding = binding::document_request(b"fnlp-int8-summary-synthesis-request-v1",
+            source, &(request.map_options, request.synthesis_options, request.limits.max_evidence_segments,
+                request.limits.max_evidence_bytes, request.limits.verification),
+            budget, context, planning, mapping, self, &map.chunks, control)?;
         let expected = Int8SummarySynthesisPreflight {
             chunks: map.chunk_count(), source_span: VerifiedSourceSpan { byte_start: 0, byte_end: source.len(),
                 scalar_start: 0, scalar_end: last.scalar_end }, discovery_work: map.work, discovery_masks: map.masks,
             synthesis_reserve: reserve, synthesis_masks: mapping.mask_visits_per_chunk,
-            limits: request.limits, options: request.synthesis_options,
+            limits: request.limits, options: request.synthesis_options, request_binding,
+            max_result_bytes: mapping.reduction.max_result_bytes as u64,
         };
         if !within(expected.reserved_model_work()?, mapping.max_model_work)
             || expected.reserved_mask_visits()? > mapping.max_mask_visits { return Err(Int8SourceMapError::WorkLimit); }
@@ -255,11 +296,9 @@ impl PreparedInt8SummarySynthesis<'_> {
                 scan_steps: total.max_scan_steps.checked_sub(remaining.max_scan_steps).ok_or_else(invalid)? },
             citation_guarantee: CitationGuarantee::StructuralSourceMembership, semantic_support: SummarySemanticSupport::NotAssessed,
             untrusted_fields: ["bullets", "synthesis_native", "discovery.mapped.root.value"],
-            bullets, synthesis_native: native, discovery };
-        expected.verify_completed(&run)?;
-        extract_int8::check_size(&run, mapping.reduction.max_result_bytes as u64).map_err(Int8SourceError::from)?;
-        checkpoint(control)?;
-        Ok(run)
+            bullets, synthesis_native: native, discovery,
+            request_binding: expected.request_binding, result_binding: [0; 32] };
+        seal_completed(run, expected, control)
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -294,6 +333,17 @@ pub struct Int8SummarySynthesisRun {
     pub synthesis_native: Option<Int8SourceTaskRun>,
     /// All map judgments remain visible, including empty summaries.
     pub discovery: Int8SourceMapRun,
+    #[serde(skip)]
+    request_binding: [u8; 32],
+    #[serde(skip)]
+    result_binding: [u8; 32],
+}
+fn seal_completed<C: DecodeStepControl>(mut run: Int8SummarySynthesisRun,
+    expected: Int8SummarySynthesisPreflight, control: &mut C) -> Result<Int8SummarySynthesisRun, Int8SourceMapError> {
+    run.result_binding = binding::composed_result(b"fnlp-int8-summary-synthesis-result-v1",
+        run.request_binding, &[], &run, expected.max_result_bytes, control)?;
+    expected.verify_completed_with_control(&run, control)?;
+    Ok(run)
 }
 fn invalid() -> Int8SourceMapError { Int8SourceError::InvalidResult.into() }
 fn vector<T>(n: usize) -> Result<Vec<T>, Int8SourceMapError> {

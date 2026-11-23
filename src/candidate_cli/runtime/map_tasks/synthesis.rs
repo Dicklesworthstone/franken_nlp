@@ -70,7 +70,8 @@ pub(super) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
         Expected::Single(expected) => {
             let result = session.engine.synthesize_int8_summary(&model, text, Arc::new(planner), Arc::new(vocabulary),
                 config, cancellation).map_err(|_| CandidateError::Execution)?;
-            expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+            expected.verify_completed_with_control(result.result(), &mut session.control())
+                .map_err(|error| error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution))?;
             deliver(&session, &facts, &result, command.max_map_result_bytes + 4096, output)
         }
         Expected::Hierarchical(expected) => {
