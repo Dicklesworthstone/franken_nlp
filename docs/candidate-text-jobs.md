@@ -149,6 +149,29 @@ and admitted extra workspace only when selected. The stored semantic result
 format remains the same. This opt-in route carries no measured throughput or
 model-parity claim.
 
+## Persistent INT8 compute teams
+
+`--compute-threads 2..=64` selects one fixed native row team for the entire
+retained invocation, including every pending generate or chat item. Width one
+keeps the existing serial path. The runtime/coordinator thread is additional to
+the requested worker count. `--prefill-rows` composes with the same team; it does
+not start a second pool or replenish the job's lifetime work allowance.
+
+For example, add `--compute-threads 4 --prefill-rows 4` to either command above.
+Worker and coordinator prompt workspace are admitted separately, and the CLI
+checks their simultaneous memory envelope before private key/model/input IO.
+It adds the complete retained-job buffer quote after reading the bounded limits
+file. Native/input/output ownership remains held through physical worker drain,
+including cancellation, errors and panic unwinding.
+
+An authenticated resume may change the physical worker count or prompt row
+width. The original semantic recipe, sample addresses, committed records and
+nonrenewable work/attempt limits remain authoritative. Completion metadata adds
+`compute_schedule` only for an explicitly selected team, after all workers have
+joined. Its width and admitted bytes describe the chosen schedule, not measured
+throughput. Final report serialization, writing and flushing also observe the
+original cancellation cause; failure there does not undo durable progress.
+
 ## Verification scope
 
 Added regression definitions cover pinned generate/chat plans, seed and sample

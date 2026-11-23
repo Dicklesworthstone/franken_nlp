@@ -158,6 +158,74 @@ fn bounded_prompt_schedule_is_additional_memory_and_not_generation_policy() {
         }
     }
 }
+#[test]
+fn persistent_team_survives_start_and_resume_parsing_for_both_text_tasks() {
+    for operation in ["start", "resume"] {
+        for task in ["generate", "chat"] {
+            for width in ["1", "2", "4", "64"] {
+                for prefill in [None, Some("4")] {
+                    let mut flags = vec!["--compute-threads", width];
+                    if let Some(rows) = prefill { flags.extend_from_slice(&["--prefill-rows", rows]); }
+                    let (_, a) = parse(operation, task, &flags).unwrap().into_parts();
+                    let admitted = a.validate().unwrap();
+                    assert_eq!(admitted.compute.threads, width.parse::<usize>().unwrap());
+                    assert_eq!(admitted.compute,
+                        a.common.compute.admit_prefill(a.common.policy.prefill().unwrap()).unwrap());
+                    assert_eq!(admitted.compute.workspace_bytes == 0, width == "1");
+                    a.check_lifetime(lifetime(), admitted).unwrap();
+                }
+            }
+        }
+    }
+}
+#[test]
+fn persistent_worker_buffers_are_additional_to_prompt_sampler_and_owned_job_memory() {
+    use crate::native_engine::strict_int8::projection::int8_team_workspace_bytes_with_prefill;
+    for task in ["generate", "chat"] {
+        for prefill in [None, Some("1"), Some("4"), Some("64")] {
+            let serial_flags = prefill.map(|rows| vec!["--prefill-rows", rows]).unwrap_or_default();
+            let serial = args(task, &serial_flags); let original = serial.validate().unwrap();
+            let rows = prefill.map(|rows| rows.parse::<usize>().unwrap()).unwrap_or(1);
+            for width in ["2", "4", "64"] {
+                let mut flags = serial_flags.clone(); flags.extend_from_slice(&["--compute-threads", width]);
+                let parallel = args(task, &flags); let admitted = parallel.validate().unwrap();
+                let expected = int8_team_workspace_bytes_with_prefill(width.parse().unwrap(), rows).unwrap();
+                assert_eq!(parallel.execution_memory_bytes(admitted).unwrap()
+                    - serial.execution_memory_bytes(original).unwrap(), expected);
+                assert_eq!(admitted.compute.workspace_bytes, expected);
+                assert_eq!(admitted.result_bytes, original.result_bytes);
+                assert!(parallel.common.options(166_101).unwrap() == serial.common.options(166_101).unwrap());
+            }
+            let mut same_flags = serial_flags;
+            same_flags.extend_from_slice(&["--compute-threads", "1"]);
+            let one = args(task, &same_flags); let admitted = one.validate().unwrap();
+            assert_eq!(one.execution_memory_bytes(admitted).unwrap(), serial.execution_memory_bytes(original).unwrap());
+        }
+    }
+}
+#[test]
+fn invalid_or_underfunded_persistent_jobs_refuse_before_private_io() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("read") } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("write") }
+        fn flush(&mut self) -> io::Result<()> { panic!("flush") }
+    }
+    for operation in ["start", "resume"] {
+        for width in ["0", "65", "18446744073709551615"] {
+            let Ok(command) = parse(operation, "generate", &["--compute-threads", width]) else { continue; };
+            let (mode, a) = command.into_parts();
+            assert_eq!(execute_owned(mode, a, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+        }
+        for task in ["generate", "chat"] {
+            let (mode, mut a) = parse(operation, task,
+                &["--compute-threads", "4", "--prefill-rows", "4"]).unwrap().into_parts();
+            a.common.memory_mib = 1024; a.common.max_weight_mib = 512;
+            assert!(a.validate().is_err(), "refusal must precede feature-graph dispatch");
+            assert!(execute_owned(mode, a, NoIo, &mut NoIo).is_err());
+        }
+    }
+}
 #[cfg(not(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64"))))]
 #[test]
@@ -169,7 +237,8 @@ fn unavailable_feature_graph_never_opens_key_config_input_or_output() {
         fn flush(&mut self) -> io::Result<()> { panic!("flush") }
     }
     for task in ["generate", "chat"] {
-        for flags in [vec![], vec!["--prefill-rows", "4"]] {
+        for flags in [vec![], vec!["--prefill-rows", "4"], vec!["--compute-threads", "4"],
+            vec!["--compute-threads", "4", "--prefill-rows", "4"]] {
             assert_eq!(execute_owned(RunMode::Start, args(task, &flags), NoIo, &mut NoIo).unwrap_err().code,
                 "owned_text_job_profile_unavailable");
         }

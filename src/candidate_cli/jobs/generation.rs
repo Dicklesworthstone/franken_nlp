@@ -76,7 +76,7 @@ impl TextJobArgs {
         // CLI preparation. This is a conservative quote, not a RAM permit.
         [limits.preparation_bytes, limits.weight_bytes, 128 * MIB, 64 * MIB,
             native.kv_bytes, native.rope_bytes, native.scratch_payload_bound,
-            64 * MIB, SAMPLER_BYTES, prefill, output, 65_536]
+            64 * MIB, SAMPLER_BYTES, prefill, limits.compute.workspace_bytes, output, 65_536]
             .iter().try_fold(0_u64, |total, bytes| total.checked_add(*bytes)
                 .ok_or_else(|| Failure::usage("text_job_memory_arithmetic")))
     }
@@ -97,10 +97,24 @@ impl TextJobArgs {
 pub(in crate::candidate_cli) fn definition() -> clap::Command {
     TextJobCommand::augment_args(clap::Command::new("text-job")
         .about("Start or resume retained native generation/chat jobs")
-        .long_about("Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. Input is the COMPLETE original {id,text,task_args?} NDJSON population, not the text-batch prompt/messages protocol; resume can explicitly restore retained inputs. Optional task_args contains sample_index and chat history only; text becomes the final user turn. Shared generation flags, explicit seed, stops and penalties are frozen in the authenticated recipe. No seed means greedy, never random seed generation. Results commit only after whole native completion; no partial token stream is retained. Failed attempts retain all native work charges. --store-results, protected existing storage, original job key and immutable limits are required. Stdout is completion metadata only. No automatic retry, model download, tools or thinking mode. --prefill-rows opts in to bounded layer-major prompt execution with separately admitted scratch; the physical schedule may change on resume without changing the authenticated semantic recipe or renewing lifetime work. Documents still execute in original order; --cohort-rows/active-rows remain unsupported.")
+        .long_about("Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. Input is the COMPLETE original {id,text,task_args?} NDJSON population, not the text-batch prompt/messages protocol; resume can explicitly restore retained inputs. Optional task_args contains sample_index and chat history only; text becomes the final user turn. Shared generation flags, explicit seed, stops and penalties are frozen in the authenticated recipe. No seed means greedy, never random seed generation. Results commit only after whole native completion; no partial token stream is retained. Failed attempts retain all native work charges. --store-results, protected existing storage, original job key and immutable limits are required. Stdout is completion metadata only. No automatic retry, model download, tools or thinking mode. --compute-threads 2..=64 keeps one persistent INT8 output-row team across every pending item, prompt and generated token. --prefill-rows opts in to bounded layer-major prompt execution and may use that same team. Worker batch storage and coordinator prompt scratch are admitted together before private IO. Either physical width may change on authenticated resume without changing the semantic recipe, original sample addresses, committed records or lifetime work. Completion metadata reports the selected schedule only after every worker joins. Width 1 keeps serial execution. Documents still execute in original order; --cohort-rows/active-rows remain unsupported.")
         .after_help(INPUT_RETENTION_HELP))
+        .mut_subcommand("start", compute::definition)
+        .mut_subcommand("resume", compute::definition)
 }
 impl TextJobCommand {
+    pub(crate) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let mut command = Self::from_arg_matches(matches)?;
+        let (_, request) = matches.subcommand().ok_or_else(||
+            clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "text job operation required"))?;
+        let common = match &mut command.operation {
+            TextOperation::Start(args) => &mut args.common,
+            TextOperation::Resume(args) => &mut args.common.common,
+        };
+        common.compute = compute::Args::from_matches(request)?;
+        Ok(command)
+    }
+
     fn into_parts(self) -> (RunMode, TextJobArgs) {
         match self.operation { TextOperation::Start(args) => (RunMode::Start, args),
             TextOperation::Resume(args) => (RunMode::Resume { discard_uncommitted: args.discard_uncommitted_tail }, args.common) }

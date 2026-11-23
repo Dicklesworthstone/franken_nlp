@@ -164,7 +164,7 @@ impl CandidateCommand {
             return int4::Int4Command::from_matches(matches).map(Self::SourceInt4);
         }
         if name == "text-job" {
-            return jobs::generation::TextJobCommand::from_arg_matches(matches).map(Self::TextJob);
+            return jobs::generation::TextJobCommand::from_matches(matches).map(Self::TextJob);
         }
         if name == "text-batch" {
             return text_batch::TextBatchCommand::from_matches(matches).map(Self::TextBatch);

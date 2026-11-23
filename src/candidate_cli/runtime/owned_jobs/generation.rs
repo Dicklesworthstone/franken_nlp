@@ -66,10 +66,15 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     let task = args.task_name(); let job_id = args.job_id; let materialize = args.materialize;
     let request = SourceJobRequest { root: args.job_dir, key, job_id, limits: lifetime,
         mode: open_mode(mode, args.input_retention)?, materialize };
-    let progress = match prefill {
-        None => session.engine.job_int8_text(&model, planner, request, host, reader, cancellation.clone()),
-        Some(prefill) => session.engine.job_int8_text_layer_major(&model, planner, request,
+    let progress = match (limits.compute.threads, prefill) {
+        (1, None) => session.engine.job_int8_text(&model, planner, request, host, reader, cancellation.clone()),
+        (1, Some(prefill)) => session.engine.job_int8_text_layer_major(&model, planner, request,
             host, prefill, reader, cancellation.clone()),
+        (threads, None) => session.engine.job_int8_text_with_threads(&model, planner, request, host,
+            crate::native_engine::simd::config::process_kernel(), threads, reader, cancellation.clone()),
+        (threads, Some(prefill)) => session.engine.job_int8_text_layer_major_with_threads(
+            &model, planner, request, host, crate::native_engine::simd::config::process_kernel(),
+            threads, prefill, reader, cancellation.clone()),
     }.map_err(host_failure)?;
     if let Some(cause) = cancellation.cause() { return Err(job_failure(JobError::Cancelled(cause))); }
     session.remaining()?;
@@ -81,9 +86,21 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     // No generated content, prompt, token IDs, seed or raw logprobs on stdout.
     // A report delivery failure may follow committed durable progress.
     let response = ScheduledResponse { response: &response,
-        prefill_schedule: prefill.map(PrefillSchedule::new).transpose()? };
-    publish_checked(&response, command::REPORT_BYTES, output, &|| session.remaining().map(|_| ()))
-        .map_err(Failure::from)
+        prefill_schedule: prefill.map(PrefillSchedule::new).transpose()?,
+        compute_schedule: ComputeSchedule::for_admission(limits.compute) };
+    publish_report(&response, output, &|| session.remaining(), &cancellation)
+}
+
+fn publish_report<T: Serialize>(response: &T, output: &mut impl Write,
+    remaining: &impl Fn() -> Result<Duration, CandidateError>, cancellation: &CancellationToken)
+    -> Result<(), Failure> {
+    publish_checked(response, command::REPORT_BYTES, output, &|| {
+        if cancellation.cause().is_some() { return Err(CandidateError::Execution); }
+        remaining().map(|_| ())
+    }).map_err(|error| match (error, cancellation.cause()) {
+        (CandidateError::Execution, Some(cause)) => job_failure(JobError::Cancelled(cause)),
+        (error, _) => Failure::from(error),
+    })
 }
 
 #[derive(Serialize)]
@@ -94,10 +111,26 @@ impl PrefillSchedule {
             admitted_workspace_bytes: limits.validate().map_err(|_| Failure::usage("text_job_prefill_quote"))? })
     }
 }
+/// Chosen physical schedule, not measured throughput or completed work. This
+/// appears only after the hosted job returns from its physical worker drain.
+#[derive(Serialize)]
+struct ComputeSchedule {
+    execution: &'static str,
+    compute_threads: usize,
+    admitted_workspace_bytes: u64,
+}
+impl ComputeSchedule {
+    fn for_admission(admitted: compute::Admission) -> Option<Self> {
+        (admitted.threads > 1).then_some(Self { execution: "int8-output-row-team-v1",
+            compute_threads: admitted.threads, admitted_workspace_bytes: admitted.workspace_bytes })
+    }
+}
 #[derive(Serialize)]
 struct ScheduledResponse<'a, T: Serialize> {
     #[serde(flatten)] response: &'a T,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefill_schedule: Option<PrefillSchedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compute_schedule: Option<ComputeSchedule>,
 }
 #[cfg(test)] mod tests;

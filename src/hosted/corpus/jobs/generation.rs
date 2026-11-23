@@ -2,9 +2,25 @@
 use super::*;
 use crate::{
     jobs::runner::generation::{Int8GenerationJobPlanner, Int8GenerationJobProcessor},
-    native_engine::strict_int8::prefill::Int8PrefillLimits,
+    native_engine::{simd::Int8Kernel, strict_int8::{prefill::Int8PrefillLimits,
+        projection::Int8ProjectionExecutor}},
     tasks::ir::TaskBudget,
 };
+
+/// The dispatcher retains this complete owner outside its scoped callback.
+/// On early return or unwind, readers, private preparation and every native
+/// reservation remain charged until the last persistent worker has joined.
+struct GenerationExecution<R> {
+    input: Charged<StreamInput<(Int8GenerationJobPlanner, SourceJobRequest), R, ()>>,
+    kv: Option<Pending>,
+    scratch: Option<Pending>,
+    _kv: Option<CommittedMemory>,
+    _scratch: Option<CommittedMemory>,
+    limits: JobHostLimits,
+    required: Int8MemoryRequirement,
+    prefill: Option<Int8PrefillLimits>,
+    lease: EngineLease,
+}
 
 impl NlpEngine {
     /// Start or explicitly resume generation/chat over the COMPLETE original
@@ -17,7 +33,7 @@ impl NlpEngine {
         request: SourceJobRequest, limits: JobHostLimits, reader: R, cancellation: CancellationToken)
         -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        self.job_int8_text_scheduled(model, planner, request, limits, None, reader, cancellation)
+        self.job_int8_text_scheduled(model, planner, request, limits, None, None, reader, cancellation)
     }
 
     /// Retained generation/chat with explicitly bounded layer-major prompt
@@ -30,15 +46,54 @@ impl NlpEngine {
         prefill: Int8PrefillLimits, reader: R, cancellation: CancellationToken)
         -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        self.job_int8_text_scheduled(model, planner, request, limits, Some(prefill), reader, cancellation)
+        self.job_int8_text_scheduled(model, planner, request, limits, Some(prefill), None, reader, cancellation)
+    }
+
+    /// Keep one admitted numerical team across every pending generation/chat
+    /// item in an authenticated retained job. Width includes the coordinator
+    /// and must be in 2..=64. Complete output rows use the existing exact leaf
+    /// kernels, and native work, addressed samples and attempts never renew.
+    ///
+    /// Team width is physical scheduling, so an explicit resume may change it
+    /// without altering the frozen recipe or committed records. The same
+    /// spool-first/journal-second runner owns all durable acknowledgements.
+    /// Cancellation may leave committed progress; every child joins before
+    /// any progress or error returns to the caller.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int8_text_with_threads<R>(&self, model: &ResidentInt8,
+        planner: Int8GenerationJobPlanner, request: SourceJobRequest, limits: JobHostLimits,
+        kernel: Int8Kernel, compute_threads: usize, reader: R, cancellation: CancellationToken)
+        -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        self.job_int8_text_scheduled(model, planner, request, limits, None,
+            Some((kernel, compute_threads)), reader, cancellation)
+    }
+
+    /// Compose bounded layer-major prompt morsels with one persistent INT8
+    /// row team for the entire retained invocation. Fixed worker batch buffers
+    /// are additional to the coordinator's prompt, KV and sampler storage.
+    /// Neither prompt width nor team width changes the authenticated semantic
+    /// recipe, original item ordinals or any lifetime debit on resume.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int8_text_layer_major_with_threads<R>(&self, model: &ResidentInt8,
+        planner: Int8GenerationJobPlanner, request: SourceJobRequest, limits: JobHostLimits,
+        kernel: Int8Kernel, compute_threads: usize, prefill: Int8PrefillLimits,
+        reader: R, cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        self.job_int8_text_scheduled(model, planner, request, limits, Some(prefill),
+            Some((kernel, compute_threads)), reader, cancellation)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn job_int8_text_scheduled<R>(&self, model: &ResidentInt8, planner: Int8GenerationJobPlanner,
         request: SourceJobRequest, limits: JobHostLimits, prefill: Option<Int8PrefillLimits>,
-        reader: R, cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+        team: Option<(Int8Kernel, usize)>, reader: R, cancellation: CancellationToken)
+        -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
+        match team {
+            None => dispatch::preflight(self, limits.native.run)?,
+            Some((_, width)) => dispatch::preflight_int8_team(self, limits.native.run, width)?,
+        }
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), planner.execution_identity())?;
         let native = planner.native_limits();
@@ -48,43 +103,87 @@ impl NlpEngine {
         capacity(planner.task_budget(), required.kv_bytes, request.limits.max_result_bytes)?;
         let scratch_bytes = workspace(sum(&[required.rope_bytes, required.scratch_payload_bound,
             limits.native.allocator_reserve_bytes])?, native.max_sampler_bytes, prefill)?;
+        let max_batch_rows = prefill.map_or(1, |limits| limits.max_batch_rows);
+        let worker_bytes = team.map(|(_, width)|
+            dispatch::int8_prefill_team_workspace_bytes(width, max_batch_rows)).transpose()?.unwrap_or(0);
+        // The dispatcher reserves worker storage separately. Validate the
+        // simultaneous envelope before any population or private job IO.
+        sum(&[bytes, required.kv_bytes, scratch_bytes, worker_bytes])?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
             || Ok(StreamInput { planner: Some((planner, request)), reader, writer: () }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch_bytes)?;
+        let execution = GenerationExecution { input, kv: Some(kv), scratch: Some(scratch),
+            _kv: None, _scratch: None, limits, required, prefill, lease };
         let model = model.clone();
-        let completed = dispatch::run(self, limits.native.run, cancellation, move |control| {
-            // Capture the whole storage-before-charge owner, including queued
-            // cancellation. No reader, seed or planner escapes physical drain.
-            let mut input = input;
-            let (planner, request) = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
-            let population = match read_population(&mut input.value.reader, &request,
-                limits.transport, control) {
-                Ok(population) => population,
-                Err(error) => return Ok(Err(JobRunError::Storage(error))),
-            };
-            let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value
-                .engine(limits.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            let admission = CorpusAdmission { lease: &lease, model: model.artifact_identity(),
-                kv_bytes: required.kv_bytes, sampler_bytes: native.max_sampler_bytes,
-                output_bytes: request.limits.max_result_bytes as u64 };
-            let result = (|| {
-                let processor = match prefill {
-                    None => Int8GenerationJobProcessor::new(&planner, &mut engine.value, admission),
-                    Some(prefill) => Int8GenerationJobProcessor::new_layer_major(&planner,
-                        &mut engine.value, admission, prefill),
-                }.map_err(JobRunError::Processor)?;
-                // The common runner authenticates the exact recipe/population
-                // before repair or forwards. Failed-attempt debits survive it.
-                run_population(request, &population, processor, control)
-            })();
-            // Every result guard already survived spool sync/acknowledgement.
-            // Runner/processor borrows end before resident scratch or inputs.
-            drop(engine); drop(population); drop(planner); drop(input); drop(lease);
-            Ok(result)
-        })?;
+        let completed = match team {
+            None => dispatch::run(self, limits.native.run, cancellation, move |control| {
+                let mut execution = execution;
+                execution.run(&model.inner.loaded.value, None, None, control)
+            }),
+            Some((kernel, width)) => dispatch::run_int8_prefill_team(self, limits.native.run,
+                cancellation, model, width, kernel, max_batch_rows, execution,
+                move |model, execution, control, projection|
+                    execution.run(model, Some(kernel), Some(projection), control)),
+        }?;
         completed.map_err(HostedJobError::Job)
+    }
+}
+
+impl<R: BufRead> GenerationExecution<R> {
+    fn commit_native(&mut self) -> Result<(), HostedError> {
+        self._kv = Some(self.kv.take().ok_or(HostedError::Limits("text job KV admission consumed"))?.commit()?);
+        self._scratch = Some(self.scratch.take().ok_or(HostedError::Limits("text job scratch admission consumed"))?.commit()?);
+        Ok(())
+    }
+
+    fn run<'weights>(&mut self, model: &'weights CurrentCandidateInt8Model,
+        kernel: Option<Int8Kernel>, projection: Option<&'weights mut (dyn Int8ProjectionExecutor + 'weights)>,
+        control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
+        // Preserve the serial route's original checkpoint allowance. The
+        // persistent route also checks its shared stop at phase boundaries.
+        if projection.is_some() {
+            if let Some(cause) = control.checkpoint(0) {
+                return Err(HostedError::Native(StrictInt8Error::Cancelled(cause)));
+            }
+        }
+        let (planner, request) = self.input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
+        let population = match read_population(&mut self.input.value.reader, &request,
+            self.limits.transport, control) {
+            Ok(population) => population,
+            Err(error) => return Ok(Err(JobRunError::Storage(error))),
+        };
+        if projection.is_some() {
+            if let Some(cause) = control.checkpoint(0) {
+                return Err(HostedError::Native(StrictInt8Error::Cancelled(cause)));
+            }
+        }
+        let engine = model.engine(self.limits.native.context_tokens,
+            memory_budget(self.required)).map_err(HostedError::Model)?;
+        let engine = match kernel { Some(kernel) => engine.with_kernel(kernel), None => engine };
+        let mut engine = match projection {
+            Some(projection) => engine.with_projection_executor(projection).map_err(HostedError::Native)?,
+            None => engine,
+        };
+        self.commit_native()?;
+        let admission = CorpusAdmission { lease: &self.lease, model: model.artifact_identity(),
+            kv_bytes: self.required.kv_bytes, sampler_bytes: planner.native_limits().max_sampler_bytes,
+            output_bytes: request.limits.max_result_bytes as u64 };
+        let result = (|| {
+            let processor = match self.prefill {
+                None => Int8GenerationJobProcessor::new(&planner, &mut engine, admission),
+                Some(prefill) => Int8GenerationJobProcessor::new_layer_major(&planner,
+                    &mut engine, admission, prefill),
+            }.map_err(JobRunError::Processor)?;
+            // Authenticate the same recipe and population before repair or
+            // forwarding. Failed-attempt debits survive either schedule.
+            run_population(request, &population, processor, control)
+        })();
+        // Native buffers and all runner borrows end here, but this admission
+        // owner stays outside the team's scope until physical join completes.
+        drop(engine); drop(population); drop(planner);
+        Ok(result)
     }
 }
 fn capacity(task: TaskBudget, kv: u64, output: usize) -> Result<(), HostedError> {
@@ -147,8 +246,11 @@ mod tests {
     fn owned_planner_input_and_result_cross_the_existing_blocking_boundary() {
         fn send<T: Send + 'static>() {}
         send::<StreamInput<(Int8GenerationJobPlanner, SourceJobRequest), std::io::Cursor<Vec<u8>>, ()>>();
+        send::<GenerationExecution<std::io::Cursor<Vec<u8>>>>();
         send::<crate::tasks::chat::quantized::Int8ChatResult>();
         let _entry = NlpEngine::job_int8_text::<std::io::Cursor<Vec<u8>>>;
         let _grouped = NlpEngine::job_int8_text_layer_major::<std::io::Cursor<Vec<u8>>>;
+        let _team = NlpEngine::job_int8_text_with_threads::<std::io::Cursor<Vec<u8>>>;
+        let _grouped_team = NlpEngine::job_int8_text_layer_major_with_threads::<std::io::Cursor<Vec<u8>>>;
     }
 }

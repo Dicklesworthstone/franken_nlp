@@ -86,16 +86,103 @@ fn changing_prompt_schedule_on_resume_preserves_recipe_identity_sampling_and_all
 fn prompt_schedule_is_explicit_public_metadata_and_absent_for_sequential_jobs() {
     let report = serde_json::json!({"schema_version": 1, "output": {"committed": 2}});
     assert_eq!(serde_json::to_value(ScheduledResponse {
-        response: &report, prefill_schedule: None }).unwrap(), report);
+        response: &report, prefill_schedule: None, compute_schedule: None }).unwrap(), report);
     let a = args("generate", &["--prefill-rows", "4"]);
     let prefill = a.common.policy.prefill().unwrap().unwrap();
     let value = serde_json::to_value(ScheduledResponse { response: &report,
-        prefill_schedule: Some(PrefillSchedule::new(prefill).unwrap()) }).unwrap();
+        prefill_schedule: Some(PrefillSchedule::new(prefill).unwrap()), compute_schedule: None }).unwrap();
     assert_eq!(value["prefill_schedule"]["execution"], LAYER_MAJOR_PREFILL_VERSION);
     assert_eq!(value["prefill_schedule"]["max_batch_rows"], 4);
     assert_eq!(value["prefill_schedule"]["admitted_workspace_bytes"], prefill.validate().unwrap());
     assert_eq!(value["output"], report["output"]);
     for private in ["seed", "history", "token_ids", "prompt_digest", "content"] {
         assert!(!value.to_string().contains(private));
+    }
+}
+
+#[test]
+fn team_and_prompt_width_changes_preserve_authenticated_recipe_and_all_lifetime_work() {
+    let seed = "07".repeat(32);
+    for task in ["generate", "chat"] {
+        let serial = args(task, &["--seed", &seed]);
+        let original = prepare(&serial, serial.validate().unwrap(), lifetime(), &facts()).unwrap();
+        let before = original.prepare_with_control(document(7, task == "chat"), &mut Continue).unwrap();
+        for width in ["1", "2", "4"] {
+            for prefill in [None, Some("1"), Some("4")] {
+                let mut flags = vec!["--seed", &seed, "--compute-threads", width];
+                if let Some(rows) = prefill { flags.extend_from_slice(&["--prefill-rows", rows]); }
+                let threaded = args(task, &flags);
+                let resumed = prepare(&threaded, threaded.validate().unwrap(), lifetime(), &facts()).unwrap();
+                let after = resumed.prepare_with_control(document(7, task == "chat"), &mut Continue).unwrap();
+                assert_eq!(canonjson::canonical_bytes(original.job_recipe()).unwrap(),
+                    canonjson::canonical_bytes(resumed.job_recipe()).unwrap());
+                assert_eq!(original.execution_identity(), resumed.execution_identity());
+                assert_eq!(before.execution_identity(), after.execution_identity());
+                assert_eq!(before.model_work(), after.model_work());
+                assert_eq!(original.task_budget(), resumed.task_budget());
+            }
+        }
+    }
+}
+
+#[test]
+fn a_stale_team_or_prompt_admission_refuses_before_installing_the_process_host() {
+    let serial = args("generate", &[]).validate().unwrap();
+    let threaded = args("generate", &["--compute-threads", "4"]);
+    assert!(matches!(Session::new(&threaded.common, serial), Err(CandidateError::Arguments)));
+    let grouped = args("generate", &["--compute-threads", "4", "--prefill-rows", "4"]);
+    assert!(matches!(Session::new(&grouped.common, threaded.validate().unwrap()), Err(CandidateError::Arguments)));
+    assert!(matches!(Session::new(&threaded.common, grouped.validate().unwrap()), Err(CandidateError::Arguments)));
+}
+
+#[test]
+fn completed_job_schedule_metadata_never_changes_stored_results_or_leaks_content() {
+    let report = serde_json::json!({"schema_version": 1, "output": {"committed": 2, "attempts": 3}});
+    for width in ["1", "2", "4"] {
+        let a = args("generate", &["--compute-threads", width, "--prefill-rows", "4"]);
+        let admitted = a.validate().unwrap();
+        let value = serde_json::to_value(ScheduledResponse { response: &report,
+            prefill_schedule: Some(PrefillSchedule::new(a.common.policy.prefill().unwrap().unwrap()).unwrap()),
+            compute_schedule: ComputeSchedule::for_admission(admitted.compute) }).unwrap();
+        assert_eq!(value["output"], report["output"]);
+        assert_eq!(value["prefill_schedule"]["max_batch_rows"], 4);
+        if width == "1" { assert!(value.get("compute_schedule").is_none()); }
+        else {
+            assert_eq!(value["compute_schedule"]["execution"], "int8-output-row-team-v1");
+            assert_eq!(value["compute_schedule"]["compute_threads"], admitted.compute.threads);
+            assert_eq!(value["compute_schedule"]["admitted_workspace_bytes"], admitted.compute.workspace_bytes);
+        }
+        for private in ["effective_seed", "history", "token_ids", "prompt_digest", "content"] {
+            assert!(!value.to_string().contains(private));
+        }
+    }
+}
+
+#[test]
+fn cancellation_during_report_publication_keeps_every_original_policy_outcome() {
+    struct CancelOnFlush { token: CancellationToken, cause: DecodeCancellationKind, bytes: Vec<u8> }
+    impl Write for CancelOnFlush {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes); Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> { self.token.cancel(self.cause); Ok(()) }
+    }
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let expected = job_failure(JobError::Cancelled(cause));
+        let token = CancellationToken::default(); token.cancel(cause);
+        let mut untouched = Vec::new();
+        let failure = publish_report(&serde_json::json!({"committed": 2}), &mut untouched,
+            &|| Ok(Duration::from_secs(1)), &token).unwrap_err();
+        assert_eq!((failure.exit, failure.code), (expected.exit, expected.code));
+        assert!(untouched.is_empty());
+
+        let token = CancellationToken::default();
+        let mut writer = CancelOnFlush { token: token.clone(), cause, bytes: Vec::new() };
+        let failure = publish_report(&serde_json::json!({"committed": 2}), &mut writer,
+            &|| Ok(Duration::from_secs(1)), &token).unwrap_err();
+        assert_eq!((failure.exit, failure.code), (expected.exit, expected.code));
+        assert!(!writer.bytes.is_empty(), "already delivered progress is not rolled back");
     }
 }
