@@ -68,11 +68,53 @@ This one-shot surface uses item ID `cli`, sample index zero and request sequence
 one. Reproducibility remains scoped to the same effective request, artifact,
 backend and numerical profile; no cross-host parity claim is introduced.
 
+## Persistent INT8 CPU teams
+
+Buffered `generate` and `chat` accept `--compute-threads N`, from 1 through 64.
+Width 1 is the default and retains the existing serial response shape. A larger
+width forms one fixed CPU team for the complete request:
+
+```sh
+fnlp candidate generate ./prompt.txt \
+  --model ./local-int8-candidate.fnlpq --memory-mib 8192 \
+  --compute-threads 4 --input-encoding safe-bpe-v1
+```
+
+The configured width counts the coordinator and its persistent children; the
+runtime's separately admitted worker is additional. Both decoder passes use
+the team for Q, K, V, attention-output, gate, up, down and language-model-head
+projections. Each participant computes complete output rows using the existing
+integer reduction, floating epilogue and BF16 cast. The coordinator quantizes
+each activation once and retains KV, token order, sampling and the sole native
+work ledger. Every projection is fully charged before its row commands are
+dispatched; failure does not refund that charge.
+
+The team is formed and sealed before fallible task work begins. Fixed worker
+buffers travel through capacity-one lanes and are reused across prompt and
+generated tokens. Cancellation, errors and panics disconnect the lanes and
+physically join all children. Input/native/output admission survives that join;
+the original shared cancellation state is checked again afterward. Only then
+may a completed result escape the dispatcher.
+
+Threaded responses add a `compute` object with schedule
+`int8-output-row-team-v1`, `compute_threads`, `completed_projections`,
+`completed_rows`, and `completed_worker_rows`. These report physically completed
+work, not speedup or a numerical-fidelity certificate. Width 1 adds no such
+object. Compact encoding retains its ordinary request identity and input policy.
+
+This initial text route uses token-ordered prefill. Widths above 1 combined with
+`--prefill-rows` fail before private input/model IO. INT8 streams, text batches
+and retained text jobs do not expose this option. A checked simultaneous memory
+floor includes the model allowance, preparation, coordinator-native buffers,
+sampler, output and every fixed child buffer before IO; the host then reserves
+their actual owners against the shared process ledger.
+
 ## Admission and delivery
 
 `--memory-mib` is mandatory. It configures the existing process ledger, not an
-OS-level RSS limiter. The route selects the current-thread preset, one blocking
-coordinator and no scoped children. It does not create a second scheduler or
+OS-level RSS limiter. The route selects the current-thread preset and one blocking
+coordinator, with `N - 1` scoped children only when a wider compute team is
+explicitly selected. It does not create a second scheduler or
 run an unadmitted native forward. Weight loading and execution use the existing
 hosted calls, cancellation/drain ownership and checked native work budgets.
 
@@ -122,3 +164,12 @@ inference result. Compilation, Rust test execution, model-present inference,
 performance measurement and controller DSR qualification were not performed in
 the implementation environment. The controller remains responsible for the
 validation flow specified in `WIRING.md`.
+
+Team-specific regression definitions cover independent numerical row goldens,
+selected-row ordering and idle workers, exact model/kernel binding, nonrefundable
+native debit, one-time formation, shared checkpoint exhaustion, cancellation
+during formation/in-flight work/join, worker and coordinator panic drain,
+complete memory admission, and unchanged serial framing. Scoped protocol tests
+use tiny projection-only fixtures under `asupersync-census`; they do not stand
+in for whole-model parity or performance measurements. They remain unexecuted
+pending the repository's authorized validation checkpoint.

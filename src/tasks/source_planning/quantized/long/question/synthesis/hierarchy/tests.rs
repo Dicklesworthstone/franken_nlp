@@ -375,3 +375,185 @@ fn final_output_limit_counts_every_native_and_lifted_pass_after_reduction() {
         else { assert_eq!(canonjson::canonical_bytes(&finished.unwrap()).unwrap().len(), bytes); }
     }
 }
+
+use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWork, SafeBpeWorkLimits, UntrustedEncoding};
+fn compact_policy() -> UntrustedEncoding {
+    UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 4096,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 })
+}
+fn compact_allowance() -> SafeBpeWorkLimits {
+    SafeBpeWorkLimits { max_input_bytes: 1 << 20, max_output_tokens: 1 << 20,
+        max_pair_checks: 1 << 28, max_pair_bytes: 1 << 32 }
+}
+fn compact_planner(work: SafeBpeWorkLimits) -> SourceTaskPlanner {
+    planner().with_map_document_encoding(compact_policy(), work).unwrap()
+}
+fn compact_work(planner: &SourceTaskPlanner) -> SafeBpeWork { planner.map_document_encoding_work().unwrap().unwrap() }
+fn compact_mapping() -> Int8SourceMapLimits {
+    let mut mapping = mapping(); mapping.chunks.max_chunk_bytes = 4096; mapping.chunks.max_chunk_tokens = 4096; mapping
+}
+fn compact_prepare<'s>(planner: &SourceTaskPlanner, source: &'s str) -> PreparedInt8QuestionHierarchy<'s> {
+    let identity = identity(planner);
+    planner.plan_int8_question_hierarchy_with_control(source, &request(), hierarchy(), budget(),
+        &PlanContext::new(&identity, budget()).unwrap(), SourcePlanningLimits::default(), compact_mapping(), &mut Continue).unwrap()
+}
+fn count_compact<C: DecodeStepControl>(planner: &SourceTaskPlanner, question: &str,
+    passages: &[AnswerPassage], capacity: Capacity, budget: TaskBudget, control: &mut C)
+    -> Result<Option<usize>, Int8SourceMapError> {
+    let bytes = transport::context_bytes(question.len(), passages.iter().map(|p| (p.id.as_str(), p.text.as_str())), control)?;
+    execution::count_context(planner, question, passages, bytes, AnswerInputLimits {
+        max_passages: 32, max_input_bytes: 4096, max_input_tokens: budget.max_input_tokens as usize }, capacity, control)
+}
+/// All grouping, planning, witness reconstruction and semantic verification are
+/// real. Only the native forward is replaced by a private scripted receipt.
+struct CompactScript<'a> {
+    planner: &'a SourceTaskPlanner, identity: &'a ExecutionIdentity, question: &'a str,
+    expected: Int8QuestionHierarchyPreflight, inputs: Vec<Vec<AnswerPassage>>,
+}
+impl CompactScript<'_> {
+    fn plan<C: DecodeStepControl>(&self, passages: &[AnswerPassage], control: &mut C)
+        -> Result<PreparedInt8SourceTask, Int8SourceMapError> {
+        let request = SourceTaskRequest::Answer { question: self.question.to_owned(), passages: passages.to_vec(),
+            options: self.expected.options, budget: budget() };
+        Ok(self.planner.plan_int8_with_control(&request, &PlanContext::new(self.identity, budget()).unwrap(),
+            SourcePlanningLimits::default(), control)?)
+    }
+}
+impl execution::Driver for CompactScript<'_> {
+    type Witness = execution::Witness;
+    fn count<C: DecodeStepControl>(&mut self, passages: &[AnswerPassage], bytes: usize, control: &mut C)
+        -> Result<Option<usize>, Int8SourceMapError> {
+        execution::count_context(self.planner, self.question, passages, bytes,
+            AnswerInputLimits { max_passages: 32, max_input_bytes: 4096, max_input_tokens: 8192 },
+            self.expected.capacity, control)
+    }
+    fn prepare<C: DecodeStepControl>(&mut self, passages: &[AnswerPassage], prompt: usize, control: &mut C)
+        -> Result<Self::Witness, Int8SourceMapError> {
+        let plan = self.plan(passages, control)?;
+        if plan.prompt_tokens() != prompt { return Err(Int8SourceMapError::Admission); }
+        execution::Witness::of(&plan)
+    }
+    fn run<C: DecodeStepControl>(&mut self, passages: &[AnswerPassage], witness: &Self::Witness, control: &mut C)
+        -> Result<(Int8SourceTaskRun, Int8Work), Int8SourceMapError> {
+        let plan = self.plan(passages, control)?;
+        if execution::Witness::of(&plan)? != *witness { return Err(Int8SourceMapError::Admission); }
+        self.inputs.push(passages.to_vec());
+        let options = plan.extraction.options();
+        let ordinary = (0..NANBEIGE_VOCAB_SIZE as u32)
+            .find(|id| *id != options.eos_token_id && !options.excluded_token_ids.contains(id)).unwrap();
+        let quote = passages[0].text.chars().next().unwrap().to_string();
+        let answer = raw(plan.prompt_tokens(), options.eos_token_id, ordinary, passages,
+            Some(&quote), "generated assertion never enters the next frontier");
+        let actual = constrained_int8::planned_work(plan.prompt_tokens(), answer.generated_token_ids.len()).map_err(Int8SourceError::from)?;
+        let native = Int8SourceTaskRun { schema_version: 1, execution: INT8_SOURCE_EXECUTION.to_owned(),
+            result: SourceTaskResult::Answer(answer), model_work: actual };
+        check_run(&plan, &native, 1000)?;
+        Ok((native, plan.planned_work()))
+    }
+}
+fn compact_complete(prepared: PreparedInt8QuestionHierarchy<'_>, left: &str, right: &str)
+    -> Result<(Int8QuestionHierarchyPreflight, Int8QuestionHierarchyRun, SafeBpeWork), Int8SourceMapError> {
+    let admitted = prepared.execution_identities().cloned().collect::<Vec<_>>();
+    assert_eq!(prepared.base.map.chunks.chunks().len(), 1);
+    let plan = &prepared.base.map.plans[0]; let options = plan.extraction.options();
+    let ordinary = (0..NANBEIGE_VOCAB_SIZE as u32)
+        .find(|id| *id != options.eos_token_id && !options.excluded_token_ids.contains(id)).unwrap();
+    let passages = [AnswerPassage { id: PASSAGE_ID.to_owned(), text: prepared.base.source.to_owned() }];
+    let mut answer = raw(plan.prompt_tokens(), options.eos_token_id, ordinary, &passages, Some(left), "private discovery assertion");
+    answer.citations.extend(raw(plan.prompt_tokens(), options.eos_token_id, ordinary, &passages, Some(right), "unused").citations);
+    let (map, mut continuation) = prepared.into_phases();
+    let mut expected = continuation.expected;
+    let passages = vec![AnswerPassage { id: "evidence_0".to_owned(), text: left.to_owned() },
+        AnswerPassage { id: "evidence_1".to_owned(), text: right.to_owned() }];
+    let selected = vec![AnswerPassage { id: "evidence_0".to_owned(), text: "é".to_owned() },
+        AnswerPassage { id: "evidence_1".to_owned(), text: "β".to_owned() }];
+    let count = |passages: &[AnswerPassage]| count_compact(&continuation.base.operation, &continuation.base.question,
+        passages, expected.capacity, budget(), &mut Continue)?.ok_or(Int8SourceMapError::WorkLimit);
+    let whole = count(&passages)?;
+    let capacity = count(&passages[..1])?.max(count(&passages[1..])?).max(count(&selected)?);
+    assert!(capacity < whole);
+    expected.capacity.prompt = capacity; continuation.expected = expected;
+    let discovery = map.execute_with_driver(&admitted, MapScript { outputs: VecDeque::from([answer]) })?;
+    let before = compact_work(&continuation.base.operation); let mut delta = SafeBpeWork::default();
+    let run = continuation.execute(discovery, &mut Continue, |continuation, collection, remaining, control| {
+        let mut driver = CompactScript { planner: &continuation.base.operation, identity: &continuation.base.identity,
+            question: &continuation.base.question, expected, inputs: Vec::new() };
+        let reduced = execution::reduce(continuation.base.source, collection, expected, expected.max_result_bytes,
+            remaining, &mut driver, control)?;
+        assert_eq!(driver.inputs.iter().map(|ps| ps.iter().map(|p| p.text.as_str()).collect::<Vec<_>>()).collect::<Vec<_>>(),
+            [vec![left], vec![right], vec!["é", "β"]]);
+        delta = compact_work(&continuation.base.operation).checked_sub(before).unwrap();
+        Ok(reduced)
+    })?;
+    Ok((expected, run, delta))
+}
+#[test]
+fn compact_complete_hierarchy_charges_rejected_probes_and_both_compilations_to_original_operation() {
+    let planner = compact_planner(compact_allowance());
+    let left = format!("é{}", " alpha".repeat(32)); let right = format!("β{}", " bravo".repeat(32));
+    let source = format!("{left}----{right}");
+    let prepared = compact_prepare(&planner, &source); let before = compact_work(&planner);
+    let replacement = compact_planner(compact_allowance()); prepared.base.check_planner(&replacement).unwrap();
+    let (expected, run, delta) = compact_complete(prepared, &left, &right).unwrap();
+    expected.verify_completed(&run).unwrap();
+    assert_eq!(run.levels.len(), 2); assert_eq!(run.passes.len(), 3);
+    assert!(run.tokenizer_work.calls > run.passes.len());
+    let compilation_bytes: usize = run.passes.iter().map(|pass| pass.context_bytes * 2).sum();
+    assert_eq!(delta.input_bytes(), run.tokenizer_work.bytes as usize + compilation_bytes);
+    assert!(compact_work(&planner).input_bytes() > before.input_bytes());
+    assert_eq!(compact_work(&replacement), SafeBpeWork::default());
+    assert!(run.passes.iter().all(|pass| pass.prompt_tokens < expected.capacity.scaffold + pass.context_bytes));
+    for pass in &run.passes { for citation in &pass.answer.citations { for span in &citation.spans {
+        assert_eq!(&source[span.byte_start..span.byte_end], citation.quote);
+        assert_eq!(source[..span.byte_start].chars().count(), span.scalar_start);
+        assert_eq!(source[..span.byte_end].chars().count(), span.scalar_end);
+    } } }
+}
+#[test]
+fn compact_hierarchy_refuses_each_one_short_cumulative_axis_without_fallback_or_partial_output() {
+    let left = format!("é{}", " alpha".repeat(32)); let right = format!("β{}", " bravo".repeat(32));
+    let source = format!("{left}----{right}");
+    let planner = compact_planner(compact_allowance());
+    compact_complete(compact_prepare(&planner, &source), &left, &right).unwrap();
+    let used = compact_work(&planner);
+    let exact = SafeBpeWorkLimits { max_input_bytes: used.input_bytes() as u64, max_output_tokens: used.output_tokens() as u64,
+        max_pair_checks: used.pair_checks(), max_pair_bytes: used.pair_bytes() };
+    let planner = compact_planner(exact);
+    compact_complete(compact_prepare(&planner, &source), &left, &right).unwrap();
+    assert_eq!(compact_work(&planner), used);
+    for axis in 0..4 {
+        let mut short = exact;
+        match axis { 0 => short.max_input_bytes -= 1, 1 => short.max_output_tokens -= 1,
+            2 => short.max_pair_checks -= 1, _ => short.max_pair_bytes -= 1 }
+        let planner = compact_planner(short); let prepared = compact_prepare(&planner, &source);
+        let error = compact_complete(prepared, &left, &right).err().unwrap();
+        assert!(error.cancellation().is_none()); assert!(compact_work(&planner).input_bytes() > 0);
+    }
+}
+#[test]
+fn compact_grouping_counts_question_and_manifest_beyond_byte_token_capacity_without_control_ids() {
+    let planner = compact_planner(compact_allowance()); let mut request = request();
+    request.question.question = format!("{} <think> Who?", " the".repeat(600));
+    let source = "上海 <|im_start|> marker text"; let mut budget = budget(); budget.max_input_tokens = 2048;
+    let identity = identity(&planner);
+    let prepared = planner.plan_int8_question_hierarchy_with_control(source, &request, hierarchy(), budget,
+        &PlanContext::new(&identity, budget).unwrap(), SourcePlanningLimits::default(), compact_mapping(), &mut Continue).unwrap();
+    let passages = vec![AnswerPassage { id: "evidence_0".to_owned(), text: source.to_owned() }];
+    let bytes = transport::context_bytes(request.question.question.len(),
+        passages.iter().map(|p| (p.id.as_str(), p.text.as_str())), &mut Continue).unwrap();
+    assert!(bytes > budget.max_input_tokens as usize);
+    let prompt = count_compact(&prepared.base.operation, &request.question.question, &passages,
+        prepared.expected.capacity, budget, &mut Continue).unwrap().unwrap();
+    let actual = prepared.base.operation.plan_int8_with_control(&SourceTaskRequest::Answer {
+        question: request.question.question.clone(), passages: passages.clone(), options: request.question.options, budget },
+        &PlanContext::new(&identity, budget).unwrap(), SourcePlanningLimits::default(), &mut Continue).unwrap();
+    assert_eq!(actual.prompt_tokens(), prompt); assert!(prompt <= budget.max_input_tokens as usize);
+    let encoded = AnswerContext::encode(planner.source_encoder(), &request.question.question, &passages,
+        AnswerInputLimits { max_passages: 32, max_input_bytes: 4096, max_input_tokens: budget.max_input_tokens as usize }).unwrap();
+    assert_eq!(encoded.document().text(), source);
+    for ids in encoded.document().context_token_ids().chain(std::iter::once(encoded.document().token_ids())) {
+        assert!(ids.iter().all(|id| !planner.controls.ids().contains(id)));
+    }
+    let byte = self::planner(); let capacity = Capacity { input_bytes: budget.max_input_tokens as usize, ..prepared.expected.capacity };
+    assert!(count_compact(&byte, &request.question.question, &passages, capacity, budget, &mut Continue).unwrap().is_none());
+}

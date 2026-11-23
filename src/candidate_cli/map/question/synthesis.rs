@@ -1,14 +1,19 @@
 //! Explicit synthesis selection; source-only maps and independent QA stay intact.
 use super::*;
 use crate::tasks::source_planning::quantized::long::question::synthesis::{SourceQuestionSynthesis, QuestionSynthesisLimits};
+use crate::tasks::source_planning::SourcePlanningLimits;
+pub(in crate::candidate_cli) mod hierarchy;
 
 #[derive(Args)]
 pub(in crate::candidate_cli) struct SynthesisArgs {
-    /// Add one native answer pass over ALL collected verbatim evidence. Keep
-    /// independent answers; no majority vote, top-k truncation or recall guarantee.
+    #[command(flatten)]
+    pub hierarchy: hierarchy::HierarchyArgs,
+    /// Add a final native answer over collected verbatim evidence. Optional
+    /// --hierarchical-answer first admits bounded quotation-selection levels.
+    /// Independent answers remain visible; no majority vote or recall guarantee.
     #[arg(long, requires = "question")]
     pub synthesize_answer: bool,
-    /// Maximum complete evidence passages for synthesis (default 32, max 32).
+    /// Maximum complete evidence passages for synthesis (default 32, max 1024).
     #[arg(long, requires = "synthesize_answer")]
     max_synthesis_passages: Option<usize>,
     /// Logical quote bytes for synthesis (default 16384), intersected with the
@@ -18,15 +23,24 @@ pub(in crate::candidate_cli) struct SynthesisArgs {
 }
 impl SynthesisArgs {
     pub(super) fn validate(&self, task: &str) -> Result<(), CandidateError> {
+        self.hierarchy.limits(self.synthesize_answer)?;
         let knobs = self.max_synthesis_passages.is_some() || self.max_synthesis_evidence_bytes.is_some();
         if (!self.synthesize_answer && knobs) || (task != "answer" && (self.synthesize_answer || knobs)) {
             return Err(CandidateError::Arguments);
         }
-        if self.max_synthesis_passages.is_some_and(|n| !(1..=source::MAX_PASSAGES).contains(&n))
+        if self.max_synthesis_passages.is_some_and(|n| !(1..=1024).contains(&n))
             || self.max_synthesis_evidence_bytes.is_some_and(|n| !(1..=MAX_INPUT_BYTES).contains(&n)) {
             return Err(CandidateError::Arguments);
         }
         Ok(())
+    }
+    pub(in crate::candidate_cli) fn planning(&self, mut planning: SourcePlanningLimits) -> SourcePlanningLimits {
+        if self.synthesize_answer {
+            // Only explicit collected-evidence synthesis expands this limit.
+            // Ordinary one-context and independent passage QA keep theirs.
+            planning.max_passages = self.max_synthesis_passages.unwrap_or(source::MAX_PASSAGES);
+        }
+        planning
     }
     pub(in crate::candidate_cli) fn request(&self, question: SourceQuestion, host: &source::SourceHostArgs)
         -> Result<SourceQuestionSynthesis, CandidateError> {
@@ -59,7 +73,7 @@ mod tests {
             assert!(crate::candidate_cli::definition().try_get_matches_from([
                 "candidate", "map", "--task", "answer", "--model", "local", "--memory-mib", "8192", "--question", "q", flag, "1"]).is_err());
         }
-        for (flag, value) in [("--max-synthesis-passages", "0"), ("--max-synthesis-passages", "33"),
+        for (flag, value) in [("--max-synthesis-passages", "0"), ("--max-synthesis-passages", "1025"),
             ("--max-synthesis-evidence-bytes", "0"), ("--max-synthesis-evidence-bytes", "1048577")] {
             assert!(command("answer", &["--question", "q", "--synthesize-answer", flag, value]).validate().is_err());
         }

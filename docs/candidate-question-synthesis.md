@@ -31,20 +31,92 @@ for both native stages; absent options use the existing defaults. Original text,
 question whitespace and Unicode are preserved.
 
 Without `--synthesize-answer`, the original independent-passage QA path is
-unchanged. Other map tasks reject synthesis arguments. The two new evidence
+unchanged. Other map tasks reject synthesis arguments. The evidence
 controls require the synthesis switch and cannot silently affect another mode:
 
 | Option | Scope |
 | --- | --- |
 | `--synthesize-answer` | Explicit additional native answer pass over collected quotes |
-| `--max-synthesis-passages` | Complete distinct `(chunk, quote)` passage set; default and CLI maximum 32 |
+| `--max-synthesis-passages` | Complete distinct `(chunk, quote)` passage set; default 32, maximum 1024 |
 | `--max-synthesis-evidence-bytes` | Total verbatim quote bytes; default 16384, intersected with `--max-input-bytes` |
 
-These are refusal thresholds, not top-k selectors. When all collected evidence
-cannot fit, the operation fails rather than silently discarding later passages or
-choosing a popular answer. Exact duplicate quotes in one chunk are deduplicated
+These are refusal thresholds, not top-k selectors. Single-pass synthesis fails
+when all collected evidence cannot fit its final context. Explicit hierarchy
+selection, described below, permits additional quotation-selection passes.
+Exact duplicate quotes in one chunk are deduplicated
 only after every proposal's spans and occurrence metadata have been checked.
 Equal quotes from different chunks remain distinct evidence passages.
+
+## Hierarchical answers for evidence exceeding one context
+
+Add `--hierarchical-answer` alongside `--synthesize-answer` when collected
+evidence needs more than one answer context:
+
+```sh
+fnlp candidate map document.txt \
+  --task answer --question question.txt \
+  --synthesize-answer --hierarchical-answer \
+  --model ./model.fnlpq --memory-mib 12288 \
+  --context-tokens 4096 --max-new-tokens 128 --max-chunks 32 \
+  --max-synthesis-passages 128 --max-synthesis-evidence-bytes 32768 \
+  --answer-max-levels 4 --answer-max-passes 16
+```
+
+This explicitly permits lossy selection among verified quotations. At each
+level, the planner groups complete quotations using the actual token count for
+the **original question, canonical passage manifest and joined evidence**.
+Quotes are never split to force a fit. Every group is compiled and admitted
+before that level's first native call. The prepared grammars are released after
+admission; compact identity/prompt/work witnesses are retained, and one group
+is reconstructed and rechecked at a time.
+
+Only verified citations from a group's answer become the next level's evidence.
+The generated answer text is retained in the result but is never fed back as
+source material. Each retained quote carries all its reachable original-source
+occurrences. A nonterminal level must strictly reduce total quote bytes; no
+progress, an oversized atomic quote, or exhausted limits fails the whole
+operation. A single group at a level supplies the final answer.
+
+| Hierarchy option | Default | Allowed range |
+| --- | ---: | ---: |
+| `--answer-max-levels` | 8 | 1–16, including the final level |
+| `--answer-max-passes` | 16 | 1–256 additional native calls across all levels |
+| `--answer-max-tokenizer-calls` | 8192 | 1–65536 grouping attempts |
+| `--answer-max-tokenizer-bytes` | 67108864 | 1–1000000000 grouping bytes |
+
+These options require the hierarchy switch. The evidence passage/byte limits
+bound the entire initial collection and every subsequent frontier. Raising the
+passage limit explicitly expands synthesis planning; ordinary passage QA keeps
+its existing limit. Grouping bytes count repeated questions and manifests,
+including failed fit probes. Native compilation is additionally bounded to two
+preparations per allowed pass, with neither preparation granting new work.
+
+Before discovery, the hierarchy reserves every permitted native pass at the
+maximum admitted context and the full per-pass grammar-mask allowance. All five
+native work limits, total masks and independent citation-verification limits
+remain shared across discovery and every level. Early completion never refunds
+that reservation. The CLI checks a simultaneous memory floor for retained
+discovery, every allowed native/lifted transcript, evidence frontiers, occurrence
+transport, planning witnesses, preparation, native buffers and output staging
+before private IO. The resident model is separately charged by the process host.
+
+`--input-encoding safe-bpe-v1` is supported. CLI preflight, hosted discovery
+planning, rejected hierarchy probes, admission preparation and execution
+reconstruction all spend the original complete-operation SafeBPE ledger. Its
+four `--max-total-tokenizer-*` limits are additional to the hierarchy's grouping
+limits. A fresh equivalent planner cannot renew the retained operation.
+
+Hierarchy output uses execution
+`portable-int8-hierarchical-quote-answer-v1`. It retains `discovery`, ordered
+`levels`, and every `passes` entry, including native generated token IDs and the
+independently lifted original-source answer. `final_pass` indexes the final
+payload without duplicating it. Status is `answered`, `abstained`,
+`no_evidence_collected`, or `evidence_exhausted`; the last means that intermediate
+selection retained no evidence and no final model pass ran. Reserved work,
+actual work, masks, verification usage and grouping work remain visible. Exact
+request and nested-result commitments remain private and are checked before
+publication. The complete result, including every intermediate receipt, must
+fit `--max-map-result-bytes`.
 
 ## Native work and completion
 
@@ -142,11 +214,20 @@ both stages and does not accept caller-invented inference receipts. The hosted
 entry point is `NlpEngine::synthesize_int8_document_answer` with
 `SourceMapConfig<SourceQuestionSynthesis>`.
 
-This extension adds 22 model-free regression definitions: 12 core, 4 CLI
-(including one feature-disabled test), 4 pinned runtime-planning fixtures and 2
-host-memory arithmetic fixtures. They cover quote-only final inputs, full-stage
+For hierarchical execution, use `hierarchy::QuestionHierarchyLimits`,
+`preflight_int8_question_hierarchy_with_control`,
+`plan_int8_question_hierarchy_with_control`, and
+`NlpEngine::synthesize_int8_document_answer_hierarchical`. The shared pure
+`hierarchy::memory::workspace_bytes` quote covers complete retained reduction
+state; input/grammar, native workspace and output have separate ownership.
+
+Model-free regression definitions cover quote-only inputs, full-stage
 reservations, Unicode lifting, overlap/duplicate handling, passage-join refusal,
-late corruption, cancellation, no-evidence accounting and mode isolation.
+late corruption, cancellation, no-evidence accounting and mode isolation. Added
+hierarchy cases exercise multilevel selection, every group's pre-forward
+admission, exact witness replay, strict progress, all six work/mask boundaries,
+complete intermediate receipts, compact-ledger continuity, same-geometry request
+substitution, all eleven cancellation causes and simultaneous memory quotes.
 
 Source/API, ownership and targeted GitHub diff review were performed. Compilation,
 Cargo tests, scripts, Actions, DSR and full-model execution were not run under the

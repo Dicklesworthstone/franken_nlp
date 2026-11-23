@@ -134,6 +134,7 @@ impl MapCommand {
         let floor = floor.checked_add(encoding.map(|limits| limits.workspace_bytes()).transpose()?.unwrap_or(0))
             .ok_or(CandidateError::Arguments)?;
         if limits.preparation_bytes < floor { return Err(CandidateError::Arguments); }
+        self.question.synthesis.check_memory(self, limits)?;
         Ok((args, limits))
     }
     pub(super) fn map_task(&self, raw: Option<&str>) -> Result<SourceMapTask, CandidateError> {

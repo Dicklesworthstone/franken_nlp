@@ -137,7 +137,7 @@ existing shape. Encoder workspace is admitted before private input/model IO and
 charged beside the full retained-plan preparation reserve.
 
 Compact input also supports `--synthesize-answer` and `--synthesize-summary`,
-including `--hierarchical-summary`. For example:
+including `--hierarchical-answer` and `--hierarchical-summary`. For example:
 
 ```sh
 fnlp candidate map report.txt --task summarize \
@@ -147,11 +147,21 @@ fnlp candidate map report.txt --task summarize \
 ```
 
 The final neural pass consumes only verified verbatim evidence collected from
-discovery. Hierarchical summary reduction charges every actual joined-evidence
+discovery. Hierarchical reduction charges every actual evidence-context
 fit probe, including rejected groups, and every compiled node against the same
 original tokenizer ledger. Neither a new pass nor an equivalent fresh planner
 renews that allowance. An empty evidence set performs no synthesis encoding or
 native call. Cancellation retains its original kind across dynamic encoding.
+
+For document QA, combine `--task answer --question question.txt` with
+`--synthesize-answer --hierarchical-answer`. Every group includes the original
+question and canonical passage manifest in its actual fit calculation. Verified
+quotations carry original occurrence sets across levels; generated answer prose
+never becomes evidence. `--answer-max-levels` and `--answer-max-passes` bound the
+whole hierarchy, with every permitted native pass reserved before discovery.
+All intermediate native/lifted answers remain visible in the complete result.
+See the [hierarchical answer contract](candidate-question-synthesis.md#hierarchical-answers-for-evidence-exceeding-one-context)
+for exact caps, memory admission and distinct completion states.
 
 Summary synthesis reserves `--max-input-bytes` per evidence prompt, independently
 of `--max-chunk-bytes` for original discovery chunks. Actual encoded counts

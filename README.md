@@ -61,6 +61,10 @@
 > [held-out sentiment ratings and paired model comparison](#native-int4-sentiment-evaluation-and-comparison).
 > INT8 `candidate map` also supports [bounded compact input for complete
 > NER, keyphrase and cited-summary documents](#implemented-candidate-int8-compact-document-maps).
+> INT8 document QA supports [bounded hierarchical answers from verified
+> quotations](docs/candidate-question-synthesis.md#hierarchical-answers-for-evidence-exceeding-one-context).
+> Buffered INT8 generation and chat support [persistent scoped CPU
+> teams](docs/candidate-inference-cli.md#persistent-int8-cpu-teams).
 > INT8 `candidate sentiment-map` adds [complete-document dimensional sentiment
 > with exact source coverage](#implemented-candidate-int8-complete-document-sentiment).
 > Candidate results retain their explicit provenance; build verification,
@@ -718,9 +722,9 @@ actual passage plans all spend the same cumulative tokenizer allowance. Each
 answer retains passage-scoped evidence in original-document coordinates.
 
 Add `--synthesize-answer` to produce a final answer from the verified collected
-quotes, or `--synthesize-summary` for a final cited summary. Summary synthesis
-also accepts `--hierarchical-summary` when those quotes need multiple bounded
-reduction passes. Discovery, final evidence encoding, hierarchy fit probes
+quotes, or `--synthesize-summary` for a final cited summary. Add
+`--hierarchical-answer` or `--hierarchical-summary` when those quotes need
+multiple bounded reduction passes. Discovery, final evidence encoding, hierarchy fit probes
 (including rejected joins) and every hierarchy node spend the original ledger.
 The final result reports cumulative encoding work for the complete invocation.
 
@@ -736,6 +740,16 @@ actual encoded token count still determines context fit. Final answers and
 summaries cite the original source, and generated discovery text never becomes
 source evidence. These modes synthesize from collected quotes and do not claim
 equivalence to native inference over the complete original document.
+
+Question hierarchies retain the original question and complete passage manifest
+in every fit calculation. They admit all groups in a level before the first
+forward, preserve original occurrence sets across quote selection, require
+strict progress, and retain all native and lifted intermediate answers.
+`--answer-max-levels` and `--answer-max-passes` bound the complete hierarchy;
+every permitted pass is reserved before discovery. Explicit synthesis accepts
+up to 1024 evidence passages, with the default unchanged at 32. See the
+[hierarchical answer contract](docs/candidate-question-synthesis.md#hierarchical-answers-for-evidence-exceeding-one-context)
+for complete work, memory, result and compact-tokenizer limits.
 
 Encoder workspace is charged alongside retained source, prompts and grammars.
 All output remains candidate

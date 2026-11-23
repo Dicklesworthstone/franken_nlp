@@ -1,5 +1,28 @@
-//! Explicit two-stage document QA, one runtime/model, one completed response.
+//! Explicit document QA synthesis, one runtime/model, one completed response.
 use super::*;
+use crate::tasks::source_planning::quantized::long::question::synthesis::{
+    SourceQuestionSynthesis, Int8QuestionSynthesisPreflight,
+    hierarchy::Int8QuestionHierarchyPreflight};
+
+enum Expected { Single(Int8QuestionSynthesisPreflight), Hierarchical(Int8QuestionHierarchyPreflight) }
+#[allow(clippy::too_many_arguments)]
+fn prepare_mode(source: &str, planner: &SourceTaskPlanner, task: &SourceQuestionSynthesis,
+    budget: TaskBudget, context: &PlanContext<'_>, command: &MapCommand, mapping: Int8SourceMapLimits,
+    control: &mut impl DecodeStepControl) -> Result<Expected, CandidateError> {
+    let planning = command.question.synthesis.planning(command.host.planning());
+    if let Some(hierarchy) = command.question.synthesis.hierarchy.limits(true)? {
+        let expected = planner.preflight_int8_question_hierarchy_with_control(source, task, hierarchy,
+            budget, context, planning, mapping, control).map_err(question_error)?;
+        command.admit_work(expected.reserved_model_work(), expected.reserved_mask_visits())?;
+        Ok(Expected::Hierarchical(expected))
+    } else {
+        let expected = planner.preflight_int8_question_synthesis_with_control(source, task,
+            budget, context, planning, mapping, control).map_err(question_error)?;
+        command.admit_work(expected.reserved_model_work().map_err(question_error)?,
+            expected.reserved_mask_visits().map_err(question_error)?)?;
+        Ok(Expected::Single(expected))
+    }
+}
 
 pub(super) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
@@ -21,27 +44,38 @@ pub(super) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
     };
     let identity = source_identity(&facts, &planner, BuiltInTask::Answer)?;
     let context = PlanContext::new(&identity, budget).map_err(|_| CandidateError::Planning)?;
-    // Fund a maximum-context final pass BEFORE weights. All actual map prompts
-    // still preflight against the remainder, without early-EOS refunds.
-    let expected = planner.preflight_int8_question_synthesis_with_control(&text, &task, budget, &context,
-        command.host.planning(), mapping, &mut session.control()).map_err(question_error)?;
-    command.admit_work(expected.reserved_model_work().map_err(|_| CandidateError::Planning)?,
-        expected.reserved_mask_visits().map_err(|_| CandidateError::Planning)?)?;
+    // Reserve every allowed synthesis pass before weights. Discovery uses the
+    // remainder, without refunds or renewed budgets between hierarchy levels.
+    let expected = prepare_mode(&text, &planner, &task, budget, &context, &command, mapping, &mut session.control())?;
     session.remaining()?;
     let cancellation = CancellationToken::default();
     let model = session.load(&args, limits, &facts, cancellation.clone())?;
-    let config = SourceMapConfig { identity, task, budget, planning: command.host.planning(), mapping,
+    let config = SourceMapConfig { identity, task, budget,
+        planning: command.question.synthesis.planning(command.host.planning()), mapping,
         native: session.native(&args)?, preparation_reserve_bytes: limits.preparation_bytes,
         reduction_reserve_bytes: command.reduction_reserve_mib.checked_mul(MIB).ok_or(CandidateError::Arguments)? };
     let planner = Arc::new(planner);
-    let result = session.engine.synthesize_int8_document_answer(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
-        config, cancellation).map_err(host_error)?;
-    session.remaining()?;
-    expected.verify_completed_with_control(result.result(), &mut session.control())
-        .map_err(|error| error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution))?;
-    // Retain output authority through final serialization, write AND flush.
-    deliver_encoded(&session, &facts, &result, encoding::report(&planner)?.as_ref(),
-        command.max_map_result_bytes + 4096, output)
+    match expected {
+        Expected::Single(expected) => {
+            let result = session.engine.synthesize_int8_document_answer(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
+                config, cancellation).map_err(host_error)?;
+            session.remaining()?;
+            expected.verify_completed_with_control(result.result(), &mut session.control())
+                .map_err(|error| error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution))?;
+            deliver_encoded(&session, &facts, &result, encoding::report(&planner)?.as_ref(),
+                command.max_map_result_bytes + 4096, output)
+        }
+        Expected::Hierarchical(expected) => {
+            let result = session.engine.synthesize_int8_document_answer_hierarchical(&model, text,
+                Arc::clone(&planner), Arc::new(vocabulary), config, expected.limits(), cancellation).map_err(host_error)?;
+            session.remaining()?;
+            expected.verify_completed_with_control(result.result(), &mut session.control())
+                .map_err(|error| error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution))?;
+            // All retained intermediate/final results stay charged through write AND flush.
+            deliver_encoded(&session, &facts, &result, encoding::report(&planner)?.as_ref(),
+                command.max_map_result_bytes + 4096, output)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -148,6 +182,70 @@ mod tests {
             cmd.host.planning(), mapping, &mut Continue).unwrap();
         assert_eq!(expected, prepared.preflight_metadata());
         assert_eq!(expected.discovery().source_span().byte_end, source.len());
+        let after = p.map_document_encoding_work().unwrap().unwrap();
+        assert!(after.input_bytes() > before.input_bytes());
+        let report = serde_json::to_value(encoding::report(&p).unwrap().unwrap()).unwrap();
+        assert_eq!(report["work_used"], serde_json::to_value(after).unwrap());
+        assert_eq!(report["complete_operation_limits"], serde_json::to_value(cmd.encoding.limits(&cmd).unwrap().unwrap().complete).unwrap());
+    }
+    #[test]
+    fn selected_hierarchy_mode_matches_full_preparation_before_model_io() {
+        let cmd = command("answer", &["--question", "q", "--synthesize-answer", "--hierarchical-answer",
+            "--max-chunk-bytes", "512", "--max-synthesis-passages", "128"]);
+        let (p, id, b, q, mapping) = assets(&cmd); let ctx = PlanContext::new(&id, b).unwrap();
+        let source = "Alice <tool_call> é 上海 😀\r\n".repeat(100);
+        let Expected::Hierarchical(expected) = prepare_mode(&source, &p, &q, b, &ctx, &cmd,
+            mapping, &mut Continue).unwrap() else { panic!("hierarchy mode lost") };
+        let prepared = p.plan_int8_question_hierarchy_with_control(&source, &q, expected.limits(), b, &ctx,
+            cmd.question.synthesis.planning(cmd.host.planning()), mapping, &mut Continue).unwrap();
+        assert_eq!(expected, prepared.preflight_metadata());
+        assert!(expected.discovery().native_chunks() > 1);
+        assert_eq!(expected.discovery().source_span().byte_end, source.len());
+        assert_eq!(prepared.execution_identities().len(), expected.discovery().native_chunks());
+        let flat = p.preflight_int8_question_synthesis_with_control(&source, &q, b, &ctx,
+            cmd.question.synthesis.planning(cmd.host.planning()), mapping, &mut Continue).unwrap();
+        assert!(expected.reserved_model_work().forward_positions > flat.reserved_model_work().unwrap().forward_positions);
+        assert!(expected.reserved_mask_visits() > flat.reserved_mask_visits().unwrap());
+    }
+    #[test]
+    fn hierarchy_cli_admits_the_entire_reservation_on_all_six_axes() {
+        let mut cmd = command("answer", &["--question", "q", "--synthesize-answer", "--hierarchical-answer"]);
+        let (p, id, b, q, mapping) = assets(&cmd); let ctx = PlanContext::new(&id, b).unwrap();
+        let Expected::Hierarchical(expected) = prepare_mode("Alice", &p, &q, b, &ctx, &cmd,
+            mapping, &mut Continue).unwrap() else { panic!("hierarchy mode lost") };
+        let work = expected.reserved_model_work(); let masks = expected.reserved_mask_visits();
+        cmd.max_forward_positions = work.forward_positions;
+        cmd.max_projected_logits = work.projected_logits;
+        cmd.max_attention_pairs = work.attention_pairs;
+        cmd.max_dot_products = work.projections.dot_products;
+        cmd.max_multiply_accumulates = work.projections.multiply_accumulates;
+        cmd.max_total_mask_node_visits = masks;
+        let exact = cmd.question_mapping().unwrap();
+        prepare_mode("Alice", &p, &q, b, &ctx, &cmd, exact, &mut Continue).unwrap();
+        for axis in 0..6 {
+            match axis { 0 => cmd.max_forward_positions -= 1, 1 => cmd.max_projected_logits -= 1,
+                2 => cmd.max_attention_pairs -= 1, 3 => cmd.max_dot_products -= 1,
+                4 => cmd.max_multiply_accumulates -= 1, _ => cmd.max_total_mask_node_visits -= 1 }
+            // Even an otherwise valid, unchanged preparation cannot grant the
+            // CLI more work than the caller's original whole-operation caps.
+            assert!(prepare_mode("Alice", &p, &q, b, &ctx, &cmd, exact, &mut Continue).is_err(), "{axis}");
+            match axis { 0 => cmd.max_forward_positions += 1, 1 => cmd.max_projected_logits += 1,
+                2 => cmd.max_attention_pairs += 1, 3 => cmd.max_dot_products += 1,
+                4 => cmd.max_multiply_accumulates += 1, _ => cmd.max_total_mask_node_visits += 1 }
+        }
+    }
+    #[test]
+    fn compact_hierarchy_carries_cli_spend_into_hosted_preparation_and_report() {
+        let cmd = command("answer", &["--question", "q", "--synthesize-answer", "--hierarchical-answer",
+            "--input-encoding", "safe-bpe-v1", "--max-chunk-bytes", "512"]);
+        let (p, id, b, q, mapping) = assets(&cmd); let ctx = PlanContext::new(&id, b).unwrap();
+        let source = "Original evidence about café, 上海, Alice and <tool_call>. ".repeat(8);
+        let Expected::Hierarchical(expected) = prepare_mode(&source, &p, &q, b, &ctx, &cmd,
+            mapping, &mut Continue).unwrap() else { panic!("hierarchy mode lost") };
+        let before = p.map_document_encoding_work().unwrap().unwrap();
+        let prepared = p.plan_int8_question_hierarchy_with_control(&source, &q, expected.limits(), b, &ctx,
+            cmd.question.synthesis.planning(cmd.host.planning()), mapping, &mut Continue).unwrap();
+        assert_eq!(expected, prepared.preflight_metadata());
         let after = p.map_document_encoding_work().unwrap().unwrap();
         assert!(after.input_bytes() > before.input_bytes());
         let report = serde_json::to_value(encoding::report(&p).unwrap().unwrap()).unwrap();

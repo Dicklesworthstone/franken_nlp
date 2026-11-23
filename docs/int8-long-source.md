@@ -106,9 +106,10 @@ compact encoding does not authorize a global object merge.
 
 Neural answer and summary synthesis accept the same complete-operation compact
 policy. Prepared synthesis retains the original encoder operation across the
-discovery phase and final verified-evidence plan. Summary hierarchy uses that
-operation for every joined-evidence fit probe, including rejected joins, and
-every node plan. Passing a fresh planner with an equivalent policy to execution
+discovery phase and final verified-evidence plan. Summary and question hierarchies
+use that operation for every evidence-context fit probe, including rejected
+groups, and every node plan. Question fit includes the original question and
+canonical passage manifest at every level. Passing a fresh planner with an equivalent policy to execution
 cannot replenish the retained ledger. All dynamic plans recheck their actual
 token fit and identity; exhaustion refuses the complete operation without a
 byte fallback. Empty evidence skips synthesis encoding and native execution.
@@ -120,6 +121,17 @@ and coordinates remain citation authority through all phases. Long-redaction
 compositions keep their separate byte-only admission. Compact tokens may change
 native output; implementation and regression definitions establish no
 model-quality, parity or measured-speed result.
+
+`SourceTaskPlanner::plan_int8_question_hierarchy_with_control` explicitly admits
+bounded quotation-selection levels when all collected QA evidence exceeds one
+answer context. Every level pre-admits all its groups, retains compact witnesses
+and reconstructs one grammar at a time. The hierarchy preserves original
+occurrence sets, requires strict reduction in quote bytes, and retains every
+native and lifted answer. Its private request/result commitments compose the
+exact discovery owner. Use
+`NlpEngine::synthesize_int8_document_answer_hierarchical` for one hosted
+invocation with complete retained-workspace and output ownership. See
+[question synthesis](candidate-question-synthesis.md) for the public contract.
 
 ## Exact completion association
 

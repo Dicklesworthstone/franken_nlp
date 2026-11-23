@@ -8,6 +8,9 @@ host to local candidate loading and native task execution:
 - `execute_int8_chat(model, prepared, request_seq, native_limits,
   max_sampler_bytes, cancellation)` executes a `PreparedInt8Chat`, covering
   both generation and multi-turn chat.
+- `execute_int8_chat_with_threads(model, prepared, request_seq, native_limits,
+  max_sampler_bytes, kernel, compute_threads, cancellation)` uses one persistent
+  output-row team for a complete buffered generation/chat request.
 - `execute_int8_extract(model, prepared, vocabulary, native_limits,
   mask_limits, max_mask_node_visits, cancellation)` executes an
   `Int8ExtractPlan` with its existing schema/source finalizer.
@@ -23,7 +26,7 @@ new allocations made by the host. Their ownership remains explicit.
 ## Runtime and physical lifetime
 
 Use an already installed `EngineResources` host with exactly one blocking
-coordinator. This is the serial native INT8 baseline, not parallel inference.
+coordinator. The default entrypoints retain the serial native INT8 baseline.
 The configured runtime can still have its separately counted scheduler workers;
 no new runtime or ad-hoc thread pool is constructed. Each call enters one
 `Cx::spawn_blocking` closure and one coordinator-only `Cx::scoped_cpu(0)` scope.
@@ -43,6 +46,39 @@ The process's configured panic hook is not replaced or suppressed.
 This uses the existing runtime's request context/root task ownership. It does
 not claim a separately certified per-request region or the full OQ-28/OQ-29
 lifecycle certificate. No scope/tree gate is closed by adding these methods.
+
+### Explicit persistent projection teams
+
+`execute_int8_chat_with_threads` admits widths 2–64 against the installed
+`scoped_cpu_children_per_coordinator` envelope, with one coordinator plus
+`compute_threads - 1` children. It crosses the blocking seam once and forms one
+sealed `scoped_cpu` team for the complete request. There is no per-token or
+per-projection spawn. The fixed worker payload can be quoted before execution
+with `int8_chat_team_workspace_bytes`; native KV, scratch, sampler, output,
+allocator and cleanup ownership are separate.
+
+Workers borrow the same immutable validated weight view and checked kernel as
+the coordinator. All seven decoder projections and the head partition output
+rows. Each row keeps its serial numerical operations. Quantization, sequence
+order, KV mutation, sampling and the sole nonrenewable native work ledger stay
+on the coordinator. The whole projection is charged before dispatch. Selected
+head rows retain their original ordering; an idle child acknowledges a command
+without inventing row work. Any failed projection poisons the executor.
+
+An outer admission bundle retains pending/committed KV, scratch, output and
+lease ownership through physical join, even when native allocation or task
+execution fails or panics. Capacity-one lanes disconnect before the scope joins
+its children. A post-join checkpoint spends the original shared authority and
+prevents a cancellation arriving during drain from being reported as success.
+Returned `HostedInt8TeamResult` retains ordinary guarded output and exposes a
+separate `Int8ComputeReceipt`; no result is returned while a worker is live.
+
+This initial team interface uses a single activation row. Layer-major prefill
+refuses an installed executor before native work or KV mutation. The explicit
+buffered host entrypoint uses ordinary token-ordered prefill; packed prompt
+execution, streams and resident corpora retain their separate entrypoints.
+The implementation and tiny scoped-team regressions establish no measured
+speedup, full-model parity or completed runtime certificate.
 
 ## Resource accounting
 

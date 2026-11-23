@@ -3,6 +3,7 @@ use super::*;
 use crate::tasks::source_planning::quantized::long::question::synthesis::{
     SourceQuestionSynthesis, Int8QuestionSynthesisRun, QuestionSynthesisLimits};
 use crate::validation::grounded_fields::GroundingBudget;
+mod hierarchy;
 
 impl NlpEngine {
     /// The final pass is funded before discovery. Same resident model, engine,
@@ -106,7 +107,7 @@ fn synthesis_bytes(limits: QuestionSynthesisLimits, verification: GroundingBudge
 mod tests {
     use super::*;
     use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits};
-    fn config() -> SourceMapConfig<SourceQuestionSynthesis> {
+    pub(super) fn config() -> SourceMapConfig<SourceQuestionSynthesis> {
         let base = super::super::tests::config();
         SourceMapConfig { identity: base.identity,
             task: SourceQuestionSynthesis { question: base.task,
