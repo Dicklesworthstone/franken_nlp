@@ -117,7 +117,7 @@ fn multi_context_quotes_reduce_to_one_summary_without_feeding_back_generated_ass
     assert_eq!(reduced.status, SummarySynthesisStatus::Synthesized);
     assert_eq!(reduced.passes[2].bullets[0].citations[0].spans[0], VerifiedSourceSpan {
         byte_start: 0, byte_end: 2, scalar_start: 0, scalar_end: 1 });
-    for pass in &reduced.passes { receipt::verify_pass(&expected, pass).unwrap(); }
+    for pass in &reduced.passes { receipt::verify_pass(&expected, pass, &mut go()).unwrap(); }
     assert_eq!(reduced.tokenizer, HierarchyTokenizerWork { calls: 5, bytes: 30 });
 }
 #[test]
@@ -168,7 +168,7 @@ fn every_completed_pass_checks_native_work_and_original_source_bounds() {
             2 => pass.native.model_work.attention_pairs += 1, 3 => pass.native.model_work.projections.dot_products += 1,
             4 => pass.native.model_work.projections.multiply_accumulates += 1,
             _ => pass.bullets[0].citations[0].spans[0].byte_end = SOURCE.len() + 1 }
-        assert!(receipt::verify_pass(&expected, pass).is_err(), "{axis}");
+        assert!(receipt::verify_pass(&expected, pass, &mut go()).is_err(), "{axis}");
     }
 }
 #[test]
@@ -182,4 +182,121 @@ fn verification_work_and_complete_output_caps_apply_across_levels() {
         assert!(execution::reduce(SOURCE, collection, request(), expected, output_cap,
             &mut remaining, &mut driver, &mut go()).is_err());
     }
+}
+
+struct MapSummary<'a> { source: &'a str, empty: bool }
+impl SourceDriver for MapSummary<'_> {
+    fn checkpoint(&mut self) -> Result<(), Int8SourceError> { Ok(()) }
+    fn run(&mut self, plan: &PreparedInt8SourceTask, _: &ExecutionIdentity) -> Result<Int8SourceTaskRun, Int8SourceError> {
+        let work = constrained_int8::planned_work(plan.prompt_tokens(), 2).unwrap();
+        let bullets = if self.empty { Vec::new() } else {
+            vec![CitedBullet { text: "discovery candidate".to_owned(), citations: vec![SourceCitation {
+                quote: self.source.to_owned(), occurrence: SourceOccurrence::Anchored,
+                spans: scan_occurrences(self.source, self.source, &mut GroundingBudget::default()).unwrap() }] }]
+        };
+        let raw = SummaryResult { schema_version: 1, task_spec_version: SUMMARIZE_TASK_VERSION.to_owned(),
+            numerics_profile: STRICT_INT8_PROFILE.to_owned(), citation_guarantee: CitationGuarantee::StructuralSourceMembership,
+            semantic_support: SummarySemanticSupport::NotAssessed, score_space: ScoreSpace::NotComputed,
+            bullets, generated_token_ids: vec![1, 0], forward_positions: work.forward_positions,
+            projected_logits: work.projected_logits, mask_node_visit_charge: 20 };
+        Ok(Int8SourceTaskRun { schema_version: 1, execution: INT8_SOURCE_EXECUTION.to_owned(),
+            result: SourceTaskResult::Summarize(raw), model_work: work })
+    }
+}
+fn completion(p: &SourceTaskPlanner, text: &str, empty: bool)
+    -> (Int8SummaryHierarchyPreflight, Int8SummaryHierarchyRun) {
+    let prepared = prepare(p, text, mapping()); let expected = prepared.expected;
+    assert_eq!(expected.chunk_count(), 1);
+    let admitted: Vec<_> = prepared.execution_identities().cloned().collect();
+    let discovery = prepared.base.map.execute_with_driver(&admitted, MapSummary { source: text, empty }).unwrap();
+    let mut remaining = request().limits.verification;
+    let collection = evidence::collect(text, discovery.mapped.root().value(), request().map_options,
+        request().limits, &mut remaining, &mut go()).unwrap();
+    let initial = EvidenceSize::of(&collection);
+    let reduced = execution::reduce(text, collection, request(), expected, mapping().reduction.max_result_bytes as u64,
+        &mut remaining, &mut script(expected), &mut go()).unwrap();
+    (expected, finish(discovery, initial, reduced, remaining, expected, &mut go()).unwrap())
+}
+#[test]
+fn completed_hierarchy_is_bound_to_source_options_and_the_original_global_allowance() {
+    let p = planner(); let (expected, run) = completion(&p, "Alice", false);
+    expected.verify_completed(&run).unwrap();
+    let foreign = prepare(&p, "Carol", mapping()).preflight_metadata();
+    assert_eq!(foreign.source_span(), expected.source_span());
+    assert_eq!(foreign.reserved_model_work(), expected.reserved_model_work());
+    assert_eq!(foreign.reserved_mask_visits(), expected.reserved_mask_visits());
+    assert!(foreign.verify_completed(&run).is_err());
+    let mut smaller = mapping(); smaller.max_mask_visits -= 1;
+    let other = prepare(&p, "Alice", smaller).preflight_metadata();
+    assert_eq!(other.reserved_mask_visits(), expected.reserved_mask_visits());
+    assert!(other.verify_completed(&run).is_err());
+
+    let (_, empty) = completion(&p, "Alice", true);
+    let id = identity(&p); let context = PlanContext::new(&id, budget()).unwrap();
+    for change_options in [false, true] {
+        let mut changed = request();
+        if change_options { changed.synthesis_options.max_bullets = 1; }
+        else { changed.limits.verification.max_matches -= 1; }
+        let other = p.plan_int8_summary_hierarchy_with_control("Alice", changed, limits(), budget(),
+            &context, SourcePlanningLimits::default(), mapping(), &mut go()).unwrap().preflight_metadata();
+        assert!(other.verify_completed(&empty).is_err());
+    }
+}
+#[test]
+fn hierarchy_seal_rejects_changed_final_text_quotes_and_tokens_that_pass_structural_checks() {
+    let p = planner();
+    for axis in 0..3 {
+        let (expected, mut run) = completion(&p, "Alice", false);
+        let pass = &mut run.passes[0];
+        let SourceTaskResult::Summarize(raw) = &mut pass.native.result else { panic!("summary fixture"); };
+        match axis {
+            0 => {
+                raw.bullets[0].text = "rewritten".to_owned();
+                pass.bullets[0].text = raw.bullets[0].text.clone();
+            }
+            1 => {
+                let span = VerifiedSourceSpan { byte_start: 1, byte_end: 2, scalar_start: 1, scalar_end: 2 };
+                raw.bullets[0].citations[0].quote = "l".to_owned();
+                raw.bullets[0].citations[0].spans = vec![span];
+                pass.bullets[0].citations[0].quote = "l".to_owned();
+                pass.bullets[0].citations[0].spans = vec![span];
+            }
+            _ => raw.generated_token_ids[0] = 2,
+        }
+        // The old header, geometry, native-work and lineage checks all accept
+        // these edits. Exact completion binding must still reject them.
+        receipt::verify(&expected, &run, &mut go()).unwrap();
+        assert!(expected.verify_completed(&run).is_err(), "{axis}");
+    }
+}
+#[test]
+fn hierarchy_completion_preserves_cancellation_during_binding_and_lineage_verification() {
+    struct CancelAt { cause: DecodeCancellationKind, stop: usize, polls: usize }
+    impl DecodeStepControl for CancelAt {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.polls += 1; (self.polls == self.stop).then_some(self.cause)
+        }
+    }
+    use DecodeCancellationKind::*;
+    let p = planner(); let (expected, run) = completion(&p, "Alice", false);
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        for stop in [1, 3, 7] {
+            let mut control = CancelAt { cause, stop, polls: 0 };
+            assert_eq!(expected.verify_completed_with_control(&run, &mut control).unwrap_err().cancellation(), Some(cause));
+            assert_eq!(control.polls, stop);
+        }
+    }
+}
+#[test]
+fn hierarchy_private_hashes_do_not_change_public_output_or_its_exact_byte_budget() {
+    let p = planner(); let (mut expected, run) = completion(&p, "Alice", true);
+    let json = crate::canonjson::canonical_string(&run).unwrap(); let debug = format!("{expected:?}");
+    for private in ["request_binding", "result_binding", "Alice"] {
+        assert!(!json.contains(private)); assert!(!debug.contains(private));
+    }
+    expected.max_result_bytes = json.len() as u64;
+    expected.verify_completed(&run).unwrap();
+    expected.max_result_bytes -= 1;
+    assert!(expected.verify_completed(&run).is_err());
 }

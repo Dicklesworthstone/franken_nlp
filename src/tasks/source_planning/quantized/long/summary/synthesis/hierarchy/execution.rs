@@ -110,7 +110,7 @@ pub(super) fn reduce<C: DecodeStepControl, D: Driver>(source: &str, mut frontier
             if masks > expected.discovery.synthesis_masks { return Err(Int8SourceMapError::WorkLimit); }
             let pass = SummaryHierarchyPass { level, group: group_index, input_segments: group.segments,
                 input_bytes: group.bytes, input_tokens: group.tokens, planned_model_work: planned, native, bullets };
-            receipt::verify_pass(&expected, &pass)?;
+            receipt::verify_pass(&expected, &pass, control)?;
             out.planned = add_work(out.planned, planned).ok_or(Int8SourceMapError::WorkLimit)?;
             out.actual = add_work(out.actual, pass.native.model_work).ok_or(Int8SourceMapError::WorkLimit)?;
             out.masks = out.masks.checked_add(masks).ok_or(Int8SourceMapError::WorkLimit)?;

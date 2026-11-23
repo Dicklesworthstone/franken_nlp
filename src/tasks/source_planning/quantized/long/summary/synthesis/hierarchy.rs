@@ -37,7 +37,7 @@ impl SummaryHierarchyLimits {
         Ok(())
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Int8SummaryHierarchyPreflight {
     discovery: Int8SummarySynthesisPreflight,
     limits: SummaryHierarchyLimits,
@@ -45,6 +45,20 @@ pub struct Int8SummaryHierarchyPreflight {
     output_tokens: usize,
     reserved_work: Int8Work,
     reserved_masks: u64,
+    request_binding: [u8; 32],
+    max_result_bytes: u64,
+}
+impl std::fmt::Debug for Int8SummaryHierarchyPreflight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Int8SummaryHierarchyPreflight")
+            .field("discovery", &self.discovery)
+            .field("limits", &self.limits)
+            .field("capacity", &self.capacity)
+            .field("output_tokens", &self.output_tokens)
+            .field("reserved_work", &self.reserved_work)
+            .field("reserved_masks", &self.reserved_masks)
+            .finish_non_exhaustive()
+    }
 }
 impl Int8SummaryHierarchyPreflight {
     pub fn chunk_count(&self) -> usize { self.discovery.chunk_count() }
@@ -53,7 +67,16 @@ impl Int8SummaryHierarchyPreflight {
     pub fn reserved_mask_visits(&self) -> u64 { self.reserved_masks }
     pub fn limits(&self) -> SummaryHierarchyLimits { self.limits }
     pub fn verify_completed(&self, run: &Int8SummaryHierarchyRun) -> Result<(), Int8SourceMapError> {
-        receipt::verify(self, run)
+        self.verify_completed_with_control(run, &mut binding::Continue)
+    }
+    pub fn verify_completed_with_control<C: DecodeStepControl>(&self, run: &Int8SummaryHierarchyRun,
+        control: &mut C) -> Result<(), Int8SourceMapError> {
+        checkpoint(control)?;
+        if run.request_binding != self.request_binding || run.result_binding != binding::composed_result(
+            b"fnlp-int8-summary-hierarchy-result-v1", self.request_binding, &[], run, self.max_result_bytes, control)? {
+            return Err(invalid());
+        }
+        receipt::verify(self, run, control)
     }
 }
 
@@ -93,8 +116,12 @@ impl SourceTaskPlanner {
         if !within(reserved_work, mapping.max_model_work) || reserved_masks > mapping.max_mask_visits {
             return Err(Int8SourceMapError::WorkLimit);
         }
+        let request_binding = binding::composed_request(b"fnlp-int8-summary-hierarchy-request-v1",
+            discovery.request_binding, &(hierarchy, capacity.scaffold_tokens(), capacity.reserved_tokens(),
+                capacity.max_source_tokens(), capacity.context_tokens(), budget.max_output_tokens), mapping, control)?;
         let expected = Int8SummaryHierarchyPreflight { discovery, limits: hierarchy, capacity,
-            output_tokens: budget.max_output_tokens as usize, reserved_work, reserved_masks };
+            output_tokens: budget.max_output_tokens as usize, reserved_work, reserved_masks, request_binding,
+            max_result_bytes: mapping.reduction.max_result_bytes as u64 };
         checkpoint(control)?;
         Ok(PreparedInt8SummaryHierarchy { base, expected, mapping })
     }
@@ -122,28 +149,34 @@ impl PreparedInt8SummaryHierarchy<'_> {
             options: request.synthesis_options, mapping, engine, vocabulary };
         let reduced = execution::reduce(source, collection, request, expected, mapping.reduction.max_result_bytes as u64,
             &mut remaining, &mut driver, control)?;
-        checkpoint(control)?;
-        let total = request.limits.verification;
-        let run = Int8SummaryHierarchyRun { schema_version: 1, execution: INT8_SUMMARY_HIERARCHY_EXECUTION,
-            numerics_profile: STRICT_INT8_PROFILE, semantics: SEMANTICS, limits: expected.limits,
-            citation_guarantee: CitationGuarantee::StructuralSourceMembership, semantic_support: SummarySemanticSupport::NotAssessed,
-            untrusted_fields: ["passes", "discovery.mapped.root.value"], initial_evidence: initial,
-            status: reduced.status, final_pass: reduced.final_pass,
-            reserved_model_work: expected.reserved_work,
-            planned_model_work: add_work(discovery.planned_model_work, reduced.planned).ok_or(Int8SourceMapError::WorkLimit)?,
-            model_work: add_work(discovery.model_work, reduced.actual).ok_or(Int8SourceMapError::WorkLimit)?,
-            reserved_mask_node_visits: expected.reserved_masks,
-            mask_node_visit_charge: discovery.mask_node_visit_charge.checked_add(reduced.masks).ok_or(Int8SourceMapError::WorkLimit)?,
-            verification_used: SummaryVerificationWork {
-                fields: total.max_fields.checked_sub(remaining.max_fields).ok_or_else(invalid)?,
-                matches: total.max_matches.checked_sub(remaining.max_matches).ok_or_else(invalid)?,
-                scan_steps: total.max_scan_steps.checked_sub(remaining.max_scan_steps).ok_or_else(invalid)? },
-            tokenizer_work: reduced.tokenizer, levels: reduced.levels, passes: reduced.passes, discovery };
-        expected.verify_completed(&run)?;
-        extract_int8::check_size(&run, mapping.reduction.max_result_bytes as u64).map_err(Int8SourceError::from)?;
-        checkpoint(control)?;
-        Ok(run)
+        finish(discovery, initial, reduced, remaining, expected, control)
     }
+}
+fn finish<C: DecodeStepControl>(discovery: Int8SourceMapRun, initial: EvidenceSize,
+    reduced: execution::Reduced, remaining: GroundingBudget, expected: Int8SummaryHierarchyPreflight,
+    control: &mut C) -> Result<Int8SummaryHierarchyRun, Int8SourceMapError> {
+    checkpoint(control)?;
+    let total = expected.discovery.limits.verification;
+    let mut run = Int8SummaryHierarchyRun { schema_version: 1, execution: INT8_SUMMARY_HIERARCHY_EXECUTION,
+        numerics_profile: STRICT_INT8_PROFILE, semantics: SEMANTICS, limits: expected.limits,
+        citation_guarantee: CitationGuarantee::StructuralSourceMembership, semantic_support: SummarySemanticSupport::NotAssessed,
+        untrusted_fields: ["passes", "discovery.mapped.root.value"], initial_evidence: initial,
+        status: reduced.status, final_pass: reduced.final_pass,
+        reserved_model_work: expected.reserved_work,
+        planned_model_work: add_work(discovery.planned_model_work, reduced.planned).ok_or(Int8SourceMapError::WorkLimit)?,
+        model_work: add_work(discovery.model_work, reduced.actual).ok_or(Int8SourceMapError::WorkLimit)?,
+        reserved_mask_node_visits: expected.reserved_masks,
+        mask_node_visit_charge: discovery.mask_node_visit_charge.checked_add(reduced.masks).ok_or(Int8SourceMapError::WorkLimit)?,
+        verification_used: SummaryVerificationWork {
+            fields: total.max_fields.checked_sub(remaining.max_fields).ok_or_else(invalid)?,
+            matches: total.max_matches.checked_sub(remaining.max_matches).ok_or_else(invalid)?,
+            scan_steps: total.max_scan_steps.checked_sub(remaining.max_scan_steps).ok_or_else(invalid)? },
+        tokenizer_work: reduced.tokenizer, levels: reduced.levels, passes: reduced.passes, discovery,
+        request_binding: expected.request_binding, result_binding: [0; 32] };
+    run.result_binding = binding::composed_result(b"fnlp-int8-summary-hierarchy-result-v1",
+        run.request_binding, &[], &run, expected.max_result_bytes, control)?;
+    expected.verify_completed_with_control(&run, control)?;
+    Ok(run)
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct EvidenceSize { pub segments: usize, pub bytes: usize }
@@ -198,6 +231,10 @@ pub struct Int8SummaryHierarchyRun {
     pub levels: Vec<SummaryHierarchyLevel>,
     pub passes: Vec<SummaryHierarchyPass>,
     pub discovery: Int8SourceMapRun,
+    #[serde(skip)]
+    request_binding: [u8; 32],
+    #[serde(skip)]
+    result_binding: [u8; 32],
 }
 impl Int8SummaryHierarchyRun {
     pub fn bullets(&self) -> &[CitedBullet] {

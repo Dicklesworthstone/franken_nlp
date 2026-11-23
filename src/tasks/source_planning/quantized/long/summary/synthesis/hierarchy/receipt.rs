@@ -2,8 +2,9 @@
 use super::*;
 use std::collections::BTreeSet;
 
-pub(super) fn verify(expected: &Int8SummaryHierarchyPreflight, run: &Int8SummaryHierarchyRun)
-    -> Result<(), Int8SourceMapError> {
+pub(super) fn verify<C: DecodeStepControl>(expected: &Int8SummaryHierarchyPreflight,
+    run: &Int8SummaryHierarchyRun, control: &mut C) -> Result<(), Int8SourceMapError> {
+    checkpoint(control)?;
     let d = expected.discovery;
     let map = &run.discovery;
     let root = map.mapped.root();
@@ -29,15 +30,20 @@ pub(super) fn verify(expected: &Int8SummaryHierarchyPreflight, run: &Int8Summary
     }
     let mut initial = EvidenceSize { segments: 0, bytes: 0 };
     for chunk in root.value().chunks() {
+        checkpoint(control)?;
         let SourceTaskResult::Summarize(raw) = &chunk.native.result else { return Err(invalid()); };
         let mut seen = BTreeSet::new();
-        for bullet in &raw.bullets { for citation in &bullet.citations {
-            if seen.insert(citation.quote.as_str()) {
-                initial.bytes = initial.bytes.checked_add(if initial.segments == 0 { 0 } else { 2 })
-                    .and_then(|n| n.checked_add(citation.quote.len())).ok_or_else(invalid)?;
-                initial.segments = initial.segments.checked_add(1).ok_or_else(invalid)?;
+        for bullet in &raw.bullets {
+            checkpoint(control)?;
+            for citation in &bullet.citations {
+                checkpoint(control)?;
+                if seen.insert(citation.quote.as_str()) {
+                    initial.bytes = initial.bytes.checked_add(if initial.segments == 0 { 0 } else { 2 })
+                        .and_then(|n| n.checked_add(citation.quote.len())).ok_or_else(invalid)?;
+                    initial.segments = initial.segments.checked_add(1).ok_or_else(invalid)?;
+                }
             }
-        } }
+        }
     }
     if run.initial_evidence != initial || initial.segments > d.limits.max_evidence_segments
         || initial.bytes > d.limits.max_evidence_bytes { return Err(invalid()); }
@@ -46,7 +52,8 @@ pub(super) fn verify(expected: &Int8SummaryHierarchyPreflight, run: &Int8Summary
     let mut masks = map.mask_node_visit_charge;
     let mut counted_bytes = 0_u64;
     for pass in &run.passes {
-        verify_pass(expected, pass)?;
+        checkpoint(control)?;
+        verify_pass(expected, pass, control)?;
         planned = add_work(planned, pass.planned_model_work).ok_or_else(invalid)?;
         actual = add_work(actual, pass.native.model_work).ok_or_else(invalid)?;
         masks = masks.checked_add(mask_charge(&pass.native.result)?).ok_or_else(invalid)?;
@@ -60,6 +67,7 @@ pub(super) fn verify(expected: &Int8SummaryHierarchyPreflight, run: &Int8Summary
             || run.status != SummarySynthesisStatus::NoEvidenceCollected || run.tokenizer_work != HierarchyTokenizerWork::default() {
             return Err(invalid());
         }
+        checkpoint(control)?;
         return Ok(());
     }
     if run.levels.is_empty() { return Err(invalid()); }
@@ -67,12 +75,14 @@ pub(super) fn verify(expected: &Int8SummaryHierarchyPreflight, run: &Int8Summary
     let mut next_pass = 0;
     let mut final_pass = None;
     for (level_index, level) in run.levels.iter().enumerate() {
+        checkpoint(control)?;
         if level.input != frontier || level.passes.start != next_pass || level.passes.start >= level.passes.end
             || level.passes.end > run.passes.len() { return Err(invalid()); }
         let passes = &run.passes[level.passes.clone()];
         let mut next_segment = 0;
         let mut bytes = 0_usize;
         for (group, pass) in passes.iter().enumerate() {
+            checkpoint(control)?;
             if pass.level != level_index || pass.group != group || pass.input_segments.start != next_segment
                 || pass.input_segments.end > frontier.segments { return Err(invalid()); }
             next_segment = pass.input_segments.end;
@@ -87,7 +97,7 @@ pub(super) fn verify(expected: &Int8SummaryHierarchyPreflight, run: &Int8Summary
                 final_pass = Some(level.passes.start);
             }
             Some(next) => {
-                if passes.len() < 2 || next != transport::selected_size(passes)?
+                if passes.len() < 2 || next != transport::selected_size(passes, control)?
                     || next.segments > d.limits.max_evidence_segments || next.bytes > d.limits.max_evidence_bytes
                     || next.bytes >= frontier.bytes || (next.segments == 0) != (next.bytes == 0) {
                     return Err(invalid());
@@ -105,11 +115,13 @@ pub(super) fn verify(expected: &Int8SummaryHierarchyPreflight, run: &Int8Summary
         _ => return Err(invalid()),
     };
     if run.status != status { return Err(invalid()); }
+    checkpoint(control)?;
     Ok(())
 }
 
-pub(super) fn verify_pass(expected: &Int8SummaryHierarchyPreflight, pass: &SummaryHierarchyPass)
-    -> Result<(), Int8SourceMapError> {
+pub(super) fn verify_pass<C: DecodeStepControl>(expected: &Int8SummaryHierarchyPreflight,
+    pass: &SummaryHierarchyPass, control: &mut C) -> Result<(), Int8SourceMapError> {
+    checkpoint(control)?;
     let native = &pass.native;
     let SourceTaskResult::Summarize(raw) = &native.result else { return Err(invalid()); };
     evidence::check_summary(raw, expected.discovery.options)?;
@@ -127,13 +139,20 @@ pub(super) fn verify_pass(expected: &Int8SummaryHierarchyPreflight, pass: &Summa
         return Err(invalid());
     }
     for (raw, lifted) in raw.bullets.iter().zip(&pass.bullets) {
+        checkpoint(control)?;
         if raw.text != lifted.text || raw.citations.len() != lifted.citations.len() { return Err(invalid()); }
         for (local, original) in raw.citations.iter().zip(&lifted.citations) {
+            checkpoint(control)?;
             if local.quote != original.quote { return Err(invalid()); }
             evidence::check_citation(original, expected.discovery.options.max_quote_scalars)?;
-            if original.spans.iter().any(|s| s.byte_end > expected.source_span().byte_end
-                || s.scalar_end > expected.source_span().scalar_end) { return Err(invalid()); }
+            for span in &original.spans {
+                checkpoint(control)?;
+                if span.byte_end > expected.source_span().byte_end || span.scalar_end > expected.source_span().scalar_end {
+                    return Err(invalid());
+                }
+            }
         }
     }
+    checkpoint(control)?;
     Ok(())
 }

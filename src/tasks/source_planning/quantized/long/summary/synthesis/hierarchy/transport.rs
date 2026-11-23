@@ -80,19 +80,31 @@ impl Collection {
 
 /// Reconstruct the next frontier's geometry from retained, verified group
 /// citations. Used only for completed-receipt checks, not as an execution API.
-pub(super) fn selected_size(passes: &[SummaryHierarchyPass]) -> Result<EvidenceSize, Int8SourceMapError> {
+pub(super) fn selected_size<C: DecodeStepControl>(passes: &[SummaryHierarchyPass], control: &mut C)
+    -> Result<EvidenceSize, Int8SourceMapError> {
+    checkpoint(control)?;
     let mut size = EvidenceSize { segments: 0, bytes: 0 };
     for pass in passes {
+        checkpoint(control)?;
         let mut seen = BTreeMap::<&str, &[VerifiedSourceSpan]>::new();
-        for bullet in &pass.bullets { for citation in &bullet.citations {
-            if let Some(old) = seen.insert(citation.quote.as_str(), &citation.spans) {
-                if old != citation.spans.as_slice() { return Err(invalid()); }
-                continue;
+        for bullet in &pass.bullets {
+            checkpoint(control)?;
+            for citation in &bullet.citations {
+                checkpoint(control)?;
+                if let Some(old) = seen.insert(citation.quote.as_str(), &citation.spans) {
+                    if old.len() != citation.spans.len() { return Err(invalid()); }
+                    for (previous, current) in old.iter().zip(&citation.spans) {
+                        checkpoint(control)?;
+                        if previous != current { return Err(invalid()); }
+                    }
+                    continue;
+                }
+                size.bytes = size.bytes.checked_add(if size.segments == 0 { 0 } else { 2 })
+                    .and_then(|n| n.checked_add(citation.quote.len())).ok_or(Int8SourceMapError::WorkLimit)?;
+                size.segments = size.segments.checked_add(1).ok_or(Int8SourceMapError::WorkLimit)?;
             }
-            size.bytes = size.bytes.checked_add(if size.segments == 0 { 0 } else { 2 })
-                .and_then(|n| n.checked_add(citation.quote.len())).ok_or(Int8SourceMapError::WorkLimit)?;
-            size.segments = size.segments.checked_add(1).ok_or(Int8SourceMapError::WorkLimit)?;
-        } }
+        }
     }
+    checkpoint(control)?;
     Ok(size)
 }
