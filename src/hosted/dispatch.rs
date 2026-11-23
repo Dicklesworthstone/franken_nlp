@@ -5,6 +5,7 @@ use asupersync::{cx::{cap, Cx}, types::{CancelKind, CancelReason}};
 use crate::{BlockingClosureGuard, native_engine::decode::{DecodeCancellationKind, DecodeStepControl}};
 
 mod team;
+pub(super) use team::{int8_team_workspace_bytes, preflight_int8_team, run_int8_team};
 pub(super) use team::{int4_team_workspace_bytes, int4_prefill_team_workspace_bytes,
     preflight_int4_team, run_int4_team, run_int4_prefill_team, run_int4_team_with_finalize,
     run_int4_prefill_team_with_finalize};

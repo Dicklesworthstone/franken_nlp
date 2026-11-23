@@ -23,6 +23,9 @@ use crate::{
         extract::{ExtractionVocabulary, quantized::{Int8ExtractPlan, Int8ExtractRun, Int8ExtractError}}},
 };
 mod dispatch;
+mod parallel;
+pub use parallel::{HostedInt8ChatTeamResult, HostedInt8TeamResult, Int8ComputeReceipt,
+    int8_chat_team_workspace_bytes};
 #[cfg(feature = "asupersync-runtime")]
 mod pull;
 #[cfg(feature = "asupersync-runtime")]

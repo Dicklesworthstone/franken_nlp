@@ -19,6 +19,7 @@ use super::{
 
 pub mod batch;
 mod tiles;
+mod range;
 /// Group-scaled packed INT4 weights sharing the activation and work rails.
 pub mod int4;
 

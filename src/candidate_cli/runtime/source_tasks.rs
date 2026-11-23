@@ -25,13 +25,12 @@ pub(super) struct Session {
 }
 impl Session {
     pub(super) fn new(args: &CandidateArgs, limits: Limits) -> Result<Self, CandidateError> {
+        if limits.compute != args.compute.admit(args.policy.prefill()?.is_some())? {
+            return Err(CandidateError::Arguments);
+        }
         let started = Instant::now();
-        let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-            runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-            max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-            helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: limits.memory_bytes,
-            leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-        }).build().map_err(|_| CandidateError::Runtime)?;
+        let engine = NlpEngine::builder().resource_config(compute::resource_config(limits))
+            .build().map_err(|_| CandidateError::Runtime)?;
         let lease = engine.resources().acquire_lease();
         let preparation = lease.reserve(MemoryClass::JobBuffers, limits.preparation_bytes)
             .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;

@@ -16,7 +16,7 @@ pub(super) mod text_batch;
 pub(super) mod owned_jobs;
 use std::{fs::File, time::{Duration, Instant}};
 use super::*;
-use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
+use crate::{NlpEngine, MemoryClass,
     execution_identity::{ExecutionIdentity, NumericsProfile, Sha256Digest, ThinkingMode, ToolMode},
     hosted::{CancellationToken, LoadLimits, NativeLimits, RunLimits},
     native_engine::{artifact_bridge::{ArtifactIdentity, ArtifactLoadBudget,
@@ -40,16 +40,24 @@ pub(super) fn execute(task: Task, args: CandidateArgs, limits: Limits,
     let prepared = streaming::prepare(&args, limits, text, messages, &facts, &mut session.control())?;
     let cancellation = CancellationToken::default();
     let model = session.load(&args, limits, &facts, cancellation.clone())?;
-    let result = execute_chat(&session.engine, &model, prepared, 1, session.native(&args)?, &args, cancellation)?;
+    let result = if limits.compute.threads == 1 {
+        compute::Completion::Serial(execute_chat(&session.engine, &model, prepared, 1,
+            session.native(&args)?, &args, cancellation)?)
+    } else {
+        compute::Completion::Team(session.engine.execute_int8_chat_with_threads(&model, prepared, 1,
+            session.native(&args)?, SAMPLER_BYTES, crate::native_engine::simd::config::process_kernel(),
+            limits.compute.threads, cancellation).map_err(|_| CandidateError::Execution)?)
+    };
     session.remaining()?;
     let response = CandidateResponse { schema_version: 1,
         scope: "real-artifact-current-candidate", evidence: "non_authoritative",
         model_id: &facts.model_id, source_revision: &facts.revision,
         source_root_sha256: &facts.source_root_sha256,
         logical_model_sha256: &facts.logical_model_sha256, quant_recipe: &facts.recipe_id,
-        output: &result };
+        output: result.result() };
     // Keep both the hosted output charge and preparation/staging charge alive
     // until serialization, external delivery and flush have actually finished.
+    let response = compute::Response { response: &response, compute: result.compute() };
     let response = input_encoding::Response { response: &response,
         input_encoding: input_encoding::reported_policy(&encoding) };
     publish_checked(&response, limits.result_bytes + 4096, output, &|| session.remaining().map(|_| ()))
@@ -61,6 +69,8 @@ pub(super) fn execute_chat(engine: &NlpEngine, model: &crate::hosted::ResidentIn
     prepared: crate::tasks::chat::quantized::PreparedInt8Chat, request_seq: u64,
     native: NativeLimits, args: &CandidateArgs, cancellation: CancellationToken)
     -> Result<crate::hosted::HostedOutput<crate::tasks::chat::quantized::Int8ChatResult>, CandidateError> {
+    // Shared corpus helpers must never silently discard a selected team.
+    if args.compute.threads() != 1 { return Err(CandidateError::Arguments); }
     match args.policy.prefill()? {
         Some(prefill) => engine.execute_int8_chat_layer_major(model, prepared, request_seq,
             native, SAMPLER_BYTES, prefill, cancellation),
@@ -115,6 +125,17 @@ fn candidate_identity(facts: &ArtifactIdentity) -> Result<ExecutionIdentity, Can
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn configured_process_envelope_matches_the_admitted_team_width() {
+        for width in ["1", "2", "7"] {
+            let args = super::super::tests::args(&["--compute-threads", width]);
+            let limits = args.validate().unwrap();
+            let config = compute::resource_config(limits);
+            assert_eq!(config.runtime_workers, 1); assert_eq!(config.max_blocking_coordinators, 1);
+            assert_eq!(config.scoped_cpu_children_per_coordinator, limits.compute.threads - 1);
+            assert_eq!(config.thread_ceiling, limits.compute.threads + 1);
+        }
+    }
     fn facts() -> ArtifactIdentity {
         ArtifactIdentity { model_id: "Nanbeige4.2-3B".to_owned(),
             revision: "f56ec5a9650268aa098496734743c25ea778bd2d".to_owned(),

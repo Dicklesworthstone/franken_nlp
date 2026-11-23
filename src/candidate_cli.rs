@@ -21,6 +21,7 @@ mod runtime;
 mod tests;
 mod generation_policy;
 mod input_encoding;
+mod compute;
 mod text_batch;
 mod source;
 mod batch;
@@ -98,6 +99,9 @@ pub(crate) struct CandidateArgs {
     /// consumers of the shared arguments retain byte-fallback admission.
     #[arg(skip)]
     input_encoding: input_encoding::InputEncodingArgs,
+    /// Only buffered generate/chat explicitly expose the physical row team.
+    #[arg(skip)]
+    compute: compute::Args,
 }
 
 pub(crate) enum CandidateCommand {
@@ -143,10 +147,10 @@ pub(crate) fn definition() -> clap::Command {
         .subcommand(stream::definition())
         .subcommand(text_batch::definition())
         .subcommand(jobs::generation::definition())
-        .subcommand(input_encoding::definition(CandidateArgs::augment_args(clap::Command::new("generate")
-            .about("Generate from a bounded UTF-8 prompt using the pinned chat template"))))
-        .subcommand(input_encoding::definition(CandidateArgs::augment_args(clap::Command::new("chat")
-            .about("Complete a bounded JSON array of system/user/assistant messages"))))
+        .subcommand(compute::definition(input_encoding::definition(CandidateArgs::augment_args(clap::Command::new("generate")
+            .about("Generate from a bounded UTF-8 prompt using the pinned chat template")))))
+        .subcommand(compute::definition(input_encoding::definition(CandidateArgs::augment_args(clap::Command::new("chat")
+            .about("Complete a bounded JSON array of system/user/assistant messages")))))
 }
 
 impl CandidateCommand {
@@ -280,12 +284,14 @@ struct Limits {
     result_bytes: usize,
     max_prompt_tokens: usize,
     kv_bytes: u64,
+    compute: compute::Admission,
 }
 
 impl CandidateArgs {
     fn from_text_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let mut args = Self::from_arg_matches(matches)?;
         args.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+        args.compute = compute::Args::from_matches(matches)?;
         Ok(args)
     }
 
@@ -325,8 +331,10 @@ impl CandidateArgs {
             .ok_or(CandidateError::Arguments)?;
         if preparation_bytes < preparation_floor || preparation_bytes > memory_bytes
             || weight_bytes > memory_bytes { return Err(CandidateError::Arguments); }
+        let compute = self.compute.admit(self.policy.prefill()?.is_some())?;
         let limits = Limits { memory_bytes, weight_bytes, preparation_bytes, result_bytes,
-            max_prompt_tokens, kv_bytes: memory.kv_bytes };
+            max_prompt_tokens, kv_bytes: memory.kv_bytes, compute };
+        compute::check_memory(self, limits, memory)?;
         self.options(166_101)?.validate(self.generation_limits(limits))
             .map_err(|_| CandidateError::Arguments)?;
         Ok(limits)

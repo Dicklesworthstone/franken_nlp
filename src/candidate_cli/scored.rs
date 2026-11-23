@@ -88,6 +88,7 @@ impl ScoredArgs {
             timeout_seconds: self.timeout_seconds, max_checkpoints: self.max_checkpoints,
             seed: None, temperature_milli: None, top_k: None, top_p_ppm: None, logprobs: false,
             policy: generation_policy::GenerationPolicyArgs::default(),
+            compute: compute::Args::default(),
             input_encoding: encoding.clone() };
         let limits = common.validate()?;
         // In addition to the shared floor, price the worst permitted repeated

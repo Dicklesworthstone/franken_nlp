@@ -11,7 +11,7 @@
 //! primitives still allocate bounded scratch; this is not an allocator-free,
 //! SIMD, batching, performance, or process-RSS claim.
 
-use std::{error::Error, fmt, path::Path};
+use std::{error::Error, fmt, path::Path, sync::Mutex};
 use serde::{Deserialize, Serialize};
 use super::{
     artifact_bridge::{ArtifactBridgeError, ArtifactIdentity, ArtifactLoadBudget, ArtifactLoadReceipt,
@@ -26,11 +26,14 @@ use super::{
     nn::{RMS_NORM_EPSILON, residual_add_f32_cast_back, rms_norm_f32_reduce_cast_back, swiglu_f32_cast_back},
     portable_int8::{ActivationBuffer, LinearError, LinearRows, ProjectionLedger, ProjectionWork, QuantizedLinear},
     rope::{DEFAULT_ADMITTED_CONTEXT_CAP, NANBEIGE_HEAD_DIM, RopeTablesF32},
+    simd::{Int8Kernel, Int8KernelKind},
     tensor::Bf16,
 };
 mod weights;
+pub(crate) mod projection;
 pub use weights::Int8WeightView;
 use weights::Int8Layer;
+use projection::{Int8ProjectionExecutor, Int8ProjectionKind, Int8ProjectionOp};
 use crate::tokenizer::embedded::{EmbeddedTokenizer, EmbeddedTokenizerError};
 #[cfg(test)]
 use super::attention::eager_gqa_attention_from_cache;
@@ -41,7 +44,7 @@ pub const STRICT_INT8_EXECUTION: &str = "portable-int8-bf16-rails-eager-gqa-v1";
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StrictInt8Error {
     Weights, Input, Context, Memory, Work, Allocation, Cache, Rope, Attention,
-    Primitive, Boundary, EmptyHidden, EngineUnavailable, Linear(LinearError),
+    Primitive, Boundary, EmptyHidden, EngineUnavailable, ProjectionExecutor, Linear(LinearError),
     Cancelled(DecodeCancellationKind),
 }
 impl fmt::Display for StrictInt8Error {
@@ -60,6 +63,7 @@ impl fmt::Display for StrictInt8Error {
             Self::Boundary => "strict int8 shared loop boundary diverged",
             Self::EmptyHidden => "strict int8 projection requires a completed forward",
             Self::EngineUnavailable => "strict int8 engine is active or poisoned",
+            Self::ProjectionExecutor => "strict int8 admitted projection executor refused or failed",
             Self::Linear(_) => "strict int8 projection failed",
             Self::Cancelled(_) => "strict int8 execution cancelled",
         })
@@ -197,6 +201,13 @@ impl CurrentCandidateInt8Model {
     pub fn load_receipt(&self) -> ArtifactLoadReceipt { self.loaded.receipt }
     pub fn tokenizer(&self) -> &EmbeddedTokenizer { &self.tokenizer }
 
+    /// One immutable, shape-checked lookup table for persistent workers. Its
+    /// tensor payload remains borrowed from this same admitted model owner.
+    #[cfg(any(feature = "asupersync-runtime", test))]
+    pub(crate) fn weight_view(&self) -> Result<Int8WeightView<'_>, StrictInt8Error> {
+        Int8WeightView::from_materialized(&self.loaded.weights)
+    }
+
     /// Create one semantic engine borrowing this model's already-materialized
     /// weights. The caller still owns request/runtime/resource admission.
     pub fn engine(
@@ -310,14 +321,33 @@ impl RunState {
 pub struct StrictInt8Engine<'weights> {
     weights: Int8WeightView<'weights>, cache: KvCache, rope: RopeTablesF32,
     activation: ActivationBuffer, state: RunState,
+    // Keep the public Send + Sync auto-traits when a private coordinator owns
+    // Send-only reply receivers. Exclusive methods use get_mut(); this slot
+    // never takes a runtime lock or enters the host with a lock held.
+    projection: Mutex<Option<&'weights mut (dyn Int8ProjectionExecutor + 'weights)>>,
 }
 impl<'weights> StrictInt8Engine<'weights> {
     pub fn new(weights: Int8WeightView<'weights>, context: usize, memory: Int8MemoryBudget) -> Result<Self, StrictInt8Error> {
         Int8MemoryRequirement::for_context(context)?.check(memory)?;
         Ok(Self { weights, cache: KvCache::try_with_capacity(context).map_err(|_| StrictInt8Error::Allocation)?,
             rope: RopeTablesF32::nanbeige(context).map_err(|_| StrictInt8Error::Rope)?,
-            activation: ActivationBuffer::try_new(I)?, state: RunState::default() })
+            activation: ActivationBuffer::try_new(I)?, state: RunState::default(), projection: Mutex::new(None) })
     }
+    /// Install one already hardware-checked kernel for all decoder/head rows.
+    /// Existing callers retain the process-selected handle in their view.
+    pub fn with_kernel(mut self, kernel: Int8Kernel) -> Self {
+        self.weights = self.weights.with_kernel(kernel); self
+    }
+    /// Only a hosted whole-request team installs this borrowed executor. Its
+    /// separately admitted storage outlives the engine and drains with scope.
+    #[cfg(any(feature = "asupersync-runtime", test))]
+    pub(crate) fn with_projection_executor(mut self,
+        executor: &'weights mut (dyn Int8ProjectionExecutor + 'weights)) -> Result<Self, StrictInt8Error> {
+        projection::check_binding(self.weights.artifact_identity(), self.weights.kernel_kind(), executor)?;
+        *self.projection.get_mut().map_err(|_| StrictInt8Error::ProjectionExecutor)? = Some(executor);
+        Ok(self)
+    }
+    pub fn kernel_kind(&self) -> Int8KernelKind { self.weights.kernel_kind() }
     pub fn profile(&self) -> &'static str { STRICT_INT8_PROFILE }
     pub fn artifact_identity(&self) -> &ArtifactIdentity { self.weights.identity }
     pub fn kv_cache(&self) -> &KvCache { &self.cache }
@@ -325,6 +355,11 @@ impl<'weights> StrictInt8Engine<'weights> {
     pub fn session<'run, C: DecodeStepControl>(&'run mut self, budget: Int8RunBudget, control: &'run mut C)
         -> Result<Int8Session<'run, 'weights, C>, StrictInt8Error> {
         if !self.cache.all_slots_have_len(0) { return Err(StrictInt8Error::Cache); }
+        // Builder chaining must not change the kernel after an executor was
+        // bound. A mismatched model or kernel refuses before session mutation.
+        if let Some(executor) = self.projection.get_mut().map_err(|_| StrictInt8Error::ProjectionExecutor)?.as_ref() {
+            projection::check_binding(self.weights.artifact_identity(), self.weights.kernel_kind(), &**executor)?;
+        }
         self.state.open()?;
         Ok(Int8Session { engine: self, control, remaining_positions: budget.max_forward_positions,
             remaining_attention: budget.max_attention_pairs, ledger: ProjectionLedger::new(budget.max_projection_work),
@@ -381,7 +416,9 @@ impl<C: DecodeStepControl> Int8Session<'_, '_, C> {
         hidden.copy_from_slice(row); finite(&hidden)?;
         let runner = LoopRunner::from_layer_weights(&self.engine.weights.layers);
         let mut executor = Executor { final_norm: self.engine.weights.final_norm, rope: &self.engine.rope,
-            activation: &mut self.engine.activation, ledger: &mut self.ledger, control: &mut *self.control, completed: 0, norms: 0 };
+            activation: &mut self.engine.activation, ledger: &mut self.ledger, control: &mut *self.control,
+            projection: self.engine.projection.get_mut().map_err(|_| StrictInt8Error::ProjectionExecutor)?,
+            completed: 0, norms: 0 };
         runner.run_token(&mut executor, &mut hidden, PositionContext::at(position), &mut self.engine.cache)?;
         if executor.completed != KV_SLOT_COUNT || executor.norms != 2 { return Err(StrictInt8Error::Boundary); }
         if !self.engine.cache.all_slots_have_len(position + 1) { return Err(StrictInt8Error::Cache); }
@@ -400,7 +437,9 @@ impl<C: DecodeStepControl> Int8Session<'_, '_, C> {
         let mut output = filled(count, 0.0_f32)?;
         self.engine.state.poisoned = true;
         self.engine.activation.encode_bf16(self.hidden.as_deref().ok_or(StrictInt8Error::EmptyHidden)?)?;
-        self.engine.weights.head.project_f32_into(&self.engine.activation, rows, &mut output, &mut self.ledger, &mut *self.control)?;
+        projection::project_f32(self.engine.projection.get_mut().map_err(|_| StrictInt8Error::ProjectionExecutor)?,
+            Int8ProjectionOp::Head, self.engine.weights.head, &self.engine.activation, rows,
+            &mut output, &mut self.ledger, &mut *self.control)?;
         self.work.projected_logits = next_count; self.engine.state.poisoned = false; Ok(output)
     }
     /// A bounded token-ordered prefill; only its final position projects head
@@ -422,11 +461,12 @@ fn end_session(cache: &mut KvCache, state: &mut RunState) {
     cache.clear(); state.active = false;
 }
 
-struct Executor<'a, C> {
+struct Executor<'a, 'executor, C> {
     final_norm: &'a [Bf16], rope: &'a RopeTablesF32, activation: &'a mut ActivationBuffer,
     ledger: &'a mut ProjectionLedger, control: &'a mut C, completed: usize, norms: usize,
+    projection: &'a mut Option<&'executor mut (dyn Int8ProjectionExecutor + 'executor)>,
 }
-impl<'w, C: DecodeStepControl> LayerExecutor<Int8Layer<'w>> for Executor<'_, C> {
+impl<'w, C: DecodeStepControl> LayerExecutor<Int8Layer<'w>> for Executor<'_, '_, C> {
     type Hidden = Vec<Bf16>;
     type Error = StrictInt8Error;
     fn layer_forward(&mut self, binding: &LayerBinding<'_, Int8Layer<'w>>, hidden: &mut Self::Hidden,
@@ -435,12 +475,13 @@ impl<'w, C: DecodeStepControl> LayerExecutor<Int8Layer<'w>> for Executor<'_, C> 
             || positions != PositionContext::at(positions.position) { return Err(StrictInt8Error::Boundary); }
         poll(self.control)?;
         let layer = binding.weights();
+        let projection = |kind| Int8ProjectionOp::Layer { layer: binding.layer_index(), kind };
         let normalized = norm(hidden, layer.norm1)?;
         self.activation.encode_bf16(&normalized)?;
         // Same quantized activation and scale feed Q/K/V; no repeated quantization.
-        let mut query = project(layer.q, self.activation, self.ledger, self.control)?;
-        let mut key = project(layer.k, self.activation, self.ledger, self.control)?;
-        let value = project(layer.v, self.activation, self.ledger, self.control)?;
+        let mut query = self.project(projection(Int8ProjectionKind::Query), layer.q)?;
+        let mut key = self.project(projection(Int8ProjectionKind::Key), layer.k)?;
+        let value = self.project(projection(Int8ProjectionKind::Value), layer.v)?;
         for head in query.chunks_exact_mut(NANBEIGE_HEAD_DIM) { self.rope.apply_split_half(positions.rope_position, head).map_err(|_| StrictInt8Error::Rope)?; }
         for head in key.chunks_exact_mut(NANBEIGE_HEAD_DIM) { self.rope.apply_split_half(positions.rope_position, head).map_err(|_| StrictInt8Error::Rope)?; }
         finite(&query)?; finite(&key)?;
@@ -452,15 +493,15 @@ impl<'w, C: DecodeStepControl> LayerExecutor<Int8Layer<'w>> for Executor<'_, C> 
         let attention = eager_gqa_attention_from_cache_with_control(&query, cache, binding.kv_slot(), self.control)?;
         finite(&attention)?; poll(self.control)?;
         self.activation.encode_bf16(&attention)?;
-        let update = project(layer.o, self.activation, self.ledger, self.control)?;
+        let update = self.project(projection(Int8ProjectionKind::AttentionOutput), layer.o)?;
         let residual = residual_add_f32_cast_back(hidden, &update).map_err(|_| StrictInt8Error::Primitive)?;
         let normalized = norm(&residual, layer.norm2)?;
         self.activation.encode_bf16(&normalized)?;
-        let gate = project(layer.gate, self.activation, self.ledger, self.control)?;
-        let up = project(layer.up, self.activation, self.ledger, self.control)?;
+        let gate = self.project(projection(Int8ProjectionKind::Gate), layer.gate)?;
+        let up = self.project(projection(Int8ProjectionKind::Up), layer.up)?;
         let product = swiglu_f32_cast_back(&gate, &up).map_err(|_| StrictInt8Error::Primitive)?;
         self.activation.encode_bf16(&product)?;
-        let update = project(layer.down, self.activation, self.ledger, self.control)?;
+        let update = self.project(projection(Int8ProjectionKind::Down), layer.down)?;
         let output = residual_add_f32_cast_back(&residual, &update).map_err(|_| StrictInt8Error::Primitive)?;
         finite(&output)?; *hidden = output; self.completed += 1; Ok(())
     }
@@ -481,10 +522,13 @@ fn norm(input: &[Bf16], scale: &[Bf16]) -> Result<Vec<Bf16>, StrictInt8Error> {
 fn finite(values: &[Bf16]) -> Result<(), StrictInt8Error> {
     if values.iter().all(|v| v.to_f32().is_finite()) { Ok(()) } else { Err(StrictInt8Error::Primitive) }
 }
-fn project<C: DecodeStepControl>(matrix: QuantizedLinear<'_>, activation: &ActivationBuffer,
-    ledger: &mut ProjectionLedger, control: &mut C) -> Result<Vec<Bf16>, StrictInt8Error> {
-    let mut output = filled(matrix.rows(), Bf16::from_bits(0))?;
-    matrix.project_bf16_into(activation, LinearRows::All, &mut output, ledger, control)?; Ok(output)
+impl<C: DecodeStepControl> Executor<'_, '_, C> {
+    fn project(&mut self, op: Int8ProjectionOp, matrix: QuantizedLinear<'_>) -> Result<Vec<Bf16>, StrictInt8Error> {
+        let mut output = filled(matrix.rows(), Bf16::from_bits(0))?;
+        projection::project_bf16(self.projection, op, matrix, self.activation, LinearRows::All,
+            &mut output, self.ledger, self.control)?;
+        Ok(output)
+    }
 }
 fn filled<T: Clone>(length: usize, value: T) -> Result<Vec<T>, StrictInt8Error> {
     let mut output = Vec::new(); output.try_reserve_exact(length).map_err(|_| StrictInt8Error::Allocation)?;

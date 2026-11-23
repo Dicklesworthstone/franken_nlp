@@ -42,6 +42,12 @@ impl<C: DecodeStepControl> Int8Session<'_, '_, C> {
     /// session; no caller may continue from partly updated layer slots.
     pub fn append_layer_major(&mut self, tokens: &[u32], limits: Int8PrefillLimits)
         -> Result<(), StrictInt8Error> {
+        // The first persistent INT8 team contract admits one activation row.
+        // Refuse an incompatible schedule before allocations, work or KV
+        // mutation rather than executing its projections outside the team.
+        if self.engine.projection.get_mut().map_err(|_| StrictInt8Error::ProjectionExecutor)?.is_some() {
+            return Err(StrictInt8Error::ProjectionExecutor);
+        }
         check_tokens(tokens)?;
         limits.validate()?;
         self.preflight(tokens.len(), 0)?;
