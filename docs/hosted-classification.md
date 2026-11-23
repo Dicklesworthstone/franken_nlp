@@ -39,3 +39,36 @@ head work, output admission limits, typed error retention and Send ownership.
 They are source additions, not recorded Rust test passes. Compilation, runtime
 execution and real-model quality/performance evidence require the authorized
 validation environment.
+
+## One persistent team for the scored-task portfolio
+
+With `asupersync-runtime`, the following explicit APIs run the complete
+request on one fixed INT8 output-row team:
+
+| Task | Sequential prompt | Layer-major prompt |
+| --- | --- | --- |
+| Classification | `execute_int8_classify_with_threads` | `execute_int8_classify_layer_major_with_threads` |
+| Judgment | `execute_int8_judge_with_threads` | `execute_int8_judge_layer_major_with_threads` |
+| Sentiment | `execute_int8_sentiment_with_threads` | `execute_int8_sentiment_layer_major_with_threads` |
+
+Classification and judgment take the resident model, sealed prepared plan,
+`NativeLimits`, kernel, compute width and cancellation token. The layer-major
+variant inserts `Int8PrefillLimits` before the cancellation token. Sentiment
+uses `SentimentHostLimits` in place of `NativeLimits`, retaining its complete
+work ceiling and additional preparation charge. Width must be 2 through 64 and
+fit the installed host envelope; width 1 uses the existing serial APIs.
+
+One private executor admits only these existing sealed plan types. It keeps
+their original score spaces, full denominators, EOS and semantic finalizers.
+Context admission uses the largest live head while work admission covers all
+heads. Successful completion requires exact work and head counts, empty KV and
+an unpoisoned native engine. Prepared inputs and all native/output reservations
+remain owned through physical worker join, including cancellation and panic.
+The returned `HostedInt8TeamResult<T>` keeps the usual result-memory guard and
+exposes completed physical work separately from semantic output.
+
+Coordinator prompt scratch and fixed child prompt capacity are separately
+derived and reserved before the first projection. The existing exact kernels
+and their reduction order remain unchanged. Nine model-free regression
+definitions and one ignored real-artifact differential gate were added for this
+route. They remain **unrun** pending DSR and model qualification.

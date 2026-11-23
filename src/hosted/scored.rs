@@ -11,6 +11,7 @@ use crate::{
 mod cohort;
 mod document;
 mod faithfulness;
+mod parallel;
 pub use document::{Int8ClassificationMapHostConfig, Int8ClassificationMapMemoryRequirement};
 pub use faithfulness::{Int8FaithfulnessMapHostConfig, Int8FaithfulnessMapMemoryRequirement};
 

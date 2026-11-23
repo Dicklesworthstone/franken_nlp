@@ -182,7 +182,7 @@ impl CandidateCommand {
             return faithfulness_map::FaithfulnessMapCommand::from_matches(matches).map(Self::FaithfulnessMap);
         }
         if name == "judge" {
-            return judge::JudgeCommand::from_arg_matches(matches).map(Self::Judge);
+            return judge::JudgeCommand::from_matches(matches).map(Self::Judge);
         }
         if name == "sentiment-map" {
             return sentiment_map::SentimentMapCommand::from_matches(matches).map(Self::SentimentMap);

@@ -100,3 +100,29 @@ fn changed_criterion_or_policy_changes_the_sealed_execution_identity() {
     let (r, _) = request(v, &cmd.args); let p = prepare(&r, &facts(), &cmd.args, b, &mut go()).unwrap();
     assert_ne!(p.execution_identity().decision_policy_digest, base.execution_identity().decision_policy_digest);
 }
+
+#[test]
+fn judgment_team_and_prefill_keep_all_modes_and_evidence_heads_exact() {
+    let serial = cli_command(&[]);
+    for mode in ["pairwise", "rubric", "faithfulness"] {
+        let mut value = fixture(mode);
+        if mode == "faithfulness" {
+            value["source"] = json!("abcdefgh");
+            value["claim"] = json!("abc");
+            value["policy"]["evidence_window_bytes"] = json!(4);
+        }
+        let (request, budget) = request(value, &serial.args);
+        let expected = prepare(&request, &facts(), &serial.args, budget, &mut go()).unwrap();
+        for rows in [None, Some("1"), Some("3")] {
+            let mut extra = vec!["--compute-threads", "4"];
+            if let Some(rows) = rows { extra.extend(["--prefill-rows", rows]); }
+            let team = cli_command(&extra);
+            let actual = prepare(&request, &facts(), &team.args, budget, &mut go()).unwrap();
+            assert_eq!(actual.execution_identity(), expected.execution_identity());
+            assert_eq!(actual.planned_work(), expected.planned_work());
+            assert_eq!(actual.head_count(), expected.head_count());
+            assert_eq!(actual.required_context(), expected.required_context());
+            if mode == "faithfulness" { assert_eq!(actual.head_count(), 3); }
+        }
+    }
+}

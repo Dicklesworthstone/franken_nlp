@@ -59,10 +59,11 @@ fn prepare(request: &Request, facts: &ArtifactIdentity, args: &ScoredArgs,
 pub(in crate::candidate_cli) fn execute(command: ScoredCommand, common: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
     let prefill = command.prefill.limits()?;
+    if limits.compute != command.compute.admit_prefill(prefill)? { return Err(CandidateError::Arguments); }
     let encoding = command.args.encoding_policy(&command.encoding)?;
     // Session precedes every input, planner and output allocation. Its modeled
     // preparation charge survives all returned failures and final delivery.
-    let session = Session::new(&common, limits)?;
+    let session = Session::new_with_prefill(&common, limits, prefill)?;
     let text = session.read(&command.args.input, input, common.max_input_bytes)?;
     let request = command::request(command.kind, &text, command.args.budget(limits), common.max_input_bytes)?;
     session.remaining()?;
@@ -76,10 +77,20 @@ pub(in crate::candidate_cli) fn execute(command: ScoredCommand, common: Candidat
     match prepared {
         Prepared::Classify(plan) => {
             let native = session.native(&common)?;
-            let result = match prefill {
-                Some(prefill) => session.engine.execute_int8_classify_layer_major(&model, plan, native, prefill, cancellation),
-                None => session.engine.execute_int8_classify(&model, plan, native, cancellation),
-            }.map_err(|_| CandidateError::Execution)?;
+            let result = if limits.compute.threads == 1 {
+                compute::Completion::Serial(match prefill {
+                    Some(prefill) => session.engine.execute_int8_classify_layer_major(&model, plan, native, prefill, cancellation),
+                    None => session.engine.execute_int8_classify(&model, plan, native, cancellation),
+                }.map_err(|_| CandidateError::Execution)?)
+            } else {
+                let kernel = crate::native_engine::simd::config::process_kernel();
+                compute::Completion::Team(match prefill {
+                    Some(prefill) => session.engine.execute_int8_classify_layer_major_with_threads(
+                        &model, plan, native, kernel, limits.compute.threads, prefill, cancellation),
+                    None => session.engine.execute_int8_classify_with_threads(
+                        &model, plan, native, kernel, limits.compute.threads, cancellation),
+                }.map_err(|_| CandidateError::Execution)?)
+            };
             deliver(&session, &facts, &result, &encoding, cap, output)
         }
         Prepared::Sentiment(plan) => {
@@ -87,23 +98,34 @@ pub(in crate::candidate_cli) fn execute(command: ScoredCommand, common: Candidat
                 native: session.native(&common)?, preparation_reserve_bytes: limits.preparation_bytes,
                 max_model_work: command.args.work_ceiling(),
             };
-            let result = match prefill {
-                Some(prefill) => session.engine.execute_int8_sentiment_layer_major(&model, plan, host, prefill, cancellation),
-                None => session.engine.execute_int8_sentiment(&model, plan, host, cancellation),
-            }.map_err(|_| CandidateError::Execution)?;
+            let result = if limits.compute.threads == 1 {
+                compute::Completion::Serial(match prefill {
+                    Some(prefill) => session.engine.execute_int8_sentiment_layer_major(&model, plan, host, prefill, cancellation),
+                    None => session.engine.execute_int8_sentiment(&model, plan, host, cancellation),
+                }.map_err(|_| CandidateError::Execution)?)
+            } else {
+                let kernel = crate::native_engine::simd::config::process_kernel();
+                compute::Completion::Team(match prefill {
+                    Some(prefill) => session.engine.execute_int8_sentiment_layer_major_with_threads(
+                        &model, plan, host, kernel, limits.compute.threads, prefill, cancellation),
+                    None => session.engine.execute_int8_sentiment_with_threads(
+                        &model, plan, host, kernel, limits.compute.threads, cancellation),
+                }.map_err(|_| CandidateError::Execution)?)
+            };
             deliver(&session, &facts, &result, &encoding, cap, output)
         }
     }
 }
-fn deliver<T: Serialize>(session: &Session, facts: &ArtifactIdentity, guarded: &T,
+fn deliver<T: Serialize>(session: &Session, facts: &ArtifactIdentity, guarded: &compute::Completion<T>,
     encoding: &UntrustedEncoding, cap: usize, output: &mut impl Write) -> Result<(), CandidateError> {
     session.remaining()?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
         evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
         source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
-        quant_recipe: &facts.recipe_id, output: guarded };
-    // guarded is the caller's HostedOutput; it and Session are still alive
-    // through serialization, external write and flush. No partial head output.
+        quant_recipe: &facts.recipe_id, output: guarded.result() };
+    // The completion keeps the ordinary output guard alive through external
+    // write and flush. A team's physical receipt is separate from task identity.
+    let response = compute::Response { response: &response, compute: guarded.compute() };
     let response = input_encoding::Response { response: &response,
         input_encoding: input_encoding::reported_policy(encoding) };
     publish_checked(&response, cap, output, &|| session.remaining().map(|_| ()))

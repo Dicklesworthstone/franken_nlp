@@ -123,3 +123,39 @@ fn selected_tokenizer_limits_bind_identity_and_exhaustion_never_falls_back() {
             Err(CandidateError::Planning)));
     }
 }
+
+#[test]
+fn physical_team_and_prefill_options_preserve_every_scored_plan_identity() {
+    for (task, json) in [
+        ("classify", r#"{"document":"A helpful service. é","labels":[{"id":"a"},{"id":"b"}]}"#),
+        ("classify", r#"{"document":"A helpful service. é","labels":[{"id":"a"},{"id":"b"}],"mode":"multi_label"}"#),
+        ("sentiment", r#"{"document":"A helpful service. é"}"#),
+    ] {
+        for compact in [false, true] {
+            let mut serial_args = Vec::new();
+            if compact { serial_args.extend(["--input-encoding", "safe-bpe-v1"]); }
+            let serial = command(task, &serial_args);
+            let request = input(&serial, json);
+            let expected = prepare(&request, &facts(), &serial.args, &encoding(&serial), &mut Continue).unwrap();
+            for rows in [None, Some("1"), Some("3")] {
+                let mut team_args = serial_args.clone();
+                team_args.extend(["--compute-threads", "4"]);
+                if let Some(rows) = rows { team_args.extend(["--prefill-rows", rows]); }
+                let team = command(task, &team_args);
+                let actual = prepare(&request, &facts(), &team.args, &encoding(&team), &mut Continue).unwrap();
+                assert_eq!(identity(&actual), identity(&expected));
+                match (&actual, &expected) {
+                    (Prepared::Classify(a), Prepared::Classify(b)) => {
+                        assert_eq!(a.planned_work(), b.planned_work());
+                        assert_eq!(a.head_count(), b.head_count());
+                    }
+                    (Prepared::Sentiment(a), Prepared::Sentiment(b)) => {
+                        assert_eq!(a.planned_work(), b.planned_work());
+                        assert_eq!(a.head_count(), b.head_count());
+                    }
+                    _ => panic!("physical scheduling changed the task family"),
+                }
+            }
+        }
+    }
+}

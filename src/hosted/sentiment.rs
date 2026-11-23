@@ -72,7 +72,7 @@ impl NlpEngine {
         })
     }
 }
-fn validate(limits: SentimentHostLimits, task: TaskBudget, context: usize, kv: u64, work: Int8Work)
+pub(super) fn validate(limits: SentimentHostLimits, task: TaskBudget, context: usize, kv: u64, work: Int8Work)
     -> Result<(), HostedError> {
     task.validate().map_err(|_| HostedError::Limits("sentiment task budget"))?;
     let cap = limits.max_model_work;

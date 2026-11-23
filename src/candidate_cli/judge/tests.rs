@@ -159,3 +159,45 @@ fn disabled_runtime_refuses_before_private_io() {
     }
     assert_eq!(command(&[]).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Unavailable));
 }
+
+#[test]
+fn judgment_parses_team_width_and_prompt_schedule_without_changing_task_policy() {
+    let serial = command(&[]);
+    assert_eq!(serial.compute.threads(), 1);
+    let (_, baseline) = serial.args.common().unwrap();
+    for width in ["1", "2", "4", "64"] {
+        for rows in [None, Some("1"), Some("4"), Some("64")] {
+            let mut extra = vec!["--compute-threads", width];
+            if let Some(rows) = rows { extra.extend(["--prefill-rows", rows]); }
+            let mut team = command(&extra);
+            team.args.memory_mib = 32768;
+            let prefill = team.prefill.limits().unwrap();
+            let (common, limits) = team.args.common_with_compute(
+                &input_encoding::InputEncodingArgs::default(), team.compute, prefill, false).unwrap();
+            assert_eq!(common.compute.threads(), width.parse::<usize>().unwrap());
+            assert_eq!(limits.compute, common.compute.admit_prefill(prefill).unwrap());
+            assert_eq!(team.args.budget(limits), serial.args.budget(baseline));
+            assert_eq!(team.args.work_ceiling(), serial.args.work_ceiling());
+            assert!(common.policy.prefill().unwrap().is_none());
+        }
+    }
+}
+
+#[test]
+fn invalid_judgment_team_or_peak_cannot_read_or_publish() {
+    use std::io::{self, Read};
+    struct NeverRead;
+    impl Read for NeverRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("judgment admission must precede IO") }
+    }
+    for (width, memory) in [("0", 8192), ("65", 8192), ("1000000", 8192), ("4", 6144)] {
+        for prefill in [false, true] {
+            let mut extra = vec!["--compute-threads", width];
+            if prefill { extra.extend(["--prefill-rows", "3"]); }
+            let mut c = command(&extra); c.args.memory_mib = memory;
+            let mut output = Vec::new();
+            assert!(matches!(c.execute(&mut NeverRead, &mut output), Err(CandidateError::Arguments)));
+            assert!(output.is_empty());
+        }
+    }
+}

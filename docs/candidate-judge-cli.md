@@ -273,3 +273,37 @@ compact tokenizer limits, private completion binding, strict request parsing and
 all eleven typed cancellation causes. These definitions were independently
 source-reviewed but remain unrun; DSR production compilation and model qualification
 are still required.
+
+## Persistent CPU teams for one complete judgment
+
+`fnlp candidate judge` accepts `--compute-threads N` (1 through 64,
+including the coordinator) and can combine it with `--prefill-rows ROWS`
+(1 through 64). Defaults preserve serial execution. One fixed team spans every
+pairwise order, rubric criterion or faithfulness/evidence head in the request;
+it never publishes a subset after a later head fails.
+
+```sh
+fnlp candidate judge request.json --model ./model.fnlpq --memory-mib 8192 \
+  --compute-threads 4 --prefill-rows 4
+```
+
+The entire threaded memory peak is checked before input or model IO, including
+ordinary native storage, caller-owned preparation, coordinator prompt workspace,
+fixed child capacity, output and cleanup. Runtime threads are additional.
+The native route keeps full-vocabulary candidate denominators, EOS scores,
+the complete work ledger and the existing task finalizer. Neither width nor
+prompt scheduling changes the sealed task identity or its decision policy.
+
+The library entrypoints are `execute_int8_judge_with_threads` and
+`execute_int8_judge_layer_major_with_threads`. They return a guarded
+`HostedInt8TeamResult<Int8JudgeRun>` after physical worker join, including
+cancel/panic drain. The CLI adds completed physical work as a separate
+`compute` object only for threaded execution; ordinary task output remains
+unchanged. Batch, complete-source maps and retained jobs keep their own
+explicit scheduling interfaces.
+
+Regression definitions cover parsing, rejection before IO, all three modes'
+unchanged identities and complete evidence windows, alongside the hosted
+artifact-dependent differential gate. Compilation and executable tests remain
+**unrun** pending DSR; no performance or model-quality claim follows from this
+source integration.

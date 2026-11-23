@@ -104,6 +104,38 @@ impl ScoredArgs {
         if limits.preparation_bytes < floor { return Err(CandidateError::Arguments); }
         Ok((common, limits))
     }
+    /// Only one-request commands expose this physical execution policy.
+    /// Shared corpus/job arguments keep their existing scheduling contract.
+    /// Validate both coordinator and child workspace before reading any input.
+    pub(super) fn common_with_compute(&self, encoding: &input_encoding::InputEncodingArgs,
+        compute: compute::Args, prefill: Option<crate::native_engine::strict_int8::prefill::Int8PrefillLimits>,
+        transferred_preparation: bool) -> Result<(CandidateArgs, Limits), CandidateError> {
+        let admission = compute.admit_prefill(prefill)?;
+        let (mut common, mut limits) = self.common_with_encoding(encoding)?;
+        common.compute = compute;
+        limits.compute = admission;
+        if admission.threads > 1
+            && self.compute_peak_bytes(limits, prefill, transferred_preparation)? > limits.memory_bytes {
+            return Err(CandidateError::Arguments);
+        }
+        Ok((common, limits))
+    }
+
+    fn compute_peak_bytes(&self, limits: Limits,
+        prefill: Option<crate::native_engine::strict_int8::prefill::Int8PrefillLimits>,
+        transferred_preparation: bool) -> Result<u64, CandidateError> {
+        let native = Int8MemoryRequirement::for_context(self.context_tokens)
+            .map_err(|_| CandidateError::Arguments)?;
+        let extra = prefill.map(|limits| limits.validate()).transpose()
+            .map_err(|_| CandidateError::Arguments)?.unwrap_or(0);
+        // Classification/judgment borrow the caller's admitted preparation.
+        // Sentiment additionally transfers an owned plan into the hosted call.
+        let transferred = if transferred_preparation { limits.preparation_bytes } else { 0 };
+        compute::request_peak_bytes(limits, native, self.max_result_bytes as u64,
+            self.max_candidate_tokens as u64, 0, transferred)?
+            .checked_add(extra).ok_or(CandidateError::Arguments)
+    }
+
     pub(super) fn budget(&self, limits: Limits) -> TaskBudget {
         TaskBudget { max_input_tokens: (self.context_tokens - self.max_candidate_tokens) as u32,
             max_output_tokens: self.max_candidate_tokens as u32, max_output_bytes: self.max_result_bytes as u64,
@@ -151,23 +183,25 @@ pub(crate) struct ScoredCommand {
     pub(super) args: ScoredArgs,
     pub(super) prefill: prefill::ScoringPrefillArgs,
     pub(super) encoding: input_encoding::InputEncodingArgs,
+    pub(super) compute: compute::Args,
 }
 pub(super) fn definitions() -> Vec<clap::Command> {
     [("classify", "Score every label exactly; exclusive or independent multi-label decisions"),
         ("sentiment", "Score independent affect dimensions; uncalibrated, not psychological measurements")]
-        .into_iter().map(|(name, about)| input_encoding::definition(prefill::ScoringPrefillArgs::augment_args(
-            ScoredArgs::augment_args(clap::Command::new(name).about(about))))
+        .into_iter().map(|(name, about)| compute::definition(input_encoding::definition(prefill::ScoringPrefillArgs::augment_args(
+            ScoredArgs::augment_args(clap::Command::new(name).about(about)))))
             .after_long_help("--input-encoding safe-bpe-v1 explicitly compacts exact untrusted document and label bytes without template-control tokens. One tokenizer allowance covers the complete request, including every label metadata segment; it is not renewed per head. Pair checks and examined bytes have separate finite caps. One transient encoder workspace is admitted before input/model IO. The exact policy binds prompt identity and appears on compact results. The default remains byte-fallback. Compact input changes prompt tokens and makes no model-output, quality or speed equivalence claim.")).collect()
 }
 impl ScoredCommand {
     pub(super) fn from_matches(kind: Kind, matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         Ok(Self { kind, args: ScoredArgs::from_arg_matches(matches)?,
             prefill: prefill::ScoringPrefillArgs::from_arg_matches(matches)?,
-            encoding: input_encoding::InputEncodingArgs::from_matches(matches)? })
+            encoding: input_encoding::InputEncodingArgs::from_matches(matches)?,
+            compute: compute::Args::from_matches(matches)? })
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
-        self.prefill.limits()?;
-        let (common, limits) = self.args.common_with_encoding(&self.encoding)?;
+        let (common, limits) = self.args.common_with_compute(&self.encoding, self.compute,
+            self.prefill.limits()?, self.kind == Kind::Sentiment)?;
         #[cfg(feature = "asupersync-runtime")]
         { runtime::scored_tasks::execute(self, common, limits, input, output) }
         #[cfg(not(feature = "asupersync-runtime"))]

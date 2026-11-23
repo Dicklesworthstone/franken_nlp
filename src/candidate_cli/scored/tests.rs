@@ -199,3 +199,97 @@ fn disabled_build_refuses_both_scored_commands_without_reading_any_input() {
         assert!(out.is_empty());
     }
 }
+
+#[test]
+fn scored_compute_options_keep_task_budgets_and_admit_fixed_prompt_capacity() {
+    for task in ["classify", "sentiment"] {
+        let serial = command(task, &[]);
+        assert_eq!(serial.compute.threads(), 1);
+        let (_, serial_limits) = serial.args.common().unwrap();
+        for width in ["1", "2", "4", "64"] {
+            for rows in [None, Some("1"), Some("4"), Some("64")] {
+                let mut extra = vec!["--compute-threads", width];
+                if let Some(rows) = rows { extra.extend(["--prefill-rows", rows]); }
+                let mut args = command(task, &extra);
+                args.args.memory_mib = 32768;
+                let prefill = args.prefill.limits().unwrap();
+                let (common, limits) = args.args.common_with_compute(&args.encoding,
+                    args.compute, prefill, task == "sentiment").unwrap();
+                assert_eq!(limits.compute.threads, width.parse::<usize>().unwrap());
+                assert_eq!(limits.compute, common.compute.admit_prefill(prefill).unwrap());
+                assert_eq!(args.args.work_ceiling(), serial.args.work_ceiling());
+                assert_eq!(args.args.budget(limits), serial.args.budget(serial_limits));
+                assert!(common.policy.prefill().unwrap().is_none());
+                assert_eq!(limits.compute.workspace_bytes == 0, width == "1");
+            }
+        }
+    }
+}
+
+#[test]
+fn scored_team_peak_adds_prefill_and_sentiment_transfer_without_discounts() {
+    let c = command("sentiment", &["--compute-threads", "4", "--prefill-rows", "3"]);
+    let prefill = c.prefill.limits().unwrap();
+    let (_, limits) = c.args.common_with_compute(&c.encoding, c.compute, prefill, true).unwrap();
+    let native = Int8MemoryRequirement::for_context(c.args.context_tokens).unwrap();
+    let ordinary = compute::request_peak_bytes(limits, native, c.args.max_result_bytes as u64,
+        c.args.max_candidate_tokens as u64, 0, 0).unwrap();
+    let extra = prefill.unwrap().validate().unwrap();
+    assert_eq!(c.args.compute_peak_bytes(limits, prefill, false).unwrap(), ordinary + extra);
+    assert_eq!(c.args.compute_peak_bytes(limits, prefill, true).unwrap(),
+        ordinary + extra + limits.preparation_bytes);
+    let mut overflow = limits;
+    overflow.preparation_bytes = u64::MAX;
+    assert!(matches!(c.args.compute_peak_bytes(overflow, prefill, true),
+        Err(CandidateError::Arguments)));
+}
+
+#[test]
+fn exact_scored_team_memory_ceiling_refuses_before_input_io() {
+    use std::io::{self, Read};
+    struct NeverRead;
+    impl Read for NeverRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("admission must precede input IO") }
+    }
+    for task in ["classify", "sentiment"] {
+        let mut c = command(task, &["--compute-threads", "4", "--prefill-rows", "3"]);
+        let prefill = c.prefill.limits().unwrap();
+        let (_, limits) = c.args.common_with_compute(&c.encoding, c.compute, prefill, task == "sentiment").unwrap();
+        let peak = c.args.compute_peak_bytes(limits, prefill, task == "sentiment").unwrap();
+        c.args.memory_mib = peak.div_ceil(MIB);
+        assert!(c.args.common_with_compute(&c.encoding, c.compute, prefill, task == "sentiment").is_ok());
+        c.args.memory_mib -= 1;
+        let mut output = Vec::new();
+        assert!(matches!(c.execute(&mut NeverRead, &mut output), Err(CandidateError::Arguments)));
+        assert!(output.is_empty());
+    }
+}
+
+#[test]
+fn invalid_scored_compute_width_cannot_read_input_or_fall_back_to_serial() {
+    use std::io::{self, Read};
+    struct NeverRead;
+    impl Read for NeverRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("invalid width reached input IO") }
+    }
+    for task in ["classify", "sentiment"] {
+        for width in ["0", "65", "1000000"] {
+            for prefill in [false, true] {
+                let mut extra = vec!["--compute-threads", width];
+                if prefill { extra.extend(["--prefill-rows", "3"]); }
+                let c = command(task, &extra);
+                let mut output = Vec::new();
+                assert!(matches!(c.execute(&mut NeverRead, &mut output), Err(CandidateError::Arguments)));
+                assert!(output.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn shared_scored_args_do_not_enable_teams_for_corpora_or_jobs() {
+    let error = ScoredArgs::augment_args(clap::Command::new("shared"))
+        .try_get_matches_from(["shared", "--model", "missing.fnlpq", "--memory-mib", "8192",
+            "--compute-threads", "4"]).unwrap_err();
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+}

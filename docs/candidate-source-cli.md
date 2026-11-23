@@ -111,7 +111,7 @@ sequential prompt processing. This schedule does not change the prepared task
 identity or borrow free-text generation controls.
 
 Compute selection belongs to these one-request commands. INT8 maps, corpora,
-extraction, scoring and retained jobs keep their existing interfaces and do
+extraction and retained jobs keep their existing interfaces and do
 not inherit the flag through shared resource arguments.
 
 Before private IO, a checked simultaneous memory quote includes **both** full

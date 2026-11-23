@@ -274,3 +274,46 @@ Rust tests, real-model inference, performance, task quality and controller DSR
 qualification were not executed in this environment. The reference native
 scoring backend and existing artifact candidate retain their prior evidence
 status.
+
+## Persistent CPU teams for complete scoring requests
+
+One-request `classify` and `sentiment` now accept `--compute-threads N`,
+where N is 1 through 64 and includes the coordinator. The default remains 1.
+This option composes with `--prefill-rows ROWS` (1 through 64): one fixed
+team serves the complete prompt, both decoder passes and every candidate
+continuation for every head. Independent heads still reuse the largest live
+KV context; this option does not turn heads or documents into simultaneous
+sequence cohorts.
+
+```sh
+fnlp candidate classify request.json --model ./model.fnlpq --memory-mib 8192 \
+  --compute-threads 4 --prefill-rows 4
+fnlp candidate sentiment request.json --model ./model.fnlpq --memory-mib 8192 \
+  --compute-threads 4 --prefill-rows 4
+```
+
+Before opening the input or model, threaded execution prices the whole
+simultaneously live request: the admitted model and metadata, caller preparation,
+native KV and ordinary scratch, coordinator prompt scratch, fixed child buffers,
+output ownership and cleanup. Sentiment additionally retains its separately
+transferred preparation charge. Workers never replace those reservations.
+Runtime threads are additional to the requested compute width.
+
+The host uses `execute_int8_classify_with_threads` or
+`execute_int8_sentiment_with_threads`; their explicit
+`*_layer_major_with_threads` variants receive the same prefill policy.
+Every head keeps its original score space, full-vocabulary denominator, EOS
+semantics, thresholds, exact work allowance and semantic finalizer. A failed
+head fails the whole request. All children physically join before return, and
+the result's output guard survives serialization, write and flush.
+
+Threaded responses add a separate `compute` object describing completed
+physical projections and worker rows. It does not enter semantic identity or
+calibration and is absent at width 1, preserving the existing serial response.
+Compact input remains independently selectable and reports its existing policy.
+The shared corpus, map and retained-job arguments do not acquire this option.
+
+Admission, pre-I/O refusal, exact-memory boundaries, task-plan identity and an
+ignored real-artifact equivalence gate have regression definitions. These
+definitions remain **unrun** pending the required DSR checkpoint. This wiring
+does not establish model parity, a measured speedup or production qualification.

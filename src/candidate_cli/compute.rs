@@ -31,7 +31,7 @@ pub(super) struct Admission { pub threads: usize, pub workspace_bytes: u64 }
 pub(super) fn definition(command: clap::Command) -> clap::Command {
     command.arg(clap::Arg::new("compute_threads").long("compute-threads")
         .value_name("N").value_parser(clap::value_parser!(usize)).default_value("1")
-        .help("Coordinator plus persistent INT8 row workers, 1..=64; 1 keeps serial execution. One fixed team serves this complete request across both decoder passes, prompt tokens and generation. Runtime threads are additional. Worker storage and native memory are admitted before input/model IO. Buffered generate/chat and one-request source tasks can combine workers with --prefill-rows on the same team. Maps, streams, batches and jobs do not expose this option"))
+        .help("Coordinator plus persistent INT8 row workers, 1..=64; 1 keeps serial execution. One fixed team serves this complete request across both decoder passes, prompt tokens and generation. Runtime threads are additional. Worker storage and native memory are admitted before input/model IO. Buffered generate/chat, one-request source tasks, classification, sentiment and judgment can combine workers with --prefill-rows on the same team. Maps, streams, batches and jobs do not expose this option"))
 }
 
 /// Price the entire simultaneously live threaded request, including the

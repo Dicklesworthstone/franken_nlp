@@ -33,9 +33,10 @@ fn poll(control: &mut impl DecodeStepControl) -> Result<(), CandidateError> {
 pub(in crate::candidate_cli) fn execute(command: JudgeCommand, args: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
     let prefill = command.prefill.limits()?;
+    if limits.compute != command.compute.admit_prefill(prefill)? { return Err(CandidateError::Arguments); }
     // Session owns preparation before any request/tokenizer allocations and
     // survives native execution and the completed response's external delivery.
-    let session = Session::new(&args, limits)?;
+    let session = Session::new_with_prefill(&args, limits, prefill)?;
     let text = session.read(&command.args.input, input, args.max_input_bytes)?;
     let budget = command.args.budget(limits);
     let request = command::request(&text, budget, args.max_input_bytes)?;
@@ -46,17 +47,28 @@ pub(in crate::candidate_cli) fn execute(command: JudgeCommand, args: CandidateAr
     let cancellation = CancellationToken::default();
     let model = session.load(&args, limits, &facts, cancellation.clone())?;
     let native = session.native(&args)?;
-    let result = match prefill {
-        Some(prefill) => session.engine.execute_int8_judge_layer_major(&model, plan, native, prefill, cancellation),
-        None => session.engine.execute_int8_judge(&model, plan, native, cancellation),
-    }.map_err(|_| CandidateError::Execution)?;
+    let result = if limits.compute.threads == 1 {
+        compute::Completion::Serial(match prefill {
+            Some(prefill) => session.engine.execute_int8_judge_layer_major(&model, plan, native, prefill, cancellation),
+            None => session.engine.execute_int8_judge(&model, plan, native, cancellation),
+        }.map_err(|_| CandidateError::Execution)?)
+    } else {
+        let kernel = crate::native_engine::simd::config::process_kernel();
+        compute::Completion::Team(match prefill {
+            Some(prefill) => session.engine.execute_int8_judge_layer_major_with_threads(
+                &model, plan, native, kernel, limits.compute.threads, prefill, cancellation),
+            None => session.engine.execute_int8_judge_with_threads(
+                &model, plan, native, kernel, limits.compute.threads, cancellation),
+        }.map_err(|_| CandidateError::Execution)?)
+    };
     session.remaining()?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
         evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
         source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
-        quant_recipe: &facts.recipe_id, output: &result };
+        quant_recipe: &facts.recipe_id, output: result.result() };
     // A failure in either order, any criterion or any evidence head has no
     // output. Hosted result ownership remains attached through write AND flush.
+    let response = compute::Response { response: &response, compute: result.compute() };
     publish_checked(&response, command.args.max_result_bytes + 4096, output,
         &|| session.remaining().map(|_| ()))
 }

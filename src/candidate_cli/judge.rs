@@ -12,17 +12,24 @@ pub(crate) struct JudgeCommand {
     pub(super) args: ScoredArgs,
     #[command(flatten)]
     pub(super) prefill: ScoringPrefillArgs,
+    #[arg(skip)]
+    pub(super) compute: compute::Args,
 }
 
 pub(super) fn definition() -> clap::Command {
-    JudgeCommand::augment_args(clap::Command::new("judge")
+    compute::definition(JudgeCommand::augment_args(clap::Command::new("judge")
         .about("Score both comparison orders, every rubric criterion, or full-source faithfulness")
-        .long_about("Judge one bounded JSON request with mode pairwise, rubric or faithfulness and an explicit uncalibrated policy. Scores use the complete finite candidate language and full-vocabulary denominators, including EOS. Faithfulness requires the whole source to fit and retains every evidence window; this is not a factuality certificate. No free generation, automatic retries, thinking or tools. One failed head fails the whole request."))
+        .long_about("Judge one bounded JSON request with mode pairwise, rubric or faithfulness and an explicit uncalibrated policy. Scores use the complete finite candidate language and full-vocabulary denominators, including EOS. Faithfulness requires the whole source to fit and retains every evidence window; this is not a factuality certificate. No free generation, automatic retries, thinking or tools. One failed head fails the whole request.")))
 }
 impl JudgeCommand {
+    pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let mut command = Self::from_arg_matches(matches)?;
+        command.compute = compute::Args::from_matches(matches)?;
+        Ok(command)
+    }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
-        self.prefill.limits()?;
-        let (common, limits) = self.args.common()?;
+        let (common, limits) = self.args.common_with_compute(&input_encoding::InputEncodingArgs::default(),
+            self.compute, self.prefill.limits()?, false)?;
         #[cfg(feature = "asupersync-runtime")]
         { runtime::judgment::execute(self, common, limits, input, output) }
         #[cfg(not(feature = "asupersync-runtime"))]
