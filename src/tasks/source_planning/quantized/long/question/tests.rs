@@ -254,11 +254,86 @@ fn complete_envelope_is_bounded_without_exporting_question_or_generated_tokens()
     let p = planner(); let prepared = prepare(&p, "éAéAéAéA", &question(), limits()); let driver = script(&prepared);
     let result = run(prepared, driver).unwrap(); let bytes = canonjson::canonical_bytes(&result).unwrap();
     let text = std::str::from_utf8(&bytes).unwrap();
-    for private in ["private-question-token", "generated_token_ids", "prompt_digest"] { assert!(!text.contains(private)); }
+    for private in ["private-question-token", "generated_token_ids", "prompt_digest", "request_binding", "result_binding"] {
+        assert!(!text.contains(private));
+    }
     for delta in [0, 1] {
         let mut l = limits(); l.reduction.max_result_bytes = bytes.len() - delta;
         let prepared = prepare(&p, "éAéAéAéA", &question(), l); let driver = script(&prepared);
         assert_eq!(run(prepared, driver).is_ok(), delta == 0);
+    }
+}
+
+#[test]
+fn equal_geometry_does_not_authorize_a_different_source_question_or_policy() {
+    let p = planner();
+    let mut q = question(); q.question = "Who??".to_owned();
+    let prepared = prepare(&p, "Alice!", &q, limits());
+    let expected = prepared.preflight_metadata();
+    let driver = script(&prepared); let result = run(prepared, driver).unwrap();
+    expected.verify_completed(&result).unwrap();
+    for axis in 0..4 {
+        let mut q = question(); q.question = "Who??".to_owned();
+        let mut mapping = limits();
+        let source = if axis == 0 { "Carol!" } else { "Alice!" };
+        match axis {
+            1 => q.question = "What?".to_owned(),
+            2 => q.verification.max_scan_steps -= 1,
+            3 => mapping.max_mask_visits += 1,
+            _ => {},
+        }
+        let foreign = prepare(&p, source, &q, mapping).preflight_metadata();
+        assert_eq!(foreign.source_span(), expected.source_span());
+        assert_eq!(foreign.planned_work(), expected.planned_work());
+        assert_eq!(foreign.reserved_mask_visits(), expected.reserved_mask_visits());
+        assert!(foreign.verify_completed(&result).is_err(), "changed request axis {axis}");
+    }
+    let diagnostic = format!("{expected:?}");
+    for private in ["request_binding", "Alice!", "Who??"] { assert!(!diagnostic.contains(private)); }
+}
+
+#[test]
+fn changing_only_answer_text_or_citations_invalidates_the_complete_payload() {
+    let p = planner(); let q = question();
+    for axis in 0..2 {
+        let prepared = prepare(&p, "Alice!", &q, limits());
+        let expected = prepared.preflight_metadata();
+        let driver = script(&prepared); let mut original = run(prepared, driver).unwrap();
+        let prepared = prepare(&p, "Alice!", &q, limits());
+        let mut driver = script(&prepared);
+        let raw = driver.outputs.front_mut().unwrap();
+        if axis == 0 {
+            raw.answer = Some("fake answer".to_owned());
+        } else {
+            raw.citations[0].quote = "l".to_owned();
+            raw.citations[0].spans[0].span = VerifiedSourceSpan {
+                byte_start: 1, byte_end: 2, scalar_start: 1, scalar_end: 2 };
+        }
+        let other = run(prepared, driver).unwrap();
+        // Both outputs are independently valid for this exact request. The
+        // completion seal also binds the particular output that was produced.
+        expected.verify_completed(&other).unwrap();
+        assert_eq!(original.model_work, other.model_work);
+        assert_eq!(original.distinct_answer_texts, other.distinct_answer_texts);
+        original.mapped = other.mapped;
+        assert!(expected.verify_completed(&original).is_err());
+    }
+}
+
+#[test]
+fn verification_keeps_the_original_typed_cancellation() {
+    struct Stop(DecodeCancellationKind);
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { Some(self.0) }
+    }
+    let p = planner(); let prepared = prepare(&p, "Alice!", &question(), limits());
+    let expected = prepared.preflight_metadata();
+    let driver = script(&prepared); let result = run(prepared, driver).unwrap();
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        assert_eq!(expected.verify_completed_with_control(&result, &mut Stop(cause))
+            .unwrap_err().cancellation(), Some(cause));
     }
 }
 

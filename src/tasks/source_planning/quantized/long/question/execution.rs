@@ -51,11 +51,12 @@ impl PreparedInt8Question<'_> {
         if let Some(error) = stopped { return Err(error.into()); }
         let mapped = mapped.map_err(Int8SourceMapError::Reduction)?;
         driver.borrow_mut().checkpoint()?;
-        let stats = statistics(mapped.root().value())?;
+        let mut check = || driver.borrow_mut().checkpoint().map_err(Int8SourceMapError::from);
+        let stats = statistics_with_checkpoints(mapped.root().value(), &mut check)?;
         if task.next != self.chunks.chunks().len() || stats.work != task.work || stats.masks != task.masks {
             return Err(Int8SourceError::InvalidResult.into());
         }
-        let run = Int8QuestionRun { schema_version: 1, execution: INT8_QUESTION_EXECUTION,
+        let mut run = Int8QuestionRun { schema_version: 1, execution: INT8_QUESTION_EXECUTION,
             numerics_profile: STRICT_INT8_PROFILE, semantics: "independent-passage-answers-no-global-selection-v1",
             outcome: stats.outcome, distinct_answer_texts: stats.distinct,
             native_chunks: stats.answered + stats.abstained, whitespace_chunks: stats.blank,
@@ -64,9 +65,10 @@ impl PreparedInt8Question<'_> {
             reserved_mask_node_visits: self.expected.masks, mask_node_visit_charge: task.masks,
             verification_scan_steps: self.verification.max_scan_steps - task.remaining.max_scan_steps,
             calibration: AnswerCalibration::Uncalibrated, citation_guarantee: CitationGuarantee::StructuralSourceMembership,
-            semantic_support: SummarySemanticSupport::NotAssessed, untrusted_fields: ["mapped.root.value"], mapped };
-        self.expected.verify_completed(&run)?;
-        extract_int8::check_size(&run, self.max_result_bytes()).map_err(Int8SourceError::from)?;
+            semantic_support: SummarySemanticSupport::NotAssessed, untrusted_fields: ["mapped.root.value"], mapped,
+            request_binding: self.expected.request_binding, result_binding: [0; 32] };
+        run.result_binding = binding::result_with_checkpoints(&run, self.max_result_bytes(), &mut check)?;
+        self.expected.verify_completed_with_checkpoints(&run, &mut check)?;
         driver.borrow_mut().checkpoint()?;
         Ok(run)
     }
@@ -207,13 +209,24 @@ pub(super) struct Statistics {
     pub citations: usize, pub spans: usize,
 }
 pub(super) fn statistics(value: &QuestionValue) -> Result<Statistics, Int8SourceError> {
+    statistics_with_checkpoints(value, &mut || Ok(())).map_err(|error| match error {
+        Int8SourceMapError::Source(source) => source,
+        _ => Int8SourceError::InvalidResult,
+    })
+}
+pub(super) fn statistics_with_checkpoints<F>(value: &QuestionValue, check: &mut F)
+    -> Result<Statistics, Int8SourceMapError> where F: FnMut() -> Result<(), Int8SourceMapError> {
+    check()?;
     let mut answers = Vec::new();
-    answers.try_reserve_exact(value.chunks.len()).map_err(|_| SourcePlanningError::AllocationRefused)?;
+    answers.try_reserve_exact(value.chunks.len())
+        .map_err(|_| Int8SourceError::from(SourcePlanningError::AllocationRefused))?;
     let mut s = Statistics { answered: 0, abstained: 0, blank: 0, distinct: 0,
         outcome: QuestionOutcome::NoAnswerProposed, work: Int8Work::default(), masks: 0, citations: 0, spans: 0 };
     for chunk in value.chunks() {
+        check()?;
         s.citations = s.citations.checked_add(chunk.citations.len()).ok_or(Int8SourceError::InvalidResult)?;
         for citation in &chunk.citations {
+            check()?;
             s.spans = s.spans.checked_add(citation.spans.len()).ok_or(Int8SourceError::InvalidResult)?;
         }
         s.work = add_work(s.work, chunk.model_work).ok_or(Int8SourceError::InvalidResult)?;
@@ -230,5 +243,6 @@ pub(super) fn statistics(value: &QuestionValue) -> Result<Statistics, Int8Source
     answers.sort_unstable(); answers.dedup(); s.distinct = answers.len();
     s.outcome = match s.distinct { 0 => QuestionOutcome::NoAnswerProposed,
         1 => QuestionOutcome::OneAnswerText, _ => QuestionOutcome::MultipleAnswerTexts };
+    check()?;
     Ok(s)
 }

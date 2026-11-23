@@ -14,6 +14,7 @@ use crate::{
 
 mod planning;
 mod execution;
+mod binding;
 /// Explicit evidence-only neural synthesis; independent passage QA is unchanged.
 pub mod synthesis;
 
@@ -42,10 +43,10 @@ impl SourceQuestion {
 }
 fn has_text(text: &str) -> bool { text.chars().any(|c| !c.is_whitespace()) }
 
-/// Geometry and exact planned work, not a native receipt or source fingerprint.
-/// Compiled from the pinned question, manifest and source encoders without
-/// weights. Private fields prevent caller-invented preflight authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Exact request association and planned work, not a native execution receipt.
+/// Private commitments bind the source, question and admitted policy without
+/// exporting their bytes or content fingerprints in diagnostics or JSON.
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Int8QuestionPreflight {
     source_span: VerifiedSourceSpan,
     chunks: usize,
@@ -53,6 +54,15 @@ pub struct Int8QuestionPreflight {
     work: Int8Work,
     masks: u64,
     verification: GroundingBudget,
+    request_binding: [u8; 32],
+    max_result_bytes: u64,
+}
+impl fmt::Debug for Int8QuestionPreflight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Int8QuestionPreflight").field("chunks", &self.chunks)
+            .field("native_chunks", &self.native_chunks).field("work", &self.work)
+            .field("masks", &self.masks).finish_non_exhaustive()
+    }
 }
 impl Int8QuestionPreflight {
     pub fn source_span(&self) -> VerifiedSourceSpan { self.source_span }
@@ -62,8 +72,24 @@ impl Int8QuestionPreflight {
     pub fn planned_work(&self) -> Int8Work { self.work }
     pub fn reserved_mask_visits(&self) -> u64 { self.masks }
     pub fn verify_completed(&self, run: &Int8QuestionRun) -> Result<(), Int8SourceMapError> {
+        self.verify_completed_with_checkpoints(run, &mut || Ok(()))
+    }
+    /// Verify the entire result under the original request's cancellation
+    /// owner; private hashing never creates a source-sized serialization copy.
+    pub fn verify_completed_with_control<C: DecodeStepControl>(&self, run: &Int8QuestionRun,
+        control: &mut C) -> Result<(), Int8SourceMapError> {
+        self.verify_completed_with_checkpoints(run,
+            &mut || checkpoint(control).map_err(Int8SourceMapError::from))
+    }
+    pub(super) fn verify_completed_with_checkpoints<F>(&self, run: &Int8QuestionRun, check: &mut F)
+        -> Result<(), Int8SourceMapError> where F: FnMut() -> Result<(), Int8SourceMapError> {
+        check()?;
+        if run.request_binding != self.request_binding
+            || run.result_binding != binding::result_with_checkpoints(run, self.max_result_bytes, check)? {
+            return Err(Int8SourceError::InvalidResult.into());
+        }
         let root = run.mapped.root();
-        let stats = execution::statistics(root.value())?;
+        let stats = execution::statistics_with_checkpoints(root.value(), check)?;
         if run.schema_version != 1 || run.execution != INT8_QUESTION_EXECUTION
             || run.numerics_profile != STRICT_INT8_PROFILE
             || run.semantics != "independent-passage-answers-no-global-selection-v1"
@@ -84,6 +110,20 @@ impl Int8QuestionPreflight {
             || !within(run.model_work, self.work) || run.mask_node_visit_charge > self.masks {
             return Err(Int8SourceError::InvalidResult.into());
         }
+        let mut byte_end = 0; let mut scalar_end = 0;
+        for (index, chunk) in root.value().chunks().enumerate() {
+            check()?;
+            let span = chunk.source_span;
+            if chunk.chunk_id != index || span.byte_start != byte_end || span.scalar_start != scalar_end
+                || span.byte_end <= span.byte_start || span.scalar_end <= span.scalar_start {
+                return Err(Int8SourceError::InvalidResult.into());
+            }
+            byte_end = span.byte_end; scalar_end = span.scalar_end;
+        }
+        if byte_end != self.source_span.byte_end || scalar_end != self.source_span.scalar_end {
+            return Err(Int8SourceError::InvalidResult.into());
+        }
+        check()?;
         Ok(())
     }
 }
@@ -139,6 +179,10 @@ pub struct Int8QuestionRun {
     pub semantic_support: SummarySemanticSupport,
     pub untrusted_fields: [&'static str; 1],
     pub mapped: MapReduceResult<QuestionValue>,
+    #[serde(skip)]
+    request_binding: [u8; 32],
+    #[serde(skip)]
+    result_binding: [u8; 32],
 }
 
 /// Consumed whole-document commitment. Blank chunks retain source coverage but

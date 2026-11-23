@@ -16,7 +16,7 @@ impl SourceTaskPlanner {
         mapping.validate(budget, planning)?;
         let cap = capacity(self, question, budget, context, planning, mapping.chunks, control)?;
         let chunks = partition(self, source, cap.chunks, control)?;
-        let mut expected = metadata(&chunks, question.verification)?;
+        let mut expected = metadata(&chunks, question.verification, mapping)?;
         for chunk in chunks.chunks() {
             checkpoint(control)?;
             if !has_text(chunk.text()) { continue; }
@@ -33,6 +33,8 @@ impl SourceTaskPlanner {
             charge(&mut expected, work, mapping)?;
         }
         if expected.native_chunks == 0 { return Err(Int8SourceMapError::EmptySource); }
+        expected.request_binding = binding::request(source, question, budget, context, planning,
+            mapping, self, &chunks, control)?;
         checkpoint(control)?;
         Ok(expected)
     }
@@ -49,7 +51,7 @@ impl SourceTaskPlanner {
         mapping.validate(budget, planning)?;
         let cap = capacity(self, question, budget, context, planning, mapping.chunks, control)?;
         let chunks = partition(self, source, cap.chunks, control)?;
-        let mut expected = metadata(&chunks, question.verification)?;
+        let mut expected = metadata(&chunks, question.verification, mapping)?;
         let mut plans = Vec::new(); let mut indices = Vec::new();
         plans.try_reserve_exact(chunks.chunks().len()).map_err(|_| Int8SourceMapError::Allocation)?;
         indices.try_reserve_exact(chunks.chunks().len()).map_err(|_| Int8SourceMapError::Allocation)?;
@@ -65,6 +67,8 @@ impl SourceTaskPlanner {
             indices.push(Some(plans.len())); plans.push(plan);
         }
         if expected.native_chunks == 0 { return Err(Int8SourceMapError::EmptySource); }
+        expected.request_binding = binding::request(source, question, budget, context, planning,
+            mapping, self, &chunks, control)?;
         checkpoint(control)?;
         Ok(PreparedInt8Question { chunks, plans, plan_indices: indices, mapping,
             options: question.options, verification: question.verification, expected })
@@ -165,12 +169,14 @@ fn partition<'s, C: DecodeStepControl>(planner: &SourceTaskPlanner, source: &'s 
     if let Some(error) = encoding_error { return Err(Int8SourceError::from(error).into()); }
     plan.map_err(Int8SourceMapError::Chunk)
 }
-fn metadata(chunks: &ChunkPlan<'_>, verification: GroundingBudget) -> Result<Int8QuestionPreflight, Int8SourceMapError> {
+fn metadata(chunks: &ChunkPlan<'_>, verification: GroundingBudget, mapping: Int8SourceMapLimits)
+    -> Result<Int8QuestionPreflight, Int8SourceMapError> {
     let first = chunks.chunks().first().ok_or(Int8SourceMapError::EmptySource)?.span();
     let last = chunks.chunks().last().ok_or(Int8SourceMapError::EmptySource)?.span();
     Ok(Int8QuestionPreflight { source_span: VerifiedSourceSpan { byte_start: first.byte_start,
         byte_end: last.byte_end, scalar_start: first.scalar_start, scalar_end: last.scalar_end },
-        chunks: chunks.chunks().len(), native_chunks: 0, work: Int8Work::default(), masks: 0, verification })
+        chunks: chunks.chunks().len(), native_chunks: 0, work: Int8Work::default(), masks: 0, verification,
+        request_binding: [0; 32], max_result_bytes: mapping.reduction.max_result_bytes as u64 })
 }
 fn charge(expected: &mut Int8QuestionPreflight, work: Int8Work, limits: Int8SourceMapLimits)
     -> Result<(), Int8SourceMapError> {
