@@ -134,3 +134,30 @@ fn cancellation_at_every_boundary_including_after_a_nonmatching_passage_prevents
         assert_eq!(error.cancellation(), Some(DecodeCancellationKind::Deadline));
     }
 }
+
+#[test]
+fn cancellation_inside_a_large_nonmatching_passage_is_not_an_absence() {
+    use DecodeCancellationKind::*;
+    struct Stop { calls: usize, cause: DecodeCancellationKind }
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.calls += 1; (self.calls == 5).then_some(self.cause)
+        }
+    }
+    let absent = "é".repeat(3000);
+    let (source, evidence) = fixture(&[&absent, "Alice"]);
+    let result = raw(&evidence, &["Alice"]);
+    let scan_charge = ((absent.len() + "Alice".len() + 1) * 8) as u64;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let mut budget = GroundingBudget::default(); let before = budget;
+        let mut control = Stop { calls: 0, cause };
+        let error = final_answer(&source, result.clone(), &evidence, AnswerOptions::default(),
+            &mut budget, &mut control).err().unwrap();
+        assert_eq!(error.cancellation(), Some(cause));
+        assert_eq!(control.calls, 5);
+        assert_eq!(budget.max_scan_steps, before.max_scan_steps - scan_charge);
+        // The matching later passage was never reached or debited.
+        assert_eq!(budget.max_matches, before.max_matches);
+    }
+}

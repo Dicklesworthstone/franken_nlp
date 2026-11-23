@@ -226,11 +226,15 @@ fn lift<C: FnMut() -> Result<(), Int4SourceError>>(chunk: &SourceChunk<'_>, cita
     if citation.quote.is_empty() || citation.quote.chars().count() > options.max_quote_scalars {
         return Err(Int4SourceError::InvalidResult);
     }
-    let mut spans = scan_occurrences(chunk.text(), &citation.quote, remaining).map_err(|error| match error {
-        FieldGroundingError::AllocationRefused => Int4SourceError::from(AnswerError::AllocationRefused),
-        FieldGroundingError::FieldBudget | FieldGroundingError::MatchBudget | FieldGroundingError::WorkBudget =>
-            Int4SourceError::from(AnswerError::OutputBudgetExceeded),
-        _ => Int4SourceError::InvalidResult,
+    let mut spans = scan_occurrences_with_checkpoints(chunk.text(), &citation.quote, remaining, &mut *checkpoint)
+        .map_err(|error| match error {
+        GroundingScanError::Checkpoint(error) => error,
+        GroundingScanError::Verification(error) => match error {
+            FieldGroundingError::AllocationRefused => Int4SourceError::from(AnswerError::AllocationRefused),
+            FieldGroundingError::FieldBudget | FieldGroundingError::MatchBudget | FieldGroundingError::WorkBudget =>
+                Int4SourceError::from(AnswerError::OutputBudgetExceeded),
+            _ => Int4SourceError::InvalidResult,
+        },
     })?;
     if citation.spans.len() != spans.len() || citation.occurrence != (if spans.len() == 1 {
         SourceOccurrence::Anchored } else { SourceOccurrence::Ambiguous })

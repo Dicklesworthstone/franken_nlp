@@ -28,7 +28,8 @@ pub(super) fn collect<C: DecodeStepControl>(source: &str, value: &QuestionValue,
             || extent.byte_end <= byte { return Err(invalid()); }
         let text = source.get(extent.byte_start..extent.byte_end).ok_or_else(invalid)?;
         remaining.max_scan_steps = remaining.max_scan_steps.checked_sub(text.len() as u64).ok_or(Int8SourceMapError::WorkLimit)?;
-        scalar = scalar.checked_add(text.chars().count()).ok_or_else(invalid)?;
+        let counted = mapreduce::count_scalars_with_checkpoints(text, &mut || checkpoint(control))?;
+        scalar = scalar.checked_add(counted).ok_or_else(invalid)?;
         if scalar != extent.scalar_end { return Err(invalid()); }
         byte = extent.byte_end;
         match chunk.status {
@@ -45,7 +46,7 @@ pub(super) fn collect<C: DecodeStepControl>(source: &str, value: &QuestionValue,
             checkpoint(control)?;
             if !has_text(&citation.quote) { return Err(invalid()); }
             remaining.max_fields = remaining.max_fields.checked_sub(1).ok_or(Int8SourceMapError::WorkLimit)?;
-            let local = scan(text, &citation.quote, remaining)?;
+            let local = scan(text, &citation.quote, remaining, control)?;
             if local.is_empty() || citation.spans.len() != local.len() || citation.occurrence != occurrence(local.len()) {
                 return Err(invalid());
             }
@@ -106,10 +107,12 @@ pub(super) fn final_answer<C: DecodeStepControl>(source: &str, raw: AnswerResult
             // passage. A charged no-match scan is ordinary absence; all other
             // failures remain fatal. Continue through later passages to verify
             // every reported occurrence and charge all verification work.
-            let local_spans = match scan_occurrences(&passage.text, &citation.quote, remaining) {
+            let local_spans = match scan_occurrences_with_checkpoints(&passage.text, &citation.quote,
+                remaining, || checkpoint(control)) {
                 Ok(spans) => spans,
-                Err(FieldGroundingError::Absent) => continue,
-                Err(error) => return Err(scan_error(error)),
+                Err(GroundingScanError::Verification(FieldGroundingError::Absent)) => continue,
+                Err(GroundingScanError::Verification(error)) => return Err(scan_error(error)),
+                Err(GroundingScanError::Checkpoint(error)) => return Err(error.into()),
             };
             // Never scan a synthetic join: matches must fit wholly in a passage.
             for local in local_spans {
@@ -142,10 +145,14 @@ pub(super) fn final_answer<C: DecodeStepControl>(source: &str, raw: AnswerResult
 fn occurrence(count: usize) -> SourceOccurrence {
     if count == 1 { SourceOccurrence::Anchored } else { SourceOccurrence::Ambiguous }
 }
-fn scan(source: &str, quote: &str, budget: &mut GroundingBudget) -> Result<Vec<VerifiedSourceSpan>, Int8SourceMapError> {
+fn scan<C: DecodeStepControl>(source: &str, quote: &str, budget: &mut GroundingBudget,
+    control: &mut C) -> Result<Vec<VerifiedSourceSpan>, Int8SourceMapError> {
     // Collection requires the quote to occur in its declared original chunk.
     // Only final_answer's search across DIFFERENT evidence passages skips Absent.
-    scan_occurrences(source, quote, budget).map_err(scan_error)
+    scan_occurrences_with_checkpoints(source, quote, budget, || checkpoint(control)).map_err(|error| match error {
+        GroundingScanError::Verification(error) => scan_error(error),
+        GroundingScanError::Checkpoint(error) => error.into(),
+    })
 }
 fn scan_error(error: FieldGroundingError) -> Int8SourceMapError {
     match error {

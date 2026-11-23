@@ -13,7 +13,7 @@ use crate::{
             ReduceInput, ReductionPolicy, SourceChunk},
         source_planning::quantized::{Int8SourceError, long::{Int8SourceMapError, Int8SourceMapLimits}}},
     validation::grounded_fields::{GroundingBudget, SourceFieldEvidence, VerifiedSourceSpan,
-        SourceOccurrence, FieldGroundingError, scan_occurrences},
+        SourceOccurrence, FieldGroundingError, GroundingScanError, scan_occurrences_with_checkpoints},
 };
 mod execution;
 /// Bounded corpus transport over complete documents and one native driver.

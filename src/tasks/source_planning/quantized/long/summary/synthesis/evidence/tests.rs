@@ -171,3 +171,23 @@ fn cancellation_during_collection_or_final_lift_never_returns_partial_bullets() 
         assert_eq!(error.cancellation(), Some(DecodeCancellationKind::Deadline));
     }
 }
+
+#[test]
+fn a_long_evidence_scan_retains_the_original_terminal_cause_and_work_charge() {
+    use DecodeCancellationKind::*;
+    struct Stop { calls: usize, cause: DecodeCancellationKind }
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.calls += 1; (self.calls == 2).then_some(self.cause)
+        }
+    }
+    let source = "é".repeat(8192);
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let mut budget = GroundingBudget::default(); let before = budget;
+        let error = scan(&source, "é", &mut budget, &mut Stop { calls: 0, cause }).unwrap_err();
+        assert_eq!(error.cancellation(), Some(cause));
+        assert_eq!(budget.max_scan_steps, before.max_scan_steps - ((source.len() + 3) * 8) as u64);
+        assert_eq!(budget.max_matches, before.max_matches);
+    }
+}

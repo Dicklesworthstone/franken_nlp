@@ -17,7 +17,7 @@ use crate::{
         mapreduce::{self, ChunkLimits, ChunkPlan, ExecutionError, ExecutionLimits, MapReduceError,
             MapReduceResult, MapReduceTask, MapOutput, ReduceInput, ReductionPolicy, SourceChunk}},
     validation::grounded_fields::{GroundingBudget, SourceFieldEvidence, VerifiedSourceSpan,
-        SourceOccurrence, FieldGroundingError, scan_occurrences},
+        SourceOccurrence, FieldGroundingError, GroundingScanError, scan_occurrences_with_checkpoints},
     tokenizer::untrusted::SafeBpeLimits,
 };
 #[cfg(test)] use crate::{native_engine::constrained_int4::Int4JsonBudget,

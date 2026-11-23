@@ -290,11 +290,15 @@ pub(super) fn original_spans<F: FnMut() -> Result<(), Int4SourceError>>(chunk: &
         checkpoint()?;
         if text.is_empty() { return Err(Int4SourceError::InvalidResult); }
         remaining.max_fields = remaining.max_fields.checked_sub(1).ok_or(ExtractError::OutputBudgetExceeded)?;
-        let mut checked = scan_occurrences(chunk.text(), text, remaining).map_err(|error| match error {
-            FieldGroundingError::AllocationRefused => ExtractError::AllocationRefused,
-            FieldGroundingError::FieldBudget | FieldGroundingError::MatchBudget | FieldGroundingError::WorkBudget =>
-                ExtractError::OutputBudgetExceeded,
-            _ => ExtractError::InvalidResult,
+        let mut checked = scan_occurrences_with_checkpoints(chunk.text(), text, remaining, &mut *checkpoint)
+            .map_err(|error| match error {
+            GroundingScanError::Checkpoint(error) => error,
+            GroundingScanError::Verification(error) => Int4SourceError::from(match error {
+                FieldGroundingError::AllocationRefused => ExtractError::AllocationRefused,
+                FieldGroundingError::FieldBudget | FieldGroundingError::MatchBudget | FieldGroundingError::WorkBudget =>
+                    ExtractError::OutputBudgetExceeded,
+                _ => ExtractError::InvalidResult,
+            }),
         })?;
         if checked.as_slice() != spans || occurrence != if checked.len() == 1 { SourceOccurrence::Anchored } else { SourceOccurrence::Ambiguous } {
             return Err(Int4SourceError::InvalidResult);

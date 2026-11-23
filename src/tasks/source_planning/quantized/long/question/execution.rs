@@ -180,12 +180,16 @@ fn lift<C: FnMut() -> Result<(), Int8SourceError>>(chunk: &SourceChunk<'_>, cita
     if citation.quote.is_empty() || citation.quote.chars().count() > options.max_quote_scalars {
         return Err(Int8SourceError::InvalidResult);
     }
-    let mut spans = scan_occurrences(chunk.text(), &citation.quote, remaining).map_err(|e| match e {
-        crate::validation::grounded_fields::FieldGroundingError::AllocationRefused => Int8SourceError::from(AnswerError::AllocationRefused),
-        crate::validation::grounded_fields::FieldGroundingError::FieldBudget
-        | crate::validation::grounded_fields::FieldGroundingError::MatchBudget
-        | crate::validation::grounded_fields::FieldGroundingError::WorkBudget => Int8SourceError::from(AnswerError::OutputBudgetExceeded),
-        _ => Int8SourceError::InvalidResult,
+    let mut spans = scan_occurrences_with_checkpoints(chunk.text(), &citation.quote, remaining, &mut *checkpoint)
+        .map_err(|error| match error {
+        GroundingScanError::Checkpoint(error) => error,
+        GroundingScanError::Verification(error) => match error {
+            crate::validation::grounded_fields::FieldGroundingError::AllocationRefused => Int8SourceError::from(AnswerError::AllocationRefused),
+            crate::validation::grounded_fields::FieldGroundingError::FieldBudget
+            | crate::validation::grounded_fields::FieldGroundingError::MatchBudget
+            | crate::validation::grounded_fields::FieldGroundingError::WorkBudget => Int8SourceError::from(AnswerError::OutputBudgetExceeded),
+            _ => Int8SourceError::InvalidResult,
+        },
     })?;
     if citation.spans.len() != spans.len() || citation.occurrence != (if spans.len() == 1 {
         SourceOccurrence::Anchored } else { SourceOccurrence::Ambiguous })

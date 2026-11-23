@@ -12,8 +12,10 @@ use crate::{
         mapreduce::{self, ChunkLimits, ChunkPlan, ExecutionError, ExecutionLimits, MapOutput,
             MapReduceError, MapReduceResult, MapReduceTask, ReduceInput, ReductionPolicy, SourceChunk}},
     validation::grounded_fields::{FieldGroundingError, GroundingBudget, SourceOccurrence,
-        VerifiedSourceSpan, scan_occurrences},
+        VerifiedSourceSpan, GroundingScanError, scan_occurrences_with_checkpoints},
 };
+#[cfg(test)]
+use crate::validation::grounded_fields::scan_occurrences;
 mod execution;
 mod completion_binding;
 /// Shared native decoder layers over independently planned source chunks.

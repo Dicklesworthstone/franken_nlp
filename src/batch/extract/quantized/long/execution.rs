@@ -125,11 +125,15 @@ fn original_fields<C: DecodeStepControl>(chunk: &SourceChunk<'_>, fields: &[Sour
         remaining.max_fields = remaining.max_fields.checked_sub(1).ok_or(ExtractError::OutputBudgetExceeded)?;
         let first = field.spans.first().ok_or(Int8SourceError::InvalidResult)?;
         let text = chunk.text().get(first.byte_start..first.byte_end).ok_or(Int8SourceError::InvalidResult)?;
-        let mut spans = scan_occurrences(chunk.text(), text, remaining).map_err(|error| match error {
-            FieldGroundingError::AllocationRefused => Int8SourceError::from(ExtractError::AllocationRefused),
-            FieldGroundingError::FieldBudget | FieldGroundingError::MatchBudget | FieldGroundingError::WorkBudget =>
-                Int8SourceError::from(ExtractError::OutputBudgetExceeded),
-            _ => Int8SourceError::InvalidResult,
+        let mut spans = scan_occurrences_with_checkpoints(chunk.text(), text, remaining, || step(control))
+            .map_err(|error| match error {
+            GroundingScanError::Checkpoint(error) => error,
+            GroundingScanError::Verification(error) => match error {
+                FieldGroundingError::AllocationRefused => Int8SourceError::from(ExtractError::AllocationRefused),
+                FieldGroundingError::FieldBudget | FieldGroundingError::MatchBudget | FieldGroundingError::WorkBudget =>
+                    Int8SourceError::from(ExtractError::OutputBudgetExceeded),
+                _ => Int8SourceError::InvalidResult,
+            },
         })?;
         if spans != field.spans || field.occurrence != (if spans.len() == 1 {
             SourceOccurrence::Anchored } else { SourceOccurrence::Ambiguous }) { return Err(Int8SourceError::InvalidResult); }

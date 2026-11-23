@@ -22,7 +22,8 @@ pub(super) fn collect<C: DecodeStepControl>(source: &str, value: &SourceMapValue
             || extent.byte_end <= byte { return Err(invalid()); }
         let text = source.get(byte..extent.byte_end).ok_or_else(invalid)?;
         charge_scan(remaining, text.len())?;
-        scalar = scalar.checked_add(text.chars().count()).ok_or_else(invalid)?;
+        let counted = mapreduce::count_scalars_with_checkpoints(text, &mut || checkpoint(control))?;
+        scalar = scalar.checked_add(counted).ok_or_else(invalid)?;
         if scalar != extent.scalar_end { return Err(invalid()); }
         byte = extent.byte_end;
         let SourceTaskResult::Summarize(summary) = &chunk.native.result else { return Err(invalid()); };
@@ -32,7 +33,7 @@ pub(super) fn collect<C: DecodeStepControl>(source: &str, value: &SourceMapValue
             for (q, citation) in bullet.citations.iter().enumerate() {
                 checkpoint(control)?;
                 remaining.max_fields = remaining.max_fields.checked_sub(1).ok_or(Int4SourceMapError::WorkLimit)?;
-                let local = scan_occurrences(text, &citation.quote, remaining).map_err(scan_error)?;
+                let local = scan(text, &citation.quote, remaining, control)?;
                 if local != citation.spans || citation.occurrence != occurrence(local.len()) { return Err(invalid()); }
                 let original = chunk.original_spans.get(field).ok_or_else(invalid)?;
                 field = field.checked_add(1).ok_or_else(invalid)?;
@@ -85,7 +86,7 @@ pub(super) fn lift_summary<C: DecodeStepControl>(source: &str, raw: &SummaryResu
         for citation in &bullet.citations {
             checkpoint(control)?;
             remaining.max_fields = remaining.max_fields.checked_sub(1).ok_or(Int4SourceMapError::WorkLimit)?;
-            let locals = scan_occurrences(&evidence.text, &citation.quote, remaining).map_err(scan_error)?;
+            let locals = scan(&evidence.text, &citation.quote, remaining, control)?;
             if locals != citation.spans || citation.occurrence != occurrence(locals.len()) { return Err(invalid()); }
             let mut spans = Vec::new();
             for local in locals {
@@ -153,6 +154,13 @@ fn scan_error(error: FieldGroundingError) -> Int4SourceMapError {
     match error { FieldGroundingError::AllocationRefused => Int4SourceMapError::Allocation,
         FieldGroundingError::WorkBudget | FieldGroundingError::MatchBudget | FieldGroundingError::FieldBudget => Int4SourceMapError::WorkLimit,
         _ => invalid() }
+}
+fn scan<C: DecodeStepControl>(source: &str, quote: &str, budget: &mut GroundingBudget,
+    control: &mut C) -> Result<Vec<VerifiedSourceSpan>, Int4SourceMapError> {
+    scan_occurrences_with_checkpoints(source, quote, budget, || checkpoint(control)).map_err(|error| match error {
+        GroundingScanError::Verification(error) => scan_error(error),
+        GroundingScanError::Checkpoint(error) => error.into(),
+    })
 }
 fn lift(local: VerifiedSourceSpan, origin: VerifiedSourceSpan) -> Result<VerifiedSourceSpan, Int4SourceMapError> {
     if local.byte_start >= local.byte_end || local.scalar_start >= local.scalar_end { return Err(invalid()); }

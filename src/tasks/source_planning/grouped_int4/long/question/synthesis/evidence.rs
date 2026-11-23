@@ -28,7 +28,8 @@ pub(super) fn collect<C: DecodeStepControl>(source: &str, value: &QuestionValue,
             || extent.byte_end <= byte { return Err(invalid()); }
         let text = source.get(extent.byte_start..extent.byte_end).ok_or_else(invalid)?;
         charge_scan(remaining, text.len())?;
-        scalar = scalar.checked_add(text.chars().count()).ok_or_else(invalid)?;
+        let counted = mapreduce::count_scalars_with_checkpoints(text, &mut || checkpoint(control))?;
+        scalar = scalar.checked_add(counted).ok_or_else(invalid)?;
         if scalar != extent.scalar_end { return Err(invalid()); }
         byte = extent.byte_end;
         match chunk.status {
@@ -51,7 +52,11 @@ pub(super) fn collect<C: DecodeStepControl>(source: &str, value: &QuestionValue,
             checkpoint(control)?;
             if citation.quote.is_empty() { return Err(invalid()); }
             remaining.max_fields = remaining.max_fields.checked_sub(1).ok_or(Int4SourceMapError::WorkLimit)?;
-            let local = scan_occurrences(text, &citation.quote, remaining).map_err(scan_error)?;
+            let local = scan_occurrences_with_checkpoints(text, &citation.quote, remaining, || checkpoint(control))
+                .map_err(|error| match error {
+                    GroundingScanError::Verification(error) => scan_error(error),
+                    GroundingScanError::Checkpoint(error) => Int4SourceMapError::from(error),
+                })?;
             if local.is_empty() || citation.spans.len() != local.len() || citation.occurrence != occurrence(local.len()) {
                 return Err(invalid());
             }
@@ -94,12 +99,14 @@ pub(super) fn lift_answer<C: DecodeStepControl>(source: &str, raw: &AnswerResult
         let mut spans = Vec::new(); let mut next = 0_usize;
         for (passage, origins) in evidence.passages.iter().zip(&evidence.origins) {
             checkpoint(control)?;
-            let local_spans = match scan_occurrences(&passage.text, &citation.quote, remaining) {
+            let local_spans = match scan_occurrences_with_checkpoints(&passage.text, &citation.quote,
+                remaining, || checkpoint(control)) {
                 Ok(spans) => spans,
                 // A quote need not occur in EVERY passage. The no-match scan is
                 // still charged, and later passages must still be inspected.
-                Err(FieldGroundingError::Absent) => continue,
-                Err(error) => return Err(scan_error(error)),
+                Err(GroundingScanError::Verification(FieldGroundingError::Absent)) => continue,
+                Err(GroundingScanError::Verification(error)) => return Err(scan_error(error)),
+                Err(GroundingScanError::Checkpoint(error)) => return Err(error.into()),
             };
             for local in local_spans {
                 let reported = citation.spans.get(next).ok_or_else(invalid)?;

@@ -9,8 +9,10 @@ use crate::{
     tasks::{answer::{AnswerCalibration, AnswerResult, AnswerStatus, PassageCitation,
             ANSWER_PASSAGE_LAYOUT_VERSION, ANSWER_TASK_VERSION},
         ir::ScoreSpace, summarize::{CitationGuarantee, SourceCitation, SummarySemanticSupport}},
-    validation::grounded_fields::{GroundingBudget, SourceOccurrence, scan_occurrences},
+    validation::grounded_fields::{GroundingBudget, SourceOccurrence, GroundingScanError, scan_occurrences_with_checkpoints},
 };
+#[cfg(test)]
+use crate::validation::grounded_fields::scan_occurrences;
 
 mod planning;
 mod execution;

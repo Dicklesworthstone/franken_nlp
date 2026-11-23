@@ -59,6 +59,27 @@ impl fmt::Display for FieldGroundingError {
 }
 impl Error for FieldGroundingError {}
 
+/// Keep the caller's original cancellation/error separate from an absent
+/// source match. In particular, interrupted evidence is never an abstention.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GroundingScanError<E> { Verification(FieldGroundingError), Checkpoint(E) }
+impl<E> From<FieldGroundingError> for GroundingScanError<E> {
+    fn from(error: FieldGroundingError) -> Self { Self::Verification(error) }
+}
+impl<E> fmt::Display for GroundingScanError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Verification(error) => fmt::Display::fmt(error, f),
+            Self::Checkpoint(_) => f.write_str("source verification checkpoint refused execution"),
+        }
+    }
+}
+impl<E: Error + 'static> Error for GroundingScanError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self { Self::Verification(error) => Some(error), Self::Checkpoint(error) => Some(error) }
+    }
+}
+
 /// Independently check every present source annotation, including annotations
 /// below optional object keys and arrays. Returned JSON pointers locate values,
 /// not schema nodes. Absence of an optional field requires no invented span.
@@ -111,6 +132,30 @@ fn pointer(parent: &str, key: &str) -> String {
 /// Independent exact matching, also useful for NER mention finalization.
 /// Consumes aggregate budgets shared by all fields in a response.
 pub fn scan_occurrences(source: &str, text: &str, budget: &mut GroundingBudget) -> Result<Vec<VerifiedSourceSpan>, FieldGroundingError> {
+    match scan_occurrences_with_checkpoints(source, text, budget, || Ok::<(), std::convert::Infallible>(())) {
+        Ok(spans) => Ok(spans),
+        Err(GroundingScanError::Verification(error)) => Err(error),
+        Err(GroundingScanError::Checkpoint(never)) => match never {},
+    }
+}
+
+/// The same independent KMP/UTF-8 occurrence census with bounded cooperative
+/// interruption. Poll before work, every 4096 scan/prefix-fallback steps, and
+/// before returning either complete matches or absence. An attempted scan
+/// retains its full original work debit on cancellation; it never publishes a
+/// partial occurrence set or refunds work for an unsuccessful search.
+pub fn scan_occurrences_with_checkpoints<E>(source: &str, text: &str, budget: &mut GroundingBudget,
+    mut checkpoint: impl FnMut() -> Result<(), E>) -> Result<Vec<VerifiedSourceSpan>, GroundingScanError<E>> {
+    checkpoint().map_err(GroundingScanError::Checkpoint)?;
+    let mut until_checkpoint = SCAN_CHECKPOINT_STEPS;
+    let mut step = || -> Result<(), GroundingScanError<E>> {
+        if until_checkpoint == 0 {
+            checkpoint().map_err(GroundingScanError::Checkpoint)?;
+            until_checkpoint = SCAN_CHECKPOINT_STEPS;
+        }
+        until_checkpoint -= 1;
+        Ok(())
+    };
     let cost = (source.len() as u64).checked_add(text.len() as u64)
         .and_then(|n| n.checked_add(1)).and_then(|n| n.checked_mul(8)).ok_or(FieldGroundingError::WorkBudget)?;
     budget.max_scan_steps = budget.max_scan_steps.checked_sub(cost).ok_or(FieldGroundingError::WorkBudget)?;
@@ -122,25 +167,31 @@ pub fn scan_occurrences(source: &str, text: &str, budget: &mut GroundingBudget) 
     };
     if text.is_empty() {
         for (scalar, byte) in source.char_indices().map(|(i, _)| i).chain(std::iter::once(source.len())).enumerate() {
+            step()?;
             push(VerifiedSourceSpan { byte_start: byte, byte_end: byte, scalar_start: scalar, scalar_end: scalar })?;
         }
     } else {
         let needle = text.as_bytes();
         let mut prefix = Vec::new();
         prefix.try_reserve_exact(needle.len()).map_err(|_| FieldGroundingError::AllocationRefused)?;
-        prefix.resize(needle.len(), 0_usize);
+        // Grow initialized entries only as they are computed. A bulk resize or
+        // a separate chars().count() would hide an uninterruptible needle scan.
+        prefix.push(0_usize);
+        let mut text_scalars = 1_usize;
         let mut matched = 0;
         for i in 1..needle.len() {
-            while matched > 0 && needle[i] != needle[matched] { matched = prefix[matched - 1]; }
+            step()?;
+            if needle[i] & 0xc0 != 0x80 { text_scalars += 1; }
+            while matched > 0 && needle[i] != needle[matched] { step()?; matched = prefix[matched - 1]; }
             if needle[i] == needle[matched] { matched += 1; }
-            prefix[i] = matched;
+            prefix.push(matched);
         }
-        let text_scalars = text.chars().count();
         let mut scalars = 0_usize;
         matched = 0;
         for (i, byte) in source.bytes().enumerate() {
+            step()?;
             if byte & 0xc0 != 0x80 { scalars += 1; }
-            while matched > 0 && byte != needle[matched] { matched = prefix[matched - 1]; }
+            while matched > 0 && byte != needle[matched] { step()?; matched = prefix[matched - 1]; }
             if byte == needle[matched] { matched += 1; }
             if matched == needle.len() {
                 let end = i + 1; let start = end - needle.len();
@@ -150,7 +201,7 @@ pub fn scan_occurrences(source: &str, text: &str, budget: &mut GroundingBudget) 
                 // the linear scan allowance charged above. Only constant-time
                 // UTF-8 boundary checks remain before publishing coordinates.
                 if !source.is_char_boundary(start) || !source.is_char_boundary(end) {
-                    return Err(FieldGroundingError::Shape);
+                    return Err(FieldGroundingError::Shape.into());
                 }
                 push(VerifiedSourceSpan { byte_start: start, byte_end: end,
                     scalar_start: scalars.checked_sub(text_scalars).ok_or(FieldGroundingError::Shape)?, scalar_end: scalars })?;
@@ -159,15 +210,109 @@ pub fn scan_occurrences(source: &str, text: &str, budget: &mut GroundingBudget) 
         }
     }
     drop(push);
-    if output.is_empty() { return Err(FieldGroundingError::Absent); }
+    drop(step);
+    checkpoint().map_err(GroundingScanError::Checkpoint)?;
+    if output.is_empty() { return Err(FieldGroundingError::Absent.into()); }
     budget.max_matches -= output.len();
     Ok(output)
 }
+
+const SCAN_CHECKPOINT_STEPS: usize = 4096;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{grammar::{compile_json_schema, CompileLimits}, validation::{parse_json, validate_source_span, SourceSpan}};
+
+    #[test]
+    fn checkpointed_scans_preserve_complete_unicode_overlap_and_budget_results() {
+        for source in ["", "éaaaa上海上海", "e\u{301}e\u{301}", "aaaaa"] {
+            for text in ["", "é", "aa", "上海", "e\u{301}", "missing"] {
+                let mut plain = GroundingBudget::default();
+                let mut checked = plain;
+                let expected = scan_occurrences(source, text, &mut plain);
+                let actual = scan_occurrences_with_checkpoints(source, text, &mut checked,
+                    || Ok::<(), ()>(()));
+                assert_eq!(actual, expected.map_err(GroundingScanError::Verification));
+                assert_eq!(checked, plain);
+                // Independent character-boundary oracle, including overlaps
+                // and the terminal empty-string occurrence.
+                let spans = source.char_indices().map(|(byte, _)| byte)
+                    .chain(std::iter::once(source.len())).enumerate()
+                    .filter_map(|(scalar, byte)| source[byte..].starts_with(text).then(|| VerifiedSourceSpan {
+                        byte_start: byte, byte_end: byte + text.len(), scalar_start: scalar,
+                        scalar_end: scalar + text.chars().count(),
+                    })).collect::<Vec<_>>();
+                let oracle = if spans.is_empty() { Err(GroundingScanError::Verification(FieldGroundingError::Absent)) }
+                    else { Ok(spans) };
+                assert_eq!(actual, oracle);
+            }
+        }
+    }
+
+    #[test]
+    fn every_terminal_cause_interrupts_large_source_and_empty_occurrence_scans() {
+        use crate::native_engine::decode::DecodeCancellationKind::*;
+        let source = "é".repeat(SCAN_CHECKPOINT_STEPS * 3);
+        for text in ["", "é", "absent"] {
+            for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+                ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+                let mut budget = GroundingBudget::default();
+                let before = budget;
+                let mut calls = 0;
+                let result = scan_occurrences_with_checkpoints(&source, text, &mut budget, || {
+                    calls += 1; if calls == 2 { Err(cause) } else { Ok(()) }
+                });
+                assert_eq!(result, Err(GroundingScanError::Checkpoint(cause)));
+                assert_eq!(calls, 2);
+                assert_eq!(budget.max_scan_steps,
+                    before.max_scan_steps - ((source.len() + text.len() + 1) * 8) as u64);
+                assert_eq!(budget.max_matches, before.max_matches);
+            }
+        }
+    }
+
+    #[test]
+    fn prefix_construction_and_one_long_fallback_are_both_interruptible() {
+        let needle = format!("{}b", "a".repeat(2 * SCAN_CHECKPOINT_STEPS));
+        // The second poll interrupts prefix construction. The third occurs
+        // inside the final byte's long KMP fallback, before source scanning.
+        for stop in [2, 3] {
+            let mut calls = 0;
+            let result = scan_occurrences_with_checkpoints("", &needle, &mut GroundingBudget::default(), || {
+                calls += 1; if calls == stop { Err("original stop") } else { Ok(()) }
+            });
+            assert_eq!(result, Err(GroundingScanError::Checkpoint("original stop")));
+            assert_eq!(calls, stop);
+        }
+    }
+
+    #[test]
+    fn final_checkpoint_cannot_be_laundered_into_absence_or_partial_success() {
+        for text in ["b", "absent"] {
+            let mut calls = 0;
+            let mut budget = GroundingBudget::default();
+            let matches = budget.max_matches;
+            let result = scan_occurrences_with_checkpoints("abc", text, &mut budget, || {
+                calls += 1; if calls == 2 { Err(7) } else { Ok(()) }
+            });
+            assert_eq!(result, Err(GroundingScanError::Checkpoint(7)));
+            assert_eq!(budget.max_matches, matches);
+        }
+    }
+
+    #[test]
+    fn scan_refuses_work_and_match_budgets_without_renewal() {
+        let mut budget = GroundingBudget { max_fields: 1, max_matches: 2, max_scan_steps: 39 };
+        assert_eq!(scan_occurrences_with_checkpoints("aaaa", "", &mut budget, || Ok::<(), ()>(())),
+            Err(GroundingScanError::Verification(FieldGroundingError::WorkBudget)));
+        assert_eq!(budget.max_scan_steps, 39);
+        budget.max_scan_steps = 40;
+        assert_eq!(scan_occurrences_with_checkpoints("aaaa", "", &mut budget, || Ok::<(), ()>(())),
+            Err(GroundingScanError::Verification(FieldGroundingError::MatchBudget)));
+        assert_eq!(budget.max_scan_steps, 0);
+    }
+
     #[test]
     fn overlapping_occurrences_and_unicode_offsets_are_verified_independently() {
         let source = "éaaaa上海上海";

@@ -112,6 +112,32 @@ fn no_match_scans_and_each_original_byte_comparison_consume_the_same_exact_allow
             &mut budget, &mut Continue), Err(Int4SourceMapError::WorkLimit)));
     }
 }
+
+#[test]
+fn cancellation_inside_a_large_nonmatching_passage_preserves_every_terminal_cause() {
+    use DecodeCancellationKind::*;
+    struct Stop { calls: usize, cause: DecodeCancellationKind }
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.calls += 1; (self.calls == 5).then_some(self.cause)
+        }
+    }
+    let absent = "é".repeat(3000);
+    let (source, evidence) = fixture(&[&absent, "Alice"]);
+    let result = raw(&evidence, &["Alice"]);
+    let scan_charge = ((absent.len() + "Alice".len() + 1) * 8) as u64;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let mut budget = GroundingBudget::default(); let before = budget;
+        let mut control = Stop { calls: 0, cause };
+        let error = final_answer(&source, result.clone(), &evidence, AnswerOptions::default(),
+            &mut budget, &mut control).err().unwrap();
+        assert_eq!(error.cancellation(), Some(cause));
+        assert_eq!(control.calls, 5);
+        assert_eq!(budget.max_scan_steps, before.max_scan_steps - scan_charge);
+        assert_eq!(budget.max_matches, before.max_matches);
+    }
+}
 #[test]
 fn repeated_subquotes_reach_only_selected_originals_and_charge_fanout_before_dedup() {
     let (source, value) = mapped(&[("éAlice éAlice", Some("éAlice")), (" Alice", None)]);

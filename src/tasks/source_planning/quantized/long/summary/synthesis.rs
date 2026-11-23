@@ -6,8 +6,11 @@ use crate::tasks::source_planning::quantized::long::question::binding;
 use crate::{
     native_engine::portable_int8::ProjectionWork,
     tasks::{ir::ScoreSpace, summarize::{CitedBullet, CitationGuarantee, SourceCitation, SummarySemanticSupport}},
-    validation::grounded_fields::{GroundingBudget, SourceOccurrence, scan_occurrences, FieldGroundingError},
+    validation::grounded_fields::{GroundingBudget, SourceOccurrence, GroundingScanError,
+        scan_occurrences_with_checkpoints, FieldGroundingError},
 };
+#[cfg(test)]
+use crate::validation::grounded_fields::scan_occurrences;
 mod evidence;
 /// Separate opt-in hierarchical quote compression; the single-pass API is unchanged.
 pub mod hierarchy;
