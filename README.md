@@ -683,7 +683,8 @@ the repository's authorized DSR checkpoint and model-present qualification.
 
 `fnlp candidate map` accepts `--input-encoding safe-bpe-v1` for NER,
 keyphrases, cited summaries, passage QA and exact-schema extraction, including exact `--reduce-keyphrases` and
-`--reduce-summary` reductions:
+`--reduce-summary` reductions and explicit neural `--synthesize-summary` or
+`--synthesize-answer`:
 
 ```sh
 fnlp candidate map document.txt --task ner \
@@ -714,9 +715,28 @@ flag. The repeated question, passage manifests, discarded source probes and
 actual passage plans all spend the same cumulative tokenizer allowance. Each
 answer retains passage-scoped evidence in original-document coordinates.
 
+Add `--synthesize-answer` to produce a final answer from the verified collected
+quotes, or `--synthesize-summary` for a final cited summary. Summary synthesis
+also accepts `--hierarchical-summary` when those quotes need multiple bounded
+reduction passes. Discovery, final evidence encoding, hierarchy fit probes
+(including rejected joins) and every hierarchy node spend the original ledger.
+The final result reports cumulative encoding work for the complete invocation.
+
+```sh
+fnlp candidate map report.txt --task summarize \
+  --synthesize-summary --hierarchical-summary --summary-max-passes 8 \
+  --model ./model.fnlpq --memory-mib 8192 \
+  --input-encoding safe-bpe-v1 --max-chunk-bytes 4096
+```
+
+Evidence bytes use the whole per-prompt `--max-input-bytes` allowance; their
+actual encoded token count still determines context fit. Final answers and
+summaries cite the original source, and generated discovery text never becomes
+source evidence. These modes synthesize from collected quotes and do not claim
+equivalence to native inference over the complete original document.
+
 Encoder workspace is charged alongside retained source, prompts and grammars.
-Compact input on this INT8 route currently excludes neural answer/summary
-synthesis. All output remains candidate
+All output remains candidate
 evidence; changed prompt tokens establish no output-parity, quality or speed
 claim. See the [CLI contract](docs/candidate-long-document-cli.md#bounded-compact-input)
 and [library contract](docs/int8-long-source.md#compact-source-encoding).

@@ -56,6 +56,7 @@ impl SourceSummarySynthesis {
 /// Private request and accounting commitment. This is not a native execution receipt.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Int8SummarySynthesisPreflight {
+    discovery: Int8SourceMapPreflight,
     chunks: usize,
     source_span: VerifiedSourceSpan,
     discovery_work: Int8Work,
@@ -98,9 +99,11 @@ impl Int8SummarySynthesisPreflight {
         control: &mut C) -> Result<(), Int8SourceMapError> {
         checkpoint(control)?;
         if run.request_binding != self.request_binding || run.result_binding != binding::composed_result(
-            b"fnlp-int8-summary-synthesis-result-v1", self.request_binding, &[], run, self.max_result_bytes, control)? {
+            b"fnlp-int8-summary-synthesis-result-v1", self.request_binding,
+            &[run.discovery.request_binding, run.discovery.result_binding], run, self.max_result_bytes, control)? {
             return Err(invalid());
         }
+        self.discovery.verify_completed_with_control(&run.discovery, control)?;
         let map = &run.discovery; let root = map.mapped.root();
         let actual = add_work(map.model_work, run.synthesis_model_work).ok_or(Int8SourceMapError::WorkLimit)?;
         let masks = map.mask_node_visit_charge.checked_add(run.synthesis_mask_node_visits)
@@ -178,6 +181,9 @@ impl Int8SummarySynthesisPreflight {
 pub struct PreparedInt8SummarySynthesis<'s> {
     source: &'s str,
     map: PreparedInt8SourceMap<'s>,
+    /// Retains the original document's ledger through every evidence pass.
+    /// A same-policy planner supplied at execution cannot renew this allowance.
+    operation: SourceTaskPlanner,
     identity: ExecutionIdentity,
     budget: TaskBudget,
     planning: SourcePlanningLimits,
@@ -194,9 +200,7 @@ impl SourceTaskPlanner {
         planning: SourcePlanningLimits, mapping: Int8SourceMapLimits, control: &mut C)
         -> Result<PreparedInt8SummarySynthesis<'s>, Int8SourceMapError> {
         checkpoint(control)?;
-        // Evidence-fit probes and the later generated-evidence pass do not yet
-        // share the complete compact-input contract of plain source maps.
-        self.encoder.require_byte_encoding().map_err(Int8SourceError::from)?;
+        let operation = self.retain_map_document_operation().map_err(Int8SourceError::from)?;
         request.validate(planning)?;
         let (discovery_limits, reserve) = reserve(budget, planning, mapping)?;
         // Derive the real summary scaffold, rather than relying on a caller's
@@ -212,6 +216,7 @@ impl SourceTaskPlanner {
                 request.limits.max_evidence_bytes, request.limits.verification),
             budget, context, planning, mapping, self, &map.chunks, control)?;
         let expected = Int8SummarySynthesisPreflight {
+            discovery: map.preflight_metadata(),
             chunks: map.chunk_count(), source_span: VerifiedSourceSpan { byte_start: 0, byte_end: source.len(),
                 scalar_start: 0, scalar_end: last.scalar_end }, discovery_work: map.work, discovery_masks: map.masks,
             synthesis_reserve: reserve, synthesis_masks: mapping.mask_visits_per_chunk,
@@ -221,7 +226,7 @@ impl SourceTaskPlanner {
         if !within(expected.reserved_model_work()?, mapping.max_model_work)
             || expected.reserved_mask_visits()? > mapping.max_mask_visits { return Err(Int8SourceMapError::WorkLimit); }
         checkpoint(control)?;
-        Ok(PreparedInt8SummarySynthesis { source, map, identity: context.execution_identity().clone(),
+        Ok(PreparedInt8SummarySynthesis { source, map, operation, identity: context.execution_identity().clone(),
             budget, planning, mapping, request, expected })
     }
 }
@@ -243,20 +248,58 @@ fn reserve(budget: TaskBudget, planning: SourcePlanningLimits, mut mapping: Int8
     mapping.max_mask_visits = sub(mapping.max_mask_visits, mapping.mask_visits_per_chunk)?;
     Ok((mapping, work))
 }
-impl PreparedInt8SummarySynthesis<'_> {
+impl<'s> PreparedInt8SummarySynthesis<'s> {
     pub fn preflight_metadata(&self) -> Int8SummarySynthesisPreflight { self.expected }
     pub fn execution_identities(&self) -> impl ExactSizeIterator<Item = &ExecutionIdentity> { self.map.execution_identities() }
     pub fn max_result_bytes(&self) -> u64 { self.mapping.reduction.max_result_bytes as u64 }
+    fn check_planner(&self, planner: &SourceTaskPlanner) -> Result<(), Int8SourceMapError> {
+        if planner.tokenizer_digest() != self.identity.tokenizer_digest || *planner.template_digest() != self.identity.template_digest {
+            return Err(Int8SourceMapError::Admission);
+        }
+        Ok(())
+    }
+    fn into_parts(self) -> (PreparedInt8SourceMap<'s>, SummarySynthesisTail<'s>) {
+        let Self { source, map, operation, identity, budget, planning, mapping, request, expected } = self;
+        (map, SummarySynthesisTail { source, operation, identity, budget, planning, mapping, request, expected })
+    }
     pub fn execute_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
         planner: &SourceTaskPlanner, engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
         -> Result<Int8SummarySynthesisRun, Int8SourceMapError> {
         checkpoint(control)?;
-        if planner.tokenizer_digest() != self.identity.tokenizer_digest || *planner.template_digest() != self.identity.template_digest {
-            return Err(Int8SourceMapError::Admission);
-        }
+        self.check_planner(planner)?;
         self.map.preflight(admitted, engine)?;
-        let Self { source, map, identity, budget, planning, mapping, request, expected } = self;
+        let (map, tail) = self.into_parts();
         let discovery = map.execute_with_control(admitted, engine, vocabulary, control)?;
+        let mapping = tail.mapping;
+        tail.execute(discovery, |plan, control| {
+            // Dynamic source/prompt/schema identity is admitted against the
+            // same model and full resident KV before any synthesis forward.
+            preflight_plans(std::slice::from_ref(plan), std::slice::from_ref(plan.execution_identity()), engine)?;
+            let mut driver = NativeDriver { engine, vocabulary, control, limits: mapping };
+            driver.run(plan, plan.execution_identity()).map_err(Into::into)
+        }, control)
+    }
+}
+
+/// The consumed discovery's continuation owns its original encoding budget.
+/// The private callback keeps tests on the actual preparation/finalization path;
+/// public callers always use the native engine above.
+struct SummarySynthesisTail<'s> {
+    source: &'s str,
+    operation: SourceTaskPlanner,
+    identity: ExecutionIdentity,
+    budget: TaskBudget,
+    planning: SourcePlanningLimits,
+    mapping: Int8SourceMapLimits,
+    request: SourceSummarySynthesis,
+    expected: Int8SummarySynthesisPreflight,
+}
+impl SummarySynthesisTail<'_> {
+    fn execute<C: DecodeStepControl, F>(self, discovery: Int8SourceMapRun, run: F, control: &mut C)
+        -> Result<Int8SummarySynthesisRun, Int8SourceMapError>
+        where F: FnOnce(&PreparedInt8SourceTask, &mut C) -> Result<Int8SourceTaskRun, Int8SourceMapError> {
+        let Self { source, operation, identity, budget, planning, mapping, request, expected } = self;
+        expected.discovery.verify_completed_with_control(&discovery, control)?;
         let mut remaining = request.limits.verification;
         let collection = evidence::collect(source, discovery.mapped.root().value(), request.map_options,
             request.limits, &mut remaining, control)?;
@@ -265,14 +308,10 @@ impl PreparedInt8SummarySynthesis<'_> {
             let context = PlanContext::new(&identity, budget).map_err(|_| Int8SourceMapError::Admission)?;
             let final_request = SourceTaskRequest::Summarize { document: copy(&collection.text)?,
                 options: request.synthesis_options, budget };
-            let plan = planner.plan_int8_with_control(&final_request, &context, planning, control)?;
+            let plan = operation.plan_int8_with_control(&final_request, &context, planning, control)?;
             let planned = plan.planned_work();
             if !within(planned, expected.synthesis_reserve) { return Err(Int8SourceMapError::WorkLimit); }
-            // Dynamic source/prompt/schema identity is admitted against the same
-            // real model and full resident KV before any synthesis forward.
-            preflight_plans(std::slice::from_ref(&plan), std::slice::from_ref(plan.execution_identity()), engine)?;
-            let mut driver = NativeDriver { engine, vocabulary, control, limits: mapping };
-            let native = driver.run(&plan, plan.execution_identity())?;
+            let native = run(&plan, control)?;
             check_run(&plan, &native, mapping.mask_visits_per_chunk)?;
             extract_int8::check_size(&native, plan.max_result_bytes()).map_err(Int8SourceError::from)?;
             let SourceTaskResult::Summarize(raw) = &native.result else { return Err(invalid()); };
@@ -344,7 +383,8 @@ pub struct Int8SummarySynthesisRun {
 fn seal_completed<C: DecodeStepControl>(mut run: Int8SummarySynthesisRun,
     expected: Int8SummarySynthesisPreflight, control: &mut C) -> Result<Int8SummarySynthesisRun, Int8SourceMapError> {
     run.result_binding = binding::composed_result(b"fnlp-int8-summary-synthesis-result-v1",
-        run.request_binding, &[], &run, expected.max_result_bytes, control)?;
+        run.request_binding, &[run.discovery.request_binding, run.discovery.result_binding],
+        &run, expected.max_result_bytes, control)?;
     expected.verify_completed_with_control(&run, control)?;
     Ok(run)
 }

@@ -179,7 +179,25 @@ fn compact_extraction_admits_schema_and_chunk_storage_before_any_private_io() {
     }
 }
 #[test]
-fn unsupported_compact_compositions_refuse_before_private_io() {
+fn compact_synthesis_prices_complete_evidence_independently_of_original_chunk_bytes() {
+    for (task, extra) in [("answer", vec!["--question", "question.txt", "--synthesize-answer"]),
+        ("summarize", vec!["--synthesize-summary"]),
+        ("summarize", vec!["--synthesize-summary", "--hierarchical-summary"])] {
+        let mut flags = vec!["--input-encoding", "safe-bpe-v1", "--max-chunk-bytes", "4096"];
+        flags.extend(extra);
+        let cmd = command(task, &flags);
+        let (_, limits) = cmd.validate().unwrap();
+        let encoding = cmd.encoding.limits(&cmd).unwrap().unwrap();
+        assert_eq!(encoding.call.max_input_bytes, cmd.host.max_input_bytes);
+        assert_eq!(encoding.call.max_output_tokens, cmd.host.max_input_bytes);
+        assert!(encoding.call.max_input_bytes > cmd.max_chunk_bytes.unwrap());
+        assert!(encoding.workspace_bytes().unwrap() < limits.preparation_bytes);
+        assert_eq!(encoding.complete.max_input_bytes, 8 * cmd.host.max_input_bytes as u64);
+    }
+}
+#[cfg(not(feature = "asupersync-runtime"))]
+#[test]
+fn compact_synthesis_with_disabled_runtime_refuses_before_private_io() {
     struct NoRead;
     impl Read for NoRead {
         fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private input read") }
@@ -190,9 +208,10 @@ fn unsupported_compact_compositions_refuse_before_private_io() {
         fn flush(&mut self) -> io::Result<()> { panic!("output flushed") }
     }
     for (task, extra) in [("answer", vec!["--question", "never-open.txt", "--synthesize-answer"]),
-        ("summarize", vec!["--synthesize-summary"])] {
+        ("summarize", vec!["--synthesize-summary"]),
+        ("summarize", vec!["--synthesize-summary", "--hierarchical-summary"])] {
         let mut flags = vec!["--input-encoding", "safe-bpe-v1"];
         flags.extend(extra);
-        assert_eq!(command(task, &flags).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+        assert_eq!(command(task, &flags).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Unavailable));
     }
 }

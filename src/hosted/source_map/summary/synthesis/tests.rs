@@ -91,3 +91,20 @@ fn hierarchical_memory_arithmetic_and_invalid_caps_fail_closed() {
     let mut c = config(); c.budget.max_output_bytes = u64::MAX / 8;
     assert!(hierarchy::hierarchy_bytes(&c, 3, h).is_err());
 }
+#[test]
+fn summary_and_hierarchy_admit_one_shared_encoder_beside_all_retained_preparation() {
+    use crate::tokenizer::{pinned_controls, untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding}};
+    let controls = pinned_controls::pinned().unwrap();
+    let planner = || SourceTaskPlanner::pinned(controls.template_controls(), 166_101).unwrap();
+    let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 4096,
+        max_output_tokens: 4096, max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 });
+    let work = SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 1 << 26, max_pair_bytes: 1 << 30 };
+    let byte = planner(); let compact = planner().with_map_document_encoding(policy.clone(), work).unwrap();
+    let mut c = config();
+    assert_eq!(input_bytes(&c, 1024, &compact).unwrap() - input_bytes(&c, 1024, &byte).unwrap(),
+        compact.map_document_encoding_workspace_bytes().unwrap());
+    assert!(input_bytes(&c, 1024, &planner().with_document_encoding(policy).unwrap()).is_err());
+    c.preparation_reserve_bytes = u64::MAX;
+    assert!(input_bytes(&c, 1024, &compact).is_err());
+}

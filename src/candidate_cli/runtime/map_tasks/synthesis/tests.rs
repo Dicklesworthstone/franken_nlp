@@ -14,9 +14,17 @@ impl DecodeStepControl for Control {
     }
 }
 fn continuing() -> Control { Control { calls: 0, stop: usize::MAX } }
+fn configured_planner(c: &MapCommand) -> Result<SourceTaskPlanner, CandidateError> {
+    let (p, _) = planner()?;
+    match c.encoding.limits(c)? {
+        Some(encoding) => p.with_map_document_encoding(encoding.policy(), encoding.complete)
+            .map_err(|_| CandidateError::Planning),
+        None => Ok(p),
+    }
+}
 fn preflight(c: &MapCommand, text: &str, control: &mut Control) -> Result<Int8SummarySynthesisPreflight, CandidateError> {
     let (_, limits) = c.validate()?;
-    let (p, _) = planner()?;
+    let p = configured_planner(c)?;
     let budget = c.host.task_budget(limits);
     let id = source_identity(&facts(), &p, crate::tasks::BuiltInTask::Summarize)?;
     let ctx = PlanContext::new(&id, budget).map_err(|_| CandidateError::Planning)?;
@@ -66,7 +74,7 @@ fn final_preparation_deadline_and_empty_source_return_no_preflight_receipt() {
     assert!(preflight(&c, "", &mut continuing()).is_err());
 }
 fn tree_preflight(c: &MapCommand, text: &str, control: &mut Control) -> Result<Int8SummaryHierarchyPreflight, CandidateError> {
-    let (_, limits) = c.validate()?; let (p, _) = planner()?;
+    let (_, limits) = c.validate()?; let p = configured_planner(c)?;
     let budget = c.host.task_budget(limits);
     let id = source_identity(&facts(), &p, crate::tasks::BuiltInTask::Summarize)?;
     let ctx = PlanContext::new(&id, budget).map_err(|_| CandidateError::Planning)?;
@@ -113,5 +121,34 @@ fn hierarchy_preparation_cancellation_preserves_deadline_through_the_cli() {
     let c = tree_command(); let mut control = continuing(); tree_preflight(&c, "éAéA", &mut control).unwrap();
     for stop in [1, control.calls] {
         assert_eq!(tree_preflight(&c, "éAéA", &mut Control { calls: 0, stop }).err(), Some(CandidateError::Timeout));
+    }
+}
+#[test]
+fn compact_summary_modes_spend_one_cli_preflight_ledger_and_report_the_same_policy() {
+    for hierarchical in [false, true] {
+        let mut flags = vec!["--synthesize-summary", "--input-encoding", "safe-bpe-v1", "--max-chunk-bytes", "512"];
+        if hierarchical { flags.extend(["--hierarchical-summary", "--summary-max-passes", "4"]); }
+        let c = command("summarize", &flags);
+        let (_, limits) = c.validate().unwrap(); let p = configured_planner(&c).unwrap();
+        let budget = c.host.task_budget(limits);
+        let id = source_identity(&facts(), &p, crate::tasks::BuiltInTask::Summarize).unwrap();
+        let ctx = PlanContext::new(&id, budget).unwrap();
+        let options = SummaryOptions::default();
+        let request = c.summary.synthesis.request(options, c.host.planning()).unwrap();
+        let capacity = p.int8_map_capacity_with_control(&SourceMapTask::Summarize(options), budget, &ctx,
+            c.host.planning(), &mut continuing()).unwrap();
+        let text = "The original document includes Alice, café, 上海 and <tool_call>. ".repeat(8);
+        let before = p.map_document_encoding_work().unwrap().unwrap();
+        let expected = prepare_mode(&text, &p, request, budget, &ctx, &c, c.mapping(capacity).unwrap(),
+            &mut continuing()).unwrap();
+        assert_eq!(matches!(expected, Expected::Hierarchical(_)), hierarchical);
+        let once = p.map_document_encoding_work().unwrap().unwrap();
+        assert!(once.input_bytes() > before.input_bytes());
+        prepare_mode(&text, &p, request, budget, &ctx, &c, c.mapping(capacity).unwrap(), &mut continuing()).unwrap();
+        let twice = p.map_document_encoding_work().unwrap().unwrap();
+        assert!(twice.input_bytes() > once.input_bytes());
+        let report = serde_json::to_value(encoding::report(&p).unwrap().unwrap()).unwrap();
+        assert_eq!(report["work_used"], serde_json::to_value(twice).unwrap());
+        assert_eq!(report["complete_operation_limits"], serde_json::to_value(c.encoding.limits(&c).unwrap().unwrap().complete).unwrap());
     }
 }

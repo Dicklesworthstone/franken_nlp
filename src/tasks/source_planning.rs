@@ -242,7 +242,7 @@ impl SourceTaskPlanner {
         self.encoder = self.encoder.with_document_encoding(policy)?;
         Ok(self)
     }
-    /// Admit compact input for one complete INT4 source-document operation.
+    /// Admit compact input for one complete INT8 or INT4 source-document operation.
     /// All probes, chunk plans, dependent neural synthesis and host replanning share this
     /// nonrenewable ledger for the planner's entire lifetime. Create another
     /// explicitly admitted planner for a different document; there is no reset.

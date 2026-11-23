@@ -33,12 +33,7 @@ fn prepare_mode(source: &str, planner: &SourceTaskPlanner, request: SourceSummar
     Ok(Expected::Hierarchical(expected))
 }
 fn planning_error(error: crate::tasks::source_planning::quantized::long::Int8SourceMapError) -> CandidateError {
-    use crate::native_engine::decode::DecodeCancellationKind;
-    match error.cancellation() {
-        Some(DecodeCancellationKind::Deadline | DecodeCancellationKind::Timeout) => CandidateError::Timeout,
-        Some(_) => CandidateError::Execution,
-        None => CandidateError::Planning,
-    }
+    error.cancellation().map(cancelled).unwrap_or(CandidateError::Planning)
 }
 pub(super) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
@@ -53,6 +48,11 @@ pub(super) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
     session.remaining()?;
     let facts = session.facts(&args)?;
     let (planner, vocabulary) = planner()?;
+    let planner = match command.encoding.limits(&command)? {
+        Some(encoding) => planner.with_map_document_encoding(encoding.policy(), encoding.complete)
+            .map_err(|_| CandidateError::Planning)?,
+        None => planner,
+    };
     let budget = command.host.task_budget(limits);
     let identity = source_identity(&facts, &planner, crate::tasks::BuiltInTask::Summarize)?;
     let context = PlanContext::new(&identity, budget).map_err(|_| CandidateError::Planning)?;
@@ -66,20 +66,25 @@ pub(super) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
     let config = SourceMapConfig { identity, task: request, budget, planning: command.host.planning(), mapping,
         native: session.native(&args)?, preparation_reserve_bytes: limits.preparation_bytes,
         reduction_reserve_bytes: command.reduction_reserve_mib.checked_mul(MIB).ok_or(CandidateError::Arguments)? };
+    // Preflight, hosted reconstruction and every dynamic evidence program
+    // retain the same cumulative encoder. Keep it alive for final reporting.
+    let planner = Arc::new(planner);
     match expected {
         Expected::Single(expected) => {
-            let result = session.engine.synthesize_int8_summary(&model, text, Arc::new(planner), Arc::new(vocabulary),
+            let result = session.engine.synthesize_int8_summary(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
                 config, cancellation).map_err(host_error)?;
             expected.verify_completed_with_control(result.result(), &mut session.control())
                 .map_err(|error| error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution))?;
-            deliver(&session, &facts, &result, command.max_map_result_bytes + 4096, output)
+            deliver_encoded(&session, &facts, &result, encoding::report(&planner)?.as_ref(),
+                command.max_map_result_bytes + 4096, output)
         }
         Expected::Hierarchical(expected) => {
-            let result = session.engine.synthesize_int8_summary_hierarchical(&model, text, Arc::new(planner), Arc::new(vocabulary),
+            let result = session.engine.synthesize_int8_summary_hierarchical(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
                 config, expected.limits(), cancellation).map_err(host_error)?;
             expected.verify_completed_with_control(result.result(), &mut session.control())
                 .map_err(|error| error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution))?;
-            deliver(&session, &facts, &result, command.max_map_result_bytes + 4096, output)
+            deliver_encoded(&session, &facts, &result, encoding::report(&planner)?.as_ref(),
+                command.max_map_result_bytes + 4096, output)
         }
     }
 }

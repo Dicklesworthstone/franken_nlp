@@ -73,9 +73,11 @@ impl Int8SummaryHierarchyPreflight {
         control: &mut C) -> Result<(), Int8SourceMapError> {
         checkpoint(control)?;
         if run.request_binding != self.request_binding || run.result_binding != binding::composed_result(
-            b"fnlp-int8-summary-hierarchy-result-v1", self.request_binding, &[], run, self.max_result_bytes, control)? {
+            b"fnlp-int8-summary-hierarchy-result-v1", self.request_binding,
+            &[run.discovery.request_binding, run.discovery.result_binding], run, self.max_result_bytes, control)? {
             return Err(invalid());
         }
+        self.discovery.discovery.verify_completed_with_control(&run.discovery, control)?;
         receipt::verify(self, run, control)
     }
 }
@@ -94,6 +96,7 @@ impl SourceTaskPlanner {
         context: &PlanContext<'_>, planning: SourcePlanningLimits, mapping: Int8SourceMapLimits, control: &mut C)
         -> Result<PreparedInt8SummaryHierarchy<'s>, Int8SourceMapError> {
         checkpoint(control)?;
+        self.map_document_encoding_workspace_bytes().map_err(Int8SourceError::from)?;
         hierarchy.validate()?;
         request.validate(planning)?;
         let capacity = self.int8_map_capacity_with_control(&SourceMapTask::Summarize(request.synthesis_options),
@@ -135,17 +138,16 @@ impl PreparedInt8SummaryHierarchy<'_> {
         -> Result<Int8SummaryHierarchyRun, Int8SourceMapError> {
         checkpoint(control)?;
         let Self { base, expected, mapping } = self;
-        if planner.tokenizer_digest() != base.identity.tokenizer_digest || *planner.template_digest() != base.identity.template_digest {
-            return Err(Int8SourceMapError::Admission);
-        }
+        base.check_planner(planner)?;
         base.map.preflight(admitted, engine)?;
-        let PreparedInt8SummarySynthesis { source, map, identity, budget, planning, request, .. } = base;
+        let PreparedInt8SummarySynthesis { source, map, operation, identity, budget, planning, request, .. } = base;
         let discovery = map.execute_with_control(admitted, engine, vocabulary, control)?;
+        expected.discovery.discovery.verify_completed_with_control(&discovery, control)?;
         let mut remaining = request.limits.verification;
         let collection = evidence::collect(source, discovery.mapped.root().value(), request.map_options,
             request.limits, &mut remaining, control)?;
         let initial = EvidenceSize::of(&collection);
-        let mut driver = execution::Native { planner, identity: &identity, budget, planning,
+        let mut driver = execution::Native { planner: &operation, identity: &identity, budget, planning,
             options: request.synthesis_options, mapping, engine, vocabulary };
         let reduced = execution::reduce(source, collection, request, expected, mapping.reduction.max_result_bytes as u64,
             &mut remaining, &mut driver, control)?;
@@ -174,7 +176,8 @@ fn finish<C: DecodeStepControl>(discovery: Int8SourceMapRun, initial: EvidenceSi
         tokenizer_work: reduced.tokenizer, levels: reduced.levels, passes: reduced.passes, discovery,
         request_binding: expected.request_binding, result_binding: [0; 32] };
     run.result_binding = binding::composed_result(b"fnlp-int8-summary-hierarchy-result-v1",
-        run.request_binding, &[], &run, expected.max_result_bytes, control)?;
+        run.request_binding, &[run.discovery.request_binding, run.discovery.result_binding],
+        &run, expected.max_result_bytes, control)?;
     expected.verify_completed_with_control(&run, control)?;
     Ok(run)
 }

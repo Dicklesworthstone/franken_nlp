@@ -14,11 +14,7 @@ pub(super) trait Driver {
 }
 impl Driver for Native<'_, '_> {
     fn count<C: DecodeStepControl>(&mut self, text: &str, control: &mut C) -> Result<usize, Int8SourceMapError> {
-        checkpoint(control)?;
-        let count = self.planner.source_encoder().encode(text, self.planning.max_input_bytes, self.planning.max_input_bytes)
-            .map_err(|_| Int8SourceMapError::WorkLimit)?.total_token_count();
-        checkpoint(control)?;
-        Ok(count)
+        count_source(self.planner, self.planning, text, control)
     }
     fn run<C: DecodeStepControl>(&mut self, text: &str, control: &mut C)
         -> Result<(Int8SourceTaskRun, Int8Work), Int8SourceMapError> {
@@ -37,6 +33,17 @@ impl Driver for Native<'_, '_> {
         extract_int8::check_size(&run, plan.max_result_bytes()).map_err(Int8SourceError::from)?;
         Ok((run, plan.planned_work()))
     }
+}
+/// Probe the actual joined evidence bytes on the retained document operation.
+/// Rejected groups and cancellation debit the same bounded ledger as real plans.
+pub(super) fn count_source<C: DecodeStepControl>(planner: &SourceTaskPlanner, planning: SourcePlanningLimits,
+    text: &str, control: &mut C) -> Result<usize, Int8SourceMapError> {
+    checkpoint(control)?;
+    let count = planner.source_encoder().encode_with_control(text,
+        planning.max_input_bytes, planning.max_input_bytes, &mut || control.prefill_checkpoint(0))
+        .map_err(Int8SourceError::from)?.total_token_count();
+    checkpoint(control)?;
+    Ok(count)
 }
 struct Group { segments: Range<usize>, bytes: usize, tokens: usize }
 fn groups<C: DecodeStepControl, D: Driver>(frontier: &evidence::Collection, cap: usize,

@@ -2,6 +2,7 @@
 //! No executed-test, neural quality or full-context equivalence evidence.
 use super::*;
 use crate::{native_engine::strict_int8::STRICT_INT8_EXECUTION, tokenizer::pinned_controls};
+use super::super::tests::{compact_policy, encoding_allowance, encoding_used, quoted_run, QuotedSummary, StopInsideEncoding};
 struct Control { calls: usize, stop: usize }
 impl DecodeStepControl for Control {
     fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
@@ -299,4 +300,113 @@ fn hierarchy_private_hashes_do_not_change_public_output_or_its_exact_byte_budget
     expected.verify_completed(&run).unwrap();
     expected.max_result_bytes -= 1;
     assert!(expected.verify_completed(&run).is_err());
+}
+
+const FIRST_QUOTE: &str = "The quick brown fox jumps over the lazy dog.";
+const SECOND_QUOTE: &str = "A blue bird sings softly near the window.";
+const COMPACT_DOCUMENT: &str = "The quick brown fox jumps over the lazy dog. -- A blue bird sings softly near the window.";
+
+struct CompactScript<'a> {
+    planner: &'a SourceTaskPlanner, identity: &'a ExecutionIdentity, inputs: Vec<String>,
+}
+impl execution::Driver for CompactScript<'_> {
+    fn count<C: DecodeStepControl>(&mut self, text: &str, control: &mut C) -> Result<usize, Int8SourceMapError> {
+        execution::count_source(self.planner, SourcePlanningLimits::default(), text, control)
+    }
+    fn run<C: DecodeStepControl>(&mut self, text: &str, control: &mut C)
+        -> Result<(Int8SourceTaskRun, Int8Work), Int8SourceMapError> {
+        let request = SourceTaskRequest::Summarize { document: text.to_owned(), options: request().synthesis_options, budget: budget() };
+        let context = PlanContext::new(self.identity, budget()).unwrap();
+        let plan = self.planner.plan_int8_with_control(&request, &context, SourcePlanningLimits::default(), control)?;
+        self.inputs.push(text.to_owned());
+        let quote = text.chars().next().unwrap().to_string();
+        Ok((quoted_run(&plan, text, &[&quote]), plan.planned_work()))
+    }
+}
+fn compact_planner(work: crate::tokenizer::untrusted::SafeBpeWorkLimits) -> SourceTaskPlanner {
+    planner().with_map_document_encoding(compact_policy(), work).unwrap()
+}
+fn compact_completion(p: &SourceTaskPlanner)
+    -> (Int8SummaryHierarchyPreflight, Result<Int8SummaryHierarchyRun, Int8SourceMapError>, Vec<String>, usize) {
+    // Measure the real compact joined texts on an independent fixture counter,
+    // then narrow the private scheduler capacity to force two reduction levels.
+    // Actual discovery, fit probes and node plans all use the original operation.
+    let counter = compact_planner(encoding_allowance());
+    let count = |text: &str| execution::count_source(&counter, SourcePlanningLimits::default(), text, &mut go()).unwrap();
+    let cap = count(FIRST_QUOTE).max(count(SECOND_QUOTE));
+    assert!(count(&format!("{FIRST_QUOTE}\n\n{SECOND_QUOTE}")) > cap);
+    let mut mapping = mapping(); mapping.chunks.max_chunk_bytes = 4096; mapping.chunks.max_chunk_tokens = 4096;
+    let prepared = prepare(p, COMPACT_DOCUMENT, mapping); let mut expected = prepared.expected;
+    assert_eq!(expected.chunk_count(), 1);
+    let mut smaller = budget(); smaller.max_input_tokens = (expected.capacity.scaffold_tokens() + cap).try_into().unwrap();
+    let id = identity(p);
+    expected.capacity = p.int8_map_capacity_with_control(&SourceMapTask::Summarize(request().synthesis_options), smaller,
+        &PlanContext::new(&id, smaller).unwrap(), SourcePlanningLimits::default(), &mut go()).unwrap();
+    assert_eq!(expected.capacity.max_source_tokens(), cap);
+    let admitted: Vec<_> = prepared.execution_identities().cloned().collect();
+    let (map, tail) = prepared.base.into_parts();
+    let discovery = map.execute_with_driver(&admitted, QuotedSummary {
+        document: COMPACT_DOCUMENT, quotes: &[FIRST_QUOTE, SECOND_QUOTE] }).unwrap();
+    expected.discovery.discovery.verify_completed(&discovery).unwrap();
+    let mut remaining = request().limits.verification;
+    let collection = evidence::collect(COMPACT_DOCUMENT, discovery.mapped.root().value(), request().map_options,
+        request().limits, &mut remaining, &mut go()).unwrap();
+    let initial = EvidenceSize::of(&collection); let before = encoding_used(p).input_bytes();
+    let mut driver = CompactScript { planner: &tail.operation, identity: &tail.identity, inputs: Vec::new() };
+    let result = execution::reduce(COMPACT_DOCUMENT, collection, request(), expected, mapping.reduction.max_result_bytes as u64,
+        &mut remaining, &mut driver, &mut go())
+        .and_then(|reduced| finish(discovery, initial, reduced, remaining, expected, &mut go()));
+    (expected, result, driver.inputs, before)
+}
+#[test]
+fn compact_hierarchy_debits_rejected_joins_and_all_nodes_on_the_original_operation() {
+    let p = compact_planner(encoding_allowance()); let (expected, result, inputs, before) = compact_completion(&p);
+    let run = result.unwrap(); expected.verify_completed(&run).unwrap();
+    assert_eq!(inputs, [FIRST_QUOTE, SECOND_QUOTE, "T\n\nA"]);
+    assert_eq!(run.levels.len(), 2); assert_eq!(run.final_pass, Some(2));
+    assert_eq!(run.status, SummarySynthesisStatus::Synthesized);
+    assert_eq!(run.passes[2].bullets[0].citations[0].quote, "T");
+    assert_eq!(run.passes[2].bullets[0].citations[0].spans[0], VerifiedSourceSpan {
+        byte_start: 0, byte_end: 1, scalar_start: 0, scalar_end: 1 });
+    assert_eq!(run.tokenizer_work.calls, 5);
+    assert_eq!(run.tokenizer_work.bytes,
+        (FIRST_QUOTE.len() * 2 + SECOND_QUOTE.len() * 2 + 2 + 1 + "T\n\nA".len()) as u64);
+    let native_bytes: usize = run.passes.iter().map(|pass| pass.input_bytes).sum();
+    assert_eq!(before, COMPACT_DOCUMENT.len() * 2);
+    assert_eq!(encoding_used(&p).input_bytes(), before + run.tokenizer_work.bytes as usize + native_bytes);
+    assert!(run.passes[..2].iter().all(|pass| pass.input_tokens < pass.input_bytes));
+    for pass in &run.passes {
+        assert!(pass.input_tokens <= pass.input_bytes);
+        receipt::verify_pass(&expected, pass, &mut go()).unwrap();
+    }
+}
+#[test]
+fn all_compact_work_limits_remain_spent_across_hierarchy_levels() {
+    let baseline = compact_planner(encoding_allowance()); let (_, result, _, _) = compact_completion(&baseline);
+    result.unwrap(); let used = encoding_used(&baseline);
+    for axis in 0..4 {
+        let mut cap = encoding_allowance();
+        match axis { 0 => cap.max_input_bytes = used.input_bytes() as u64 - 1,
+            1 => cap.max_output_tokens = used.output_tokens() as u64 - 1,
+            2 => cap.max_pair_checks = used.pair_checks() - 1, _ => cap.max_pair_bytes = used.pair_bytes() - 1 }
+        let p = compact_planner(cap); let (_, result, calls, before) = compact_completion(&p);
+        assert!(result.is_err(), "{axis}"); assert!(calls.len() < 3, "{axis}");
+        assert!(encoding_used(&p).input_bytes() >= before);
+    }
+}
+#[test]
+fn compact_hierarchy_fit_probes_preserve_every_cancellation_kind_and_never_refund() {
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let p = compact_planner(encoding_allowance()); let retained = p.retain_map_document_operation().unwrap();
+        let mut control = StopInsideEncoding { planner: &p, cause, busy_polls: 0 };
+        let error = execution::count_source(&retained, SourcePlanningLimits::default(), COMPACT_DOCUMENT, &mut control).unwrap_err();
+        assert_eq!(error.cancellation(), Some(cause)); assert_eq!(control.busy_polls, 8);
+        assert_eq!(encoding_used(&p).input_bytes(), COMPACT_DOCUMENT.len());
+        let before = encoding_used(&p);
+        execution::count_source(&retained, SourcePlanningLimits::default(), COMPACT_DOCUMENT, &mut go()).unwrap();
+        assert_eq!(encoding_used(&p).input_bytes(), before.input_bytes() + COMPACT_DOCUMENT.len());
+        assert!(encoding_used(&p).pair_checks() >= before.pair_checks());
+    }
 }

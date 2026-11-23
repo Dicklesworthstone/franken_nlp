@@ -104,10 +104,39 @@ as well. Complete-document extraction corpora and retained extraction jobs
 retain their separate byte-only admission. Chunk JSON remains independent;
 compact encoding does not authorize a global object merge.
 
-Neural answer/summary synthesis and long-redaction compositions remain explicitly
-byte-only on these INT8 library paths. This change does not extend their
-multi-stage accounting. Compact tokens may change native output; implementation
-and regression definitions establish no model-quality or parity result.
+Neural answer and summary synthesis accept the same complete-operation compact
+policy. Prepared synthesis retains the original encoder operation across the
+discovery phase and final verified-evidence plan. Summary hierarchy uses that
+operation for every joined-evidence fit probe, including rejected joins, and
+every node plan. Passing a fresh planner with an equivalent policy to execution
+cannot replenish the retained ledger. All dynamic plans recheck their actual
+token fit and identity; exhaustion refuses the complete operation without a
+byte fallback. Empty evidence skips synthesis encoding and native execution.
+
+The hosted synthesis and hierarchy entrypoints reserve encoder workspace beside
+the retained plans and source/evidence buffers. Their private completion
+commitments include the authenticated discovery result. Original source bytes
+and coordinates remain citation authority through all phases. Long-redaction
+compositions keep their separate byte-only admission. Compact tokens may change
+native output; implementation and regression definitions establish no
+model-quality, parity or measured-speed result.
+
+## Exact completion association
+
+`preflight_int8_map_with_control` returns an `Int8SourceMapPreflight` that binds
+the exact source, task options, model identity, encoding policy, partition and
+complete planning/work allowances. `PreparedInt8SourceMap::preflight_metadata`
+returns the same contract after full planning. Sizing uses the actual shared
+encoder without retaining native grammars, and its work remains charged.
+
+`verify_completed_with_control` checks the full completed result against that
+preflight, including native payloads and bookkeeping. Equal chunk geometry or
+identical visible output cannot substitute a result from another source.
+Exact summary and keyphrase reducers additionally bind their own aggregation,
+verification and output limits. All three result types retain private request
+and result commitments; these fields are omitted from JSON and diagnostics.
+Final verification enforces the complete serialized byte ceiling and preserves
+typed cancellation throughout the scan.
 
 ## Process-hosted entrypoint
 

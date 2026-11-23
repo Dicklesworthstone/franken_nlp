@@ -136,12 +136,34 @@ operation limits and cumulative work used. Default byte responses retain their
 existing shape. Encoder workspace is admitted before private input/model IO and
 charged beside the full retained-plan preparation reserve.
 
-`--synthesize-answer` and `--synthesize-summary` still refuse compact input during
-option validation. Complete-document extraction corpora and retained extraction
-jobs retain their separate byte-mode contracts. Compact passage QA retains
-independent passage answers and every
-verified source occurrence; it adds no answer vote or global synthesis pass.
-The default byte routes retain their existing behavior.
+Compact input also supports `--synthesize-answer` and `--synthesize-summary`,
+including `--hierarchical-summary`. For example:
+
+```sh
+fnlp candidate map report.txt --task summarize \
+  --synthesize-summary --hierarchical-summary --summary-max-passes 8 \
+  --model ./model.fnlpq --memory-mib 8192 \
+  --input-encoding safe-bpe-v1 --max-chunk-bytes 4096
+```
+
+The final neural pass consumes only verified verbatim evidence collected from
+discovery. Hierarchical summary reduction charges every actual joined-evidence
+fit probe, including rejected groups, and every compiled node against the same
+original tokenizer ledger. Neither a new pass nor an equivalent fresh planner
+renews that allowance. An empty evidence set performs no synthesis encoding or
+native call. Cancellation retains its original kind across dynamic encoding.
+
+Summary synthesis reserves `--max-input-bytes` per evidence prompt, independently
+of `--max-chunk-bytes` for original discovery chunks. Actual encoded counts
+decide native context fit. Every final citation is lifted back to the original
+document; generated summaries and answers never become source facts. The
+`input_encoding` report includes all phases. Synthesis from collected quotes
+does not establish full-document equivalence.
+
+Complete-document extraction corpora and retained extraction jobs keep their
+separate byte-mode contracts. Passage QA without `--synthesize-answer` retains
+independent passage answers and every verified source occurrence. The default
+byte routes retain their existing behavior.
 
 ## Limits and ownership
 

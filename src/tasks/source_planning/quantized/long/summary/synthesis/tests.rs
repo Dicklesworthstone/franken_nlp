@@ -233,3 +233,162 @@ fn summary_completion_hashes_are_private_and_public_output_has_an_exact_byte_cei
     expected.max_result_bytes -= 1;
     assert!(expected.verify_completed(&run).is_err());
 }
+
+const COMPACT_SOURCE: &str = "The quick brown fox jumps over the lazy dog. 上海 <think> <|im_start|> ▁\r\n";
+pub(super) fn compact_policy() -> crate::tokenizer::untrusted::UntrustedEncoding {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 4096,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 })
+}
+pub(super) fn encoding_allowance() -> crate::tokenizer::untrusted::SafeBpeWorkLimits {
+    crate::tokenizer::untrusted::SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 1 << 26, max_pair_bytes: 1 << 30 }
+}
+fn compact(work: crate::tokenizer::untrusted::SafeBpeWorkLimits) -> SourceTaskPlanner {
+    planner().with_map_document_encoding(compact_policy(), work).unwrap()
+}
+fn compact_mapping() -> Int8SourceMapLimits {
+    let mut limits = mapping();
+    limits.chunks.max_chunk_bytes = 4096; limits.chunks.max_chunk_tokens = 4096;
+    limits
+}
+pub(super) fn encoding_used(p: &SourceTaskPlanner) -> crate::tokenizer::untrusted::SafeBpeWork {
+    p.map_document_encoding_work().unwrap().unwrap()
+}
+pub(super) fn quoted_run(plan: &PreparedInt8SourceTask, document: &str, quotes: &[&str]) -> Int8SourceTaskRun {
+    let work = constrained_int8::planned_work(plan.prompt_tokens(), 2).unwrap();
+    let bullets = quotes.iter().map(|quote| {
+        let spans = scan_occurrences(document, quote, &mut GroundingBudget::default()).unwrap();
+        CitedBullet { text: "untrusted generated assertion".to_owned(), citations: vec![SourceCitation {
+            quote: (*quote).to_owned(),
+            occurrence: if spans.len() == 1 { SourceOccurrence::Anchored } else { SourceOccurrence::Ambiguous }, spans }] }
+    }).collect();
+    let raw = SummaryResult { schema_version: 1, task_spec_version: SUMMARIZE_TASK_VERSION.to_owned(),
+        numerics_profile: STRICT_INT8_PROFILE.to_owned(), citation_guarantee: CitationGuarantee::StructuralSourceMembership,
+        semantic_support: SummarySemanticSupport::NotAssessed, score_space: ScoreSpace::NotComputed,
+        bullets, generated_token_ids: vec![1, 0], forward_positions: work.forward_positions,
+        projected_logits: work.projected_logits, mask_node_visit_charge: 20 };
+    Int8SourceTaskRun { schema_version: 1, execution: INT8_SOURCE_EXECUTION.to_owned(),
+        result: SourceTaskResult::Summarize(raw), model_work: work }
+}
+pub(super) struct QuotedSummary<'a> { pub document: &'a str, pub quotes: &'a [&'a str] }
+impl SourceDriver for QuotedSummary<'_> {
+    fn checkpoint(&mut self) -> Result<(), Int8SourceError> { Ok(()) }
+    fn run(&mut self, plan: &PreparedInt8SourceTask, _: &ExecutionIdentity) -> Result<Int8SourceTaskRun, Int8SourceError> {
+        Ok(quoted_run(plan, self.document, self.quotes))
+    }
+}
+fn quoted_discovery(p: &SourceTaskPlanner, empty: bool) -> (SummarySynthesisTail<'static>, Int8SourceMapRun) {
+    let prepared = prepare(p, COMPACT_SOURCE, request(), compact_mapping(), &mut continuing()).unwrap();
+    assert_eq!(prepared.expected.chunk_count(), 1);
+    let admitted: Vec<_> = prepared.execution_identities().cloned().collect();
+    let (map, tail) = prepared.into_parts();
+    let discovery = map.execute_with_driver(&admitted, QuotedSummary { document: COMPACT_SOURCE,
+        quotes: if empty { &[] } else { &[COMPACT_SOURCE] } }).unwrap();
+    (tail, discovery)
+}
+fn quoted_completion(p: &SourceTaskPlanner) -> (Int8SummarySynthesisPreflight, Int8SummarySynthesisRun) {
+    let (tail, discovery) = quoted_discovery(p, false); let expected = tail.expected;
+    let run = tail.execute(discovery, |plan, _| Ok(quoted_run(plan, COMPACT_SOURCE, &[COMPACT_SOURCE])),
+        &mut continuing()).unwrap();
+    (expected, run)
+}
+#[test]
+fn compact_summary_reuses_discovery_encoding_budget_and_preserves_original_evidence() {
+    let (byte_expected, byte) = quoted_completion(&planner());
+    let p = compact(encoding_allowance()); let (expected, run) = quoted_completion(&p);
+    expected.verify_completed(&run).unwrap(); byte_expected.verify_completed(&byte).unwrap();
+    assert_eq!(run.bullets, byte.bullets);
+    assert_eq!(run.evidence_segments, 1); assert_eq!(run.evidence_bytes, COMPACT_SOURCE.len());
+    assert_eq!(run.bullets[0].citations[0].quote, COMPACT_SOURCE);
+    assert_eq!(run.bullets[0].citations[0].spans[0], VerifiedSourceSpan {
+        byte_start: 0, byte_end: COMPACT_SOURCE.len(), scalar_start: 0, scalar_end: COMPACT_SOURCE.chars().count() });
+    assert!(run.discovery.model_work.forward_positions < byte.discovery.model_work.forward_positions);
+    assert!(run.synthesis_model_work.forward_positions < byte.synthesis_model_work.forward_positions);
+    // The source fit probe, discovery plan and derived evidence plan all spend
+    // the same operation; no generated assertion is ever encoded as evidence.
+    let used = encoding_used(&p);
+    assert_eq!(used.input_bytes(), 3 * COMPACT_SOURCE.len());
+    assert!(used.output_tokens() < used.input_bytes());
+    assert!(used.pair_checks() > 0); assert!(used.pair_bytes() > 0);
+    assert!(byte_expected.verify_completed(&run).is_err());
+    assert!(expected.verify_completed(&byte).is_err());
+    let byte_json = serde_json::to_value(&byte).unwrap(); let compact_json = serde_json::to_value(&run).unwrap();
+    assert!(byte_json.as_object().unwrap().keys().eq(compact_json.as_object().unwrap().keys()));
+
+    let mut cap = encoding_allowance(); cap.max_input_bytes = (2 * COMPACT_SOURCE.len()) as u64;
+    let p = compact(cap); let (tail, discovery) = quoted_discovery(&p, true);
+    let before = encoding_used(&p);
+    let run = tail.execute(discovery, |_, _| panic!("empty evidence must not run synthesis"), &mut continuing()).unwrap();
+    assert_eq!(run.status, SummarySynthesisStatus::NoEvidenceCollected);
+    assert_eq!(encoding_used(&p), before);
+}
+#[test]
+fn every_compact_summary_axis_is_nonrenewable_through_dynamic_synthesis() {
+    let baseline = compact(encoding_allowance()); quoted_completion(&baseline);
+    let used = encoding_used(&baseline);
+    for axis in 0..4 {
+        let mut cap = encoding_allowance();
+        match axis { 0 => cap.max_input_bytes = used.input_bytes() as u64 - 1,
+            1 => cap.max_output_tokens = used.output_tokens() as u64 - 1,
+            2 => cap.max_pair_checks = used.pair_checks() - 1, _ => cap.max_pair_bytes = used.pair_bytes() - 1 }
+        let p = compact(cap); let fresh = compact(cap);
+        let prepared = prepare(&p, COMPACT_SOURCE, request(), compact_mapping(), &mut continuing()).unwrap();
+        // An execution-time planner with identical policy has no authority to
+        // replace the original operation's already-spent allowance.
+        prepared.check_planner(&fresh).unwrap();
+        let admitted: Vec<_> = prepared.execution_identities().cloned().collect();
+        let (map, tail) = prepared.into_parts();
+        let discovery = map.execute_with_driver(&admitted, QuotedSummary {
+            document: COMPACT_SOURCE, quotes: &[COMPACT_SOURCE] }).unwrap();
+        let before = encoding_used(&p); let mut native_calls = 0;
+        assert!(tail.execute(discovery, |_, _| { native_calls += 1; Err(invalid()) }, &mut continuing()).is_err(), "{axis}");
+        assert_eq!(native_calls, 0); assert_eq!(encoding_used(&fresh).input_bytes(), 0);
+        let after = encoding_used(&p);
+        assert!(after.input_bytes() >= before.input_bytes()); assert!(after.output_tokens() >= before.output_tokens());
+        assert!(after.pair_checks() >= before.pair_checks()); assert!(after.pair_bytes() >= before.pair_bytes());
+    }
+}
+#[test]
+fn compact_summary_binds_each_limit_and_rejects_a_per_call_only_policy() {
+    use crate::tokenizer::untrusted::UntrustedEncoding;
+    let p = planner().with_document_encoding(compact_policy()).unwrap();
+    assert!(prepare(&p, COMPACT_SOURCE, request(), compact_mapping(), &mut continuing()).is_err());
+    let (expected, run) = quoted_completion(&compact(encoding_allowance()));
+    for axis in 0..8 {
+        let UntrustedEncoding::SafeBpeV1(mut call) = compact_policy() else { unreachable!() };
+        let mut whole = encoding_allowance();
+        match axis { 0 => call.max_input_bytes += 1, 1 => call.max_output_tokens += 1,
+            2 => call.max_pair_checks += 1, 3 => call.max_pair_bytes += 1,
+            4 => whole.max_input_bytes += 1, 5 => whole.max_output_tokens += 1,
+            6 => whole.max_pair_checks += 1, _ => whole.max_pair_bytes += 1 }
+        let p = planner().with_map_document_encoding(UntrustedEncoding::SafeBpeV1(call), whole).unwrap();
+        let other = prepare(&p, COMPACT_SOURCE, request(), compact_mapping(), &mut continuing()).unwrap().preflight_metadata();
+        assert_eq!(other.reserved_model_work().unwrap(), expected.reserved_model_work().unwrap());
+        assert_ne!(other, expected); assert!(other.verify_completed(&run).is_err(), "{axis}");
+    }
+}
+pub(super) struct StopInsideEncoding<'a> {
+    pub planner: &'a SourceTaskPlanner, pub cause: DecodeCancellationKind, pub busy_polls: usize,
+}
+impl DecodeStepControl for StopInsideEncoding<'_> {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+        if self.planner.map_document_encoding_work().is_err() {
+            self.busy_polls += 1;
+            if self.busy_polls == 8 { return Some(self.cause); }
+        }
+        None
+    }
+}
+#[test]
+fn dynamic_summary_encoding_retains_all_terminal_causes_and_spent_work() {
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let p = compact(encoding_allowance()); let (tail, discovery) = quoted_discovery(&p, false);
+        let before = encoding_used(&p); let mut control = StopInsideEncoding { planner: &p, cause, busy_polls: 0 };
+        let error = tail.execute(discovery, |_, _| panic!("cancelled encoding must not run inference"), &mut control).err().unwrap();
+        assert_eq!(error.cancellation(), Some(cause)); assert_eq!(control.busy_polls, 8);
+        assert!(encoding_used(&p).input_bytes() > before.input_bytes());
+    }
+}

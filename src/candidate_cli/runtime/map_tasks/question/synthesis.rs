@@ -14,6 +14,11 @@ pub(super) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
     let budget = command.host.task_budget(limits);
     let facts = session.facts(&args)?;
     let (planner, vocabulary) = planner()?;
+    let planner = match command.encoding.limits(&command)? {
+        Some(encoding) => planner.with_map_document_encoding(encoding.policy(), encoding.complete)
+            .map_err(|_| CandidateError::Planning)?,
+        None => planner,
+    };
     let identity = source_identity(&facts, &planner, BuiltInTask::Answer)?;
     let context = PlanContext::new(&identity, budget).map_err(|_| CandidateError::Planning)?;
     // Fund a maximum-context final pass BEFORE weights. All actual map prompts
@@ -28,13 +33,15 @@ pub(super) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
     let config = SourceMapConfig { identity, task, budget, planning: command.host.planning(), mapping,
         native: session.native(&args)?, preparation_reserve_bytes: limits.preparation_bytes,
         reduction_reserve_bytes: command.reduction_reserve_mib.checked_mul(MIB).ok_or(CandidateError::Arguments)? };
-    let result = session.engine.synthesize_int8_document_answer(&model, text, Arc::new(planner), Arc::new(vocabulary),
+    let planner = Arc::new(planner);
+    let result = session.engine.synthesize_int8_document_answer(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
         config, cancellation).map_err(host_error)?;
     session.remaining()?;
     expected.verify_completed_with_control(result.result(), &mut session.control())
         .map_err(|error| error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution))?;
     // Retain output authority through final serialization, write AND flush.
-    deliver(&session, &facts, &result, command.max_map_result_bytes + 4096, output)
+    deliver_encoded(&session, &facts, &result, encoding::report(&planner)?.as_ref(),
+        command.max_map_result_bytes + 4096, output)
 }
 
 #[cfg(test)]
@@ -50,6 +57,10 @@ mod tests {
     }
     fn assets(cmd: &MapCommand) -> (SourceTaskPlanner, ExecutionIdentity, TaskBudget, SourceQuestionSynthesis, Int8SourceMapLimits) {
         let (_, limits) = cmd.validate().unwrap(); let (p, _) = planner().unwrap();
+        let p = match cmd.encoding.limits(cmd).unwrap() {
+            Some(encoding) => p.with_map_document_encoding(encoding.policy(), encoding.complete).unwrap(),
+            None => p,
+        };
         let id = source_identity(&facts(), &p, BuiltInTask::Answer).unwrap();
         let b = cmd.host.task_budget(limits);
         let q = cmd.question.task("Who is named?".to_owned(), None).unwrap();
@@ -123,5 +134,24 @@ mod tests {
         id.task_spec = "ner-v1".to_owned();
         assert!(p.preflight_int8_question_synthesis_with_control("Alice", &q, b, &PlanContext::new(&id, b).unwrap(),
             cmd.host.planning(), mapping, &mut Continue).is_err());
+    }
+    #[test]
+    fn compact_cli_preflight_and_hosted_planning_keep_the_original_operation_usage() {
+        let cmd = command("answer", &["--question", "q", "--synthesize-answer",
+            "--input-encoding", "safe-bpe-v1", "--max-chunk-bytes", "512"]);
+        let (p, id, b, q, mapping) = assets(&cmd); let ctx = PlanContext::new(&id, b).unwrap();
+        let source = "The original document names Alice, café, 上海 and <tool_call>. ".repeat(8);
+        let expected = p.preflight_int8_question_synthesis_with_control(&source, &q, b, &ctx,
+            cmd.host.planning(), mapping, &mut Continue).unwrap();
+        let before = p.map_document_encoding_work().unwrap().unwrap();
+        let prepared = p.plan_int8_question_synthesis_with_control(&source, &q, b, &ctx,
+            cmd.host.planning(), mapping, &mut Continue).unwrap();
+        assert_eq!(expected, prepared.preflight_metadata());
+        assert_eq!(expected.discovery().source_span().byte_end, source.len());
+        let after = p.map_document_encoding_work().unwrap().unwrap();
+        assert!(after.input_bytes() > before.input_bytes());
+        let report = serde_json::to_value(encoding::report(&p).unwrap().unwrap()).unwrap();
+        assert_eq!(report["work_used"], serde_json::to_value(after).unwrap());
+        assert_eq!(report["complete_operation_limits"], serde_json::to_value(cmd.encoding.limits(&cmd).unwrap().unwrap().complete).unwrap());
     }
 }

@@ -6,7 +6,7 @@ use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEnc
 pub(in crate::candidate_cli) struct EncodingArgs {
     #[arg(skip)]
     pub input: input_encoding::InputEncodingArgs,
-    /// Across every accepted/discarded probe and actual chunk plan, including hosted replanning.
+    /// Across every probe, map plan and synthesis pass, including hosted replanning.
     #[arg(long)]
     max_total_tokenizer_input_bytes: Option<u64>,
     /// Cumulative encoded tokens, separate from the native context per chunk.
@@ -40,16 +40,13 @@ impl EncodingArgs {
                 self.max_total_tokenizer_pair_checks, self.max_total_tokenizer_pair_bytes]
                 .iter().all(Option::is_none) { Ok(None) } else { Err(CandidateError::Arguments) };
         }
-        // Generated evidence has another planning frontier and must not
-        // silently inherit the plain-map operation's encoding admission.
-        if !matches!(command.task.as_str(), "ner" | "keyphrases" | "summarize" | "answer" | "extract")
-            || command.summary.synthesis.synthesize_summary
-            || command.question.synthesis.synthesize_answer {
+        if !matches!(command.task.as_str(), "ner" | "keyphrases" | "summarize" | "answer" | "extract") {
             return Err(CandidateError::Arguments);
         }
-        let bytes = if command.task == "answer" {
-            // Question, passage manifest and source share each prompt's byte
-            // ceiling. Native context fit still uses their actual token count.
+        let bytes = if command.task == "answer" || command.summary.synthesis.synthesize_summary {
+            // Question/manifests and collected summary evidence can exceed an
+            // original map chunk's byte ceiling. Price their full per-prompt
+            // byte ceiling before IO; actual context fit remains token-based.
             command.host.max_input_bytes
         } else if command.task == "extract" {
             // Each final prompt encodes the complete declarative schema plus
@@ -81,7 +78,7 @@ pub(super) fn definition(command: clap::Command) -> clap::Command {
     input_encoding::definition(command)
         .mut_arg("max_tokenizer_pair_checks", |arg| arg.help("BPE pair checks per encoding; --max-total-tokenizer-pair-checks also bounds the complete invocation"))
         .mut_arg("max_tokenizer_pair_bytes", |arg| arg.help("BPE examined pair bytes per encoding; --max-total-tokenizer-pair-bytes also bounds the complete invocation"))
-        .after_long_help("--input-encoding safe-bpe-v1 supports complete NER, keyphrase, cited-summary, passage-QA and exact-schema extraction maps, including exact --reduce-keyphrases and --reduce-summary. It preserves original source bytes and coordinates and excludes template-control tokens. All accepted/rejected sizing probes, repeated schema/question/manifest encoding, CLI preflight and actual hosted chunk plans spend ONE nonrenewable tokenizer ledger. The four --max-total-tokenizer-* ceilings bound cumulative work; bytes and tokens default to eight times --max-input-bytes, pair checks to 268435456, and pair bytes to 4294967296. Per-call workspace is admitted before private IO and remains charged beside retained plans. Set --max-chunk-bytes to bound candidate bytes independently of native token capacity; omitted compact mode uses --context-tokens bytes. QA prices the question and manifest within --max-input-bytes per prompt; extraction additionally reserves the complete 64-KiB schema ceiling, up to the encoder's 1-MiB aggregate maximum. Tokenizer exhaustion fails the whole document without retry, byte fallback or partial success. Every ceiling binds execution identity; compact results report actual cumulative work. Neural answer/summary synthesis does not accept compact input on this INT8 map route. Changed prompt tokens imply no identical-output, tokenizer-parity, quality or speed claim.")
+        .after_long_help("--input-encoding safe-bpe-v1 supports complete NER, keyphrase, cited-summary, passage-QA and exact-schema extraction maps, exact --reduce-keyphrases and --reduce-summary, and explicit --synthesize-summary or --synthesize-answer. Summary synthesis also supports --hierarchical-summary. It preserves original source bytes and coordinates and excludes template-control tokens. All accepted/rejected sizing probes, repeated schema/question/manifest encoding, CLI preflight, hosted chunk plans, collected-evidence synthesis and every summary hierarchy pass spend ONE nonrenewable tokenizer ledger. The four --max-total-tokenizer-* ceilings bound cumulative work; bytes and tokens default to eight times --max-input-bytes, pair checks to 268435456, and pair bytes to 4294967296. Per-call workspace is admitted before private IO and remains charged beside retained plans. Set --max-chunk-bytes to bound original map candidates independently of native token capacity; omitted compact mode uses --context-tokens bytes. QA and summary synthesis reserve --max-input-bytes per prompt so evidence can exceed an original chunk's byte ceiling; extraction additionally reserves the complete 64-KiB schema ceiling, up to the encoder's 1-MiB aggregate maximum. Tokenizer exhaustion fails the whole document without retry, byte fallback or partial success. Every ceiling binds execution identity; compact results report actual cumulative work. Changed prompt tokens imply no identical-output, tokenizer-parity, quality or speed claim.")
 }
 
 #[cfg(feature = "asupersync-runtime")]
