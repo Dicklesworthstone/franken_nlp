@@ -124,8 +124,9 @@ impl ExtractionArgs {
     pub(super) fn validate_one_off_with_prefill(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
         self.validate_extraction_storage(args, false)
     }
-    /// Independent-record streams and retained single-context jobs bind both
-    /// schedules and own the expanded worker buffers through physical join.
+    /// One-shot extraction, independent-record streams and retained
+    /// single-context jobs bind both schedules and own the expanded worker
+    /// buffers through physical join.
     /// Other composed routes retain their separate scheduling admission.
     pub(super) fn validate_population_with_threaded_prefill(&self, args: &Int4Args)
         -> Result<Int4Limits, CandidateError> {

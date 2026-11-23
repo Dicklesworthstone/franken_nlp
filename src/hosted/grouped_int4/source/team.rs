@@ -12,6 +12,29 @@ impl NlpEngine {
         mask_limits: MaskWorkLimits, max_mask_node_visits: u64, kernel: PackedInt4Kernel,
         compute_threads: usize, cancellation: CancellationToken)
         -> Result<HostedInt4TeamResult<Int4SourceTaskRun>, HostedError> {
+        self.execute_int4_source_task_team(model, prepared, vocabulary, native, mask_limits,
+            max_mask_node_visits, kernel, compute_threads, None, cancellation)
+    }
+
+    /// Share one admitted row team across bounded layer-major prompts and
+    /// source-constrained decoding. Source spans, selected legal rows and the
+    /// complete result remain governed by the existing task finalizer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_int4_source_task_layer_major_with_threads(&self, model: &ResidentInt4,
+        prepared: PreparedInt4SourceTask, vocabulary: Arc<ExtractionVocabulary>, native: NativeLimits,
+        mask_limits: MaskWorkLimits, max_mask_node_visits: u64, kernel: PackedInt4Kernel,
+        compute_threads: usize, prefill: Int4PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedInt4TeamResult<Int4SourceTaskRun>, HostedError> {
+        self.execute_int4_source_task_team(model, prepared, vocabulary, native, mask_limits,
+            max_mask_node_visits, kernel, compute_threads, Some(prefill), cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_int4_source_task_team(&self, model: &ResidentInt4, prepared: PreparedInt4SourceTask,
+        vocabulary: Arc<ExtractionVocabulary>, native: NativeLimits,
+        mask_limits: MaskWorkLimits, max_mask_node_visits: u64, kernel: PackedInt4Kernel,
+        compute_threads: usize, prefill: Option<Int4PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedInt4TeamResult<Int4SourceTaskRun>, HostedError> {
         dispatch::preflight_int4_team(self, native.run, compute_threads)?;
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
         constrained_int4::check_model(prepared.execution_identity(), model.model_identity())
@@ -24,13 +47,17 @@ impl NlpEngine {
             output_bytes: prepared.max_result_bytes(), output_tokens: prepared.task_budget().max_output_tokens as u64,
             preparation_bytes: None };
         parallel::execute_task(self, model, prepared, native, kernel, compute_threads, memory,
-            cancellation, move |prepared, engine, control| {
+            prefill, cancellation, move |prepared, engine, control| {
                 let budget = Int4JsonBudget { native: Int4RunBudget::exact(work), json: JsonWorkBudget {
                     max_forward_positions: work.forward_positions, max_projected_logits: work.projected_logits,
                     max_kv_bytes: required.kv_bytes, max_total_mask_node_visits: max_mask_node_visits, mask_limits,
                 } };
-                let run = prepared.execute_with_control(prepared.execution_identity(), engine,
-                    &vocabulary, budget, control).map_err(task_error)?;
+                let run = match prefill {
+                    None => prepared.execute_with_control(prepared.execution_identity(), engine,
+                        &vocabulary, budget, control),
+                    Some(limits) => prepared.execute_layer_major_with_control(prepared.execution_identity(),
+                        engine, &vocabulary, budget, limits, control),
+                }.map_err(task_error)?;
                 if run.group_width != prepared.group_width() || engine.is_poisoned()
                     || !engine.kv_cache().all_slots_have_len(0) {
                     return Err(task_error(Int4SourceError::InvalidResult));

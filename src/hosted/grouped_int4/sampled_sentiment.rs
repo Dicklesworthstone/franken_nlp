@@ -190,7 +190,7 @@ impl NlpEngine {
             preparation_bytes: Some(limits.preparation_reserve_bytes),
         };
         parallel::execute_task(self, model, (prepared, vocabulary), limits.native,
-            kernel, compute_threads, memory, cancellation, move |input, engine, control| {
+            kernel, compute_threads, memory, None, cancellation, move |input, engine, control| {
                 execute_prepared(&input.0, &input.1, engine, limits, required.kv_bytes, work, None,
                     reuse_prefill, control)
             })

@@ -21,26 +21,30 @@ struct AdmittedInput<P> { prepared: P, _memory: Option<CommittedMemory> }
 #[allow(clippy::too_many_arguments)]
 pub(in crate::hosted::grouped_int4) fn execute_task<P, T, F>(host: &NlpEngine,
     model: &ResidentInt4, prepared: P, native: NativeLimits, kernel: PackedInt4Kernel,
-    compute_threads: usize, memory: TaskMemory, cancellation: CancellationToken, execute: F)
+    compute_threads: usize, memory: TaskMemory, prefill: Option<Int4PrefillLimits>,
+    cancellation: CancellationToken, execute: F)
     -> Result<HostedInt4TeamResult<T>, HostedError>
 where P: Send + 'static, T: Send + 'static,
     F: for<'weights> FnOnce(&P, &mut StrictInt4Engine<'weights>, &mut RunControl)
         -> Result<T, HostedError> + Send + 'static {
     dispatch::preflight_int4_team(host, native.run, compute_threads)?;
     if !Arc::ptr_eq(host.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
-    // Detect the combined scratch overflow before any reservation. The team
-    // quote remains owned by the dispatcher until all children have joined.
-    sum(&[memory.scratch_bytes, int4_task_team_workspace_bytes(compute_threads,
-        model.model_identity().group_width())?])?;
+    // The coordinator's prompt rails and each worker's packed-row buffers are
+    // separate live allocations. Validate both before any reservation; the
+    // dispatcher owns the worker quote until every child has joined.
+    let scratch_bytes = super::super::prefill::with_extra_workspace(memory.scratch_bytes, prefill)?;
+    let max_batch_rows = prefill.map_or(1, |limits| limits.max_batch_rows);
+    sum(&[scratch_bytes, dispatch::int4_prefill_team_workspace_bytes(compute_threads,
+        model.model_identity().group_width(), max_batch_rows)?])?;
     let lease = host.resources().acquire_lease();
     let input_memory = memory.preparation_bytes.map(|bytes|
         Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?.commit()).transpose()?;
     let input = AdmittedInput { prepared, _memory: input_memory };
     let kv = Pending::reserve(&lease, MemoryClass::KvPages, memory.required.kv_bytes)?;
-    let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, memory.scratch_bytes)?;
+    let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch_bytes)?;
     let output = output_claim(&lease, memory.output_bytes, memory.output_tokens)?;
-    dispatch::run_int4_team(host, native.run, cancellation, model.clone(), compute_threads,
-        kernel, move |weights, control, team| {
+    dispatch::run_int4_prefill_team(host, native.run, cancellation, model.clone(), compute_threads,
+        kernel, max_batch_rows, move |weights, control, team| {
             // Whole-aggregate capture preserves storage-before-charge drop
             // order even if a queued request is discarded before invocation.
             let input = input;

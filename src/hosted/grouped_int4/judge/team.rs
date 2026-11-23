@@ -19,7 +19,7 @@ impl NlpEngine {
             output_tokens: u64::from(prepared.task_budget().max_output_tokens),
             preparation_bytes: Some(limits.preparation_reserve_bytes) };
         parallel::execute_task(self, model, prepared, limits.native, kernel, compute_threads, memory,
-            cancellation, move |prepared, engine, control| {
+            None, cancellation, move |prepared, engine, control| {
                 let budget = Int4ScoringBudget { native: Int4RunBudget::exact(work), max_kv_bytes: required.kv_bytes };
                 let result = prepared.execute_with_control(prepared.execution_identity(), engine, budget, control)
                     .map_err(judge_error)?;

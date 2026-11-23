@@ -627,9 +627,9 @@ impl Int4Command {
                 | Int4Task::SemanticObjectCorpus(_) | Int4Task::SemanticObjectDocumentJob => return Err(CandidateError::Arguments),
             Int4Task::SampledSentiment(_) | Int4Task::SampledSentimentMap(_) | Int4Task::SampledSentimentCorpus(_) | Int4Task::SampledSentimentBatch(_) | Int4Task::SampledSentimentJob | Int4Task::SampledSentimentDocumentJob => return Err(CandidateError::Arguments),
             Int4Task::Text(_) => self.args.validate_text_compute()?,
-            Int4Task::Classify(scoring) => scoring.validate_one_off_with_prefill(&self.args)?,
-            Int4Task::Extract(extraction) => extraction.validate_one_off_with_prefill(&self.args)?,
-            Int4Task::Source(_, source) => source.validate_with_prefill(&self.args)?,
+            Int4Task::Classify(scoring) => scoring.validate_with_threaded_prefill(&self.args)?,
+            Int4Task::Extract(extraction) => extraction.validate_population_with_threaded_prefill(&self.args)?,
+            Int4Task::Source(_, source) => source.validate_population_with_threaded_prefill(&self.args)?,
             // The blocking stream must own its input and writer through cleanup.
             Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::FaithfulnessMap(_) | Int4Task::FaithfulnessCorpus(_) | Int4Task::Semantic(_) | Int4Task::SemanticBatch(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::SentimentMap(_) | Int4Task::SentimentCorpus(_) | Int4Task::ClassifyMap(_) | Int4Task::ClassifyCorpus(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
                 | Int4Task::SourceSemanticBatch(_) | Int4Task::ObjectMap(_) | Int4Task::SourceSemantic(..) | Int4Task::SourceCorpus(_) | Int4Task::AnswerCorpus(_) | Int4Task::ExtractCorpus(_) | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::ClassificationDocumentJob | Int4Task::SentimentDocumentJob | Int4Task::FaithfulnessDocumentJob | Int4Task::QuestionDocumentJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),

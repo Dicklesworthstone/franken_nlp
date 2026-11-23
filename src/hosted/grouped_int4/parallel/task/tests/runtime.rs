@@ -59,15 +59,20 @@ fn complete_delivery_refusal_and_late_cancellation_keep_storage_charged_until_dr
     let model = ResidentInt4 { inner: Arc::new(ResidentModel { loaded, lease }) };
     let baseline = host.resources().memory_snapshot().committed_bytes;
 
+    let packed = Int4PrefillLimits { max_batch_rows: 3,
+        max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(3).unwrap() };
+    for prefill in [None, Some(packed)] {
     let (input, input_observed) = tracked(&host);
     let (output, output_observed) = tracked(&host);
     let result = execute_task(&host, &model, input, native, PackedInt4Kernel::scalar(), 3,
-        memory(native), CancellationToken::default(), move |prepared, engine, _| {
+        memory(native), prefill, CancellationToken::default(), move |prepared, engine, _| {
             let snapshot = prepared.resources.memory_snapshot();
             assert_eq!(snapshot.by_class[&MemoryClass::JobBuffers].committed_bytes, PREPARATION);
             assert_eq!(snapshot.by_class[&MemoryClass::JobBuffers].reserved_bytes, OUTPUT);
-            assert!(snapshot.by_class[&MemoryClass::ActivationScratch].committed_bytes
-                >= int4_task_team_workspace_bytes(3, 4).unwrap());
+            assert_eq!(snapshot.by_class[&MemoryClass::ActivationScratch].committed_bytes,
+                memory(native).scratch_bytes + prefill.map_or(0, |limits| limits.validate().unwrap())
+                + dispatch::int4_prefill_team_workspace_bytes(3, 4,
+                    prefill.map_or(1, |limits| limits.max_batch_rows)).unwrap());
             assert!(engine.kv_cache().all_slots_have_len(0));
             Ok(output)
         }).unwrap();
@@ -85,7 +90,7 @@ fn complete_delivery_refusal_and_late_cancellation_keep_storage_charged_until_dr
 
     let (input, observed) = tracked(&host);
     let error = execute_task(&host, &model, input, native, PackedInt4Kernel::scalar(), 3,
-        memory(native), CancellationToken::default(), |_, _, _| -> Result<(), HostedError> {
+        memory(native), prefill, CancellationToken::default(), |_, _, _| -> Result<(), HostedError> {
             Err(HostedError::Int4(Int4HostError::Judge(Int4JudgeError::Accounting)))
         }).err().unwrap();
     assert!(matches!(error, HostedError::Int4(Int4HostError::Judge(Int4JudgeError::Accounting))));
@@ -97,7 +102,7 @@ fn complete_delivery_refusal_and_late_cancellation_keep_storage_charged_until_dr
     let (output, output_observed) = tracked(&host);
     let stop = CancellationToken::default(); let cancel = stop.clone();
     let error = execute_task(&host, &model, input, native, PackedInt4Kernel::scalar(), 3,
-        memory(native), stop, move |_, _, _| {
+        memory(native), prefill, stop, move |_, _, _| {
             cancel.cancel(DecodeCancellationKind::Deadline); Ok(output)
         }).err().unwrap();
     assert!(matches!(error, HostedError::Stopped { stop: RunStop { kind: DecodeCancellationKind::Deadline, .. }, .. }));
@@ -110,7 +115,7 @@ fn complete_delivery_refusal_and_late_cancellation_keep_storage_charged_until_dr
     let stop = CancellationToken::default(); stop.cancel(DecodeCancellationKind::ParentCancelled);
     let entered = Arc::new(AtomicBool::new(false)); let entry = Arc::clone(&entered);
     let error = execute_task(&host, &model, input, native, PackedInt4Kernel::scalar(), 3,
-        memory(native), stop, move |_, _, _| {
+        memory(native), prefill, stop, move |_, _, _| {
             entry.store(true, Ordering::SeqCst); Ok(())
         }).err().unwrap();
     assert!(matches!(error, HostedError::Stopped { stop: RunStop { kind: DecodeCancellationKind::ParentCancelled, .. }, .. }));
@@ -122,7 +127,7 @@ fn complete_delivery_refusal_and_late_cancellation_keep_storage_charged_until_dr
     let mut excessive = memory(native); excessive.output_bytes = 512 << 20;
     let (input, observed) = tracked(&host);
     let error = execute_task(&host, &model, input, native, PackedInt4Kernel::scalar(), 3,
-        excessive, CancellationToken::default(), |_, _, _| -> Result<(), HostedError> {
+        excessive, prefill, CancellationToken::default(), |_, _, _| -> Result<(), HostedError> {
             panic!("over-budget result entered native work")
         }).err().unwrap();
     assert!(matches!(error, HostedError::Reservation(_)));
@@ -131,11 +136,24 @@ fn complete_delivery_refusal_and_late_cancellation_keep_storage_charged_until_dr
     drained(&host, baseline);
 
     let error = execute_task(&host, &model, (), native, PackedInt4Kernel::scalar(), 4,
-        memory(native), CancellationToken::default(), |_, _, _| -> Result<(), HostedError> {
+        memory(native), prefill, CancellationToken::default(), |_, _, _| -> Result<(), HostedError> {
             panic!("unadmitted team entered native work")
         }).err().unwrap();
     assert!(matches!(error, HostedError::Limits(_)));
     drained(&host, baseline);
+    }
+    // An invalid prompt quote cannot reserve input/output or enter the team.
+    for prefill in [Int4PrefillLimits { max_batch_rows: 0, ..packed },
+        Int4PrefillLimits { max_extra_scratch_bytes: packed.max_extra_scratch_bytes - 1, ..packed }] {
+        let (input, observed) = tracked(&host);
+        assert!(execute_task(&host, &model, input, native, PackedInt4Kernel::scalar(), 3,
+            memory(native), Some(prefill), CancellationToken::default(), |_, _, _| -> Result<(), HostedError> {
+                panic!("unadmitted prompt entered native work")
+            }).is_err());
+        assert_eq!(observed.dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(observed.job_bytes_at_drop.load(Ordering::SeqCst), 0);
+        drained(&host, baseline);
+    }
     drop(model);
     drained(&host, 0);
 }

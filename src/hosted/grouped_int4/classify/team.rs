@@ -8,6 +8,25 @@ impl NlpEngine {
     pub fn execute_int4_classify_with_threads(&self, model: &ResidentInt4, prepared: PreparedInt4Classification,
         native: NativeLimits, kernel: PackedInt4Kernel, compute_threads: usize, cancellation: CancellationToken)
         -> Result<HostedInt4TeamResult<Int4ClassificationRun>, HostedError> {
+        self.execute_int4_classify_team(model, prepared, native, kernel, compute_threads, None, cancellation)
+    }
+
+    /// Reuse the same fixed team for bounded layer-major prompts and every
+    /// continuation head. Prompt/worker scratch is admitted once; probability
+    /// spaces, head identities and the complete native work bound are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_int4_classify_layer_major_with_threads(&self, model: &ResidentInt4,
+        prepared: PreparedInt4Classification, native: NativeLimits, kernel: PackedInt4Kernel,
+        compute_threads: usize, prefill: Int4PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedInt4TeamResult<Int4ClassificationRun>, HostedError> {
+        self.execute_int4_classify_team(model, prepared, native, kernel, compute_threads, Some(prefill), cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_int4_classify_team(&self, model: &ResidentInt4, prepared: PreparedInt4Classification,
+        native: NativeLimits, kernel: PackedInt4Kernel, compute_threads: usize,
+        prefill: Option<Int4PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedInt4TeamResult<Int4ClassificationRun>, HostedError> {
         dispatch::preflight_int4_team(self, native.run, compute_threads)?;
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
         grouped_int4::check_model(prepared.execution_identity(), model.model_identity()).map_err(classification_error)?;
@@ -20,10 +39,13 @@ impl NlpEngine {
             output_bytes: task.max_output_bytes, output_tokens: u64::from(task.max_output_tokens),
             preparation_bytes: None };
         parallel::execute_task(self, model, prepared, native, kernel, compute_threads, memory,
-            cancellation, move |prepared, engine, control| {
+            prefill, cancellation, move |prepared, engine, control| {
                 let budget = Int4ScoringBudget { native: Int4RunBudget::exact(work), max_kv_bytes: required.kv_bytes };
-                let result = prepared.execute_with_control(prepared.execution_identity(), engine, budget, control)
-                    .map_err(classification_error)?;
+                let result = match prefill {
+                    None => prepared.execute_with_control(prepared.execution_identity(), engine, budget, control),
+                    Some(limits) => prepared.execute_layer_major_with_control(prepared.execution_identity(),
+                        engine, budget, limits, control),
+                }.map_err(classification_error)?;
                 if result.model_work != work || result.head_count != prepared.head_count()
                     || result.group_width != prepared.group_width()
                     || engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) {

@@ -84,7 +84,7 @@ impl Prepared {
         -> Result<Completed, CandidateError> {
         let kernel = limits.kernel;
         if limits.compute.threads > 1 {
-            if limits.cohort.is_some() || (limits.prefill.is_some() && !matches!(&self, Self::Text(_))) {
+            if limits.cohort.is_some() {
                 return Err(CandidateError::Arguments);
             }
             let threads = limits.compute.threads;
@@ -95,17 +95,24 @@ impl Prepared {
                     Some(prefill) => engine.execute_int4_chat_layer_major_with_threads(model, plan, 1, native,
                         SAMPLER_BYTES, kernel, threads, prefill, cancellation),
                 }.map(Completed::TextTeam),
-                Self::Classify(plan) => engine.execute_int4_classify_with_threads(model, plan, native,
-                    kernel, threads, cancellation)
-                    .map(|result| Completed::Classify(compute::Completion::Team(result))),
-                Self::Extract { plan, vocabulary, masks, max_mask_node_visits } =>
-                    engine.execute_int4_extract_with_threads(model, plan, vocabulary, native, masks,
-                        max_mask_node_visits, kernel, threads, cancellation)
-                        .map(|result| Completed::Extract(compute::Completion::Team(result))),
-                Self::Source { plan, vocabulary, masks, max_mask_node_visits } =>
-                    engine.execute_int4_source_task_with_threads(model, plan, vocabulary, native, masks,
-                        max_mask_node_visits, kernel, threads, cancellation)
-                        .map(|result| Completed::Source(compute::Completion::Team(result))),
+                Self::Classify(plan) => match limits.prefill {
+                    None => engine.execute_int4_classify_with_threads(model, plan, native,
+                        kernel, threads, cancellation),
+                    Some(prefill) => engine.execute_int4_classify_layer_major_with_threads(model, plan, native,
+                        kernel, threads, prefill, cancellation),
+                }.map(|result| Completed::Classify(compute::Completion::Team(result))),
+                Self::Extract { plan, vocabulary, masks, max_mask_node_visits } => match limits.prefill {
+                    None => engine.execute_int4_extract_with_threads(model, plan, vocabulary, native, masks,
+                        max_mask_node_visits, kernel, threads, cancellation),
+                    Some(prefill) => engine.execute_int4_extract_layer_major_with_threads(model, plan,
+                        vocabulary, native, masks, max_mask_node_visits, kernel, threads, prefill, cancellation),
+                }.map(|result| Completed::Extract(compute::Completion::Team(result))),
+                Self::Source { plan, vocabulary, masks, max_mask_node_visits } => match limits.prefill {
+                    None => engine.execute_int4_source_task_with_threads(model, plan, vocabulary, native, masks,
+                        max_mask_node_visits, kernel, threads, cancellation),
+                    Some(prefill) => engine.execute_int4_source_task_layer_major_with_threads(model, plan,
+                        vocabulary, native, masks, max_mask_node_visits, kernel, threads, prefill, cancellation),
+                }.map(|result| Completed::Source(compute::Completion::Team(result))),
             }.map_err(execution_error);
         }
         if let Some(admission) = limits.cohort {

@@ -31,7 +31,7 @@ pub(super) struct Admission { pub threads: usize, pub workspace_bytes: u64 }
 pub(super) fn definition(command: clap::Command) -> clap::Command {
     command.arg(clap::Arg::new("compute_threads").long("compute-threads")
         .value_name("N").value_parser(clap::value_parser!(usize)).default_value("1")
-        .help("Coordinator plus persistent INT4 row workers, 1..=64; 1 is serial. One team serves the complete request or supported resident batch across all documents, heads, tokens and flushes. Generate/chat, live text streams, score-batch, independent extract/ner/keyphrases/summarize/answer-batch streams and retained text/scored/extraction/source jobs can also use --prefill-rows; other routes cannot combine these schedules. Cannot combine with --cohort-heads or --cohort-documents. Runtime threads are additional. Worker scratch is admitted before IO"))
+        .help("Coordinator plus persistent INT4 row workers, 1..=64; 1 is serial. One team serves the complete request or supported resident batch across all documents, heads, tokens and flushes. One-shot generate/chat/classify/extract/ner/keyphrases/summarize/answer, live text streams, score-batch, independent extraction/source streams and retained text/scored/extraction/source jobs can also use --prefill-rows; other routes cannot combine these schedules. Cannot combine with --cohort-heads or --cohort-documents. Runtime threads are additional. Worker scratch is admitted before IO"))
 }
 
 /// The same admitted team width determines the process envelope for every
@@ -62,12 +62,14 @@ impl Schedule {
 #[cfg(feature = "asupersync-runtime")]
 pub(super) fn matches(task: &Int4Task, args: &Int4Args, limits: Int4Limits)
     -> Result<bool, CandidateError> {
-    let text = matches!(task, Int4Task::Text(_));
-    Ok(limits.compute == args.compute.admit_with_prefill(args.group_width, if text { limits.prefill } else { None })?
+    let threaded_prefill = matches!(task, Int4Task::Text(_) | Int4Task::Classify(_)
+        | Int4Task::Extract(_) | Int4Task::Source(..));
+    Ok(limits.compute == args.compute.admit_with_prefill(args.group_width,
+        if threaded_prefill { limits.prefill } else { None })?
         && (limits.compute.threads == 1
             || (matches!(task, Int4Task::Text(_) | Int4Task::Classify(_) | Int4Task::Sentiment(_)
                 | Int4Task::Judge(_) | Int4Task::Extract(_) | Int4Task::Source(..))
-                && (limits.prefill.is_none() || text) && limits.cohort.is_none())))
+                && (limits.prefill.is_none() || threaded_prefill) && limits.cohort.is_none())))
 }
 
 /// Keep each physical schedule's complete output owner alive while callers

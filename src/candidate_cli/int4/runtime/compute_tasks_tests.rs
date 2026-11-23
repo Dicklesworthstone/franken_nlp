@@ -8,7 +8,7 @@ enum Case { MultiLabel, Structural, SelectedSource, Keyphrases }
 const CASES: [Case; 4] = [Case::MultiLabel, Case::Structural, Case::SelectedSource, Case::Keyphrases];
 const SOURCE: &str = "é Alice 上海 Alice";
 
-fn command(case: Case, threads: usize, snapshot: &str, pin: &str, memory: u64) -> Int4Command {
+fn command(case: Case, threads: usize, prefill: Option<&str>, snapshot: &str, pin: &str, memory: u64) -> Int4Command {
     let memory = memory.to_string(); let threads = threads.to_string();
     let operation = match case {
         Case::MultiLabel => "classify", Case::Structural | Case::SelectedSource => "extract",
@@ -18,6 +18,7 @@ fn command(case: Case, threads: usize, snapshot: &str, pin: &str, memory: u64) -
         "--snapshot", snapshot, "--expected-model-sha256", pin, "--memory-mib", &memory,
         "--context-tokens", "1024", "--max-input-bytes", "4096", "--preparation-mib", "512",
         "--max-result-bytes", "65536", "--compute-threads", &threads];
+    if let Some(rows) = prefill { argv.extend(["--prefill-rows", rows]); }
     match case {
         Case::MultiLabel => argv.extend(["--max-candidate-tokens", "4", "--input-encoding", "safe-bpe-v1"]),
         Case::Structural => argv.extend(["--schema", "controller-inline-schema.json", "--max-new-tokens", "16"]),
@@ -26,7 +27,8 @@ fn command(case: Case, threads: usize, snapshot: &str, pin: &str, memory: u64) -
             // Every legal row fits. This exercises exact selected-row execution
             // without assuming a small, unmeasured vocabulary-mask cardinality.
             "--max-selected-rows", "166144"]),
-        Case::Keyphrases => argv.extend(["--max-new-tokens", "16", "--input-encoding", "safe-bpe-v1"]),
+        Case::Keyphrases => argv.extend(["--max-new-tokens", "16", "--input-encoding", "safe-bpe-v1",
+            "--max-selected-rows", "166144"]),
     }
     let matches = crate::candidate_cli::definition().try_get_matches_from(argv).unwrap();
     let CandidateCommand::SourceInt4(command) = CandidateCommand::from_matches(&matches).unwrap()
@@ -36,9 +38,9 @@ fn command(case: Case, threads: usize, snapshot: &str, pin: &str, memory: u64) -
 
 fn admission(command: &Int4Command) -> Int4Limits {
     match &command.task {
-        Int4Task::Classify(scoring) => scoring.validate_one_off_with_prefill(&command.args),
-        Int4Task::Extract(options) => options.validate_one_off_with_prefill(&command.args),
-        Int4Task::Source(_, options) => options.validate_with_prefill(&command.args),
+        Int4Task::Classify(scoring) => scoring.validate_with_threaded_prefill(&command.args),
+        Int4Task::Extract(options) => options.validate_population_with_threaded_prefill(&command.args),
+        Int4Task::Source(_, options) => options.validate_population_with_threaded_prefill(&command.args),
         _ => panic!("unexpected controller fixture route"),
     }.unwrap()
 }
@@ -132,7 +134,7 @@ fn completed_work(completed: &Completed, case: Case) -> Int4Work {
 
 #[test]
 #[ignore = "run alone in a fresh process with controller-admitted INT4 snapshot, independent pin and real structured/scored multi-thread inference"]
-fn snapshot_task_teams_match_full_serial_results_identities_work_and_release_every_charge() {
+fn snapshot_task_prefill_teams_match_full_serial_results_identities_work_and_release_every_charge() {
     let snapshot = std::env::var("FNLP_INT4_STREAM_SNAPSHOT").expect("explicit existing snapshot required");
     let pin = std::env::var("FNLP_INT4_STREAM_MODEL_SHA256").expect("independent content pin required");
     let memory: u64 = std::env::var("FNLP_INT4_TEST_MEMORY_MIB").expect("explicit memory ceiling required")
@@ -140,7 +142,7 @@ fn snapshot_task_teams_match_full_serial_results_identities_work_and_release_eve
     // Admit the largest tested preparation before any model/planner allocation.
     // The same charge covers private inputs and serialized comparison values.
     let preparation_bytes = CASES.into_iter().map(|case|
-        admission(&command(case, 4, &snapshot, &pin, memory)).preparation_bytes).max().unwrap();
+        admission(&command(case, 4, Some("3"), &snapshot, &pin, memory)).preparation_bytes).max().unwrap();
     let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
         runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
         max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 3,
@@ -150,7 +152,7 @@ fn snapshot_task_teams_match_full_serial_results_identities_work_and_release_eve
     let idle = engine.resources().memory_snapshot();
     let lease = engine.resources().acquire_lease();
     let preparation = lease.reserve(MemoryClass::JobBuffers, preparation_bytes).unwrap().commit().unwrap();
-    let base = command(Case::MultiLabel, 1, &snapshot, &pin, memory);
+    let base = command(Case::MultiLabel, 1, None, &snapshot, &pin, memory);
     let model = load_model(&engine, &base.args, admission(&base), Duration::from_secs(3600),
         CancellationToken::default()).unwrap();
     let resident = engine.resources().memory_snapshot();
@@ -159,8 +161,9 @@ fn snapshot_task_teams_match_full_serial_results_identities_work_and_release_eve
         let mut serial_planned = None;
         let mut serial_actual = None;
         let mut serial_result = None;
-        for width in [1, 2, 4] {
-            let command = command(case, width, &snapshot, &pin, memory);
+        for (width, prefill) in [(1, None), (2, None), (4, None),
+            (1, Some("3")), (2, Some("1")), (2, Some("2")), (4, Some("3"))] {
+            let command = command(case, width, prefill, &snapshot, &pin, memory);
             let limits = admission(&command);
             let (args, input) = request(command, limits, case);
             let prepared = prepare(input, &model, &args, limits, &mut DeadlineControl {
@@ -168,10 +171,10 @@ fn snapshot_task_teams_match_full_serial_results_identities_work_and_release_eve
             }).unwrap();
             let identity = prepared.identity().clone();
             let planned = planned_work(&prepared);
-            if width == 1 { serial_identity = Some(identity.clone()); serial_planned = Some(planned); }
+            if width == 1 && prefill.is_none() { serial_identity = Some(identity.clone()); serial_planned = Some(planned); }
             else {
-                assert_eq!(&identity, serial_identity.as_ref().unwrap(), "identity changed for {case:?} width={width}");
-                assert_eq!(planned, serial_planned.unwrap(), "planned work changed for {case:?} width={width}");
+                assert_eq!(&identity, serial_identity.as_ref().unwrap(), "identity changed for {case:?} width={width} prefill={prefill:?}");
+                assert_eq!(planned, serial_planned.unwrap(), "planned work changed for {case:?} width={width} prefill={prefill:?}");
             }
             let completed = prepared.execute(&engine, &model, NativeLimits {
                 context_tokens: args.context_tokens, allocator_reserve_bytes: ALLOCATOR_BYTES,
@@ -184,19 +187,21 @@ fn snapshot_task_teams_match_full_serial_results_identities_work_and_release_eve
             assert!(actual.attention_pairs <= planned.attention_pairs);
             assert!(actual.projections.fits(planned.projections));
             let value = serde_json::to_value(&completed).unwrap();
-            if width == 1 {
+            if width == 1 && prefill.is_none() {
                 assert!(completed.compute().is_none());
                 serial_actual = Some(actual); serial_result = Some(value);
             } else {
-                assert_eq!(actual, serial_actual.unwrap(), "completed work changed for {case:?} width={width}");
-                assert_eq!(&value, serial_result.as_ref().unwrap(), "full result changed for {case:?} width={width}");
+                assert_eq!(actual, serial_actual.unwrap(), "completed work changed for {case:?} width={width} prefill={prefill:?}");
+                assert_eq!(&value, serial_result.as_ref().unwrap(), "full result changed for {case:?} width={width} prefill={prefill:?}");
+            }
+            if width > 1 {
                 let receipt = completed.compute().unwrap();
                 assert_eq!(receipt.schedule, "int4-output-row-team-v1");
                 assert_eq!(receipt.compute_threads, width);
                 assert!(receipt.completed_projections > 0);
                 assert!(receipt.completed_worker_rows > 0);
                 assert!(receipt.completed_worker_rows < receipt.completed_rows);
-            }
+            } else { assert!(completed.compute().is_none()); }
             drop(completed);
             assert_eq!(engine.resources().memory_snapshot(), resident, "retained charge for {case:?} width={width}");
             let closures = engine.resources().outstanding_closure_snapshot();
