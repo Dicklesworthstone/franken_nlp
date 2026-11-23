@@ -91,6 +91,94 @@ native failure is not the model relation `unsupported`. Source membership proves
 that a quotation occurs; correlated model reads are not a factuality certificate.
 All score distributions and judgments remain uncalibrated.
 
+## Complete-source INT8 faithfulness
+
+Use `candidate faithfulness-map` when the complete source exceeds one native
+context or one evidence partition:
+
+```sh
+fnlp candidate faithfulness-map request.json \
+  --model ./model.fnlpq --memory-mib 16384 \
+  --max-chunks 64 --max-chunk-bytes 4096
+```
+
+The input is the same explicit `{mode: "faithfulness", source, claim, policy}`
+object shown above. Only the source is partitioned. Every chunk receives the
+unchanged claim, a global chunk judgment and all of its local evidence windows.
+The planner calculates source capacity after accounting for the exact claim,
+trusted scaffold and candidate continuation. It preserves all source bytes,
+Unicode scalars and CRLF boundaries; it refuses an indivisible unit that cannot
+fit instead of dropping or rewriting it. The ordinary one-context `judge`
+command keeps its complete-source fit requirement.
+
+The completed output retains each native chunk result and its original-source
+byte/scalar span. Its aggregate lifts decisive supporting and contrary quotes
+into original-source coordinates. Contrary evidence can force an explicit
+`conflicting_evidence` abstention even when supporting evidence exists.
+The separate `--minimum-classified-coverage-ppm` policy defaults to 1000000:
+all original source scalars must belong to classified chunk judgments before
+the document can meet that coverage floor. Insufficient coverage or unresolved
+evidence produces an explicit abstention. The result declares
+`single_context_equivalence: false`; separate contexts cannot establish an
+inference that requires jointly reading different chunks.
+
+Document limits are independent:
+
+| Option | Default | Scope |
+| --- | ---: | --- |
+| `--max-input-bytes` | 1048576 | Complete JSON, including source and claim |
+| `--context-tokens` | 2048 | Largest live native head |
+| `--max-chunks` | 64 | Complete lossless source partition, maximum 256 |
+| `--max-tokenizer-calls` | 8192 | All accepted and rejected partition probes |
+| `--max-result-bytes` | 65536 | Complete native result for each chunk |
+| `--max-retained-result-bytes` | 16777216 | Sum of retained complete chunk results |
+| `--max-map-result-bytes` | 16777216 | Final document, chunks and evidence aggregate |
+| `--preparation-mib` | 1024 | Modeled preparation reserve; additional ownership is priced separately |
+
+All five native-work ceilings apply to the complete document across every
+chunk and evidence head. Nothing renews per chunk. The forward-position default
+is 262144; projected logits 10000000000; attention pairs 1000000000000; dot
+products and multiply-accumulates each 10000000000000000. These are admission
+ceilings, not measured work or performance estimates.
+
+Compact source and claim encoding is explicit:
+
+```sh
+fnlp candidate faithfulness-map request.json \
+  --model ./model.fnlpq --memory-mib 16384 \
+  --input-encoding safe-bpe-v1
+```
+
+One bounded tokenizer ledger covers claim-capacity calculations, successful and
+rejected source probes, and all final chunk/evidence-head plans in each complete
+preparation. The four `--max-tokenizer-*` ceilings bound input bytes, output
+tokens, pair checks and pair bytes. They do not reset between chunks or evidence
+heads. Exact source/claim bytes remain untrusted data, and template-control token
+IDs cannot enter their segments. The CLI preflight and later owned hosted
+preparation use the same exact encoding policy, each with its own complete
+preparation allowance. Output records the selected policy and actual hosted
+tokenizer work. Compact prompts do not claim numerical or output equivalence.
+
+The process quote admits source and claim ownership, every retained plan,
+tokenizer workspace, complete chunk results, aggregate evidence, one physical
+native cache and final output staging before input/model IO. Preflight completes
+before weight loading. The owned host reconstructs the exact request under its
+charge, checks every chunk before the first forward, and verifies sealed
+completion before returning. Private request/result commitments bind the original
+source, claim, model, policies, declared ceilings and payload; they are omitted
+from JSON and diagnostic formatting. A late failure never returns a successful
+document prefix. Output ownership survives checked serialization, write and flush.
+
+Library callers can use `Int8FaithfulnessMapHostConfig::requirements` or
+`requirements_with_encoding`, then `NlpEngine::map_int8_faithfulness` or
+`map_int8_faithfulness_with_encoding`. The supplied base identity must already
+match the resident model and exact pinned judge tokenizer/template. The host
+does not repair mismatched identities or trust caller-supplied chunk scores.
+
+This route supports one complete request. It does not expose corpus execution,
+retained jobs, prompt-prefill scheduling or compute-team controls. The one-context
+`judge` route and the INT4 faithfulness population routes retain their own options.
+
 ## Admission, delivery and limits
 
 Shared finite-scoring options match `candidate classify` and `sentiment`:
@@ -138,8 +226,9 @@ execution refuses before input or model IO.
 
 `fnlp candidate source-int4 judge` accepts `--input-encoding safe-bpe-v1`
 for all three request modes. Its model input is an explicit pinned source or an
-independently pinned INT4 snapshot. The strict-INT8 commands described above
-retain their existing encoding contract.
+independently pinned INT4 snapshot. The one-context strict-INT8 `judge` command retains its existing encoding
+contract; the complete-source `faithfulness-map` command explicitly supports
+compact input as described above.
 
 Compact input preserves exact untrusted bytes and excludes template-control
 tokens. Evidence windows are independently encoded from original UTF-8 spans,
@@ -175,3 +264,12 @@ all three real pinned planners, complete head counts, identity binding, context
 reuse, every computational-work axis and cancellation. They are test sources,
 not executed tests. Rust compilation/tests, full-model inference, numerical
 parity, task quality, benchmarks and controller DSR were not run here.
+
+The complete-source INT8 faithfulness addition includes 39 further regression
+definitions across native planning/evidence reduction, hosted ownership/admission,
+and public command/runtime boundaries. They cover lossless long sources, unchanged
+claims, original evidence, conflict/coverage abstention, all five work axes,
+compact tokenizer limits, private completion binding, strict request parsing and
+all eleven typed cancellation causes. These definitions were independently
+source-reviewed but remain unrun; DSR production compilation and model qualification
+are still required.

@@ -10,7 +10,9 @@ use crate::{
 };
 mod cohort;
 mod document;
+mod faithfulness;
 pub use document::{Int8ClassificationMapHostConfig, Int8ClassificationMapMemoryRequirement};
+pub use faithfulness::{Int8FaithfulnessMapHostConfig, Int8FaithfulnessMapMemoryRequirement};
 
 impl NlpEngine {
     /// Execute exclusive or independent multi-label classification. The sealed

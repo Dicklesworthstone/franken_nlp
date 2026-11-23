@@ -33,6 +33,7 @@ mod extract;
 mod jobs;
 mod map;
 mod judge;
+mod faithfulness_map;
 mod redact;
 mod resolve;
 mod stream;
@@ -116,6 +117,7 @@ pub(crate) enum CandidateCommand {
     Extract(extract::ExtractCommand),
     Map(map::MapCommand),
     Judge(judge::JudgeCommand),
+    FaithfulnessMap(faithfulness_map::FaithfulnessMapCommand),
     Redact(redact::RedactCommand),
     Resolve(resolve::ResolveCommand),
     Batch(batch::BatchCommand),
@@ -142,6 +144,7 @@ pub(crate) fn definition() -> clap::Command {
         .subcommand(jobs::scored::definition())
         .subcommand(map::definition())
         .subcommand(judge::definition())
+        .subcommand(faithfulness_map::definition())
         .subcommand(redact::definition())
         .subcommand(resolve::definition())
         .subcommand(stream::definition())
@@ -174,6 +177,9 @@ impl CandidateCommand {
         }
         if name == "redact" {
             return redact::RedactCommand::from_arg_matches(matches).map(Self::Redact);
+        }
+        if name == "faithfulness-map" {
+            return faithfulness_map::FaithfulnessMapCommand::from_matches(matches).map(Self::FaithfulnessMap);
         }
         if name == "judge" {
             return judge::JudgeCommand::from_arg_matches(matches).map(Self::Judge);
@@ -257,6 +263,7 @@ impl CandidateCommand {
             Self::Extract(command) => return command.execute(input, output),
             Self::Map(command) => return command.execute(input, output),
             Self::Judge(command) => return command.execute(input, output),
+            Self::FaithfulnessMap(command) => return command.execute(input, output),
             Self::Redact(command) => return command.execute(input, output),
             Self::Resolve(command) => return command.execute(input, output),
             // A borrowed stream cannot outlive the hosted blocking closure.

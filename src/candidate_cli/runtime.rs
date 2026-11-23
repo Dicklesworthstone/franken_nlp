@@ -7,6 +7,7 @@ pub(super) mod classify_map;
 pub(super) mod extraction;
 pub(super) mod map_tasks;
 pub(super) mod judgment;
+pub(super) mod faithfulness_map;
 pub(super) mod redaction;
 pub(super) mod resolution;
 pub(super) mod streaming;
