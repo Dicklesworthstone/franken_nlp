@@ -208,12 +208,6 @@ pub(super) struct Statistics {
     pub outcome: QuestionOutcome, pub work: Int8Work, pub masks: u64,
     pub citations: usize, pub spans: usize,
 }
-pub(super) fn statistics(value: &QuestionValue) -> Result<Statistics, Int8SourceError> {
-    statistics_with_checkpoints(value, &mut || Ok(())).map_err(|error| match error {
-        Int8SourceMapError::Source(source) => source,
-        _ => Int8SourceError::InvalidResult,
-    })
-}
 pub(super) fn statistics_with_checkpoints<F>(value: &QuestionValue, check: &mut F)
     -> Result<Statistics, Int8SourceMapError> where F: FnMut() -> Result<(), Int8SourceMapError> {
     check()?;

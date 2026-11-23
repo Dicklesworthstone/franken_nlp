@@ -38,6 +38,40 @@ pub(super) fn result_with_checkpoints<F>(run: &Int8QuestionRun, cap: u64, check:
     writer.finish()
 }
 
+pub(super) struct Continue;
+impl DecodeStepControl for Continue {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
+}
+
+/// Preserve the original complete allowance before a synthesis reservation
+/// subtracts from it. The nested request already binds source and question.
+pub(super) fn composed_request<C: DecodeStepControl>(domain: &[u8], nested: [u8; 32],
+    authority: &(impl Serialize + ?Sized), mapping: Int8SourceMapLimits, control: &mut C)
+    -> Result<[u8; 32], Int8SourceMapError> {
+    let mut check = || checkpoint(control).map_err(Int8SourceMapError::from);
+    let mut writer = PrivateBinding::new(domain, u64::MAX, &mut check)?;
+    writer.hash.update(nested);
+    writer.value(authority)?;
+    writer.value(&(mapping.chunks, mapping.reduction, mapping.max_model_work,
+        (mapping.mask_limits.max_trie_node_visits, mapping.mask_limits.checkpoint_interval_nodes),
+        mapping.mask_visits_per_chunk, mapping.max_mask_visits))?;
+    writer.finish()
+}
+
+/// The public result omits private child commitments. Bind those explicitly
+/// so a foreign discovery result with identical visible bytes cannot be used.
+pub(super) fn composed_result<C: DecodeStepControl>(domain: &[u8], request: [u8; 32],
+    nested: &[[u8; 32]], value: &(impl Serialize + ?Sized), cap: u64, control: &mut C)
+    -> Result<[u8; 32], Int8SourceMapError> {
+    let mut check = || checkpoint(control).map_err(Int8SourceMapError::from);
+    let mut writer = PrivateBinding::new(domain, cap, &mut check)?;
+    writer.hash.update(request);
+    writer.hash.update((nested.len() as u64).to_le_bytes());
+    for binding in nested { writer.hash.update(binding); }
+    writer.value(value)?;
+    writer.finish()
+}
+
 const CHECKPOINT_BYTES: usize = 64 * 1024;
 struct PrivateBinding<'a, F> {
     hash: Sha256,

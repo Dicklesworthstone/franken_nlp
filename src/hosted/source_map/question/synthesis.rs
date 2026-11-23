@@ -61,7 +61,7 @@ impl NlpEngine {
                 .engine(config.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
             let result = allocate(output, || prepared.execute_with_control(&admitted, &input.value.planner,
                 &mut engine.value, &input.value.vocabulary, control).map_err(HostedError::SourceMap))?;
-            expected.verify_completed(&result.value).map_err(HostedError::SourceMap)?;
+            expected.verify_completed_with_control(&result.value, control).map_err(HostedError::SourceMap)?;
             drop(engine);
             drop(admitted);
             drop(input);

@@ -221,7 +221,7 @@ fn no_evidence_skips_the_final_model_without_refunding_its_reservation_or_hiding
     let p = planner(); let q = request(); let text = "Alice"; let prepared = prepare(&p, text, &q);
     let expected = prepared.expected; let admitted: Vec<_> = prepared.execution_identities().cloned().collect();
     let discovery = prepared.map.execute_with_driver(&admitted, Abstain).unwrap();
-    let mut remaining = remaining_verification(&discovery, q.question.verification).unwrap();
+    let mut remaining = remaining_verification(&discovery, q.question.verification, &mut Continue).unwrap();
     let evidence = evidence::collect(text, discovery.mapped.root().value(), q.limits, &mut remaining, &mut Continue).unwrap();
     assert!(evidence.passages.is_empty());
     let answer = SynthesisAnswer { status: SynthesisStatus::NoEvidenceCollected, answer: None, citations: Vec::new() };
@@ -242,4 +242,80 @@ fn changing_the_original_question_changes_all_discovery_identities_and_bad_profi
     let mut id = identity(&p); id.numerics_profile = NumericsProfile::HfBf16Eager;
     assert!(p.plan_int8_question_synthesis_with_control("Alice", &a, budget(), &PlanContext::new(&id, budget()).unwrap(),
         SourcePlanningLimits::default(), limits(), &mut Continue).is_err());
+}
+
+fn no_evidence_completion(p: &SourceTaskPlanner, text: &str, q: &SourceQuestionSynthesis)
+    -> (Int8QuestionSynthesisPreflight, Int8QuestionSynthesisRun) {
+    let prepared = prepare(p, text, q);
+    let expected = prepared.expected;
+    let admitted: Vec<_> = prepared.execution_identities().cloned().collect();
+    let discovery = prepared.map.execute_with_driver(&admitted, Abstain).unwrap();
+    let mut remaining = remaining_verification(&discovery, q.question.verification, &mut Continue).unwrap();
+    let evidence = evidence::collect(text, discovery.mapped.root().value(), q.limits,
+        &mut remaining, &mut Continue).unwrap();
+    assert!(evidence.passages.is_empty());
+    let answer = SynthesisAnswer { status: SynthesisStatus::NoEvidenceCollected, answer: None, citations: Vec::new() };
+    let run = finish(discovery, answer, 0, 0, Int8Work::default(), Int8Work::default(), 0, remaining,
+        expected, limits().reduction.max_result_bytes as u64, &mut Continue).unwrap();
+    (expected, run)
+}
+#[test]
+fn synthesis_completion_is_bound_to_exact_source_question_and_evidence_allowance() {
+    let p = planner(); let q = request();
+    let (expected, run) = no_evidence_completion(&p, "Alice", &q);
+    expected.verify_completed(&run).unwrap();
+    let mut changed_question = request(); changed_question.question.question = "Who is known?".to_owned();
+    let mut changed_passages = request(); changed_passages.limits.max_evidence_passages -= 1;
+    let mut changed_bytes = request(); changed_bytes.limits.max_evidence_bytes -= 1;
+    for (source, request) in [("Carol", &q), ("Alice", &changed_question),
+        ("Alice", &changed_passages), ("Alice", &changed_bytes)] {
+        let foreign = prepare(&p, source, request).preflight_metadata();
+        assert_eq!(foreign.reserved_model_work().unwrap(), expected.reserved_model_work().unwrap());
+        assert_eq!(foreign.reserved_mask_visits().unwrap(), expected.reserved_mask_visits().unwrap());
+        assert!(foreign.verify_completed(&run).is_err());
+    }
+}
+#[test]
+fn synthesis_seal_rejects_mutated_payload_and_foreign_private_discovery() {
+    let p = planner(); let q = request();
+    let (expected, mut run) = no_evidence_completion(&p, "Alice", &q);
+    // This remains below the allowance and used to pass every work/status check.
+    run.verification_used.fields += 1;
+    assert!(expected.verify_completed(&run).is_err());
+    run.verification_used.fields -= 1;
+    expected.verify_completed(&run).unwrap();
+    let (_, foreign) = no_evidence_completion(&p, "Carol", &q);
+    assert_eq!(canonjson::canonical_string(&run.discovery).unwrap(),
+        canonjson::canonical_string(&foreign.discovery).unwrap());
+    run.discovery = foreign.discovery;
+    assert!(expected.verify_completed(&run).is_err());
+}
+#[test]
+fn synthesis_verification_preserves_every_cancellation_kind_before_and_during_binding() {
+    struct CancelAt { cause: DecodeCancellationKind, stop: usize, polls: usize }
+    impl DecodeStepControl for CancelAt {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.polls += 1; (self.polls == self.stop).then_some(self.cause)
+        }
+    }
+    use DecodeCancellationKind::*;
+    let p = planner(); let (expected, run) = no_evidence_completion(&p, "Alice", &request());
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        for stop in [1, 3] {
+            let mut control = CancelAt { cause, stop, polls: 0 };
+            assert_eq!(expected.verify_completed_with_control(&run, &mut control).unwrap_err().cancellation(), Some(cause));
+            assert_eq!(control.polls, stop);
+        }
+    }
+}
+#[test]
+fn synthesis_private_bindings_do_not_enter_json_or_preflight_debug() {
+    let p = planner(); let q = request();
+    let (expected, run) = no_evidence_completion(&p, "Alice", &q);
+    let json = canonjson::canonical_string(&run).unwrap();
+    let debug = format!("{expected:?}");
+    for private in ["request_binding", "result_binding", "Alice", "Who is named?"] {
+        assert!(!json.contains(private)); assert!(!debug.contains(private));
+    }
 }

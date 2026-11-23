@@ -57,7 +57,16 @@ fn each_native_work_axis_and_mask_allowance_can_refuse_before_weights() {
     }
     let mut exact = mapping; exact.mapping.max_model_work = expected.planned_work();
     exact.mapping.max_mask_visits = expected.reserved_mask_visits();
-    assert_eq!(preflight(SOURCE, &request, &planner, exact, &mut continuing()).unwrap(), expected);
+    let admitted = preflight(SOURCE, &request, &planner, exact, &mut continuing()).unwrap();
+    assert_eq!(admitted.source_span(), expected.source_span());
+    assert_eq!(admitted.chunk_count(), expected.chunk_count());
+    assert_eq!(admitted.planned_work(), expected.planned_work());
+    assert_eq!(admitted.reserved_mask_visits(), expected.reserved_mask_visits());
+    // Tightening the declared ceilings preserves geometry but changes the
+    // admitted request identity, even when the native work is unchanged.
+    assert_ne!(admitted, expected);
+    let rebuilt = planner.plan_document_with_control(SOURCE, &request, exact, &mut continuing()).unwrap();
+    assert_eq!(admitted, rebuilt.preflight_metadata());
 }
 #[test]
 fn malformed_unsupported_duplicate_and_unfunded_schemas_never_mint_metadata() {

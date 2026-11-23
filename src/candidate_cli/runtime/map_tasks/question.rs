@@ -46,7 +46,8 @@ pub(super) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
     session.remaining()?;
     // Verify exact work, original source coverage, blank/native status counts,
     // outcome and verification ceilings, not just successful serialization.
-    expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+    expected.verify_completed_with_control(result.result(), &mut session.control())
+        .map_err(|error| error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution))?;
     // Output and preparation guards remain alive through write AND flush.
     deliver_encoded(&session, &facts, &result, encoding::report(&planner)?.as_ref(),
         command.max_map_result_bytes + 4096, output)

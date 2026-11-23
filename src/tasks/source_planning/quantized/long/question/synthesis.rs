@@ -22,12 +22,24 @@ pub struct SourceQuestionSynthesis {
     pub limits: QuestionSynthesisLimits,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Int8QuestionSynthesisPreflight {
     discovery: Int8QuestionPreflight,
     synthesis_reserve: Int8Work,
     synthesis_masks: u64,
     limits: QuestionSynthesisLimits,
+    request_binding: [u8; 32],
+    max_result_bytes: u64,
+}
+impl std::fmt::Debug for Int8QuestionSynthesisPreflight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Int8QuestionSynthesisPreflight")
+            .field("discovery", &self.discovery)
+            .field("synthesis_reserve", &self.synthesis_reserve)
+            .field("synthesis_masks", &self.synthesis_masks)
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
+    }
 }
 impl Int8QuestionSynthesisPreflight {
     pub fn discovery(&self) -> Int8QuestionPreflight { self.discovery }
@@ -39,7 +51,17 @@ impl Int8QuestionSynthesisPreflight {
         self.discovery.reserved_mask_visits().checked_add(self.synthesis_masks).ok_or(Int8SourceMapError::WorkLimit)
     }
     pub fn verify_completed(&self, run: &Int8QuestionSynthesisRun) -> Result<(), Int8SourceMapError> {
-        self.discovery.verify_completed(&run.discovery)?;
+        self.verify_completed_with_control(run, &mut binding::Continue)
+    }
+    pub fn verify_completed_with_control<C: DecodeStepControl>(&self, run: &Int8QuestionSynthesisRun,
+        control: &mut C) -> Result<(), Int8SourceMapError> {
+        checkpoint(control)?;
+        if run.request_binding != self.request_binding || run.result_binding != binding::composed_result(
+            b"fnlp-int8-question-synthesis-result-v1", self.request_binding,
+            &[run.discovery.request_binding, run.discovery.result_binding], run, self.max_result_bytes, control)? {
+            return Err(invalid());
+        }
+        self.discovery.verify_completed_with_control(&run.discovery, control)?;
         let actual = add_work(run.discovery.model_work, run.synthesis_model_work).ok_or(Int8SourceMapError::WorkLimit)?;
         let masks = run.discovery.mask_node_visit_charge.checked_add(run.synthesis_mask_node_visits)
             .ok_or(Int8SourceMapError::WorkLimit)?;
@@ -79,6 +101,7 @@ impl Int8QuestionSynthesisPreflight {
                 } else if run.synthesis.answer.is_some() || !run.synthesis.citations.is_empty() { return Err(invalid()); }
             }
         }
+        checkpoint(control)?;
         Ok(())
     }
 }
@@ -111,7 +134,7 @@ impl SourceTaskPlanner {
         let (discovery_limits, reserve) = reserve(request.limits, budget, planning, mapping)?;
         let discovery = self.preflight_int8_question_with_control(source, &request.question, budget, context,
             planning, discovery_limits, control)?;
-        expectation(discovery, reserve, request.limits, mapping)
+        expectation(discovery, reserve, request.limits, mapping, control)
     }
     #[allow(clippy::too_many_arguments)]
     pub fn plan_int8_question_synthesis_with_control<'s, C: DecodeStepControl>(&self, source: &'s str,
@@ -123,14 +146,19 @@ impl SourceTaskPlanner {
         let (discovery_limits, reserve) = reserve(request.limits, budget, planning, mapping)?;
         let map = self.plan_int8_question_with_control(source, &request.question, budget, context,
             planning, discovery_limits, control)?;
-        let expected = expectation(map.preflight_metadata(), reserve, request.limits, mapping)?;
+        let expected = expectation(map.preflight_metadata(), reserve, request.limits, mapping, control)?;
         Ok(PreparedInt8QuestionSynthesis { source, question: copy(&request.question.question)?, map,
             identity: context.execution_identity().clone(), budget, planning, mapping, options: request.question.options, expected })
     }
 }
-fn expectation(discovery: Int8QuestionPreflight, synthesis_reserve: Int8Work, limits: QuestionSynthesisLimits,
-    mapping: Int8SourceMapLimits) -> Result<Int8QuestionSynthesisPreflight, Int8SourceMapError> {
-    let value = Int8QuestionSynthesisPreflight { discovery, synthesis_reserve, synthesis_masks: mapping.mask_visits_per_chunk, limits };
+fn expectation<C: DecodeStepControl>(discovery: Int8QuestionPreflight, synthesis_reserve: Int8Work,
+    limits: QuestionSynthesisLimits, mapping: Int8SourceMapLimits, control: &mut C)
+    -> Result<Int8QuestionSynthesisPreflight, Int8SourceMapError> {
+    let request_binding = binding::composed_request(b"fnlp-int8-question-synthesis-request-v1",
+        discovery.request_binding, &(limits.max_evidence_passages, limits.max_evidence_bytes), mapping, control)?;
+    let value = Int8QuestionSynthesisPreflight { discovery, synthesis_reserve,
+        synthesis_masks: mapping.mask_visits_per_chunk, limits, request_binding,
+        max_result_bytes: mapping.reduction.max_result_bytes as u64 };
     if !within(value.reserved_model_work()?, mapping.max_model_work) || value.reserved_mask_visits()? > mapping.max_mask_visits {
         return Err(Int8SourceMapError::WorkLimit);
     }
@@ -170,8 +198,8 @@ impl PreparedInt8QuestionSynthesis<'_> {
         self.map.preflight(admitted, engine)?;
         let Self { source, question, map, identity, budget, planning, mapping, options, expected } = self;
         let discovery = map.execute_with_control(admitted, engine, vocabulary, control)?;
-        expected.discovery.verify_completed(&discovery)?;
-        let mut remaining = remaining_verification(&discovery, expected.discovery.verification)?;
+        expected.discovery.verify_completed_with_control(&discovery, control)?;
+        let mut remaining = remaining_verification(&discovery, expected.discovery.verification, control)?;
         let collection = evidence::collect(source, discovery.mapped.root().value(), expected.limits, &mut remaining, control)?;
         let passages = collection.passages.len(); let bytes = collection.bytes;
         let (answer, planned, work, masks) = if passages == 0 {
@@ -239,9 +267,15 @@ pub struct Int8QuestionSynthesisRun {
     pub synthesis: SynthesisAnswer,
     /// All alternatives/abstentions remain visible, even after synthesis.
     pub discovery: Int8QuestionRun,
+    #[serde(skip)]
+    request_binding: [u8; 32],
+    #[serde(skip)]
+    result_binding: [u8; 32],
 }
-fn remaining_verification(discovery: &Int8QuestionRun, total: GroundingBudget) -> Result<GroundingBudget, Int8SourceMapError> {
-    let stats = execution::statistics(discovery.mapped.root().value())?;
+fn remaining_verification<C: DecodeStepControl>(discovery: &Int8QuestionRun, total: GroundingBudget,
+    control: &mut C) -> Result<GroundingBudget, Int8SourceMapError> {
+    let stats = execution::statistics_with_checkpoints(discovery.mapped.root().value(),
+        &mut || checkpoint(control).map_err(Int8SourceMapError::from))?;
     Ok(GroundingBudget { max_fields: total.max_fields.checked_sub(stats.citations).ok_or(Int8SourceMapError::WorkLimit)?,
         max_matches: total.max_matches.checked_sub(stats.spans).ok_or(Int8SourceMapError::WorkLimit)?,
         max_scan_steps: total.max_scan_steps.checked_sub(discovery.verification_scan_steps).ok_or(Int8SourceMapError::WorkLimit)? })
@@ -261,16 +295,18 @@ fn finish<C: DecodeStepControl>(discovery: Int8QuestionRun, synthesis: Synthesis
     let model_work = add_work(discovery.model_work, synthesis_model_work).ok_or(Int8SourceMapError::WorkLimit)?;
     let mask_node_visit_charge = discovery.mask_node_visit_charge.checked_add(synthesis_mask_node_visits)
         .ok_or(Int8SourceMapError::WorkLimit)?;
-    let run = Int8QuestionSynthesisRun { schema_version: 1, execution: INT8_QUESTION_SYNTHESIS_EXECUTION,
+    let mut run = Int8QuestionSynthesisRun { schema_version: 1, execution: INT8_QUESTION_SYNTHESIS_EXECUTION,
         numerics_profile: STRICT_INT8_PROFILE, semantics: SEMANTICS, evidence_passages, evidence_bytes,
         synthesis_reserved_work: expected.synthesis_reserve, synthesis_planned_work, synthesis_model_work,
         reserved_model_work: expected.reserved_model_work()?, model_work,
         reserved_mask_node_visits: expected.reserved_mask_visits()?, synthesis_mask_node_visits, mask_node_visit_charge,
         verification_used, calibration: AnswerCalibration::Uncalibrated,
         citation_guarantee: CitationGuarantee::StructuralSourceMembership, semantic_support: SummarySemanticSupport::NotAssessed,
-        untrusted_fields: ["synthesis", "discovery.mapped.root.value"], synthesis, discovery };
-    expected.verify_completed(&run)?;
-    extract_int8::check_size(&run, cap).map_err(Int8SourceError::from)?;
+        untrusted_fields: ["synthesis", "discovery.mapped.root.value"], synthesis, discovery,
+        request_binding: expected.request_binding, result_binding: [0; 32] };
+    run.result_binding = binding::composed_result(b"fnlp-int8-question-synthesis-result-v1",
+        run.request_binding, &[run.discovery.request_binding, run.discovery.result_binding], &run, cap, control)?;
+    expected.verify_completed_with_control(&run, control)?;
     checkpoint(control)?;
     Ok(run)
 }

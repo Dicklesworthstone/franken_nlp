@@ -19,7 +19,7 @@ pub(super) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
     // Fund a maximum-context final pass BEFORE weights. All actual map prompts
     // still preflight against the remainder, without early-EOS refunds.
     let expected = planner.preflight_int8_question_synthesis_with_control(&text, &task, budget, &context,
-        command.host.planning(), mapping, &mut session.control()).map_err(|_| CandidateError::Planning)?;
+        command.host.planning(), mapping, &mut session.control()).map_err(question_error)?;
     command.admit_work(expected.reserved_model_work().map_err(|_| CandidateError::Planning)?,
         expected.reserved_mask_visits().map_err(|_| CandidateError::Planning)?)?;
     session.remaining()?;
@@ -29,9 +29,10 @@ pub(super) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
         native: session.native(&args)?, preparation_reserve_bytes: limits.preparation_bytes,
         reduction_reserve_bytes: command.reduction_reserve_mib.checked_mul(MIB).ok_or(CandidateError::Arguments)? };
     let result = session.engine.synthesize_int8_document_answer(&model, text, Arc::new(planner), Arc::new(vocabulary),
-        config, cancellation).map_err(|_| CandidateError::Execution)?;
+        config, cancellation).map_err(host_error)?;
     session.remaining()?;
-    expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+    expected.verify_completed_with_control(result.result(), &mut session.control())
+        .map_err(|error| error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution))?;
     // Retain output authority through final serialization, write AND flush.
     deliver(&session, &facts, &result, command.max_map_result_bytes + 4096, output)
 }
@@ -76,7 +77,15 @@ mod tests {
         let (p, id, b, q, mapping) = assets(&cmd); let ctx = PlanContext::new(&id, b).unwrap(); let source = "éAéA      éAéA";
         let synthesis = p.plan_int8_question_synthesis_with_control(source, &q, b, &ctx, cmd.host.planning(), mapping, &mut Continue).unwrap();
         let plain = p.plan_int8_question_with_control(source, &q.question, b, &ctx, cmd.host.planning(), mapping, &mut Continue).unwrap();
-        assert_eq!(synthesis.preflight_metadata().discovery(), plain.preflight_metadata());
+        let discovery = synthesis.preflight_metadata().discovery(); let plain_expected = plain.preflight_metadata();
+        assert_eq!(discovery.source_span(), plain_expected.source_span());
+        assert_eq!(discovery.chunk_count(), plain_expected.chunk_count());
+        assert_eq!(discovery.native_chunks(), plain_expected.native_chunks());
+        assert_eq!(discovery.planned_work(), plain_expected.planned_work());
+        assert_eq!(discovery.reserved_mask_visits(), plain_expected.reserved_mask_visits());
+        // Synthesis subtracts its reservation from the original discovery
+        // allowance, so exact private request authority must differ.
+        assert_ne!(discovery, plain_expected);
         for (a, b) in synthesis.execution_identities().zip(plain.execution_identities()) { assert_eq!(a, b); }
         assert_eq!(synthesis.preflight_metadata().discovery().whitespace_chunks(), 1);
     }
