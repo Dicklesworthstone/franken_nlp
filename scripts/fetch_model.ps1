@@ -53,7 +53,8 @@ function Release-Lock {
 function Exit-Fetch([int]$Code, [string]$Message = '') {
     if ($Message) { Write-Log "ERROR code=$Code detail=$Message" }
     if ($Code -ne 0) { Write-ResumeGuidance }
-    Release-Lock
+    # The invocation's finally block owns release, including unexpected errors
+    # and pipeline cancellation. Never release while a transfer is unwinding.
     exit $Code
 }
 
@@ -399,16 +400,45 @@ function Download-One($Entry, $Entries) {
     }
     Ensure-PartialAndJournal $partial $journal $url $Entry
     $start = Get-Length $partial
+    $partialVerified = $false
     if ($start -gt $Entry.Length) {
         Quarantine $partial 'partial-longer-than-expected'
         Quarantine $journal 'partial-longer-than-expected'
         Ensure-PartialAndJournal $partial $journal $url $Entry
         $start = 0
+    } elseif ($start -eq $Entry.Length) {
+        # A transport may have finished immediately before interruption. Only
+        # the exact length AND digest authorize its no-transfer publication.
+        if (Test-VerifiedFile $partial $Entry.Length $Entry.Sha256) {
+            $partialVerified = $true
+            Write-Log "DECISION=RESUME_VERIFIED file=$($Entry.Name) existing_bytes=$start"
+        } else {
+            Write-Log "DECISION=RESTART file=$($Entry.Name) reason=completed-partial-verification-failed"
+            Quarantine $partial 'completed-partial-verification-failed'
+            Quarantine $journal 'completed-partial-verification-failed'
+            Ensure-PartialAndJournal $partial $journal $url $Entry
+            $start = 0
+        }
     }
-    Assert-Preflight $Entries
-    Write-Log ("DECISION={0} file={1} existing_bytes={2} expected_bytes={3}" -f $(if ($start -gt 0) {'RESUME'} else {'MISS'}), $Entry.Name, $start, $Entry.Length)
-    Download-Partial $url $partial $journal $Entry
-    if (-not (Test-VerifiedFile $partial $Entry.Length $Entry.Sha256)) { Exit-Fetch 1 "digest/length verification failure file=$($Entry.Name) expected_bytes=$($Entry.Length) expected_sha256=$($Entry.Sha256)" }
+    if (-not $partialVerified) {
+        # Quarantine retains the rejected bytes. Remove their storage credit
+        # before deciding whether a new download fits on this filesystem.
+        Assert-Preflight $Entries
+        Write-Log ("DECISION={0} file={1} existing_bytes={2} expected_bytes={3}" -f $(if ($start -gt 0) {'RESUME'} else {'MISS'}), $Entry.Name, $start, $Entry.Length)
+        Download-Partial $url $partial $journal $Entry
+        if (-not (Test-VerifiedFile $partial $Entry.Length $Entry.Sha256)) {
+            # Do not trap every future invocation behind a full-length bad
+            # prefix. Preserve its bytes and binding; the next attempt must
+            # acquire and verify a separately admitted fresh copy.
+            Quarantine $partial 'completed-download-verification-failed'
+            Quarantine $journal 'completed-download-verification-failed'
+            Exit-Fetch 1 "digest/length verification failure file=$($Entry.Name) expected_bytes=$($Entry.Length) expected_sha256=$($Entry.Sha256) rejected_bytes=quarantined"
+        }
+    }
+    # A verified retained partial needs no new payload space or network call.
+    # Flush before the same-directory, no-replace move, as on a fresh transfer.
+    $completed = [IO.File]::Open($partial, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $completed.Flush($true) } finally { $completed.Dispose() }
     [IO.File]::Move($partial, $final)
     $script:VerifiedNames[$Entry.Name] = $true
     Write-Log "COMPLETE file=$($Entry.Name) observed_bytes=$($Entry.Length) sha256=$($Entry.Sha256)"
@@ -433,27 +463,38 @@ if ($Revision -ne $DefaultRevision) {
 }
 if ($TestBaseUrl -and $env:FNLP_FETCH_ALLOW_TEST_BASE_URL -ne '1') { Exit-Fetch 2 '-TestBaseUrl requires FNLP_FETCH_ALLOW_TEST_BASE_URL=1' }
 
-Ensure-Destination
-$entries = Get-Catalog
-$script:LockDir = Join-Path $Dest ('.fnlp-fetch-lock-' + $Revision)
-try { New-Item -ItemType Directory -Path $script:LockDir -ErrorAction Stop | Out-Null }
-catch { Exit-Fetch 4 "revision lock busy or stale path=$script:LockDir; do not bypass concurrent access" }
-$script:LockOwned = $true
-Write-Log "LOCK RESULT=PASS path=$script:LockDir"
-if (-not $CheckOnly) { Initialize-VerifiedFiles $entries }
+try {
+    Ensure-Destination
+    $entries = Get-Catalog
+    $script:LockDir = Join-Path $Dest ('.fnlp-fetch-lock-' + $Revision)
+    try { New-Item -ItemType Directory -Path $script:LockDir -ErrorAction Stop | Out-Null }
+    catch { Exit-Fetch 4 "revision lock busy or stale path=$script:LockDir; do not bypass concurrent access" }
+    $script:LockOwned = $true
+    Write-Log "LOCK RESULT=PASS path=$script:LockDir"
+    if (-not $CheckOnly) { Initialize-VerifiedFiles $entries }
 
-$failed = $false
-foreach ($entry in $entries) {
-    if ($CheckOnly) {
-        Write-Log "CHECK_ONLY file=$($entry.Name) expected_bytes=$($entry.Length)"
-        $checkPath = Join-Path $Dest $entry.Name
-        if (-not (Test-VerifiedFile $checkPath $entry.Length $entry.Sha256)) { $failed = $true }
-    } else { Download-One $entry $entries }
+    $failed = $false
+    foreach ($entry in $entries) {
+        if ($CheckOnly) {
+            Write-Log "CHECK_ONLY file=$($entry.Name) expected_bytes=$($entry.Length)"
+            $checkPath = Join-Path $Dest $entry.Name
+            if (-not (Test-VerifiedFile $checkPath $entry.Length $entry.Sha256)) { $failed = $true }
+        } else { Download-One $entry $entries }
+    }
+    if ($failed) {
+        Write-Log "CHECK_ONLY RESULT=FAIL files=$($entries.Count)/$($entries.Count)"; Exit-Fetch 1
+    }
+    if ($CheckOnly) { Write-Log "CHECK_ONLY RESULT=PASS files=$($entries.Count)/$($entries.Count)" }
+    else { Write-Log "FETCH_MODEL RESULT=PASS files=$($entries.Count)/$($entries.Count) bytes=$(($entries | Measure-Object -Property Length -Sum).Sum)" }
+    [Console]::Error.WriteLine(('NEXT source="{0}" command="fnlp convert --source {0} --source-manifest docs/truth-pack/nanbeige4.2-3b.source.json --recipe nanbeige42-int8-v1 --arch generic -o nanbeige4.2-3b.fnlpq-v1.int8.generic.fnlpq"' -f $Dest))
+    Exit-Fetch 0
+} catch [Management.Automation.PipelineStoppedException] {
+    # Ctrl+C / an owning PowerShell host's Stop is terminal, never a retry.
+    # Transfer cleanup runs first; the invocation finally releases its lock.
+    [Console]::Error.WriteLine('FETCH_MODEL INTERRUPTED retained_partials=journal-bound')
+    throw
+} catch {
+    Exit-Fetch 1 "source acquisition failed detail=$($_.Exception.Message)"
+} finally {
+    Release-Lock
 }
-if ($failed) {
-    Write-Log "CHECK_ONLY RESULT=FAIL files=$($entries.Count)/$($entries.Count)"; Exit-Fetch 1
-}
-if ($CheckOnly) { Write-Log "CHECK_ONLY RESULT=PASS files=$($entries.Count)/$($entries.Count)" }
-else { Write-Log "FETCH_MODEL RESULT=PASS files=$($entries.Count)/$($entries.Count) bytes=$(($entries | Measure-Object -Property Length -Sum).Sum)" }
-[Console]::Error.WriteLine(('NEXT source="{0}" command="fnlp convert --source {0} --source-manifest docs/truth-pack/nanbeige4.2-3b.source.json --recipe nanbeige42-int8-v1 --arch generic -o nanbeige4.2-3b.fnlpq-v1.int8.generic.fnlpq"' -f $Dest))
-Exit-Fetch 0

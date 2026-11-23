@@ -308,6 +308,14 @@ function Test-DiskAdmission {
     function Assert-Disk([bool]$Condition, [string]$Label) {
         if (-not $Condition) { throw "disk admission assertion failed: $Label" }
     }
+    function Assert-Quarantined([string]$PayloadPath, [string]$JournalText) {
+        $qdir = Join-Path $Dest 'quarantine'
+        $payloads = @(Get-ChildItem -LiteralPath $qdir -File | Where-Object { $_.Name -like 'alpha.bin.partial.*' })
+        $journals = @(Get-ChildItem -LiteralPath $qdir -File | Where-Object { $_.Name -like 'alpha.bin.journal.*' })
+        Assert-Disk ($payloads.Count -eq 1 -and $journals.Count -eq 1) 'rejected bytes and one binding retained'
+        Assert-Disk ((Get-Sha256 $payloads[0].FullName) -eq (Get-Sha256 $PayloadPath)) 'quarantine payload stays byte-identical'
+        Assert-Disk ([IO.File]::ReadAllText($journals[0].FullName) -eq $JournalText) 'quarantine journal stays byte-identical'
+    }
     function New-DiskCase([string]$Name) {
         $path = Join-Path $Work ('disk-' + $Name)
         New-Item -ItemType Directory -Path $path | Out-Null
@@ -375,6 +383,64 @@ function Test-DiskAdmission {
     Initialize-VerifiedFiles $entries
     Assert-Disk ((Get-RemainingDownloadBytes $entries) -eq $entries[0].Length) 'same-length corrupt source remains charged'
 
+    $Dest = New-DiskCase complete-verified
+    [IO.File]::Copy((Join-Path $diskFixture 'alpha.bin'), (Join-Path $Dest 'alpha.bin.partial'))
+    [IO.File]::Copy((Join-Path $diskFixture 'beta.bin'), (Join-Path $Dest 'beta.bin'))
+    $binding = Get-JournalText "$TestBaseUrl/alpha.bin" $entries[0]
+    Write-NewUtf8File (Join-Path $script:JournalDir 'alpha.bin.journal') $binding
+    $script:TestFreeBytes = [int64]0
+    Initialize-VerifiedFiles $entries
+    Download-One $entries[0] $entries
+    Assert-Disk ($script:SpaceProbes -eq 0 -and $script:TestTransfers -eq 0) 'verified completed partial needs no new disk or transport'
+    Assert-Disk ((Get-Sha256 (Join-Path $Dest 'alpha.bin')) -eq $entries[0].Sha256) 'verified completed partial publishes exact bytes'
+    Assert-Disk (-not (Test-Path -LiteralPath (Join-Path $Dest 'quarantine'))) 'verified completed partial is not quarantined'
+
+    $rejectedAlpha = Join-Path $Work 'rejected-alpha.bin'
+    $rejectedBytes = [IO.File]::ReadAllBytes((Join-Path $diskFixture 'alpha.bin'))
+    $rejectedBytes[0] = $rejectedBytes[0] -bxor 1
+    [IO.File]::WriteAllBytes($rejectedAlpha, $rejectedBytes)
+
+    $Dest = New-DiskCase complete-corrupt
+    [IO.File]::Copy($rejectedAlpha, (Join-Path $Dest 'alpha.bin.partial'))
+    [IO.File]::Copy((Join-Path $diskFixture 'beta.bin'), (Join-Path $Dest 'beta.bin'))
+    Write-NewUtf8File (Join-Path $script:JournalDir 'alpha.bin.journal') $binding
+    $script:TestFreeBytes = $entries[0].Length + $MarginBytes
+    Initialize-VerifiedFiles $entries
+    Download-One $entries[0] $entries
+    Assert-Disk ($script:TestTransfers -eq 1 -and $script:TestFreeBytes -eq $MarginBytes) 'corrupt completed partial restarts once with full disk charge'
+    Assert-Disk ((Get-Sha256 (Join-Path $Dest 'alpha.bin')) -eq $entries[0].Sha256) 'fresh replacement verifies'
+    Assert-Quarantined $rejectedAlpha $binding
+
+    $Dest = New-DiskCase complete-corrupt-no-space
+    [IO.File]::Copy($rejectedAlpha, (Join-Path $Dest 'alpha.bin.partial'))
+    [IO.File]::Copy((Join-Path $diskFixture 'beta.bin'), (Join-Path $Dest 'beta.bin'))
+    Write-NewUtf8File (Join-Path $script:JournalDir 'alpha.bin.journal') $binding
+    $script:TestFreeBytes = $MarginBytes
+    Initialize-VerifiedFiles $entries
+    $refused = $false
+    try { Download-One $entries[0] $entries }
+    catch { $refused = $_.Exception.Message -match '^disk-test-exit:4 ' }
+    Assert-Disk ($refused -and $script:TestTransfers -eq 0) 'lost corrupt-prefix credit must be admitted before replacement'
+    Assert-Disk (-not (Test-Path -LiteralPath (Join-Path $Dest 'alpha.bin'))) 'low-space recovery never publishes rejected bytes'
+    Assert-Quarantined $rejectedAlpha $binding
+
+    $Dest = New-DiskCase corrupt-resumed-prefix
+    [IO.File]::WriteAllBytes((Join-Path $Dest 'alpha.bin.partial'), $rejectedBytes[0..4])
+    [IO.File]::Copy((Join-Path $diskFixture 'beta.bin'), (Join-Path $Dest 'beta.bin'))
+    Write-NewUtf8File (Join-Path $script:JournalDir 'alpha.bin.journal') $binding
+    $script:TestFreeBytes = $entries[0].Length - 5 + $MarginBytes
+    Initialize-VerifiedFiles $entries
+    $refused = $false
+    try { Download-One $entries[0] $entries }
+    catch { $refused = $_.Exception.Message -match '^disk-test-exit:1 ' }
+    Assert-Disk ($refused -and $script:TestTransfers -eq 1) 'completed corrupt resume refuses without an unbounded retry'
+    Assert-Disk (-not (Test-Path -LiteralPath (Join-Path $Dest 'alpha.bin'))) 'corrupt resumed result never publishes'
+    Assert-Quarantined $rejectedAlpha $binding
+    $script:TestFreeBytes = $entries[0].Length + $MarginBytes
+    Download-One $entries[0] $entries
+    Assert-Disk ($script:TestTransfers -eq 2 -and $script:TestFreeBytes -eq $MarginBytes) 'later retry starts clean with a new admission'
+    Assert-Disk ((Get-Sha256 (Join-Path $Dest 'alpha.bin')) -eq $entries[0].Sha256) 'later retry escapes corrupt completed-prefix trap'
+
     $Dest = New-DiskCase insufficient
     $script:TestFreeBytes = $total + $MarginBytes - 1
     $refused = $false
@@ -394,13 +460,54 @@ function Test-DiskAdmission {
     try { Get-Catalog | Out-Null }
     catch { $refused = $_.Exception.Message -match '^disk-test-exit:2 ' }
     Assert-Disk $refused 'catalog plus margin overflow refuses'
-    Pass 'disk-admission' 'eight cached-resume-capacity-and-overflow scenarios without network'
+    Pass 'disk-admission' 'twelve cache-recovery-resume-capacity-and-overflow scenarios without network'
+}
+
+function Test-UnexpectedFailureCleanup {
+    $script:Cases++
+    $destination = Join-Path $Work 'unexpected-failure'
+    New-Item -ItemType Directory -Path $destination | Out-Null
+    $source = Join-Path $destination 'ready.bin'
+    [IO.File]::WriteAllText($source, 'retained verified source', [Text.UTF8Encoding]::new($false))
+    $digest = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
+    $catalogPath = Join-Path $Work 'unexpected-failure-catalog.txt'
+    $catalogLine = 'ready.bin|' + (Get-Item -LiteralPath $source).Length + '|' + $digest
+    [IO.File]::WriteAllText($catalogPath, $catalogLine + [char]10)
+    $wrapper = Join-Path $Work 'unexpected-failure-wrapper.ps1'
+    $wrapperBody = @'
+param([string]$Fetcher, [string]$Destination, [string]$CatalogPath)
+# Inject a failure in the existing command dependency, after the real fetcher
+# has acquired its revision lock. No production test hooks are introduced.
+function Get-FileHash {
+    param([string]$LiteralPath, [string]$Algorithm)
+    throw [IO.IOException]::new('fixture verification failure')
+}
+& $Fetcher -Dest $Destination -Catalog $CatalogPath -AllowUntrustedRevision -CheckOnly
+exit $LASTEXITCODE
+'@
+    [IO.File]::WriteAllText($wrapper, $wrapperBody, [Text.UTF8Encoding]::new($false))
+    $errorPath = Join-Path $Work 'unexpected-failure.err'
+    & $script:PwshPath -NoProfile -File $wrapper -Fetcher $Fetch -Destination $destination -CatalogPath $catalogPath 2> $errorPath
+    $status = $LASTEXITCODE
+    $lock = Join-Path $destination ('.fnlp-fetch-lock-' + $Revision)
+    if ($status -ne 1 -or (Test-Path -LiteralPath $lock) -or
+        (Get-Content -LiteralPath $errorPath -Raw) -notmatch 'fixture verification failure' -or
+        (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant() -ne $digest) {
+        Fail 'unexpected-failure' "owned-lock-release exit=$status"
+        return
+    }
+    & $script:PwshPath -NoProfile -File $Fetch -Dest $destination -Catalog $catalogPath -AllowUntrustedRevision -CheckOnly
+    if ($LASTEXITCODE -eq 0 -and -not (Test-Path -LiteralPath $lock)) {
+        Pass 'unexpected-failure' 'verification-error-releases-only-owned-lock-and-allows-clean-retry'
+    } else { Fail 'unexpected-failure' 'retry-after-unexpected-failure' }
 }
 
 try {
+    $script:PwshPath = (Get-Command pwsh -ErrorAction Stop).Source
     if ($DiskOnly) {
         New-Item -ItemType Directory -Path $Work | Out-Null
         Test-DiskAdmission
+        Test-UnexpectedFailureCleanup
         return
     }
     if (-not (Get-Command python3 -ErrorAction SilentlyContinue)) { throw 'python3 is required for the local fixture server' }
@@ -594,6 +701,7 @@ try {
     if ($status -eq 4 -and [IO.File]::ReadAllText($ownerMarker) -eq 'another invocation owns this lock' -and (Get-Content (Join-Path $Work 'case19.err') -Raw) -notmatch 'LOCK_RELEASE_DEFERRED') { Pass '19' 'nonempty-contended-lock-untouched' }
     else { Fail '19' "nonempty-contended-lock-untouched exit=$status" }
     Test-DiskAdmission
+    Test-UnexpectedFailureCleanup
 } catch {
     Fail 'harness' $_.Exception.Message
 } finally {
