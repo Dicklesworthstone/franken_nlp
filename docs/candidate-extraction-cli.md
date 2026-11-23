@@ -117,6 +117,61 @@ task quality, tokenizer parity and measured speed are not established by this
 wiring. INT8 extraction corpora and retained extraction jobs keep their existing
 byte-input contracts.
 
+## Persistent compute workers and prompt prefill
+
+Single-request extraction can use one persistent INT8 projection team and
+bounded layer-major prompt processing together:
+
+```sh
+fnlp candidate extract document.txt --schema schema.json \
+  --model ./model.fnlpq --memory-mib 8192 \
+  --compute-threads 4 --prefill-rows 4 \
+  --input-encoding safe-bpe-v1
+```
+
+`--compute-threads` accepts 1 through 64 and counts the coordinator plus its
+row workers; runtime threads are additional. The default of 1 keeps serial
+execution. A wider team is formed once for the whole extraction request and
+serves prompt processing and constrained decoding across both decoder passes.
+`--prefill-rows` accepts 1 through 64 tokens from this one prompt per morsel.
+It works with either serial execution or a worker team. Omitting it keeps the
+existing sequential prompt schedule. Neither option batches source documents.
+
+Both schedules consume the same identity-sealed extraction plan and vocabulary.
+They preserve structural or source-membership mode, the exact original schema
+and decimal domain, grammar limits, original source evidence and the requested
+output budget. They also compose with `--selected-rows`; the complete legal
+grammar row set still has to fit its explicit ceiling. Scheduling does not
+change the compact-input policy or introduce free-text sampling controls.
+
+Before schema, source or model IO, admission includes the caller's complete
+schema/source preparation, the separately charged transferred plan and
+vocabulary, native KV and scratch, coordinator prefill scratch, fixed worker
+payload and bounded result staging. The two preparation owners coexist; compact
+tokens and selected heads do not discount their original-byte storage. Invalid
+geometry or an insufficient memory ceiling refuses before any private file is
+opened. The installed runtime capacity must match the complete admitted worker
+and prompt-row geometry. Shared request cancellation, checkpoint and deadline
+authority remains in force through native cleanup and physical worker join.
+
+Successful worker execution adds a separate `compute` receipt describing
+completed physical projections. The exact extraction result remains unchanged
+in shape, including its JSON string and source occurrences. Serial results
+omit this field, retaining the previous default response shape. Output memory
+and the caller's preparation remain held through serialization, writing and
+flushing. These options apply to one-request extraction; extraction corpora
+and retained jobs retain their existing schedules. Numerical equivalence,
+extraction quality and measured speed require model-present evidence.
+
+The library offers `execute_int8_extract_layer_major`,
+`execute_int8_extract_with_threads` and
+`execute_int8_extract_layer_major_with_threads`. Each takes a sealed plan,
+resident model, vocabulary and `SourceLimits` covering the transferred
+preparation and native/mask bounds. Threaded variants also take the kernel
+and compute width; the layer-major variant places `Int8PrefillLimits`
+before the cancellation token. The original sequential
+`execute_int8_extract` API retains its existing contract.
+
 ## Evidence scope
 
 Regression sources cover command routing, duplicate/unsupported schemas,
@@ -125,7 +180,10 @@ transfer, context limits and shared preparation cancellation. Compact-input
 regressions cover complete workspace admission before IO, original and combined
 byte limits, cumulative schema/source tokenizer exhaustion, policy-bound
 identity, selected-row composition, every cancellation cause and unchanged
-byte-default output. They use real pinned planning and grammar code, not a fake
-inference-success producer.
+byte-default output. Worker/prefill regressions cover independent and combined
+schedules, admitted geometry, exact peak refusal before IO, unchanged sealed
+identity under both grounding and encoding modes, selected-head composition
+and serial receipt omission. They use real pinned planning and grammar code,
+not a fake inference-success producer.
 Compilation, Rust tests, model-present execution, fidelity, performance and
 controller DSR qualification were not run in this implementation session.

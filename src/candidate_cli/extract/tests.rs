@@ -107,6 +107,82 @@ fn host_budget_reserves_complete_context_and_fixed_schema_cap() {
 }
 
 #[test]
+fn extraction_workers_and_prompt_morsels_compose_without_changing_shared_task_limits() {
+    let serial = command(&[]);
+    let (serial_args, serial_limits) = serial.validate().unwrap();
+    assert_eq!(serial_args.compute.threads(), 1);
+    assert_eq!(serial_limits.compute.workspace_bytes, 0);
+    assert!(serial.prefill().unwrap().is_none());
+    for width in ["1", "4", "64"] {
+        for rows in [None, Some("1"), Some("4"), Some("64")] {
+            let mut flags = vec!["--compute-threads", width, "--selected-rows", "31",
+                "--source-membership", "--input-encoding", "safe-bpe-v1"];
+            if let Some(rows) = rows { flags.extend(["--prefill-rows", rows]); }
+            let mut cmd = command(&flags);
+            cmd.host.memory_mib = 16_384;
+            let (args, limits) = cmd.validate().unwrap();
+            let prefill = cmd.prefill().unwrap();
+            assert_eq!(args.compute.threads(), width.parse::<usize>().unwrap());
+            assert_eq!(limits.compute, args.compute.admit_prefill(prefill).unwrap());
+            assert_eq!(prefill.map(|p| p.max_batch_rows), rows.map(|n| n.parse::<usize>().unwrap()));
+            assert!(args.policy.prefill().unwrap().is_none());
+            assert_eq!(canonjson::canonical_bytes(&cmd.host.task_budget(limits)).unwrap(),
+                canonjson::canonical_bytes(&serial.host.task_budget(serial_limits)).unwrap());
+            assert_eq!(cmd.head.limits().unwrap().unwrap().max_rows_per_step, 31);
+            assert!(cmd.source_membership);
+            // Corpus/job consumers of the shared host retain their own serial contract.
+            let (shared, shared_limits) = cmd.host.common(cmd.input.clone()).unwrap();
+            assert_eq!(shared.compute.threads(), 1);
+            assert_eq!(shared_limits.compute.workspace_bytes, 0);
+        }
+    }
+}
+
+#[test]
+fn invalid_extraction_schedules_refuse_before_schema_source_model_or_output_io() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private source read") } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("extraction output written") }
+        fn flush(&mut self) -> io::Result<()> { panic!("extraction output flushed") }
+    }
+    for flag in ["--compute-threads", "--prefill-rows"] {
+        for value in ["0", "65", "1000000"] {
+            assert_eq!(command(&[flag, value]).execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+        }
+        for value in ["-1", "NaN", "4.0", "999999999999999999999999999999999999"] {
+            assert!(super::super::definition().try_get_matches_from(["candidate", "extract",
+                "--model", "must-not-open.fnlpq", "--memory-mib", "8192",
+                "--schema", "must-not-open.json", flag, value]).is_err());
+        }
+    }
+    for flags in [vec!["--compute-threads", "4"], vec!["--prefill-rows", "4"],
+        vec!["--compute-threads", "4", "--prefill-rows", "4"]] {
+        let mut cmd = command(&flags);
+        cmd.host.memory_mib = 16_384;
+        let (args, mut limits) = cmd.validate().unwrap();
+        let prefill = cmd.prefill().unwrap();
+        let peak = compute::source_peak_bytes(&args, limits, cmd.host.max_result_bytes, prefill).unwrap();
+        limits.memory_bytes = peak;
+        compute::check_source_memory(&args, limits, cmd.host.max_result_bytes, prefill).unwrap();
+        limits.memory_bytes -= 1;
+        assert_eq!(compute::check_source_memory(&args, limits, cmd.host.max_result_bytes, prefill),
+            Err(CandidateError::Arguments));
+        // The exact peak must still fail if either preparation owner, the
+        // coordinator's prompt scratch or the fixed child payload is omitted.
+        let extra = prefill.map(|p| p.validate().unwrap()).unwrap_or(0);
+        for missing in [limits.preparation_bytes, extra, limits.compute.workspace_bytes] {
+            if missing == 0 { continue; }
+            limits.memory_bytes = peak - missing;
+            assert_eq!(compute::check_source_memory(&args, limits, cmd.host.max_result_bytes, prefill),
+                Err(CandidateError::Arguments));
+        }
+        cmd.host.memory_mib = (peak - 1) / MIB;
+        assert_eq!(cmd.execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
 fn compact_extraction_admits_the_complete_schema_and_source_workspace_before_io() {
     use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
     let cmd = command(&["--input-encoding", "safe-bpe-v1",
@@ -195,4 +271,10 @@ fn disabled_feature_never_reads_schema_source_or_model() {
     assert!(!diagnostic.contains("local.fnlpq") && !diagnostic.contains("schema.json"));
     let cmd = command(&["--input-encoding", "safe-bpe-v1"]);
     assert_eq!(cmd.execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Unavailable));
+    for width in ["1", "4"] {
+        let mut cmd = command(&["--compute-threads", width, "--prefill-rows", "4",
+            "--input-encoding", "safe-bpe-v1", "--selected-rows", "31"]);
+        cmd.host.memory_mib = 16_384;
+        assert_eq!(cmd.execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Unavailable));
+    }
 }

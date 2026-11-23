@@ -6,6 +6,7 @@ use crate::{
     batch::{BatchDocument, extract::{ExtractionBatchArgs,
         quantized::{Int8ExtractionBatchPlanner, PreparedInt8BatchExtraction}}},
     candidate_cli::extract::{self as command, ExtractCommand},
+    hosted::SourceLimits,
     native_engine::decode::{DecodeCancellationKind, DecodeStepControl},
     tasks::extract::ExtractionVocabulary,
     tokenizer::untrusted::UntrustedEncoding,
@@ -55,10 +56,13 @@ fn prepare(planner: &Int8ExtractionBatchPlanner, document: String, request: Extr
 
 pub(in crate::candidate_cli) fn execute(command: ExtractCommand, args: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+    let prefill = command.prefill()?;
+    if limits.compute != command.compute.admit_prefill(prefill)? { return Err(CandidateError::Arguments); }
+    compute::check_source_memory(&args, limits, command.host.max_result_bytes, prefill)?;
     let encoding = command.encoding_policy(limits)?;
     // Storage-before-charge lifetime: this owner is declared before schema,
     // document, tokenizer, program, executable and output-staging allocations.
-    let session = Session::new(&args, limits)?;
+    let session = Session::new_with_prefill(&args, limits, prefill)?;
     let schema = session.read(&command.schema, input, command::SCHEMA_BYTES)?;
     let document = session.read(&command.input, input, args.max_input_bytes)?;
     let request = command::arguments(schema, command.source_membership, command.host.task_budget(limits))?;
@@ -75,17 +79,35 @@ pub(in crate::candidate_cli) fn execute(command: ExtractCommand, args: Candidate
     session.remaining()?;
     let cancellation = CancellationToken::default();
     let model = session.load(&args, limits, &facts, cancellation.clone())?;
-    let result = session.engine.execute_int8_extract(&model, prepared, vocabulary,
-        session.native(&args)?, command.host.masks(), command.host.max_mask_node_visits, cancellation)
-        .map_err(|_| CandidateError::Execution)?;
+    let native_limits = SourceLimits {
+        native: session.native(&args)?, preparation_reserve_bytes: limits.preparation_bytes,
+        mask_limits: command.host.masks(), max_mask_node_visits: command.host.max_mask_node_visits,
+    };
+    let result = if limits.compute.threads == 1 {
+        compute::Completion::Serial(match prefill {
+            Some(prefill) => session.engine.execute_int8_extract_layer_major(&model, prepared,
+                vocabulary, native_limits, prefill, cancellation),
+            None => session.engine.execute_int8_extract(&model, prepared, vocabulary,
+                native_limits.native, native_limits.mask_limits, native_limits.max_mask_node_visits, cancellation),
+        }.map_err(|_| CandidateError::Execution)?)
+    } else {
+        let kernel = crate::native_engine::simd::config::process_kernel();
+        compute::Completion::Team(match prefill {
+            Some(prefill) => session.engine.execute_int8_extract_layer_major_with_threads(&model, prepared,
+                vocabulary, native_limits, kernel, limits.compute.threads, prefill, cancellation),
+            None => session.engine.execute_int8_extract_with_threads(&model, prepared,
+                vocabulary, native_limits, kernel, limits.compute.threads, cancellation),
+        }.map_err(|_| CandidateError::Execution)?)
+    };
     session.remaining()?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
         evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
         source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
-        quant_recipe: &facts.recipe_id, output: &result };
+        quant_recipe: &facts.recipe_id, output: result.result() };
     // The raw extracted JSON remains a STRING in the typed result. Converting
     // it through Value here would destroy the exact decimal/scalar contract.
     // Output and preparation guards remain live until external flush completes.
+    let response = compute::Response { response: &response, compute: result.compute() };
     let response = input_encoding::Response { response: &response,
         input_encoding: input_encoding::reported_policy(&encoding) };
     publish_checked(&response, command.host.max_result_bytes + 4096, output,

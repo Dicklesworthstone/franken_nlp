@@ -3,6 +3,7 @@ use super::*;
 use crate::{
     batch::extract::{ExtractionBatchArgs, ExtractionBatchGrounding},
     grammar::{CompileLimits, runtime::JsonProgram},
+    native_engine::strict_int8::prefill::Int8PrefillLimits,
 };
 use source::SourceHostArgs;
 pub(super) mod selected;
@@ -18,6 +19,13 @@ pub(crate) struct ExtractCommand {
     pub(super) host: SourceHostArgs,
     #[command(flatten)]
     pub(super) head: selected::SelectedRowsArgs,
+    /// Layer-major INT8 prompt processing, 1..=64 tokens per morsel.
+    /// Composes with persistent compute workers and the exact selected grammar head.
+    /// Omitted keeps sequential prompt processing; this does not batch documents.
+    #[arg(long, value_name = "ROWS")]
+    prefill_rows: Option<usize>,
+    #[arg(skip)]
+    pub(super) compute: compute::Args,
     /// Bounded local JSON schema file, never a URL or stdin. Exact numbers are retained.
     #[arg(long, value_name = "FILE")]
     pub(super) schema: PathBuf,
@@ -30,23 +38,38 @@ pub(crate) struct ExtractCommand {
 }
 
 pub(super) fn definition() -> clap::Command {
-    input_encoding::definition(ExtractCommand::augment_args(clap::Command::new("extract")
+    compute::definition(input_encoding::definition(ExtractCommand::augment_args(clap::Command::new("extract")
         .about("Extract using an exact local JSON schema and constrained INT8 decoding")
-        .long_about("Compile a bounded user schema and exact source before loading weights. The supported schema subset is the existing grammar compiler's; unsupported keywords fail closed. Schema validity does not prove extracted facts. Use --source-membership for explicit verbatim source fields. --selected-rows explicitly projects the complete legal grammar set instead of the full vocabulary, with a per-step row ceiling that refuses rather than prunes. EOS remains a scored choice; no speed or parity qualification is implied. No sampling, repair retry, remote schema resolution or semantic-verification claim is available.")))
+        .long_about("Compile a bounded user schema and exact source before loading weights. The supported schema subset is the existing grammar compiler's; unsupported keywords fail closed. Schema validity does not prove extracted facts. Use --source-membership for explicit verbatim source fields. --selected-rows explicitly projects the complete legal grammar set instead of the full vocabulary, with a per-step row ceiling that refuses rather than prunes. EOS remains a scored choice; no speed or parity qualification is implied. No sampling, repair retry, remote schema resolution or semantic-verification claim is available."))))
         .after_long_help("--input-encoding safe-bpe-v1 explicitly compacts the exact schema and source while excluding template-control tokens. Both segments share ONE tokenizer allowance, including pair checks, examined pair bytes and actual untrusted tokens. The aggregate input ceiling is max-input-bytes plus the 64-KiB schema allowance, capped at 1 MiB; the separate schema and document byte ceilings still apply. Workspace for the complete allowance is admitted before either file or model IO. The policy binds execution identity and is reported on compact results. Exhaustion refuses without fallback. Original schema numbers, source bytes and citation offsets remain exact. Byte-fallback is the default. Compact input changes prompt tokens and makes no identical-output, quality or measured-speed claim.")
 }
 impl ExtractCommand {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let mut command = Self::from_arg_matches(matches)?;
         command.encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+        command.compute = compute::Args::from_matches(matches)?;
         Ok(command)
     }
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), CandidateError> {
         self.head.limits()?;
+        let prefill = self.prefill()?;
+        let admission = self.compute.admit_prefill(prefill)?;
         check_schema_path(&self.schema)?;
-        let (args, limits) = self.host.common_with_encoding(self.input.clone(), &self.encoding)?;
+        let (mut args, mut limits) = self.host.common_with_encoding(self.input.clone(), &self.encoding)?;
+        args.compute = self.compute;
+        limits.compute = admission;
         validate_preparation(&self.host, &self.encoding_policy(limits)?, limits)?;
+        // The new hosted schedules retain a separately charged transferred
+        // plan/vocabulary beside the caller's original schema/source owner.
+        compute::check_source_memory(&args, limits, self.host.max_result_bytes, prefill)?;
         Ok((args, limits))
+    }
+    pub(super) fn prefill(&self) -> Result<Option<Int8PrefillLimits>, CandidateError> {
+        self.prefill_rows.map(|rows| {
+            let bytes = Int8PrefillLimits::required_extra_scratch_bytes(rows)
+                .map_err(|_| CandidateError::Arguments)?;
+            Ok(Int8PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: bytes })
+        }).transpose()
     }
     pub(super) fn encoding_policy(&self, limits: Limits)
         -> Result<crate::tokenizer::untrusted::UntrustedEncoding, CandidateError> {

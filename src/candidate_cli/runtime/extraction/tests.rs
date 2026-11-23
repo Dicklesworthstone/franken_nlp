@@ -187,6 +187,69 @@ fn compact_extraction_preserves_exact_segments_and_composes_with_both_grounding_
 }
 
 #[test]
+fn mismatched_extraction_worker_or_prompt_capacity_refuses_at_runtime_entry_before_io() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private source read") } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("extraction output written") }
+        fn flush(&mut self) -> io::Result<()> { panic!("extraction output flushed") }
+    }
+    for (admitted, requested) in [
+        (vec![], vec!["--compute-threads", "4"]),
+        (vec!["--compute-threads", "4"], vec![]),
+        (vec!["--compute-threads", "4", "--prefill-rows", "4"],
+            vec!["--compute-threads", "4", "--prefill-rows", "64"]),
+    ] {
+        let mut admitted = make_command(&admitted);
+        admitted.host.memory_mib = 16_384;
+        let (args, limits) = admitted.validate().unwrap();
+        let mut requested = make_command(&requested);
+        requested.schema = PathBuf::from("must-not-open-mismatched-schema.json");
+        assert_eq!(execute(requested, args, limits, &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
+fn worker_and_prefill_schedules_keep_exact_sealed_schema_source_and_selected_head_identity() {
+    for encoding in ["byte-fallback", "safe-bpe-v1"] {
+        for (schema, grounded) in [
+            (r#"{"type":"number","const":0.12345678901234567890123456789012345678}"#, false),
+            (r#"{"type":"string","maxLength":32,"x-fnlp-source":"verbatim"}"#, true),
+        ] {
+            let base = ["--input-encoding", encoding, "--selected-rows", "31"];
+            let serial = make_command(&base);
+            let (_, serial_limits) = serial.validate().unwrap();
+            let compiler = planner(&facts(), &serial.host, serial_limits, None).unwrap();
+            let request = || command::arguments(schema.to_owned(), grounded,
+                serial.host.task_budget(serial_limits)).unwrap();
+            let document = "Alice in 上海. <tool_call> é";
+            let original = prepare(&compiler, document.to_owned(), request(), &serial.host,
+                &serial.encoding_policy(serial_limits).unwrap(), &mut continuing()).unwrap();
+            let original = serial.head.extraction(original.into_extraction_plan()).unwrap();
+            for schedule in [vec!["--compute-threads", "4"], vec!["--prefill-rows", "4"],
+                vec!["--compute-threads", "4", "--prefill-rows", "4"]] {
+                let mut flags = base.to_vec();
+                flags.extend(schedule);
+                let mut cmd = make_command(&flags);
+                cmd.host.memory_mib = 16_384;
+                let (_, limits) = cmd.validate().unwrap();
+                let prepared = prepare(&compiler, document.to_owned(), request(), &cmd.host,
+                    &cmd.encoding_policy(limits).unwrap(), &mut continuing()).unwrap();
+                assert_eq!(prepared.source().text(), document);
+                let selected = cmd.head.extraction(prepared.into_extraction_plan()).unwrap();
+                selected.verify_identity(original.execution_identity()).unwrap();
+                assert_eq!(selected.execution_identity(), original.execution_identity());
+                assert_eq!(selected.execution_identity().schema_digest, Sha256Digest::of_bytes(schema.as_bytes()));
+                assert_eq!(selected.planned_work(), original.planned_work());
+                assert_eq!(selected.selected_rows().unwrap().max_rows_per_step, 31);
+                assert_eq!(canonjson::canonical_bytes(selected.options()).unwrap(),
+                    canonjson::canonical_bytes(original.options()).unwrap());
+            }
+        }
+    }
+}
+
+#[test]
 fn compact_schema_and_source_cannot_each_receive_a_fresh_tokenizer_allowance() {
     use crate::tokenizer::untrusted::{SafeBpeWork, UntrustedDocumentEncoder};
     let cmd = make_command(&["--input-encoding", "safe-bpe-v1"]);
@@ -303,10 +366,13 @@ fn byte_defaults_and_exact_decimal_output_remain_compatible_with_optional_proven
     #[derive(Serialize)]
     struct ExactText<'a> { json: &'a str }
     let text = ExactText { json: "0.12345678901234567890123456789012345678" };
-    let byte_wire = input_encoding::Response { response: &text, input_encoding: None };
+    let compute_wire = compute::Response { response: &text, compute: None };
+    let byte_wire = input_encoding::Response { response: &compute_wire, input_encoding: None };
     assert_eq!(serde_json::to_vec(&byte_wire).unwrap(), serde_json::to_vec(&text).unwrap());
-    let wire = input_encoding::Response { response: &text, input_encoding: input_encoding::reported_policy(&encoding) };
+    let wire = input_encoding::Response { response: &compute_wire,
+        input_encoding: input_encoding::reported_policy(&encoding) };
     let wire = serde_json::to_value(wire).unwrap();
     assert_eq!(wire["json"].as_str(), Some(text.json));
+    assert!(wire.get("compute").is_none());
     assert_eq!(wire["input_encoding"], serde_json::to_value(encoding).unwrap());
 }

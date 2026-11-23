@@ -110,9 +110,9 @@ are retained. Width 1 keeps coordinator-only execution. Omitting prefill keeps
 sequential prompt processing. This schedule does not change the prepared task
 identity or borrow free-text generation controls.
 
-Compute selection belongs to these one-request commands. INT8 maps, corpora,
-extraction and retained jobs keep their existing interfaces and do
-not inherit the flag through shared resource arguments.
+Source-task compute selection belongs to these one-request commands. INT8 maps,
+corpora and retained jobs keep their existing interfaces and do not inherit
+the flag through shared resource arguments.
 
 Before private IO, a checked simultaneous memory quote includes **both** full
 preparation owners: the CLI session and the transferred prepared source task,

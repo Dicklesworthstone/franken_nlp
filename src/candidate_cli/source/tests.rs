@@ -212,7 +212,7 @@ fn source_team_width_prefill_and_aggregate_memory_refuse_before_all_io() {
 }
 
 #[test]
-fn route_local_source_teams_do_not_enable_maps_corpora_jobs_or_extraction() {
+fn route_local_source_teams_do_not_enable_maps_corpora_or_jobs() {
     for route in ["map", "batch"] {
         let base = ["candidate", route, "--task", "ner", "--model", "m", "--memory-mib", "8192"];
         assert!(super::super::definition().try_get_matches_from(base).is_ok());
@@ -229,9 +229,6 @@ fn route_local_source_teams_do_not_enable_maps_corpora_jobs_or_extraction() {
         assert_eq!(super::super::definition().try_get_matches_from(argv).unwrap_err().kind(),
             clap::error::ErrorKind::UnknownArgument);
     }
-    assert_eq!(super::super::definition().try_get_matches_from(["candidate", "extract", "--model", "m",
-        "--memory-mib", "8192", "--schema", "schema.json", "--compute-threads", "2"])
-        .unwrap_err().kind(), clap::error::ErrorKind::UnknownArgument);
     // All other consumers receive the shared host's default, even when a
     // one-shot SourceCommand separately selected a team.
     let cmd = command("ner", &["--compute-threads", "7"]);
