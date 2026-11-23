@@ -56,18 +56,31 @@ quantized activation and compute independent full output rows. The prepared
 identity, selected-row head policy, exact source data and mask budgets do not
 change with worker width.
 
+`NlpEngine::execute_int8_source_layer_major_with_threads` adds
+`Int8PrefillLimits` after the kernel and compute-width arguments. It combines
+bounded prompt morsels of 1–64 rows with that same persistent team, then retains
+the team for constrained decoding and finalization. Before execution, the host
+derives and reserves the coordinator's extra prompt workspace and the children's
+fixed batch capacity separately. Child buffers cover both batched decoder rows
+and the one-position output head. Invalid geometry, underpriced prompt workspace
+or overflow in the combined scratch quote refuses before request dispatch.
+Prompt morsels do not reset the native work ledger or cancellation allowance.
+
 The existing process host must admit the requested child envelope. Input and
 vocabulary preparation, KV, scratch, output and worker reservations survive
 physical join on success, error and panic. A checkpoint after join uses the
 original shared cancellation authority. Successful
 `HostedInt8TeamResult<Int8SourceTaskRun>` retains guarded output and exposes
-separate physical compute counters. The existing default and layer-major APIs
-retain their serial contracts; this single-row team does not silently compose
-with packed prefill. Candidate users select it with `--compute-threads` on
-`ner`, `keyphrases`, `summarize`, or `answer`; see the
+separate physical compute counters. The existing default and serial layer-major
+APIs keep their contracts. Candidate users can combine `--compute-threads` and
+`--prefill-rows` on `ner`, `keyphrases`, `summarize`, or `answer`; see the
 [source command contract](candidate-source-cli.md#persistent-cpu-teams-for-source-tasks).
 
-Added admission and real-artifact gate definitions cover the task/encoding/head
-matrix, exact work ceilings, complete result equality between widths, typed
-cancellation and output lifetime. They are unexecuted definitions and do not
-establish whole-model parity or measured performance.
+Expanded regression definitions cover the task/encoding/head matrix, unchanged
+work ceilings and identities, independent coordinator/child memory admission,
+invalid batch bounds, combined scratch overflow, and output ownership. The
+controller-only real-artifact gate compares the complete serial result and model
+work with sequential-team and one-/three-row prompt-team execution at widths two
+and four; it also exercises all typed cancellation causes and rejected admission.
+These are authored, unexecuted definitions. They do not establish whole-model
+parity, executed correctness, or measured performance.

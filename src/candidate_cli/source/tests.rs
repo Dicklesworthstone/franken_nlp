@@ -193,8 +193,8 @@ fn source_team_width_prefill_and_aggregate_memory_refuse_before_all_io() {
     }
     for task in ["ner", "keyphrases", "summarize", "answer"] {
         for extra in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
-            vec!["--compute-threads", "2", "--prefill-rows", "1"],
-            vec!["--compute-threads", "7", "--prefill-rows", "64"],
+            vec!["--compute-threads", "2", "--prefill-rows", "0"],
+            vec!["--compute-threads", "7", "--prefill-rows", "65"],
             vec!["--compute-threads", "2", "--max-weight-mib", "8192"]] {
             let mut flags = extra; flags.extend(["--options", "must-not-open-team-options.json"]);
             let cmd = command(task, &flags);
@@ -202,7 +202,7 @@ fn source_team_width_prefill_and_aggregate_memory_refuse_before_all_io() {
         }
         let mut cmd = command(task, &["--compute-threads", "3", "--options", "must-not-open-team-options.json"]);
         let (common, limits) = cmd.validate().unwrap();
-        let required = compute::source_peak_bytes(&common, limits, cmd.args.host.max_result_bytes).unwrap();
+        let required = compute::source_peak_bytes(&common, limits, cmd.args.host.max_result_bytes, None).unwrap();
         // Even a nearly sufficient aggregate ceiling must refuse before
         // document, options, model, vocabulary or output allocations begin.
         cmd.args.host.memory_mib = (required - 1) / MIB;
@@ -264,10 +264,64 @@ fn default_build_refuses_all_source_commands_without_reading_any_input() {
     impl Read for NoRead { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("input read") } }
     for name in ["ner", "keyphrases", "summarize", "answer"] {
         for width in ["1", "3"] {
-            let cmd = command(name, &["--options", "never-open-private-options.json", "--compute-threads", width]);
+            let cmd = command(name, &["--options", "never-open-private-options.json",
+                "--compute-threads", width, "--prefill-rows", "4"]);
             let mut output = Vec::new();
             assert_eq!(cmd.execute(&mut NoRead, &mut output), Err(CandidateError::Unavailable));
             assert!(output.is_empty());
+        }
+    }
+}
+
+#[test]
+fn source_prompt_morsels_and_workers_compose_without_inheriting_generation_policy() {
+    use crate::native_engine::strict_int8::projection::int8_team_workspace_bytes_with_prefill;
+    for task in ["ner", "keyphrases", "summarize", "answer"] {
+        let serial = command(task, &["--input-encoding", "safe-bpe-v1", "--selected-rows", "32"]);
+        let (_, baseline) = serial.validate().unwrap();
+        for width in [1_usize, 2, 7, 64] {
+            for rows in [1_usize, 4, 64] {
+                let width_text = width.to_string(); let rows_text = rows.to_string();
+                let mut cmd = command(task, &["--compute-threads", &width_text, "--prefill-rows", &rows_text,
+                    "--input-encoding", "safe-bpe-v1", "--selected-rows", "32"]);
+                cmd.args.host.memory_mib = 16384;
+                let (common, limits) = cmd.validate().unwrap();
+                let prefill = cmd.args.prefill.limits().unwrap().unwrap();
+                assert_eq!(limits.compute.threads, width);
+                assert_eq!(limits.compute.workspace_bytes, if width == 1 { 0 }
+                    else { int8_team_workspace_bytes_with_prefill(width, rows).unwrap() });
+                assert_eq!(prefill.max_batch_rows, rows);
+                assert!(common.policy.prefill().unwrap().is_none());
+                assert_eq!(common.compute, cmd.args.compute);
+                assert_eq!(cmd.args.host.task_budget(limits), serial.args.host.task_budget(baseline));
+                assert_eq!(cmd.args.head.limits().unwrap().unwrap().max_rows_per_step, 32);
+                assert_eq!(limits.preparation_bytes, baseline.preparation_bytes);
+                assert!(matches!(common.input_encoding_policy(limits).unwrap(),
+                    crate::tokenizer::untrusted::UntrustedEncoding::SafeBpeV1(_)));
+            }
+        }
+    }
+}
+
+#[test]
+fn composed_source_memory_refuses_before_document_options_or_model_io() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("source input read"); } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("source output written"); }
+        fn flush(&mut self) -> io::Result<()> { panic!("source output flushed"); }
+    }
+    for task in ["ner", "keyphrases", "summarize", "answer"] {
+        for width in ["1", "4", "64"] {
+            let mut cmd = command(task, &["--compute-threads", width, "--prefill-rows", "64",
+                "--options", "must-not-open-source-options.json"]);
+            cmd.args.host.memory_mib = 16384;
+            let (common, limits) = cmd.validate().unwrap();
+            let prefill = cmd.args.prefill.limits().unwrap();
+            let required = compute::source_peak_bytes(&common, limits,
+                cmd.args.host.max_result_bytes, prefill).unwrap();
+            cmd.args.host.memory_mib = (required - 1) / MIB;
+            assert_eq!(cmd.execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
         }
     }
 }

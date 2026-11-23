@@ -89,10 +89,10 @@ plus `N - 1` persistent children for the complete prompt and constrained decode:
 
 ```sh
 fnlp candidate ner article.txt --model ./model.fnlpq --memory-mib 8192 \
-  --compute-threads 4 --input-encoding safe-bpe-v1 --selected-rows 4096
+  --compute-threads 4 --prefill-rows 4 --input-encoding safe-bpe-v1 --selected-rows 4096
 
 fnlp candidate answer question.json --model ./model.fnlpq --memory-mib 8192 \
-  --compute-threads 4
+  --compute-threads 4 --prefill-rows 4
 ```
 
 The same team serves all seven decoder projections in both loop passes and
@@ -102,21 +102,32 @@ finalization stay with the coordinator. Worker width does not rewrite the
 prepared prompt, task, compact policy or selected-row policy. All grammar-legal
 selected rows remain eligible.
 
-Widths above 1 cannot combine with `--prefill-rows`; the command rejects that
-combination before source, options or model IO. Width 1 still supports explicit
-layer-major prefill. Compute selection belongs to these one-request commands;
-INT8 maps, corpora, extraction, scoring and retained jobs keep their existing
-interfaces and do not inherit the flag through shared resource arguments.
+All widths compose with `--prefill-rows ROWS` from 1 through 64. This groups
+prompt positions within the request into bounded layer-major morsels; the same
+fixed team then serves constrained decoding and selected head projections.
+Rows remain causally ordered, and both decoder passes and their final norms
+are retained. Width 1 keeps coordinator-only execution. Omitting prefill keeps
+sequential prompt processing. This schedule does not change the prepared task
+identity or borrow free-text generation controls.
+
+Compute selection belongs to these one-request commands. INT8 maps, corpora,
+extraction, scoring and retained jobs keep their existing interfaces and do
+not inherit the flag through shared resource arguments.
 
 Before private IO, a checked simultaneous memory quote includes **both** full
 preparation owners: the CLI session and the transferred prepared source task,
 grammar and vocabulary. It also prices model, KV, coordinator scratch, fixed
-worker buffers, allocator headroom, cleanup and complete output. Compact input
+worker buffers, allocator headroom, cleanup and complete output. Explicit
+prefill additionally prices the coordinator's prompt activations and the
+workers' fixed row capacity; neither replaces ordinary scratch. Invalid row
+counts and a ceiling even one byte below the required aggregate refuse before
+private IO. Compact input
 and selected rows cannot discount retained original bytes or the second
 preparation reserve. The actual host reservations enforce the same process
 memory authority during execution.
 
-The hosted `execute_int8_source_with_threads` entrypoint retains input and native
+The hosted `execute_int8_source_with_threads` and
+`execute_int8_source_layer_major_with_threads` entrypoints retain input and native
 admission outside the scoped task callback until every worker physically joins,
 including errors, cancellation and panic. It checks the original shared control
 again after join. The complete task result remains guarded through serialization,
@@ -177,8 +188,11 @@ and QA boundaries, complete prompt/output budgets, pinned plan identity,
 preparation deadlines and feature-disabled no-IO behavior.
 
 Team regression definitions additionally cover the full source-task/encoding/head
-policy matrix, exact work and mask authority, both preparation charges, complete
-pre-IO refusal and guarded runtime boundaries. An explicit ignored model gate
+policy matrix, exact work and mask authority, both preparation charges, combined
+prompt/team capacity, exact aggregate-memory boundaries, complete pre-IO refusal
+and guarded runtime startup. They check that source scheduling reaches the
+physical dispatcher without entering generation policy or changing the task's
+semantic identity. An explicit ignored model gate
 compares full results and native work at serial, two-thread and four-thread
 widths using an independently pinned real artifact. It also checks all eleven
 pre-cancellation causes, source-owner release and output-guard lifetime. Neither

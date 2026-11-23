@@ -63,18 +63,6 @@ fn zeroed<T: Default + Clone>(length: usize) -> Result<Vec<T>, StrictInt8Error> 
     Ok(values)
 }
 
-/// Preserve the single-row dispatcher for buffered structured tasks. The
-/// request still receives one team and one original cancellation authority.
-#[allow(clippy::too_many_arguments)]
-pub(in crate::hosted) fn run_int8_team<T, A, F>(engine: &NlpEngine, limits: RunLimits,
-    cancellation: CancellationToken, model: ResidentInt8, width: usize, kernel: Int8Kernel,
-    admission: A, work: F) -> Result<T, HostedError>
-where T: Send + 'static, A: Send + 'static,
-    F: FnOnce(&CurrentCandidateInt8Model, &mut A, &mut RunControl, &mut dyn Int8ProjectionExecutor)
-        -> Result<T, HostedError> + Send + 'static {
-    run_int8_prefill_team(engine, limits, cancellation, model, width, kernel, 1, admission, work)
-}
-
 /// Worker storage is charged before the blocking crossing and remains owned
 /// until all fixed children physically join, including cancellation and panic.
 /// Prompt-row capacity is fixed once, before the team starts any native work.

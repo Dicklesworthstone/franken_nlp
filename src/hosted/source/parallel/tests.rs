@@ -24,6 +24,10 @@ fn task_budget() -> TaskBudget {
     TaskBudget { max_input_tokens: 7680, max_output_tokens: 512, max_output_bytes: 1 << 20,
         max_grammar_states: 4096, max_kv_bytes: Int8MemoryRequirement::for_context(8192).unwrap().kv_bytes }
 }
+fn prefill(rows: usize) -> Int8PrefillLimits {
+    Int8PrefillLimits { max_batch_rows: rows,
+        max_extra_scratch_bytes: Int8PrefillLimits::required_extra_scratch_bytes(rows).unwrap() }
+}
 fn facts() -> ArtifactIdentity {
     ArtifactIdentity { model_id: "Nanbeige4.2-3B".to_owned(),
         revision: "f56ec5a9650268aa098496734743c25ea778bd2d".to_owned(), recipe_id: "source-team-fixture".to_owned(),
@@ -76,8 +80,8 @@ fn all_source_modes_keep_their_sealed_identity_head_policy_and_complete_native_a
         let prepared = prepare(&facts(), kind, compact, selected);
         let identity = canonjson::canonical_bytes(prepared.execution_identity()).unwrap();
         let work = prepared.planned_work();
-        for width in [2, 3, 64] {
-            let required = team_requirements(limits(), prepared.task_budget(), work, width).unwrap();
+        for width in [2, 3, 64] { for schedule in [None, Some(prefill(1)), Some(prefill(3))] {
+            let required = team_requirements(limits(), prepared.task_budget(), work, width, schedule).unwrap();
             let budget = native_budget(limits(), work, required.native.kv_bytes);
             assert_eq!(budget.native.max_projection_work, work.projections);
             assert_eq!(budget.native.max_forward_positions, work.forward_positions);
@@ -87,10 +91,11 @@ fn all_source_modes_keep_their_sealed_identity_head_policy_and_complete_native_a
             assert_eq!(budget.json.max_kv_bytes, prepared.task_budget().max_kv_bytes);
             assert_eq!(budget.json.max_total_mask_node_visits, limits().max_mask_node_visits);
             assert_eq!(budget.json.mask_limits.max_trie_node_visits, limits().mask_limits.max_trie_node_visits);
+            assert_eq!(required.max_batch_rows, schedule.map_or(1, |limits| limits.max_batch_rows));
             assert_eq!(prepared.selected_rows().is_some(), selected);
             prepared.verify_identity(prepared.execution_identity()).unwrap();
             assert_eq!(canonjson::canonical_bytes(prepared.execution_identity()).unwrap(), identity);
-        }
+        } }
     } } }
 }
 
@@ -109,11 +114,13 @@ fn team_admission_preserves_every_context_preparation_and_mask_refusal() {
             6 => limits.native.allocator_reserve_bytes = 0,
             _ => limits.native.allocator_reserve_bytes = u64::MAX,
         }
-        assert!(team_requirements(limits, task, work, 2).is_err(), "admitted axis {axis}");
+        for schedule in [None, Some(prefill(3))] {
+            assert!(team_requirements(limits, task, work, 2, schedule).is_err(), "admitted axis {axis}");
+        }
     }
-    for width in [0, 1, 65, usize::MAX] {
-        assert!(team_requirements(limits(), prepared.task_budget(), work, width).is_err());
-    }
+    for width in [0, 1, 65, usize::MAX] { for schedule in [None, Some(prefill(3))] {
+        assert!(team_requirements(limits(), prepared.task_budget(), work, width, schedule).is_err());
+    } }
 }
 
 #[test]
@@ -122,10 +129,64 @@ fn worker_storage_never_replaces_coordinator_scratch_or_whole_context_kv() {
     let ordinary = requirements(limits().native).unwrap();
     let scratch = ordinary.rope_bytes + ordinary.scratch_payload_bound + limits().native.allocator_reserve_bytes;
     for width in [2, 7, 64] {
-        let admitted = team_requirements(limits(), prepared.task_budget(), prepared.planned_work(), width).unwrap();
+        let admitted = team_requirements(limits(), prepared.task_budget(), prepared.planned_work(), width, None).unwrap();
         assert_eq!(admitted.native, ordinary); assert_eq!(admitted.scratch_bytes, scratch);
-        assert!(dispatch::int8_team_workspace_bytes(width).unwrap() > 0);
+        assert_eq!(admitted.max_batch_rows, 1);
+        assert_eq!(dispatch::int8_prefill_team_workspace_bytes(width, admitted.max_batch_rows).unwrap(),
+            dispatch::int8_team_workspace_bytes(width).unwrap());
     }
+}
+
+#[test]
+fn packed_source_prompts_admit_coordinator_and_persistent_child_storage_separately() {
+    let prepared = prepare(&facts(), 3, true, true);
+    let ordinary = requirements(limits().native).unwrap();
+    let scratch = ordinary.rope_bytes + ordinary.scratch_payload_bound + limits().native.allocator_reserve_bytes;
+    for rows in [1, 3, 64] { for width in [2, 7, 64] {
+        let schedule = prefill(rows);
+        let admitted = team_requirements(limits(), prepared.task_budget(), prepared.planned_work(),
+            width, Some(schedule)).unwrap();
+        assert_eq!(admitted.native, ordinary);
+        assert_eq!(admitted.max_batch_rows, rows);
+        assert_eq!(admitted.scratch_bytes, scratch + schedule.validate().unwrap());
+        let children = dispatch::int8_prefill_team_workspace_bytes(width, rows).unwrap();
+        assert!(children >= dispatch::int8_team_workspace_bytes(width).unwrap());
+        assert!(children > 0);
+        assert!(sum(&[admitted.scratch_bytes, children]).unwrap() > admitted.scratch_bytes);
+    } }
+}
+
+#[test]
+fn source_team_prefill_refuses_underpriced_or_unbounded_prompt_rows_before_dispatch() {
+    let prepared = prepare(&facts(), 0, false, false);
+    for rows in [1, 3, 64] {
+        let mut schedule = prefill(rows);
+        schedule.max_extra_scratch_bytes -= 1;
+        assert!(matches!(team_requirements(limits(), prepared.task_budget(), prepared.planned_work(),
+            2, Some(schedule)), Err(HostedError::Native(_))));
+    }
+    for rows in [0, 65, usize::MAX] {
+        let schedule = Int8PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX };
+        assert!(team_requirements(limits(), prepared.task_budget(), prepared.planned_work(), 2,
+            Some(schedule)).is_err());
+    }
+}
+
+#[test]
+fn combined_source_team_scratch_overflow_cannot_hide_in_independent_quotes() {
+    let prepared = prepare(&facts(), 0, false, false);
+    let schedule = prefill(3);
+    let native = requirements(limits().native).unwrap();
+    let workers = dispatch::int8_prefill_team_workspace_bytes(4, 3).unwrap();
+    let fixed = native.rope_bytes + native.scratch_payload_bound + schedule.validate().unwrap();
+    let mut exact = limits();
+    exact.native.allocator_reserve_bytes = u64::MAX - fixed - workers;
+    let admitted = team_requirements(exact, prepared.task_budget(), prepared.planned_work(),
+        4, Some(schedule)).unwrap();
+    assert_eq!(sum(&[admitted.scratch_bytes, workers]).unwrap(), u64::MAX);
+    exact.native.allocator_reserve_bytes += 1;
+    assert!(matches!(team_requirements(exact, prepared.task_budget(), prepared.planned_work(),
+        4, Some(schedule)), Err(HostedError::Limits("memory arithmetic"))));
 }
 
 #[test]
@@ -134,6 +195,7 @@ fn transferred_source_and_guarded_result_cross_only_owned_runtime_boundaries() {
     send::<SourceTeamAdmission>(); send::<SourceInput>();
     send::<HostedInt8TeamResult<Int8SourceTaskRun>>();
     let _typed_entry = NlpEngine::execute_int8_source_with_threads;
+    let _typed_prefill_entry = NlpEngine::execute_int8_source_layer_major_with_threads;
 }
 
 mod model;

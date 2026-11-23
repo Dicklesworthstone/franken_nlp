@@ -4,7 +4,7 @@ use std::{path::PathBuf, sync::{Arc, Mutex}};
 use crate::{CommittedMemory,
     hosted::{HostedError, ResidentInt8, SourceLimits},
     native_engine::{artifact_bridge::{ArtifactBridgeError, current_candidate_load_checkpoints},
-        strict_int8::CurrentCandidateInt8Error,
+        strict_int8::{CurrentCandidateInt8Error, prefill::Int8PrefillLimits},
         decode::{DecodeCancellationKind, DecodeStepControl}},
     tasks::{BuiltInTask, extract::ExtractionVocabulary, ir::PlanContext,
         source_planning::{SourceTaskPlanner, SourceTaskRequest, quantized::PreparedInt8SourceTask}},
@@ -25,7 +25,13 @@ pub(super) struct Session {
 }
 impl Session {
     pub(super) fn new(args: &CandidateArgs, limits: Limits) -> Result<Self, CandidateError> {
-        if limits.compute != args.compute.admit_prefill(args.policy.prefill()?)? {
+        Self::new_with_prefill(args, limits, args.policy.prefill()?)
+    }
+    /// Source and scoring routes carry a separate physical prompt schedule.
+    /// They must not inherit generation policy merely to configure a team.
+    pub(super) fn new_with_prefill(args: &CandidateArgs, limits: Limits, prefill: Option<Int8PrefillLimits>)
+        -> Result<Self, CandidateError> {
+        if limits.compute != args.compute.admit_prefill(prefill)? {
             return Err(CandidateError::Arguments);
         }
         let started = Instant::now();
@@ -168,12 +174,12 @@ fn prepare(planner: &SourceTaskPlanner, facts: &ArtifactIdentity, request: &Sour
 pub(in crate::candidate_cli) fn execute(command: SourceCommand, args: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
     let prefill = command.args.prefill.limits()?;
-    if limits.compute != command.args.compute.admit(prefill.is_some())? {
+    if limits.compute != command.args.compute.admit_prefill(prefill)? {
         return Err(CandidateError::Arguments);
     }
-    compute::check_source_memory(&args, limits, command.args.host.max_result_bytes)?;
+    compute::check_source_memory(&args, limits, command.args.host.max_result_bytes, prefill)?;
     let encoding = args.input_encoding_policy(limits)?;
-    let session = Session::new(&args, limits)?;
+    let session = Session::new_with_prefill(&args, limits, prefill)?;
     let text = session.read(&command.args.input, input, args.max_input_bytes)?;
     let options = command.args.options.as_ref()
         .map(|path| session.read(path, input, command::OPTIONS_BYTES)).transpose()?;
@@ -202,9 +208,13 @@ pub(in crate::candidate_cli) fn execute(command: SourceCommand, args: CandidateA
             None => session.engine.execute_int8_source(&model, prepared, vocabulary, native_limits, cancellation),
         }.map_err(|_| CandidateError::Execution)?)
     } else {
-        compute::Completion::Team(session.engine.execute_int8_source_with_threads(&model, prepared,
-            vocabulary, native_limits, crate::native_engine::simd::config::process_kernel(),
-            limits.compute.threads, cancellation).map_err(|_| CandidateError::Execution)?)
+        let kernel = crate::native_engine::simd::config::process_kernel();
+        compute::Completion::Team(match prefill {
+            Some(prefill) => session.engine.execute_int8_source_layer_major_with_threads(&model, prepared,
+                vocabulary, native_limits, kernel, limits.compute.threads, prefill, cancellation),
+            None => session.engine.execute_int8_source_with_threads(&model, prepared,
+                vocabulary, native_limits, kernel, limits.compute.threads, cancellation),
+        }.map_err(|_| CandidateError::Execution)?)
     };
     session.remaining()?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
@@ -226,7 +236,7 @@ mod tests {
     use crate::candidate_cli::source::Kind;
 
     #[test]
-    fn buffered_team_prefill_survives_shared_startup_without_loosening_source_guards() {
+    fn buffered_and_source_team_prefill_survive_shared_startup_with_exact_capacity() {
         let args = crate::candidate_cli::tests::args(&["--compute-threads", "4", "--prefill-rows", "4"]);
         let limits = args.validate().unwrap();
         // Exercise the same real startup used by buffered generate/chat,
@@ -241,9 +251,25 @@ mod tests {
         let mut wrong_width = limits;
         wrong_width.compute.threads = 2;
         assert!(matches!(Session::new(&args, wrong_width), Err(CandidateError::Arguments)));
-        // Source tasks own a separate explicit single-row capability check.
+        // Source scheduling stays separate from free-text generation policy.
         let source = command::tests::command("ner", &["--compute-threads", "4", "--prefill-rows", "4"]);
-        assert!(matches!(source.validate(), Err(CandidateError::Arguments)));
+        let (source_args, source_limits) = source.validate().unwrap();
+        let prefill = source.args.prefill.limits().unwrap();
+        assert!(source_args.policy.prefill().unwrap().is_none());
+        let session = Session::new_with_prefill(&source_args, source_limits, prefill).unwrap();
+        assert!(session.checked_source.lock().unwrap().is_none());
+        session.remaining().unwrap();
+        drop(session);
+        // Passing through the unscheduled constructor would discard the
+        // admitted prompt-row capacity; it must fail before any private IO.
+        assert!(matches!(Session::new(&source_args, source_limits), Err(CandidateError::Arguments)));
+        let mut short = source_limits;
+        short.compute.workspace_bytes -= 1;
+        assert!(matches!(Session::new_with_prefill(&source_args, short, prefill), Err(CandidateError::Arguments)));
+        let larger = Int8PrefillLimits { max_batch_rows: 64,
+            max_extra_scratch_bytes: Int8PrefillLimits::required_extra_scratch_bytes(64).unwrap() };
+        assert!(matches!(Session::new_with_prefill(&source_args, source_limits, Some(larger)),
+            Err(CandidateError::Arguments)));
     }
     #[test]
     fn artifact_inspection_observes_every_stop_before_path_access() {
@@ -414,11 +440,11 @@ mod tests {
     }
 
     #[test]
-    fn source_compute_width_preserves_compact_selected_plan_identity_and_work() {
+    fn source_compute_width_and_prefill_preserve_compact_selected_plan_identity_and_work() {
         for kind in [Kind::Ner, Kind::Keyphrases, Kind::Summarize, Kind::Answer] {
             let serial = command::tests::command(kind.name(), &["--input-encoding", "safe-bpe-v1", "--selected-rows", "32"]);
             let threaded = command::tests::command(kind.name(), &["--input-encoding", "safe-bpe-v1",
-                "--selected-rows", "32", "--compute-threads", "4"]);
+                "--selected-rows", "32", "--compute-threads", "4", "--prefill-rows", "4"]);
             let (serial_args, serial_limits) = serial.validate().unwrap();
             let (threaded_args, threaded_limits) = threaded.validate().unwrap();
             let policy = serial_args.input_encoding_policy(serial_limits).unwrap();
@@ -440,6 +466,8 @@ mod tests {
             assert_eq!(serial_plan.prompt_tokens(), threaded_plan.prompt_tokens());
             assert_eq!(threaded_plan.selected_rows().unwrap().max_rows_per_step, 32);
             assert_eq!(threaded_limits.compute.threads, 4);
+            assert_eq!(threaded.args.prefill.limits().unwrap().unwrap().max_batch_rows, 4);
+            assert!(threaded_args.policy.prefill().unwrap().is_none());
             threaded_plan.verify_identity(serial_plan.execution_identity()).unwrap();
         }
     }

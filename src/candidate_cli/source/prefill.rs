@@ -5,7 +5,8 @@ use crate::{candidate_cli::CandidateError, native_engine::strict_int8::prefill::
 #[derive(Args, Default)]
 pub(in crate::candidate_cli) struct SourcePrefillArgs {
     /// Opt into layer-major INT8 prompt processing, 1..=64 tokens per morsel.
-    /// Omitted keeps sequential prefill. Composes with --selected-rows.
+    /// Omitted keeps sequential prefill. Composes with --selected-rows and
+    /// --compute-threads on one persistent team for this complete request.
     /// Extra scratch is process-admitted; this is not document batching or a speed claim.
     #[arg(long, value_name = "ROWS")]
     prefill_rows: Option<usize>,

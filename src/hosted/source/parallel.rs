@@ -27,17 +27,20 @@ impl SourceTeamAdmission {
     }
 }
 
-struct TeamRequirements { native: Int8MemoryRequirement, scratch_bytes: u64 }
-fn team_requirements(limits: SourceLimits, task: TaskBudget, work: Int8Work, width: usize)
+struct TeamRequirements { native: Int8MemoryRequirement, scratch_bytes: u64, max_batch_rows: usize }
+fn team_requirements(limits: SourceLimits, task: TaskBudget, work: Int8Work, width: usize,
+    prefill: Option<Int8PrefillLimits>)
     -> Result<TeamRequirements, HostedError> {
     let native = requirements(limits.native)?;
     validate(limits, task, work, native.kv_bytes)?;
     let scratch_bytes = source_scratch(sum(&[native.rope_bytes, native.scratch_payload_bound,
-        limits.native.allocator_reserve_bytes])?, None)?;
+        limits.native.allocator_reserve_bytes])?, prefill)?;
+    let max_batch_rows = prefill.map_or(1, |limits| limits.max_batch_rows);
     // Children have independent fixed payloads, not a discount against the
     // existing coordinator scratch or caller/host preparation reservations.
-    sum(&[scratch_bytes, dispatch::int8_team_workspace_bytes(width)?])?;
-    Ok(TeamRequirements { native, scratch_bytes })
+    // Their batch capacity is fixed before any source-task work starts.
+    sum(&[scratch_bytes, dispatch::int8_prefill_team_workspace_bytes(width, max_batch_rows)?])?;
+    Ok(TeamRequirements { native, scratch_bytes, max_batch_rows })
 }
 fn native_budget(limits: SourceLimits, work: Int8Work, kv_bytes: u64) -> Int8JsonBudget {
     Int8JsonBudget { native: Int8RunBudget::exact(work), json: JsonWorkBudget {
@@ -55,8 +58,8 @@ impl NlpEngine {
     /// governed by the prepared request; worker width is physical metadata.
     ///
     /// One team serves the complete sequential prompt and constrained decode.
-    /// Every legal selected head row stays eligible. This API does not combine
-    /// a team with layer-major prefill, independent-sequence cohorts or jobs.
+    /// Every legal selected head row stays eligible. The explicit layer-major
+    /// variant admits prompt morsels before forming the same fixed team.
     /// Input, KV, scratch and output authority survive physical join, including
     /// cancellation and panic. The returned guard owns result memory through
     /// serialization and delivery; no partial source result is published.
@@ -65,11 +68,36 @@ impl NlpEngine {
         vocabulary: Arc<ExtractionVocabulary>, limits: SourceLimits, kernel: Int8Kernel,
         compute_threads: usize, cancellation: CancellationToken)
         -> Result<HostedInt8TeamResult<Int8SourceTaskRun>, HostedError> {
+        self.execute_int8_source_team(model, prepared, vocabulary, limits, kernel,
+            compute_threads, None, cancellation)
+    }
+
+    /// Use one persistent output-row team for bounded layer-major prompt
+    /// morsels and constrained source decoding. Coordinator prefill scratch
+    /// and fixed worker row capacity are both admitted before execution; the
+    /// same team, native work ledger and cancellation allowance span the
+    /// complete task. This scheduling choice preserves the prepared input,
+    /// every legal selected row, source finalization and guarded delivery.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_int8_source_layer_major_with_threads(&self, model: &ResidentInt8,
+        prepared: PreparedInt8SourceTask, vocabulary: Arc<ExtractionVocabulary>,
+        limits: SourceLimits, kernel: Int8Kernel, compute_threads: usize,
+        prefill: Int8PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8SourceTaskRun>, HostedError> {
+        self.execute_int8_source_team(model, prepared, vocabulary, limits, kernel,
+            compute_threads, Some(prefill), cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_int8_source_team(&self, model: &ResidentInt8, prepared: PreparedInt8SourceTask,
+        vocabulary: Arc<ExtractionVocabulary>, limits: SourceLimits, kernel: Int8Kernel,
+        compute_threads: usize, prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8SourceTaskRun>, HostedError> {
         dispatch::preflight_int8_team(self, limits.native.run, compute_threads)?;
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), prepared.execution_identity())?;
         let work = prepared.planned_work();
-        let required = team_requirements(limits, prepared.task_budget(), work, compute_threads)?;
+        let required = team_requirements(limits, prepared.task_budget(), work, compute_threads, prefill)?;
         let lease = self.resources().acquire_lease();
         let output = output_claim(&lease, prepared.max_result_bytes(),
             u64::from(prepared.task_budget().max_output_tokens))?;
@@ -79,16 +107,21 @@ impl NlpEngine {
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.scratch_bytes)?;
         let admission = SourceTeamAdmission { input, kv: Some(kv), scratch: Some(scratch), output: Some(output),
             _kv: None, _scratch: None, _lease: lease };
-        dispatch::run_int8_team(self, limits.native.run, cancellation, model.clone(), compute_threads,
-            kernel, admission, move |model, admission, control, team| {
+        dispatch::run_int8_prefill_team(self, limits.native.run, cancellation, model.clone(), compute_threads,
+            kernel, required.max_batch_rows, admission, move |model, admission, control, team| {
                 let mut engine = model.engine(limits.native.context_tokens, memory_budget(required.native))
                     .map_err(HostedError::Model)?.with_kernel(kernel)
                     .with_projection_executor(team).map_err(HostedError::Native)?;
                 admission.commit_native()?;
                 let input = &admission.input.value;
-                let result = input.prepared.execute_with_control(input.prepared.execution_identity(),
-                    &mut engine, &input.vocabulary, native_budget(limits, work, required.native.kv_bytes),
-                    control).map_err(HostedError::Source)?;
+                let budget = native_budget(limits, work, required.native.kv_bytes);
+                let result = match prefill {
+                    Some(prefill) => input.prepared.execute_layer_major_with_control(
+                        input.prepared.execution_identity(), &mut engine, &input.vocabulary,
+                        budget, prefill, control),
+                    None => input.prepared.execute_with_control(input.prepared.execution_identity(),
+                        &mut engine, &input.vocabulary, budget, control),
+                }.map_err(HostedError::Source)?;
                 if engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) {
                     return Err(HostedError::Source(Int8SourceError::InvalidResult));
                 }

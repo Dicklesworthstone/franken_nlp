@@ -166,11 +166,11 @@ impl SourceCommand {
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), CandidateError> {
         self.args.head.limits()?;
         let prefill = self.args.prefill.limits()?;
-        let compute = self.args.compute.admit(prefill.is_some())?;
+        let compute = self.args.compute.admit_prefill(prefill)?;
         let (mut common, mut limits) = self.args.host.common_with_encoding(self.args.input.clone(), &self.encoding)?;
         common.compute = self.args.compute;
         limits.compute = compute;
-        compute::check_source_memory(&common, limits, self.args.host.max_result_bytes)?;
+        compute::check_source_memory(&common, limits, self.args.host.max_result_bytes, prefill)?;
         if self.args.options.as_ref().is_some_and(|path| path.as_os_str().is_empty() || path.as_os_str() == "-") {
             return Err(CandidateError::Arguments);
         }

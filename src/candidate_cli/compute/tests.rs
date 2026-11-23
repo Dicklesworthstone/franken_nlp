@@ -63,19 +63,19 @@ fn source_peak_retains_both_preparation_owners_with_an_exact_memory_boundary() {
         let native = Int8MemoryRequirement::for_context(args.context_tokens).unwrap();
         let one_owner = request_peak_bytes(limits, native, command.args.host.max_result_bytes as u64,
             args.max_new_tokens as u64, 0, 0).unwrap();
-        let required = source_peak_bytes(&args, limits, command.args.host.max_result_bytes).unwrap();
+        let required = source_peak_bytes(&args, limits, command.args.host.max_result_bytes, None).unwrap();
         assert_eq!(required - one_owner, limits.preparation_bytes,
             "transferred plan, vocabulary and source retain their own whole reservation");
         for memory_bytes in [one_owner, required - 1] {
             limits.memory_bytes = memory_bytes;
-            assert_eq!(check_source_memory(&args, limits, command.args.host.max_result_bytes), Err(CandidateError::Arguments));
+            assert_eq!(check_source_memory(&args, limits, command.args.host.max_result_bytes, None), Err(CandidateError::Arguments));
         }
         limits.memory_bytes = required;
-        check_source_memory(&args, limits, command.args.host.max_result_bytes).unwrap();
+        check_source_memory(&args, limits, command.args.host.max_result_bytes, None).unwrap();
         let mut larger = limits; larger.preparation_bytes += 1;
-        assert_eq!(source_peak_bytes(&args, larger, command.args.host.max_result_bytes).unwrap(), required + 2);
+        assert_eq!(source_peak_bytes(&args, larger, command.args.host.max_result_bytes, None).unwrap(), required + 2);
         larger.preparation_bytes = u64::MAX;
-        assert_eq!(source_peak_bytes(&args, larger, command.args.host.max_result_bytes), Err(CandidateError::Arguments));
+        assert_eq!(source_peak_bytes(&args, larger, command.args.host.max_result_bytes, None), Err(CandidateError::Arguments));
     }
 }
 
@@ -133,4 +133,47 @@ fn combined_memory_peak_includes_coordinator_prefill_and_fixed_child_capacity() 
     check_memory(&args, limits, native).unwrap();
     limits.memory_bytes -= 1;
     assert_eq!(check_memory(&args, limits, native), Err(CandidateError::Arguments));
+}
+
+
+#[test]
+fn source_prompt_workspace_and_child_capacity_remain_separate_exact_charges() {
+    use crate::candidate_cli::source::tests::command;
+    for task in ["ner", "keyphrases", "summarize", "answer"] {
+        for width in ["1", "4", "64"] {
+            let mut command = command(task, &["--compute-threads", width, "--prefill-rows", "64"]);
+            command.args.host.memory_mib = 16384;
+            let (args, mut limits) = command.validate().unwrap();
+            let prefill = command.args.prefill.limits().unwrap().unwrap();
+            let base = source_peak_bytes(&args, limits, command.args.host.max_result_bytes, None).unwrap();
+            let required = source_peak_bytes(&args, limits, command.args.host.max_result_bytes, Some(prefill)).unwrap();
+            assert_eq!(required - base, prefill.validate().unwrap());
+            limits.memory_bytes = required;
+            check_source_memory(&args, limits, command.args.host.max_result_bytes, Some(prefill)).unwrap();
+            limits.memory_bytes -= 1;
+            assert_eq!(check_source_memory(&args, limits, command.args.host.max_result_bytes, Some(prefill)),
+                Err(CandidateError::Arguments));
+            let native = Int8MemoryRequirement::for_context(args.context_tokens).unwrap();
+            let one_owner = request_peak_bytes(limits, native, command.args.host.max_result_bytes as u64,
+                args.max_new_tokens as u64, 0, 0).unwrap();
+            assert_eq!(required - one_owner, limits.preparation_bytes + prefill.validate().unwrap());
+            if width != "1" {
+                assert!(limits.compute.workspace_bytes > int8_team_workspace_bytes(limits.compute.threads).unwrap());
+            }
+            let mut larger_cap = prefill; larger_cap.max_extra_scratch_bytes = u64::MAX;
+            // The host reserves the derived payload, not an arbitrary larger cap.
+            assert_eq!(source_peak_bytes(&args, limits, command.args.host.max_result_bytes,
+                Some(larger_cap)).unwrap(), required);
+        }
+    }
+}
+
+#[test]
+fn even_serial_compute_admission_validates_explicit_prompt_geometry() {
+    for threads in [1_usize, 2, 64] {
+        for (rows, bytes) in [(0, 0), (65, u64::MAX), (4, 0)] {
+            assert_eq!(Args { threads }.admit_prefill(Some(Int8PrefillLimits {
+                max_batch_rows: rows, max_extra_scratch_bytes: bytes })), Err(CandidateError::Arguments));
+        }
+    }
 }

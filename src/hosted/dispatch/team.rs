@@ -15,7 +15,7 @@ mod projection;
 use projection::{Command, Peer, Reply, TeamExecutor, WorkerBuffers};
 mod int8;
 pub(in crate::hosted) use int8::{int8_team_workspace_bytes, int8_prefill_team_workspace_bytes,
-    preflight_int8_team, run_int8_team, run_int8_prefill_team};
+    preflight_int8_team, run_int8_prefill_team};
 
 pub(in crate::hosted) fn int4_team_workspace_bytes(width: usize, group_width: usize)
     -> Result<u64, HostedError> {

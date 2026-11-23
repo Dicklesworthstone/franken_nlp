@@ -13,20 +13,13 @@ impl Args {
         Ok(Self { threads })
     }
     pub(super) fn threads(self) -> usize { self.threads }
-    /// Source tasks retain their existing single-row team capability.
-    pub(super) fn admit(self, prefill: bool) -> Result<Admission, CandidateError> {
-        if self.threads != 1 && prefill { return Err(CandidateError::Arguments); }
-        self.admit_prefill(None)
-    }
-    /// Buffered generation admits one team for prompt batches and decode.
+    /// One admitted team spans prompt morsels and subsequent per-token work.
     pub(super) fn admit_prefill(self, prefill: Option<Int8PrefillLimits>) -> Result<Admission, CandidateError> {
+        if let Some(limits) = prefill { limits.validate().map_err(|_| CandidateError::Arguments)?; }
         if self.threads == 1 { return Ok(Admission { threads: 1, workspace_bytes: 0 }); }
         let workspace_bytes = match prefill {
             None => int8_team_workspace_bytes(self.threads),
-            Some(limits) => {
-                limits.validate().map_err(|_| CandidateError::Arguments)?;
-                int8_team_workspace_bytes_with_prefill(self.threads, limits.max_batch_rows)
-            }
+            Some(limits) => int8_team_workspace_bytes_with_prefill(self.threads, limits.max_batch_rows),
         }.map_err(|_| CandidateError::Arguments)?;
         Ok(Admission { threads: self.threads, workspace_bytes })
     }
@@ -38,7 +31,7 @@ pub(super) struct Admission { pub threads: usize, pub workspace_bytes: u64 }
 pub(super) fn definition(command: clap::Command) -> clap::Command {
     command.arg(clap::Arg::new("compute_threads").long("compute-threads")
         .value_name("N").value_parser(clap::value_parser!(usize)).default_value("1")
-        .help("Coordinator plus persistent INT8 row workers, 1..=64; 1 keeps serial execution. One fixed team serves this complete request across both decoder passes, prompt tokens and generation. Runtime threads are additional. Worker storage and native memory are admitted before input/model IO. Buffered generate/chat can combine workers with --prefill-rows on the same team. Source tasks keep single-row team execution. Maps, streams, batches and jobs do not expose this option"))
+        .help("Coordinator plus persistent INT8 row workers, 1..=64; 1 keeps serial execution. One fixed team serves this complete request across both decoder passes, prompt tokens and generation. Runtime threads are additional. Worker storage and native memory are admitted before input/model IO. Buffered generate/chat and one-request source tasks can combine workers with --prefill-rows on the same team. Maps, streams, batches and jobs do not expose this option"))
 }
 
 /// Price the entire simultaneously live threaded request, including the
@@ -59,23 +52,27 @@ pub(super) fn check_memory(args: &CandidateArgs, limits: Limits, native: Int8Mem
 /// Source execution retains the caller's preparation alongside a separately
 /// charged transferred plan/vocabulary/source owner. Neither source bytes nor
 /// that second reservation disappear when a compact or selected head is used.
-pub(super) fn check_source_memory(args: &CandidateArgs, limits: Limits, max_result_bytes: usize)
-    -> Result<(), CandidateError> {
-    if limits.compute.threads == 1 { return Ok(()); }
-    if source_peak_bytes(args, limits, max_result_bytes)? > limits.memory_bytes {
+pub(super) fn check_source_memory(args: &CandidateArgs, limits: Limits, max_result_bytes: usize,
+    prefill: Option<Int8PrefillLimits>) -> Result<(), CandidateError> {
+    if limits.compute.threads == 1 && prefill.is_none() { return Ok(()); }
+    if source_peak_bytes(args, limits, max_result_bytes, prefill)? > limits.memory_bytes {
         return Err(CandidateError::Arguments);
     }
     Ok(())
 }
 
-pub(super) fn source_peak_bytes(args: &CandidateArgs, limits: Limits, max_result_bytes: usize)
-    -> Result<u64, CandidateError> {
+pub(super) fn source_peak_bytes(args: &CandidateArgs, limits: Limits, max_result_bytes: usize,
+    prefill: Option<Int8PrefillLimits>) -> Result<u64, CandidateError> {
     let native = Int8MemoryRequirement::for_context(args.context_tokens).map_err(|_| CandidateError::Arguments)?;
+    // Prompt activations stay on the coordinator while children retain their
+    // separately priced fixed batch buffers. Neither replaces native scratch.
+    let extra = prefill.map(Int8PrefillLimits::validate).transpose()
+        .map_err(|_| CandidateError::Arguments)?.unwrap_or(0);
     request_peak_bytes(limits, native, max_result_bytes as u64, args.max_new_tokens as u64,
-        0, limits.preparation_bytes)
+        0, limits.preparation_bytes)?.checked_add(extra).ok_or(CandidateError::Arguments)
 }
 
-fn request_peak_bytes(limits: Limits, native: Int8MemoryRequirement, result_bytes: u64,
+pub(super) fn request_peak_bytes(limits: Limits, native: Int8MemoryRequirement, result_bytes: u64,
     output_tokens: u64, sampler_bytes: u64, transferred_preparation_bytes: u64)
     -> Result<u64, CandidateError> {
     let output = result_bytes.checked_mul(4)
