@@ -62,9 +62,9 @@ fn prepare<'s>(p: &SourceTaskPlanner, source: &'s str, l: Int8SourceMapLimits) -
 fn admitted(p: &PreparedInt8SourceMap<'_>) -> Vec<ExecutionIdentity> { p.execution_identities().cloned().collect() }
 fn driver() -> (FakeDriver, Rc<Cell<usize>>) {
     let calls = Rc::new(Cell::new(0));
-    (FakeDriver { calls: Rc::clone(&calls), fail_at: None, corrupt: false }, calls)
+    (FakeDriver { calls: Rc::clone(&calls), fail_at: None, corrupt: false, token: 1 }, calls)
 }
-struct FakeDriver { calls: Rc<Cell<usize>>, fail_at: Option<usize>, corrupt: bool }
+struct FakeDriver { calls: Rc<Cell<usize>>, fail_at: Option<usize>, corrupt: bool, token: u32 }
 impl SourceDriver for FakeDriver {
     fn checkpoint(&mut self) -> Result<(), Int8SourceError> { Ok(()) }
     fn run(&mut self, plan: &PreparedInt8SourceTask, _: &ExecutionIdentity) -> Result<Int8SourceTaskRun, Int8SourceError> {
@@ -73,7 +73,7 @@ impl SourceDriver for FakeDriver {
         let work = constrained_int8::planned_work(plan.prompt_tokens(), 2).unwrap();
         let result = SourceTaskResult::Ner(NerResult { schema_version: 1, task_spec_version: NER_TASK_VERSION.to_owned(),
             numerics_profile: STRICT_INT8_PROFILE.to_owned(), score_space: ScoreSpace::NotComputed,
-            grounding: ExtractionGrounding::SourceMembership, entities: vec![], generated_token_ids: vec![1, 0],
+            grounding: ExtractionGrounding::SourceMembership, entities: vec![], generated_token_ids: vec![self.token, 0],
             forward_positions: work.forward_positions, projected_logits: work.projected_logits, mask_node_visit_charge: 20 });
         let mut model_work = work;
         if self.corrupt { model_work.projections.multiply_accumulates -= 1; }
@@ -147,6 +147,75 @@ fn cancellation_of_a_later_chunk_discards_the_partial_document() {
     let (mut driver, calls) = driver(); driver.fail_at = Some(2);
     let error = prepared.execute_with_driver(&ids, driver).err().unwrap();
     assert_eq!(error.cancellation(), Some(DecodeCancellationKind::Deadline)); assert_eq!(calls.get(), 2);
+}
+#[test]
+fn completion_binds_exact_source_options_model_and_unused_allowances() {
+    let p = planner(); let prepared = prepare(&p, "Alice", limits());
+    let expected = prepared.preflight_metadata(); let ids = admitted(&prepared);
+    let result = prepared.execute_with_driver(&ids, driver().0).unwrap();
+    expected.verify_completed(&result).unwrap();
+    for axis in 0..8 {
+        let mut source = "Alice"; let mut options = NerOptions::default();
+        let mut mapping = limits(); let mut planning = SourcePlanningLimits::default();
+        match axis { 0 => source = "Bobby", 1 => options.max_entities -= 1,
+            3 => mapping.max_model_work.forward_positions -= 1,
+            4 => mapping.max_mask_visits -= 1, 5 => mapping.chunks.max_chunks -= 1,
+            6 => mapping.reduction.reduce_fan_in += 1, 7 => planning.max_input_bytes -= 1,
+            _ => {} }
+        let task = SourceMapTask::Ner(options); let mut id = identity(&p, &task);
+        if axis == 2 { id.logical_model_digest = Sha256Digest::of_bytes(b"another model"); }
+        let foreign = p.preflight_int8_map_with_control(source, &task, budget(),
+            &PlanContext::new(&id, budget()).unwrap(), planning, mapping, &mut Continue).unwrap();
+        assert_eq!(foreign.source_span(), expected.source_span());
+        if axis != 1 { assert_eq!(foreign.planned_work(), expected.planned_work()); }
+        assert_ne!(foreign, expected);
+        assert!(foreign.verify_completed(&result).is_err());
+    }
+    let foreign = prepare(&p, "Bobby", limits()); let ids = admitted(&foreign);
+    let foreign = foreign.execute_with_driver(&ids, driver().0).unwrap();
+    assert_eq!(crate::canonjson::canonical_bytes(&result).unwrap(), crate::canonjson::canonical_bytes(&foreign).unwrap());
+    assert!(expected.verify_completed(&foreign).is_err(), "same visible output cannot substitute a foreign source");
+    let json = serde_json::to_string(&result).unwrap(); let debug = format!("{expected:?}");
+    for private in ["request_binding", "result_binding", "Alice"] {
+        assert!(!json.contains(private)); assert!(!debug.contains(private));
+    }
+}
+#[test]
+fn completion_detects_payload_substitution_even_when_all_work_and_spans_match() {
+    let p = planner(); let prepared = prepare(&p, "Alice Bob Carol Dave", limits());
+    let expected = prepared.preflight_metadata(); let ids = admitted(&prepared);
+    let mut result = prepared.execute_with_driver(&ids, driver().0).unwrap();
+    let prepared = prepare(&p, "Alice Bob Carol Dave", limits()); let ids = admitted(&prepared);
+    let (mut alternate, _) = driver(); alternate.token = 2;
+    let alternate = prepared.execute_with_driver(&ids, alternate).unwrap();
+    expected.verify_completed(&alternate).unwrap();
+    assert_eq!(result.model_work, alternate.model_work);
+    assert_eq!(result.mask_node_visit_charge, alternate.mask_node_visit_charge);
+    result.mapped = alternate.mapped;
+    assert!(expected.verify_completed(&result).is_err());
+}
+#[test]
+fn completion_check_preserves_all_cancellation_causes_through_final_serialization() {
+    struct Stop { calls: usize, stop_at: usize, cause: DecodeCancellationKind }
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.calls += 1; (self.calls == self.stop_at).then_some(self.cause)
+        }
+    }
+    use DecodeCancellationKind::*;
+    let p = planner(); let prepared = prepare(&p, "Alice Bob Carol Dave", limits());
+    let expected = prepared.preflight_metadata(); let ids = admitted(&prepared);
+    let result = prepared.execute_with_driver(&ids, driver().0).unwrap();
+    let mut count = Stop { calls: 0, stop_at: usize::MAX, cause: User };
+    expected.verify_completed_with_control(&result, &mut count).unwrap();
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        for stop_at in [1, 2, count.calls] {
+            let error = expected.verify_completed_with_control(&result,
+                &mut Stop { calls: 0, stop_at, cause }).unwrap_err();
+            assert_eq!(error.cancellation(), Some(cause));
+        }
+    }
 }
 #[test]
 fn corrupt_native_mac_accounting_stops_before_the_next_chunk() {

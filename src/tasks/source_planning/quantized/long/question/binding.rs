@@ -64,11 +64,28 @@ pub(in crate::tasks::source_planning::quantized::long) fn composed_result<C: Dec
     nested: &[[u8; 32]], value: &(impl Serialize + ?Sized), cap: u64, control: &mut C)
     -> Result<[u8; 32], Int8SourceMapError> {
     let mut check = || checkpoint(control).map_err(Int8SourceMapError::from);
-    let mut writer = PrivateBinding::new(domain, cap, &mut check)?;
+    composed_result_with_checkpoints(domain, request, nested, value, cap, &mut check)
+}
+
+pub(in crate::tasks::source_planning::quantized::long) fn composed_result_with_checkpoints<F>(domain: &[u8],
+    request: [u8; 32], nested: &[[u8; 32]], value: &(impl Serialize + ?Sized), cap: u64, check: &mut F)
+    -> Result<[u8; 32], Int8SourceMapError> where F: FnMut() -> Result<(), Int8SourceMapError> {
+    let mut writer = PrivateBinding::new(domain, cap, check)?;
     writer.hash.update(request);
     writer.hash.update((nested.len() as u64).to_le_bytes());
     for binding in nested { writer.hash.update(binding); }
     writer.value(value)?;
+    writer.finish()
+}
+
+/// A reducer adds its own limits to the complete map request; the nested
+/// commitment already binds the original mapping and input-encoding authority.
+pub(in crate::tasks::source_planning::quantized::long) fn derived_request_with_checkpoints<F>(domain: &[u8],
+    nested: [u8; 32], authority: &(impl Serialize + ?Sized), check: &mut F)
+    -> Result<[u8; 32], Int8SourceMapError> where F: FnMut() -> Result<(), Int8SourceMapError> {
+    let mut writer = PrivateBinding::new(domain, u64::MAX, check)?;
+    writer.hash.update(nested);
+    writer.value(authority)?;
     writer.finish()
 }
 

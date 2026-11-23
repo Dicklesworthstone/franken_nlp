@@ -5,61 +5,29 @@ mod question;
 mod extraction;
 mod synthesis;
 mod keyphrase_reduction;
-use std::{cell::RefCell, sync::Arc};
+use std::sync::Arc;
 use super::source_tasks::{Session, planner, source_identity};
 use crate::{candidate_cli::map::{MapCommand, encoding},
     hosted::{HostedError, SourceMapConfig},
-    native_engine::{constrained_int8, decode::{DecodeCancellationKind, DecodeStepControl}, strict_int8::Int8Work},
-    tasks::{ir::PlanContext, mapreduce::{ChunkPlan, MapReduceError},
-        source_planning::{SourceTaskPlanner, quantized::{Int8SourceError, capacity::Int8SourceMapCapacity,
-            long::{Int8SourceMapLimits, Int8SourceMapRun}}}}};
+    native_engine::decode::{DecodeCancellationKind, DecodeStepControl},
+    tasks::{ir::PlanContext,
+        source_planning::{SourceTaskPlanner, quantized::{Int8SourceError,
+            long::{Int8SourceMapLimits, Int8SourceMapRun, Int8SourceMapPreflight, SourceMapTask}}}}};
 
-/// Geometry/work only; no source bytes, prompt commitments or native receipt.
-struct Preflight { chunks: usize, source_bytes: usize, source_scalars: usize, work: Int8Work, masks: u64 }
+type Preflight = Int8SourceMapPreflight;
 
+#[allow(clippy::too_many_arguments)]
 fn preflight(source: &str, planner: &SourceTaskPlanner, command: &MapCommand,
-    capacity: Int8SourceMapCapacity, mapping: Int8SourceMapLimits, budget: TaskBudget,
+    task: &SourceMapTask, context: &PlanContext<'_>, mapping: Int8SourceMapLimits, budget: TaskBudget,
     control: &mut impl DecodeStepControl) -> Result<Preflight, CandidateError> {
     poll(control)?;
     if source.is_empty() { return Err(CandidateError::Input); }
-    // Same partitioner and exact source counter as the native map compiler.
-    // This temporary metadata plan drops before loading and retains no source
-    // grammar or second prepared task. The host independently compiles every
-    // actual chunk before the first native forward.
-    planner.map_document_encoding_workspace_bytes().map_err(|_| CandidateError::Planning)?;
-    let mut failure = None;
-    let mut cancellation = None;
-    let chunks = {
-        let control = RefCell::new(&mut *control);
-        ChunkPlan::build_with_checkpoints(source, mapping.chunks, |text| {
-            planner.source_encoder().encode_with_control(text, mapping.chunks.max_chunk_bytes,
-                mapping.chunks.max_chunk_bytes, &mut || control.borrow_mut().prefill_checkpoint(0))
-                .map(|s| s.total_token_count()).map_err(|error| {
-                    failure = Some(Int8SourceError::from(error)); MapReduceError::Tokenizer
-                })
-        }, || match control.borrow_mut().prefill_checkpoint(0) {
-            Some(cause) => { cancellation = Some(cause); Err(MapReduceError::Cancelled) }, None => Ok(()),
-        })
-    };
-    if let Some(cause) = cancellation { return Err(cancelled(cause)); }
-    if let Some(error) = failure { return Err(source_error(error)); }
-    let chunks = chunks.map_err(|_| CandidateError::Planning)?;
-    let mut work = Int8Work::default();
-    let mut masks = 0_u64;
-    for chunk in chunks.chunks() {
-        poll(control)?;
-        let prompt = capacity.scaffold_tokens().checked_add(chunk.tokens()).ok_or(CandidateError::Planning)?;
-        if prompt > budget.max_input_tokens as usize
-            || prompt.checked_add(budget.max_output_tokens as usize)
-                .is_none_or(|n| n > command.host.context_tokens) { return Err(CandidateError::Planning); }
-        work = work.checked_add(constrained_int8::planned_work(prompt, budget.max_output_tokens as usize)
-            .map_err(|_| CandidateError::Planning)?).map_err(|_| CandidateError::Planning)?;
-        masks = masks.checked_add(mapping.mask_visits_per_chunk).ok_or(CandidateError::Planning)?;
-        command.admit_work(work, masks)?;
-    }
+    let expected = planner.preflight_int8_map_with_control(source, task, budget, context,
+        command.host.planning(), mapping, control)
+        .map_err(|error| error.cancellation().map(cancelled).unwrap_or(CandidateError::Planning))?;
+    command.admit_work(expected.planned_work(), expected.reserved_mask_visits())?;
     poll(control)?;
-    Ok(Preflight { chunks: chunks.chunks().len(), source_bytes: source.len(),
-        source_scalars: source.chars().count(), work, masks })
+    Ok(expected)
 }
 fn poll(control: &mut impl DecodeStepControl) -> Result<(), CandidateError> {
     match control.prefill_checkpoint(0) { Some(cause) => Err(cancelled(cause)), None => Ok(()) }
@@ -118,7 +86,11 @@ pub(in crate::candidate_cli) fn execute(command: MapCommand, args: CandidateArgs
     if let Some(limits) = summary { limits.validate(mapping).map_err(|_| CandidateError::Planning)?; }
     let keyphrases = command.keyphrases.limits(command.max_map_result_bytes)?;
     if let Some(limits) = keyphrases { limits.validate(mapping).map_err(|_| CandidateError::Planning)?; }
-    let expected = preflight(&text, &planner, &command, capacity, mapping, budget, &mut session.control())?;
+    let expected = preflight(&text, &planner, &command, &task, &context, mapping, budget, &mut session.control())?;
+    let expected_summary = summary.map(|limits| expected.summary_with_control(limits, &mut session.control())
+        .map_err(|error| error.cancellation().map(cancelled).unwrap_or(CandidateError::Planning))).transpose()?;
+    let expected_keyphrases = keyphrases.map(|limits| expected.keyphrases_with_control(limits, &mut session.control())
+        .map_err(|error| error.cancellation().map(cancelled).unwrap_or(CandidateError::Planning))).transpose()?;
     session.remaining()?;
     // No weights until the complete partition and all five work axes fit.
     let cancellation = CancellationToken::default();
@@ -129,23 +101,23 @@ pub(in crate::candidate_cli) fn execute(command: MapCommand, args: CandidateArgs
     // Retain the exact planner, not a fresh ledger, through hosted recompilation
     // and final usage reporting. All private source storage stays charged.
     let planner = Arc::new(planner);
-    if let Some(limits) = summary {
+    if let (Some(limits), Some(expected)) = (summary, expected_summary) {
         let result = session.engine.summarize_int8_source(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
             config, limits, cancellation).map_err(host_error)?;
-        summary::check_completed(&expected, result.result(), limits.max_bullets)?;
+        summary::check_completed(&expected, result.result(), &mut session.control())?;
         return deliver_encoded(&session, &facts, &result, encoding::report(&planner)?.as_ref(),
             command.max_map_result_bytes + 4096, output);
     }
-    if let Some(limits) = keyphrases {
+    if let (Some(limits), Some(expected)) = (keyphrases, expected_keyphrases) {
         let result = session.engine.keyphrases_int8_source(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
             config, limits, cancellation).map_err(host_error)?;
-        keyphrase_reduction::check_completed(&expected, result.result(), limits)?;
+        keyphrase_reduction::check_completed(&expected, result.result(), &mut session.control())?;
         return deliver_encoded(&session, &facts, &result, encoding::report(&planner)?.as_ref(),
             command.max_map_result_bytes + 4096, output);
     }
     let result = session.engine.map_int8_source(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
         config, cancellation).map_err(host_error)?;
-    check_completed(&expected, result.result())?;
+    check_completed(&expected, result.result(), &mut session.control())?;
     deliver_encoded(&session, &facts, &result, encoding::report(&planner)?.as_ref(),
         command.max_map_result_bytes + 4096, output)
 }
@@ -167,15 +139,10 @@ fn deliver_encoded<T: Serialize>(session: &Session, facts: &ArtifactIdentity, re
     publish_checked(&response, cap, output, &|| session.remaining().map(|_| ()))
 }
 
-fn check_completed(expected: &Preflight, result: &Int8SourceMapRun) -> Result<(), CandidateError> {
-    let root = result.mapped.root(); let span = root.source_span();
-    if result.planned_model_work != expected.work || result.reserved_mask_node_visits != expected.masks
-        || root.value().len() != expected.chunks || root.chunk_range() != (0..expected.chunks)
-        || span.byte_start != 0 || span.byte_end != expected.source_bytes
-        || span.scalar_start != 0 || span.scalar_end != expected.source_scalars {
-        return Err(CandidateError::Execution);
-    }
-    Ok(())
+fn check_completed(expected: &Preflight, result: &Int8SourceMapRun,
+    control: &mut impl DecodeStepControl) -> Result<(), CandidateError> {
+    expected.verify_completed_with_control(result, control)
+        .map_err(|error| error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution))
 }
 
 #[cfg(test)] mod tests;

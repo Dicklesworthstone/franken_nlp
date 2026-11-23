@@ -119,6 +119,55 @@ fn global_top_k_keeps_late_support_and_every_original_unicode_occurrence() {
     assert_eq!(result.model_work.projected_logits, 4 * 166_144);
 }
 #[test]
+fn completed_summary_requires_exact_source_and_every_reducer_allowance() {
+    let p = planner(); let prepared = prepare(&p, "éAéAéAéA", 2);
+    let map = prepared.preflight_metadata();
+    let expected = map.summary_with_control(limits(), &mut Continue).unwrap();
+    let driver = script(&prepared); let result = run(prepared, limits(), driver).unwrap();
+    expected.verify_completed(&result).unwrap();
+    let foreign = prepare(&p, "éBéBéBéB", 2).preflight_metadata();
+    assert_eq!(map.source_span(), foreign.source_span()); assert_eq!(map.planned_work(), foreign.planned_work());
+    assert!(foreign.summary_with_control(limits(), &mut Continue).unwrap().verify_completed(&result).is_err());
+    for axis in 0..7 {
+        let mut changed = limits();
+        match axis { 0 => changed.max_bullets += 1, 1 => changed.max_result_bytes -= 1,
+            2 => changed.aggregation.max_unique_bullets -= 1, 3 => changed.aggregation.max_citations -= 1,
+            4 => changed.aggregation.max_evidence_spans -= 1, 5 => changed.aggregation.max_value_bytes -= 1,
+            _ => changed.aggregation.max_scan_steps -= 1 }
+        let foreign = map.summary_with_control(changed, &mut Continue).unwrap();
+        assert!(foreign.verify_completed(&result).is_err());
+    }
+    let debug = format!("{expected:?}");
+    assert!(!debug.contains("request_binding")); assert!(!debug.contains("éAéA"));
+}
+#[test]
+fn completion_rejects_changed_summary_text_evidence_ranks_and_bookkeeping() {
+    let p = planner(); let prepared = prepare(&p, "éAéAéAéA", 2);
+    let expected = prepared.preflight_metadata().summary_with_control(limits(), &mut Continue).unwrap();
+    let driver = script(&prepared); let mut result = run(prepared, limits(), driver).unwrap();
+    result.summary.bullets[0].text.push('!');
+    assert!(expected.verify_completed(&result).is_err()); result.summary.bullets[0].text.pop();
+    result.summary.bullets[0].rank_sum += 1;
+    assert!(expected.verify_completed(&result).is_err()); result.summary.bullets[0].rank_sum -= 1;
+    result.summary.bullets[0].evidence[0].citations[0].spans[0].scalar_end += 1;
+    assert!(expected.verify_completed(&result).is_err());
+    result.summary.bullets[0].evidence[0].citations[0].spans[0].scalar_end -= 1;
+    result.verification_scan_steps += 1;
+    assert!(expected.verify_completed(&result).is_err()); result.verification_scan_steps -= 1;
+    result.reduce_calls += 1;
+    assert!(expected.verify_completed(&result).is_err()); result.reduce_calls -= 1;
+    expected.verify_completed(&result).unwrap();
+    struct Stop(DecodeCancellationKind);
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { Some(self.0) }
+    }
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        assert_eq!(expected.verify_completed_with_control(&result, &mut Stop(cause)).unwrap_err().cancellation(), Some(cause));
+    }
+}
+#[test]
 fn final_selection_is_identical_across_fanins_and_multi_level_trees() {
     let p = planner(); let source = "éAéAéAéAéAéAéAéA";
     let mut baseline = None;
@@ -219,9 +268,14 @@ fn whole_envelope_is_bounded_and_no_private_prompt_or_token_transcript_escapes()
     let p = planner(); let prepared = prepare(&p, "éAéAéAéA", 2); let driver = script(&prepared);
     let result = run(prepared, limits(), driver).unwrap(); let bytes = crate::canonjson::canonical_bytes(&result).unwrap();
     let text = std::str::from_utf8(&bytes).unwrap();
-    for field in ["generated_token_ids", "prompt_digest", "logical_model_digest"] { assert!(!text.contains(field)); }
+    for field in ["generated_token_ids", "prompt_digest", "logical_model_digest", "request_binding", "result_binding"] {
+        assert!(!text.contains(field));
+    }
     let prepared = prepare(&p, "éAéAéAéA", 2); let driver = script(&prepared);
     assert!(run(prepared, Int8SummaryLimits { max_result_bytes: bytes.len() - 1, ..limits() }, driver).is_err());
+    let prepared = prepare(&p, "éAéAéAéA", 2); let driver = script(&prepared);
+    let exact = run(prepared, Int8SummaryLimits { max_result_bytes: bytes.len(), ..limits() }, driver).unwrap();
+    assert_eq!(crate::canonjson::canonical_bytes(&exact).unwrap().len(), bytes.len());
 }
 #[test]
 fn invalid_summary_limits_are_rejected_before_any_native_call() {

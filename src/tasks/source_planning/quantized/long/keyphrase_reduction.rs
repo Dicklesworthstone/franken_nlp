@@ -7,7 +7,7 @@ use super::*;
 use std::cell::RefCell;
 use crate::tasks::{
     corpus_keyphrases::{CorpusKeyphraseLimits, CorpusKeyphraseResult, CorpusKeyphraseTask,
-        KeyphrasePass, check_bytes},
+        KeyphrasePass, CORPUS_KEYPHRASE_POLICY},
     mapreduce::CHUNK_PROFILE,
 };
 
@@ -94,6 +94,89 @@ pub struct Int8CorpusKeyphraseRun {
     pub mask_node_visit_charge: u64,
     pub verification_scan_work: u64,
     pub keyphrases: CorpusKeyphraseResult,
+    #[serde(skip)]
+    request_binding: [u8; 32],
+    #[serde(skip)]
+    result_binding: [u8; 32],
+}
+
+#[derive(Clone, Copy)]
+pub struct Int8KeyphrasePreflight {
+    map: Int8SourceMapPreflight,
+    limits: Int8KeyphraseLimits,
+    request_binding: [u8; 32],
+}
+impl fmt::Debug for Int8KeyphrasePreflight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Int8KeyphrasePreflight").field("map", &self.map)
+            .field("limits", &self.limits).finish_non_exhaustive()
+    }
+}
+impl Int8SourceMapPreflight {
+    /// Bind every complete-union and final-ranking limit before the first map.
+    pub fn keyphrases_with_control<C: DecodeStepControl>(&self, limits: Int8KeyphraseLimits,
+        control: &mut C) -> Result<Int8KeyphrasePreflight, Int8CorpusKeyphraseError> {
+        self.keyphrases_with_checkpoints(limits, &mut || checkpoint(control).map_err(Int8SourceMapError::from))
+    }
+    fn keyphrases_with_checkpoints<F>(&self, limits: Int8KeyphraseLimits, check: &mut F)
+        -> Result<Int8KeyphrasePreflight, Int8CorpusKeyphraseError>
+        where F: FnMut() -> Result<(), Int8SourceMapError> {
+        check()?;
+        limits.aggregation.validate()?;
+        if self.task != BuiltInTask::Keyphrases || !(1..=4096).contains(&limits.max_phrases)
+            || !(1..=64 * 1024 * 1024).contains(&limits.max_result_bytes)
+            || limits.aggregation.max_value_bytes > self.max_value_bytes
+            || limits.max_result_bytes as u64 > self.max_result_bytes {
+            return Err(Int8CorpusKeyphraseError::InvalidLimits);
+        }
+        let a = limits.aggregation;
+        let request_binding = question::binding::derived_request_with_checkpoints(
+            b"fnlp-int8-keyphrase-reduction-request-v1", self.request_binding,
+            &(a.max_unique_phrases, a.max_evidence_spans, a.max_value_bytes, a.max_scan_work,
+                limits.max_phrases, limits.max_result_bytes), check)?;
+        Ok(Int8KeyphrasePreflight { map: *self, limits, request_binding })
+    }
+}
+impl Int8KeyphrasePreflight {
+    pub fn verify_completed(&self, run: &Int8CorpusKeyphraseRun) -> Result<(), Int8CorpusKeyphraseError> {
+        self.verify_completed_with_checkpoints(run, &mut || Ok(()))
+    }
+    pub fn verify_completed_with_control<C: DecodeStepControl>(&self, run: &Int8CorpusKeyphraseRun,
+        control: &mut C) -> Result<(), Int8CorpusKeyphraseError> {
+        self.verify_completed_with_checkpoints(run,
+            &mut || checkpoint(control).map_err(Int8SourceMapError::from))
+    }
+    fn verify_completed_with_checkpoints<F>(&self, run: &Int8CorpusKeyphraseRun, check: &mut F)
+        -> Result<(), Int8CorpusKeyphraseError> where F: FnMut() -> Result<(), Int8SourceMapError> {
+        check()?;
+        if run.request_binding != self.request_binding || run.result_binding != keyphrase_result_binding(run,
+            self.limits.max_result_bytes as u64, check)? { return Err(Int8CorpusKeyphraseError::Accounting); }
+        let phrases = &run.keyphrases;
+        if run.schema_version != 1 || run.execution != INT8_CORPUS_KEYPHRASE_EXECUTION
+            || run.numerics_profile != STRICT_INT8_PROFILE || run.chunk_profile != CHUNK_PROFILE
+            || run.semantics != INT8_CORPUS_KEYPHRASE_SEMANTICS || run.source_span != self.map.source_span
+            || run.planned_model_work != self.map.work || run.reserved_mask_node_visits != self.map.masks
+            || !within(run.model_work, self.map.work) || run.mask_node_visit_charge > self.map.masks
+            || run.verification_scan_work > self.limits.aggregation.max_scan_work
+            || phrases.schema_version != 1 || phrases.task_spec_version != KEYPHRASES_TASK_VERSION
+            || phrases.ranking_policy != CORPUS_KEYPHRASE_POLICY
+            || phrases.mapped_chunks != self.map.chunks || run.requested_max_phrases != self.limits.max_phrases
+            || phrases.phrases.len() > self.limits.max_phrases
+            || phrases.phrases.len().checked_add(phrases.omitted_candidates)
+                .is_none_or(|n| n > self.limits.aggregation.max_unique_phrases)
+            || phrases.forward_positions != run.model_work.forward_positions
+            || phrases.projected_logits != run.model_work.projected_logits
+            || phrases.mask_node_visit_charge != run.mask_node_visit_charge {
+            return Err(Int8CorpusKeyphraseError::Accounting);
+        }
+        check()?;
+        Ok(())
+    }
+}
+fn keyphrase_result_binding<F>(run: &Int8CorpusKeyphraseRun, cap: u64, check: &mut F)
+    -> Result<[u8; 32], Int8SourceMapError> where F: FnMut() -> Result<(), Int8SourceMapError> {
+    question::binding::composed_result_with_checkpoints(b"fnlp-int8-keyphrase-reduction-result-v1",
+        run.request_binding, &[], run, cap, check)
 }
 
 impl PreparedInt8SourceMap<'_> {
@@ -135,6 +218,8 @@ impl PreparedInt8SourceMap<'_> {
         let options = self.keyphrase_options(limits)?;
         verify_identities(&self.plans, admitted)?;
         let driver = RefCell::new(driver);
+        let expected = self.expected.keyphrases_with_checkpoints(limits,
+            &mut || driver.borrow_mut().checkpoint().map_err(Int8SourceMapError::from))?;
         let pass = Pass { plans: &self.plans, admitted, driver: &driver, options,
             next_chunk: 0, work: Int8Work::default(), masks: 0,
             mask_cap: self.limits.mask_visits_per_chunk, native_error: None };
@@ -165,14 +250,16 @@ impl PreparedInt8SourceMap<'_> {
         let keyphrases = reduced.into_value().into_ranked(limits.max_phrases, limits.max_result_bytes)?;
         if keyphrases.forward_positions != pass.work.forward_positions || keyphrases.projected_logits != pass.work.projected_logits
             || keyphrases.mask_node_visit_charge != pass.masks { return Err(Int8CorpusKeyphraseError::Accounting); }
-        let output = Int8CorpusKeyphraseRun { schema_version: 1, execution: INT8_CORPUS_KEYPHRASE_EXECUTION,
+        let mut output = Int8CorpusKeyphraseRun { schema_version: 1, execution: INT8_CORPUS_KEYPHRASE_EXECUTION,
             numerics_profile: STRICT_INT8_PROFILE, chunk_profile: CHUNK_PROFILE, semantics: INT8_CORPUS_KEYPHRASE_SEMANTICS,
             source_span: metadata.0, map_batches: metadata.1, reduce_calls: metadata.2, reduction_levels: metadata.3,
             requested_max_phrases: limits.max_phrases, planned_model_work: self.work, model_work: pass.work,
             reserved_mask_node_visits: self.masks, mask_node_visit_charge: pass.masks,
-            verification_scan_work: scan_work, keyphrases };
-        check_bytes(&output, limits.max_result_bytes)?;
-        driver.borrow_mut().checkpoint()?;
+            verification_scan_work: scan_work, keyphrases,
+            request_binding: expected.request_binding, result_binding: [0; 32] };
+        let mut check = || driver.borrow_mut().checkpoint().map_err(Int8SourceMapError::from);
+        output.result_binding = keyphrase_result_binding(&output, limits.max_result_bytes as u64, &mut check)?;
+        expected.verify_completed_with_checkpoints(&output, &mut check)?;
         Ok(output)
     }
 }

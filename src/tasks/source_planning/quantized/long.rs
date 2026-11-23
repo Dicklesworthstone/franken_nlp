@@ -34,6 +34,10 @@ const MAX_SOURCE_CHUNKS: usize = 256;
 #[serde(tag = "task", content = "options", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceMapTask { Ner(NerOptions), Keyphrases(KeyphraseOptions), Summarize(SummaryOptions) }
 impl SourceMapTask {
+    fn kind(&self) -> BuiltInTask {
+        match self { Self::Ner(_) => BuiltInTask::Ner, Self::Keyphrases(_) => BuiltInTask::Keyphrases,
+            Self::Summarize(_) => BuiltInTask::Summarize }
+    }
     fn request(&self, document: String, budget: TaskBudget) -> SourceTaskRequest {
         match self {
             Self::Ner(options) => SourceTaskRequest::Ner { document, options: options.clone(), budget },
@@ -152,6 +156,88 @@ pub struct Int8SourceMapRun {
     pub reserved_mask_node_visits: u64,
     pub mask_node_visit_charge: u64,
     pub mapped: MapReduceResult<SourceMapValue>,
+    #[serde(skip)]
+    request_binding: [u8; 32],
+    #[serde(skip)]
+    result_binding: [u8; 32],
+}
+
+/// The exact admitted source, task, policy and complete partition, not a native
+/// execution receipt. Private commitments never enter diagnostics or output.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct Int8SourceMapPreflight {
+    source_span: VerifiedSourceSpan,
+    chunks: usize,
+    task: BuiltInTask,
+    work: Int8Work,
+    masks: u64,
+    max_value_bytes: usize,
+    max_result_bytes: u64,
+    request_binding: [u8; 32],
+}
+impl fmt::Debug for Int8SourceMapPreflight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Int8SourceMapPreflight").field("source_span", &self.source_span)
+            .field("chunks", &self.chunks).field("task", &self.task)
+            .field("work", &self.work).field("masks", &self.masks).finish_non_exhaustive()
+    }
+}
+impl Int8SourceMapPreflight {
+    pub fn source_span(&self) -> VerifiedSourceSpan { self.source_span }
+    pub fn chunk_count(&self) -> usize { self.chunks }
+    pub fn planned_work(&self) -> Int8Work { self.work }
+    pub fn reserved_mask_visits(&self) -> u64 { self.masks }
+    pub fn verify_completed(&self, run: &Int8SourceMapRun) -> Result<(), Int8SourceMapError> {
+        self.verify_completed_with_checkpoints(run, &mut || Ok(()))
+    }
+    pub fn verify_completed_with_control<C: DecodeStepControl>(&self, run: &Int8SourceMapRun,
+        control: &mut C) -> Result<(), Int8SourceMapError> {
+        self.verify_completed_with_checkpoints(run,
+            &mut || checkpoint(control).map_err(Int8SourceMapError::from))
+    }
+    fn verify_completed_with_checkpoints<F>(&self, run: &Int8SourceMapRun, check: &mut F)
+        -> Result<(), Int8SourceMapError> where F: FnMut() -> Result<(), Int8SourceMapError> {
+        check()?;
+        if run.request_binding != self.request_binding || run.result_binding != source_map_result_binding(run,
+            self.max_result_bytes, check)? { return Err(Int8SourceError::InvalidResult.into()); }
+        let root = run.mapped.root();
+        if run.schema_version != 1 || run.execution != INT8_SOURCE_MAP_EXECUTION
+            || run.semantics != "independent-chunks-no-cross-chunk-reasoning-v1"
+            || run.planned_model_work != self.work || run.reserved_mask_node_visits != self.masks
+            || !within(run.model_work, self.work) || run.mask_node_visit_charge > self.masks
+            || root.source_span() != self.source_span || root.chunk_range() != (0..self.chunks)
+            || root.value().len() != self.chunks { return Err(Int8SourceError::InvalidResult.into()); }
+        let mut byte_end = 0; let mut scalar_end = 0;
+        let mut work = Int8Work::default(); let mut masks = 0_u64;
+        for (index, chunk) in root.value().chunks().enumerate() {
+            check()?;
+            let span = chunk.source_span;
+            let kind = match &chunk.native.result { SourceTaskResult::Ner(_) => BuiltInTask::Ner,
+                SourceTaskResult::Keyphrases(_) => BuiltInTask::Keyphrases,
+                SourceTaskResult::Summarize(_) => BuiltInTask::Summarize,
+                SourceTaskResult::Answer(_) => return Err(Int8SourceError::InvalidResult.into()) };
+            if chunk.chunk_id != index || kind != self.task
+                || span.byte_start != byte_end || span.scalar_start != scalar_end
+                || span.byte_end <= span.byte_start || span.scalar_end <= span.scalar_start {
+                return Err(Int8SourceError::InvalidResult.into());
+            }
+            byte_end = span.byte_end; scalar_end = span.scalar_end;
+            work = add_work(work, chunk.native.model_work).ok_or(Int8SourceMapError::WorkLimit)?;
+            masks = masks.checked_add(mask_charge(&chunk.native.result)?).ok_or(Int8SourceMapError::WorkLimit)?;
+        }
+        if byte_end != self.source_span.byte_end || scalar_end != self.source_span.scalar_end
+            || work != run.model_work || masks != run.mask_node_visit_charge {
+            return Err(Int8SourceError::InvalidResult.into());
+        }
+        check()?;
+        Ok(())
+    }
+}
+
+fn source_map_result_binding<F>(run: &Int8SourceMapRun, cap: u64, check: &mut F)
+    -> Result<[u8; 32], Int8SourceMapError> where F: FnMut() -> Result<(), Int8SourceMapError> {
+    question::binding::composed_result_with_checkpoints(b"fnlp-int8-source-map-result-v1",
+        run.request_binding, &[], run, cap, check)
 }
 
 /// Borrows the unchanged original text. Not Clone/Deserialize: execution
@@ -162,8 +248,37 @@ pub struct PreparedInt8SourceMap<'s> {
     limits: Int8SourceMapLimits,
     work: Int8Work,
     masks: u64,
+    expected: Int8SourceMapPreflight,
 }
 impl SourceTaskPlanner {
+    /// Size and bind the actual document without retaining native grammars.
+    /// The same partitioner and operation-owned encoding ledger are used by
+    /// later full planning. No sizing work is refunded or renewed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn preflight_int8_map_with_control<C: DecodeStepControl>(&self, source: &str,
+        task: &SourceMapTask, budget: TaskBudget, context: &PlanContext<'_>,
+        planning: SourcePlanningLimits, limits: Int8SourceMapLimits, control: &mut C)
+        -> Result<Int8SourceMapPreflight, Int8SourceMapError> {
+        limits.validate(budget, planning)?;
+        let capacity = self.int8_map_capacity_with_control(task, budget, context, planning, control)?;
+        let chunks = self.partition_int8_map_with_control(source, limits, control)?;
+        let mut work = Int8Work::default();
+        for chunk in chunks.chunks() {
+            checkpoint(control)?;
+            let prompt = capacity.scaffold_tokens().checked_add(chunk.tokens()).ok_or(Int8SourceMapError::WorkLimit)?;
+            if prompt > budget.max_input_tokens as usize
+                || prompt.checked_add(budget.max_output_tokens as usize)
+                    .is_none_or(|n| n > planning.max_context_tokens) { return Err(Int8SourceMapError::WorkLimit); }
+            let part = constrained_int8::planned_work(prompt, budget.max_output_tokens as usize)
+                .map_err(|_| Int8SourceMapError::WorkLimit)?;
+            work = add_work(work, part).filter(|&n| within(n, limits.max_model_work))
+                .ok_or(Int8SourceMapError::WorkLimit)?;
+        }
+        let masks = limits.mask_visits_per_chunk.checked_mul(chunks.chunks().len() as u64)
+            .filter(|&n| n <= limits.max_mask_visits).ok_or(Int8SourceMapError::WorkLimit)?;
+        self.int8_map_expectation(source, task, budget, context, planning, limits, &chunks, work, masks, control)
+    }
+
     /// Compile every chunk with the SAME admitted task/profile and source
     /// encoder. Complete prompts are independently checked by the task planner;
     /// an underestimated scaffold reserve fails BEFORE any model execution.
@@ -178,6 +293,31 @@ impl SourceTaskPlanner {
         // document ledger. A one-request encoder alone cannot authorize a map.
         self.map_document_encoding_workspace_bytes().map_err(Int8SourceError::from)?;
         constrained_int8::check_profile(context.execution_identity()).map_err(Int8SourceError::from)?;
+        if source.is_empty() { return Err(Int8SourceMapError::EmptySource); }
+        let chunks = self.partition_int8_map_with_control(source, limits, control)?;
+        let masks = limits.mask_visits_per_chunk.checked_mul(chunks.chunks().len() as u64)
+            .filter(|&n| n <= limits.max_mask_visits).ok_or(Int8SourceMapError::WorkLimit)?;
+        let mut plans = Vec::new();
+        plans.try_reserve_exact(chunks.chunks().len()).map_err(|_| Int8SourceMapError::Allocation)?;
+        let mut work = Int8Work::default();
+        for chunk in chunks.chunks() {
+            checkpoint(control)?;
+            let request = task.request(chunk.text().to_owned(), budget);
+            let plan = self.plan_int8_with_control(&request, context, planning, control)?;
+            work = add_work(work, plan.planned_work()).ok_or(Int8SourceMapError::WorkLimit)?;
+            if !within(work, limits.max_model_work) { return Err(Int8SourceMapError::WorkLimit); }
+            plans.push(plan);
+        }
+        let expected = self.int8_map_expectation(source, task, budget, context, planning, limits,
+            &chunks, work, masks, control)?;
+        checkpoint(control)?;
+        Ok(PreparedInt8SourceMap { chunks, plans, limits, work, masks, expected })
+    }
+
+    fn partition_int8_map_with_control<'s, C: DecodeStepControl>(&self, source: &'s str,
+        limits: Int8SourceMapLimits, control: &mut C) -> Result<ChunkPlan<'s>, Int8SourceMapError> {
+        checkpoint(control)?;
+        self.map_document_encoding_workspace_bytes().map_err(Int8SourceError::from)?;
         if source.is_empty() { return Err(Int8SourceMapError::EmptySource); }
         let mut cancelled = None;
         let mut encoding_error = None;
@@ -199,25 +339,25 @@ impl SourceTaskPlanner {
         };
         if let Some(cause) = cancelled { return Err(Int8SourceError::Cancelled(cause).into()); }
         if let Some(error) = encoding_error { return Err(Int8SourceError::from(error).into()); }
-        let chunks = chunks.map_err(Int8SourceMapError::Chunk)?;
-        let masks = limits.mask_visits_per_chunk.checked_mul(chunks.chunks().len() as u64)
-            .filter(|&n| n <= limits.max_mask_visits).ok_or(Int8SourceMapError::WorkLimit)?;
-        let mut plans = Vec::new();
-        plans.try_reserve_exact(chunks.chunks().len()).map_err(|_| Int8SourceMapError::Allocation)?;
-        let mut work = Int8Work::default();
-        for chunk in chunks.chunks() {
-            checkpoint(control)?;
-            let request = task.request(chunk.text().to_owned(), budget);
-            let plan = self.plan_int8_with_control(&request, context, planning, control)?;
-            work = add_work(work, plan.planned_work()).ok_or(Int8SourceMapError::WorkLimit)?;
-            if !within(work, limits.max_model_work) { return Err(Int8SourceMapError::WorkLimit); }
-            plans.push(plan);
-        }
-        checkpoint(control)?;
-        Ok(PreparedInt8SourceMap { chunks, plans, limits, work, masks })
+        chunks.map_err(Int8SourceMapError::Chunk)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn int8_map_expectation<C: DecodeStepControl>(&self, source: &str, task: &SourceMapTask,
+        budget: TaskBudget, context: &PlanContext<'_>, planning: SourcePlanningLimits,
+        limits: Int8SourceMapLimits, chunks: &ChunkPlan<'_>, work: Int8Work, masks: u64, control: &mut C)
+        -> Result<Int8SourceMapPreflight, Int8SourceMapError> {
+        let last = chunks.chunks().last().ok_or(Int8SourceMapError::EmptySource)?.span();
+        let request_binding = question::binding::document_request(b"fnlp-int8-source-map-request-v1",
+            source, task, budget, context, planning, limits, self, chunks, control)?;
+        Ok(Int8SourceMapPreflight { source_span: VerifiedSourceSpan { byte_start: 0, byte_end: source.len(),
+            scalar_start: 0, scalar_end: last.scalar_end }, chunks: chunks.chunks().len(), task: task.kind(),
+            work, masks, max_value_bytes: limits.reduction.max_value_bytes,
+            max_result_bytes: limits.reduction.max_result_bytes as u64, request_binding })
     }
 }
 impl PreparedInt8SourceMap<'_> {
+    pub fn preflight_metadata(&self) -> Int8SourceMapPreflight { self.expected }
     pub fn execution_identities(&self) -> impl ExactSizeIterator<Item = &ExecutionIdentity> {
         self.plans.iter().map(PreparedInt8SourceTask::execution_identity)
     }
@@ -254,13 +394,14 @@ impl PreparedInt8SourceMap<'_> {
         let mapped = mapped.map_err(Int8SourceMapError::Reduction)?;
         if task.next_chunk != self.plans.len() || mapped.root().value().len() != self.plans.len()
             || !within(task.work, self.work) || task.masks > self.masks { return Err(Int8SourceError::InvalidResult.into()); }
-        let result = Int8SourceMapRun { schema_version: 1, execution: INT8_SOURCE_MAP_EXECUTION,
+        let mut result = Int8SourceMapRun { schema_version: 1, execution: INT8_SOURCE_MAP_EXECUTION,
             semantics: "independent-chunks-no-cross-chunk-reasoning-v1", planned_model_work: self.work,
             model_work: task.work, reserved_mask_node_visits: self.masks,
-            mask_node_visit_charge: task.masks, mapped };
-        let size = extract_int8::check_size(&result, self.max_result_bytes());
-        task.driver.checkpoint()?;
-        size.map_err(Int8SourceError::from)?;
+            mask_node_visit_charge: task.masks, mapped,
+            request_binding: self.expected.request_binding, result_binding: [0; 32] };
+        let mut check = || task.driver.checkpoint().map_err(Int8SourceMapError::from);
+        result.result_binding = source_map_result_binding(&result, self.max_result_bytes(), &mut check)?;
+        self.expected.verify_completed_with_checkpoints(&result, &mut check)?;
         Ok(result)
     }
 }

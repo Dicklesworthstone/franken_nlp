@@ -135,6 +135,65 @@ fn ranking_and_evidence_are_independent_of_batch_and_multilevel_tree_shape() {
     } }
 }
 #[test]
+fn completed_keyphrases_require_exact_source_and_every_reducer_allowance() {
+    let p = planner(); let prepared = prepare(&p, SOURCE, 2, 1);
+    let map = prepared.preflight_metadata();
+    let expected = map.keyphrases_with_control(limits(), &mut Continue).unwrap();
+    let driver = script(&prepared); let result = run(prepared, limits(), driver).unwrap();
+    expected.verify_completed(&result).unwrap();
+    let source = SOURCE.replace('A', "Z");
+    let foreign = prepare(&p, &source, 2, 1).preflight_metadata();
+    assert_eq!(map.source_span(), foreign.source_span()); assert_eq!(map.planned_work(), foreign.planned_work());
+    assert!(foreign.keyphrases_with_control(limits(), &mut Continue).unwrap().verify_completed(&result).is_err());
+    for axis in 0..6 {
+        let mut changed = limits();
+        match axis { 0 => changed.max_phrases += 1, 1 => changed.max_result_bytes -= 1,
+            2 => changed.aggregation.max_unique_phrases -= 1, 3 => changed.aggregation.max_evidence_spans -= 1,
+            4 => changed.aggregation.max_value_bytes -= 1, _ => changed.aggregation.max_scan_work -= 1 }
+        assert!(map.keyphrases_with_control(changed, &mut Continue).unwrap().verify_completed(&result).is_err());
+    }
+    let json = serde_json::to_string(&result).unwrap(); let debug = format!("{expected:?}");
+    for private in ["request_binding", "result_binding", SOURCE] {
+        assert!(!json.contains(private)); assert!(!debug.contains(private));
+    }
+}
+#[test]
+fn completion_rejects_changed_keyphrase_text_evidence_ranks_and_bookkeeping() {
+    let p = planner(); let prepared = prepare(&p, SOURCE, 2, 1);
+    let expected = prepared.preflight_metadata().keyphrases_with_control(limits(), &mut Continue).unwrap();
+    let driver = script(&prepared); let mut result = run(prepared, limits(), driver).unwrap();
+    result.keyphrases.phrases[0].text.push('!');
+    assert!(expected.verify_completed(&result).is_err()); result.keyphrases.phrases[0].text.pop();
+    result.keyphrases.phrases[0].rank_sum += 1;
+    assert!(expected.verify_completed(&result).is_err()); result.keyphrases.phrases[0].rank_sum -= 1;
+    result.keyphrases.phrases[0].evidence[0].spans[0].scalar_end += 1;
+    assert!(expected.verify_completed(&result).is_err()); result.keyphrases.phrases[0].evidence[0].spans[0].scalar_end -= 1;
+    result.verification_scan_work += 1;
+    assert!(expected.verify_completed(&result).is_err()); result.verification_scan_work -= 1;
+    result.reduce_calls += 1;
+    assert!(expected.verify_completed(&result).is_err()); result.reduce_calls -= 1;
+    expected.verify_completed(&result).unwrap();
+    struct Stop(DecodeCancellationKind);
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { Some(self.0) }
+    }
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        assert_eq!(expected.verify_completed_with_control(&result, &mut Stop(cause)).unwrap_err().cancellation(), Some(cause));
+    }
+}
+#[test]
+fn final_keyphrase_binding_obeys_the_exact_complete_output_byte_cap() {
+    let p = planner(); let prepared = prepare(&p, SOURCE, 2, 1); let driver = script(&prepared);
+    let bytes = crate::canonjson::canonical_bytes(&run(prepared, limits(), driver).unwrap()).unwrap();
+    let prepared = prepare(&p, SOURCE, 2, 1); let driver = script(&prepared);
+    assert!(run(prepared, Int8KeyphraseLimits { max_result_bytes: bytes.len() - 1, ..limits() }, driver).is_err());
+    let prepared = prepare(&p, SOURCE, 2, 1); let driver = script(&prepared);
+    let exact = run(prepared, Int8KeyphraseLimits { max_result_bytes: bytes.len(), ..limits() }, driver).unwrap();
+    assert_eq!(crate::canonjson::canonical_bytes(&exact).unwrap().len(), bytes.len());
+}
+#[test]
 fn late_corrupt_unselected_candidates_fail_the_complete_document() {
     let p = planner();
     for axis in 0..5 {

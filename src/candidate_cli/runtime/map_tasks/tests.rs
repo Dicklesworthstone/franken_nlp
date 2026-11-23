@@ -2,7 +2,8 @@
 use super::*;
 use crate::{candidate_cli::map::tests::command,
     native_engine::decode::DecodeCancellationKind,
-    tasks::{mapreduce::ChunkLimits, source_planning::quantized::long::SourceMapTask}};
+    tasks::{mapreduce::{ChunkLimits, ChunkPlan, MapReduceError}, source_planning::quantized::{
+        capacity::Int8SourceMapCapacity, long::SourceMapTask}}};
 
 struct Control { calls: usize, stop_at: usize }
 impl DecodeStepControl for Control {
@@ -34,6 +35,14 @@ fn assets(command: &MapCommand) -> (SourceTaskPlanner, ExecutionIdentity, TaskBu
     let mapping = command.mapping(cap).unwrap();
     (p, id, b, task, cap, mapping)
 }
+fn preflight(source: &str, planner: &SourceTaskPlanner, command: &MapCommand,
+    _capacity: Int8SourceMapCapacity, mapping: Int8SourceMapLimits, budget: TaskBudget,
+    control: &mut impl DecodeStepControl) -> Result<Preflight, CandidateError> {
+    let identity = source_identity(&facts(), planner, command.kind()?)?;
+    let task = command.map_task(None)?;
+    let context = PlanContext::new(&identity, budget).map_err(|_| CandidateError::Planning)?;
+    super::preflight(source, planner, command, &task, &context, mapping, budget, control)
+}
 #[test]
 fn long_document_preflight_equals_actual_native_plans_for_each_task() {
     for name in ["ner", "keyphrases", "summarize"] {
@@ -45,11 +54,12 @@ fn long_document_preflight_equals_actual_native_plans_for_each_task() {
         let actual = p.plan_int8_map_with_control(&text, &task, b, &ctx,
             cmd.host.planning(), mapping, &mut go()).unwrap();
         assert!(actual.chunk_count() > 1);
-        assert_eq!(expected.chunks, actual.chunk_count());
-        assert_eq!(expected.work, actual.planned_work());
-        assert_eq!(expected.masks, actual.reserved_mask_visits());
-        assert_eq!(expected.source_bytes, text.len());
-        assert_eq!(expected.source_scalars, text.chars().count());
+        assert_eq!(expected, actual.preflight_metadata());
+        assert_eq!(expected.chunk_count(), actual.chunk_count());
+        assert_eq!(expected.planned_work(), actual.planned_work());
+        assert_eq!(expected.reserved_mask_visits(), actual.reserved_mask_visits());
+        assert_eq!(expected.source_span().byte_end, text.len());
+        assert_eq!(expected.source_span().scalar_end, text.chars().count());
         for identity in actual.execution_identities() {
             assert_eq!(identity.logical_model_digest.to_hex(), facts().logical_model_sha256);
             assert_eq!(identity.task_spec, cmd.kind().unwrap().spec().identity());
@@ -77,7 +87,7 @@ fn automatic_limits_preserve_every_source_byte_and_crlf_boundary() {
     }
     assert_eq!((byte_end, scalar_end), (text.len(), text.chars().count()));
     let result = preflight(&text, &p, &cmd, cap, mapping, b, &mut go()).unwrap();
-    assert_eq!(result.chunks, chunks.chunks().len());
+    assert_eq!(result.chunk_count(), chunks.chunks().len());
 }
 #[test]
 fn exceeding_chunk_cardinality_refuses_the_entire_document() {
@@ -91,12 +101,12 @@ fn one_less_than_actual_work_or_mask_allowance_refuses_before_loading() {
     let mut cmd = command("ner", &[]); let (p, _, b, _, cap, mapping) = assets(&cmd);
     let text = "Alice\r\n".repeat(100);
     let expected = preflight(&text, &p, &cmd, cap, mapping, b, &mut go()).unwrap();
-    cmd.max_forward_positions = expected.work.forward_positions - 1;
+    cmd.max_forward_positions = expected.planned_work().forward_positions - 1;
     assert!(preflight(&text, &p, &cmd, cap, mapping, b, &mut go()).is_err());
-    cmd.max_forward_positions = expected.work.forward_positions;
-    cmd.max_total_mask_node_visits = expected.masks - 1;
+    cmd.max_forward_positions = expected.planned_work().forward_positions;
+    cmd.max_total_mask_node_visits = expected.reserved_mask_visits() - 1;
     assert!(preflight(&text, &p, &cmd, cap, mapping, b, &mut go()).is_err());
-    cmd.max_total_mask_node_visits = expected.masks;
+    cmd.max_total_mask_node_visits = expected.reserved_mask_visits();
     assert!(preflight(&text, &p, &cmd, cap, mapping, b, &mut go()).is_ok());
 }
 #[test]
@@ -134,9 +144,10 @@ fn compact_preflight_and_hosted_replanning_share_one_counter_and_exact_native_wo
         assert_eq!(p.map_document_encoding_work().unwrap().unwrap().input_bytes(), text.len());
         let actual = p.plan_int8_map_with_control(&text, &task, b, &PlanContext::new(&id, b).unwrap(),
             cmd.host.planning(), mapping, &mut go()).unwrap();
-        assert_eq!(expected.chunks, actual.chunk_count());
-        assert_eq!(expected.work, actual.planned_work());
-        assert_eq!(expected.masks, actual.reserved_mask_visits());
+        assert_eq!(expected, actual.preflight_metadata());
+        assert_eq!(expected.chunk_count(), actual.chunk_count());
+        assert_eq!(expected.planned_work(), actual.planned_work());
+        assert_eq!(expected.reserved_mask_visits(), actual.reserved_mask_visits());
         let used = p.map_document_encoding_work().unwrap().unwrap();
         assert_eq!(used.input_bytes(), 3 * text.len(), "preflight, hosted sizing and actual compilation");
         assert!(used.output_tokens() < used.input_bytes());

@@ -7,7 +7,7 @@
 use super::*;
 use std::cell::RefCell;
 use crate::corpus::summarize::{CorpusSummaryError, CorpusSummaryLimits, CorpusSummaryResult,
-    CorpusSummaryTask, SummaryPass, check_bytes};
+    CorpusSummaryTask, SummaryPass, SUMMARY_REDUCTION_POLICY};
 use crate::tasks::{mapreduce::CHUNK_PROFILE, summarize::SummaryResult};
 
 /// Separate opt-in neural synthesis from verified verbatim map evidence.
@@ -17,7 +17,7 @@ pub const INT8_CORPUS_SUMMARY_EXECUTION: &str = "portable-int8-cited-summary-map
 
 /// These bounds constrain the complete document, independently of each native
 /// chunk's SummaryOptions and TaskBudget. No intermediate top-k is permitted.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Int8SummaryLimits {
     pub aggregation: CorpusSummaryLimits,
     pub max_bullets: usize,
@@ -98,6 +98,89 @@ pub struct Int8CorpusSummaryRun {
     pub mask_node_visit_charge: u64,
     pub verification_scan_steps: u64,
     pub summary: CorpusSummaryResult,
+    #[serde(skip)]
+    request_binding: [u8; 32],
+    #[serde(skip)]
+    result_binding: [u8; 32],
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct Int8SummaryPreflight {
+    map: Int8SourceMapPreflight,
+    limits: Int8SummaryLimits,
+    request_binding: [u8; 32],
+}
+impl fmt::Debug for Int8SummaryPreflight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Int8SummaryPreflight").field("map", &self.map)
+            .field("limits", &self.limits).finish_non_exhaustive()
+    }
+}
+impl Int8SourceMapPreflight {
+    /// Add the complete reducer allowance to the exact map request before
+    /// execution. A changed top-k, evidence or scan cap is a different request.
+    pub fn summary_with_control<C: DecodeStepControl>(&self, limits: Int8SummaryLimits,
+        control: &mut C) -> Result<Int8SummaryPreflight, Int8CorpusSummaryError> {
+        self.summary_with_checkpoints(limits, &mut || checkpoint(control).map_err(Int8SourceMapError::from))
+    }
+    fn summary_with_checkpoints<F>(&self, limits: Int8SummaryLimits, check: &mut F)
+        -> Result<Int8SummaryPreflight, Int8CorpusSummaryError>
+        where F: FnMut() -> Result<(), Int8SourceMapError> {
+        check()?;
+        limits.aggregation.validate()?;
+        if self.task != BuiltInTask::Summarize || !(1..=1024).contains(&limits.max_bullets)
+            || !(1..=64 * 1024 * 1024).contains(&limits.max_result_bytes)
+            || limits.aggregation.max_value_bytes > self.max_value_bytes
+            || limits.max_result_bytes as u64 > self.max_result_bytes {
+            return Err(Int8CorpusSummaryError::InvalidLimits);
+        }
+        let request_binding = question::binding::derived_request_with_checkpoints(
+            b"fnlp-int8-summary-reduction-request-v1", self.request_binding,
+            &(limits.aggregation, limits.max_bullets, limits.max_result_bytes), check)?;
+        Ok(Int8SummaryPreflight { map: *self, limits, request_binding })
+    }
+}
+impl Int8SummaryPreflight {
+    pub fn verify_completed(&self, run: &Int8CorpusSummaryRun) -> Result<(), Int8CorpusSummaryError> {
+        self.verify_completed_with_checkpoints(run, &mut || Ok(()))
+    }
+    pub fn verify_completed_with_control<C: DecodeStepControl>(&self, run: &Int8CorpusSummaryRun,
+        control: &mut C) -> Result<(), Int8CorpusSummaryError> {
+        self.verify_completed_with_checkpoints(run,
+            &mut || checkpoint(control).map_err(Int8SourceMapError::from))
+    }
+    fn verify_completed_with_checkpoints<F>(&self, run: &Int8CorpusSummaryRun, check: &mut F)
+        -> Result<(), Int8CorpusSummaryError> where F: FnMut() -> Result<(), Int8SourceMapError> {
+        check()?;
+        if run.request_binding != self.request_binding || run.result_binding != summary_result_binding(run,
+            self.limits.max_result_bytes as u64, check)? { return Err(Int8CorpusSummaryError::Accounting); }
+        let summary = &run.summary;
+        if run.schema_version != 1 || run.execution != INT8_CORPUS_SUMMARY_EXECUTION
+            || run.numerics_profile != STRICT_INT8_PROFILE || run.chunk_profile != CHUNK_PROFILE
+            || run.semantics != "exact-bullet-evidence-union-no-neural-synthesis-v1"
+            || run.source_span != self.map.source_span
+            || run.planned_model_work != self.map.work || run.reserved_mask_node_visits != self.map.masks
+            || !within(run.model_work, self.map.work) || run.mask_node_visit_charge > self.map.masks
+            || run.verification_scan_steps > self.limits.aggregation.max_scan_steps
+            || summary.schema_version != 1 || summary.task_spec_version != SUMMARIZE_TASK_VERSION
+            || summary.reduction_policy != SUMMARY_REDUCTION_POLICY
+            || summary.mapped_chunks != self.map.chunks || summary.requested_max_bullets != self.limits.max_bullets
+            || summary.bullets.len() > self.limits.max_bullets
+            || summary.bullets.len().checked_add(summary.omitted_bullets)
+                .is_none_or(|n| n > self.limits.aggregation.max_unique_bullets)
+            || summary.forward_positions != run.model_work.forward_positions
+            || summary.projected_logits != run.model_work.projected_logits
+            || summary.mask_node_visit_charge != run.mask_node_visit_charge {
+            return Err(Int8CorpusSummaryError::Accounting);
+        }
+        check()?;
+        Ok(())
+    }
+}
+fn summary_result_binding<F>(run: &Int8CorpusSummaryRun, cap: u64, check: &mut F)
+    -> Result<[u8; 32], Int8SourceMapError> where F: FnMut() -> Result<(), Int8SourceMapError> {
+    question::binding::composed_result_with_checkpoints(b"fnlp-int8-summary-reduction-result-v1",
+        run.request_binding, &[], run, cap, check)
 }
 
 impl PreparedInt8SourceMap<'_> {
@@ -139,6 +222,8 @@ impl PreparedInt8SourceMap<'_> {
         let options = self.summary_options(limits)?;
         verify_identities(&self.plans, admitted)?;
         let driver = RefCell::new(driver);
+        let expected = self.expected.summary_with_checkpoints(limits,
+            &mut || driver.borrow_mut().checkpoint().map_err(Int8SourceMapError::from))?;
         let mut checkpoint_error = None;
         let pass = Pass { plans: &self.plans, admitted, driver: &driver, options,
             next_chunk: 0, work: Int8Work::default(), masks: 0, mask_cap: self.limits.mask_visits_per_chunk };
@@ -165,14 +250,16 @@ impl PreparedInt8SourceMap<'_> {
         let summary = reduced.into_value().into_ranked(limits.max_bullets, limits.max_result_bytes)?;
         if summary.forward_positions != pass.work.forward_positions || summary.projected_logits != pass.work.projected_logits
             || summary.mask_node_visit_charge != pass.masks { return Err(Int8CorpusSummaryError::Accounting); }
-        let output = Int8CorpusSummaryRun { schema_version: 1, execution: INT8_CORPUS_SUMMARY_EXECUTION,
+        let mut output = Int8CorpusSummaryRun { schema_version: 1, execution: INT8_CORPUS_SUMMARY_EXECUTION,
             numerics_profile: STRICT_INT8_PROFILE, chunk_profile: CHUNK_PROFILE,
             semantics: "exact-bullet-evidence-union-no-neural-synthesis-v1",
             source_span: metadata.0, map_batches: metadata.1, reduce_calls: metadata.2, reduction_levels: metadata.3,
             planned_model_work: self.work, model_work: pass.work, reserved_mask_node_visits: self.masks,
-            mask_node_visit_charge: pass.masks, verification_scan_steps: scan_steps, summary };
-        check_bytes(&output, limits.max_result_bytes)?;
-        driver.borrow_mut().checkpoint()?;
+            mask_node_visit_charge: pass.masks, verification_scan_steps: scan_steps, summary,
+            request_binding: expected.request_binding, result_binding: [0; 32] };
+        let mut check = || driver.borrow_mut().checkpoint().map_err(Int8SourceMapError::from);
+        output.result_binding = summary_result_binding(&output, limits.max_result_bytes as u64, &mut check)?;
+        expected.verify_completed_with_checkpoints(&output, &mut check)?;
         Ok(output)
     }
 }
