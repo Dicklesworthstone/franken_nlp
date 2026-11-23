@@ -108,7 +108,9 @@ pub struct Int8RedactionRun {
 
 /// Immutable detector recipe. The identity explicitly describes NER planning,
 /// not a precompiled redaction prompt. Each pass derives its exact prompt from
-/// the supplied text under this fixed context. No mutable task factory exists.
+/// the supplied text under this fixed context. Compact input requires a planner
+/// configured with `with_map_document_encoding`: preflight and both passes
+/// retain that same complete-operation allowance. No mutable task factory exists.
 pub struct Int8Redactor<'p> {
     planner: &'p SourceTaskPlanner,
     identity: ExecutionIdentity,
@@ -119,6 +121,11 @@ impl<'p> Int8Redactor<'p> {
     pub fn new(planner: &'p SourceTaskPlanner, ner_identity: ExecutionIdentity, config: Int8RedactionConfig)
         -> Result<Self, Int8RedactionError> {
         config.validate()?;
+        // Original preflight, execution planning and fresh edited-source
+        // verification form one operation. Compact per-pass limits alone
+        // must not renew the tokenizer allowance between these stages.
+        // Byte input retains its existing zero-workspace admission.
+        planner.map_document_encoding_workspace_bytes().map_err(Int8SourceError::from)?;
         ner_identity.validate().map_err(|_| Int8RedactionError::Identity)?;
         constrained_int8::check_profile(&ner_identity).map_err(|_| Int8RedactionError::Identity)?;
         if ner_identity.task_spec != NER_TASK_VERSION || ner_identity.tokenizer_digest != planner.tokenizer_digest()
@@ -174,6 +181,15 @@ impl<'p> Int8Redactor<'p> {
         result.policy_digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&(
             INT8_REDACTION_EXECUTION, result.policy_digest, &self.config.ner, self.config.per_pass,
         )).map_err(|_| RedactError::Serialization)?);
+        if let Some(limits) = self.planner.map_document_encoding_limits() {
+            // Encoding changes prompt tokens and is a separate semantic
+            // recipe. Bind both per-call and complete-operation ceilings
+            // without disclosing source bytes or changing byte-mode identity.
+            result.policy_digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&(
+                "portable-int8-redaction-input-encoding-v1", result.policy_digest,
+                self.planner.document_encoding(), limits,
+            )).map_err(|_| RedactError::Serialization)?);
+        }
         let output = Int8RedactionRun { schema_version: 1, execution: INT8_REDACTION_EXECUTION,
             numerics_profile: STRICT_INT8_PROFILE, result, ner_passes: ledger.completed,
             reserved_model_work: ledger.reserved, model_work: ledger.actual,

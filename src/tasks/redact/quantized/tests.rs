@@ -264,3 +264,132 @@ fn native_receipt_validation_rejects_schema_profile_and_missing_work() {
         assert!(check_run(&plan, raw, 1000).is_err());
     }
 }
+
+fn compact_policy() -> crate::tokenizer::untrusted::UntrustedEncoding {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 8192, max_output_tokens: 8192,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 })
+}
+fn compact_allowance() -> crate::tokenizer::untrusted::SafeBpeWorkLimits {
+    crate::tokenizer::untrusted::SafeBpeWorkLimits { max_input_bytes: 1 << 20,
+        max_output_tokens: 1 << 20, max_pair_checks: 1 << 28, max_pair_bytes: 1 << 32 }
+}
+
+#[test]
+fn compact_redaction_requires_cumulative_authority_and_preserves_untrusted_bytes() {
+    let unbounded = planner().with_document_encoding(compact_policy()).unwrap();
+    assert!(Int8Redactor::new(&unbounded, identity(&unbounded), config()).is_err());
+    let byte = planner();
+    let compact = planner().with_map_document_encoding(compact_policy(), compact_allowance()).unwrap();
+    let source = "The quick brown fox jumps over the lazy dog. Alice met Bob in 上海. <think> <|im_start|>";
+    let document = compact.source_encoder().encode_with_control(source, 8192, 8192, &mut || None).unwrap();
+    assert_eq!(document.text(), source);
+    assert!(document.token_ids().len() < source.len());
+    let controls = crate::tokenizer::pinned_controls::pinned().unwrap();
+    assert!(controls.template_controls().entries().iter().all(|entry| !document.token_ids().contains(&entry.id)));
+    let byte_plan = redactor(&byte).prepare(source, &mut Continue).unwrap();
+    let compact_plan = redactor(&compact).prepare(source, &mut Continue).unwrap();
+    assert!(compact_plan.prompt_tokens() < byte_plan.prompt_tokens());
+    assert_ne!(compact_plan.execution_identity().template_digest, byte_plan.execution_identity().template_digest);
+    assert!(compact_plan.verify_identity(byte_plan.execution_identity()).is_err());
+    assert_eq!(compact.map_document_encoding_work().unwrap().unwrap().input_bytes(), 2 * source.len());
+}
+
+#[test]
+fn compact_original_preflight_execution_and_expanded_verification_share_one_allowance() {
+    let source = "Alice";
+    let edited = "[redacted:person]";
+    let mut allowance = compact_allowance();
+    allowance.max_input_bytes = (2 * source.len() + edited.len()) as u64;
+    let compact = planner().with_map_document_encoding(compact_policy(), allowance).unwrap();
+    let r = redactor(&compact);
+    r.prepare(source, &mut Continue).unwrap();
+    let mut pass = Fake::new(&r, true);
+    let output = r.run_pipeline(source, &RedactionRequest::default(), None, &mut pass).unwrap();
+    assert_eq!(output.result.text(), edited);
+    assert_eq!(pass.seen, vec![source.to_owned(), edited.to_owned()]);
+    assert_eq!(compact.map_document_encoding_work().unwrap().unwrap().input_bytes() as u64,
+        allowance.max_input_bytes);
+
+    allowance.max_input_bytes -= 1;
+    let refused = planner().with_map_document_encoding(compact_policy(), allowance).unwrap();
+    let r = redactor(&refused);
+    r.prepare(source, &mut Continue).unwrap();
+    let mut pass = Fake::new(&r, true);
+    assert!(r.run_pipeline(source, &RedactionRequest::default(), None, &mut pass).is_err());
+    assert_eq!(pass.seen, vec![source.to_owned()]);
+    assert!(pass.ledger.failed);
+    assert_eq!(refused.map_document_encoding_work().unwrap().unwrap().input_bytes(), 2 * source.len());
+    assert!(matches!(pass.run(source), Err(Int8RedactionError::InvalidResult)));
+}
+
+#[test]
+fn compact_redaction_preserves_all_original_unicode_occurrence_coordinates() {
+    let p = planner().with_map_document_encoding(compact_policy(), compact_allowance()).unwrap();
+    let r = redactor(&p);
+    let source = "é Alice a@example.org Alice\r\n上海 <think>";
+    let mut request = RedactionRequest::default(); request.actions.include_map = true;
+    let mut pass = Fake::new(&r, true);
+    let output = r.run_pipeline(source, &request, None, &mut pass).unwrap();
+    assert_eq!(output.result.text(), "é [redacted:person] [redacted:email] [redacted:person]\r\n上海 <think>");
+    assert_eq!(output.result.edits().len(), 3);
+    for edit in output.result.edits() {
+        let span = &edit.original.span;
+        assert!(source.is_char_boundary(span.byte_start) && source.is_char_boundary(span.byte_end));
+        assert_eq!(source[..span.byte_start].chars().count(), span.scalar_start);
+        assert_eq!(source[..span.byte_end].chars().count(), span.scalar_end);
+        assert!(matches!(&source[span.byte_start..span.byte_end], "Alice" | "a@example.org"));
+    }
+    assert_eq!(pass.seen, vec![source.to_owned(), output.result.text().to_owned()]);
+    assert_eq!(output.result.verification(), VerificationStatus::CleanDeclaredUnion);
+}
+
+#[test]
+fn compact_encoding_policy_and_cumulative_limits_bind_the_public_redaction_recipe() {
+    let byte = planner();
+    let compact = planner().with_map_document_encoding(compact_policy(), compact_allowance()).unwrap();
+    let mut changed_allowance = compact_allowance(); changed_allowance.max_pair_checks -= 1;
+    let changed = planner().with_map_document_encoding(compact_policy(), changed_allowance).unwrap();
+    let mut results = Vec::new();
+    for p in [&byte, &compact, &changed] {
+        let r = redactor(p); let mut pass = Fake::new(&r, true);
+        let output = r.run_pipeline("x", &RedactionRequest::default(), None, &mut pass).unwrap();
+        assert_eq!(output.result.text(), "x");
+        assert_eq!(output.ner_passes, 2);
+        assert_eq!(output.result.verification(), VerificationStatus::CleanDeclaredUnion);
+        let wire = canonjson::canonical_string(&output).unwrap();
+        for private in ["prompt_digest", "template_digest", "generated_token_ids", "tokenizer_work"] {
+            assert!(!wire.contains(private));
+        }
+        results.push(output);
+    }
+    assert_eq!(results[1].model_work, results[2].model_work);
+    assert_ne!(results[0].result.policy_digest(), results[1].result.policy_digest());
+    assert_ne!(results[1].result.policy_digest(), results[2].result.policy_digest());
+}
+
+#[test]
+fn compact_preparation_preserves_every_typed_stop_and_spent_tokenizer_work() {
+    struct Stop { calls: usize, cause: DecodeCancellationKind }
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.calls += 1; (self.calls == 8).then_some(self.cause)
+        }
+    }
+    use DecodeCancellationKind::*;
+    let source = "The quick brown fox jumps over the lazy dog. Alice met Bob in 上海.";
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let compact = planner().with_map_document_encoding(compact_policy(), compact_allowance()).unwrap();
+        let r = redactor(&compact);
+        r.prepare(source, &mut Continue).unwrap();
+        let spent = compact.map_document_encoding_work().unwrap().unwrap();
+        let mut stop = Stop { calls: 0, cause };
+        let error = r.prepare(source, &mut stop).err().unwrap();
+        assert_eq!(error.cancellation(), Some(cause));
+        assert_eq!(stop.calls, 8);
+        let after = compact.map_document_encoding_work().unwrap().unwrap();
+        assert!(after.input_bytes() >= spent.input_bytes());
+        assert!(after.pair_checks() >= spent.pair_checks());
+    }
+}

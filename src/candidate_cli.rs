@@ -176,7 +176,7 @@ impl CandidateCommand {
             return resolve::ResolveCommand::from_arg_matches(matches).map(Self::Resolve);
         }
         if name == "redact" {
-            return redact::RedactCommand::from_arg_matches(matches).map(Self::Redact);
+            return redact::RedactCommand::from_matches(matches).map(Self::Redact);
         }
         if name == "faithfulness-map" {
             return faithfulness_map::FaithfulnessMapCommand::from_matches(matches).map(Self::FaithfulnessMap);

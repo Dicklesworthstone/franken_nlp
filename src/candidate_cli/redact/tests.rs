@@ -85,3 +85,111 @@ fn disabled_feature_never_consumes_even_a_private_key() {
         assert_eq!(cmd.execute(&mut NoIo, &mut NoIo), Err(CandidateError::Unavailable));
     }
 }
+
+
+#[test]
+fn compact_redaction_uses_one_operation_allowance_and_preserves_original_input_cap() {
+    for verify in [false, true] {
+        let mut extra = vec!["--input-encoding", "safe-bpe-v1", "--max-input-bytes", "4",
+            "--max-result-bytes", "4096", "--max-tokenizer-pair-checks", "123456",
+            "--max-tokenizer-pair-bytes", "7654321"];
+        if !verify { extra.push("--no-verify"); }
+        let mut cmd = command(&extra);
+        cmd.host.memory_mib = 16_384;
+        let (common, limits) = cmd.validate().unwrap();
+        assert_eq!(cmd.host.preparation_mib, 1024);
+        assert_eq!(common.max_input_bytes, 4);
+        assert!(read_input(&mut Cursor::new(b"12345"), common.max_input_bytes).is_err());
+        let (policy, complete) = cmd.encoding_policy(limits).unwrap();
+        let UntrustedEncoding::SafeBpeV1(call) = policy else { panic!("compact policy required"); };
+        assert_eq!(call.max_input_bytes, 4096);
+        assert_eq!(call.max_output_tokens, limits.max_prompt_tokens);
+        let passes = 2 + u64::from(verify);
+        assert_eq!(complete.unwrap(), SafeBpeWorkLimits {
+            max_input_bytes: 4096 * passes,
+            max_output_tokens: limits.max_prompt_tokens as u64 * passes,
+            max_pair_checks: 123456, max_pair_bytes: 7654321,
+        });
+    }
+}
+
+#[test]
+fn compact_redaction_prices_expanded_workspace_and_every_live_owner() {
+    let mut cmd = command(&["--input-encoding", "safe-bpe-v1"]);
+    cmd.host.memory_mib = 16_384;
+    let (_, limits) = cmd.validate().unwrap();
+    let (policy, _) = cmd.encoding_policy(limits).unwrap();
+    let UntrustedEncoding::SafeBpeV1(call) = policy else { panic!("compact policy required"); };
+    let workspace = call.requirements().unwrap().workspace_bytes + 1024;
+    let floor = 256 * MIB + call.max_input_bytes as u64 * 32
+        + cmd.host.max_result_bytes as u64 * 16 + workspace;
+    let mut exact = limits;
+    exact.preparation_bytes = floor;
+    assert!(cmd.encoding_policy(exact).is_ok());
+    exact.preparation_bytes -= 1;
+    assert!(matches!(cmd.encoding_policy(exact), Err(CandidateError::Arguments)));
+
+    let native = Int8MemoryRequirement::for_context(cmd.host.context_tokens).unwrap();
+    let result = cmd.host.max_result_bytes as u64;
+    let edit = cmd.edit_reserve_mib * MIB;
+    // Independent owner inventory: model/metadata/load slack, two preparation
+    // owners, native state, final output, cleanup/load buffer, captured source
+    // and secret metadata, plus the overlapping intermediate NER/edit owner.
+    let expected = limits.weight_bytes + 128 * MIB + 64 * MIB
+        + 2 * limits.preparation_bytes + native.kv_bytes + native.rope_bytes
+        + native.scratch_payload_bound + 64 * MIB + result * 4 + 4096
+        + 65_536 + 64 * 1024 + cmd.host.max_input_bytes as u64 + 1 + 4096
+        + result * 4 + cmd.host.max_new_tokens as u64 * 8 + edit;
+    assert_eq!(cmd.compact_peak_bytes(limits, edit).unwrap(), expected);
+    cmd.host.memory_mib = expected.div_ceil(MIB) - 1;
+    assert!(cmd.host.common_with_encoding(cmd.input.clone(), &cmd.encoding).is_ok());
+    assert!(matches!(cmd.validate(), Err(CandidateError::Arguments)));
+    cmd.host.memory_mib += 1;
+    assert!(cmd.validate().is_ok());
+}
+
+#[test]
+fn compact_redaction_refuses_unadmitted_composition_and_limits_before_private_io() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private read") } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("result write") }
+        fn flush(&mut self) -> io::Result<()> { panic!("result flush") }
+    }
+    for mode in 0..6 {
+        let mut cmd = command(&["private.txt", "--input-encoding", "safe-bpe-v1",
+            "--action", "pseudonymize", "--key-stdin", "--key-id", "rotation", "--namespace", "scope"]);
+        cmd.host.memory_mib = 16_384;
+        match mode {
+            0 => cmd.long.chunked = true,
+            1 => cmd.corpus.ndjson = true,
+            2 => cmd.retention.store_results = true,
+            3 => cmd.host.preparation_mib = 512,
+            4 => cmd.host.max_result_bytes = (1 << 20) + 1,
+            5 => cmd.host.memory_mib = 1024,
+            _ => unreachable!(),
+        }
+        assert_eq!(cmd.execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+    }
+    for flag in ["--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
+        let matches = super::super::definition().try_get_matches_from(
+            ["candidate", "redact", "--model", "local.fnlpq", "--memory-mib", "16384", flag, "1"]).unwrap();
+        assert!(CandidateCommand::from_matches(&matches).is_err());
+        let mut cmd = command(&["--input-encoding", "safe-bpe-v1", flag, "0"]);
+        cmd.host.memory_mib = 16_384;
+        assert!(matches!(cmd.validate(), Err(CandidateError::Arguments)));
+    }
+}
+
+#[test]
+fn explicit_byte_redaction_preserves_default_admission_and_has_no_encoding_allowance() {
+    let default = command(&[]);
+    let explicit = command(&["--input-encoding", "byte-fallback"]);
+    let (common, limits) = default.validate().unwrap();
+    let (explicit_common, explicit_limits) = explicit.validate().unwrap();
+    assert_eq!(limits, explicit_limits);
+    assert_eq!(common.input_encoding, explicit_common.input_encoding);
+    assert_eq!(default.host.preparation_mib, 512);
+    assert_eq!(explicit.host.preparation_mib, 512);
+    assert_eq!(explicit.encoding_policy(explicit_limits).unwrap(), (UntrustedEncoding::ByteFallback, None));
+}

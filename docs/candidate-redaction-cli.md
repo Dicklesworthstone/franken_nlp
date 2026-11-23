@@ -20,6 +20,50 @@ partially redacted documents are not exported; maps do not copy detected origina
 values. Undetected content can remain in the edited text. Output and preparation
 charges survive complete serialization, writing and flushing.
 
+## Compact input for one document
+
+The default byte-fallback encoder uses one token per source byte. Select
+`--input-encoding safe-bpe-v1` when you need compact tokens while preserving
+the exact original UTF-8 bytes and source coordinates:
+
+```sh
+fnlp candidate redact document.txt --model ./model.fnlpq --memory-mib 12288 \
+  --input-encoding safe-bpe-v1
+```
+
+Compact input excludes template-control token IDs. Instruction-shaped text
+remains untrusted document content; this is a byte-preserving token boundary,
+not a promise that the model cannot follow document instructions. The changed
+prompt tokens do not imply identical model output, detector recall or measured
+speed. Both original and actual edited text must independently fit context.
+
+One nonrenewable tokenizer ledger spans original-source preflight, original
+execution planning and fresh edited-source verification. The
+`--max-tokenizer-pair-checks` (4194304 default) and
+`--max-tokenizer-pair-bytes` (67108864 default) ceilings apply to their total.
+Consumed work stays consumed after a failed or cancelled planning call.
+Input-byte and output-token work totals use the admitted per-call peak times
+three preparations, or two with `--no-verify`. Exhaustion returns no successful
+redaction and never resets the allowance or silently selects byte fallback.
+
+The original reader still obeys `--max-input-bytes`. Tokenizer admission also
+prices the larger of that limit and `--max-result-bytes`, since placeholders
+and pseudonyms can expand the edited source. Compact preparation defaults to
+1024 MiB; byte preparation retains 512 MiB. Before key, document or model IO,
+compact admission checks both preparation owners, tokenizer workspace, model
+and native state, the overlapping NER/edit buffers and final output against
+the process ceiling. These are modeled reservations, not measured RSS.
+
+Compact responses add an `input_encoding` object containing `policy`,
+`complete_limits` and actual cumulative `work`. The native policy digest binds
+the exact per-call encoding and complete limits. Byte responses retain their
+existing shape and policy identity.
+
+This option currently covers single-document INT8 redaction only.
+Combinations with `--chunked`, `--ndjson` or retained jobs are refused before
+private IO; those modes require their own complete-operation admission.
+Tokenizer work flags require `--input-encoding safe-bpe-v1`.
+
 ## Scope and verification
 
 Default NER types are person, organization and location. `--ner-options FILE`
@@ -89,7 +133,8 @@ policy metadata and any opted-in coordinate map, not just edited text.
 Rule scans have a separately finite per-scan `--max-rule-work`. Detection and
 edit counts share `--max-detections` (4096 default, at most 16384). The hosted
 edit reserve (`--edit-reserve-mib`, 64 default) has a checked floor for region
-metadata and replacement staging. Shared preparation defaults to 512 MiB.
+metadata and replacement staging. Preparation defaults to 512 MiB for byte
+input or 1024 MiB for compact input.
 These are modeled ledger commitments, not OS-enforced or measured RSS bounds.
 One cooperative elapsed limit follows key/input reads, planning, loading and
 execution; blocking I/O and individual tokenizer operations are not preempted.
@@ -104,3 +149,11 @@ NER preparation, independent work accounting and cancellation. They are not
 neural-success fixtures. Rust compilation/tests, model inference, PII recall,
 benchmarks and controller DSR were not executed for this implementation.
 All successful outputs retain `evidence=non_authoritative`.
+
+The compact-input increment adds regression definitions for shared work across
+preflight/reconstruction/verification, exact source-byte preservation, all eleven
+cancellation causes, policy binding, expanded-workspace admission, total live
+memory, unsupported compositions and optional response metadata. These definitions
+have received source review but remain unexecuted pending the required DSR
+checkpoint; neither detector quality nor end-to-end compact-model behavior is
+qualified by this change.

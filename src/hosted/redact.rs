@@ -44,6 +44,9 @@ impl NlpEngine {
     /// Reuse one real resident model/native engine for original-source NER and,
     /// when requested, transformed-source NER. Return only a completed guarded
     /// result after rules, occurrence verification and all edits have drained.
+    /// Compact input must retain the original cumulative planner through any
+    /// caller preflight and both execution passes. Its workspace fits inside
+    /// the transferred preparation reservation; admission never resets it.
     /// No public neural CLI, batch daemon or artifact gate is activated here.
     #[allow(clippy::too_many_arguments)]
     pub fn redact_int8(&self, model: &ResidentInt8, source: String,
@@ -55,6 +58,7 @@ impl NlpEngine {
         check_model_identity(model.artifact_identity(), &config.ner_identity)?;
         let required = requirements(config.native)?;
         validate(&config, source.len(), planner.tokenizer_digest(), *planner.template_digest(), required.kv_bytes)?;
+        check_encoding_preparation(&planner, config.preparation_reserve_bytes)?;
         let input_bytes = input_bytes(&source, &config, pseudonyms.as_ref())?;
         let temporary_bytes = temporary_bytes(&config)?;
         let run = config.native.run;
@@ -88,6 +92,14 @@ impl NlpEngine {
             Ok(GuardedOutput::new(result.value, result._memory))
         })
     }
+}
+fn check_encoding_preparation(planner: &SourceTaskPlanner, preparation_bytes: u64) -> Result<(), HostedError> {
+    let required = planner.map_document_encoding_workspace_bytes()
+        .map_err(|_| HostedError::Limits("INT8 redaction cumulative encoding admission"))?;
+    if preparation_bytes < required {
+        return Err(HostedError::Limits("INT8 redaction tokenizer workspace"));
+    }
+    Ok(())
 }
 fn redaction_error(error: RedactError) -> HostedError { HostedError::Redaction(error.into()) }
 fn execution_error(error: Int8RedactionError) -> HostedError {

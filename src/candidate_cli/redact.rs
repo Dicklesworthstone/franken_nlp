@@ -6,6 +6,7 @@ pub(super) mod retention;
 use clap::ValueEnum;
 use crate::tasks::{ner::NerOptions, redact::{PiiKind, RedactionRequest,
     actions::RedactionAction, pseudonym::PseudonymKey}};
+use crate::tokenizer::untrusted::{SafeBpeWorkLimits, UntrustedEncoding};
 use source::SourceHostArgs;
 
 #[derive(Clone, Copy, Eq, PartialEq, ValueEnum)]
@@ -28,6 +29,9 @@ pub(crate) struct RedactCommand {
     pub(super) input: PathBuf,
     #[command(flatten)]
     pub(super) host: SourceHostArgs,
+    /// Compact input is admitted only for one complete redaction operation.
+    #[arg(skip)]
+    pub(super) encoding: input_encoding::InputEncodingArgs,
     #[command(flatten)]
     pub(super) long: long::LongArgs,
     #[command(flatten)]
@@ -69,13 +73,28 @@ pub(crate) struct RedactCommand {
 }
 
 pub(super) fn definition() -> clap::Command {
-    RedactCommand::augment_args(clap::Command::new("redact")
+    input_encoding::definition(RedactCommand::augment_args(clap::Command::new("redact")
         .about("Redact with native source-bound NER plus rules; verify the edited text afresh")
         .after_help("Verification covers only the selected detector union, not all PII. Model omissions and Unicode obfuscations remain possible. Pseudonyms are not anonymization. By default this candidate command emits one completed JSON object, never intermediate NER text. Pseudonymization always uses full 256-bit HMAC; raw key bytes have no argv option. Add --chunked for long documents: rules scan whole text while NER uses source-aligned chunks, then verification re-chunks the actual edited text. NER chunk boundaries may split entities; per-document work ceilings never renew per chunk. Add --ndjson for an owned corpus stream with one resident engine, fixed policy/key scope and independent whole-corpus ceilings. Completed document events remain valid if later records fail; any failed record yields a nonzero exit. Records cannot override actions, keys, types, chunking or verification. Add --store-results with --job-dir, --job-id, --job-key-file and --job-limits for explicit private retention. Save original envelopes only with --spool-input --max-retained-input-mib N; --resume --use-retained-input --max-retained-input-mib N restores them without a population positional argument or population stdin read. Otherwise resume requires the complete original population. Policy and both key scopes remain unchanged. Retained mode emits metadata only, and an error may follow durable progress. It requires metadata-store on supported Linux targets. The independent fnlp redact --rules-only command remains model-free."))
+    )
+        .mut_arg("preparation_mib", |arg| arg
+            .default_value_if("input_encoding", clap::builder::ArgPredicate::Equals("safe-bpe-v1".into()), "1024")
+            .help("Preparation memory in MiB; defaults to 512 for byte input or 1024 for compact redaction, including edited-text tokenizer workspace"))
+        .mut_arg("max_tokenizer_pair_checks", |arg| arg.help("Cumulative BPE pair-comparison cap across original preflight, execution planning and fresh edited-text verification; safe-bpe-v1 only, default 4194304"))
+        .mut_arg("max_tokenizer_pair_bytes", |arg| arg.help("Cumulative BPE examined-pair byte cap across the complete redaction operation; safe-bpe-v1 only, default 67108864"))
+        .after_long_help("Single-document --input-encoding safe-bpe-v1 preserves exact source bytes and excludes template-control tokens. One tokenizer ledger covers original preflight, execution planning and fresh verification of the actual edited text. Pair-work ceilings apply to their sum, never reset per pass. Byte/token totals are bounded by the declared per-pass peak times two preparations, or three with verification. The edited text must independently fit context and result limits. Admission prices its possible expansion before private key, document or model IO. Compact results report exact policy, complete limits and consumed work; the policy digest binds both limits. Tokenizer exhaustion returns no successful result. Compact input is unavailable with --chunked, --ndjson or retained jobs. This changes prompt tokens and makes no claim of identical model output, detector quality or measured speed.")
 }
 impl RedactCommand {
+    pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let mut command = Self::from_arg_matches(matches)?;
+        command.encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+        Ok(command)
+    }
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), CandidateError> {
-        let (common, limits) = self.host.common(self.input.clone())?;
+        if !self.encoding.is_default() && (self.long.chunked || self.corpus.ndjson || self.retention.store_results) {
+            return Err(CandidateError::Arguments);
+        }
+        let (common, limits) = self.host.common_with_encoding(self.input.clone(), &self.encoding)?;
         self.long.validate(&self.host, limits)?;
         if self.rules.is_empty() || !(1..=16_384).contains(&self.max_detections)
             || self.max_rule_work == 0 || self.max_rule_work > 1_000_000_000_000
@@ -94,7 +113,52 @@ impl RedactCommand {
         validate_key_scope(self.action, population_stdin, self.key_stdin, self.key_id.as_deref(),
             self.namespace.as_deref(), self.expected_key_commitment.as_deref())?;
         self.corpus.validate(self, limits)?;
+        let (_, complete) = self.encoding_policy(limits)?;
+        if complete.is_some() && self.compact_peak_bytes(limits, edit)? > limits.memory_bytes {
+            return Err(CandidateError::Arguments);
+        }
         Ok((common, limits))
+    }
+    pub(super) fn encoding_policy(&self, limits: Limits)
+        -> Result<(UntrustedEncoding, Option<SafeBpeWorkLimits>), CandidateError> {
+        // Verification can expand the source. Only its admitted encoding peak
+        // grows; the original document reader still uses max_input_bytes.
+        let input_bytes = self.host.max_input_bytes.max(self.host.max_result_bytes);
+        let policy = self.encoding.policy(input_bytes, limits.max_prompt_tokens)?;
+        let complete = match &policy {
+            UntrustedEncoding::ByteFallback => None,
+            UntrustedEncoding::SafeBpeV1(call) => {
+                let passes = 2 + u64::from(!self.no_verify);
+                let complete = SafeBpeWorkLimits {
+                    max_input_bytes: (call.max_input_bytes as u64).checked_mul(passes)
+                        .ok_or(CandidateError::Arguments)?,
+                    max_output_tokens: (call.max_output_tokens as u64).checked_mul(passes)
+                        .ok_or(CandidateError::Arguments)?,
+                    max_pair_checks: call.max_pair_checks, max_pair_bytes: call.max_pair_bytes,
+                };
+                complete.validate().map_err(|_| CandidateError::Arguments)?;
+                let workspace = call.requirements().map_err(|_| CandidateError::Arguments)?.workspace_bytes
+                    .checked_add(1024).ok_or(CandidateError::Arguments)?;
+                let floor = (256 * MIB).checked_add(input_bytes as u64 * 32)
+                    .and_then(|n| n.checked_add(self.host.max_result_bytes as u64 * 16))
+                    .and_then(|n| n.checked_add(workspace)).ok_or(CandidateError::Arguments)?;
+                if limits.preparation_bytes < floor { return Err(CandidateError::Arguments); }
+                Some(complete)
+            }
+        };
+        Ok((policy, complete))
+    }
+    fn compact_peak_bytes(&self, limits: Limits, edit_bytes: u64) -> Result<u64, CandidateError> {
+        let native = Int8MemoryRequirement::for_context(self.host.context_tokens)
+            .map_err(|_| CandidateError::Arguments)?;
+        // The caller preparation and the transferred planner/source owner
+        // coexist with edited text, a fresh NER result, native KV and output.
+        let peak = compute::request_peak_bytes(limits, native, self.host.max_result_bytes as u64,
+            0, 0, limits.preparation_bytes)?;
+        [peak, self.host.max_input_bytes as u64 + 1, 4096,
+            self.host.max_result_bytes as u64 * 4, self.host.max_new_tokens as u64 * 8, edit_bytes]
+            .into_iter().try_fold(0_u64, |sum, bytes| sum.checked_add(bytes))
+            .ok_or(CandidateError::Arguments)
     }
     pub(super) fn request(&self) -> RedactionRequest {
         let mut request = RedactionRequest::default();
