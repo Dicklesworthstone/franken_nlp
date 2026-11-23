@@ -25,6 +25,7 @@ mod text_batch;
 mod source;
 mod batch;
 mod scored;
+mod sentiment_map;
 mod classify_map;
 mod scored_batch;
 mod extract;
@@ -106,6 +107,7 @@ pub(crate) enum CandidateCommand {
     TextJob(jobs::generation::TextJobCommand),
     Source(source::SourceCommand),
     Scored(scored::ScoredCommand),
+    SentimentMap(sentiment_map::SentimentMapCommand),
     ClassifyMap(classify_map::ClassifyMapCommand),
     Extract(extract::ExtractCommand),
     Map(map::MapCommand),
@@ -127,6 +129,7 @@ pub(crate) fn definition() -> clap::Command {
         .subcommand(int4::definition())
         .subcommands(source::definitions())
         .subcommands(scored::definitions())
+        .subcommand(sentiment_map::definition())
         .subcommand(classify_map::definition())
         .subcommand(batch::definition())
         .subcommand(scored_batch::definition())
@@ -170,6 +173,9 @@ impl CandidateCommand {
         }
         if name == "judge" {
             return judge::JudgeCommand::from_arg_matches(matches).map(Self::Judge);
+        }
+        if name == "sentiment-map" {
+            return sentiment_map::SentimentMapCommand::from_matches(matches).map(Self::SentimentMap);
         }
         if name == "map" {
             return map::MapCommand::from_matches(matches).map(Self::Map);
@@ -242,6 +248,7 @@ impl CandidateCommand {
             Self::TextBatch(command) => return command.execute(input, output),
             Self::Source(command) => return command.execute(input, output),
             Self::Scored(command) => return command.execute(input, output),
+            Self::SentimentMap(command) => return command.execute(input, output),
             Self::ClassifyMap(command) => return command.execute(input, output),
             Self::Extract(command) => return command.execute(input, output),
             Self::Map(command) => return command.execute(input, output),

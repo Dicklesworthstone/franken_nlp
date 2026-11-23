@@ -61,6 +61,8 @@
 > [held-out sentiment ratings and paired model comparison](#native-int4-sentiment-evaluation-and-comparison).
 > INT8 `candidate map` also supports [bounded compact input for complete
 > NER, keyphrase and cited-summary documents](#implemented-candidate-int8-compact-document-maps).
+> INT8 `candidate sentiment-map` adds [complete-document dimensional sentiment
+> with exact source coverage](#implemented-candidate-int8-complete-document-sentiment).
 > Candidate results retain their explicit provenance; build verification,
 > model quality and release qualification remain separate pending gates.
 > The top-level task, batch and job examples below remain the disclosed 1.0
@@ -741,6 +743,90 @@ evidence; changed prompt tokens establish no output-parity, quality or speed
 claim. See the [CLI contract](docs/candidate-long-document-cli.md#bounded-compact-input)
 and [library contract](docs/int8-long-source.md#compact-source-encoding).
 Rust and model qualification remain pending.
+
+## Implemented candidate INT8 complete-document sentiment
+
+`fnlp candidate sentiment-map` scores every chunk of a complete document with
+the native INT8 engine, then combines the independent affect dimensions. It
+accepts the same strict JSON request as `candidate sentiment`; `axes` and
+`policy` are optional. For example, save this as `sentiment-document.json`:
+
+```json
+{
+  "document": "The first shipment arrived promptly and worked well.\nThe replacement was delayed, and support never explained why.",
+  "axes": ["valence", "approach"],
+  "policy": {
+    "minimum_peak_weight_ppm": 600000,
+    "maximum_normalized_entropy_ppm": 700000
+  }
+}
+```
+
+Run it against an explicitly selected local current-candidate INT8 artifact:
+
+```sh
+fnlp candidate sentiment-map sentiment-document.json \
+  --model ./model.fnlpq --memory-mib 16384 \
+  --max-chunk-bytes 4096 --max-chunks 64
+```
+
+The command requires `asupersync-runtime`. `--memory-mib` is the process
+admission ledger budget, not an operating-system RSS limit. Admission includes
+the resident model, one reusable physical KV allocation, retained chunk plans,
+all retained chunk results, optional encoder/prefill scratch, and publication
+staging. The source is partitioned without gaps or overlap, with original UTF-8
+byte and Unicode-scalar offsets. Every selected dimension of every chunk must
+fit and preflight before the first native forward; an over-budget tail is
+refused rather than omitted.
+
+Omitting `axes` selects valence, arousal, dominance and approach. Each axis uses
+its own five-bin candidate language, scored through EOS with full-vocabulary
+denominators. The complete result retains all chunk distributions and an
+original-Unicode-scalar-weighted mixture for each axis, including weights from
+abstained chunks. It reports within-chunk variance separately from variation
+between chunk means. An aggregate estimate requires both the chosen coverage
+threshold and the original peak/entropy policy to pass. These descriptive,
+uncalibrated mixtures are not full-document model posteriors or psychological
+measurements, and they do not assert equivalence to one full-context inference.
+
+The principal bounds are independent:
+
+| Option | Scope | Default |
+|---|---|---|
+| `--max-input-bytes` | Complete input JSON bytes | 1048576 |
+| `--context-tokens` | Largest live native chunk/axis context | 2048 |
+| `--max-chunks` | Complete source partition | 64 |
+| `--max-tokenizer-calls` | Source sizing probes | 8192 |
+| `--max-result-bytes` | One complete native chunk result | 65536 |
+| `--max-retained-result-bytes` | Sum of retained chunk-record bytes | 16777216 |
+| `--max-map-result-bytes` | Complete map result, including the aggregate | 16777216 |
+| `--minimum-estimated-coverage-ppm` | Non-abstained original scalar coverage per axis | 1000000 |
+
+The five native work ceilings (`--max-forward-positions`,
+`--max-projected-logits`, `--max-attention-pairs`, `--max-dot-products` and
+`--max-multiply-accumulates`) cover every chunk and axis together. Add
+`--prefill-rows 1..64` for explicit bounded layer-major prompt execution.
+`--input-encoding safe-bpe-v1` selects byte-preserving compact input with one
+tokenizer ledger spanning accepted and rejected sizing probes and all final
+chunk/axis plans. Its `--max-tokenizer-input-bytes`,
+`--max-tokenizer-output-tokens`, `--max-tokenizer-pair-checks` and
+`--max-tokenizer-pair-bytes` ceilings never renew per chunk. Compact results
+record the exact policy and actual work; changed prompt tokens make no model
+output-parity, quality or speed claim.
+
+Any failed chunk, exhausted budget or observed cancellation prevents a
+completed document result. The host verifies the sealed source geometry,
+identities, work and aggregate before publication, and memory guards remain
+held through output flush. The cooperative deadline spans input, loading,
+planning, inference, reduction and publication; blocking IO is not preempted.
+
+Library callers use `SentimentPlanner::plan_int8_document_with_control` and
+`Int8SentimentMapLimits` for explicit planning, or
+`NlpEngine::map_int8_sentiment` / `map_int8_sentiment_layer_major` with
+`Int8SentimentMapHostConfig` for owned execution. The config's `requirements`
+method quotes admission before private IO. This remains a source-inventoried
+candidate surface; controller-selected build, model-present correctness and
+quality gates remain pending.
 
 ## Implemented candidate INT4 token streaming
 

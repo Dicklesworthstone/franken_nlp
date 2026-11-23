@@ -23,6 +23,8 @@ use crate::{
 use super::{SentimentLimits, SentimentPlan, SentimentPlanner, SentimentPlanningError,
     SentimentRequest, SentimentResult, SentimentError, distribution::HeadPlan};
 mod cohort;
+/// Complete-document maps with the original native axes and exact source coverage.
+pub mod long;
 
 pub const INT8_SENTIMENT_EXECUTION: &str = "portable-int8-independent-affect-heads-v1";
 const SAMPLER_VERSION: &str = "sentiment-complete-candidate-eos-v1";
@@ -142,6 +144,21 @@ impl PreparedInt8Sentiment {
     pub fn head_count(&self) -> usize { self.schedules.len() }
     pub fn task_budget(&self) -> TaskBudget { self.budget }
     pub fn max_result_bytes(&self) -> u64 { self.inner.max_output_bytes }
+    /// Each independent axis must contain the same one untrusted document.
+    fn source_token_count(&self) -> Result<usize, Int8SentimentError> {
+        use crate::tasks::ir::PromptSegmentKind;
+        let mut source: Option<&[u32]> = None;
+        for head in &self.inner.heads {
+            let mut segments = head.ir.prompt_segments().iter()
+                .filter(|segment| segment.kind() == PromptSegmentKind::Document);
+            let ids = segments.next().ok_or(Int8SentimentError::Accounting)?.token_ids();
+            if ids.is_empty() || segments.next().is_some() || source.is_some_and(|previous| previous != ids) {
+                return Err(Int8SentimentError::Accounting);
+            }
+            source = Some(ids);
+        }
+        source.map(<[u32]>::len).ok_or(Int8SentimentError::Accounting)
+    }
     pub fn required_context(&self) -> usize { self.schedules.iter().map(|s| s.context).max().unwrap_or(0) }
     pub fn verify_identity(&self, admitted: &ExecutionIdentity) -> Result<(), Int8SentimentError> {
         admitted.validate().map_err(|_| Int8SentimentError::Identity)?;

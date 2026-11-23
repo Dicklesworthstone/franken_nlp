@@ -2,6 +2,8 @@
 use super::*;
 use crate::{native_engine::strict_int8::{Int8Work, scoring::Int8ScoringBudget, prefill::Int8PrefillLimits},
     tasks::{ir::TaskBudget, sentiment::quantized::{PreparedInt8Sentiment, Int8SentimentRun, Int8SentimentError}}};
+mod long;
+pub use long::Int8SentimentMapHostConfig;
 
 /// Whole-bundle compute and caller-priced input ownership. Preparation is a
 /// modeled reservation, not measured RSS. Before transfer the caller remains

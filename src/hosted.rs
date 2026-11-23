@@ -76,7 +76,7 @@ pub use grouped_int4::{HostedInt4ChatTeamResult, HostedInt4TeamResult, Int4Compu
 mod scored;
 pub use scored::{Int8ClassificationMapHostConfig, Int8ClassificationMapMemoryRequirement};
 mod sentiment;
-pub use sentiment::SentimentHostLimits;
+pub use sentiment::{SentimentHostLimits, Int8SentimentMapHostConfig};
 mod redact;
 pub use redact::{RedactConfig, RedactionPseudonyms};
 mod resolve;
@@ -156,6 +156,7 @@ pub enum HostedError {
     ClassificationMap(crate::tasks::classify::quantized::long::Int8ClassificationMapError),
     Judge(crate::tasks::judge::quantized::Int8JudgeError),
     Sentiment(crate::tasks::sentiment::quantized::Int8SentimentError),
+    SentimentMap(crate::tasks::sentiment::quantized::long::Int8SentimentMapError),
     Source(crate::tasks::source_planning::quantized::Int8SourceError),
     SourceMap(crate::tasks::source_planning::quantized::long::Int8SourceMapError),
     Resolution(crate::corpus::native_resolve::quantized::Int8ResolveError),
@@ -189,6 +190,7 @@ impl fmt::Display for HostedError {
             Self::ClassificationMap(_) => "hosted native classification document failed",
             Self::Judge(_) => "hosted native judgment failed",
             Self::Sentiment(_) => "hosted native sentiment failed",
+            Self::SentimentMap(_) => "hosted native sentiment document failed",
             Self::Source(_) => "hosted native source task failed",
             Self::SourceMap(_) => "hosted native source map failed",
             Self::Resolution(_) => "hosted native entity resolution failed",
@@ -213,6 +215,7 @@ impl Error for HostedError {
             Self::SourceMap(e) => Some(e), Self::Resolution(e) => Some(e),
             Self::ClassificationMap(e) => Some(e),
             Self::Redaction(e) => Some(e), Self::Sentiment(e) => Some(e),
+            Self::SentimentMap(e) => Some(e),
             Self::Source(e) => Some(e), Self::Judge(e) => Some(e), Self::Classification(e) => Some(e), Self::Extraction(e) => Some(e), Self::BatchSetup(e) => Some(e), Self::Batch(e) => Some(e), _ => None,
         }
     }
