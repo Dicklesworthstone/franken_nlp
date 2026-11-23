@@ -2,7 +2,7 @@ use super::*;
 use crate::candidate_cli::tests::args;
 
 #[test]
-fn only_buffered_generate_and_chat_expose_the_fixed_compute_team() {
+fn buffered_generate_and_chat_expose_the_fixed_team_without_enabling_corpora() {
     for task in ["generate", "chat"] {
         for width in ["1", "2", "7", "64"] {
             let matches = super::super::definition().try_get_matches_from(["candidate", task,
@@ -52,6 +52,31 @@ fn compact_input_retains_exact_policy_and_preparation_charge_with_a_team() {
     assert_eq!(serial.input_encoding_policy(serial_limits).unwrap(), threaded.input_encoding_policy(threaded_limits).unwrap());
     assert_eq!(serial_limits.preparation_bytes, threaded_limits.preparation_bytes);
     assert!(threaded_limits.compute.workspace_bytes > 0);
+}
+
+#[test]
+fn source_peak_retains_both_preparation_owners_with_an_exact_memory_boundary() {
+    use crate::candidate_cli::source::tests::command;
+    for task in ["ner", "keyphrases", "summarize", "answer"] {
+        let command = command(task, &["--compute-threads", "4"]);
+        let (args, mut limits) = command.validate().unwrap();
+        let native = Int8MemoryRequirement::for_context(args.context_tokens).unwrap();
+        let one_owner = request_peak_bytes(limits, native, command.args.host.max_result_bytes as u64,
+            args.max_new_tokens as u64, 0, 0).unwrap();
+        let required = source_peak_bytes(&args, limits, command.args.host.max_result_bytes).unwrap();
+        assert_eq!(required - one_owner, limits.preparation_bytes,
+            "transferred plan, vocabulary and source retain their own whole reservation");
+        for memory_bytes in [one_owner, required - 1] {
+            limits.memory_bytes = memory_bytes;
+            assert_eq!(check_source_memory(&args, limits, command.args.host.max_result_bytes), Err(CandidateError::Arguments));
+        }
+        limits.memory_bytes = required;
+        check_source_memory(&args, limits, command.args.host.max_result_bytes).unwrap();
+        let mut larger = limits; larger.preparation_bytes += 1;
+        assert_eq!(source_peak_bytes(&args, larger, command.args.host.max_result_bytes).unwrap(), required + 2);
+        larger.preparation_bytes = u64::MAX;
+        assert_eq!(source_peak_bytes(&args, larger, command.args.host.max_result_bytes), Err(CandidateError::Arguments));
+    }
 }
 
 #[cfg(feature = "asupersync-runtime")]

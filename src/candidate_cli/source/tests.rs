@@ -162,6 +162,84 @@ fn compact_source_flags_are_explicit_and_workspace_is_admitted_before_io() {
 }
 
 #[test]
+fn all_four_one_request_routes_admit_explicit_widths_without_changing_source_policy() {
+    for task in ["ner", "keyphrases", "summarize", "answer"] {
+        let serial = command(task, &[]);
+        let (_, baseline) = serial.validate().unwrap();
+        assert_eq!(baseline.compute.threads, 1); assert_eq!(baseline.compute.workspace_bytes, 0);
+        for width in ["1", "2", "7", "64"] {
+            let cmd = command(task, &["--compute-threads", width, "--selected-rows", "32",
+                "--input-encoding", "safe-bpe-v1"]);
+            let (common, limits) = cmd.validate().unwrap();
+            assert_eq!(limits.compute.threads, width.parse::<usize>().unwrap());
+            assert_eq!(common.compute, cmd.args.compute);
+            assert_eq!(limits.kv_bytes, baseline.kv_bytes);
+            assert_eq!(limits.preparation_bytes, baseline.preparation_bytes);
+            assert_eq!(cmd.args.host.task_budget(limits), serial.args.host.task_budget(baseline));
+            assert_eq!(cmd.args.head.limits().unwrap().unwrap().max_rows_per_step, 32);
+            assert!(matches!(common.input_encoding_policy(limits).unwrap(),
+                crate::tokenizer::untrusted::UntrustedEncoding::SafeBpeV1(_)));
+        }
+    }
+}
+
+#[test]
+fn source_team_width_prefill_and_aggregate_memory_refuse_before_all_io() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("source team read private input") } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("source team wrote output") }
+        fn flush(&mut self) -> io::Result<()> { panic!("source team flushed output") }
+    }
+    for task in ["ner", "keyphrases", "summarize", "answer"] {
+        for extra in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+            vec!["--compute-threads", "2", "--prefill-rows", "1"],
+            vec!["--compute-threads", "7", "--prefill-rows", "64"],
+            vec!["--compute-threads", "2", "--max-weight-mib", "8192"]] {
+            let mut flags = extra; flags.extend(["--options", "must-not-open-team-options.json"]);
+            let cmd = command(task, &flags);
+            assert_eq!(cmd.execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+        }
+        let mut cmd = command(task, &["--compute-threads", "3", "--options", "must-not-open-team-options.json"]);
+        let (common, limits) = cmd.validate().unwrap();
+        let required = compute::source_peak_bytes(&common, limits, cmd.args.host.max_result_bytes).unwrap();
+        // Even a nearly sufficient aggregate ceiling must refuse before
+        // document, options, model, vocabulary or output allocations begin.
+        cmd.args.host.memory_mib = (required - 1) / MIB;
+        assert_eq!(cmd.execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+        command(task, &["--compute-threads", "1", "--prefill-rows", "4"]).validate().unwrap();
+    }
+}
+
+#[test]
+fn route_local_source_teams_do_not_enable_maps_corpora_jobs_or_extraction() {
+    for route in ["map", "batch"] {
+        let base = ["candidate", route, "--task", "ner", "--model", "m", "--memory-mib", "8192"];
+        assert!(super::super::definition().try_get_matches_from(base).is_ok());
+        let mut argv = base.to_vec(); argv.extend(["--compute-threads", "2"]);
+        assert_eq!(super::super::definition().try_get_matches_from(argv).unwrap_err().kind(),
+            clap::error::ErrorKind::UnknownArgument);
+    }
+    for mode in ["start", "resume"] {
+        let mut argv = vec!["candidate", "job", mode, "--task", "ner", "--model", "m",
+            "--memory-mib", "8192", "--job-dir", "private/job", "--key-file", "private/key",
+            "--limits", "limits.json", "--job-id", "0123456789abcdef0123456789abcdef", "--store-results"];
+        assert!(super::super::definition().try_get_matches_from(&argv).is_ok());
+        argv.extend(["--compute-threads", "2"]);
+        assert_eq!(super::super::definition().try_get_matches_from(argv).unwrap_err().kind(),
+            clap::error::ErrorKind::UnknownArgument);
+    }
+    assert_eq!(super::super::definition().try_get_matches_from(["candidate", "extract", "--model", "m",
+        "--memory-mib", "8192", "--schema", "schema.json", "--compute-threads", "2"])
+        .unwrap_err().kind(), clap::error::ErrorKind::UnknownArgument);
+    // All other consumers receive the shared host's default, even when a
+    // one-shot SourceCommand separately selected a team.
+    let cmd = command("ner", &["--compute-threads", "7"]);
+    let (common, limits) = cmd.args.host.common(cmd.args.input.clone()).unwrap();
+    assert_eq!(common.compute.threads(), 1); assert_eq!(limits.compute.threads, 1);
+}
+
+#[test]
 fn invalid_compact_source_limits_never_read_options_document_or_model() {
     struct NoIo;
     impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private source read") } }
@@ -185,9 +263,11 @@ fn default_build_refuses_all_source_commands_without_reading_any_input() {
     struct NoRead;
     impl Read for NoRead { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("input read") } }
     for name in ["ner", "keyphrases", "summarize", "answer"] {
-        let cmd = command(name, &["--options", "never-open-private-options.json"]);
-        let mut output = Vec::new();
-        assert_eq!(cmd.execute(&mut NoRead, &mut output), Err(CandidateError::Unavailable));
-        assert!(output.is_empty());
+        for width in ["1", "3"] {
+            let cmd = command(name, &["--options", "never-open-private-options.json", "--compute-threads", width]);
+            let mut output = Vec::new();
+            assert_eq!(cmd.execute(&mut NoRead, &mut output), Err(CandidateError::Unavailable));
+            assert!(output.is_empty());
+        }
     }
 }

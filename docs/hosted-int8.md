@@ -11,6 +11,9 @@ host to local candidate loading and native task execution:
 - `execute_int8_chat_with_threads(model, prepared, request_seq, native_limits,
   max_sampler_bytes, kernel, compute_threads, cancellation)` uses one persistent
   output-row team for a complete buffered generation/chat request.
+- `execute_int8_source_with_threads(model, prepared, vocabulary, source_limits,
+  kernel, compute_threads, cancellation)` reuses the same team mechanism for
+  NER, keyphrases, cited summarization and supplied-passage QA.
 - `execute_int8_extract(model, prepared, vocabulary, native_limits,
   mask_limits, max_mask_node_visits, cancellation)` executes an
   `Int8ExtractPlan` with its existing schema/source finalizer.
@@ -28,7 +31,7 @@ new allocations made by the host. Their ownership remains explicit.
 Use an already installed `EngineResources` host with exactly one blocking
 coordinator. The default entrypoints retain the serial native INT8 baseline.
 The configured runtime can still have its separately counted scheduler workers;
-no new runtime or ad-hoc thread pool is constructed. Each call enters one
+no new runtime or ad-hoc thread pool is constructed. Each default serial call enters one
 `Cx::spawn_blocking` closure and one coordinator-only `Cx::scoped_cpu(0)` scope.
 The native callback receives a checkpoint-only restricted context, and its
 ambient context is restricted as well. Re-entry from a synchronous call or
@@ -79,6 +82,17 @@ buffered host entrypoint uses ordinary token-ordered prefill; packed prompt
 execution, streams and resident corpora retain their separate entrypoints.
 The implementation and tiny scoped-team regressions establish no measured
 speedup, full-model parity or completed runtime certificate.
+
+`execute_int8_source_with_threads` uses the same fixed team with the original
+`PreparedInt8SourceTask`, including its sealed full/selected-head policy and
+compact encoding identity. It runs the existing constrained decoder and source
+finalizer without changing grammar-mask or native-work authority. The outer
+admission bundle also owns the transferred prepared task and vocabulary, so
+their preparation charge survives child join alongside native reservations.
+Callers must separately account for any preparation they retain themselves;
+the candidate source CLI explicitly prices both coexisting owners. The result
+type is `HostedInt8TeamResult<Int8SourceTaskRun>` and its guarded output remains
+charged until the caller has finished delivery.
 
 ## Resource accounting
 

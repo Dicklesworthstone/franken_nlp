@@ -64,7 +64,8 @@
 > INT8 document QA supports [bounded hierarchical answers from verified
 > quotations](docs/candidate-question-synthesis.md#hierarchical-answers-for-evidence-exceeding-one-context).
 > Buffered INT8 generation and chat support [persistent scoped CPU
-> teams](docs/candidate-inference-cli.md#persistent-int8-cpu-teams).
+> teams](docs/candidate-inference-cli.md#persistent-int8-cpu-teams), as do
+> [one-request NER, keyphrases, summaries and passage QA](docs/candidate-source-cli.md#persistent-cpu-teams-for-source-tasks).
 > INT8 `candidate sentiment-map` adds [complete-document dimensional sentiment
 > with exact source coverage](#implemented-candidate-int8-complete-document-sentiment).
 > Candidate results retain their explicit provenance; build verification,

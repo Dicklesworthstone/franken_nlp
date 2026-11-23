@@ -1,4 +1,4 @@
-//! Physical INT8 row teams are explicitly exposed only by buffered text routes.
+//! Physical INT8 row teams are explicitly exposed by supported one-shot routes.
 use super::*;
 use crate::native_engine::strict_int8::projection::int8_team_workspace_bytes;
 
@@ -26,7 +26,7 @@ pub(super) struct Admission { pub threads: usize, pub workspace_bytes: u64 }
 pub(super) fn definition(command: clap::Command) -> clap::Command {
     command.arg(clap::Arg::new("compute_threads").long("compute-threads")
         .value_name("N").value_parser(clap::value_parser!(usize)).default_value("1")
-        .help("Coordinator plus persistent INT8 row workers, 1..=64; 1 keeps serial execution. One fixed team serves this complete buffered request across both decoder passes, prompt tokens and generation. Runtime threads are additional. Worker storage and native memory are admitted before input/model IO. Widths above 1 cannot combine with --prefill-rows; streams, batches and jobs do not expose this option"))
+        .help("Coordinator plus persistent INT8 row workers, 1..=64; 1 keeps serial execution. One fixed team serves this complete request across both decoder passes, prompt tokens and generation. Runtime threads are additional. Worker storage and native memory are admitted before input/model IO. Widths above 1 cannot combine with --prefill-rows; maps, streams, batches and jobs do not expose this option"))
 }
 
 /// Price the entire simultaneously live threaded request, including the
@@ -36,16 +36,42 @@ pub(super) fn definition(command: clap::Command) -> clap::Command {
 pub(super) fn check_memory(args: &CandidateArgs, limits: Limits, native: Int8MemoryRequirement)
     -> Result<(), CandidateError> {
     if limits.compute.threads == 1 { return Ok(()); }
-    let output = (limits.result_bytes as u64).checked_mul(4)
-        .and_then(|bytes| bytes.checked_add(args.max_new_tokens as u64 * 8))
-        .and_then(|bytes| bytes.checked_add(4096)).ok_or(CandidateError::Arguments)?;
-    let peak = [limits.weight_bytes, 128 * MIB, 64 * MIB, limits.preparation_bytes,
-        native.kv_bytes, native.rope_bytes, native.scratch_payload_bound, SAMPLER_BYTES,
-        64 * MIB, limits.compute.workspace_bytes, output, 65_536, 64 * 1024]
-        .into_iter().try_fold(0_u64, |sum, bytes| sum.checked_add(bytes))
-        .ok_or(CandidateError::Arguments)?;
+    let peak = request_peak_bytes(limits, native, limits.result_bytes as u64,
+        args.max_new_tokens as u64, SAMPLER_BYTES, 0)?;
     if peak > limits.memory_bytes { return Err(CandidateError::Arguments); }
     Ok(())
+}
+
+/// Source execution retains the caller's preparation alongside a separately
+/// charged transferred plan/vocabulary/source owner. Neither source bytes nor
+/// that second reservation disappear when a compact or selected head is used.
+pub(super) fn check_source_memory(args: &CandidateArgs, limits: Limits, max_result_bytes: usize)
+    -> Result<(), CandidateError> {
+    if limits.compute.threads == 1 { return Ok(()); }
+    if source_peak_bytes(args, limits, max_result_bytes)? > limits.memory_bytes {
+        return Err(CandidateError::Arguments);
+    }
+    Ok(())
+}
+
+pub(super) fn source_peak_bytes(args: &CandidateArgs, limits: Limits, max_result_bytes: usize)
+    -> Result<u64, CandidateError> {
+    let native = Int8MemoryRequirement::for_context(args.context_tokens).map_err(|_| CandidateError::Arguments)?;
+    request_peak_bytes(limits, native, max_result_bytes as u64, args.max_new_tokens as u64,
+        0, limits.preparation_bytes)
+}
+
+fn request_peak_bytes(limits: Limits, native: Int8MemoryRequirement, result_bytes: u64,
+    output_tokens: u64, sampler_bytes: u64, transferred_preparation_bytes: u64)
+    -> Result<u64, CandidateError> {
+    let output = result_bytes.checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(output_tokens.checked_mul(8)?))
+        .and_then(|bytes| bytes.checked_add(4096)).ok_or(CandidateError::Arguments)?;
+    [limits.weight_bytes, 128 * MIB, 64 * MIB, limits.preparation_bytes, transferred_preparation_bytes,
+        native.kv_bytes, native.rope_bytes, native.scratch_payload_bound, sampler_bytes,
+        64 * MIB, limits.compute.workspace_bytes, output, 65_536, 64 * 1024]
+        .into_iter().try_fold(0_u64, |sum, bytes| sum.checked_add(bytes))
+        .ok_or(CandidateError::Arguments)
 }
 
 #[cfg(feature = "asupersync-runtime")]

@@ -133,6 +133,10 @@ pub(super) struct SourceArgs {
     /// Defaults are used only when omitted; unknown/partial options are rejected.
     #[arg(long, value_name = "FILE")]
     pub options: Option<PathBuf>,
+    /// Explicitly enabled only for one-request source commands. Shared host
+    /// arguments used by maps, corpora and jobs retain their serial default.
+    #[arg(skip)]
+    pub compute: compute::Args,
 }
 
 pub(crate) struct SourceCommand {
@@ -148,22 +152,32 @@ pub(super) fn definitions() -> Vec<clap::Command> {
         (Kind::Keyphrases, "Rank exact source keyphrases"),
         (Kind::Summarize, "Produce a summary with exact source citations"),
         (Kind::Answer, "Answer a question using only explicit evidence passages")]
-        .into_iter().map(|(kind, about)| input_encoding::definition(
-            SourceArgs::augment_args(clap::Command::new(kind.name()).about(about)))
+        .into_iter().map(|(kind, about)| compute::definition(input_encoding::definition(
+            SourceArgs::augment_args(clap::Command::new(kind.name()).about(about))))
             .after_long_help(SOURCE_ENCODING_HELP)).collect()
 }
 impl SourceCommand {
     pub(super) fn from_matches(kind: Kind, matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-        Ok(Self { kind, args: SourceArgs::from_arg_matches(matches)?,
+        let mut args = SourceArgs::from_arg_matches(matches)?;
+        args.compute = compute::Args::from_matches(matches)?;
+        Ok(Self { kind, args,
             encoding: input_encoding::InputEncodingArgs::from_matches(matches)? })
     }
-    pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+    pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), CandidateError> {
         self.args.head.limits()?;
-        self.args.prefill.limits()?;
-        let (common, limits) = self.args.host.common_with_encoding(self.args.input.clone(), &self.encoding)?;
+        let prefill = self.args.prefill.limits()?;
+        let compute = self.args.compute.admit(prefill.is_some())?;
+        let (mut common, mut limits) = self.args.host.common_with_encoding(self.args.input.clone(), &self.encoding)?;
+        common.compute = self.args.compute;
+        limits.compute = compute;
+        compute::check_source_memory(&common, limits, self.args.host.max_result_bytes)?;
         if self.args.options.as_ref().is_some_and(|path| path.as_os_str().is_empty() || path.as_os_str() == "-") {
             return Err(CandidateError::Arguments);
         }
+        Ok((common, limits))
+    }
+    pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+        let (common, limits) = self.validate()?;
         #[cfg(feature = "asupersync-runtime")]
         { runtime::source_tasks::execute(self, common, limits, input, output) }
         #[cfg(not(feature = "asupersync-runtime"))]

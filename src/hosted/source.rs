@@ -6,6 +6,7 @@ use crate::{
     tasks::{ir::TaskBudget, source_planning::quantized::{
         Int8SourceTaskRun, PreparedInt8SourceTask}},
 };
+mod parallel;
 
 /// Complete native and caller-priced preparation envelope. The preparation
 /// charge must cover the transferred compiled source/grammar/passage metadata

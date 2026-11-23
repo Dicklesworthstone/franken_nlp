@@ -44,3 +44,30 @@ explicit synthetic decoder results. They do not constitute model inference,
 quantized quality, BF16 parity, throughput or numerical qualification. Rust
 compilation/tests were not run in the coding-agent session; repository policy
 reserves those for its authorized validation environment.
+
+## One hosted persistent team for a source request
+
+`NlpEngine::execute_int8_source_with_threads` accepts the prepared source task,
+shared vocabulary, ordinary `SourceLimits`, checked `Int8Kernel`, admitted
+compute width 2–64 and cancellation token. One sealed team spans prompt prefill,
+both decoder passes, constrained generation and source finalization. The native
+session charges each complete projection once; workers receive the original
+quantized activation and compute independent full output rows. The prepared
+identity, selected-row head policy, exact source data and mask budgets do not
+change with worker width.
+
+The existing process host must admit the requested child envelope. Input and
+vocabulary preparation, KV, scratch, output and worker reservations survive
+physical join on success, error and panic. A checkpoint after join uses the
+original shared cancellation authority. Successful
+`HostedInt8TeamResult<Int8SourceTaskRun>` retains guarded output and exposes
+separate physical compute counters. The existing default and layer-major APIs
+retain their serial contracts; this single-row team does not silently compose
+with packed prefill. Candidate users select it with `--compute-threads` on
+`ner`, `keyphrases`, `summarize`, or `answer`; see the
+[source command contract](candidate-source-cli.md#persistent-cpu-teams-for-source-tasks).
+
+Added admission and real-artifact gate definitions cover the task/encoding/head
+matrix, exact work ceilings, complete result equality between widths, typed
+cancellation and output lifetime. They are unexecuted definitions and do not
+establish whole-model parity or measured performance.

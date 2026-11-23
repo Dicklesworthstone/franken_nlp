@@ -81,6 +81,50 @@ retains the original result envelope. Layer-major prefill and exact selected-row
 projection compose with compact input. This selects a different prompt token
 sequence and carries no model-output, quality or measured-speed claim.
 
+## Persistent CPU teams for source tasks
+
+All four one-request commands accept `--compute-threads N` from 1 through 64.
+Width 1 keeps the existing serial path. A larger width admits one coordinator
+plus `N - 1` persistent children for the complete prompt and constrained decode:
+
+```sh
+fnlp candidate ner article.txt --model ./model.fnlpq --memory-mib 8192 \
+  --compute-threads 4 --input-encoding safe-bpe-v1 --selected-rows 4096
+
+fnlp candidate answer question.json --model ./model.fnlpq --memory-mib 8192 \
+  --compute-threads 4
+```
+
+The same team serves all seven decoder projections in both loop passes and
+every full or selected head projection. Each output row keeps its existing
+arithmetic; quantization, KV, grammar masks, native work accounting and semantic
+finalization stay with the coordinator. Worker width does not rewrite the
+prepared prompt, task, compact policy or selected-row policy. All grammar-legal
+selected rows remain eligible.
+
+Widths above 1 cannot combine with `--prefill-rows`; the command rejects that
+combination before source, options or model IO. Width 1 still supports explicit
+layer-major prefill. Compute selection belongs to these one-request commands;
+INT8 maps, corpora, extraction, scoring and retained jobs keep their existing
+interfaces and do not inherit the flag through shared resource arguments.
+
+Before private IO, a checked simultaneous memory quote includes **both** full
+preparation owners: the CLI session and the transferred prepared source task,
+grammar and vocabulary. It also prices model, KV, coordinator scratch, fixed
+worker buffers, allocator headroom, cleanup and complete output. Compact input
+and selected rows cannot discount retained original bytes or the second
+preparation reserve. The actual host reservations enforce the same process
+memory authority during execution.
+
+The hosted `execute_int8_source_with_threads` entrypoint retains input and native
+admission outside the scoped task callback until every worker physically joins,
+including errors, cancellation and panic. It checks the original shared control
+again after join. The complete task result remains guarded through serialization,
+write and flush. Threaded responses add the same `compute` physical counters as
+[buffered INT8 generation](candidate-inference-cli.md#persistent-int8-cpu-teams),
+outside the semantic `output`. Width 1 omits this object and preserves the
+existing wire shape. Physical counters do not establish speedup or model parity.
+
 ## Execution and output contracts
 
 The command reserves preparation memory before reading private input or
@@ -131,3 +175,12 @@ No tests, real-model runs or DSR qualification were executed while implementing
 this change. Added regression sources cover all four dispatch routes, option
 and QA boundaries, complete prompt/output budgets, pinned plan identity,
 preparation deadlines and feature-disabled no-IO behavior.
+
+Team regression definitions additionally cover the full source-task/encoding/head
+policy matrix, exact work and mask authority, both preparation charges, complete
+pre-IO refusal and guarded runtime boundaries. An explicit ignored model gate
+compares full results and native work at serial, two-thread and four-thread
+widths using an independently pinned real artifact. It also checks all eleven
+pre-cancellation causes, source-owner release and output-guard lifetime. Neither
+that model gate nor the ordinary Rust regressions ran in this implementation
+session; DSR and model qualification remain pending.

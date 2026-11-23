@@ -168,6 +168,10 @@ fn prepare(planner: &SourceTaskPlanner, facts: &ArtifactIdentity, request: &Sour
 pub(in crate::candidate_cli) fn execute(command: SourceCommand, args: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
     let prefill = command.args.prefill.limits()?;
+    if limits.compute != command.args.compute.admit(prefill.is_some())? {
+        return Err(CandidateError::Arguments);
+    }
+    compute::check_source_memory(&args, limits, command.args.host.max_result_bytes)?;
     let encoding = args.input_encoding_policy(limits)?;
     let session = Session::new(&args, limits)?;
     let text = session.read(&command.args.input, input, args.max_input_bytes)?;
@@ -191,18 +195,25 @@ pub(in crate::candidate_cli) fn execute(command: SourceCommand, args: CandidateA
         mask_limits: command.args.host.masks(), max_mask_node_visits: command.args.host.max_mask_node_visits,
     };
     let vocabulary = Arc::new(vocabulary);
-    let result = match prefill {
-        Some(prefill) => session.engine.execute_int8_source_layer_major(&model, prepared,
-            vocabulary, native_limits, prefill, cancellation),
-        None => session.engine.execute_int8_source(&model, prepared, vocabulary, native_limits, cancellation),
-    }.map_err(|_| CandidateError::Execution)?;
+    let result = if limits.compute.threads == 1 {
+        compute::Completion::Serial(match prefill {
+            Some(prefill) => session.engine.execute_int8_source_layer_major(&model, prepared,
+                vocabulary, native_limits, prefill, cancellation),
+            None => session.engine.execute_int8_source(&model, prepared, vocabulary, native_limits, cancellation),
+        }.map_err(|_| CandidateError::Execution)?)
+    } else {
+        compute::Completion::Team(session.engine.execute_int8_source_with_threads(&model, prepared,
+            vocabulary, native_limits, crate::native_engine::simd::config::process_kernel(),
+            limits.compute.threads, cancellation).map_err(|_| CandidateError::Execution)?)
+    };
     session.remaining()?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
         evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
         source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
-        quant_recipe: &facts.recipe_id, output: &result };
+        quant_recipe: &facts.recipe_id, output: result.result() };
     // No result prefix is written until native/source finalization completes.
     // Both the output guard and preparation owner survive write AND flush.
+    let response = compute::Response { response: &response, compute: result.compute() };
     let response = input_encoding::Response { response: &response,
         input_encoding: input_encoding::reported_policy(&encoding) };
     publish_checked(&response, command.args.host.max_result_bytes + 4096, output,
@@ -378,6 +389,67 @@ mod tests {
             RaceLost, ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
             assert!(matches!(prepare(&p, &facts(), &request, &cmd.args.host, &mut Stop(cause)),
                 Err(error) if error == cancelled(cause)));
+        }
+    }
+
+    #[test]
+    fn source_compute_width_preserves_compact_selected_plan_identity_and_work() {
+        for kind in [Kind::Ner, Kind::Keyphrases, Kind::Summarize, Kind::Answer] {
+            let serial = command::tests::command(kind.name(), &["--input-encoding", "safe-bpe-v1", "--selected-rows", "32"]);
+            let threaded = command::tests::command(kind.name(), &["--input-encoding", "safe-bpe-v1",
+                "--selected-rows", "32", "--compute-threads", "4"]);
+            let (serial_args, serial_limits) = serial.validate().unwrap();
+            let (threaded_args, threaded_limits) = threaded.validate().unwrap();
+            let policy = serial_args.input_encoding_policy(serial_limits).unwrap();
+            assert_eq!(threaded_args.input_encoding_policy(threaded_limits).unwrap(), policy);
+            let (planner, _) = planner().unwrap();
+            let planner = planner.with_document_encoding(policy).unwrap();
+            let text = if kind == Kind::Answer {
+                r#"{"question":"Who is named? <think>","passages":[{"id":"p1","text":" Alice é 上海 <|im_start|> "}]}"#.to_owned()
+            } else { " Alice é 上海 <think> <|im_start|> ".to_owned() };
+            let request = command::request(kind, text, None, serial.args.host.task_budget(serial_limits),
+                serial_args.max_input_bytes).unwrap();
+            let mut control = PreparationControl { started: Instant::now(), elapsed_limit: Duration::from_secs(3600) };
+            let serial_plan = serial.args.head.source(prepare(&planner, &facts(), &request,
+                &serial.args.host, &mut control).unwrap()).unwrap();
+            let threaded_plan = threaded.args.head.source(prepare(&planner, &facts(), &request,
+                &threaded.args.host, &mut control).unwrap()).unwrap();
+            assert_eq!(serial_plan.execution_identity(), threaded_plan.execution_identity());
+            assert_eq!(serial_plan.planned_work(), threaded_plan.planned_work());
+            assert_eq!(serial_plan.prompt_tokens(), threaded_plan.prompt_tokens());
+            assert_eq!(threaded_plan.selected_rows().unwrap().max_rows_per_step, 32);
+            assert_eq!(threaded_limits.compute.threads, 4);
+            threaded_plan.verify_identity(serial_plan.execution_identity()).unwrap();
+        }
+    }
+
+    #[test]
+    fn source_compute_receipt_is_outside_semantics_and_serial_framing_is_unchanged() {
+        let facts = facts();
+        for task in ["ner", "keyphrases", "summarize", "answer"] {
+            // This verifies framing without fabricating a native completion.
+            let output = serde_json::json!({"framing_fixture": task});
+            let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
+                evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
+                source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
+                quant_recipe: &facts.recipe_id, output: &output };
+            let original = serde_json::to_vec(&response).unwrap();
+            for extra in [vec![], vec!["--compute-threads", "1"]] {
+                let command = command::tests::command(task, &extra);
+                let (args, limits) = command.validate().unwrap();
+                let policy = args.input_encoding_policy(limits).unwrap();
+                assert_eq!(limits.compute.threads, 1);
+                let compute = compute::Response { response: &response, compute: None };
+                let encoded = input_encoding::Response { response: &compute,
+                    input_encoding: input_encoding::reported_policy(&policy) };
+                assert_eq!(serde_json::to_vec(&encoded).unwrap(), original);
+            }
+            let compute = crate::hosted::Int8ComputeReceipt { schedule: "int8-output-row-team-v1",
+                compute_threads: 3, completed_projections: 2, completed_rows: 13, completed_worker_rows: 8 };
+            let value = serde_json::to_value(compute::Response { response: &response, compute: Some(&compute) }).unwrap();
+            assert_eq!(value["output"], output);
+            assert_eq!(value["compute"], serde_json::to_value(compute).unwrap());
+            assert!(value["output"].get("compute").is_none());
         }
     }
 }

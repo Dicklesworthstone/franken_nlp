@@ -1,4 +1,4 @@
-//! Explicit persistent output-row teams for buffered INT8 generation and chat.
+//! Explicit persistent output-row teams for complete buffered INT8 tasks.
 use super::*;
 use crate::native_engine::{simd::Int8Kernel, strict_int8::projection::Int8ProjectionStats};
 
@@ -26,6 +26,9 @@ impl From<Int8ProjectionStats> for Int8ComputeReceipt {
 /// team: the dispatcher physically joins every child before returning it.
 pub struct HostedInt8TeamResult<T> { output: HostedOutput<T>, compute: Int8ComputeReceipt }
 impl<T> HostedInt8TeamResult<T> {
+    pub(super) fn from_guarded(output: HostedOutput<T>, compute: Int8ComputeReceipt) -> Self {
+        Self { output, compute }
+    }
     pub fn result(&self) -> &T { self.output.result() }
     pub fn compute(&self) -> &Int8ComputeReceipt { &self.compute }
 }
