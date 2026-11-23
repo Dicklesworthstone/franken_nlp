@@ -25,6 +25,9 @@ LOCK_DIR=
 LOCK_OWNED=0
 JOURNAL_DIR=
 VERIFIED_NAMES=' '
+CURL_PID=
+INTERRUPT_STATUS=0
+INTERRUPT_NAME=
 USER_AGENT='franken_nlp-agent (+https://github.com/Dicklesworthstone/franken_nlp)'
 
 log() {
@@ -60,9 +63,45 @@ release_lock() {
     fi
 }
 
+request_interrupt() {
+    # Latch rather than exiting from the trap: a signal may arrive between
+    # starting curl and recording $!. The next checkpoint owns that exact
+    # child before cleanup can release the revision lock. The first signal
+    # selects the conventional 128+signal exit status.
+    if [ "$INTERRUPT_STATUS" -eq 0 ]; then
+        INTERRUPT_STATUS=$1
+        INTERRUPT_NAME=$2
+    fi
+}
+
+cleanup_fetch() {
+    cleanup_status=$?
+    # wait must not be interrupted while the child still owns the partial.
+    # A second signal cannot release the lock ahead of actual writer exit.
+    trap '' HUP INT TERM
+    trap - 0
+    if [ "$INTERRUPT_STATUS" -ne 0 ]; then
+        cleanup_status=$INTERRUPT_STATUS
+        log "INTERRUPTED signal=$INTERRUPT_NAME code=$INTERRUPT_STATUS; retaining partials and journals"
+        resume_guidance
+    fi
+    if [ -n "$CURL_PID" ]; then
+        # Background POSIX-shell jobs may inherit ignored SIGINT. TERM stops
+        # only our recorded transfer, never a process group or another curl.
+        kill -TERM "$CURL_PID" 2>/dev/null || true
+        wait "$CURL_PID" 2>/dev/null || true
+        CURL_PID=
+    fi
+    release_lock
+    exit "$cleanup_status"
+}
+
+check_interrupted() {
+    if [ "$INTERRUPT_STATUS" -ne 0 ]; then finish "$INTERRUPT_STATUS"; fi
+}
+
 finish() {
     code=$1
-    release_lock
     exit "$code"
 }
 
@@ -195,6 +234,7 @@ verify_existing_closure() {
     # exact catalog names may be excluded from subsequent disk admission.
     while IFS='|' read -r inventory_name inventory_length inventory_digest; do
         [ -n "$inventory_name" ] || continue
+        check_interrupted
         if { [ -e "$DEST/$inventory_name" ] || [ -L "$DEST/$inventory_name" ]; } &&
             verify_file "$DEST/$inventory_name" "$inventory_length" "$inventory_digest"; then
             VERIFIED_NAMES="$VERIFIED_NAMES$inventory_name "
@@ -375,9 +415,11 @@ download_with_progress() {
     done
     transfer_attempt=1
     while [ "$transfer_attempt" -le 4 ]; do
+        check_interrupted
         transfer_url=$transfer_origin
         transfer_hops=0
         while :; do
+            check_interrupted
             if [ -z "$TEST_BASE" ] && ! effective_host_ok "$transfer_url"; then
                 log "REDIRECT_HOST_REFUSED phase=pre-contact activation=refused effective_url=$transfer_url"
                 return 90
@@ -395,14 +437,21 @@ download_with_progress() {
             "$@" --continue-at - --output "$transfer_partial" --write-out '%{http_code}
 %{redirect_url}
 ' "$transfer_url" > "$curl_meta" 2> "$curl_log" &
-            curl_pid=$!
-            while kill -0 "$curl_pid" 2>/dev/null; do
+            CURL_PID=$!
+            check_interrupted
+            while kill -0 "$CURL_PID" 2>/dev/null; do
+                check_interrupted
                 current=$(bytes "$transfer_partial" 2>/dev/null || printf 0)
                 log "PROGRESS file=${transfer_partial##*/} bytes=$current expected_bytes=$transfer_expected"
                 sleep 1
+                check_interrupted
             done
-            wait "$curl_pid"
+            wait "$CURL_PID"
             curl_status=$?
+            # An interrupted wait may return before curl exits. Keep its
+            # handle for cleanup until the pending signal has been checked.
+            check_interrupted
+            CURL_PID=
             transfer_status=$(sed -n '1p' "$curl_meta" | tr -d '\r')
             if [ "$curl_status" -eq 47 ]; then
                 case "$transfer_status" in 301|302|303|307|308) ;; *) return 47;; esac
@@ -427,13 +476,16 @@ download_with_progress() {
             if [ "$curl_status" -eq 33 ]; then return 33; fi
             break
         done
+        check_interrupted
         if [ "$transfer_attempt" -lt 4 ]; then sleep "$transfer_attempt"; fi
+        check_interrupted
         transfer_attempt=$((transfer_attempt + 1))
     done
     return "$curl_status"
 }
 
 verify_file() {
+    check_interrupted
     path=$1
     expected_length=$2
     expected_digest=$3
@@ -444,6 +496,7 @@ verify_file() {
     fi
     observed_length=$(bytes "$path")
     observed_digest=$(sha256 "$path")
+    check_interrupted
     [ "$observed_length" = "$expected_length" ] && [ "$observed_digest" = "$expected_digest" ] || {
         log "VERIFY RESULT=FAIL file=${path##*/} expected_bytes=$expected_length observed_bytes=$observed_length expected_sha256=$expected_digest observed_sha256=$observed_digest"
         return 1
@@ -452,6 +505,7 @@ verify_file() {
 }
 
 download_one() {
+    check_interrupted
     name=$1
     length=$2
     digest=$3
@@ -500,9 +554,12 @@ download_one() {
     if ! verify_file "$partial" "$length" "$digest"; then
         fail 1 "digest/length verification failure file=$name expected_bytes=$length expected_sha256=$digest"
     fi
+    check_interrupted
     sync "$partial" 2>/dev/null || sync
+    check_interrupted
     mv "$partial" "$final" || fail 1 "same-directory activation rename failed file=$name"
     sync "$final" 2>/dev/null || sync
+    check_interrupted
     VERIFIED_NAMES="$VERIFIED_NAMES$name "
     log "COMPLETE file=$name observed_bytes=$length sha256=$digest"
 }
@@ -539,14 +596,21 @@ if [ -n "$TEST_BASE" ] && [ "${FNLP_FETCH_ALLOW_TEST_BASE_URL:-}" != 1 ]; then
     log "ERROR code=2 detail=--test-base-url requires FNLP_FETCH_ALLOW_TEST_BASE_URL=1"
     exit 2
 fi
+trap 'request_interrupt 129 HUP' HUP
+trap 'request_interrupt 130 INT' INT
+trap 'request_interrupt 143 TERM' TERM
+trap cleanup_fetch 0
 ensure_destination
 catalog_stats
+check_interrupted
 acquire_lock
+check_interrupted
 if [ "$CHECK_ONLY" -eq 0 ]; then verify_existing_closure; fi
 
 status=0
 while IFS='|' read -r file length digest; do
     [ -n "$file" ] || continue
+    check_interrupted
     if [ "$CHECK_ONLY" -eq 1 ]; then
         log "CHECK_ONLY file=$file expected_bytes=$length"
         if ! verify_file "$DEST/$file" "$length" "$digest"; then
@@ -559,6 +623,7 @@ done <<EOF
 $(catalog_lines)
 EOF
 
+check_interrupted
 if [ "$status" -ne 0 ]; then
     log "CHECK_ONLY RESULT=FAIL files=$CATALOG_COUNT/$CATALOG_COUNT"
     resume_guidance

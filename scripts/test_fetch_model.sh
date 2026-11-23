@@ -208,6 +208,194 @@ EOF
     fi
 }
 
+run_interrupt_cases() {
+    # Exercise the actual fetch script and an owned long-lived transfer child.
+    # The fake transport has an explicit drain latch, so no server, network,
+    # large model or wall-clock race is needed to inspect lock ownership.
+    CASES=$((CASES + 1))
+    if python3 - "$FETCH" "$WORK" "$REV" > "$WORK/interrupt-tests.out" 2> "$WORK/interrupt-tests.err" <<'PY'
+import hashlib
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+fetch = Path(sys.argv[1])
+root = Path(sys.argv[2]) / "interrupt-cases"
+revision = sys.argv[3]
+root.mkdir()
+shim = root / "bin"
+shim.mkdir()
+curl = shim / "curl"
+curl.write_text(r'''#!/usr/bin/env python3
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+case = Path(os.environ["FNLP_TEST_TRANSFER_CASE"])
+args = sys.argv[1:]
+output = Path(args[args.index("--output") + 1])
+payload = b"pinned conversion source bytes\n"
+if os.environ["FNLP_TEST_TRANSFER_MODE"] == "complete":
+    retained = output.stat().st_size
+    (case / "resumed-offset").write_text(str(retained))
+    with output.open("ab", buffering=0) as destination:
+        destination.write(payload[retained:])
+        os.fsync(destination.fileno())
+    sys.stdout.write("206\n\n")
+    sys.exit(0)
+
+stopping = False
+def stop(signum, frame):
+    global stopping
+    stopping = True
+signal.signal(signal.SIGTERM, stop)
+with output.open("ab", buffering=0) as destination:
+    destination.write(payload[:7])
+    os.fsync(destination.fileno())
+(case / "child-started").write_text(str(os.getpid()))
+while not stopping:
+    time.sleep(0.01)
+lock = Path(os.environ["FNLP_TEST_TRANSFER_LOCK"])
+(case / "child-stopping").write_text("locked" if lock.is_dir() else "unlocked")
+while not (case / "allow-exit").exists():
+    time.sleep(0.01)
+(case / "child-exited").write_text("locked" if lock.is_dir() else "unlocked")
+''')
+curl.chmod(0o700)
+payload = b"pinned conversion source bytes\n"
+digest = hashlib.sha256(payload).hexdigest()
+catalog = root / "catalog.txt"
+catalog.write_text(f"alpha.bin|{len(payload)}|{digest}\n")
+
+def await_record(path, timeout=8):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            value = path.read_text()
+        except FileNotFoundError:
+            value = ""
+        if value:
+            return value
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {path.name}")
+
+def child_exists(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+for signum, signal_name, expected_code in [
+    (signal.SIGINT, "INT", 130),
+    (signal.SIGTERM, "TERM", 143),
+    (signal.SIGHUP, "HUP", 129),
+]:
+    case = root / signal_name.lower()
+    case.mkdir()
+    destination = case / "source"
+    destination.mkdir(mode=0o700)
+    lock = destination / (".fnlp-fetch-lock-" + revision)
+    journal = destination / ".fnlp-fetch-journals" / "alpha.bin.journal"
+    partial = destination / "alpha.bin.partial"
+    environment = dict(os.environ)
+    environment.update({
+        "PATH": str(shim) + os.pathsep + os.environ["PATH"],
+        "FNLP_FETCH_ALLOW_TEST_BASE_URL": "1",
+        "FNLP_TEST_TRANSFER_CASE": str(case),
+        "FNLP_TEST_TRANSFER_LOCK": str(lock),
+        "FNLP_TEST_TRANSFER_MODE": "block",
+    })
+    command = [str(fetch), "--dest", str(destination), "--catalog", str(catalog),
+               "--allow-untrusted-revision", "--test-base-url", "https://fixture.invalid/source"]
+    child_pid = None
+    process = None
+    with (case / "fetch.out").open("wb") as stdout, (case / "fetch.err").open("wb") as stderr:
+        try:
+            # Popen avoids an asynchronous shell's inherited ignored SIGINT.
+            # Signal only the fetch parent; it must stop and join its own child.
+            process = subprocess.Popen(command, env=environment, stdout=stdout,
+                                       stderr=stderr, start_new_session=True)
+            child_pid = int(await_record(case / "child-started"))
+            original_journal = journal.read_bytes()
+            original_partial = partial.read_bytes()
+            assert original_partial == payload[:7]
+            assert lock.is_dir()
+            process.send_signal(signum)
+            assert await_record(case / "child-stopping") == "locked"
+            assert process.poll() is None, "parent returned before writer drained"
+            assert lock.is_dir(), "lock released while writer is still alive"
+
+            # Cleanup ignores subsequent signals until the recorded child
+            # exits. The first signal remains the terminal reason.
+            process.send_signal(signal.SIGTERM if signum != signal.SIGTERM else signal.SIGINT)
+            retry_environment = dict(environment, FNLP_TEST_TRANSFER_MODE="complete")
+            contender = subprocess.run(command, env=retry_environment, capture_output=True, timeout=5)
+            assert contender.returncode == 4, contender.stderr.decode()
+            assert lock.is_dir(), "contender removed the active writer's lock"
+            assert process.poll() is None
+            assert journal.read_bytes() == original_journal
+            assert partial.read_bytes() == original_partial
+
+            (case / "allow-exit").write_text("drain")
+            assert process.wait(timeout=8) == expected_code
+            assert await_record(case / "child-exited") == "locked"
+            assert not child_exists(child_pid), "recorded transfer remains alive after parent exit"
+            assert not lock.exists()
+            assert journal.read_bytes() == original_journal
+            assert partial.read_bytes() == original_partial
+            assert not (destination / "alpha.bin").exists()
+            stderr.flush()
+            diagnostics = (case / "fetch.err").read_text()
+            assert f"INTERRUPTED signal={signal_name} code={expected_code}" in diagnostics
+            assert "RESUME command=" in diagnostics
+            assert "FETCH_MODEL RESULT=PASS" not in diagnostics
+
+            resumed = subprocess.run(command, env=retry_environment, capture_output=True, timeout=8)
+            assert resumed.returncode == 0, resumed.stderr.decode()
+            assert int(await_record(case / "resumed-offset")) == len(original_partial)
+            assert (destination / "alpha.bin").read_bytes() == payload
+            assert not partial.exists()
+            assert not lock.exists()
+            print(f"INTERRUPT_TEST signal={signal_name} RESULT=PASS exit={expected_code} joined=true resumed=true")
+        finally:
+            # Retain every fixture. On assertion failure, drain only this
+            # fixture's exact child and parent rather than killing a process
+            # group, another curl, or an unrelated fetch invocation.
+            (case / "allow-exit").write_text("drain")
+            if child_pid is not None and child_exists(child_pid):
+                try:
+                    os.kill(child_pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+PY
+    then
+        cat "$WORK/interrupt-tests.out"
+        pass_case interruption owned-writer-drain-lock-lifetime-and-resume
+    else
+        cat "$WORK/interrupt-tests.out"
+        cat "$WORK/interrupt-tests.err" >&2
+        fail_case interruption owned-writer-drain-lock-lifetime-and-resume
+    fi
+}
+
+if [ "${1:-}" = --interrupt-only ]; then
+    run_interrupt_cases
+    exit
+fi
+
 if [ "${1:-}" = --disk-only ]; then
     run_disk_cases
     exit
@@ -516,3 +704,4 @@ if [ "$lock_status" -eq 4 ] && [ -f "$DEST19/.fnlp-fetch-lock-$REV/owner.txt" ] 
 else fail_case 19 nonempty-contended-lock-untouched; fi
 
 run_disk_cases
+run_interrupt_cases
