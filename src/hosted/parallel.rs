@@ -1,6 +1,7 @@
 //! Explicit persistent output-row teams for complete buffered INT8 tasks.
 use super::*;
-use crate::native_engine::{simd::Int8Kernel, strict_int8::projection::Int8ProjectionStats};
+use crate::native_engine::{simd::Int8Kernel, strict_int8::{
+    prefill::Int8PrefillLimits, projection::Int8ProjectionStats}};
 
 /// Physical completion evidence, separate from prompt, model and sampler
 /// identity. These counters do not certify speed or model fidelity.
@@ -40,6 +41,14 @@ pub fn int8_chat_team_workspace_bytes(compute_threads: usize) -> Result<u64, Hos
     dispatch::int8_team_workspace_bytes(compute_threads)
 }
 
+/// Fixed child storage when layer-major prompt rows share the same team as
+/// decode. The coordinator's prefill workspace is admitted separately. Worker
+/// BF16 rows cover the wider of a one-row head and bounded decoder batches.
+pub fn int8_chat_prefill_team_workspace_bytes(compute_threads: usize, max_batch_rows: usize)
+    -> Result<u64, HostedError> {
+    dispatch::int8_prefill_team_workspace_bytes(compute_threads, max_batch_rows)
+}
+
 /// Pending and committed reservations stay outside the scoped callback, so
 /// native allocation failure, cancellation and panic all retain admission
 /// until the dispatcher has joined every child. Storage is still freed before
@@ -63,13 +72,36 @@ impl NlpEngine {
     /// The coordinator owns quantization, the sole native work ledger, KV,
     /// sequence order and sampling. Child formation occurs once per request.
     ///
-    /// The resource host must admit this width before execution. This initial
-    /// route accepts sequential prompt prefill only; it does not run packed
-    /// prompt rows, streams, cohorts or resident batches on the team.
+    /// The resource host must admit this width before execution. This route
+    /// uses sequential prompt prefill; the explicit layer-major variant admits
+    /// additional prompt-row capacity before forming the same fixed team.
     #[allow(clippy::too_many_arguments)]
     pub fn execute_int8_chat_with_threads(&self, model: &ResidentInt8, prepared: PreparedInt8Chat,
         request_seq: u64, native: NativeLimits, max_sampler_bytes: u64, kernel: Int8Kernel,
         compute_threads: usize, cancellation: CancellationToken)
+        -> Result<HostedInt8ChatTeamResult, HostedError> {
+        self.execute_int8_chat_team(model, prepared, request_seq, native, max_sampler_bytes,
+            kernel, compute_threads, None, cancellation)
+    }
+
+    /// Share one persistent output-row team across bounded layer-major prompt
+    /// morsels and subsequent decode. Complete output rows stay on one worker;
+    /// each row retains its quantization, integer reduction and BF16 boundary.
+    /// All batch capacity is charged before workers form and never grows in a
+    /// projection. The original cancellation allowance spans both schedules.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_int8_chat_layer_major_with_threads(&self, model: &ResidentInt8, prepared: PreparedInt8Chat,
+        request_seq: u64, native: NativeLimits, max_sampler_bytes: u64, kernel: Int8Kernel,
+        compute_threads: usize, prefill: Int8PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedInt8ChatTeamResult, HostedError> {
+        self.execute_int8_chat_team(model, prepared, request_seq, native, max_sampler_bytes,
+            kernel, compute_threads, Some(prefill), cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_int8_chat_team(&self, model: &ResidentInt8, prepared: PreparedInt8Chat,
+        request_seq: u64, native: NativeLimits, max_sampler_bytes: u64, kernel: Int8Kernel,
+        compute_threads: usize, prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken)
         -> Result<HostedInt8ChatTeamResult, HostedError> {
         dispatch::preflight_int8_team(self, native.run, compute_threads)?;
         self.check_resident_domain(model)?;
@@ -82,25 +114,31 @@ impl NlpEngine {
             || prepared.native_plan().sampler_bytes() > max_sampler_bytes {
             return Err(HostedError::Limits("native task preflight"));
         }
-        int8_chat_team_workspace_bytes(compute_threads)?;
+        let max_batch_rows = prefill.map_or(1, |limits| limits.max_batch_rows);
+        let extra = prefill.map_or(Ok(0), |limits| limits.validate()).map_err(HostedError::Native)?;
+        int8_chat_prefill_team_workspace_bytes(compute_threads, max_batch_rows)?;
         let lease = self.resources().acquire_lease();
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
         let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound,
+            sum(&[required.rope_bytes, required.scratch_payload_bound, extra,
                 max_sampler_bytes, native.allocator_reserve_bytes])?)?;
         let output = output_claim(&lease, prepared.task_plan().ir().budget().max_output_bytes,
             u64::from(prepared.task_plan().ir().budget().max_output_tokens))?;
         let admission = ChatAdmission { kv: Some(kv), scratch: Some(workspace), output: Some(output),
             _kv: None, _scratch: None, _lease: lease };
-        dispatch::run_int8_team(self, native.run, cancellation, model.clone(), compute_threads, kernel,
-            admission, move |model, admission, control, team| {
+        dispatch::run_int8_prefill_team(self, native.run, cancellation, model.clone(), compute_threads, kernel,
+            max_batch_rows, admission, move |model, admission, control, team| {
                 let mut engine = model.engine(native.context_tokens, memory_budget(required)).map_err(HostedError::Model)?
                     .with_kernel(kernel).with_projection_executor(team).map_err(HostedError::Native)?;
                 admission.commit_native()?;
                 let budget = Int8GenerationBudget { native: Int8RunBudget::exact(work),
                     max_kv_bytes: required.kv_bytes, max_sampler_bytes };
-                let result = prepared.execute(prepared.execution_identity(), &mut engine,
-                    request_seq, budget, control).map_err(HostedError::Chat)?;
+                let result = match prefill {
+                    None => prepared.execute(prepared.execution_identity(), &mut engine,
+                        request_seq, budget, control),
+                    Some(limits) => prepared.execute_layer_major(prepared.execution_identity(), &mut engine,
+                        request_seq, budget, limits, control),
+                }.map_err(HostedError::Chat)?;
                 drop(engine);
                 let compute = team.stats().into();
                 let committed = admission.output.take().ok_or(HostedError::Limits("INT8 output admission consumed"))?.commit()?;
@@ -128,4 +166,17 @@ mod tests {
         let four = int8_chat_team_workspace_bytes(4).unwrap();
         assert!(two > 0 && four > two);
     }
+    #[test]
+    fn prefill_quote_keeps_single_row_compatibility_and_refuses_unbounded_capacity() {
+        for width in [2, 3, 64] {
+            assert_eq!(int8_chat_prefill_team_workspace_bytes(width, 1).unwrap(),
+                int8_chat_team_workspace_bytes(width).unwrap());
+            assert!(int8_chat_prefill_team_workspace_bytes(width, 3).unwrap()
+                > int8_chat_team_workspace_bytes(width).unwrap());
+            for rows in [0, 65, usize::MAX] {
+                assert!(int8_chat_prefill_team_workspace_bytes(width, rows).is_err());
+            }
+        }
+    }
+
 }

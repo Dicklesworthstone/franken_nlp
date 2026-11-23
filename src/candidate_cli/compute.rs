@@ -1,6 +1,7 @@
 //! Physical INT8 row teams are explicitly exposed by supported one-shot routes.
 use super::*;
-use crate::native_engine::strict_int8::projection::int8_team_workspace_bytes;
+use crate::native_engine::strict_int8::{prefill::Int8PrefillLimits,
+    projection::{int8_team_workspace_bytes, int8_team_workspace_bytes_with_prefill}};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Args { threads: usize }
@@ -12,10 +13,21 @@ impl Args {
         Ok(Self { threads })
     }
     pub(super) fn threads(self) -> usize { self.threads }
+    /// Source tasks retain their existing single-row team capability.
     pub(super) fn admit(self, prefill: bool) -> Result<Admission, CandidateError> {
+        if self.threads != 1 && prefill { return Err(CandidateError::Arguments); }
+        self.admit_prefill(None)
+    }
+    /// Buffered generation admits one team for prompt batches and decode.
+    pub(super) fn admit_prefill(self, prefill: Option<Int8PrefillLimits>) -> Result<Admission, CandidateError> {
         if self.threads == 1 { return Ok(Admission { threads: 1, workspace_bytes: 0 }); }
-        if prefill { return Err(CandidateError::Arguments); }
-        let workspace_bytes = int8_team_workspace_bytes(self.threads).map_err(|_| CandidateError::Arguments)?;
+        let workspace_bytes = match prefill {
+            None => int8_team_workspace_bytes(self.threads),
+            Some(limits) => {
+                limits.validate().map_err(|_| CandidateError::Arguments)?;
+                int8_team_workspace_bytes_with_prefill(self.threads, limits.max_batch_rows)
+            }
+        }.map_err(|_| CandidateError::Arguments)?;
         Ok(Admission { threads: self.threads, workspace_bytes })
     }
 }
@@ -26,7 +38,7 @@ pub(super) struct Admission { pub threads: usize, pub workspace_bytes: u64 }
 pub(super) fn definition(command: clap::Command) -> clap::Command {
     command.arg(clap::Arg::new("compute_threads").long("compute-threads")
         .value_name("N").value_parser(clap::value_parser!(usize)).default_value("1")
-        .help("Coordinator plus persistent INT8 row workers, 1..=64; 1 keeps serial execution. One fixed team serves this complete request across both decoder passes, prompt tokens and generation. Runtime threads are additional. Worker storage and native memory are admitted before input/model IO. Widths above 1 cannot combine with --prefill-rows; maps, streams, batches and jobs do not expose this option"))
+        .help("Coordinator plus persistent INT8 row workers, 1..=64; 1 keeps serial execution. One fixed team serves this complete request across both decoder passes, prompt tokens and generation. Runtime threads are additional. Worker storage and native memory are admitted before input/model IO. Buffered generate/chat can combine workers with --prefill-rows on the same team. Source tasks keep single-row team execution. Maps, streams, batches and jobs do not expose this option"))
 }
 
 /// Price the entire simultaneously live threaded request, including the
@@ -36,8 +48,10 @@ pub(super) fn definition(command: clap::Command) -> clap::Command {
 pub(super) fn check_memory(args: &CandidateArgs, limits: Limits, native: Int8MemoryRequirement)
     -> Result<(), CandidateError> {
     if limits.compute.threads == 1 { return Ok(()); }
+    let prefill_bytes = args.policy.prefill()?.map(|prefill| prefill.max_extra_scratch_bytes).unwrap_or(0);
     let peak = request_peak_bytes(limits, native, limits.result_bytes as u64,
-        args.max_new_tokens as u64, SAMPLER_BYTES, 0)?;
+        args.max_new_tokens as u64, SAMPLER_BYTES, 0)?
+        .checked_add(prefill_bytes).ok_or(CandidateError::Arguments)?;
     if peak > limits.memory_bytes { return Err(CandidateError::Arguments); }
     Ok(())
 }

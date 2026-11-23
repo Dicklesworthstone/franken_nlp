@@ -25,7 +25,7 @@ pub(super) struct Session {
 }
 impl Session {
     pub(super) fn new(args: &CandidateArgs, limits: Limits) -> Result<Self, CandidateError> {
-        if limits.compute != args.compute.admit(args.policy.prefill()?.is_some())? {
+        if limits.compute != args.compute.admit_prefill(args.policy.prefill()?)? {
             return Err(CandidateError::Arguments);
         }
         let started = Instant::now();
@@ -224,6 +224,27 @@ pub(in crate::candidate_cli) fn execute(command: SourceCommand, args: CandidateA
 mod tests {
     use super::*;
     use crate::candidate_cli::source::Kind;
+
+    #[test]
+    fn buffered_team_prefill_survives_shared_startup_without_loosening_source_guards() {
+        let args = crate::candidate_cli::tests::args(&["--compute-threads", "4", "--prefill-rows", "4"]);
+        let limits = args.validate().unwrap();
+        // Exercise the same real startup used by buffered generate/chat,
+        // without opening input, an artifact or a native invocation.
+        let session = Session::new(&args, limits).unwrap();
+        assert!(session.checked_source.lock().unwrap().is_none());
+        session.remaining().unwrap();
+        drop(session);
+        let mut short = limits;
+        short.compute.workspace_bytes -= 1;
+        assert!(matches!(Session::new(&args, short), Err(CandidateError::Arguments)));
+        let mut wrong_width = limits;
+        wrong_width.compute.threads = 2;
+        assert!(matches!(Session::new(&args, wrong_width), Err(CandidateError::Arguments)));
+        // Source tasks own a separate explicit single-row capability check.
+        let source = command::tests::command("ner", &["--compute-threads", "4", "--prefill-rows", "4"]);
+        assert!(matches!(source.validate(), Err(CandidateError::Arguments)));
+    }
     #[test]
     fn artifact_inspection_observes_every_stop_before_path_access() {
         struct Stop(DecodeCancellationKind);

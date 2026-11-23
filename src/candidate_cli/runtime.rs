@@ -45,9 +45,15 @@ pub(super) fn execute(task: Task, args: CandidateArgs, limits: Limits,
         compute::Completion::Serial(execute_chat(&session.engine, &model, prepared, 1,
             session.native(&args)?, &args, cancellation)?)
     } else {
-        compute::Completion::Team(session.engine.execute_int8_chat_with_threads(&model, prepared, 1,
-            session.native(&args)?, SAMPLER_BYTES, crate::native_engine::simd::config::process_kernel(),
-            limits.compute.threads, cancellation).map_err(|_| CandidateError::Execution)?)
+        let native = session.native(&args)?;
+        let kernel = crate::native_engine::simd::config::process_kernel();
+        let result = match args.policy.prefill()? {
+            None => session.engine.execute_int8_chat_with_threads(&model, prepared, 1,
+                native, SAMPLER_BYTES, kernel, limits.compute.threads, cancellation),
+            Some(prefill) => session.engine.execute_int8_chat_layer_major_with_threads(&model, prepared, 1,
+                native, SAMPLER_BYTES, kernel, limits.compute.threads, prefill, cancellation),
+        };
+        compute::Completion::Team(result.map_err(|_| CandidateError::Execution)?)
     };
     session.remaining()?;
     let response = CandidateResponse { schema_version: 1,

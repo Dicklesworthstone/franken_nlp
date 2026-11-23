@@ -217,3 +217,5 @@ fn worker_and_coordinator_panics_join_every_child_before_scope_completion() {
         })));
     assert!(result.is_err()); assert_eq!(dropped.load(Ordering::SeqCst), 3);
 }
+
+mod prefill;

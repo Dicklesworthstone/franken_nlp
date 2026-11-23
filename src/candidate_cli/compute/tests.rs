@@ -32,8 +32,8 @@ fn team_width_prefill_and_complete_memory_fail_before_any_private_io() {
         fn flush(&mut self) -> io::Result<()> { panic!("unadmitted flush"); }
     }
     for extra in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
-        vec!["--compute-threads", "2", "--prefill-rows", "1"],
-        vec!["--compute-threads", "7", "--prefill-rows", "64"],
+        vec!["--compute-threads", "2", "--prefill-rows", "0"],
+        vec!["--compute-threads", "7", "--prefill-rows", "65"],
         vec!["--compute-threads", "2", "--max-weight-mib", "8192"]] {
         for task in [Task::Generate, Task::Chat] {
             let command = CandidateCommand::Text { task, args: args(&extra) };
@@ -97,3 +97,40 @@ fn omitted_and_explicit_serial_width_leave_wire_bytes_identical() {
     assert_eq!(wrapped["compute"], serde_json::to_value(compute).unwrap());
 }
 
+
+#[test]
+fn buffered_prompt_batches_share_the_team_without_changing_generation_semantics() {
+    for task in ["generate", "chat"] {
+        for width in [2_usize, 7, 64] { for rows in [1_usize, 4, 64] {
+            let width_text = width.to_string(); let rows_text = rows.to_string();
+            let matches = super::super::definition().try_get_matches_from(["candidate", task,
+                "--model", "m", "--memory-mib", "16384", "--compute-threads", &width_text,
+                "--prefill-rows", &rows_text]).unwrap();
+            let CandidateCommand::Text { args: combined, .. } = CandidateCommand::from_matches(&matches).unwrap()
+                else { panic!("wrong route") };
+            let limits = combined.validate().unwrap();
+            assert_eq!(limits.compute.threads, width);
+            assert_eq!(limits.compute.workspace_bytes, int8_team_workspace_bytes_with_prefill(width, rows).unwrap());
+            assert!(combined.options(166_101).unwrap() == args(&[]).options(166_101).unwrap());
+            if rows == 1 {
+                assert_eq!(limits.compute.workspace_bytes, int8_team_workspace_bytes(width).unwrap());
+            }
+        } }
+    }
+}
+
+#[test]
+fn combined_memory_peak_includes_coordinator_prefill_and_fixed_child_capacity() {
+    let args = args(&["--compute-threads", "7", "--prefill-rows", "64"]);
+    let mut limits = args.validate().unwrap();
+    let native = Int8MemoryRequirement::for_context(args.context_tokens).unwrap();
+    let base = request_peak_bytes(limits, native, limits.result_bytes as u64,
+        args.max_new_tokens as u64, SAMPLER_BYTES, 0).unwrap();
+    let extra = args.policy.prefill().unwrap().unwrap().validate().unwrap();
+    assert!(extra > 0);
+    assert!(limits.compute.workspace_bytes > int8_team_workspace_bytes(7).unwrap());
+    limits.memory_bytes = base + extra;
+    check_memory(&args, limits, native).unwrap();
+    limits.memory_bytes -= 1;
+    assert_eq!(check_memory(&args, limits, native), Err(CandidateError::Arguments));
+}

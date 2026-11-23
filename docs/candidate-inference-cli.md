@@ -102,12 +102,35 @@ Threaded responses add a `compute` object with schedule
 work, not speedup or a numerical-fidelity certificate. Width 1 adds no such
 object. Compact encoding retains its ordinary request identity and input policy.
 
-This initial text route uses token-ordered prefill. Widths above 1 combined with
-`--prefill-rows` fail before private input/model IO. INT8 streams, text batches
-and retained text jobs do not expose this option. A checked simultaneous memory
-floor includes the model allowance, preparation, coordinator-native buffers,
-sampler, output and every fixed child buffer before IO; the host then reserves
-their actual owners against the shared process ledger.
+Buffered generation and chat can combine the team with bounded layer-major
+prompt prefill. `--prefill-rows` accepts 1 through 64 rows per prompt morsel:
+
+```sh
+fnlp candidate generate ./prompt.txt \
+  --model ./local-int8-candidate.fnlpq --memory-mib 8192 \
+  --compute-threads 4 --prefill-rows 8 --input-encoding safe-bpe-v1
+```
+
+One fixed team handles every prompt morsel and subsequent decode. Each prompt
+projection debits all activation/output-row work once before dispatch; children
+cannot renew it. Attention still appends and reads one causal KV row at a time,
+both decoder passes retain their post-pass norm, and only the final prompt
+position computes the language-model head. Insufficient batch capacity refuses
+before native work or KV mutation; there is no silent serial fallback.
+
+The simultaneous memory floor includes the model allowance, preparation,
+ordinary coordinator-native buffers, additional coordinator prefill scratch,
+sampler, output and all fixed child buffers before input/model IO. Children
+receive their maximum prompt-row capacity before formation and reuse it for
+both prefill and decode. Vocabulary-head buffers retain single-row capacity.
+The same shared startup verifies the admitted width and batch workspace.
+
+Omitting `--prefill-rows` keeps token-ordered prefill. Width 1 keeps the existing
+serial path. INT8 streams, text batches and retained text jobs do not expose
+compute-team controls; source-task teams keep their separate single-row
+capability. The composed schedule has regression definitions, including an
+explicit artifact-dependent parity test, but no measured speedup or full-model
+equivalence claim.
 
 ## Admission and delivery
 

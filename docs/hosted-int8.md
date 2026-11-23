@@ -76,12 +76,30 @@ prevents a cancellation arriving during drain from being reported as success.
 Returned `HostedInt8TeamResult` retains ordinary guarded output and exposes a
 separate `Int8ComputeReceipt`; no result is returned while a worker is live.
 
-This initial team interface uses a single activation row. Layer-major prefill
-refuses an installed executor before native work or KV mutation. The explicit
-buffered host entrypoint uses ordinary token-ordered prefill; packed prompt
-execution, streams and resident corpora retain their separate entrypoints.
-The implementation and tiny scoped-team regressions establish no measured
-speedup, full-model parity or completed runtime certificate.
+For batched prompts, `execute_int8_chat_layer_major_with_threads` accepts
+`Int8PrefillLimits` after the compute width and keeps the same team through
+subsequent decode. Quote fixed child payload with
+`int8_chat_prefill_team_workspace_bytes(compute_threads, max_batch_rows)`.
+This is additional to the coordinator's
+`Int8PrefillLimits::required_extra_scratch_bytes(max_batch_rows)` and ordinary
+native reservations. Both prompt-row and thread capacities are fixed before
+formation; worker buffers do not grow during execution.
+
+All seven decoder BF16 projections batch across admitted prompt rows. The
+coordinator validates and charges the complete M×N×K projection once, then
+assembles each child's ordered output stripe. Each independent dot uses the
+existing kernel and fixed epilogue. Causal KV append/read order and both
+post-pass norms remain unchanged. The final language-model head retains a
+single activation row; multirow head/f32 requests refuse. An executor without
+sufficient batch capacity refuses before work or KV mutation.
+
+The one-row dispatcher and its workspace quote remain compatible with existing
+source-task callers. Streams and resident corpora retain separate entrypoints.
+Regression definitions cover kernel tiers, batch/column tails, exact work,
+all typed cancellations, stale replies, worker/coordinator panic and physical
+drain. An explicitly ignored artifact test compares logits and all 44 KV slots.
+These definitions remain unrun and establish no measured speedup, full-model
+parity or completed runtime certificate.
 
 `execute_int8_source_with_threads` uses the same fixed team with the original
 `PreparedInt8SourceTask`, including its sealed full/selected-head policy and

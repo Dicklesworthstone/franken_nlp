@@ -338,7 +338,7 @@ impl CandidateArgs {
             .ok_or(CandidateError::Arguments)?;
         if preparation_bytes < preparation_floor || preparation_bytes > memory_bytes
             || weight_bytes > memory_bytes { return Err(CandidateError::Arguments); }
-        let compute = self.compute.admit(self.policy.prefill()?.is_some())?;
+        let compute = self.compute.admit_prefill(self.policy.prefill()?)?;
         let limits = Limits { memory_bytes, weight_bytes, preparation_bytes, result_bytes,
             max_prompt_tokens, kv_bytes: memory.kv_bytes, compute };
         compute::check_memory(self, limits, memory)?;

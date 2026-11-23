@@ -18,6 +18,12 @@ pub(in crate::hosted) fn int8_team_workspace_bytes(width: usize) -> Result<u64, 
         .map_err(|_| HostedError::Limits("INT8 team workspace arithmetic or width"))
 }
 
+pub(in crate::hosted) fn int8_prefill_team_workspace_bytes(width: usize, max_batch_rows: usize)
+    -> Result<u64, HostedError> {
+    native_projection::int8_team_workspace_bytes_with_prefill(width, max_batch_rows)
+        .map_err(|_| HostedError::Limits("INT8 team workspace arithmetic or width"))
+}
+
 pub(in crate::hosted) fn preflight_int8_team(engine: &NlpEngine, limits: RunLimits, width: usize)
     -> Result<(), HostedError> {
     preflight(engine, limits)?;
@@ -30,20 +36,23 @@ pub(in crate::hosted) fn preflight_int8_team(engine: &NlpEngine, limits: RunLimi
 }
 
 struct Workspace {
-    children: Vec<WorkerBuffers>,
+    children: Vec<WorkerBuffers>, max_batch_rows: usize,
     #[cfg(test)] panic_worker: Option<usize>,
     #[cfg(test)] cancel_on_exit: Option<(CancellationToken, DecodeCancellationKind)>,
 }
 impl Workspace {
-    fn new(width: usize) -> Result<Self, HostedError> {
-        int8_team_workspace_bytes(width)?;
+    #[cfg(test)]
+    fn new(width: usize) -> Result<Self, HostedError> { Self::with_batch_rows(width, 1) }
+
+    fn with_batch_rows(width: usize, max_batch_rows: usize) -> Result<Self, HostedError> {
+        int8_prefill_team_workspace_bytes(width, max_batch_rows)?;
         let mut children = Vec::new();
         children.try_reserve_exact(width - 1).map_err(|_| HostedError::Native(StrictInt8Error::Allocation))?;
         for _ in 1..width {
-            children.push(WorkerBuffers::new(NANBEIGE_VOCAB_SIZE.div_ceil(width))
+            children.push(WorkerBuffers::new(width, max_batch_rows)
                 .map_err(HostedError::Native)?);
         }
-        Ok(Self { children, #[cfg(test)] panic_worker: None, #[cfg(test)] cancel_on_exit: None })
+        Ok(Self { children, max_batch_rows, #[cfg(test)] panic_worker: None, #[cfg(test)] cancel_on_exit: None })
     }
 }
 
@@ -54,11 +63,25 @@ fn zeroed<T: Default + Clone>(length: usize) -> Result<Vec<T>, StrictInt8Error> 
     Ok(values)
 }
 
-/// Worker storage is charged before the blocking crossing and remains owned
-/// until all fixed children physically join, including cancellation and panic.
+/// Preserve the single-row dispatcher for buffered structured tasks. The
+/// request still receives one team and one original cancellation authority.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::hosted) fn run_int8_team<T, A, F>(engine: &NlpEngine, limits: RunLimits,
-    cancellation: CancellationToken, model: ResidentInt8, width: usize, kernel: Int8Kernel, admission: A, work: F)
+    cancellation: CancellationToken, model: ResidentInt8, width: usize, kernel: Int8Kernel,
+    admission: A, work: F) -> Result<T, HostedError>
+where T: Send + 'static, A: Send + 'static,
+    F: FnOnce(&CurrentCandidateInt8Model, &mut A, &mut RunControl, &mut dyn Int8ProjectionExecutor)
+        -> Result<T, HostedError> + Send + 'static {
+    run_int8_prefill_team(engine, limits, cancellation, model, width, kernel, 1, admission, work)
+}
+
+/// Worker storage is charged before the blocking crossing and remains owned
+/// until all fixed children physically join, including cancellation and panic.
+/// Prompt-row capacity is fixed once, before the team starts any native work.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::hosted) fn run_int8_prefill_team<T, A, F>(engine: &NlpEngine, limits: RunLimits,
+    cancellation: CancellationToken, model: ResidentInt8, width: usize, kernel: Int8Kernel,
+    max_batch_rows: usize, admission: A, work: F)
     -> Result<T, HostedError>
 where T: Send + 'static, A: Send + 'static,
     F: FnOnce(&CurrentCandidateInt8Model, &mut A, &mut RunControl, &mut dyn Int8ProjectionExecutor)
@@ -67,8 +90,9 @@ where T: Send + 'static, A: Send + 'static,
     if !Arc::ptr_eq(engine.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
     let shared = RunShared::new(limits, cancellation)?;
     let lease = engine.resources().acquire_lease();
-    let pending = Pending::reserve(&lease, MemoryClass::ActivationScratch, int8_team_workspace_bytes(width)?)?;
-    let workspace = allocate(pending, || Workspace::new(width))?;
+    let pending = Pending::reserve(&lease, MemoryClass::ActivationScratch,
+        int8_prefill_team_workspace_bytes(width, max_batch_rows)?)?;
+    let workspace = allocate(pending, || Workspace::with_batch_rows(width, max_batch_rows))?;
     run_blocking(engine, limits, move |blocking_cx| {
         let mut workspace = workspace;
         // Native KV/scratch and output claims are owned outside the scoped
@@ -99,7 +123,7 @@ where F: FnOnce(&mut RunControl, &mut dyn Int8ProjectionExecutor) -> Result<T, H
     #[cfg(test)] let panic_worker = workspace.panic_worker;
     #[cfg(test)] let cancel_on_exit = workspace.cancel_on_exit.clone();
     let scope_result = leaf.scoped_cpu(width - 1, |scope| {
-        let mut executor = TeamExecutor::new(weights, kernel, width,
+        let mut executor = TeamExecutor::new(weights, kernel, width, workspace.max_batch_rows,
             Arc::clone(&team), Arc::clone(&gate), Arc::clone(&shared))?;
         let mut control = RunControl { cx: leaf.clone(), shared: Arc::clone(&shared) };
         // This is the only formation loop. Projection commands cannot spawn.

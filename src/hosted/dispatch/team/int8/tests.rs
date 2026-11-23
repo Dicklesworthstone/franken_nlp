@@ -26,6 +26,25 @@ fn balanced_ranges_cover_every_position_once_including_idle_workers() {
     }
 }
 
+#[test]
+fn prefill_quote_matches_fixed_storage_without_multiplying_head_buffers() {
+    for width in [2, 7, 64] {
+        for rows in [1, 3, 64] {
+            let workspace = Workspace::with_batch_rows(width, rows).unwrap();
+            let payload = workspace.children.iter().map(WorkerBuffers::payload_bytes).sum::<usize>();
+            assert_eq!(int8_prefill_team_workspace_bytes(width, rows).unwrap(),
+                payload as u64 + 4096 * (width as u64 - 1) + 65536);
+            assert_eq!(workspace.max_batch_rows, rows);
+            assert_eq!(workspace.children.len(), width - 1);
+        }
+        assert_eq!(int8_prefill_team_workspace_bytes(width, 1).unwrap(),
+            int8_team_workspace_bytes(width).unwrap());
+        for rows in [0, 65, usize::MAX] {
+            assert!(Workspace::with_batch_rows(width, rows).is_err());
+        }
+    }
+}
+
 // The pinned dependency intentionally gates testing Cx construction. These
 // tests use actual scoped workers and lanes, with no alternative runtime in
 // production and no synthetic whole-model parity claim.
