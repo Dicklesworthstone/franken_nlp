@@ -5,8 +5,8 @@ use super::{ActivationBuffer, ArtifactIdentity, Bf16, DecodeStepControl,
     LinearRows, ProjectionLedger, QuantizedLinear, StrictInt8Error};
 #[cfg(any(feature = "asupersync-runtime", test))]
 use super::Int8WeightView;
-use crate::native_engine::{lmhead::NANBEIGE_VOCAB_SIZE, quant_algebra::MAX_MODEL_K,
-    simd::Int8KernelKind};
+use crate::native_engine::{layer::NANBEIGE_INTERMEDIATE_SIZE, lmhead::NANBEIGE_VOCAB_SIZE,
+    portable_int8::batch::MAX_BATCH_ROWS, quant_algebra::MAX_MODEL_K, simd::Int8KernelKind};
 #[cfg(any(feature = "asupersync-runtime", test))]
 use serde::{Deserialize, Serialize};
 
@@ -16,12 +16,23 @@ pub(crate) const MAX_INT8_TEAM_WIDTH: usize = 64;
 /// Ordinary engine scratch and OS thread stacks remain separately admitted;
 /// this quote is not a measured process RSS bound.
 pub(crate) fn int8_team_workspace_bytes(width: usize) -> Result<u64, StrictInt8Error> {
-    if !(2..=MAX_INT8_TEAM_WIDTH).contains(&width) { return Err(StrictInt8Error::Memory); }
-    let rows = NANBEIGE_VOCAB_SIZE.div_ceil(width) as u64;
-    let output = (std::mem::size_of::<f32>() + std::mem::size_of::<Bf16>()
-        + std::mem::size_of::<u32>()) as u64;
-    let child = rows.checked_mul(output)
-        .and_then(|bytes| bytes.checked_add(MAX_MODEL_K as u64))
+    int8_team_workspace_bytes_with_prefill(width, 1)
+}
+
+/// Fixed payload for a persistent team that also admits finite prompt cohorts.
+/// Only decoder BF16 projections batch; the final vocabulary head stays one
+/// activation row. Child BF16 storage covers the larger of those two shapes.
+/// The 4096-byte child allowance also includes its fixed 64 activation scales.
+pub(crate) fn int8_team_workspace_bytes_with_prefill(width: usize, rows: usize) -> Result<u64, StrictInt8Error> {
+    if !(2..=MAX_INT8_TEAM_WIDTH).contains(&width) || !(1..=MAX_BATCH_ROWS).contains(&rows) {
+        return Err(StrictInt8Error::Memory);
+    }
+    let head = NANBEIGE_VOCAB_SIZE.div_ceil(width) as u64;
+    let layer = NANBEIGE_INTERMEDIATE_SIZE.div_ceil(width) as u64;
+    let bf16 = layer.checked_mul(rows as u64).ok_or(StrictInt8Error::Memory)?.max(head);
+    let child = head.checked_mul((std::mem::size_of::<f32>() + std::mem::size_of::<u32>()) as u64)
+        .and_then(|bytes| bytes.checked_add(bf16.checked_mul(std::mem::size_of::<Bf16>() as u64)?))
+        .and_then(|bytes| bytes.checked_add((rows as u64).checked_mul(MAX_MODEL_K as u64)?))
         .and_then(|bytes| bytes.checked_add(4096)).ok_or(StrictInt8Error::Memory)?;
     child.checked_mul((width - 1) as u64)
         .and_then(|bytes| bytes.checked_add(65_536)).ok_or(StrictInt8Error::Memory)
@@ -50,12 +61,13 @@ pub(crate) struct Int8ProjectionStats {
 }
 
 /// Installed only by one hosted, whole-request, sealed CPU team. Its workers
-/// share the coordinator's original cancellation/checkpoint authority. This
-/// initial interface supports one activation row; layer-major prefill refuses
-/// an installed executor rather than silently bypassing it.
+/// share the coordinator's original cancellation/checkpoint authority. A batch
+/// capacity of zero means single-row projections only; prefill checks the
+/// whole morsel capacity before any work, KV mutation or allocation.
 pub(crate) trait Int8ProjectionExecutor: Send {
     fn artifact_identity(&self) -> &ArtifactIdentity;
     fn kernel_kind(&self) -> Int8KernelKind;
+    fn max_batch_rows(&self) -> usize { 0 }
     #[cfg(any(feature = "asupersync-runtime", test))]
     fn stats(&self) -> Int8ProjectionStats;
     fn project_bf16_into(&mut self, op: Int8ProjectionOp, input: &ActivationBuffer,
@@ -64,6 +76,10 @@ pub(crate) trait Int8ProjectionExecutor: Send {
     fn project_f32_into(&mut self, op: Int8ProjectionOp, input: &ActivationBuffer,
         rows: LinearRows<'_>, output: &mut [f32], control: &mut dyn DecodeStepControl)
         -> Result<(), StrictInt8Error>;
+    /// Optional capability, never a serial fallback for an installed team.
+    fn project_batch_bf16_into(&mut self, _op: Int8ProjectionOp, _inputs: &[ActivationBuffer],
+        _rows: LinearRows<'_>, _output: &mut [Bf16], _control: &mut dyn DecodeStepControl)
+        -> Result<(), StrictInt8Error> { Err(StrictInt8Error::ProjectionExecutor) }
 }
 
 #[cfg(any(feature = "asupersync-runtime", test))]
@@ -128,7 +144,30 @@ pub(super) fn project_f32<'executor, C: DecodeStepControl>(
     }
 }
 
+/// One whole-cohort debit remains in the native session, never per child or
+/// per activation. The single-row final lm-head uses the original f32 seam.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn project_batch_bf16<'executor, C: DecodeStepControl>(
+    executor: &mut Option<&'executor mut (dyn Int8ProjectionExecutor + 'executor)>,
+    op: Int8ProjectionOp, matrix: QuantizedLinear<'_>, inputs: &[ActivationBuffer],
+    rows: LinearRows<'_>, output: &mut [Bf16], ledger: &mut ProjectionLedger, control: &mut C)
+    -> Result<(), StrictInt8Error> {
+    match executor {
+        Some(executor) => {
+            if inputs.len() > executor.max_batch_rows()
+                || (matches!(op, Int8ProjectionOp::Head) && inputs.len() > 1) {
+                return Err(StrictInt8Error::ProjectionExecutor);
+            }
+            matrix.reserve_batch_projection(inputs, rows, output.len(), ledger)?;
+            executor.project_batch_bf16_into(op, inputs, rows, output, control)
+        }
+        None => matrix.project_batch_bf16_into(inputs, rows, output, ledger, control).map_err(Into::into),
+    }
+}
+
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod batch_tests;
 #[cfg(test)]
 pub(crate) mod fixture;

@@ -104,5 +104,7 @@ impl QuantizedLinear<'_> {
     }
 }
 
+mod batch;
+
 #[cfg(test)]
 mod tests;
