@@ -19,6 +19,7 @@ pub use execution::{
 pub const CHUNK_PROFILE: &str = "source-partition-token-shrink-v1";
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ITEMS: usize = 1_000_000;
+const SOURCE_SCAN_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MapReduceError {
@@ -180,7 +181,7 @@ impl<'a> ChunkPlan<'a> {
         while start < source.len() {
             if chunks.len() == limits.max_chunks { return Err(MapReduceError::ChunkBudget); }
             let ceiling = start + byte_cap.min(source.len() - start);
-            let mut end = preferred_end(source, start, aligned_end(source, ceiling));
+            let mut end = preferred_end(source, start, aligned_end(source, ceiling), &mut checkpoint)?;
             if end <= start { return Err(MapReduceError::TokenBudget); }
             let tokens = loop {
                 checkpoint()?;
@@ -197,10 +198,10 @@ impl<'a> ChunkPlan<'a> {
                     if first == '\r' && source.as_bytes().get(smaller) == Some(&b'\n') { smaller += 1; }
                 }
                 if smaller >= end { return Err(MapReduceError::TokenBudget); }
-                end = preferred_end(source, start, smaller);
+                end = preferred_end(source, start, smaller, &mut checkpoint)?;
             };
             let text = &source[start..end];
-            let next_scalar = scalar + text.chars().count();
+            let next_scalar = scalar + count_scalars_with_checkpoints(text, &mut checkpoint)?;
             chunks.try_reserve(1).map_err(|_| MapReduceError::AllocationRefused)?;
             chunks.push(SourceChunk {
                 id: chunks.len(),
@@ -223,15 +224,28 @@ impl<'a> ChunkPlan<'a> {
     /// Lift a chunk-local citation to exact original byte/scalar coordinates.
     /// This proves membership and UTF-8 boundaries, NOT semantic entailment.
     pub fn lift_span(&self, chunk_id: usize, local: Range<usize>) -> Result<VerifiedSourceSpan, MapReduceError> {
+        self.lift_span_with_checkpoints(chunk_id, local, || Ok(()))
+    }
+
+    /// Lift coordinates while polling the caller during long source scans.
+    /// Counts the prefix and selected range once each; no source-sized index,
+    /// normalized text or guessed Unicode offsets are allocated.
+    pub fn lift_span_with_checkpoints<C>(&self, chunk_id: usize, local: Range<usize>,
+        mut checkpoint: C) -> Result<VerifiedSourceSpan, MapReduceError>
+    where C: FnMut() -> Result<(), MapReduceError> {
+        checkpoint()?;
         let chunk = self.chunks.get(chunk_id).ok_or(MapReduceError::InvalidSpan)?;
         if local.start >= local.end || chunk.text.get(local.clone()).is_none() {
             return Err(MapReduceError::InvalidSpan);
         }
+        let before = count_scalars_with_checkpoints(&chunk.text[..local.start], &mut checkpoint)?;
+        let selected = count_scalars_with_checkpoints(&chunk.text[local.clone()], &mut checkpoint)?;
+        checkpoint()?;
         Ok(VerifiedSourceSpan {
             byte_start: chunk.span.byte_start + local.start,
             byte_end: chunk.span.byte_start + local.end,
-            scalar_start: chunk.span.scalar_start + chunk.text[..local.start].chars().count(),
-            scalar_end: chunk.span.scalar_start + chunk.text[..local.end].chars().count(),
+            scalar_start: chunk.span.scalar_start + before,
+            scalar_end: chunk.span.scalar_start + before + selected,
         })
     }
 }
@@ -246,15 +260,39 @@ fn aligned_end(source: &str, mut end: usize) -> usize {
     end
 }
 
-fn preferred_end(source: &str, start: usize, end: usize) -> usize {
-    if end == source.len() { return end; }
-    source.as_bytes()[start..end].iter().enumerate().rev().find_map(|(index, byte)| {
-        let point = start + index + 1;
-        (point - start >= (end - start) / 2
-            && matches!(*byte, b' ' | b'\t' | b'\n' | b'\r')
-            && !(*byte == b'\r' && source.as_bytes().get(point) == Some(&b'\n')))
-            .then_some(point)
-    }).unwrap_or(end)
+fn preferred_end<C>(source: &str, start: usize, end: usize, checkpoint: &mut C)
+    -> Result<usize, MapReduceError> where C: FnMut() -> Result<(), MapReduceError> {
+    if end == source.len() { return Ok(end); }
+    let mut high = end;
+    while high > start {
+        checkpoint()?;
+        let low = start.max(high.saturating_sub(SOURCE_SCAN_BYTES));
+        if let Some(point) = source.as_bytes()[low..high].iter().enumerate().rev().find_map(|(index, byte)| {
+            let point = low + index + 1;
+            (point - start >= (end - start) / 2
+                && matches!(*byte, b' ' | b'\t' | b'\n' | b'\r')
+                && !(*byte == b'\r' && source.as_bytes().get(point) == Some(&b'\n')))
+                .then_some(point)
+        }) { return Ok(point); }
+        high = low;
+    }
+    Ok(end)
+}
+
+/// Count valid UTF-8 in finite byte windows. Aligning the end down costs at
+/// most three byte checks, and each scalar is counted exactly once.
+pub(crate) fn count_scalars_with_checkpoints<E>(text: &str,
+    checkpoint: &mut impl FnMut() -> Result<(), E>) -> Result<usize, E> {
+    let (mut start, mut scalars) = (0, 0);
+    while start < text.len() {
+        checkpoint()?;
+        let mut end = start + SOURCE_SCAN_BYTES.min(text.len() - start);
+        while !text.is_char_boundary(end) { end -= 1; }
+        scalars += text[start..end].chars().count();
+        start = end;
+    }
+    checkpoint()?;
+    Ok(scalars)
 }
 
 #[cfg(test)]
@@ -377,6 +415,95 @@ mod tests {
             if checks == 3 { Err(MapReduceError::Cancelled) } else { Ok(()) }
         });
         assert!(matches!(result, Err(MapReduceError::Cancelled)));
+    }
+
+
+    #[test]
+    fn bounded_scalar_scans_preserve_utf8_across_every_window_boundary() {
+        for padding in 0..4 {
+            let source = format!("{}{}", "x".repeat(SOURCE_SCAN_BYTES - padding),
+                "é😀e\u{301}\r\n上海".repeat(SOURCE_SCAN_BYTES));
+            let mut polls = 0;
+            let count = count_scalars_with_checkpoints(&source, &mut || {
+                polls += 1; Ok::<_, MapReduceError>(())
+            }).unwrap();
+            assert_eq!(count, source.chars().count());
+            assert!(polls >= source.len().div_ceil(SOURCE_SCAN_BYTES));
+        }
+    }
+
+    #[test]
+    fn cancellation_inside_boundary_search_prevents_the_first_tokenizer_call() {
+        let source = "x".repeat(4 * SOURCE_SCAN_BYTES);
+        let options = ChunkLimits { max_input_bytes: source.len(), max_chunk_bytes: 3 * SOURCE_SCAN_BYTES,
+            max_chunk_tokens: 1, ..ChunkLimits::default() };
+        let (mut polls, mut encodes) = (0, 0);
+        let result = ChunkPlan::build_with_checkpoints(&source, options, |_| {
+            encodes += 1; Ok(1)
+        }, || {
+            polls += 1;
+            if polls == 3 { Err(MapReduceError::Cancelled) } else { Ok(()) }
+        });
+        assert!(matches!(result, Err(MapReduceError::Cancelled)));
+        assert_eq!(encodes, 0);
+    }
+
+    #[test]
+    fn cancellation_inside_scalar_count_never_publishes_a_partial_partition() {
+        let source = "é".repeat(3 * SOURCE_SCAN_BYTES);
+        let options = ChunkLimits { max_input_bytes: source.len(), max_chunk_bytes: source.len(),
+            max_chunk_tokens: 1, ..ChunkLimits::default() };
+        let (mut polls, mut encodes) = (0, 0);
+        let result = ChunkPlan::build_with_checkpoints(&source, options, |_| {
+            encodes += 1; Ok(1)
+        }, || {
+            polls += 1;
+            if polls == 5 { Err(MapReduceError::Cancelled) } else { Ok(()) }
+        });
+        assert!(matches!(result, Err(MapReduceError::Cancelled)));
+        assert_eq!(encodes, 1);
+    }
+
+    #[test]
+    fn chunk_boundary_search_keeps_the_original_delimiter_and_crlf_policy() {
+        fn legacy(source: &str, start: usize, end: usize) -> usize {
+            if end == source.len() { return end; }
+            source.as_bytes()[start..end].iter().enumerate().rev().find_map(|(index, byte)| {
+                let point = start + index + 1;
+                (point - start >= (end - start) / 2
+                    && matches!(*byte, b' ' | b'\t' | b'\n' | b'\r')
+                    && !(*byte == b'\r' && source.as_bytes().get(point) == Some(&b'\n')))
+                    .then_some(point)
+            }).unwrap_or(end)
+        }
+        let source = format!("{} \r\n{}\té{} tail", "x".repeat(SOURCE_SCAN_BYTES),
+            "y".repeat(SOURCE_SCAN_BYTES), "z".repeat(SOURCE_SCAN_BYTES));
+        for start in [0, 1, SOURCE_SCAN_BYTES - 1] {
+            for end in [start, start + 1, 2 * SOURCE_SCAN_BYTES, source.len() - 2, source.len()] {
+                assert_eq!(preferred_end(&source, start, end, &mut || Ok(())).unwrap(),
+                    legacy(&source, start, end));
+            }
+        }
+    }
+
+    #[test]
+    fn controlled_coordinate_lifting_matches_original_spans_and_can_stop_mid_scan() {
+        let source = format!("{}Z", "é😀".repeat(SOURCE_SCAN_BYTES));
+        let options = ChunkLimits { max_input_bytes: source.len(), max_chunk_bytes: source.len(),
+            max_chunk_tokens: 1, ..ChunkLimits::default() };
+        let plan = ChunkPlan::build(&source, options, |_| Ok(1)).unwrap();
+        let range = source.len() - 1..source.len();
+        let expected = plan.lift_span(0, range.clone()).unwrap();
+        assert_eq!(expected.scalar_start, 2 * SOURCE_SCAN_BYTES);
+        let actual = plan.lift_span_with_checkpoints(0, range.clone(), || Ok(())).unwrap();
+        assert_eq!(actual, expected);
+        let mut polls = 0;
+        let result = plan.lift_span_with_checkpoints(0, range, || {
+            polls += 1;
+            if polls == 3 { Err(MapReduceError::Cancelled) } else { Ok(()) }
+        });
+        assert!(matches!(result, Err(MapReduceError::Cancelled)));
+        assert_eq!(polls, 3);
     }
 
     #[test]

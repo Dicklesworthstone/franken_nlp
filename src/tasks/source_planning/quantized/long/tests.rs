@@ -392,3 +392,41 @@ fn empty_source_and_unbounded_chunk_counts_are_refused() {
     assert!(matches!(p.plan_int8_map_with_control("Alice", &task, budget(), &ctx,
         SourcePlanningLimits::default(), l, &mut Continue), Err(Int8SourceMapError::InvalidLimits)));
 }
+
+#[test]
+fn long_source_coordinate_scans_preserve_all_native_cancellation_causes() {
+    let source = format!("{}Z", "é😀".repeat(4096));
+    let chunks = ChunkPlan::build(&source, ChunkLimits { max_input_bytes: source.len(),
+        max_chunk_bytes: source.len(), max_chunk_tokens: 1, ..ChunkLimits::default() }, |_| Ok(1)).unwrap();
+    let chunk = &chunks.chunks()[0];
+    let local = VerifiedSourceSpan { byte_start: source.len() - 1, byte_end: source.len(),
+        scalar_start: 8192, scalar_end: 8193 };
+    let valid = lift_spans(&chunks, chunk, "Z", &[local], &mut || Ok(())).unwrap();
+    assert_eq!(valid, vec![local]);
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let mut polls = 0;
+        let error = lift_spans(&chunks, chunk, "Z", &[local], &mut || {
+            polls += 1;
+            if polls == 4 { Err(Int8SourceError::Cancelled(cause)) } else { Ok(()) }
+        }).unwrap_err();
+        assert_eq!(error.cancellation(), Some(cause));
+        assert_eq!(polls, 4);
+    }
+}
+
+#[test]
+fn controlled_span_lifting_still_rejects_wrong_scalar_coordinates() {
+    let chunks = ChunkPlan::build("éA😀Z", ChunkLimits { max_chunk_bytes: 16,
+        max_chunk_tokens: 16, ..ChunkLimits::default() }, |_| Ok(4)).unwrap();
+    let chunk = &chunks.chunks()[0];
+    let correct = VerifiedSourceSpan { byte_start: 7, byte_end: 8, scalar_start: 3, scalar_end: 4 };
+    assert_eq!(lift_spans(&chunks, chunk, "Z", &[correct], &mut || Ok(())).unwrap(), vec![correct]);
+    for span in [VerifiedSourceSpan { scalar_start: 2, ..correct },
+        VerifiedSourceSpan { scalar_end: 5, ..correct },
+        VerifiedSourceSpan { byte_start: 4, ..correct }] {
+        assert!(matches!(lift_spans(&chunks, chunk, "Z", &[span], &mut || Ok(())),
+            Err(Int8SourceError::InvalidResult)));
+    }
+}

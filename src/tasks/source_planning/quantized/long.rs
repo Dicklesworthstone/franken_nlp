@@ -423,11 +423,23 @@ fn lift_spans<F: FnMut() -> Result<(), Int8SourceError>>(plan: &ChunkPlan<'_>, c
         if chunk.text().get(span.byte_start..span.byte_end) != Some(text) {
             return Err(Int8SourceError::InvalidResult);
         }
-        let scalar_start = chunk.text()[..span.byte_start].chars().count();
-        if span.scalar_start != scalar_start || span.scalar_end != scalar_start + text.chars().count() {
+        // The planner owns the original coordinates. Scan its exact prefix
+        // and selected range once, with the same request control throughout.
+        // Preserve a typed native stop instead of laundering it into InvalidSpan.
+        let mut stopped = None;
+        let original = plan.lift_span_with_checkpoints(chunk.id(), span.byte_start..span.byte_end, || {
+            match checkpoint() {
+                Ok(()) => Ok(()),
+                Err(error) => { stopped = Some(error); Err(MapReduceError::Cancelled) }
+            }
+        });
+        if let Some(error) = stopped { return Err(error); }
+        let original = original.map_err(|_| Int8SourceError::InvalidResult)?;
+        if original.scalar_start.checked_sub(chunk.span().scalar_start) != Some(span.scalar_start)
+            || original.scalar_end.checked_sub(chunk.span().scalar_start) != Some(span.scalar_end) {
             return Err(Int8SourceError::InvalidResult);
         }
-        lifted.push(plan.lift_span(chunk.id(), span.byte_start..span.byte_end).map_err(|_| Int8SourceError::InvalidResult)?);
+        lifted.push(original);
     }
     Ok(lifted)
 }
