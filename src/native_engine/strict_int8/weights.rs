@@ -23,8 +23,10 @@ pub struct Int8WeightView<'a> {
 }
 impl<'a> Int8WeightView<'a> {
     /// Bind all 201 existing bridge tensors without cloning their payloads.
-    /// Missing, extra, wrongly typed/shaped tensors and invalid int8 sidecars
-    /// refuse. The source still has ONLY its original synthetic evidence grade.
+    /// Missing, extra or wrongly typed/shaped tensors refuse. The immutable
+    /// bridge owner already checked every int8 sidecar during cancellable load;
+    /// binding a new request never scans the multi-gigabyte payload again.
+    /// The source retains its original evidence grade.
     pub fn from_materialized(source: &'a ArtifactWeightSet) -> Result<Self, StrictInt8Error> {
         if source.identity().model_id != "Nanbeige4.2-3B"
             || source.bf16().len() != 2 * PHYSICAL_LAYER_COUNT + 2

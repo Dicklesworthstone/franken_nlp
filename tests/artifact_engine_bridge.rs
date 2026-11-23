@@ -11,7 +11,11 @@ use franken_nlp::native_engine::{
         load_synthetic_with_contract, load_synthetic_with_contract_with_checkpoint,
         scan_current_80_byte_forensic_census,
     },
-    decode::DecodeCancellationKind,
+    decode::{DecodeCancellationKind, DecodeStepControl},
+    lmhead::NANBEIGE_VOCAB_SIZE,
+    portable_int8::{ActivationBuffer, LinearError, LinearRows, ProjectionLedger,
+        ProjectionWork, QuantizedLinear},
+    quant_algebra::MAX_MODEL_K,
     tensor::Bf16,
 };
 
@@ -239,28 +243,133 @@ fn streaming_bridge_refuses_tampered_row_sum_after_checked_sidecar_decode() {
 }
 
 #[test]
-fn streaming_bridge_refuses_nonfinite_quantization_scale_at_the_sidecar_stage() {
+fn streaming_bridge_refuses_invalid_quantization_scales_before_constructing_an_owner() {
+    for invalid in [0.0_f32, -0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        for row in 0..2 {
+            let mut fixture = StreamingFixture::expected();
+            let mut scales = [0.25_f32, 0.5];
+            scales[row] = invalid;
+            fixture.mappings.get_mut("model.layers.0.self_attn.q_proj.weight")
+                .expect("quantized mapping")[1] = scales.into_iter().flat_map(f32::to_le_bytes).collect();
+            let error = load_synthetic_with_contract(
+                &fixture,
+                ArtifactLoadBudget::streaming_only(28, 3),
+                &contracts(),
+                |_| {},
+            ).expect_err("every materialized scale must be finite and positive");
+            assert!(matches!(
+                error,
+                ArtifactBridgeError::Tensor {
+                    ref tensor,
+                    stage: "scales",
+                    ..
+                } if tensor == "model.layers.0.self_attn.q_proj.weight"
+            ));
+        }
+    }
+}
+
+#[test]
+fn checked_owner_views_preserve_full_selected_and_bf16_projection_semantics() {
     let mut fixture = StreamingFixture::expected();
-    fixture
-        .mappings
-        .get_mut("model.layers.0.self_attn.q_proj.weight")
-        .expect("quantized mapping")[1] =
-        [f32::INFINITY.to_le_bytes(), 0.5_f32.to_le_bytes()].concat();
-    let error = load_synthetic_with_contract(
-        &fixture,
-        ArtifactLoadBudget::streaming_only(28, 3),
-        &contracts(),
-        |_| {},
-    )
-    .expect_err("nonfinite scales are never materialized into the quantized set");
-    assert!(matches!(
-        error,
-        ArtifactBridgeError::Tensor {
-            ref tensor,
-            stage: "scales",
-            ..
-        } if tensor == "model.layers.0.self_attn.q_proj.weight"
-    ));
+    let mappings = fixture.mappings.get_mut("model.layers.0.self_attn.q_proj.weight").unwrap();
+    mappings[0] = vec![128, 127, 127, 128];
+    mappings[2] = [(-1_i32).to_le_bytes(), (-1_i32).to_le_bytes()].concat();
+    let source = ObservedSource::new(fixture);
+    let checkpoints = Cell::new(0);
+    let loaded = load_synthetic_with_contract_with_checkpoint(
+        &source, ArtifactLoadBudget::streaming_only(28, 3), &contracts(), |_| {},
+        || { checkpoints.set(checkpoints.get() + 1); None },
+    ).unwrap();
+    let matrix = loaded.weights.quantized().get("layer.0.attn.q").unwrap();
+    let clone = matrix.clone();
+    let mut input = ActivationBuffer::try_new(2).unwrap();
+    input.encode_f32(&[-63.5, 127.0]).unwrap();
+    let source_reads = source.chunks.get();
+    let load_checkpoints = checkpoints.get();
+
+    struct Continue;
+    impl DecodeStepControl for Continue {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
+    }
+    for owner in [matrix, &clone] {
+        let checked = QuantizedLinear::checked(owner.rows(), owner.columns(), owner.values(),
+            owner.row_scales(), owner.row_sums()).unwrap();
+        for selection in [LinearRows::All, LinearRows::Selected(&[1])] {
+            let count = selection.checked_count(owner.rows()).unwrap();
+            let work = ProjectionWork::for_shape(count, owner.columns()).unwrap();
+            let mut expected = vec![0.0_f32; count];
+            checked.project_f32_into(&input, selection, &mut expected,
+                &mut ProjectionLedger::new(work), &mut Continue).unwrap();
+            for _ in 0..4 {
+                let borrowed = QuantizedLinear::from_portable(owner).unwrap();
+                assert_eq!(borrowed.kernel_kind(), checked.kernel_kind());
+                let mut actual = vec![0.0_f32; count];
+                let mut ledger = ProjectionLedger::new(work);
+                borrowed.project_f32_into(&input, selection, &mut actual, &mut ledger, &mut Continue).unwrap();
+                assert_eq!(actual.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|value| value.to_bits()).collect::<Vec<_>>());
+                assert_eq!(ledger.reserved(), work);
+                let mut cast = vec![Bf16::from_bits(0); count];
+                borrowed.project_bf16_into(&input, selection, &mut cast,
+                    &mut ProjectionLedger::new(work), &mut Continue).unwrap();
+                assert_eq!(cast, expected.iter().copied().map(Bf16::from_f32).collect::<Vec<_>>());
+            }
+        }
+    }
+    assert_eq!(source.chunks.get(), source_reads, "borrowing does not reopen or rematerialize weights");
+    assert_eq!(checkpoints.get(), load_checkpoints, "borrowing leaves the completed load controller untouched");
+}
+
+#[test]
+fn zero_quantized_axes_refuse_before_reading_any_mapping() {
+    for shape in [vec![0, 2], vec![2, 0]] {
+        let mut fixture = StreamingFixture::expected();
+        let mut contract = contracts()[1].clone();
+        contract.shape = shape.clone();
+        let descriptor = &mut fixture.tensors[1];
+        descriptor.shape = shape.clone();
+        descriptor.mapping_lengths = TensorMappingLengths {
+            data: 0, scale: u64::from(shape[0]) * 4, row_sum: u64::from(shape[0]) * 4,
+        };
+        fixture.tensors.remove(0);
+        let source = ObservedSource::new(fixture);
+        let error = load_synthetic_with_contract(&source,
+            ArtifactLoadBudget::streaming_only(16, 3), &[contract], |_| {})
+            .expect_err("an empty matrix axis cannot become a validated owner");
+        assert!(matches!(error, ArtifactBridgeError::Census { .. }
+            | ArtifactBridgeError::Tensor { stage: "quantized-shape", .. }));
+        assert_eq!(source.chunks.get(), 0);
+        assert_eq!(source.completed_mappings.get(), 0);
+    }
+}
+
+#[test]
+fn checked_owner_views_still_refuse_geometry_outside_the_native_kernel_contract() {
+    for (rows, columns) in [(1, MAX_MODEL_K + 1), (NANBEIGE_VOCAB_SIZE + 1, 1)] {
+        let mut fixture = StreamingFixture::expected();
+        let mut contract = contracts()[1].clone();
+        contract.shape = vec![rows as u32, columns as u32];
+        let descriptor = &mut fixture.tensors[1];
+        descriptor.shape = contract.shape.clone();
+        descriptor.mapping_lengths = TensorMappingLengths {
+            data: (rows * columns) as u64, scale: (rows * 4) as u64, row_sum: (rows * 4) as u64,
+        };
+        fixture.tensors.remove(0);
+        fixture.mappings.insert(contract.source_name.clone(), [
+            vec![1; rows * columns],
+            (0..rows).flat_map(|_| 1.0_f32.to_le_bytes()).collect(),
+            (0..rows).flat_map(|_| (columns as i32).to_le_bytes()).collect(),
+        ]);
+        fixture.chunk_bytes = 64 * 1024;
+        let loaded = load_synthetic_with_contract(&fixture,
+            ArtifactLoadBudget::streaming_only((rows * (columns + 8)) as u64, 64 * 1024),
+            &[contract], |_| {}).unwrap();
+        let owner = loaded.weights.quantized().get("layer.0.attn.q").unwrap();
+        assert!(matches!(QuantizedLinear::from_portable(owner), Err(LinearError::Shape)));
+        assert!(matches!(QuantizedLinear::checked(owner.rows(), owner.columns(), owner.values(),
+            owner.row_scales(), owner.row_sums()), Err(LinearError::Shape)));
+    }
 }
 
 #[test]

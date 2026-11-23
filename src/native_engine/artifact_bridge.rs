@@ -217,6 +217,13 @@ pub enum ArtifactBf16Tensor {
 }
 
 /// One portable quantized matrix retained in its canonical logical layout.
+///
+/// This immutable owner is constructed only after `decode_quantized_matrix`
+/// validates exact payload/sidecar lengths, positive finite scales and every
+/// signed row sum with caller-controlled checkpoints. Private fields, shared
+/// accessors and the absence of deserialization/mutation preserve that content
+/// invariant; cloning preserves it too. Native borrowed views may reuse these
+/// checks, but still enforce their own stricter model/kernel shape limits.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PortableQuantizedMatrix {
     rows: usize,
@@ -1554,6 +1561,13 @@ fn decode_quantized_matrix<S: CheckedArtifactSource>(
     };
     let rows = checked_usize(u64::from(*rows), &descriptor.name, "quantized-shape")?;
     let columns = checked_usize(u64::from(*columns), &descriptor.name, "quantized-shape")?;
+    if rows == 0 || columns == 0 {
+        return Err(ArtifactBridgeError::Tensor {
+            tensor: descriptor.name.clone(),
+            stage: "quantized-shape",
+            reason: "portable quantized matrix dimensions must be nonzero".to_owned(),
+        });
+    }
     let expected_values = rows
         .checked_mul(columns)
         .ok_or_else(|| ArtifactBridgeError::Tensor {

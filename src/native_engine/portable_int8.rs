@@ -164,8 +164,9 @@ impl LinearRows<'_> {
     }
 }
 
-/// Borrowed immutable row-major int8 weights. Construction recomputes every
-/// semantic sum once, checks the entire scale sidecar, and bounds integer K.
+/// Borrowed immutable row-major int8 weights. Raw-slice construction checks
+/// every semantic row sum and scale; a materialized bridge owner carries those
+/// checks already, so borrowing it validates only this kernel's geometry.
 /// A view does not authenticate a file, choose an envelope authority or clone
 /// weights. Full i8 bit patterns, including -128, retain exact scalar semantics.
 #[derive(Clone, Copy)]
@@ -175,10 +176,7 @@ pub struct QuantizedLinear<'a> {
 impl<'a> QuantizedLinear<'a> {
     pub fn checked(rows: usize, columns: usize, values: &'a [i8], scales: &'a [f32], sums: &[i32])
         -> Result<Self, LinearError> {
-        if rows == 0 || rows > NANBEIGE_VOCAB_SIZE || columns == 0 || columns > MAX_MODEL_K
-            || rows.checked_mul(columns) != Some(values.len()) || scales.len() != rows || sums.len() != rows {
-            return Err(LinearError::Shape);
-        }
+        Self::check_shape(rows, columns, values.len(), scales.len(), sums.len())?;
         for (row, (&scale, &sum)) in values.chunks_exact(columns).zip(scales.iter().zip(sums)) {
             if !scale.is_finite() || scale <= 0.0 { return Err(LinearError::WeightScale); }
             let actual: i64 = row.iter().map(|&value| i64::from(value)).sum();
@@ -186,8 +184,31 @@ impl<'a> QuantizedLinear<'a> {
         }
         Ok(Self { rows, columns, values, scales, kernel: Int8Kernel::scalar() })
     }
+
+    /// Borrow the bridge's immutable validated owner without scanning its
+    /// payload again. Its only constructor checks exact mapping lengths,
+    /// positive finite scales and every row sum under the load checkpoint
+    /// controller. Private fields, no deserialization and shared-only access
+    /// preserve that invariant for this view's entire lifetime.
+    ///
+    /// A synthetic bridge contract can exceed the model kernel's dimensions,
+    /// so kernel geometry still refuses here. Raw caller-owned slices must use
+    /// [`Self::checked`]; this is not an unchecked-slice constructor.
     pub fn from_portable(matrix: &'a PortableQuantizedMatrix) -> Result<Self, LinearError> {
-        Self::checked(matrix.rows(), matrix.columns(), matrix.values(), matrix.row_scales(), matrix.row_sums())
+        let rows = matrix.rows();
+        let columns = matrix.columns();
+        let values = matrix.values();
+        let scales = matrix.row_scales();
+        Self::check_shape(rows, columns, values.len(), scales.len(), matrix.row_sums().len())?;
+        Ok(Self { rows, columns, values, scales, kernel: Int8Kernel::scalar() })
+    }
+    fn check_shape(rows: usize, columns: usize, values: usize, scales: usize, sums: usize)
+        -> Result<(), LinearError> {
+        if rows == 0 || rows > NANBEIGE_VOCAB_SIZE || columns == 0 || columns > MAX_MODEL_K
+            || rows.checked_mul(columns) != Some(values) || scales != rows || sums != rows {
+            return Err(LinearError::Shape);
+        }
+        Ok(())
     }
     /// Select an already hardware-checked executable without copying weights,
     /// changing quantization, or moving any fixed floating-point cast boundary.
