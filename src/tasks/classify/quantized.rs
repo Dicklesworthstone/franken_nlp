@@ -17,6 +17,7 @@ use crate::{canonjson, execution_identity::{ExecutionIdentity, NumericsProfile, 
 use super::{ClassificationLimits, ClassificationPlanner, ClassificationPlanningError, ClassificationRequest,
     ClassificationTaskResult, PreparedClassification, planning::{self, ClassificationHead}};
 mod cohort;
+pub mod long;
 
 pub const INT8_CLASSIFICATION_EXECUTION: &str = "portable-int8-independent-classification-heads-v1";
 
@@ -79,7 +80,18 @@ impl ClassificationPlanner {
     pub fn plan_int8_with_control<C: DecodeStepControl>(&self, request: &ClassificationRequest,
         context: &PlanContext<'_>, limits: ClassificationLimits, control: &mut C)
         -> Result<PreparedInt8Classification, Int8ClassificationError> {
-        let inner = self.plan_with_profile(request, context, limits, control, NumericsProfile::StrictQuantized { version: 1 })?;
+        self.plan_int8_with_encoding_work(request, context, limits, control,
+            &mut crate::tokenizer::untrusted::SafeBpeWork::default())
+    }
+
+    /// Whole-document planning shares one tokenizer allowance across label
+    /// capacity checks, source probes and every final chunk/head plan.
+    fn plan_int8_with_encoding_work<C: DecodeStepControl>(&self, request: &ClassificationRequest,
+        context: &PlanContext<'_>, limits: ClassificationLimits, control: &mut C,
+        encoding_work: &mut crate::tokenizer::untrusted::SafeBpeWork)
+        -> Result<PreparedInt8Classification, Int8ClassificationError> {
+        let inner = self.plan_with_profile_and_work(request, context, limits, control,
+            NumericsProfile::StrictQuantized { version: 1 }, encoding_work)?;
         let mut schedules = planning::reserved(inner.head_count())?;
         let mut work = Int8Work::default();
         for head in &inner.heads {
