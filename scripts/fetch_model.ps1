@@ -291,6 +291,14 @@ function Test-EffectiveHost([Uri]$Uri) {
     return $downloadHost -eq 'huggingface.co' -or $downloadHost -eq 'cdn-lfs.huggingface.co' -or $downloadHost -like '*.xethub.hf.co' -or $downloadHost -like '*.cdn.hf.co'
 }
 
+function Wait-FetchTask([Threading.Tasks.Task]$Task) {
+    # Blocking GetResult on a silent HTTP body prevents PowerShell from
+    # observing Ctrl+C / Stop. Yield at a bounded interval until the owned
+    # operation finishes; the transfer's finally cancels and drains on Stop.
+    while (-not $Task.IsCompleted) { Start-Sleep -Milliseconds 100 }
+    return $Task.GetAwaiter().GetResult()
+}
+
 function Download-Partial([string]$Url, [string]$Partial, [string]$Journal, $Entry) {
     $lastError = $null
     for ($attempt = 1; $attempt -le 4; $attempt++) {
@@ -316,6 +324,9 @@ function Download-Partial([string]$Url, [string]$Partial, [string]$Journal, $Ent
             $response = $null
             $input = $null
             $output = $null
+            $pendingTransfer = $null
+            $transferCancellation = [Threading.CancellationTokenSource]::new()
+            $cleanupError = $null
             try {
                 for ($redirects = 0; ; $redirects++) {
                     if (-not $TestBaseUrl -and -not (Test-EffectiveHost $requestedUri)) {
@@ -325,7 +336,9 @@ function Download-Partial([string]$Url, [string]$Partial, [string]$Journal, $Ent
                     $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, $requestedUri)
                     $request.Headers.UserAgent.ParseAdd($UserAgent)
                     if ($start -gt 0) { $request.Headers.Range = [Net.Http.Headers.RangeHeaderValue]::Parse("bytes=$start-") }
-                    $response = $client.SendAsync($request, [Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+                    $pendingTransfer = $client.SendAsync($request, [Net.Http.HttpCompletionOption]::ResponseHeadersRead, $transferCancellation.Token)
+                    $response = Wait-FetchTask $pendingTransfer
+                    $pendingTransfer = $null
                     if ([int]$response.StatusCode -notin @(301, 302, 303, 307, 308)) { break }
                     if ($redirects -ge 8) { throw 'redirect limit exceeded maximum=8' }
                     $location = $response.Headers.Location
@@ -350,12 +363,18 @@ function Download-Partial([string]$Url, [string]$Partial, [string]$Journal, $Ent
                 if ($null -ne $contentLength -and $contentLength -ne $expectedBodyBytes) {
                     throw "server returned mismatched Content-Length expected=$expectedBodyBytes actual=$contentLength"
                 }
-                $input = $response.Content.ReadAsStream()
+                $pendingTransfer = $response.Content.ReadAsStreamAsync()
+                $input = Wait-FetchTask $pendingTransfer
+                $pendingTransfer = $null
                 $output = [IO.File]::Open($Partial, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::None)
                 $buffer = New-Object byte[] 1048576
                 $nextLog = [DateTime]::UtcNow
                 $receivedBytes = [int64]0
-                while (($read = $input.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                while ($true) {
+                    $pendingTransfer = $input.ReadAsync($buffer, 0, $buffer.Length, $transferCancellation.Token)
+                    $read = Wait-FetchTask $pendingTransfer
+                    $pendingTransfer = $null
+                    if ($read -eq 0) { break }
                     if ([int64]$read -gt ($expectedBodyBytes - $receivedBytes)) {
                         throw "response body exceeds expected length expected=$expectedBodyBytes observed_at_least=$($receivedBytes + $read)"
                     }
@@ -368,14 +387,35 @@ function Download-Partial([string]$Url, [string]$Partial, [string]$Journal, $Ent
                 }
                 $output.Flush($true)
             } finally {
-                if ($null -ne $output) { $output.Dispose() }
-                if ($null -ne $input) { $input.Dispose() }
-                if ($null -ne $response) { $response.Dispose() }
-                if ($null -ne $request) { $request.Dispose() }
-                $client.Dispose()
-                $handler.Dispose()
+                # Only this pipeline writes the partial, synchronously. Stop
+                # network work, close every owned handle, then observe the
+                # actual outstanding task before releasing the revision lock.
+                # A failing disposer must not skip the remaining cleanup.
+                try { $transferCancellation.Cancel() } catch { $cleanupError = $_ }
+                foreach ($owned in @($output, $input, $response, $request, $client, $handler)) {
+                    if ($null -ne $owned) {
+                        try { $owned.Dispose() }
+                        catch { if ($null -eq $cleanupError) { $cleanupError = $_ } }
+                    }
+                }
+                if ($null -ne $pendingTransfer) {
+                    try {
+                        $unclaimedResult = $pendingTransfer.GetAwaiter().GetResult()
+                        # Stop may arrive after headers/stream acquisition
+                        # completed but before its result was assigned above.
+                        if ($unclaimedResult -is [IDisposable]) { $unclaimedResult.Dispose() }
+                    } catch {
+                        # A cancelled or faulted task is terminal and drained.
+                        # Preserve the original transfer error / pipeline Stop.
+                    }
+                }
+                $transferCancellation.Dispose()
             }
+            if ($null -ne $cleanupError) { throw $cleanupError }
             return
+        } catch [Management.Automation.PipelineStoppedException] {
+            # Cancellation is never converted into another mirror/retry.
+            throw
         } catch {
             $lastError = $_.Exception.Message
             if ($attempt -lt 4) { Start-Sleep -Seconds $attempt }

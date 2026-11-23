@@ -1,7 +1,7 @@
 # Local-fixture tests for fetch_model.ps1. The retained work directory is
 # printed on completion for audit; this harness deliberately never deletes it.
 [CmdletBinding()]
-param([switch]$DiskOnly)
+param([switch]$DiskOnly, [switch]$LifecycleOnly)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -36,7 +36,7 @@ function Stop-RetryServer {
         $script:RetryServer = $null
     }
 }
-function Start-InterruptedResumeServer([switch]$MalformedRange, [switch]$OverlongBody) {
+function Start-InterruptedResumeServer([switch]$MalformedRange, [switch]$OverlongBody, [switch]$SilentHeaders, [switch]$SilentBody, [string]$SourceDirectory = $Fixture) {
     $runId = [Guid]::NewGuid().ToString('N')
     $ready = Join-Path $Work ("retry-$runId.ready")
     $trace = Join-Path $Work ("retry-$runId.trace")
@@ -53,6 +53,20 @@ root = Path(fixture)
 state = {"first_alpha": True}
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    def wait_for_disconnect(self):
+        with open(trace_path, "a", encoding="ascii") as trace:
+            trace.write("stall-ready={}\n".format(mode))
+        self.connection.settimeout(15)
+        try:
+            closed = self.connection.recv(1) == b""
+        except (ConnectionResetError, ConnectionAbortedError):
+            closed = True
+        except (TimeoutError, OSError):
+            closed = False
+        with open(trace_path, "a", encoding="ascii") as trace:
+            trace.write("stall-closed={}\n".format(closed))
+        self.close_connection = True
+
     def do_GET(self):
         candidate = root / Path(urlsplit(self.path).path).name
         if not candidate.is_file():
@@ -64,25 +78,49 @@ class Handler(http.server.BaseHTTPRequestHandler):
             trace.write("{} range={}\n".format(candidate.name, range_header))
         if candidate.name == "alpha.bin" and state["first_alpha"]:
             state["first_alpha"] = False
+            if mode == "silent-headers":
+                self.wait_for_disconnect()
+                return
             self.send_response(200)
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
-            self.wfile.write(payload[:5])
+            prefix = 8192 if mode == "silent-body" else 5
+            self.wfile.write(payload[:prefix])
             self.wfile.flush()
+            if mode == "silent-body":
+                self.wait_for_disconnect()
+                return
             self.close_connection = True
             self.connection.shutdown(socket.SHUT_RDWR)
             return
         if candidate.name == "alpha.bin":
-            expected = "bytes=5-"
-            if range_header != expected:
-                self.send_error(416, "expected {}".format(expected))
+            start = 5
+            if mode in ("silent-headers", "silent-body"):
+                if not range_header:
+                    start = 0
+                elif range_header.startswith("bytes=") and range_header.endswith("-"):
+                    try:
+                        start = int(range_header[6:-1])
+                    except ValueError:
+                        self.send_error(416)
+                        return
+                else:
+                    self.send_error(416)
+                    return
+                maximum = 8192 if mode == "silent-body" else 0
+                if start < 0 or start > maximum:
+                    self.send_error(416)
+                    return
+            elif range_header != "bytes=5-":
+                self.send_error(416, "expected bytes=5-")
                 return
-            remainder = payload[5:]
-            self.send_response(206)
+            remainder = payload[start:]
+            self.send_response(206 if start else 200)
             if mode != "overlong-body":
                 self.send_header("Content-Length", str(len(remainder)))
-            reported_start = 4 if mode == "malformed-range" else 5
-            self.send_header("Content-Range", "bytes {}-{}/{}".format(reported_start, len(payload) - 1, len(payload)))
+            if start:
+                reported_start = 4 if mode == "malformed-range" else start
+                self.send_header("Content-Range", "bytes {}-{}/{}".format(reported_start, len(payload) - 1, len(payload)))
             self.end_headers()
             self.wfile.write(remainder)
             if mode == "overlong-body":
@@ -103,8 +141,8 @@ with open(ready_path, "w", encoding="ascii") as ready:
 server.serve_forever()
 '@
     Set-Content -LiteralPath $serverScript -NoNewline -Encoding utf8 -Value $serverCode
-    $mode = if ($MalformedRange) { 'malformed-range' } elseif ($OverlongBody) { 'overlong-body' } else { 'exact-range' }
-    $script:RetryServer = Start-Process -FilePath python3 -ArgumentList @($serverScript, $Fixture, $ready, $trace, $mode) -PassThru -RedirectStandardOutput (Join-Path $Work ("retry-$runId.out")) -RedirectStandardError (Join-Path $Work ("retry-$runId.err"))
+    $mode = if ($SilentHeaders) { 'silent-headers' } elseif ($SilentBody) { 'silent-body' } elseif ($MalformedRange) { 'malformed-range' } elseif ($OverlongBody) { 'overlong-body' } else { 'exact-range' }
+    $script:RetryServer = Start-Process -FilePath python3 -ArgumentList @($serverScript, $SourceDirectory, $ready, $trace, $mode) -PassThru -RedirectStandardOutput (Join-Path $Work ("retry-$runId.out")) -RedirectStandardError (Join-Path $Work ("retry-$runId.err"))
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
         if (Test-Path -LiteralPath $ready) {
             $port = [int](Get-Content -LiteralPath $ready -Raw)
@@ -463,6 +501,111 @@ function Test-DiskAdmission {
     Pass 'disk-admission' 'twelve cache-recovery-resume-capacity-and-overflow scenarios without network'
 }
 
+function Test-InterruptedTransfer([string]$Stage) {
+    $script:Cases++
+    $destination = Join-Path $Work ("interrupted-" + $Stage)
+    $fixtureRoot = Join-Path $Work ("interrupt-fixture-" + $Stage)
+    New-Item -ItemType Directory -Path $fixtureRoot | Out-Null
+    $payload = [Text.Encoding]::UTF8.GetBytes('bounded retained source bytes ' * 2048)
+    $source = Join-Path $fixtureRoot 'alpha.bin'
+    [IO.File]::WriteAllBytes($source, $payload)
+    $digest = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
+    $catalogPath = Join-Path $Work ("interrupt-" + $Stage + ".catalog")
+    [IO.File]::WriteAllText($catalogPath, ('alpha.bin|' + $payload.Length + '|' + $digest + [char]10))
+    $server = if ($Stage -eq 'headers') {
+        Start-InterruptedResumeServer -SilentHeaders -SourceDirectory $fixtureRoot
+    } else {
+        Start-InterruptedResumeServer -SilentBody -SourceDirectory $fixtureRoot
+    }
+    if (-not $server) { throw "could not start silent-$Stage fixture" }
+    $runner = [Management.Automation.PowerShell]::Create()
+    $invocation = $null
+    $stop = $null
+    try {
+        $env:FNLP_FETCH_ALLOW_TEST_BASE_URL = '1'
+        [void]$runner.AddCommand($Fetch).AddParameter('Dest', $destination).AddParameter('Catalog', $catalogPath).AddParameter('TestBaseUrl', $server.Base).AddParameter('AllowUntrustedRevision')
+        $invocation = $runner.BeginInvoke()
+        $partial = Join-Path $destination 'alpha.bin.partial'
+        $journal = Join-Path $destination '.fnlp-fetch-journals/alpha.bin.journal'
+        $lock = Join-Path $destination ('.fnlp-fetch-lock-' + $Revision)
+        $waiting = $false
+        $deadline = [DateTime]::UtcNow.AddSeconds(10)
+        while ([DateTime]::UtcNow -lt $deadline -and -not $invocation.IsCompleted) {
+            $trace = if (Test-Path -LiteralPath $server.Trace) { [IO.File]::ReadAllText($server.Trace) } else { '' }
+            $retained = if (Test-Path -LiteralPath $partial) { (Get-Item -LiteralPath $partial).Length } else { -1 }
+            if ($trace -match "stall-ready=silent-$Stage" -and
+                (($Stage -eq 'headers' -and $retained -eq 0) -or ($Stage -eq 'body' -and $retained -gt 0))) {
+                $waiting = $true
+                break
+            }
+            Start-Sleep -Milliseconds 50
+        }
+        if (-not $waiting -or -not (Test-Path -LiteralPath $lock)) { throw "fetch never reached the silent-$Stage wait under its lock" }
+        $journalBytes = [IO.File]::ReadAllText($journal)
+
+        # A real competing invocation must not enter or remove this live lock.
+        & $script:PwshPath -NoProfile -File $Fetch -Dest $destination -Catalog $catalogPath -TestBaseUrl $server.Base -AllowUntrustedRevision 2> (Join-Path $Work ("interrupt-" + $Stage + "-contender.err"))
+        if ($LASTEXITCODE -ne 4 -or -not (Test-Path -LiteralPath $lock)) { throw 'concurrent acquisition changed the owned lock' }
+
+        # Exercise the same PowerShell stop mechanism as Ctrl+C, without a
+        # platform-specific process signal or an unbounded synchronous Stop.
+        $stop = $runner.BeginStop($null, $null)
+        $deadline = [DateTime]::UtcNow.AddSeconds(5)
+        while (-not $stop.IsCompleted -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 50 }
+        if (-not $stop.IsCompleted) { throw 'pipeline stop did not finish within five seconds' }
+        $runner.EndStop($stop)
+        try { [void]$runner.EndInvoke($invocation) }
+        catch {
+            if ($_.Exception.GetBaseException() -isnot [Management.Automation.PipelineStoppedException]) { throw }
+        }
+        if ($runner.InvocationStateInfo.State -ne [Management.Automation.PSInvocationState]::Stopped) { throw 'stopped acquisition became ordinary completion' }
+        if ((Test-Path -LiteralPath $lock) -or (Test-Path -LiteralPath (Join-Path $destination 'alpha.bin'))) { throw 'stop retained its lock or published incomplete bytes' }
+        if ([IO.File]::ReadAllText($journal) -cne $journalBytes) { throw 'stop changed resume authority' }
+        $exclusive = [IO.File]::Open($partial, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        $exclusive.Dispose()
+        $retainedBytes = [IO.File]::ReadAllBytes($partial)
+        $retained = $retainedBytes.Length
+        if (($Stage -eq 'headers' -and $retained -ne 0) -or
+            ($Stage -eq 'body' -and ($retained -le 0 -or $retained -gt 8192))) { throw 'unexpected retained prefix length' }
+        for ($index = 0; $index -lt $retained; $index++) {
+            if ($retainedBytes[$index] -ne $payload[$index]) { throw 'stopped transfer changed its retained source prefix' }
+        }
+        $prefixDigest = (Get-FileHash -LiteralPath $partial -Algorithm SHA256).Hash
+        Start-Sleep -Milliseconds 200
+        if ((Get-Item -LiteralPath $partial).Length -ne $retained -or
+            (Get-FileHash -LiteralPath $partial -Algorithm SHA256).Hash -ne $prefixDigest) { throw 'a writer outlived pipeline stop' }
+        $deadline = [DateTime]::UtcNow.AddSeconds(3)
+        while ([IO.File]::ReadAllText($server.Trace) -notmatch 'stall-closed=True' -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 50 }
+        $trace = [IO.File]::ReadAllText($server.Trace)
+        if ($trace -notmatch 'stall-closed=True' -or @($trace -split [char]10 | Where-Object { $_ -like 'alpha.bin range=*' }).Count -ne 1) {
+            throw 'stop did not close its connection or retried after cancellation'
+        }
+
+        & $script:PwshPath -NoProfile -File $Fetch -Dest $destination -Catalog $catalogPath -TestBaseUrl $server.Base -AllowUntrustedRevision 2> (Join-Path $Work ("interrupt-" + $Stage + "-resumed.err"))
+        if ($LASTEXITCODE -ne 0 -or (Get-FileHash -LiteralPath (Join-Path $destination 'alpha.bin') -Algorithm SHA256).Hash.ToLowerInvariant() -ne $digest) {
+            throw 'stopped acquisition could not resume and verify the exact source'
+        }
+        $range = if ($retained -gt 0) { "bytes=$retained-" } else { '' }
+        $requests = @(Get-Content -LiteralPath $server.Trace | Where-Object { $_ -like 'alpha.bin range=*' })
+        if ($requests.Count -ne 2 -or $requests[1] -cne "alpha.bin range=$range") { throw 'retry did not bind the actual retained byte count' }
+        Pass ("interrupt-" + $Stage) 'stops-and-drains-before-owned-lock-release-then-resumes-exact-prefix'
+    } catch {
+        Fail ("interrupt-" + $Stage) $_.Exception.Message
+        throw
+    } finally {
+        # A failing old implementation must not hang the test host. Closing
+        # this exact fixture server unblocks its pending socket before cleanup.
+        Stop-RetryServer
+        if ($null -ne $invocation -and -not $invocation.IsCompleted) {
+            if ($null -eq $stop) { $stop = $runner.BeginStop($null, $null) }
+            $deadline = [DateTime]::UtcNow.AddSeconds(5)
+            while (-not $invocation.IsCompleted -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 50 }
+        }
+        if ($null -eq $invocation -or $invocation.IsCompleted) { $runner.Dispose() }
+        else { throw 'fixture pipeline did not drain after its exact server stopped' }
+    }
+}
+
 function Test-UnexpectedFailureCleanup {
     $script:Cases++
     $destination = Join-Path $Work 'unexpected-failure'
@@ -503,6 +646,7 @@ exit $LASTEXITCODE
 }
 
 try {
+    if ($DiskOnly -and $LifecycleOnly) { throw 'choose either -DiskOnly or -LifecycleOnly' }
     $script:PwshPath = (Get-Command pwsh -ErrorAction Stop).Source
     if ($DiskOnly) {
         New-Item -ItemType Directory -Path $Work | Out-Null
@@ -511,7 +655,7 @@ try {
         return
     }
     if (-not (Get-Command python3 -ErrorAction SilentlyContinue)) { throw 'python3 is required for the local fixture server' }
-    if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) { throw 'openssl is required for the local TLS redirect server' }
+    if (-not $LifecycleOnly -and -not (Get-Command openssl -ErrorAction SilentlyContinue)) { throw 'openssl is required for the local TLS redirect server' }
     $script:PwshPath = (Get-Command pwsh -ErrorAction Stop).Source
 
     # Keep the redirect fixture honest: it supplies a private CA through the
@@ -533,6 +677,12 @@ try {
         Fail 'runtime-host' "requires-pwsh-7-or-newer actual=$pwshVersion"
     }
     New-Item -ItemType Directory -Path $Work | Out-Null
+    if ($LifecycleOnly) {
+        Test-UnexpectedFailureCleanup
+        Test-InterruptedTransfer 'headers'
+        Test-InterruptedTransfer 'body'
+        return
+    }
     $Fixture = Join-Path $Work ('fixture/resolve/' + $Revision)
     New-Item -ItemType Directory -Path $Fixture -Force | Out-Null
     [IO.File]::WriteAllText((Join-Path $Fixture 'alpha.bin'), "alpha fixture bytes`n", [Text.UTF8Encoding]::new($false))
@@ -702,6 +852,8 @@ try {
     else { Fail '19' "nonempty-contended-lock-untouched exit=$status" }
     Test-DiskAdmission
     Test-UnexpectedFailureCleanup
+    Test-InterruptedTransfer 'headers'
+    Test-InterruptedTransfer 'body'
 } catch {
     Fail 'harness' $_.Exception.Message
 } finally {
