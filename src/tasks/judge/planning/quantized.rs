@@ -14,6 +14,7 @@ use crate::native_engine::{
             Int8ScoringError, INT8_SCORING_EXECUTION}},
 };
 mod cohort;
+pub mod faithfulness_map;
 
 pub const INT8_JUDGE_EXECUTION: &str = "portable-int8-complete-judge-prefix-heads-v1";
 
@@ -89,10 +90,18 @@ impl JudgePlanner {
     pub fn plan_int8_with_control<C: DecodeStepControl>(&self, request: &JudgeRequest,
         context: &PlanContext<'_>, limits: JudgeLimits, control: &mut C)
         -> Result<PreparedInt8Judge, Int8JudgeError> {
+        self.plan_int8_with_encoding_work(request, context, limits, control, &mut SafeBpeWork::default())
+    }
+
+    /// Composed document planning shares the original tokenizer allowance
+    /// across claim-capacity checks, source probes and every complete head.
+    fn plan_int8_with_encoding_work<C: DecodeStepControl>(&self, request: &JudgeRequest,
+        context: &PlanContext<'_>, limits: JudgeLimits, control: &mut C, work: &mut SafeBpeWork)
+        -> Result<PreparedInt8Judge, Int8JudgeError> {
         checkpoint(control)?;
         check_profile(context.execution_identity())?;
         let inner = self.plan_with_profile_and_work(request, context, limits,
-            NumericsProfile::StrictQuantized { version: 1 }, control, &mut SafeBpeWork::default())?;
+            NumericsProfile::StrictQuantized { version: 1 }, control, work)?;
         checkpoint(control)?;
         let mut schedules = reserved(inner.executable.bundle().heads.len())?;
         let mut work = Int8Work::default();
