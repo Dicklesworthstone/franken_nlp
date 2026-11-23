@@ -1,6 +1,7 @@
 # Candidate classification and dimensional sentiment
 
-`fnlp candidate classify` and `fnlp candidate sentiment` use full-vocabulary
+`fnlp candidate classify`, `fnlp candidate classify-map` and
+`fnlp candidate sentiment` use full-vocabulary
 finite-continuation scoring on the existing strict-INT8 model. They do not ask
 free generation to produce labels or sentiment JSON. Every exact candidate,
 including its terminal EOS, is scored before independent task finalization.
@@ -42,6 +43,103 @@ characters. IDs are not normalized: distinct Unicode spellings remain distinct.
 The fixed planner uses opaque response codes and encodes labels/descriptions as
 untrusted data, so user label strings are not executable templates or tokens.
 
+
+## Complete-document classification
+
+Use `classify-map` when the document requires more than one native context:
+
+```sh
+fnlp candidate classify-map request.json \
+  --model ./model.fnlpq --memory-mib 16384 \
+  --max-chunks 64
+```
+
+The request uses the same `document`, `labels`, `mode` and `policy` fields as
+`classify`. Both exclusive and independent multi-label classification are
+supported. The command partitions the complete original source into
+nonoverlapping chunks that fit every label head, retaining original UTF-8 bytes,
+CRLF boundaries and byte/scalar coordinates. It refuses a document that cannot
+fit the declared limits; it never returns a successful prefix or truncates input.
+
+Every chunk and label head is planned before weights are loaded. The hosted
+invocation independently reconstructs and checks the complete plan before its
+first native forward. All five native work ceilings in the table below apply
+to the **whole document**. Each chunk receives an exact slice, and one native
+context is reused serially after logical KV is cleared. A failure or cancellation
+in any chunk prevents complete document success.
+
+The result retains every complete chunk result and a separately named
+source-scalar-weighted aggregate. Scalar weights refer to the exact original
+Unicode source, including source assigned to abstained chunks. The aggregate
+preserves the declared classification thresholds and makes abstention explicit.
+Multi-label decisions remain independent. This is a descriptive mixture of
+independent chunk classifications; it is not a full-context probability,
+calibrated confidence, or a claim that separate chunks capture cross-document
+relationships.
+
+Additional bounds are explicit:
+
+| Option | Default | Scope |
+|---|---:|---|
+| `--max-chunks` | 64 | Complete document; hard maximum 256 |
+| `--max-chunk-bytes` | Input byte ceiling | Additional per-chunk bound; native context still decides fit |
+| `--max-tokenizer-calls` | 8192 | Complete partition, including rejected sizing probes |
+| `--max-result-bytes` | 1048576 | One complete native chunk result |
+| `--max-retained-result-bytes` | 16777216 | Sum of complete retained chunk records |
+| `--max-map-result-bytes` | 16777216 | Complete native map and aggregate, with up to 4096 additional envelope bytes |
+| `--minimum-classified-coverage-ppm` | 1000000 | Required non-abstaining source coverage for an aggregate decision |
+
+Retained-result and complete-map byte limits are independent, each with a 64 MiB
+hard maximum. All final serialization and output staging remain admitted until
+write and flush complete. The output includes original source spans, chunk and
+head counts, planned/actual work, retained byte counts, and the explicit
+`single_context_equivalence=false` disclosure.
+
+Compact input is opt-in:
+
+```sh
+fnlp candidate classify-map request.json \
+  --model ./model.fnlpq --memory-mib 16384 \
+  --input-encoding safe-bpe-v1
+```
+
+This command uses the complete-document encoding options
+`--max-tokenizer-input-bytes`, `--max-tokenizer-output-tokens`,
+`--max-tokenizer-pair-checks` and `--max-tokenizer-pair-bytes`.
+The byte and token ceilings are cumulative preparation allowances, separate
+from the original JSON input ceiling and each native context. Capacity checks,
+label metadata, accepted and rejected partition probes, and every final
+chunk/head plan share one allowance per complete preparation. The CLI preflight
+and owned hosted preparation each use that same fixed policy with their own
+ledger. Neither renews work at chunk or label boundaries. A depleted allowance
+refuses the request without switching encoding.
+
+The default preparation reservation is 512 MiB for byte input and 1024 MiB for
+compact input. A pure worst-case quote includes the declared label/chunk
+frontier, retained plans and results, encoder workspace, native scratch, KV,
+weights and output staging before input/model IO. The example's 16 GiB process
+ceiling is a configured admission limit, not measured RSS or a claim that every
+larger configuration fits. Increasing declared work or output limits may require
+a larger preparation or process reservation.
+
+Library callers can use
+`ClassificationPlanner::plan_int8_document_with_control` and
+`PreparedInt8ClassificationMap`, or the owned
+`NlpEngine::map_int8_classify` /
+`NlpEngine::map_int8_classify_with_encoding` entry points with
+`Int8ClassificationMapHostConfig`. The host accepts one already charged
+`ResidentInt8`. Its caller identity must already bind the exact classifier,
+tokenizer and input policy. `requirements_with_encoding` exposes the pure
+memory quote before constructing the request.
+
+Completion verification binds the exact source, taxonomy, policies, identities,
+original limits and complete public result. Those private bindings are omitted
+from JSON and Debug output; caller-provided JSON cannot manufacture native
+completion authority. The original cancellation/deadline follows preparation,
+execution, aggregation, verification and publication. This command currently
+uses serial native scoring; it accepts no cohort, prefill-schedule or retained-job
+options.
+
 ## Dimensional sentiment
 
 ```sh
@@ -70,7 +168,7 @@ inferences about hidden mental states.
 
 ### Compact untrusted input
 
-Both commands accept explicit compact input:
+The single-context classification and sentiment commands accept explicit compact input:
 
 ```sh
 fnlp candidate classify request.json --model ./model.fnlpq --memory-mib 8192 \
@@ -108,7 +206,7 @@ does not prevent a model from reacting to instruction-shaped document prose.
 
 ### Shared request bounds
 
-Both commands accept a file or `-`/omitted path for stdin. Input is bounded while
+All three commands accept a file or `-`/omitted path for stdin. Input is bounded while
 reading, with a 65536-byte default and 1 MiB hard maximum. UTF-8 source bytes are
 preserved. Duplicate keys (including escaped aliases), unknown fields, malformed
 policy, repeated axes and invalid labels reject before model metadata access.
@@ -119,7 +217,8 @@ options on this surface. Supported policy integers range from 0 to 1000000.
 Default context is 2048 tokens; `--max-candidate-tokens` defaults to 16 and
 includes EOS. The host reserves that depth before prompt admission. The live
 context is the largest head, not summed forward work across independent heads.
-`--max-result-bytes` defaults to 1 MiB for the whole native result; bounded
+For single-context classification and sentiment, `--max-result-bytes` defaults
+to 1 MiB for the whole native result; bounded
 candidate provenance adds at most 4096 bytes. `--preparation-mib` defaults to
 512, with an additional checked floor for worst-case repeated prompt storage.
 These are modeled memory commitments, not observed or OS-enforced RSS limits.
@@ -158,7 +257,7 @@ input/file calls cannot be forcibly interrupted.
 Native checkpoint allowance is separate from the loader's finite allowance.
 Without `asupersync-runtime`, commands expose help but refuse before reading
 input or opening a model. Existing generate/chat/source/batch commands remain
-on their previous dispatch paths. These two new commands are single-request;
+on their previous dispatch paths. All three scored commands accept one request per invocation;
 the source-task `candidate batch` family is unchanged.
 
 ## Validation scope
@@ -166,7 +265,11 @@ the source-task `candidate batch` family is unchanged.
 The implementation adds model-free parser/command/resource tests and real-pinned
 planning tests for both classification modes and all sentiment axes. Native
 sentiment separately has private synthetic scoring/finalization tests. These
-are test sources, not evidence of a successful full-model run. Rust compilation,
+are test sources, not evidence of a successful full-model run. Complete-document
+classification adds synthetic finalization and pinned planning definitions for
+source coverage, all work axes, independent multi-label semantics, abstention,
+private binding mutation refusal, exact byte limits, cumulative compact encoding,
+hosted ownership admission and all eleven typed cancellation causes. Rust compilation,
 Rust tests, real-model inference, performance, task quality and controller DSR
 qualification were not executed in this environment. The reference native
 scoring backend and existing artifact candidate retain their prior evidence

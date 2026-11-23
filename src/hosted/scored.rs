@@ -9,6 +9,8 @@ use crate::{
         judge::quantized::{Int8JudgeError, Int8JudgeRun, PreparedInt8Judge}},
 };
 mod cohort;
+mod document;
+pub use document::{Int8ClassificationMapHostConfig, Int8ClassificationMapMemoryRequirement};
 
 impl NlpEngine {
     /// Execute exclusive or independent multi-label classification. The sealed

@@ -74,6 +74,7 @@ pub use grouped_int4::{Int4HostError, Int4LoadLimits, Int4LoadRequirements, Int4
 pub use grouped_int4::{HostedInt4ChatTeamResult, HostedInt4TeamResult, Int4ComputeReceipt,
     int4_chat_team_workspace_bytes, int4_chat_prefill_team_workspace_bytes, int4_task_team_workspace_bytes};
 mod scored;
+pub use scored::{Int8ClassificationMapHostConfig, Int8ClassificationMapMemoryRequirement};
 mod sentiment;
 pub use sentiment::SentimentHostLimits;
 mod redact;
@@ -152,6 +153,7 @@ pub enum HostedError {
     Int4(Int4HostError),
     Extraction(Int8ExtractError),
     Classification(crate::tasks::classify::quantized::Int8ClassificationError),
+    ClassificationMap(crate::tasks::classify::quantized::long::Int8ClassificationMapError),
     Judge(crate::tasks::judge::quantized::Int8JudgeError),
     Sentiment(crate::tasks::sentiment::quantized::Int8SentimentError),
     Source(crate::tasks::source_planning::quantized::Int8SourceError),
@@ -184,6 +186,7 @@ impl fmt::Display for HostedError {
             Self::Int4(_) => "hosted source-candidate INT4 loading or execution failed",
             Self::Extraction(_) => "hosted native extraction failed",
             Self::Classification(_) => "hosted native classification failed",
+            Self::ClassificationMap(_) => "hosted native classification document failed",
             Self::Judge(_) => "hosted native judgment failed",
             Self::Sentiment(_) => "hosted native sentiment failed",
             Self::Source(_) => "hosted native source task failed",
@@ -208,6 +211,7 @@ impl Error for HostedError {
             Self::Int4(e) => Some(e),
             Self::Assay(e) => Some(e),
             Self::SourceMap(e) => Some(e), Self::Resolution(e) => Some(e),
+            Self::ClassificationMap(e) => Some(e),
             Self::Redaction(e) => Some(e), Self::Sentiment(e) => Some(e),
             Self::Source(e) => Some(e), Self::Judge(e) => Some(e), Self::Classification(e) => Some(e), Self::Extraction(e) => Some(e), Self::BatchSetup(e) => Some(e), Self::Batch(e) => Some(e), _ => None,
         }

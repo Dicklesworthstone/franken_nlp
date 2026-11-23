@@ -2,6 +2,7 @@
 pub(super) mod source_tasks;
 pub(super) mod batch_tasks;
 pub(super) mod scored_tasks;
+pub(super) mod classify_map;
 pub(super) mod extraction;
 pub(super) mod map_tasks;
 pub(super) mod judgment;

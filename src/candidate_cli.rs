@@ -25,6 +25,7 @@ mod text_batch;
 mod source;
 mod batch;
 mod scored;
+mod classify_map;
 mod scored_batch;
 mod extract;
 mod jobs;
@@ -105,6 +106,7 @@ pub(crate) enum CandidateCommand {
     TextJob(jobs::generation::TextJobCommand),
     Source(source::SourceCommand),
     Scored(scored::ScoredCommand),
+    ClassifyMap(classify_map::ClassifyMapCommand),
     Extract(extract::ExtractCommand),
     Map(map::MapCommand),
     Judge(judge::JudgeCommand),
@@ -125,6 +127,7 @@ pub(crate) fn definition() -> clap::Command {
         .subcommand(int4::definition())
         .subcommands(source::definitions())
         .subcommands(scored::definitions())
+        .subcommand(classify_map::definition())
         .subcommand(batch::definition())
         .subcommand(scored_batch::definition())
         .subcommand(extract::definition())
@@ -170,6 +173,9 @@ impl CandidateCommand {
         }
         if name == "map" {
             return map::MapCommand::from_matches(matches).map(Self::Map);
+        }
+        if name == "classify-map" {
+            return classify_map::ClassifyMapCommand::from_matches(matches).map(Self::ClassifyMap);
         }
         if name == "score-job" {
             return jobs::scored::ScoreJobCommand::from_arg_matches(matches).map(Self::ScoreJob);
@@ -236,6 +242,7 @@ impl CandidateCommand {
             Self::TextBatch(command) => return command.execute(input, output),
             Self::Source(command) => return command.execute(input, output),
             Self::Scored(command) => return command.execute(input, output),
+            Self::ClassifyMap(command) => return command.execute(input, output),
             Self::Extract(command) => return command.execute(input, output),
             Self::Map(command) => return command.execute(input, output),
             Self::Judge(command) => return command.execute(input, output),
