@@ -54,6 +54,66 @@ fn caller_cancellation_before_launch_never_falls_through_to_file_loading() {
 }
 
 #[test]
+fn pull_control_is_not_reset_at_admission_or_runtime_entry_and_every_guard_drains() {
+    use franken_nlp::{
+        artifact::pull::http::{NetworkPartsOptions, NetworkPartsRequest, NetworkPullError,
+            direct::NetworkArtifactRequest},
+        hosted::{HostedNetworkPullError, NetworkPullHostOptions},
+        native_engine::decode::DecodeStepControl,
+    };
+    use asupersync::CancelKind;
+    struct StopAt { checks: usize, stop_at: usize, cause: DecodeCancellationKind }
+    impl DecodeStepControl for StopAt {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.checks += 1;
+            (self.checks >= self.stop_at).then_some(self.cause)
+        }
+    }
+    let _serial = SERIAL.lock().unwrap();
+    let engine = engine();
+    for (cause, expected) in [
+        (DecodeCancellationKind::User, CancelKind::User),
+        (DecodeCancellationKind::Timeout, CancelKind::Timeout),
+        (DecodeCancellationKind::Deadline, CancelKind::Deadline),
+        (DecodeCancellationKind::PollQuota, CancelKind::PollQuota),
+        (DecodeCancellationKind::CostBudget, CancelKind::CostBudget),
+        (DecodeCancellationKind::FailFast, CancelKind::FailFast),
+        (DecodeCancellationKind::RaceLost, CancelKind::RaceLost),
+        (DecodeCancellationKind::ParentCancelled, CancelKind::ParentCancelled),
+        (DecodeCancellationKind::ResourceUnavailable, CancelKind::ResourceUnavailable),
+        (DecodeCancellationKind::Shutdown, CancelKind::Shutdown),
+        (DecodeCancellationKind::LinkedExit, CancelKind::LinkedExit),
+    ] {
+        for stop_at in 2..=4 {
+            for direct in [false, true] {
+                let mut control = StopAt { checks: 0, stop_at, cause };
+                // Represent prior manifest/cache/preparation work. Admission
+                // must borrow this state rather than creating a fresh budget.
+                assert_eq!(control.checkpoint(0), None);
+                let result = if direct {
+                    engine.acquire_release_artifact_candidate(NetworkArtifactRequest {
+                        manifest: PathBuf::new(), expected_release_manifest_sha256: String::new(),
+                        staging_output: PathBuf::new(), output: PathBuf::new(),
+                    }, NetworkPartsOptions::default(), NetworkPullHostOptions::default(), &mut control)
+                        .map(|_| ())
+                } else {
+                    engine.download_release_parts_candidate(NetworkPartsRequest {
+                        manifest: PathBuf::new(), expected_release_manifest_sha256: String::new(),
+                        parts_dir: PathBuf::new(),
+                    }, NetworkPartsOptions::default(), NetworkPullHostOptions::default(), &mut control)
+                        .map(|_| ())
+                };
+                assert!(matches!(result, Err(HostedNetworkPullError::Transfer(NetworkPullError::Cancelled {
+                    cause: Some(observed), part: None,
+                })) if observed == expected));
+                assert_eq!(control.checks, stop_at);
+                assert_drained(engine);
+            }
+        }
+    }
+}
+
+#[test]
 fn over_budget_load_rolls_back_the_entire_reservation_without_native_work() {
     let _serial = SERIAL.lock().unwrap(); let engine = engine(); let mut limits = limits();
     limits.artifact.max_weight_bytes = engine.resources().config().memory_ceiling_bytes;

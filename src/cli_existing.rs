@@ -42,6 +42,7 @@ use crate::{
     artifact::pull::http::{NetworkPartsOptions, NetworkPartsRequest, NetworkPullError},
     artifact::pull::http::direct::NetworkArtifactRequest,
     hosted::{HostedError, HostedNetworkPullError, NetworkPullHostOptions},
+    native_engine::decode::{DecodeCancellationKind, DecodeStepControl},
 };
 use clap::{CommandFactory, Parser, Subcommand};
 
@@ -177,6 +178,10 @@ struct ModelsDownloadPartsCommand {
     /// Total seconds per mirror attempt, including redirects, headers and body.
     #[arg(long, default_value_t = 300)]
     request_timeout_seconds: u64,
+    /// One cooperative deadline for the complete invocation, including cache
+    /// verification and every mirror/range. Blocking filesystem IO is not preempted.
+    #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..))]
+    timeout_seconds: u64,
     /// Maximum explicit absolute-HTTPS redirect hops per mirror.
     #[arg(long, default_value_t = 5)]
     max_redirects: u32,
@@ -221,6 +226,10 @@ struct ModelsAcquireCommand {
     /// Total seconds per mirror attempt, including redirects, headers and body.
     #[arg(long, default_value_t = 300)]
     request_timeout_seconds: u64,
+    /// One cooperative deadline for verification, download and reconstruction.
+    /// Mirrors and new ranges never renew it; blocking filesystem IO is not preempted.
+    #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..))]
+    timeout_seconds: u64,
     /// Maximum explicit absolute-HTTPS redirect hops per mirror.
     #[arg(long, default_value_t = 5)]
     max_redirects: u32,
@@ -506,6 +515,36 @@ fn run_models_command(command: ModelsSubcommand) -> ExitCode {
     }
 }
 
+/// Created once before runtime or file work and borrowed by every acquisition
+/// stage. A relative per-mirror timeout never resets this invocation deadline.
+#[cfg(feature = "asupersync-runtime")]
+struct ModelsPullControl {
+    deadline: std::time::Instant,
+    expired: bool,
+}
+
+#[cfg(feature = "asupersync-runtime")]
+impl ModelsPullControl {
+    fn new(timeout_seconds: u64) -> Option<Self> {
+        if timeout_seconds == 0 { return None; }
+        let deadline = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(timeout_seconds))?;
+        Some(Self { deadline, expired: false })
+    }
+
+    fn checkpoint_at(&mut self, now: std::time::Instant) -> Option<DecodeCancellationKind> {
+        self.expired |= now >= self.deadline;
+        self.expired.then_some(DecodeCancellationKind::Deadline)
+    }
+}
+
+#[cfg(feature = "asupersync-runtime")]
+impl DecodeStepControl for ModelsPullControl {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+        self.checkpoint_at(std::time::Instant::now())
+    }
+}
+
 fn run_models_acquire(command: ModelsAcquireCommand) -> ExitCode {
     const MIB: u64 = 1024 * 1024;
     // Enforce the same mode contract for programmatic callers as clap does for
@@ -524,7 +563,7 @@ fn run_models_acquire(command: ModelsAcquireCommand) -> ExitCode {
         eprintln!("MODELS_ACQUIRE RESULT=REFUSED reason=invalid-network-reserve-mib");
         return ErrorCode::Usage.as_process_exit();
     };
-    if command.request_timeout_seconds == 0 || command.max_redirects > 16 {
+    if command.request_timeout_seconds == 0 || command.timeout_seconds == 0 || command.max_redirects > 16 {
         eprintln!("MODELS_ACQUIRE RESULT=REFUSED reason=invalid-network-limits");
         return ErrorCode::Usage.as_process_exit();
     }
@@ -537,6 +576,10 @@ fn run_models_acquire(command: ModelsAcquireCommand) -> ExitCode {
     #[cfg(feature = "asupersync-runtime")]
     {
         use std::time::Duration;
+        let Some(mut control) = ModelsPullControl::new(command.timeout_seconds) else {
+            eprintln!("MODELS_ACQUIRE RESULT=REFUSED reason=invalid-invocation-deadline");
+            return ErrorCode::Usage.as_process_exit();
+        };
         let engine = match NlpEngine::builder().resource_config(ResourceHostConfig {
             runtime_preset: RuntimePreset::CurrentThread,
             runtime_workers: 1,
@@ -568,9 +611,14 @@ fn run_models_acquire(command: ModelsAcquireCommand) -> ExitCode {
                     max_redirects: command.max_redirects,
                 },
                 NetworkPullHostOptions { network_reserve_bytes },
+                &mut control,
             );
             return match result {
                 Ok(report) => {
+                    if control.checkpoint(0).is_some() {
+                        eprintln!("MODELS_ACQUIRE RESULT=FAIL mode=direct reason=invocation-deadline");
+                        return ErrorCode::BudgetOrTimeout.as_process_exit();
+                    }
                     eprintln!(
                         "MODELS_ACQUIRE RESULT=PASS mode=direct output={} artifact_bytes={} artifact_sha256={} manifest_sha256={} parts={} cache_hit={} resumed_bytes={} network_downloaded_bytes={} retained_new_bytes={} local_workspace_bytes={LOCAL_RELEASE_WORKSPACE_RESERVE_BYTES} directory_durability=unconfirmed activation_authority=false",
                         report.output.display(), report.artifact_bytes, report.artifact_sha256,
@@ -604,9 +652,13 @@ fn run_models_acquire(command: ModelsAcquireCommand) -> ExitCode {
         // parts/staging or starting transport. Bad existing files never
         // silently authorize replacement.
         match verify_local_release_cache(
-            &command.manifest, &command.manifest_sha256, &command.output, |_| None,
+            &command.manifest, &command.manifest_sha256, &command.output, |_| control.checkpoint(0),
         ) {
             Ok(Some(report)) => {
+                if control.checkpoint(0).is_some() {
+                    eprintln!("MODELS_ACQUIRE RESULT=FAIL stage=cache-verify reason=invocation-deadline");
+                    return ErrorCode::BudgetOrTimeout.as_process_exit();
+                }
                 eprintln!(
                     "MODELS_ACQUIRE RESULT=PASS output={} artifact_bytes={} artifact_sha256={} manifest_sha256={} parts={} cache_hit=true network_reused_bytes=0 network_downloaded_bytes=0 reconstruct_resumed_bytes=0 reconstruct_copied_bytes=0 local_workspace_bytes={LOCAL_RELEASE_WORKSPACE_RESERVE_BYTES} directory_durability=unconfirmed activation_authority=false",
                     report.output.display(), report.artifact_bytes, report.artifact_sha256,
@@ -634,6 +686,7 @@ fn run_models_acquire(command: ModelsAcquireCommand) -> ExitCode {
             },
             transfer,
             NetworkPullHostOptions { network_reserve_bytes },
+            &mut control,
         ) {
             Ok(report) => report,
             Err(error) => {
@@ -654,10 +707,14 @@ fn run_models_acquire(command: ModelsAcquireCommand) -> ExitCode {
                 resume: reconstruct_resume,
                 max_new_bytes: command.max_copy_bytes,
             },
-            |_| None,
+            |_| control.checkpoint(0),
         );
         match reconstruction {
             Ok(report) => {
+                if control.checkpoint(0).is_some() {
+                    eprintln!("MODELS_ACQUIRE RESULT=FAIL stage=reconstruct reason=invocation-deadline");
+                    return ErrorCode::BudgetOrTimeout.as_process_exit();
+                }
                 eprintln!(
                     "MODELS_ACQUIRE RESULT=PASS output={} artifact_bytes={} artifact_sha256={} manifest_sha256={} parts={} cache_hit=false network_reused_bytes={} network_downloaded_bytes={} reconstruct_resumed_bytes={} reconstruct_copied_bytes={} local_workspace_bytes={LOCAL_RELEASE_WORKSPACE_RESERVE_BYTES} directory_durability=unconfirmed activation_authority=false",
                     report.output.display(),
@@ -699,10 +756,14 @@ fn run_models_download_parts(command: ModelsDownloadPartsCommand) -> ExitCode {
             eprintln!("MODELS_DOWNLOAD_PARTS RESULT=REFUSED reason=invalid-network-reserve-mib");
             return ErrorCode::Usage.as_process_exit();
         };
-        if command.request_timeout_seconds == 0 || command.max_redirects > 16 {
+        if command.request_timeout_seconds == 0 || command.timeout_seconds == 0 || command.max_redirects > 16 {
             eprintln!("MODELS_DOWNLOAD_PARTS RESULT=REFUSED reason=invalid-network-limits");
             return ErrorCode::Usage.as_process_exit();
         }
+        let Some(mut control) = ModelsPullControl::new(command.timeout_seconds) else {
+            eprintln!("MODELS_DOWNLOAD_PARTS RESULT=REFUSED reason=invalid-invocation-deadline");
+            return ErrorCode::Usage.as_process_exit();
+        };
         let engine = match NlpEngine::builder().resource_config(ResourceHostConfig {
             runtime_preset: RuntimePreset::CurrentThread,
             runtime_workers: 1,
@@ -733,8 +794,13 @@ fn run_models_download_parts(command: ModelsDownloadPartsCommand) -> ExitCode {
             },
             transfer,
             NetworkPullHostOptions { network_reserve_bytes },
+            &mut control,
         ) {
             Ok(report) => {
+                if control.checkpoint(0).is_some() {
+                    eprintln!("MODELS_DOWNLOAD_PARTS RESULT=FAIL reason=invocation-deadline");
+                    return ErrorCode::BudgetOrTimeout.as_process_exit();
+                }
                 eprintln!(
                     "MODELS_DOWNLOAD_PARTS RESULT=PASS parts={} complete_bytes={} reused_bytes={} downloaded_bytes={} manifest_sha256={} activation_authority=false parts_dir={}",
                     report.parts.len(),
@@ -3052,6 +3118,7 @@ mod tests {
         assert_eq!(command.network_reserve_mib, 16);
         assert_eq!(command.max_download_bytes, Some(1_048_576));
         assert_eq!(command.max_copy_bytes, Some(1_048_576));
+        assert_eq!(command.timeout_seconds, 3600);
         assert!(!command.no_resume);
         assert!(!command.direct);
         assert_eq!(command.parts_dir, Some(PathBuf::from("/release/parts")));
@@ -3096,6 +3163,65 @@ mod tests {
             args.extend(conflict);
             assert!(Cli::try_parse_from(args).is_err(), "direct mode cannot silently ignore {conflict:?}");
         }
+    }
+
+    #[test]
+    fn models_network_commands_expose_distinct_invocation_and_attempt_deadlines() {
+        for mode in ["parts", "direct", "download"] {
+            let mut args = vec!["fnlp", "models",
+                if mode == "download" { "download-parts" } else { "acquire" },
+                "--manifest", "/release/manifest.json", "--manifest-sha256",
+                "abababababababababababababababababababababababababababababababab",
+                "--memory-mib", "256", "--request-timeout-seconds", "3",
+                "--timeout-seconds", "37"];
+            if mode != "download" {
+                args.extend(["--staging-output", "/models/model.stage", "--output", "/models/model.fnlpq"]);
+            }
+            if mode == "direct" { args.push("--direct"); }
+            else { args.extend(["--parts-dir", "/release/parts"]); }
+            let parsed = Cli::try_parse_from(&args).expect("both independent deadline bounds parse");
+            let (attempt, invocation) = match parsed.command {
+                Some(Command::Models { command: ModelsSubcommand::Acquire(command) }) =>
+                    (command.request_timeout_seconds, command.timeout_seconds),
+                Some(Command::Models { command: ModelsSubcommand::DownloadParts(command) }) =>
+                    (command.request_timeout_seconds, command.timeout_seconds),
+                _ => panic!("wrong network route"),
+            };
+            assert_eq!((attempt, invocation), (3, 37));
+            let timeout = args.iter().position(|arg| *arg == "--timeout-seconds").unwrap() + 1;
+            args[timeout] = "0";
+            assert!(Cli::try_parse_from(&args).is_err(), "unbounded invocation cannot be requested");
+        }
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn models_invocation_deadline_stays_terminal_through_local_cache_and_reconstruction() {
+        use crate::artifact::pull::{LocalReconstructPhase, verify_local_release_cache};
+        let mut control = ModelsPullControl::new(37).expect("finite invocation deadline");
+        assert!(ModelsPullControl::new(0).is_none());
+        assert!(ModelsPullControl::new(u64::MAX).is_none());
+        let deadline = control.deadline;
+        assert_eq!(control.checkpoint_at(deadline - std::time::Duration::from_secs(1)), None);
+        assert_eq!(control.checkpoint_at(deadline), Some(DecodeCancellationKind::Deadline));
+        // Once the enclosing run stops, a later stage cannot gain a new budget,
+        // even if a caller presents an earlier observation time.
+        assert_eq!(control.checkpoint_at(deadline - std::time::Duration::from_secs(10)),
+            Some(DecodeCancellationKind::Deadline));
+        let manifest = Path::new("must-not-open-after-invocation-deadline.json");
+        let output = Path::new("must-not-open-after-invocation-deadline.fnlpq");
+        let digest = "ab".repeat(32);
+        let cache = verify_local_release_cache(manifest, &digest, output, |_| control.checkpoint(0));
+        assert!(matches!(cache, Err(PullError::Cancelled { cause: DecodeCancellationKind::Deadline,
+            progress }) if progress.phase == LocalReconstructPhase::VerifyArtifact));
+        let reconstruction = reconstruct_local_release_with_options(&LocalReconstructRequest {
+            manifest: manifest.to_owned(), expected_release_manifest_sha256: digest,
+            parts_dir: PathBuf::from("must-not-open-after-invocation-deadline-parts"),
+            staging_output: PathBuf::from("must-not-create-after-invocation-deadline.stage"),
+            output: output.to_owned(),
+        }, &LocalReconstructOptions::default(), |_| control.checkpoint(0));
+        assert!(matches!(reconstruction, Err(PullError::Cancelled {
+            cause: DecodeCancellationKind::Deadline, .. })));
     }
 
     #[test]

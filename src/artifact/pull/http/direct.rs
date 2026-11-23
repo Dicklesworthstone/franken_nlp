@@ -26,7 +26,8 @@ use asupersync::{CancelKind, cx::Cx, http::HttpClient};
 use sha2::{Digest, Sha256};
 
 use super::{
-    COPY_BUFFER_BYTES, MAX_RANGE_BYTES, NetworkPartsOptions, NetworkPullError, ResumeMirrorPasses, USER_AGENT,
+    COPY_BUFFER_BYTES, MAX_RANGE_BYTES, NetworkPartsOptions, NetworkPullError, PullCheckpoints,
+    ResumeMirrorPasses, USER_AGENT,
     checkpoint, drive_attempt, exhausted_mirrors, fetch_range, hex_lower,
     next_range_end, quarantine_resumed_prefix, restore_window_prefix, staging_error, validate_options,
 };
@@ -37,7 +38,7 @@ use super::super::{
 };
 use crate::{
     artifact::manifest::{ReleaseManifest, ReleasePart},
-    native_engine::decode::DecodeCancellationKind,
+    native_engine::decode::{DecodeCancellationKind, DecodeStepControl},
 };
 
 #[derive(Clone, Debug)]
@@ -85,18 +86,24 @@ pub struct NetworkArtifactReport {
 /// ledger reservations. Synchronous filesystem operations are cooperative.
 /// Cancellation after publication can leave a verified final pathname without
 /// a success receipt; retry authenticates that pathname as a cache hit.
+/// `control` is the caller's original invocation control, including time spent
+/// before runtime entry. It covers cache rehash, every range/mirror, final
+/// container verification and publication without renewing any allowance.
 pub async fn acquire_release_artifact(
     cx: &Cx,
     request: &NetworkArtifactRequest,
     options: NetworkPartsOptions,
+    control: &mut impl DecodeStepControl,
 ) -> Result<NetworkArtifactReport, NetworkPullError> {
+    let checkpoints = PullCheckpoints::new(cx, control);
+    let cx = &checkpoints;
     validate_options(options)?;
     checkpoint(cx, None)?;
     validate_request(request)?;
     let cached = verify_local_release_cache(
         &request.manifest, &request.expected_release_manifest_sha256,
         &request.output, |_| local_cancellation(cx),
-    ).map_err(|error| local_error(cx, error))?;
+    ).map_err(local_error)?;
     if let Some(cached) = cached {
         checkpoint(cx, None)?;
         return Ok(NetworkArtifactReport {
@@ -256,7 +263,7 @@ pub async fn acquire_release_artifact(
     verify_and_publish_staged_artifact(
         &mut staging, &manifest, &request.staging_output, &request.output,
         &mut buffer, &mut progress, &mut |_| local_cancellation(cx),
-    ).map_err(|error| local_error(cx, error))?;
+    ).map_err(local_error)?;
     checkpoint(cx, None)?;
     Ok(NetworkArtifactReport {
         release_manifest_sha256: request.expected_release_manifest_sha256.clone(),
@@ -395,9 +402,9 @@ fn finish_artifact_attempt(
     checked
 }
 
-fn local_cancellation(cx: &Cx) -> Option<DecodeCancellationKind> {
-    if cx.checkpoint().is_ok() { return None; }
-    Some(match cx.cancel_reason().map(|reason| reason.kind) {
+fn local_cancellation(cx: &PullCheckpoints<'_>) -> Option<DecodeCancellationKind> {
+    if checkpoint(cx, None).is_ok() { return None; }
+    Some(match cx.cause.get() {
         Some(CancelKind::User) => DecodeCancellationKind::User,
         Some(CancelKind::Timeout) => DecodeCancellationKind::Timeout,
         Some(CancelKind::Deadline) => DecodeCancellationKind::Deadline,
@@ -412,11 +419,9 @@ fn local_cancellation(cx: &Cx) -> Option<DecodeCancellationKind> {
     })
 }
 
-fn local_error(cx: &Cx, error: PullError) -> NetworkPullError {
+fn local_error(error: PullError) -> NetworkPullError {
     match error {
-        PullError::Cancelled { progress, .. } => NetworkPullError::Cancelled {
-            cause: cx.cancel_reason().map(|reason| reason.kind), part: progress.part_index,
-        },
+        PullError::Cancelled { cause, progress } => NetworkPullError::cancelled(cause, progress.part_index),
         error => NetworkPullError::Manifest(error),
     }
 }

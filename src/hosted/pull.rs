@@ -18,6 +18,7 @@ use crate::{
         direct::{NetworkArtifactReport, NetworkArtifactRequest, acquire_release_artifact},
     },
     artifact::pull::LOCAL_RELEASE_WORKSPACE_RESERVE_BYTES,
+    native_engine::decode::DecodeStepControl,
 };
 
 const MIN_NETWORK_RESERVE_BYTES: u64 = 2 * 1024 * 1024;
@@ -70,28 +71,35 @@ impl NlpEngine {
     /// Both local verification and transport bookkeeping are admitted before
     /// any manifest, artifact or network IO, including a final cache hit. The
     /// reservations and structured runtime remain owned until all verification
-    /// and publication work completes. This does not activate a model root.
+    /// and publication work completes. The caller retains one control from
+    /// before admission through any later reconstruction/publication phase;
+    /// this method never renews its deadline or work allowance. This does not
+    /// activate a model root.
     pub fn acquire_release_artifact_candidate(
         &self,
         request: NetworkArtifactRequest,
         transfer: NetworkPartsOptions,
         host: NetworkPullHostOptions,
+        control: &mut impl DecodeStepControl,
     ) -> Result<NetworkArtifactReport, HostedNetworkPullError> {
         if host.network_reserve_bytes < MIN_NETWORK_RESERVE_BYTES {
             return Err(HostedError::Limits("release acquisition network reserve").into());
         }
+        caller_checkpoint(control)?;
         let _sync_call = self.enter_sync_call().map_err(|_| HostedError::Reentrant)?;
         let lease = self.resources().acquire_lease();
         let local = Pending::reserve(&lease, MemoryClass::Staging,
             LOCAL_RELEASE_WORKSPACE_RESERVE_BYTES)?.commit()?;
         let network = Pending::reserve(&lease, MemoryClass::Staging, host.network_reserve_bytes)?
             .commit()?;
-        let result = self.resources().runtime().block_on(async move {
+        caller_checkpoint(control)?;
+        let result = self.resources().runtime().block_on(async {
             let cx = Cx::current().ok_or(HostedError::MissingRuntimeContext)?;
-            acquire_release_artifact(&cx, &request, transfer)
+            acquire_release_artifact(&cx, &request, transfer, control)
                 .await
                 .map_err(HostedNetworkPullError::Transfer)
         });
+        if result.is_ok() { caller_checkpoint(control)?; }
         drop(network);
         drop(local);
         drop(lease);
@@ -102,30 +110,42 @@ impl NlpEngine {
     ///
     /// The returned report has no activation authority. The runtime context,
     /// staging-memory obligation and request inputs remain owned until the
-    /// network future has physically completed or returned an error.
+    /// network future has physically completed or returned an error. The same
+    /// caller control spans cached-part verification and every mirror/window.
     pub fn download_release_parts_candidate(
         &self,
         request: NetworkPartsRequest,
         transfer: NetworkPartsOptions,
         host: NetworkPullHostOptions,
+        control: &mut impl DecodeStepControl,
     ) -> Result<NetworkPartsReport, HostedNetworkPullError> {
         if host.network_reserve_bytes < MIN_NETWORK_RESERVE_BYTES {
             return Err(HostedError::Limits("release acquisition network reserve").into());
         }
+        caller_checkpoint(control)?;
         let _sync_call = self.enter_sync_call().map_err(|_| HostedError::Reentrant)?;
         let lease = self.resources().acquire_lease();
         let network = Pending::reserve(&lease, MemoryClass::Staging, host.network_reserve_bytes)?
             .commit()?;
-        let result = self.resources().runtime().block_on(async move {
+        caller_checkpoint(control)?;
+        let result = self.resources().runtime().block_on(async {
             let cx = Cx::current().ok_or(HostedError::MissingRuntimeContext)?;
-            download_release_parts(&cx, &request, transfer)
+            download_release_parts(&cx, &request, transfer, control)
                 .await
                 .map_err(HostedNetworkPullError::Transfer)
         });
+        if result.is_ok() { caller_checkpoint(control)?; }
         drop(network);
         drop(lease);
         result
     }
+}
+
+fn caller_checkpoint(control: &mut impl DecodeStepControl) -> Result<(), HostedNetworkPullError> {
+    if let Some(cause) = control.checkpoint(0) {
+        return Err(NetworkPullError::cancelled(cause, None).into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

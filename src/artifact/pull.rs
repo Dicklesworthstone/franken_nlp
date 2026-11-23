@@ -99,6 +99,7 @@ pub struct LocalReconstructProgress {
     /// Bytes appended during this invocation, excluding the retained prefix.
     pub copied_bytes: u64,
     /// Manifest-declared complete artifact length, not a completion claim.
+    /// Zero at the initial checkpoint before the manifest has been read.
     pub artifact_bytes: u64,
 }
 
@@ -379,7 +380,7 @@ pub fn reconstruct_local_release(
 /// mismatch refuses the operation without truncation or repair. Source parts
 /// remain required when resuming an already complete staging file.
 ///
-/// Checkpoints occur before staging/part work and between bounded reads/writes,
+/// Checkpoints occur before manifest/staging/part work and between bounded reads/writes,
 /// including prefix, whole-file and container verification. A synchronous
 /// filesystem call cannot be preempted. Cancellation and copy-budget failure
 /// preserve staging and return no successful report; only final publication
@@ -390,9 +391,6 @@ pub fn reconstruct_local_release_with_options(
     options: &LocalReconstructOptions,
     mut checkpoint: impl FnMut(LocalReconstructProgress) -> Option<DecodeCancellationKind>,
 ) -> Result<LocalReconstructReport, PullError> {
-    validate_request_paths(request)?;
-    let manifest = read_pinned_manifest(&request.manifest, &request.expected_release_manifest_sha256)?;
-
     let mut progress = LocalReconstructProgress {
         phase: if options.resume {
             LocalReconstructPhase::VerifyPrefix
@@ -402,8 +400,14 @@ pub fn reconstruct_local_release_with_options(
         part_index: None,
         verified_prefix_bytes: 0,
         copied_bytes: 0,
-        artifact_bytes: manifest.artifact.bytes,
+        // No manifest IO is authorized until the original caller control has
+        // accepted this phase. The complete size is unknown at that boundary.
+        artifact_bytes: 0,
     };
+    reconstruction_checkpoint(progress, &mut checkpoint)?;
+    validate_request_paths(request)?;
+    let manifest = read_pinned_manifest(&request.manifest, &request.expected_release_manifest_sha256)?;
+    progress.artifact_bytes = manifest.artifact.bytes;
     reconstruction_checkpoint(progress, &mut checkpoint)?;
     let mut staging = open_staging(&request.staging_output, options.resume)?;
     let resumed_bytes = staging.metadata().map_err(|error| PullError::Publish {
@@ -500,7 +504,10 @@ fn verify_and_publish_staged_artifact(
         operation: "create final no-replace hard link",
         detail: error.to_string(),
     })?;
-    check_staging_path(staging, output, manifest.artifact.bytes)
+    check_staging_path(staging, output, manifest.artifact.bytes)?;
+    // Publication may already be visible when the enclosing invocation stops.
+    // Keep the verified file, but never turn that late stop into success.
+    reconstruction_checkpoint(*progress, checkpoint)
 }
 
 fn reconstruction_checkpoint(

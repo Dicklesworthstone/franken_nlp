@@ -19,6 +19,7 @@
 pub mod direct;
 
 use std::{
+    cell::{Cell, RefCell},
     error::Error,
     fmt,
     fs::{self, File, OpenOptions},
@@ -45,6 +46,7 @@ use crate::artifact::{
         release_manifest_sha256,
     },
 };
+use crate::native_engine::decode::{DecodeCancellationKind, DecodeStepControl};
 
 const USER_AGENT: &str = "franken_nlp-agent (+https://github.com/Dicklesworthstone/franken_nlp)";
 const STAGING_SUFFIX: &str = ".partial";
@@ -196,17 +198,61 @@ impl From<PullError> for NetworkPullError {
     fn from(error: PullError) -> Self { Self::Manifest(error) }
 }
 
+impl NetworkPullError {
+    pub(crate) fn cancelled(cause: DecodeCancellationKind, part: Option<usize>) -> Self {
+        Self::Cancelled { cause: Some(runtime_cancellation_kind(cause)), part }
+    }
+}
+
+/// Borrow the caller's one invocation control without renewing its deadline,
+/// checkpoint allowance or cancellation token at a range/mirror boundary.
+/// The synchronous hook borrow ends before any future is polled or awaited.
+/// The attempt's timer and transfer can therefore share this adapter without
+/// retaining a mutable borrow across an await. The first observed stop wins.
+struct PullCheckpoints<'a> {
+    runtime: &'a Cx,
+    caller: RefCell<&'a mut dyn DecodeStepControl>,
+    stopped: Cell<bool>,
+    cause: Cell<Option<CancelKind>>,
+}
+
+impl<'a> PullCheckpoints<'a> {
+    fn new(runtime: &'a Cx, caller: &'a mut dyn DecodeStepControl) -> Self {
+        Self { runtime, caller: RefCell::new(caller), stopped: Cell::new(false), cause: Cell::new(None) }
+    }
+}
+
+fn runtime_cancellation_kind(cause: DecodeCancellationKind) -> CancelKind {
+    match cause {
+        DecodeCancellationKind::User => CancelKind::User,
+        DecodeCancellationKind::Timeout => CancelKind::Timeout,
+        DecodeCancellationKind::Deadline => CancelKind::Deadline,
+        DecodeCancellationKind::PollQuota => CancelKind::PollQuota,
+        DecodeCancellationKind::CostBudget => CancelKind::CostBudget,
+        DecodeCancellationKind::FailFast => CancelKind::FailFast,
+        DecodeCancellationKind::RaceLost => CancelKind::RaceLost,
+        DecodeCancellationKind::ParentCancelled => CancelKind::ParentCancelled,
+        DecodeCancellationKind::ResourceUnavailable => CancelKind::ResourceUnavailable,
+        DecodeCancellationKind::Shutdown => CancelKind::Shutdown,
+        DecodeCancellationKind::LinkedExit => CancelKind::LinkedExit,
+    }
+}
+
 /// Acquire every immutable part named by an independently pinned manifest.
 ///
 /// Success means every final part is a regular file whose exact complete
 /// SHA-256 matches the manifest. It does not reconstruct, pack or activate the
 /// model. Callers may feed the resulting directory to the existing local
-/// reconstruction path.
+/// reconstruction path. `control` must retain the same enclosing invocation
+/// deadline, work allowance and cancellation source across those phases.
 pub async fn download_release_parts(
     cx: &Cx,
     request: &NetworkPartsRequest,
     options: NetworkPartsOptions,
+    control: &mut impl DecodeStepControl,
 ) -> Result<NetworkPartsReport, NetworkPullError> {
+    let checkpoints = PullCheckpoints::new(cx, control);
+    let cx = &checkpoints;
     validate_options(options)?;
     checkpoint(cx, None)?;
     if !validate_sha256_text(&request.expected_release_manifest_sha256).is_some() {
@@ -412,15 +458,15 @@ pub async fn download_release_parts(
 /// 100 ms, subject to runtime scheduling and cooperative synchronous work.
 /// The timer does not cancel/recreate the transfer or renew its deadline.
 async fn drive_attempt<T>(
-    cx: &Cx,
+    cx: &PullCheckpoints<'_>,
     part: usize,
     mirror: usize,
     timeout: Duration,
     future: impl Future<Output = Result<T, NetworkPullError>>,
 ) -> Result<T, NetworkPullError> {
     checkpoint(cx, Some(part))?;
-    let parent_deadline = cx.budget().deadline;
-    let deadline = cx.budget_for_timeout(timeout).deadline
+    let parent_deadline = cx.runtime.budget().deadline;
+    let deadline = cx.runtime.budget_for_timeout(timeout).deadline
         .ok_or(NetworkPullError::InvalidOptions("mirror attempt requires a deadline"))?;
     let parent_limited = parent_deadline.is_some_and(|parent| parent <= deadline);
     let expired = || if parent_limited {
@@ -428,12 +474,12 @@ async fn drive_attempt<T>(
     } else {
         NetworkPullError::RequestTimeout { part, mirror }
     };
-    if deadline <= cx.now() { return Err(expired()); }
+    if deadline <= cx.runtime.now() { return Err(expired()); }
     let result = {
         let mut attempt = std::pin::pin!(future);
         let mut cancellation = std::pin::pin!(async {
             loop {
-                asupersync::time::sleep(cx.now(), CANCELLATION_CHECK_INTERVAL).await;
+                asupersync::time::sleep(cx.runtime.now(), CANCELLATION_CHECK_INTERVAL).await;
                 if let Err(error) = checkpoint(cx, Some(part)) { break error; }
             }
         });
@@ -450,7 +496,7 @@ async fn drive_attempt<T>(
     // Synchronous file work is cooperative; detect a late ready result too.
     checkpoint(cx, Some(part))?;
     match result {
-        Ok(result) if cx.now() <= deadline => result,
+        Ok(result) if cx.runtime.now() <= deadline => result,
         _ => Err(expired()),
     }
 }
@@ -660,7 +706,7 @@ fn charge_body_bytes(downloaded: &mut u64, bytes: usize) -> Result<(), NetworkPu
 }
 
 async fn fetch_range(
-    cx: &Cx,
+    cx: &PullCheckpoints<'_>,
     client: &HttpClient,
     part: usize,
     mirror: usize,
@@ -680,7 +726,7 @@ async fn fetch_range(
         checkpoint(cx, Some(part))?;
         let response = redirect_policy.with_authorized_target(&url, |target| {
             client.request_streaming(
-                cx,
+                cx.runtime,
                 Method::Get,
                 target,
                 vec![
@@ -909,7 +955,7 @@ fn open_partial(part: usize, path: &Path, resume: bool) -> Result<File, NetworkP
     }
 }
 
-fn hash_prefix(part: usize, file: &mut File, length: u64, cx: &Cx) -> Result<Sha256, NetworkPullError> {
+fn hash_prefix(part: usize, file: &mut File, length: u64, cx: &PullCheckpoints<'_>) -> Result<Sha256, NetworkPullError> {
     file.seek(SeekFrom::Start(0)).map_err(|error| staging_error(part, "seek-prefix", error))?;
     let mut remaining = length;
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
@@ -963,11 +1009,20 @@ fn staging_error(part: usize, operation: &'static str, error: std::io::Error) ->
     NetworkPullError::Staging { part, operation, detail: error.to_string() }
 }
 
-fn checkpoint(cx: &Cx, part: Option<usize>) -> Result<(), NetworkPullError> {
-    if cx.checkpoint().is_err() {
-        return Err(NetworkPullError::Cancelled {
-            cause: cx.cancel_reason().map(|reason| reason.kind), part,
-        });
+fn checkpoint(cx: &PullCheckpoints<'_>, part: Option<usize>) -> Result<(), NetworkPullError> {
+    if cx.stopped.get() {
+        return Err(NetworkPullError::Cancelled { cause: cx.cause.get(), part });
+    }
+    let caller_stop = { cx.caller.borrow_mut().checkpoint(0) };
+    if let Some(cause) = caller_stop {
+        cx.cause.set(Some(runtime_cancellation_kind(cause)));
+        cx.stopped.set(true);
+    } else if cx.runtime.checkpoint().is_err() {
+        cx.cause.set(cx.runtime.cancel_reason().map(|reason| reason.kind));
+        cx.stopped.set(true);
+    }
+    if cx.stopped.get() {
+        return Err(NetworkPullError::Cancelled { cause: cx.cause.get(), part });
     }
     Ok(())
 }
@@ -989,6 +1044,25 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_ATTEMPT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) struct NeverStopped;
+    impl DecodeStepControl for NeverStopped {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
+    }
+
+    struct TokenControl(crate::hosted::CancellationToken);
+    impl DecodeStepControl for TokenControl {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { self.0.cause() }
+    }
+
+    const CALLER_CAUSES: [DecodeCancellationKind; 11] = [
+        DecodeCancellationKind::User, DecodeCancellationKind::Timeout,
+        DecodeCancellationKind::Deadline, DecodeCancellationKind::PollQuota,
+        DecodeCancellationKind::CostBudget, DecodeCancellationKind::FailFast,
+        DecodeCancellationKind::RaceLost, DecodeCancellationKind::ParentCancelled,
+        DecodeCancellationKind::ResourceUnavailable, DecodeCancellationKind::Shutdown,
+        DecodeCancellationKind::LinkedExit,
+    ];
 
     struct AttemptDrop<'a>(&'a Cell<bool>);
     impl Drop for AttemptDrop<'_> {
@@ -1040,7 +1114,9 @@ mod tests {
         let guard = DropSignal(&dropped);
         let result = runtime.block_on(async {
             let cx = Cx::current().unwrap();
-            drive_attempt(&cx, 0, 0, Duration::from_millis(100), async move {
+            let mut caller = NeverStopped;
+            let checks = PullCheckpoints::new(&cx, &mut caller);
+            drive_attempt(&checks, 0, 0, Duration::from_millis(100), async move {
                 let _guard = guard;
                 std::future::pending::<Result<u64, NetworkPullError>>().await
             }).await
@@ -1068,7 +1144,9 @@ mod tests {
                 assert_eq!(cx.now(), asupersync::types::Time::from_secs(17));
                 let dropped = Cell::new(false);
                 let mut task = Context::from_waker(Waker::noop());
-                let mut attempt = std::pin::pin!(drive_attempt(&cx, 2, 1, Duration::from_secs(60), async {
+                let mut caller = NeverStopped;
+                let checks = PullCheckpoints::new(&cx, &mut caller);
+                let mut attempt = std::pin::pin!(drive_attempt(&checks, 2, 1, Duration::from_secs(60), async {
                     let _guard = AttemptDrop(&dropped);
                     std::future::pending::<Result<u64, NetworkPullError>>().await
                 }));
@@ -1099,7 +1177,9 @@ mod tests {
             let cx = Cx::current().unwrap();
             assert_eq!(cx.now(), asupersync::types::Time::from_secs(17));
             let mut task = Context::from_waker(Waker::noop());
-            let mut attempt = std::pin::pin!(drive_attempt(&cx, 0, 0, Duration::from_secs(60), async {
+            let mut caller = NeverStopped;
+            let checks = PullCheckpoints::new(&cx, &mut caller);
+            let mut attempt = std::pin::pin!(drive_attempt(&checks, 0, 0, Duration::from_secs(60), async {
                 let _guard = AttemptDrop(&dropped);
                 file.write_all(b"cd").unwrap(); hasher.update(b"cd");
                 charge_body_bytes(&mut downloaded, 2).unwrap();
@@ -1123,6 +1203,124 @@ mod tests {
     }
 
     #[test]
+    fn caller_cancellation_stops_silent_attempts_and_rolls_back_every_cause() {
+        for cause in CALLER_CAUSES {
+            let (runtime, clock) = virtual_attempt_runtime();
+            let (mut file, part, mut hasher) = attempt_fixture(b"ab", b"abcdef");
+            let mut downloaded = 0;
+            let dropped = Cell::new(false);
+            let token = crate::hosted::CancellationToken::default();
+            let mut caller = TokenControl(token.clone());
+            let result = runtime.block_on(async {
+                let cx = Cx::current().unwrap();
+                let checks = PullCheckpoints::new(&cx, &mut caller);
+                let mut task = Context::from_waker(Waker::noop());
+                let mut attempt = std::pin::pin!(drive_attempt(&checks, 0, 0, Duration::from_secs(60), async {
+                    let _guard = AttemptDrop(&dropped);
+                    file.write_all(b"cd").unwrap(); hasher.update(b"cd");
+                    charge_body_bytes(&mut downloaded, 2).unwrap();
+                    std::future::pending::<Result<u64, NetworkPullError>>().await
+                }));
+                assert!(attempt.as_mut().poll(&mut task).is_pending());
+                token.cancel(cause);
+                clock.advance(100_000_000);
+                let Poll::Ready(result) = attempt.as_mut().poll(&mut task) else {
+                    panic!("caller cancellation must interrupt a pending body at the next timer poll");
+                };
+                assert!(!cx.is_cancel_requested(), "a caller token must not cancel unrelated runtime work");
+                result
+            });
+            assert!(dropped.get(), "release transfer borrow before rollback");
+            assert!(matches!(finish_attempt(0, 0, &part, 2, 5, &mut file, &hasher, result),
+                Err(NetworkPullError::Cancelled { cause: Some(observed), part: Some(0) })
+                if observed == runtime_cancellation_kind(cause)));
+            assert_eq!(file.metadata().unwrap().len(), 2);
+            assert_eq!(file.stream_position().unwrap(), 2);
+            assert_eq!(downloaded, 2, "cancelled traffic remains spent");
+        }
+    }
+
+    #[test]
+    fn caller_deadline_is_shared_across_windows_and_mirrors_and_does_not_renew() {
+        struct Deadline<'a>(&'a Cx);
+        impl DecodeStepControl for Deadline<'_> {
+            fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+                (self.0.now() >= asupersync::types::Time::from_secs(18))
+                    .then_some(DecodeCancellationKind::Deadline)
+            }
+        }
+        let (runtime, clock) = virtual_attempt_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut caller = Deadline(&cx);
+            let checks = PullCheckpoints::new(&cx, &mut caller);
+            assert_eq!(drive_attempt(&checks, 0, 0, Duration::from_secs(60), async {
+                clock.advance(400_000_000); Ok(4_u64)
+            }).await.unwrap(), 4);
+            assert!(matches!(drive_attempt(&checks, 0, 0, Duration::from_secs(60), async {
+                clock.advance(400_000_000);
+                Err::<u64, _>(NetworkPullError::Response { part: 0, mirror: 0, detail: "retryable fixture" })
+            }).await, Err(NetworkPullError::Response { .. })));
+
+            let dropped = Cell::new(false);
+            let mut task = Context::from_waker(Waker::noop());
+            let mut retry = std::pin::pin!(drive_attempt(&checks, 0, 1, Duration::from_secs(60), async {
+                let _guard = AttemptDrop(&dropped);
+                std::future::pending::<Result<u64, NetworkPullError>>().await
+            }));
+            assert!(retry.as_mut().poll(&mut task).is_pending());
+            clock.advance(200_000_000);
+            assert!(matches!(retry.as_mut().poll(&mut task), Poll::Ready(Err(
+                NetworkPullError::Cancelled { cause: Some(CancelKind::Deadline), part: Some(0) }
+            ))));
+            assert!(dropped.get());
+            assert!(matches!(drive_attempt(&checks, 1, 0, Duration::from_secs(60), async {
+                panic!("a later part must not restart expired work");
+                #[allow(unreachable_code)] Ok::<u64, NetworkPullError>(0)
+            }).await, Err(NetworkPullError::Cancelled { cause: Some(CancelKind::Deadline), part: Some(1) })));
+        });
+    }
+
+    #[test]
+    fn caller_stop_latches_even_if_a_custom_control_later_clears_it() {
+        struct OneStop(Option<DecodeCancellationKind>);
+        impl DecodeStepControl for OneStop {
+            fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { self.0.take() }
+        }
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut caller = OneStop(Some(DecodeCancellationKind::CostBudget));
+            let checks = PullCheckpoints::new(&cx, &mut caller);
+            for part in [None, Some(0), Some(1)] {
+                assert!(matches!(checkpoint(&checks, part), Err(NetworkPullError::Cancelled {
+                    cause: Some(CancelKind::CostBudget), part: observed,
+                }) if observed == part));
+            }
+            assert!(!cx.is_cancel_requested());
+        });
+    }
+
+    #[test]
+    fn public_parts_acquisition_checks_every_caller_cause_before_manifest_io() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let request = NetworkPartsRequest { manifest: PathBuf::new(),
+            expected_release_manifest_sha256: String::new(), parts_dir: PathBuf::new() };
+        for cause in CALLER_CAUSES {
+            let token = crate::hosted::CancellationToken::default();
+            token.cancel(cause);
+            let mut caller = TokenControl(token);
+            runtime.block_on(async {
+                let cx = Cx::current().unwrap();
+                assert!(matches!(download_release_parts(&cx, &request, NetworkPartsOptions::default(),
+                    &mut caller).await, Err(NetworkPullError::Cancelled { cause: Some(observed), part: None })
+                    if observed == runtime_cancellation_kind(cause)));
+                assert!(!cx.is_cancel_requested());
+            });
+        }
+    }
+
+    #[test]
     fn cancellation_ticks_keep_one_transfer_and_never_renew_the_attempt_deadline() {
         let (runtime, clock) = virtual_attempt_runtime();
         runtime.block_on(async {
@@ -1132,7 +1330,9 @@ mod tests {
             let polls = Cell::new(0);
             let dropped = Cell::new(false);
             let mut task = Context::from_waker(Waker::noop());
-            let mut attempt = std::pin::pin!(drive_attempt(&cx, 0, 0, Duration::from_millis(250), async {
+            let mut caller = NeverStopped;
+            let checks = PullCheckpoints::new(&cx, &mut caller);
+            let mut attempt = std::pin::pin!(drive_attempt(&checks, 0, 0, Duration::from_millis(250), async {
                 starts.set(starts.get() + 1);
                 let _guard = AttemptDrop(&dropped);
                 poll_fn(|_| {
@@ -1160,8 +1360,10 @@ mod tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
             let cx = Cx::current().unwrap();
-            assert_eq!(drive_attempt(&cx, 2, 3, Duration::from_secs(60), async { Ok(17_u64) }).await.unwrap(), 17);
-            let result = drive_attempt(&cx, 2, 3, Duration::from_secs(60), async {
+            let mut caller = NeverStopped;
+            let checks = PullCheckpoints::new(&cx, &mut caller);
+            assert_eq!(drive_attempt(&checks, 2, 3, Duration::from_secs(60), async { Ok(17_u64) }).await.unwrap(), 17);
+            let result = drive_attempt(&checks, 2, 3, Duration::from_secs(60), async {
                 Err::<u64, _>(NetworkPullError::Response { part: 2, mirror: 3, detail: "invalid range" })
             }).await;
             assert!(matches!(result, Err(NetworkPullError::Response { part: 2, mirror: 3, .. })));
@@ -1173,7 +1375,9 @@ mod tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
             let cx = Cx::current().unwrap();
-            let result = drive_attempt(&cx, 1, 2, Duration::ZERO, async {
+            let mut caller = NeverStopped;
+            let checks = PullCheckpoints::new(&cx, &mut caller);
+            let result = drive_attempt(&checks, 1, 2, Duration::ZERO, async {
                 panic!("expired work must never be polled");
                 #[allow(unreachable_code)] Ok::<u64, NetworkPullError>(0)
             }).await;
@@ -1190,7 +1394,9 @@ mod tests {
             CancelKind::Shutdown, CancelKind::LinkedExit] {
             runtime.block_on(async {
                 let cx = Cx::current().unwrap();
-                let result = drive_attempt(&cx, 2, 1, Duration::from_secs(60), async {
+                let mut caller = NeverStopped;
+                let checks = PullCheckpoints::new(&cx, &mut caller);
+                let result = drive_attempt(&checks, 2, 1, Duration::from_secs(60), async {
                     cx.cancel_with(cause, None);
                     Ok(4_u64)
                 }).await;
@@ -1352,10 +1558,12 @@ mod tests {
         runtime.block_on(async {
             let cx = Cx::current().unwrap();
             assert_eq!(cx.now(), asupersync::types::Time::from_secs(17));
+            let mut caller = NeverStopped;
+            let checks = PullCheckpoints::new(&cx, &mut caller);
             for (index, bytes) in [b"cd", b"ef", b"gh"].into_iter().enumerate() {
                 let start = 2 + index as u64 * 2;
                 let mut hasher = prefix.clone();
-                let result = drive_attempt(&cx, 0, 0, Duration::from_secs(1), async {
+                let result = drive_attempt(&checks, 0, 0, Duration::from_secs(1), async {
                     // Each bounded response is healthy, even though the complete
                     // transfer lasts longer than the per-request timeout.
                     clock.advance(750_000_000);

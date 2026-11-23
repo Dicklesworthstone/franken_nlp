@@ -454,6 +454,32 @@ fn existing_final_output_is_never_replaced_even_after_valid_resume() {
 }
 
 #[test]
+fn reconstruction_checks_cancellation_before_manifest_io_or_staging_changes() {
+    let fixture = Fixture::new("reconstruct-pre-io");
+    for resume in [false, true] {
+        let mut request = fixture.request(if resume { "resume" } else { "fresh" });
+        request.manifest = fixture.root.join("manifest-must-not-be-opened.json");
+        let mut checks = 0;
+        let error = reconstruct_local_release_with_options(&request,
+            &LocalReconstructOptions { resume, max_new_bytes: None }, |progress| {
+                checks += 1;
+                assert_eq!(progress.phase, if resume {
+                    LocalReconstructPhase::VerifyPrefix
+                } else { LocalReconstructPhase::Copy });
+                assert_eq!(progress.artifact_bytes, 0, "manifest size is not known before IO");
+                assert_eq!(progress.copied_bytes, 0);
+                assert_eq!(progress.verified_prefix_bytes, 0);
+                Some(DecodeCancellationKind::Deadline)
+            }).expect_err("the original control wins before an absent manifest is opened");
+        assert!(matches!(error, PullError::Cancelled { cause: DecodeCancellationKind::Deadline, .. }));
+        assert_eq!(checks, 1);
+        assert!(!request.manifest.exists());
+        assert!(!request.staging_output.exists());
+        assert!(!request.output.exists());
+    }
+}
+
+#[test]
 fn prefix_cancellation_preserves_cause_and_all_existing_bytes() {
     let fixture = Fixture::new("cancel-prefix");
     let request = fixture.request("resume");
@@ -513,6 +539,27 @@ fn final_verification_and_publish_cancellation_leave_complete_unpublished_stagin
         assert!(!request.output.exists());
         assert_eq!(fs::read(&request.staging_output).unwrap(), fixture.artifact);
     }
+}
+
+#[test]
+fn cancellation_during_local_publication_preserves_verified_file_without_success() {
+    let fixture = Fixture::new("local-publish-stop");
+    let request = fixture.request("final");
+    let error = reconstruct_local_release_with_options(&request,
+        &LocalReconstructOptions::default(), |progress| {
+            (progress.phase == LocalReconstructPhase::Publish && request.output.exists())
+                .then_some(DecodeCancellationKind::LinkedExit)
+        }).expect_err("publication does not erase a terminal invocation stop");
+    assert!(matches!(error, PullError::Cancelled {
+        cause: DecodeCancellationKind::LinkedExit, progress,
+    } if progress.phase == LocalReconstructPhase::Publish
+        && progress.copied_bytes == fixture.artifact.len() as u64));
+    assert_eq!(fs::read(&request.output).unwrap(), fixture.artifact);
+    assert_eq!(fs::read(&request.staging_output).unwrap(), fixture.artifact);
+    let cache = verify_local_release_cache(&request.manifest,
+        &request.expected_release_manifest_sha256, &request.output, |_| None)
+        .unwrap().expect("a retry may authenticate the already verified publication");
+    assert_eq!(cache.artifact_sha256, fixture.manifest.artifact.sha256);
 }
 
 #[test]
@@ -730,10 +777,16 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(feature = "asupersync-runtime")]
 mod direct_acquisition {
     use super::*;
+    use franken_nlp::native_engine::decode::DecodeStepControl;
     use franken_nlp::artifact::pull::http::{
         NetworkPartsOptions, NetworkPullError,
         direct::{NetworkArtifactReport, NetworkArtifactRequest, acquire_release_artifact},
     };
+
+    struct NeverStopped;
+    impl DecodeStepControl for NeverStopped {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
+    }
 
     fn request(fixture: &Fixture, label: &str) -> NetworkArtifactRequest {
         let local = fixture.request(label);
@@ -752,7 +805,7 @@ mod direct_acquisition {
             let cx = asupersync::cx::Cx::current().unwrap();
             acquire_release_artifact(&cx, request, NetworkPartsOptions {
                 resume, max_new_bytes: Some(0), ..NetworkPartsOptions::default()
-            }).await
+            }, &mut NeverStopped).await
         })
     }
 
@@ -793,6 +846,69 @@ mod direct_acquisition {
         assert_eq!(report.downloaded_bytes, 0);
         assert_eq!(report.retained_new_bytes, 0);
         assert!(!request.staging_output.exists());
+    }
+
+    #[test]
+    fn direct_cancellation_after_publication_returns_no_success_and_retry_verifies_cache() {
+        struct StopAfterPublication(PathBuf);
+        impl DecodeStepControl for StopAfterPublication {
+            fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+                self.0.exists().then_some(DecodeCancellationKind::Shutdown)
+            }
+        }
+        let fixture = Fixture::new("direct-late-cancel");
+        let request = request(&fixture, "published");
+        fs::write(&request.staging_output, &fixture.artifact).unwrap();
+        let mut control = StopAfterPublication(request.output.clone());
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let result = runtime.block_on(async {
+            let cx = asupersync::cx::Cx::current().unwrap();
+            let result = acquire_release_artifact(&cx, &request, NetworkPartsOptions {
+                resume: true, max_new_bytes: Some(0), ..NetworkPartsOptions::default()
+            }, &mut control).await;
+            assert!(cx.cancel_reason().is_none(), "the invocation stop is independent of runtime cancellation");
+            result
+        });
+        assert!(matches!(result, Err(NetworkPullError::Cancelled {
+            cause: Some(asupersync::CancelKind::Shutdown), part: None,
+        })));
+        assert_eq!(fs::read(&request.output).unwrap(), fixture.artifact);
+        assert_eq!(fs::read(&request.staging_output).unwrap(), fixture.artifact);
+        let report = acquire(&request, false).unwrap();
+        assert!(report.cache_hit, "a late stop never destroys already verified publication");
+        assert_eq!(report.downloaded_bytes, 0);
+    }
+
+    #[test]
+    fn direct_local_verification_observes_caller_control_and_preserves_stored_bytes() {
+        struct StopAt { checks: usize, stop_at: usize }
+        impl DecodeStepControl for StopAt {
+            fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+                self.checks += 1;
+                (self.checks >= self.stop_at).then_some(DecodeCancellationKind::CostBudget)
+            }
+        }
+        let fixture = Fixture::new("direct-local-control");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        for cached in [false, true] {
+            let mut request = request(&fixture, if cached { "cache" } else { "staging" });
+            if cached { request.output = fixture.root.join(LOGICAL_NAME); }
+            else { fs::write(&request.staging_output, &fixture.artifact).unwrap(); }
+            let mut control = StopAt { checks: 0, stop_at: 8 };
+            let result = runtime.block_on(async {
+                let cx = asupersync::cx::Cx::current().unwrap();
+                acquire_release_artifact(&cx, &request, NetworkPartsOptions {
+                    resume: true, max_new_bytes: Some(0), ..NetworkPartsOptions::default()
+                }, &mut control).await
+            });
+            assert!(matches!(result, Err(NetworkPullError::Cancelled {
+                cause: Some(asupersync::CancelKind::CostBudget), ..
+            })));
+            assert_eq!(control.checks, 8, "a stopped hook is not renewed or repeatedly charged");
+            assert_eq!(request.output.exists(), cached);
+            if cached { assert_eq!(fs::read(&request.output).unwrap(), fixture.artifact); }
+            else { assert_eq!(fs::read(&request.staging_output).unwrap(), fixture.artifact); }
+        }
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::artifact::manifest::{
     ReleaseArtifact, ReleaseCompatibility, ReleaseDigests, ReleaseLifecycle,
     ReleaseSourceClosure,
 };
-use super::super::charge_body_bytes;
+use super::super::{charge_body_bytes, tests::NeverStopped};
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -184,6 +184,36 @@ fn prefix_cancellation_keeps_its_exact_cause_and_retained_bytes() {
     assert_eq!(fs::read(path).unwrap(), b"abcDEFGh");
 }
 
+#[test]
+fn local_checks_preserve_caller_cancellation_without_an_ambient_runtime_reason() {
+    struct Stop(DecodeCancellationKind);
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { Some(self.0) }
+    }
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    for cause in [DecodeCancellationKind::User, DecodeCancellationKind::Timeout,
+        DecodeCancellationKind::Deadline, DecodeCancellationKind::PollQuota,
+        DecodeCancellationKind::CostBudget, DecodeCancellationKind::FailFast,
+        DecodeCancellationKind::RaceLost, DecodeCancellationKind::ParentCancelled,
+        DecodeCancellationKind::ResourceUnavailable, DecodeCancellationKind::Shutdown,
+        DecodeCancellationKind::LinkedExit] {
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut caller = Stop(cause);
+            let checks = PullCheckpoints::new(&cx, &mut caller);
+            assert!(cx.cancel_reason().is_none());
+            assert_eq!(local_cancellation(&checks), Some(cause));
+            let error = local_error(PullError::Cancelled { cause, progress: LocalReconstructProgress {
+                phase: LocalReconstructPhase::VerifyArtifact, part_index: Some(2),
+                verified_prefix_bytes: 7, copied_bytes: 0, artifact_bytes: 12,
+            } });
+            assert!(matches!(error, NetworkPullError::Cancelled { cause: Some(observed), part: Some(2) }
+                if observed == super::super::runtime_cancellation_kind(cause)));
+            assert!(!cx.is_cancel_requested());
+        });
+    }
+}
+
 struct Dropped<'a>(&'a Cell<bool>);
 impl Drop for Dropped<'_> {
     fn drop(&mut self) { self.0.set(true); }
@@ -206,7 +236,9 @@ fn timeout_and_cancellation_drop_the_transfer_then_restore_the_artifact_boundary
         let result = runtime.block_on(async {
             let cx = Cx::current().unwrap();
             let mut task = Context::from_waker(Waker::noop());
-            let mut attempt = std::pin::pin!(drive_attempt(&cx, 1, 0, Duration::from_millis(250), async {
+            let mut caller = NeverStopped;
+            let checks = PullCheckpoints::new(&cx, &mut caller);
+            let mut attempt = std::pin::pin!(drive_attempt(&checks, 1, 0, Duration::from_millis(250), async {
                 let _guard = Dropped(&dropped);
                 file.write_all(b"F").unwrap(); hasher.update(b"F");
                 charge_body_bytes(&mut downloaded, 1).unwrap();
