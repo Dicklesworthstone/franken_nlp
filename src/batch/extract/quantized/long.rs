@@ -6,6 +6,7 @@
 //! fabricated global object; required fields are not replaced with guessed nulls.
 use super::*;
 use std::{cell::RefCell, sync::{Arc, Mutex}};
+use sha2::{Digest, Sha256};
 use crate::{
     tasks::{extract::{ExtractionGrounding, quantized::check_size},
         mapreduce::{self, ChunkPlan, MapReduceError, MapReduceResult, MapReduceTask, MapOutput,
@@ -35,7 +36,7 @@ pub struct Int8ExtractionMapLimits {
     /// chunks. Native schema/source validation retains its own per-pass caps.
     pub verification: GroundingBudget,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Int8ExtractionMapPreflight {
     source_span: VerifiedSourceSpan,
     chunks: usize,
@@ -43,6 +44,18 @@ pub struct Int8ExtractionMapPreflight {
     masks: u64,
     grounding: ExtractionGrounding,
     verification: GroundingBudget,
+    // Process-private association authority; never a public source fingerprint.
+    request_binding: [u8; 32],
+    max_result_bytes: u64,
+}
+impl fmt::Debug for Int8ExtractionMapPreflight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Int8ExtractionMapPreflight")
+            .field("source_span", &self.source_span).field("chunks", &self.chunks)
+            .field("work", &self.work).field("masks", &self.masks)
+            .field("grounding", &self.grounding).field("verification", &self.verification)
+            .field("max_result_bytes", &self.max_result_bytes).finish()
+    }
 }
 impl Int8ExtractionMapPreflight {
     pub fn source_span(&self) -> VerifiedSourceSpan { self.source_span }
@@ -50,8 +63,21 @@ impl Int8ExtractionMapPreflight {
     pub fn planned_work(&self) -> Int8Work { self.work }
     pub fn reserved_mask_visits(&self) -> u64 { self.masks }
     pub fn verify_completed(&self, run: &Int8ExtractionMapRun) -> Result<(), Int8SourceMapError> {
+        self.verify_completed_with_control(run, &mut VerificationOnly)
+    }
+    /// Preserve the caller's cancellation/deadline through the complete result
+    /// binding, including large serialized JSON values and source evidence.
+    pub fn verify_completed_with_control<C: DecodeStepControl>(&self, run: &Int8ExtractionMapRun,
+        control: &mut C) -> Result<(), Int8SourceMapError> {
+        step(control)?;
+        // Geometry and plausible counters alone cannot identify an admitted
+        // source/schema. Public mapped/envelope fields must also remain exact.
+        if run.request_binding != self.request_binding
+            || run.result_binding != result_binding(run, self.max_result_bytes, control)? {
+            return Err(Int8SourceError::InvalidResult.into());
+        }
         let root = run.mapped.root();
-        let (work, masks, fields, spans) = execution::statistics(root.value())?;
+        let (work, masks, fields, spans) = execution::statistics(root.value(), control)?;
         if run.schema_version != 1 || run.execution != INT8_EXTRACTION_MAP_EXECUTION
             || run.numerics_profile != STRICT_INT8_PROFILE || run.semantics != SEMANTICS
             || run.grounding != self.grounding || run.untrusted_fields != ["mapped.root.value"]
@@ -64,6 +90,7 @@ impl Int8ExtractionMapPreflight {
             || run.verification_used.scan_steps > self.verification.max_scan_steps {
             return Err(Int8SourceError::InvalidResult.into());
         }
+        step(control)?;
         Ok(())
     }
 }
@@ -103,6 +130,10 @@ pub struct Int8ExtractionMapRun {
     pub verification_used: ExtractionMapVerification,
     pub untrusted_fields: [&'static str; 1],
     pub mapped: MapReduceResult<ExtractionMapValue>,
+    #[serde(skip)]
+    request_binding: [u8; 32],
+    #[serde(skip)]
+    result_binding: [u8; 32],
 }
 
 /// Source-borrowing, consumed commitment. No wire constructor or external
@@ -229,6 +260,7 @@ impl Int8ExtractionBatchPlanner {
             source_span: VerifiedSourceSpan { byte_start: first.byte_start, byte_end: last.byte_end,
                 scalar_start: first.scalar_start, scalar_end: last.scalar_end }, chunks: chunks.chunks().len(),
             work: Int8Work::default(), masks: 0, verification: v,
+            request_binding: [0; 32], max_result_bytes: m.reduction.max_result_bytes as u64,
             grounding: match args.grounding { ExtractionBatchGrounding::Structural => ExtractionGrounding::NotRequested,
                 ExtractionBatchGrounding::SourceMembership => ExtractionGrounding::SourceMembership } };
         let mut plans = Vec::new();
@@ -253,6 +285,7 @@ impl Int8ExtractionBatchPlanner {
                 .ok_or(Int8SourceMapError::WorkLimit)?;
             plans.push(plan);
         }
+        expected.request_binding = request_binding(source, args, self, limits, &chunks, &plans, control)?;
         step(control)?;
         Ok(PreparedInt8ExtractionMap { chunks, plans, limits, expected })
     }
@@ -275,6 +308,104 @@ impl Int8ExtractionBatchPlanner {
         result.map_err(|error| Int8SourceError::from(error).into())
     }
 }
+
+/// Bind exact request bytes, immutable compilation policy, original ceilings
+/// and the ordered actual child plans. Remaining tokenizer work is deliberately
+/// excluded: recompiling under the same invocation ledger must preserve identity.
+#[allow(clippy::too_many_arguments)]
+fn request_binding<C: DecodeStepControl>(source: &str, args: &ExtractionBatchArgs,
+    planner: &Int8ExtractionBatchPlanner, limits: Int8ExtractionMapLimits,
+    chunks: &ChunkPlan<'_>, plans: &[PreparedInt8BatchExtraction], control: &mut C)
+    -> Result<[u8; 32], Int8SourceMapError> {
+    let mut writer = PrivateDigest::new(b"fnlp-int8-extraction-map-request-v1", u64::MAX, control)?;
+    let m = limits.mapping;
+    let c = planner.compiler.compiler_limits;
+    writer.value(&(source, args))?;
+    writer.value(&(m.chunks, m.reduction, m.max_model_work,
+        (m.mask_limits.max_trie_node_visits, m.mask_limits.checkpoint_interval_nodes),
+        m.mask_visits_per_chunk, m.max_mask_visits, limits.verification))?;
+    writer.value(&((c.max_schema_bytes, c.max_string_bytes, c.max_array_items, c.max_output_bytes,
+        c.max_states, c.max_transitions, c.max_mask_bytes), planner.compiler.source_limits,
+        planner.compiler.ceiling, planner.document_encoding(), planner.map_document_encoding_limits()))?;
+    writer.value(&plans.len())?;
+    for (chunk, plan) in chunks.chunks().iter().zip(plans) {
+        writer.poll()?;
+        writer.value(&(chunk.id(), chunk.span(), chunk.tokens(), plan.execution_identity(),
+            plan.plan.options(), plan.plan.max_result_bytes()))?;
+    }
+    writer.finish()
+}
+
+fn result_binding<C: DecodeStepControl>(run: &Int8ExtractionMapRun, cap: u64, control: &mut C)
+    -> Result<[u8; 32], Int8SourceMapError> {
+    let mut writer = PrivateDigest::new(b"fnlp-int8-extraction-map-result-v1", cap, control)?;
+    // The request binding is intentionally absent from serialized output, so
+    // include it explicitly in the private result commitment.
+    writer.hash.update(run.request_binding);
+    writer.value(run)?;
+    writer.finish()
+}
+
+struct VerificationOnly;
+impl DecodeStepControl for VerificationOnly {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
+}
+
+const BINDING_CHECKPOINT_BYTES: usize = 64 * 1024;
+/// Stream repository-owned structures into a bounded hash; never allocate a
+/// second document/result-sized buffer or publish this as a digest protocol.
+struct PrivateDigest<'a, C> {
+    hash: Sha256,
+    remaining: u64,
+    until_checkpoint: usize,
+    control: &'a mut C,
+    failure: Option<Int8SourceMapError>,
+}
+impl<'a, C: DecodeStepControl> PrivateDigest<'a, C> {
+    fn new(domain: &[u8], cap: u64, control: &'a mut C) -> Result<Self, Int8SourceMapError> {
+        step(control)?;
+        let mut hash = Sha256::new(); hash.update(domain); hash.update([0]);
+        Ok(Self { hash, remaining: cap, until_checkpoint: BINDING_CHECKPOINT_BYTES, control, failure: None })
+    }
+    fn poll(&mut self) -> Result<(), Int8SourceMapError> { step(self.control).map_err(Into::into) }
+    fn value(&mut self, value: &(impl Serialize + ?Sized)) -> Result<(), Int8SourceMapError> {
+        let encoded = serde_json::to_writer(&mut *self, value);
+        if let Some(error) = self.failure.take() { return Err(error); }
+        encoded.map_err(|_| Int8SourceMapError::from(Int8SourceError::from(ExtractError::Serialization)))?;
+        self.hash.update([0]);
+        Ok(())
+    }
+    fn finish(mut self) -> Result<[u8; 32], Int8SourceMapError> {
+        self.poll()?;
+        Ok(self.hash.finalize().into())
+    }
+}
+impl<C: DecodeStepControl> std::io::Write for PrivateDigest<'_, C> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let Some(remaining) = self.remaining.checked_sub(bytes.len() as u64) else {
+            self.failure = Some(Int8SourceError::from(ExtractError::OutputBudgetExceeded).into());
+            return Err(std::io::Error::other("INT8 extraction map binding limit"));
+        };
+        self.remaining = remaining;
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if self.until_checkpoint == 0 {
+                if let Err(error) = self.poll() {
+                    self.failure = Some(error);
+                    return Err(std::io::Error::other("INT8 extraction map binding stopped"));
+                }
+                self.until_checkpoint = BINDING_CHECKPOINT_BYTES;
+            }
+            let count = self.until_checkpoint.min(bytes.len() - offset);
+            self.hash.update(&bytes[offset..offset + count]);
+            self.until_checkpoint -= count;
+            offset += count;
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
 fn step<C: DecodeStepControl>(control: &mut C) -> Result<(), Int8SourceError> {
     match control.prefill_checkpoint(0) { Some(cause) => Err(Int8SourceError::Cancelled(cause)), None => Ok(()) }
 }

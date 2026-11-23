@@ -90,7 +90,7 @@ impl NlpEngine {
             let result = allocate(output, || {
                 let result = prepared.execute_with_control(&admitted, &mut engine.value,
                     &input.value.vocabulary, control).map_err(HostedError::SourceMap)?;
-                expected.verify_completed(&result).map_err(HostedError::SourceMap)?;
+                expected.verify_completed_with_control(&result, control).map_err(HostedError::SourceMap)?;
                 poll(control)?;
                 Ok(result)
             })?;

@@ -62,7 +62,12 @@ pub(super) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
     let planner = Arc::new(planner);
     let result = session.engine.extract_int8_document(&model, text, Arc::clone(&planner), vocabulary,
         config, cancellation).map_err(host_error)?;
-    expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+    expected.verify_completed_with_control(result.result(), &mut session.control()).map_err(|error| {
+        match error.cancellation() {
+            Some(DecodeCancellationKind::Deadline | DecodeCancellationKind::Timeout) => CandidateError::Timeout,
+            _ => CandidateError::Execution,
+        }
+    })?;
     // Exact native JSON remains a STRING. No serde Value roundtrip, repair,
     // object merge, source-field synthesis or partially successful publication.
     deliver_encoded(&session, &facts, &result, encoding::extraction_report(&planner)?.as_ref(),

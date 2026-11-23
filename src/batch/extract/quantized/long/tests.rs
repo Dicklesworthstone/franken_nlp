@@ -382,3 +382,130 @@ fn compact_document_cancellation_keeps_the_cause_and_already_spent_work() {
         }
     }
 }
+
+#[test]
+fn same_geometry_sources_schemas_and_models_cannot_exchange_completed_results() {
+    let p = planner(); let a = source_args();
+    let prepared = prepare(&p, "Alice", &a, limits());
+    let expected = prepared.preflight_metadata();
+    let original = run(prepared, Script::new(&a)).unwrap();
+    expected.verify_completed(&original).unwrap();
+    for axis in 0..3 {
+        let mut changed_planner = planner(); let mut changed_args = a.clone();
+        let source = if axis == 0 { "Bobby" } else { "Alice" };
+        if axis == 1 { changed_args.schema = changed_args.schema.replace("64", "63"); }
+        if axis == 2 { changed_planner.compiler.identity.logical_model_digest = Sha256Digest::of_bytes(b"other model"); }
+        let prepared = prepare(&changed_planner, source, &changed_args, limits());
+        let changed = prepared.preflight_metadata();
+        assert_eq!(expected.source_span(), changed.source_span());
+        assert_eq!(expected.chunk_count(), changed.chunk_count());
+        assert_eq!(expected.planned_work(), changed.planned_work());
+        assert_ne!(expected, changed);
+        let result = run(prepared, Script::new(&changed_args)).unwrap();
+        changed.verify_completed(&result).unwrap();
+        assert!(expected.verify_completed(&result).is_err(), "{axis}");
+        assert!(changed.verify_completed(&original).is_err(), "{axis}");
+    }
+}
+
+#[test]
+fn unused_request_ceilings_remain_part_of_the_completed_extraction_authority() {
+    let p = planner(); let a = source_args();
+    let prepared = prepare(&p, "Alice", &a, limits());
+    let expected = prepared.preflight_metadata();
+    let original = run(prepared, Script::new(&a)).unwrap();
+    for axis in 0..10 {
+        let mut changed_args = a.clone(); let mut changed_limits = limits();
+        match axis {
+            0 => changed_limits.mapping.chunks.max_input_bytes -= 1,
+            1 => changed_limits.mapping.chunks.max_tokenizer_calls -= 1,
+            2 => changed_limits.mapping.reduction.max_result_bytes -= 1,
+            3 => changed_limits.mapping.reduction.max_total_value_bytes -= 1,
+            4 => changed_limits.mapping.max_model_work.attention_pairs -= 1,
+            5 => changed_limits.mapping.max_mask_visits -= 1,
+            6 => changed_limits.mapping.mask_limits.checkpoint_interval_nodes += 1,
+            7 => changed_limits.verification.max_scan_steps -= 1,
+            8 => changed_args.budget.max_kv_bytes -= 1,
+            _ => changed_limits.mapping.reduction.map_batch_chunks = 1,
+        }
+        let changed = prepare(&p, "Alice", &changed_args, changed_limits).preflight_metadata();
+        assert_eq!(expected.planned_work(), changed.planned_work(), "{axis}");
+        assert_eq!(expected.reserved_mask_visits(), changed.reserved_mask_visits(), "{axis}");
+        assert!(changed.verify_completed(&original).is_err(), "{axis}");
+    }
+}
+
+#[test]
+fn moved_map_payload_and_mutated_envelope_do_not_retain_a_completion_seal() {
+    let p = planner(); let a = source_args();
+    let expected = prepare(&p, "Alice", &a, limits()).preflight_metadata();
+    let mut left = run(prepare(&p, "Alice", &a, limits()), Script::new(&a)).unwrap();
+    let mut right = run(prepare(&p, "Bobby", &a, limits()), Script::new(&a)).unwrap();
+    assert_eq!(left.model_work, right.model_work);
+    assert_eq!(left.verification_used, right.verification_used);
+    std::mem::swap(&mut left.mapped, &mut right.mapped);
+    assert!(expected.verify_completed(&left).is_err());
+    std::mem::swap(&mut left.mapped, &mut right.mapped);
+    expected.verify_completed(&left).unwrap();
+    // A still-in-budget verification counter previously passed all aggregate
+    // checks. The complete retained envelope must remain unchanged too.
+    left.verification_used.scan_steps += 1;
+    assert!(left.verification_used.scan_steps <= limits().verification.max_scan_steps);
+    assert!(expected.verify_completed(&left).is_err());
+}
+
+#[test]
+fn completion_bindings_are_private_and_respect_the_exact_serialized_byte_cap() {
+    let p = planner(); let a = source_args();
+    let prepared = prepare(&p, "Alice", &a, limits()); let expected = prepared.preflight_metadata();
+    let result = run(prepared, Script::new(&a)).unwrap();
+    let bytes = serde_json::to_vec(&result).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(json.get("request_binding").is_none() && json.get("result_binding").is_none());
+    let debug = format!("{expected:?}");
+    assert!(!debug.contains("request_binding") && !debug.contains("Alice"));
+    assert_eq!(result_binding(&result, bytes.len() as u64, &mut Continue).unwrap(), result.result_binding);
+    let error = result_binding(&result, bytes.len() as u64 - 1, &mut Continue).unwrap_err();
+    assert!(matches!(error, Int8SourceMapError::Source(Int8SourceError::Extraction(
+        Int8ExtractError::Extraction(ExtractError::OutputBudgetExceeded)))));
+}
+
+struct BindingControl { calls: usize, stop: usize, cause: DecodeCancellationKind }
+impl DecodeStepControl for BindingControl {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+        self.calls += 1; (self.calls == self.stop).then_some(self.cause)
+    }
+}
+
+#[test]
+fn completion_verification_preserves_all_terminal_causes_at_every_checkpoint() {
+    let p = planner(); let a = source_args();
+    let prepared = prepare(&p, "Alice", &a, limits()); let expected = prepared.preflight_metadata();
+    let result = run(prepared, Script::new(&a)).unwrap();
+    let mut complete = BindingControl { calls: 0, stop: usize::MAX, cause: DecodeCancellationKind::User };
+    expected.verify_completed_with_control(&result, &mut complete).unwrap();
+    assert!(complete.calls >= 4);
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        for stop in 1..=complete.calls {
+            let mut control = BindingControl { calls: 0, stop, cause };
+            let error = expected.verify_completed_with_control(&result, &mut control).unwrap_err();
+            assert_eq!(error.cancellation(), Some(cause)); assert_eq!(control.calls, stop);
+        }
+    }
+}
+
+#[test]
+fn one_large_binding_write_checks_cancellation_before_hashing_the_whole_payload() {
+    let payload = "x".repeat(3 * BINDING_CHECKPOINT_BYTES);
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let mut control = BindingControl { calls: 0, stop: 2, cause };
+        let mut writer = PrivateDigest::new(b"test", u64::MAX, &mut control).unwrap();
+        let error = writer.value(&payload).unwrap_err();
+        assert_eq!(error.cancellation(), Some(cause));
+        drop(writer); assert_eq!(control.calls, 2);
+    }
+}

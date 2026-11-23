@@ -241,7 +241,7 @@ fn execute_document<D: Driver, A: ExtractionDocumentBatchAdmission, C: DecodeSte
         // Borrowing the driver preserves the SAME resident engine across items.
         let output = plan.execute_with_driver(&admitted, BorrowedDriver(driver), control)
             .map_err(|e| map_failure(e, true))?;
-        prepared.expected.verify_completed(&output).map_err(|e| map_failure(e, true))?;
+        prepared.expected.verify_completed_with_control(&output, control).map_err(|e| map_failure(e, true))?;
         if !driver.clean() { return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)); }
         checkpoint(control)?;
         Ok(GuardedOutput::new(output, guard))

@@ -43,15 +43,17 @@ impl PreparedInt8ExtractionMap<'_> {
         step(&mut **control.borrow_mut())?;
         if task.next != self.expected.chunks || !task.driver.clean() { return Err(Int8SourceError::InvalidResult.into()); }
         let remaining = task.remaining; let total = self.limits.verification;
-        let run = Int8ExtractionMapRun { schema_version: 1, execution: INT8_EXTRACTION_MAP_EXECUTION,
+        let mut run = Int8ExtractionMapRun { schema_version: 1, execution: INT8_EXTRACTION_MAP_EXECUTION,
             numerics_profile: STRICT_INT8_PROFILE, semantics: SEMANTICS, grounding: self.expected.grounding,
             planned_model_work: self.expected.work, model_work: task.work, reserved_mask_node_visits: self.expected.masks,
             mask_node_visit_charge: task.masks, verification_used: ExtractionMapVerification {
                 fields: total.max_fields.checked_sub(remaining.max_fields).ok_or(Int8SourceMapError::WorkLimit)?,
                 matches: total.max_matches.checked_sub(remaining.max_matches).ok_or(Int8SourceMapError::WorkLimit)?,
                 scan_steps: total.max_scan_steps.checked_sub(remaining.max_scan_steps).ok_or(Int8SourceMapError::WorkLimit)? },
-            untrusted_fields: ["mapped.root.value"], mapped };
-        self.expected.verify_completed(&run)?;
+            untrusted_fields: ["mapped.root.value"], mapped,
+            request_binding: self.expected.request_binding, result_binding: [0; 32] };
+        run.result_binding = result_binding(&run, self.max_result_bytes(), &mut **control.borrow_mut())?;
+        self.expected.verify_completed_with_control(&run, &mut **control.borrow_mut())?;
         check_size(&run, self.max_result_bytes()).map_err(Int8SourceError::from)?;
         step(&mut **control.borrow_mut())?;
         Ok(run)
@@ -149,13 +151,18 @@ fn original_fields<C: DecodeStepControl>(chunk: &SourceChunk<'_>, fields: &[Sour
     step(control)?;
     Ok(output)
 }
-pub(super) fn statistics(value: &ExtractionMapValue) -> Result<(Int8Work, u64, usize, usize), Int8SourceError> {
+pub(super) fn statistics<C: DecodeStepControl>(value: &ExtractionMapValue, control: &mut C)
+    -> Result<(Int8Work, u64, usize, usize), Int8SourceError> {
     let (mut work, mut masks, mut fields, mut spans) = (Int8Work::default(), 0_u64, 0_usize, 0_usize);
     for chunk in value.chunks() {
+        step(control)?;
         work = add_work(work, chunk.native.model_work).ok_or(Int8SourceError::InvalidResult)?;
         masks = masks.checked_add(chunk.native.result.output.mask_node_visit_charge).ok_or(Int8SourceError::InvalidResult)?;
         fields = fields.checked_add(chunk.original_fields.len()).ok_or(Int8SourceError::InvalidResult)?;
-        for field in &chunk.original_fields { spans = spans.checked_add(field.spans.len()).ok_or(Int8SourceError::InvalidResult)?; }
+        for field in &chunk.original_fields {
+            step(control)?;
+            spans = spans.checked_add(field.spans.len()).ok_or(Int8SourceError::InvalidResult)?;
+        }
     }
     Ok((work, masks, fields, spans))
 }
