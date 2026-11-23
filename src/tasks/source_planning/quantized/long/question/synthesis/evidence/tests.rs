@@ -97,7 +97,8 @@ fn absence_in_all_passages_and_matches_only_across_a_join_still_refuse() {
 fn no_match_scans_remain_charged_without_consuming_or_refunding_occurrence_allowances() {
     let (source, evidence) = fixture(&["Alice", "Bob", "Carol"]);
     let quote = "Alice";
-    let cost: u64 = evidence.passages.iter().map(|p| (p.text.len() as u64 + quote.len() as u64 + 1) * 8).sum();
+    let cost = evidence.passages.iter().map(|p| (p.text.len() as u64 + quote.len() as u64 + 1) * 8).sum::<u64>()
+        + quote.len() as u64; // Verify the lifted occurrence in the original source too.
     let mut exact = GroundingBudget { max_fields: 1, max_matches: 2, max_scan_steps: cost };
     final_answer(&source, raw(&evidence, &[quote]), &evidence, AnswerOptions::default(), &mut exact, &mut Continue).unwrap();
     assert_eq!(exact, GroundingBudget { max_fields: 0, max_matches: 0, max_scan_steps: 0 });
@@ -138,24 +139,27 @@ fn cancellation_at_every_boundary_including_after_a_nonmatching_passage_prevents
 #[test]
 fn cancellation_inside_a_large_nonmatching_passage_is_not_an_absence() {
     use DecodeCancellationKind::*;
-    struct Stop { calls: usize, cause: DecodeCancellationKind }
+    struct Stop { calls: usize, stop: usize, cause: DecodeCancellationKind }
     impl DecodeStepControl for Stop {
         fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
-            self.calls += 1; (self.calls == 5).then_some(self.cause)
+            self.calls += 1; (self.calls == self.stop).then_some(self.cause)
         }
     }
     let absent = "é".repeat(3000);
     let (source, evidence) = fixture(&[&absent, "Alice"]);
     let result = raw(&evidence, &["Alice"]);
+    let mut admission = Stop { calls: 0, stop: usize::MAX, cause: User };
+    check_answer(&result, AnswerOptions::default(), &mut admission).unwrap();
+    let inside_scan = 5 + admission.calls;
     let scan_charge = ((absent.len() + "Alice".len() + 1) * 8) as u64;
     for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
         ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
         let mut budget = GroundingBudget::default(); let before = budget;
-        let mut control = Stop { calls: 0, cause };
+        let mut control = Stop { calls: 0, stop: inside_scan, cause };
         let error = final_answer(&source, result.clone(), &evidence, AnswerOptions::default(),
             &mut budget, &mut control).err().unwrap();
         assert_eq!(error.cancellation(), Some(cause));
-        assert_eq!(control.calls, 5);
+        assert_eq!(control.calls, inside_scan);
         assert_eq!(budget.max_scan_steps, before.max_scan_steps - scan_charge);
         // The matching later passage was never reached or debited.
         assert_eq!(budget.max_matches, before.max_matches);

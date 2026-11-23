@@ -1,0 +1,186 @@
+//! Complete ordered frontier, native work and final-answer consistency checks.
+use super::*;
+use std::collections::BTreeSet;
+
+pub(super) fn verify<C: DecodeStepControl>(expected: &Int8QuestionHierarchyPreflight, run: &Int8QuestionHierarchyRun,
+    control: &mut C) -> Result<(), Int8SourceMapError> {
+    checkpoint(control)?;
+    let base = expected.base; let map = &run.discovery;
+    base.discovery.verify_completed_with_control(map, control)?;
+    let remaining = remaining_verification(map, base.discovery.verification, control)?;
+    let discovery_fields = base.discovery.verification.max_fields.checked_sub(remaining.max_fields).ok_or_else(invalid)?;
+    let discovery_matches = base.discovery.verification.max_matches.checked_sub(remaining.max_matches).ok_or_else(invalid)?;
+    if run.schema_version != 1 || run.execution != INT8_QUESTION_HIERARCHY_EXECUTION
+        || run.numerics_profile != STRICT_INT8_PROFILE || run.semantics != SEMANTICS || run.limits != expected.limits
+        || run.calibration != AnswerCalibration::Uncalibrated
+        || run.citation_guarantee != CitationGuarantee::StructuralSourceMembership
+        || run.semantic_support != SummarySemanticSupport::NotAssessed
+        || run.untrusted_fields != ["passes", "discovery.mapped.root.value"]
+        || run.reserved_model_work != expected.reserved_work || run.reserved_mask_node_visits != expected.reserved_masks
+        || run.passes.len() > expected.limits.max_passes || run.levels.len() > expected.limits.max_levels
+        || run.verification_used.fields > base.discovery.verification.max_fields
+        || run.verification_used.matches > base.discovery.verification.max_matches
+        || run.verification_used.scan_steps > base.discovery.verification.max_scan_steps
+        || run.verification_used.fields < discovery_fields || run.verification_used.matches < discovery_matches
+        || run.verification_used.scan_steps < map.verification_scan_steps
+        || run.tokenizer_work.calls > expected.limits.max_tokenizer_calls || run.tokenizer_work.bytes > expected.limits.max_tokenizer_bytes
+        || run.tokenizer_work.calls < run.passes.len() { return Err(invalid()); }
+    let mut frontier = Vec::new();
+    for chunk in map.mapped.root().value().chunks() {
+        checkpoint(control)?;
+        let mut seen = BTreeSet::new();
+        for citation in &chunk.citations {
+            checkpoint(control)?;
+            if seen.insert(citation.quote.as_str()) {
+                frontier.try_reserve(1).map_err(|_| Int8SourceMapError::Allocation)?;
+                frontier.push(citation.quote.as_str());
+            }
+        }
+    }
+    let initial = transport::quote_size(&frontier, control)?;
+    if run.initial_evidence != initial || initial.passages > base.limits.max_evidence_passages
+        || initial.bytes > base.limits.max_evidence_bytes { return Err(invalid()); }
+    let mut planned = map.planned_model_work; let mut actual = map.model_work; let mut masks = map.mask_node_visit_charge;
+    let mut counted_bytes = 0_u64;
+    for pass in &run.passes {
+        checkpoint(control)?;
+        verify_pass(expected, pass, control)?;
+        planned = add_work(planned, pass.planned_model_work).ok_or_else(invalid)?;
+        actual = add_work(actual, pass.native.model_work).ok_or_else(invalid)?;
+        let SourceTaskResult::Answer(raw) = &pass.native.result else { return Err(invalid()); };
+        masks = masks.checked_add(raw.mask_node_visit_charge).ok_or_else(invalid)?;
+        counted_bytes = counted_bytes.checked_add(pass.context_bytes as u64).ok_or_else(invalid)?;
+    }
+    if run.planned_model_work != planned || run.model_work != actual || run.mask_node_visit_charge != masks
+        || !within(planned, expected.reserved_work) || !within(actual, planned) || masks > expected.reserved_masks
+        || run.tokenizer_work.bytes < counted_bytes { return Err(invalid()); }
+    if initial.passages == 0 {
+        if initial.bytes != 0 || map.answered_chunks != 0 || !run.passes.is_empty() || !run.levels.is_empty() || run.final_pass.is_some()
+            || run.status != QuestionHierarchyStatus::NoEvidenceCollected || run.tokenizer_work != HierarchyTokenizerWork::default() {
+            return Err(invalid());
+        }
+        return Ok(());
+    }
+    if initial.bytes == 0 || map.answered_chunks == 0 || run.levels.is_empty() { return Err(invalid()); }
+    let mut next_pass = 0; let mut final_pass = None;
+    for (level_index, level) in run.levels.iter().enumerate() {
+        checkpoint(control)?;
+        let size = transport::quote_size(&frontier, control)?;
+        if level.input != size || level.passes.start != next_pass || level.passes.start >= level.passes.end
+            || level.passes.end > run.passes.len() { return Err(invalid()); }
+        let passes = &run.passes[level.passes.clone()];
+        let mut next_passage = 0;
+        for (group, pass) in passes.iter().enumerate() {
+            checkpoint(control)?;
+            if pass.level != level_index || pass.group != group || pass.input_passages.start != next_passage
+                || pass.input_passages.end > frontier.len() { return Err(invalid()); }
+            let quotes = &frontier[pass.input_passages.clone()];
+            if transport::quote_size(quotes, control)?.bytes != pass.input_bytes { return Err(invalid()); }
+            let mut ids = vector(quotes.len())?;
+            for index in pass.input_passages.clone() { checkpoint(control)?; ids.push(format!("evidence_{index}")); }
+            let bytes = transport::context_bytes(expected.capacity.question_bytes,
+                ids.iter().zip(quotes).map(|(id, text)| (id.as_str(), *text)), control)?;
+            if bytes != pass.context_bytes { return Err(invalid()); }
+            // Local spans must designate actual quote passages in this group.
+            // Synthetic joins, the question and manifest cannot be citations.
+            verify_local_passages(pass, &ids, quotes, control)?;
+            next_passage = pass.input_passages.end;
+        }
+        if next_passage != frontier.len() { return Err(invalid()); }
+        next_pass = level.passes.end;
+        match level.next_evidence {
+            None => {
+                if passes.len() != 1 || level_index + 1 != run.levels.len() { return Err(invalid()); }
+                final_pass = Some(level.passes.start);
+            }
+            Some(next) => {
+                let selected = transport::selected_quotes(passes, control)?;
+                if passes.len() < 2 || next != transport::quote_size(&selected, control)?
+                    || next.passages > base.limits.max_evidence_passages || next.bytes > base.limits.max_evidence_bytes
+                    || next.bytes >= size.bytes || (next.passages == 0) != (next.bytes == 0) { return Err(invalid()); }
+                if next.passages == 0 && level_index + 1 != run.levels.len() { return Err(invalid()); }
+                frontier = selected;
+            }
+        }
+    }
+    if next_pass != run.passes.len() || run.final_pass != final_pass { return Err(invalid()); }
+    let status = match final_pass {
+        Some(index) => match run.passes[index].answer.status {
+            SynthesisStatus::Answered => QuestionHierarchyStatus::Answered,
+            SynthesisStatus::Abstained => QuestionHierarchyStatus::Abstained,
+            SynthesisStatus::NoEvidenceCollected => return Err(invalid()),
+        },
+        None if frontier.is_empty() => QuestionHierarchyStatus::EvidenceExhausted,
+        _ => return Err(invalid()),
+    };
+    if run.status != status { return Err(invalid()); }
+    checkpoint(control)?;
+    Ok(())
+}
+pub(super) fn verify_pass<C: DecodeStepControl>(expected: &Int8QuestionHierarchyPreflight,
+    pass: &QuestionHierarchyPass, control: &mut C) -> Result<(), Int8SourceMapError> {
+    checkpoint(control)?;
+    let native = &pass.native;
+    let SourceTaskResult::Answer(raw) = &native.result else { return Err(invalid()); };
+    let status = evidence::check_answer(raw, expected.options, control)?;
+    let ids = &raw.generated_token_ids; let eos = expected.capacity.eos;
+    if pass.input_passages.start >= pass.input_passages.end || pass.input_passages.end > expected.base.limits.max_evidence_passages
+        || pass.input_bytes == 0 || pass.input_bytes > expected.base.limits.max_evidence_bytes
+        || pass.context_bytes > expected.capacity.input_bytes
+        || pass.input_bytes.checked_add(expected.capacity.question_bytes).is_none_or(|n| pass.context_bytes <= n)
+        || pass.prompt_tokens <= expected.capacity.scaffold || pass.prompt_tokens > expected.capacity.prompt
+        || ids.is_empty() || ids.len() > expected.output_tokens || ids.last() != Some(&eos) { return Err(invalid()); }
+    for (index, id) in ids[..ids.len() - 1].iter().enumerate() {
+        if index % 4096 == 0 { checkpoint(control)?; }
+        if *id == eos || *id as usize >= NANBEIGE_VOCAB_SIZE { return Err(invalid()); }
+    }
+    let planned = constrained_int8::planned_work(pass.prompt_tokens, expected.output_tokens).map_err(Int8SourceError::from)?;
+    let actual = constrained_int8::planned_work(pass.prompt_tokens, ids.len()).map_err(Int8SourceError::from)?;
+    if native.schema_version != 1 || native.execution != INT8_SOURCE_EXECUTION
+        || pass.planned_model_work != planned || native.model_work != actual
+        || !within(planned, expected.base.synthesis_reserve) || !within(actual, planned)
+        || raw.forward_positions != actual.forward_positions || raw.projected_logits != actual.projected_logits
+        || raw.mask_node_visit_charge > expected.base.synthesis_masks || pass.answer.status != status
+        || raw.answer != pass.answer.answer || raw.citations.len() != pass.answer.citations.len() { return Err(invalid()); }
+    for (local, original) in raw.citations.iter().zip(&pass.answer.citations) {
+        checkpoint(control)?;
+        if local.quote != original.quote || local.spans.is_empty()
+            || local.occurrence != if local.spans.len() == 1 { SourceOccurrence::Anchored } else { SourceOccurrence::Ambiguous } {
+            return Err(invalid());
+        }
+        evidence::check_original_citation(original, expected.options, expected.discovery().source_span(), control)?;
+    }
+    Ok(())
+}
+fn verify_local_passages<C: DecodeStepControl>(pass: &QuestionHierarchyPass, ids: &[String], quotes: &[&str],
+    control: &mut C) -> Result<(), Int8SourceMapError> {
+    let SourceTaskResult::Answer(raw) = &pass.native.result else { return Err(invalid()); };
+    // One bounded scalar-boundary index per passage avoids prefix rescans for
+    // every repeated occurrence. All traversal uses the original controller.
+    let mut boundaries = vector(quotes.len())?;
+    for text in quotes {
+        checkpoint(control)?;
+        let mut positions = vector(text.len().checked_add(1).ok_or_else(invalid)?)?;
+        for (index, (byte, _)) in text.char_indices().enumerate() {
+            if index % 4096 == 0 { checkpoint(control)?; }
+            positions.push(byte);
+        }
+        positions.push(text.len()); boundaries.push(positions);
+    }
+    for citation in &raw.citations {
+        checkpoint(control)?;
+        let mut previous = None;
+        for occurrence in &citation.spans {
+            checkpoint(control)?;
+            let index = ids.iter().position(|id| id == &occurrence.passage_id).ok_or_else(invalid)?;
+            let text = quotes[index]; let span = occurrence.span;
+            let key = (index, span.byte_start);
+            if previous.is_some_and(|old| old >= key) || span.byte_start >= span.byte_end
+                || text.get(span.byte_start..span.byte_end) != Some(citation.quote.as_str())
+                || boundaries[index].binary_search(&span.byte_start).ok() != Some(span.scalar_start)
+                || boundaries[index].binary_search(&span.byte_end).ok() != Some(span.scalar_end) { return Err(invalid()); }
+            previous = Some(key);
+        }
+    }
+    Ok(())
+}

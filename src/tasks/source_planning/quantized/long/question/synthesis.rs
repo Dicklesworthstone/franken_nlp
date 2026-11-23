@@ -4,6 +4,8 @@
 use super::*;
 use crate::native_engine::portable_int8::ProjectionWork;
 mod evidence;
+/// Explicit bounded quotation selection when all evidence exceeds one context.
+pub mod hierarchy;
 
 pub const INT8_QUESTION_SYNTHESIS_EXECUTION: &str = "portable-int8-question-verbatim-evidence-synthesis-v1";
 const SEMANTICS: &str = "answer-from-collected-quotes-not-full-document-equivalence-v1";

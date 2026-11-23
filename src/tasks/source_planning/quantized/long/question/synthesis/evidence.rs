@@ -6,7 +6,7 @@ use crate::validation::grounded_fields::FieldGroundingError;
 
 pub(super) struct Collection {
     pub passages: Vec<AnswerPassage>,
-    origins: Vec<Vec<VerifiedSourceSpan>>,
+    pub(super) origins: Vec<Vec<VerifiedSourceSpan>>,
     pub bytes: usize,
 }
 impl Collection {
@@ -77,28 +77,17 @@ pub(super) fn collect<C: DecodeStepControl>(source: &str, value: &QuestionValue,
 }
 pub(super) fn final_answer<C: DecodeStepControl>(source: &str, raw: AnswerResult, evidence: &Collection,
     options: AnswerOptions, remaining: &mut GroundingBudget, control: &mut C) -> Result<SynthesisAnswer, Int8SourceMapError> {
+    lift_answer(source, &raw, evidence, options, remaining, control)
+}
+/// Borrow the native receipt so hierarchical execution retains every pass.
+pub(super) fn lift_answer<C: DecodeStepControl>(source: &str, raw: &AnswerResult, evidence: &Collection,
+    options: AnswerOptions, remaining: &mut GroundingBudget, control: &mut C) -> Result<SynthesisAnswer, Int8SourceMapError> {
     checkpoint(control)?;
-    if raw.schema_version != 1 || raw.task_spec_version != ANSWER_TASK_VERSION || raw.numerics_profile != STRICT_INT8_PROFILE
-        || raw.calibration != AnswerCalibration::Uncalibrated || raw.score_space != ScoreSpace::NotComputed
-        || raw.citation_guarantee != CitationGuarantee::StructuralSourceMembership
-        || raw.semantic_support != SummarySemanticSupport::NotAssessed
-        || raw.untrusted_fields != ["answer", "citations"] || raw.citations.len() > options.max_citations
-        || evidence.passages.is_empty() || evidence.passages.len() != evidence.origins.len() { return Err(invalid()); }
-    let status = match raw.status {
-        AnswerStatus::Answered => {
-            if !raw.answerable || raw.citations.is_empty() || !raw.answer.as_ref().is_some_and(|text|
-                has_text(text) && text.chars().count() <= options.max_answer_scalars) { return Err(invalid()); }
-            SynthesisStatus::Answered
-        }
-        AnswerStatus::Abstained => {
-            if raw.answerable || raw.answer.is_some() || !raw.citations.is_empty() { return Err(invalid()); }
-            SynthesisStatus::Abstained
-        }
-    };
+    let status = check_answer(raw, options, control)?;
+    if evidence.passages.is_empty() || evidence.passages.len() != evidence.origins.len() { return Err(invalid()); }
     let mut citations = vector(raw.citations.len())?;
-    for citation in raw.citations {
+    for citation in &raw.citations {
         checkpoint(control)?;
-        if citation.quote.is_empty() || citation.quote.chars().count() > options.max_quote_scalars { return Err(invalid()); }
         remaining.max_fields = remaining.max_fields.checked_sub(1).ok_or(Int8SourceMapError::WorkLimit)?;
         let mut spans = Vec::new(); let mut next = 0_usize;
         for (passage, origins) in evidence.passages.iter().zip(&evidence.origins) {
@@ -123,6 +112,8 @@ pub(super) fn final_answer<C: DecodeStepControl>(source: &str, raw: AnswerResult
                     checkpoint(control)?;
                     // Charge fanout BEFORE lifting, even duplicate coordinates.
                     remaining.max_matches = remaining.max_matches.checked_sub(1).ok_or(Int8SourceMapError::WorkLimit)?;
+                    remaining.max_scan_steps = remaining.max_scan_steps.checked_sub(citation.quote.len() as u64)
+                        .ok_or(Int8SourceMapError::WorkLimit)?;
                     let span = lift(local, origin)?;
                     if source.get(span.byte_start..span.byte_end) != Some(citation.quote.as_str()) { return Err(invalid()); }
                     spans.try_reserve(1).map_err(|_| Int8SourceMapError::Allocation)?;
@@ -137,10 +128,61 @@ pub(super) fn final_answer<C: DecodeStepControl>(source: &str, raw: AnswerResult
         // original occurrence. Do not label that as multiple source occurrences.
         spans.sort_unstable_by_key(|s| (s.byte_start, s.byte_end, s.scalar_start, s.scalar_end));
         spans.dedup();
-        citations.push(SourceCitation { quote: citation.quote, occurrence: occurrence(spans.len()), spans });
+        citations.push(SourceCitation { quote: copy(&citation.quote)?, occurrence: occurrence(spans.len()), spans });
     }
+    let answer = raw.answer.as_deref().map(copy).transpose()?;
     checkpoint(control)?;
-    Ok(SynthesisAnswer { status, answer: raw.answer, citations })
+    Ok(SynthesisAnswer { status, answer, citations })
+}
+pub(super) fn check_answer<C: DecodeStepControl>(raw: &AnswerResult, options: AnswerOptions, control: &mut C)
+    -> Result<SynthesisStatus, Int8SourceMapError> {
+    checkpoint(control)?;
+    if raw.schema_version != 1 || raw.task_spec_version != ANSWER_TASK_VERSION || raw.numerics_profile != STRICT_INT8_PROFILE
+        || raw.calibration != AnswerCalibration::Uncalibrated || raw.score_space != ScoreSpace::NotComputed
+        || raw.citation_guarantee != CitationGuarantee::StructuralSourceMembership
+        || raw.semantic_support != SummarySemanticSupport::NotAssessed
+        || raw.untrusted_fields != ["answer", "citations"] || raw.citations.len() > options.max_citations {
+        return Err(invalid());
+    }
+    let status = match raw.status {
+        AnswerStatus::Answered => {
+            let text = raw.answer.as_deref().ok_or_else(invalid)?;
+            let scalars = mapreduce::count_scalars_with_checkpoints(text, &mut || checkpoint(control))?;
+            if !raw.answerable || raw.citations.is_empty() || !has_text(text)
+                || scalars > options.max_answer_scalars { return Err(invalid()); }
+            SynthesisStatus::Answered
+        }
+        AnswerStatus::Abstained => {
+            if raw.answerable || raw.answer.is_some() || !raw.citations.is_empty() { return Err(invalid()); }
+            SynthesisStatus::Abstained
+        }
+    };
+    for citation in &raw.citations {
+        checkpoint(control)?;
+        let scalars = mapreduce::count_scalars_with_checkpoints(&citation.quote, &mut || checkpoint(control))?;
+        if citation.quote.is_empty() || scalars > options.max_quote_scalars { return Err(invalid()); }
+    }
+    Ok(status)
+}
+pub(super) fn check_original_citation<C: DecodeStepControl>(citation: &SourceCitation, options: AnswerOptions,
+    source: VerifiedSourceSpan, control: &mut C) -> Result<(), Int8SourceMapError> {
+    checkpoint(control)?;
+    let scalars = mapreduce::count_scalars_with_checkpoints(&citation.quote, &mut || checkpoint(control))?;
+    if citation.quote.is_empty() || scalars > options.max_quote_scalars || citation.spans.is_empty()
+        || citation.occurrence != occurrence(citation.spans.len()) { return Err(invalid()); }
+    let mut previous = None;
+    for span in &citation.spans {
+        checkpoint(control)?;
+        if span.byte_end.checked_sub(span.byte_start) != Some(citation.quote.len())
+            || span.scalar_end.checked_sub(span.scalar_start) != Some(scalars)
+            || span.byte_start < source.byte_start || span.byte_end > source.byte_end
+            || span.scalar_start < source.scalar_start || span.scalar_end > source.scalar_end
+            || previous.is_some_and(|(byte, scalar)| byte >= span.byte_start || scalar >= span.scalar_start) {
+            return Err(invalid());
+        }
+        previous = Some((span.byte_start, span.scalar_start));
+    }
+    Ok(())
 }
 fn occurrence(count: usize) -> SourceOccurrence {
     if count == 1 { SourceOccurrence::Anchored } else { SourceOccurrence::Ambiguous }
