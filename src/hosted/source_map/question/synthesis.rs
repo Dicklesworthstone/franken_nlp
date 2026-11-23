@@ -17,10 +17,9 @@ impl NlpEngine {
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), &config.identity)?;
         let required = requirements(config.native)?;
-        validate_synthesis(&config, source.len(), required.kv_bytes)?;
+        validate_synthesis(&config, source.len(), required.kv_bytes, planner.document_encoding())?;
         check_assets(&config.identity, planner.tokenizer_digest(), *planner.template_digest())?;
-        let bytes = sum(&[source.capacity() as u64, config.task.question.question.capacity() as u64,
-            config.preparation_reserve_bytes])?;
+        let bytes = input_bytes(&config, source.capacity(), &planner)?;
         let run = config.native.run;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
@@ -71,19 +70,28 @@ impl NlpEngine {
         })
     }
 }
-fn validate_synthesis(config: &SourceMapConfig<SourceQuestionSynthesis>, source_bytes: usize, kv_bytes: u64)
+fn validate_synthesis(config: &SourceMapConfig<SourceQuestionSynthesis>, source_bytes: usize, kv_bytes: u64,
+    encoding: &UntrustedEncoding)
     -> Result<(), HostedError> {
     validate_common(config, source_bytes, kv_bytes)?;
     if config.identity.task_spec != ANSWER_TASK_VERSION { return Err(HostedError::ModelIdentity); }
     config.task.question.validate().map_err(HostedError::SourceMap)?;
     let limits = config.task.limits;
-    if config.task.question.question.len() > config.planning.max_input_bytes
-        || config.task.question.question.len() > config.budget.max_input_tokens as usize
+    let byte_limit = match encoding {
+        UntrustedEncoding::ByteFallback => config.planning.max_input_bytes.min(config.budget.max_input_tokens as usize),
+        UntrustedEncoding::SafeBpeV1(policy) => config.planning.max_input_bytes.min(policy.max_input_bytes),
+    };
+    if config.task.question.question.len() > byte_limit
         || !(1..=1024).contains(&limits.max_evidence_passages) || limits.max_evidence_passages > config.planning.max_passages
         || limits.max_evidence_bytes == 0 || limits.max_evidence_bytes > config.planning.max_input_bytes {
         return Err(HostedError::Limits("question synthesis evidence or question limits"));
     }
     Ok(())
+}
+fn input_bytes(config: &SourceMapConfig<SourceQuestionSynthesis>, source_capacity: usize, planner: &SourceTaskPlanner)
+    -> Result<u64, HostedError> {
+    sum(&[super::super::input_bytes(config, source_capacity, planner)?,
+        config.task.question.question.capacity() as u64])
 }
 fn synthesis_bytes(limits: QuestionSynthesisLimits, verification: GroundingBudget, output: u64, tokens: u64)
     -> Result<u64, HostedError> {
@@ -97,6 +105,47 @@ fn synthesis_bytes(limits: QuestionSynthesisLimits, verification: GroundingBudge
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits};
+    fn config() -> SourceMapConfig<SourceQuestionSynthesis> {
+        let base = super::super::tests::config();
+        SourceMapConfig { identity: base.identity,
+            task: SourceQuestionSynthesis { question: base.task,
+                limits: QuestionSynthesisLimits { max_evidence_passages: 4, max_evidence_bytes: 1024 } },
+            budget: base.budget, planning: base.planning, mapping: base.mapping, native: base.native,
+            preparation_reserve_bytes: base.preparation_reserve_bytes,
+            reduction_reserve_bytes: base.reduction_reserve_bytes }
+    }
+    #[test]
+    fn compact_synthesis_admits_question_bytes_and_shared_workspace_before_native_work() {
+        let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 4096,
+            max_output_tokens: 4096, max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 });
+        let work = SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+            max_pair_checks: 1 << 26, max_pair_bytes: 1 << 30 };
+        let byte = super::super::tests::planner();
+        let compact = super::super::tests::planner().with_map_document_encoding(policy.clone(), work).unwrap();
+        let mut c = config(); c.task.question.question = " the".repeat(32);
+        assert!(c.task.question.question.len() > c.budget.max_input_tokens as usize);
+        validate_synthesis(&c, 10, 1024, &policy).unwrap();
+        assert!(validate_synthesis(&c, 10, 1024, &UntrustedEncoding::ByteFallback).is_err());
+        assert_eq!(input_bytes(&c, 1024, &compact).unwrap() - input_bytes(&c, 1024, &byte).unwrap(),
+            compact.map_document_encoding_workspace_bytes().unwrap());
+        let unbudgeted = super::super::tests::planner().with_document_encoding(policy.clone()).unwrap();
+        assert!(input_bytes(&c, 1024, &unbudgeted).is_err());
+        c.task.question.question = "q".repeat(4097);
+        assert!(validate_synthesis(&c, 10, 1024, &policy).is_err());
+        c.preparation_reserve_bytes = u64::MAX;
+        assert!(input_bytes(&c, 1024, &compact).is_err());
+    }
+    #[test]
+    fn byte_synthesis_preserves_original_question_capacity_and_preparation_charge() {
+        let mut c = config();
+        let mut question = String::with_capacity(8192); question.push_str("Who?");
+        c.task.question.question = question;
+        let planner = super::super::tests::planner();
+        validate_synthesis(&c, 10, 1024, &UntrustedEncoding::ByteFallback).unwrap();
+        assert_eq!(input_bytes(&c, 1024, &planner).unwrap(),
+            1024 + c.task.question.question.capacity() as u64 + c.preparation_reserve_bytes);
+    }
     #[test]
     fn evidence_origin_fanout_and_final_native_storage_are_additional_to_the_map() {
         let l = QuestionSynthesisLimits { max_evidence_passages: 32, max_evidence_bytes: 16384 };

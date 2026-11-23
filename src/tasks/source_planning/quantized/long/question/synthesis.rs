@@ -112,6 +112,22 @@ pub struct PreparedInt8QuestionSynthesis<'s> {
     source: &'s str,
     question: String,
     map: PreparedInt8Question<'s>,
+    // Share the exact nonrenewable encoding ledger that admitted discovery.
+    // An equal-policy caller planner cannot renew it for the evidence pass.
+    operation: SourceTaskPlanner,
+    identity: ExecutionIdentity,
+    budget: TaskBudget,
+    planning: SourcePlanningLimits,
+    mapping: Int8SourceMapLimits,
+    options: AnswerOptions,
+    expected: Int8QuestionSynthesisPreflight,
+}
+// Private continuation keeps the original source/question and encoding owner
+// after discovery. Callers cannot substitute evidence or a fresh allowance.
+struct Continuation<'s> {
+    source: &'s str,
+    question: String,
+    operation: SourceTaskPlanner,
     identity: ExecutionIdentity,
     budget: TaskBudget,
     planning: SourcePlanningLimits,
@@ -128,9 +144,9 @@ impl SourceTaskPlanner {
         planning: SourcePlanningLimits, mapping: Int8SourceMapLimits, control: &mut C)
         -> Result<Int8QuestionSynthesisPreflight, Int8SourceMapError> {
         checkpoint(control)?;
-        // Plain passage maps admit one shared compact ledger. Evidence
-        // synthesis has additional probes and retains its byte-only contract.
-        self.encoder.require_byte_encoding().map_err(Int8SourceError::from)?;
+        // A per-call compact policy cannot authorize composed discovery and
+        // synthesis. Its whole-document operation allowance must exist first.
+        self.map_document_encoding_workspace_bytes().map_err(Int8SourceError::from)?;
         let (discovery_limits, reserve) = reserve(request.limits, budget, planning, mapping)?;
         let discovery = self.preflight_int8_question_with_control(source, &request.question, budget, context,
             planning, discovery_limits, control)?;
@@ -142,12 +158,13 @@ impl SourceTaskPlanner {
         planning: SourcePlanningLimits, mapping: Int8SourceMapLimits, control: &mut C)
         -> Result<PreparedInt8QuestionSynthesis<'s>, Int8SourceMapError> {
         checkpoint(control)?;
-        self.encoder.require_byte_encoding().map_err(Int8SourceError::from)?;
+        let operation = self.retain_map_document_operation().map_err(Int8SourceError::from)?;
         let (discovery_limits, reserve) = reserve(request.limits, budget, planning, mapping)?;
         let map = self.plan_int8_question_with_control(source, &request.question, budget, context,
             planning, discovery_limits, control)?;
         let expected = expectation(map.preflight_metadata(), reserve, request.limits, mapping, control)?;
-        Ok(PreparedInt8QuestionSynthesis { source, question: copy(&request.question.question)?, map,
+        checkpoint(control)?;
+        Ok(PreparedInt8QuestionSynthesis { source, question: copy(&request.question.question)?, map, operation,
             identity: context.execution_identity().clone(), budget, planning, mapping, options: request.question.options, expected })
     }
 }
@@ -181,10 +198,20 @@ fn reserve(limits: QuestionSynthesisLimits, budget: TaskBudget, planning: Source
         .ok_or(Int8SourceMapError::WorkLimit)?;
     Ok((mapping, reserved))
 }
-impl PreparedInt8QuestionSynthesis<'_> {
+impl<'s> PreparedInt8QuestionSynthesis<'s> {
     pub fn preflight_metadata(&self) -> Int8QuestionSynthesisPreflight { self.expected }
     pub fn execution_identities(&self) -> impl ExactSizeIterator<Item = &ExecutionIdentity> { self.map.execution_identities() }
     pub fn max_result_bytes(&self) -> u64 { self.mapping.reduction.max_result_bytes as u64 }
+    fn check_planner(&self, planner: &SourceTaskPlanner) -> Result<(), Int8SourceMapError> {
+        if planner.tokenizer_digest() != self.identity.tokenizer_digest || *planner.template_digest() != self.identity.template_digest {
+            return Err(Int8SourceMapError::Admission);
+        }
+        Ok(())
+    }
+    fn into_phases(self) -> (PreparedInt8Question<'s>, Continuation<'s>) {
+        let Self { source, question, map, operation, identity, budget, planning, mapping, options, expected } = self;
+        (map, Continuation { source, question, operation, identity, budget, planning, mapping, options, expected })
+    }
     /// One real engine and controller for discovery AND the final evidence-only
     /// question. Insufficient evidence/context refuses; nothing is silently ranked
     /// away. All generated map answers remain in the completed output.
@@ -192,12 +219,21 @@ impl PreparedInt8QuestionSynthesis<'_> {
         planner: &SourceTaskPlanner, engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
         -> Result<Int8QuestionSynthesisRun, Int8SourceMapError> {
         checkpoint(control)?;
-        if planner.tokenizer_digest() != self.identity.tokenizer_digest || *planner.template_digest() != self.identity.template_digest {
-            return Err(Int8SourceMapError::Admission);
-        }
+        self.check_planner(planner)?;
         self.map.preflight(admitted, engine)?;
-        let Self { source, question, map, identity, budget, planning, mapping, options, expected } = self;
+        let mapping = self.mapping;
+        let (map, continuation) = self.into_phases();
         let discovery = map.execute_with_control(admitted, engine, vocabulary, control)?;
+        continuation.execute(discovery, control, |plan, control| {
+            synthesis_pass(plan, engine, vocabulary, mapping, control)
+        })
+    }
+}
+impl Continuation<'_> {
+    fn execute<C: DecodeStepControl, F>(self, discovery: Int8QuestionRun,
+        control: &mut C, run: F) -> Result<Int8QuestionSynthesisRun, Int8SourceMapError>
+        where F: FnOnce(&PreparedInt8SourceTask, &mut C) -> Result<Int8SourceTaskRun, Int8SourceMapError> {
+        let Self { source, question, operation, identity, budget, planning, mapping, options, expected } = self;
         expected.discovery.verify_completed_with_control(&discovery, control)?;
         let mut remaining = remaining_verification(&discovery, expected.discovery.verification, control)?;
         let collection = evidence::collect(source, discovery.mapped.root().value(), expected.limits, &mut remaining, control)?;
@@ -208,14 +244,10 @@ impl PreparedInt8QuestionSynthesis<'_> {
         } else {
             let context = PlanContext::new(&identity, budget).map_err(|_| Int8SourceMapError::Admission)?;
             let request = SourceTaskRequest::Answer { question, passages: collection.copy_passages()?, options, budget };
-            let plan = planner.plan_int8_with_control(&request, &context, planning, control)?;
+            let plan = operation.plan_int8_with_control(&request, &context, planning, control)?;
             let planned = plan.planned_work();
             if !within(planned, expected.synthesis_reserve) { return Err(Int8SourceMapError::WorkLimit); }
-            // Admit the actual dynamic evidence identity and full resident KV
-            // before the final forward; discovery success cannot waive this.
-            preflight_plans(std::slice::from_ref(&plan), std::slice::from_ref(plan.execution_identity()), engine)?;
-            let mut driver = NativeDriver { engine, vocabulary, control, limits: mapping };
-            let native = driver.run(&plan, plan.execution_identity())?;
+            let native = run(&plan, control)?;
             check_run(&plan, &native, mapping.mask_visits_per_chunk)?;
             extract_int8::check_size(&native, plan.max_result_bytes()).map_err(Int8SourceError::from)?;
             let work = native.model_work;
@@ -228,6 +260,15 @@ impl PreparedInt8QuestionSynthesis<'_> {
         finish(discovery, answer, passages, bytes, planned, work, masks, remaining, expected,
             mapping.reduction.max_result_bytes as u64, control)
     }
+}
+fn synthesis_pass<C: DecodeStepControl>(plan: &PreparedInt8SourceTask, engine: &mut StrictInt8Engine<'_>,
+    vocabulary: &ExtractionVocabulary, mapping: Int8SourceMapLimits, control: &mut C)
+    -> Result<Int8SourceTaskRun, Int8SourceMapError> {
+    // Admit the actual evidence identity and full resident KV before the
+    // final forward; a completed discovery cannot waive either requirement.
+    preflight_plans(std::slice::from_ref(plan), std::slice::from_ref(plan.execution_identity()), engine)?;
+    let mut driver = NativeDriver { engine, vocabulary, control, limits: mapping };
+    Ok(driver.run(plan, plan.execution_identity())?)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]

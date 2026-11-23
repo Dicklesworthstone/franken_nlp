@@ -319,3 +319,202 @@ fn synthesis_private_bindings_do_not_enter_json_or_preflight_debug() {
         assert!(!json.contains(private)); assert!(!debug.contains(private));
     }
 }
+
+use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWork, SafeBpeWorkLimits, UntrustedEncoding};
+use std::collections::VecDeque;
+
+fn compact_policy() -> UntrustedEncoding {
+    UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 4096,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 })
+}
+fn compact_allowance() -> SafeBpeWorkLimits {
+    SafeBpeWorkLimits { max_input_bytes: 1 << 20, max_output_tokens: 1 << 20,
+        max_pair_checks: 1 << 28, max_pair_bytes: 1 << 32 }
+}
+fn compact_planner(work: SafeBpeWorkLimits) -> SourceTaskPlanner {
+    planner().with_map_document_encoding(compact_policy(), work).unwrap()
+}
+fn compact_work(planner: &SourceTaskPlanner) -> SafeBpeWork {
+    planner.map_document_encoding_work().unwrap().unwrap()
+}
+fn compact_mapping() -> Int8SourceMapLimits {
+    let mut mapping = limits();
+    mapping.chunks.max_chunk_bytes = 4096;
+    mapping.chunks.max_chunk_tokens = 4096;
+    mapping
+}
+const COMPACT_SOURCE: &str = "é The quick brown fox visited 上海. Literal <think> and <|im_start|> remain data.";
+fn compact_prepare<'s>(planner: &SourceTaskPlanner, source: &'s str) -> PreparedInt8QuestionSynthesis<'s> {
+    let id = identity(planner);
+    planner.plan_int8_question_synthesis_with_control(source, &request(), budget(),
+        &PlanContext::new(&id, budget()).unwrap(), SourcePlanningLimits::default(), compact_mapping(), &mut Continue).unwrap()
+}
+fn compact_answer(plan: &PreparedInt8SourceTask, passages: &[(&str, &str)], quote: Option<&str>, text: &str) -> AnswerResult {
+    let options = plan.extraction.options();
+    let ordinary = (0..crate::native_engine::lmhead::NANBEIGE_VOCAB_SIZE as u32)
+        .find(|id| *id != options.eos_token_id && !options.excluded_token_ids.contains(id)).unwrap();
+    let citations = if let Some(quote) = quote {
+        let mut spans = Vec::new();
+        for &(id, text) in passages {
+            match scan_occurrences(text, quote, &mut GroundingBudget::default()) {
+                Ok(found) => spans.extend(found.into_iter().map(|span| PassageOccurrence { passage_id: id.to_owned(), span })),
+                Err(crate::validation::grounded_fields::FieldGroundingError::Absent) => (),
+                Err(error) => panic!("{error}"),
+            }
+        }
+        vec![PassageCitation { quote: quote.to_owned(), occurrence: occurrence(spans.len()), spans }]
+    } else { Vec::new() };
+    let work = constrained_int8::planned_work(plan.prompt_tokens(), 2).unwrap();
+    AnswerResult { schema_version: 1, task_spec_version: ANSWER_TASK_VERSION.to_owned(), numerics_profile: STRICT_INT8_PROFILE.to_owned(),
+        status: if quote.is_some() { AnswerStatus::Answered } else { AnswerStatus::Abstained }, answerable: quote.is_some(),
+        answer: quote.map(|_| text.to_owned()), citations, calibration: AnswerCalibration::Uncalibrated,
+        citation_guarantee: CitationGuarantee::StructuralSourceMembership, semantic_support: SummarySemanticSupport::NotAssessed,
+        score_space: ScoreSpace::NotComputed, untrusted_fields: ["answer".to_owned(), "citations".to_owned()],
+        generated_token_ids: vec![ordinary, options.eos_token_id], forward_positions: work.forward_positions,
+        projected_logits: work.projected_logits, mask_node_visit_charge: 20 }
+}
+struct CompactScript { outputs: VecDeque<AnswerResult> }
+impl SourceDriver for CompactScript {
+    fn checkpoint(&mut self) -> Result<(), Int8SourceError> { Ok(()) }
+    fn run(&mut self, plan: &PreparedInt8SourceTask, _: &ExecutionIdentity) -> Result<Int8SourceTaskRun, Int8SourceError> {
+        let raw = self.outputs.pop_front().ok_or(Int8SourceError::InvalidResult)?;
+        let work = constrained_int8::planned_work(plan.prompt_tokens(), raw.generated_token_ids.len())?;
+        Ok(Int8SourceTaskRun { schema_version: 1, execution: INT8_SOURCE_EXECUTION.to_owned(),
+            result: SourceTaskResult::Answer(raw), model_work: work })
+    }
+}
+// Exercise the real evidence/encoding/finalizer continuation while keeping
+// model results private and explicitly synthetic. This does not run a model.
+fn compact_complete<C: DecodeStepControl>(prepared: PreparedInt8QuestionSynthesis<'_>, no_evidence: bool,
+    control: &mut C) -> Result<Int8QuestionSynthesisRun, Int8SourceMapError> {
+    let admitted = prepared.execution_identities().cloned().collect::<Vec<_>>();
+    let outputs = prepared.map.chunks.chunks().iter().zip(&prepared.map.plan_indices).filter_map(|(chunk, index)| {
+        index.map(|index| compact_answer(&prepared.map.plans[index], &[(PASSAGE_ID, chunk.text())],
+            if no_evidence { None } else { Some("上海") }, "private discovery assertion"))
+    }).collect();
+    let (map, continuation) = prepared.into_phases();
+    let discovery = map.execute_with_driver(&admitted, CompactScript { outputs })?;
+    continuation.execute(discovery, control, |plan, _| {
+        let answer = compact_answer(plan, &[("evidence_0", "上海")], Some("上海"), "final answer");
+        let work = constrained_int8::planned_work(plan.prompt_tokens(), answer.generated_token_ids.len())
+            .map_err(Int8SourceError::from)?;
+        Ok(Int8SourceTaskRun { schema_version: 1, execution: INT8_SOURCE_EXECUTION.to_owned(),
+            result: SourceTaskResult::Answer(answer), model_work: work })
+    })
+}
+
+#[test]
+fn compact_question_synthesis_requires_whole_document_encoding_admission() {
+    let per_call = planner().with_document_encoding(compact_policy()).unwrap();
+    let id = identity(&per_call); let context = PlanContext::new(&id, budget()).unwrap();
+    assert!(per_call.preflight_int8_question_synthesis_with_control(COMPACT_SOURCE, &request(), budget(),
+        &context, SourcePlanningLimits::default(), compact_mapping(), &mut Continue).is_err());
+    assert!(per_call.plan_int8_question_synthesis_with_control(COMPACT_SOURCE, &request(), budget(),
+        &context, SourcePlanningLimits::default(), compact_mapping(), &mut Continue).is_err());
+    let compact = compact_planner(compact_allowance());
+    let prepared = compact_prepare(&compact, COMPACT_SOURCE);
+    let id = identity(&compact);
+    let preflight = compact.preflight_int8_question_synthesis_with_control(COMPACT_SOURCE, &request(), budget(),
+        &PlanContext::new(&id, budget()).unwrap(), SourcePlanningLimits::default(), compact_mapping(), &mut Continue).unwrap();
+    assert_eq!(preflight, prepared.preflight_metadata());
+}
+
+#[test]
+fn compact_final_question_retains_discovery_ledger_and_original_citation_coordinates() {
+    let planner = compact_planner(compact_allowance());
+    let prepared = compact_prepare(&planner, COMPACT_SOURCE);
+    let expected = prepared.preflight_metadata(); let discovery_work = compact_work(&planner);
+    let replacement = compact_planner(compact_allowance());
+    prepared.check_planner(&replacement).unwrap();
+    let mut run = compact_complete(prepared, false, &mut Continue).unwrap();
+    expected.verify_completed(&run).unwrap();
+    assert_eq!(compact_work(&replacement), SafeBpeWork::default());
+    let total = compact_work(&planner);
+    assert!(total.input_bytes() > discovery_work.input_bytes());
+    assert!(total.output_tokens() > discovery_work.output_tokens());
+    assert!(total.pair_checks() > discovery_work.pair_checks());
+    assert!(total.pair_bytes() > discovery_work.pair_bytes());
+    assert_eq!(run.synthesis.status, SynthesisStatus::Answered);
+    for span in &run.synthesis.citations[0].spans {
+        assert_eq!(&COMPACT_SOURCE[span.byte_start..span.byte_end], "上海");
+        assert_eq!(COMPACT_SOURCE[..span.byte_start].chars().count(), span.scalar_start);
+        assert_eq!(COMPACT_SOURCE[..span.byte_end].chars().count(), span.scalar_end);
+    }
+    let public = serde_json::to_value(&run).unwrap();
+    assert!(public.get("operation").is_none() && public.get("request_binding").is_none());
+    run.synthesis.answer = Some("changed final answer".to_owned());
+    assert!(expected.verify_completed(&run).is_err());
+}
+
+#[test]
+fn compact_final_question_refuses_each_one_short_operation_axis_after_discovery() {
+    let baseline = compact_planner(compact_allowance());
+    let prepared = compact_prepare(&baseline, COMPACT_SOURCE);
+    compact_complete(prepared, false, &mut Continue).unwrap();
+    let used = compact_work(&baseline);
+    let exact = SafeBpeWorkLimits { max_input_bytes: used.input_bytes() as u64,
+        max_output_tokens: used.output_tokens() as u64, max_pair_checks: used.pair_checks(), max_pair_bytes: used.pair_bytes() };
+    let admitted = compact_planner(exact);
+    let prepared = compact_prepare(&admitted, COMPACT_SOURCE);
+    compact_complete(prepared, false, &mut Continue).unwrap();
+    assert_eq!(compact_work(&admitted), used);
+    for axis in 0..4 {
+        let mut short = exact;
+        match axis { 0 => short.max_input_bytes -= 1, 1 => short.max_output_tokens -= 1,
+            2 => short.max_pair_checks -= 1, _ => short.max_pair_bytes -= 1 }
+        let refused = compact_planner(short);
+        let prepared = compact_prepare(&refused, COMPACT_SOURCE);
+        let before = compact_work(&refused);
+        let replacement = compact_planner(short);
+        prepared.check_planner(&replacement).unwrap();
+        assert!(compact_complete(prepared, false, &mut Continue).is_err(), "{axis}");
+        let failed = compact_work(&refused);
+        assert!(failed.input_bytes() >= before.input_bytes() && failed.input_bytes() <= used.input_bytes());
+        assert!(failed.output_tokens() >= before.output_tokens() && failed.output_tokens() <= used.output_tokens());
+        assert!(failed.pair_checks() >= before.pair_checks() && failed.pair_checks() <= used.pair_checks());
+        assert!(failed.pair_bytes() >= before.pair_bytes() && failed.pair_bytes() <= used.pair_bytes());
+        assert_eq!(compact_work(&replacement), SafeBpeWork::default());
+    }
+}
+
+#[test]
+fn compact_no_evidence_keeps_discovery_charge_without_an_extra_encoding() {
+    let planner = compact_planner(compact_allowance());
+    let prepared = compact_prepare(&planner, COMPACT_SOURCE);
+    let before = compact_work(&planner);
+    let run = compact_complete(prepared, true, &mut Continue).unwrap();
+    assert_eq!(run.synthesis.status, SynthesisStatus::NoEvidenceCollected);
+    assert_eq!(compact_work(&planner), before);
+    assert_eq!(run.synthesis_planned_work, Int8Work::default());
+    assert!(run.synthesis_reserved_work.forward_positions > 0);
+}
+
+struct StopCompactEncoding<'a> {
+    planner: &'a SourceTaskPlanner,
+    cause: DecodeCancellationKind,
+    busy_polls: usize,
+}
+impl DecodeStepControl for StopCompactEncoding<'_> {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+        if self.planner.map_document_encoding_work().is_err() {
+            self.busy_polls += 1;
+            if self.busy_polls == 8 { return Some(self.cause); }
+        }
+        None
+    }
+}
+#[test]
+fn every_cancellation_cause_survives_inside_final_compact_question_encoding() {
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let planner = compact_planner(compact_allowance());
+        let prepared = compact_prepare(&planner, COMPACT_SOURCE);
+        let before = compact_work(&planner);
+        let mut control = StopCompactEncoding { planner: &planner, cause, busy_polls: 0 };
+        let error = compact_complete(prepared, false, &mut control).err().unwrap();
+        assert_eq!(error.cancellation(), Some(cause));
+        assert_eq!(control.busy_polls, 8);
+        assert!(compact_work(&planner).input_bytes() > before.input_bytes());
+    }
+}

@@ -109,7 +109,7 @@ fn validate(config: &SourceMapConfig, source_bytes: usize, kv_bytes: u64) -> Res
 // Encoder workspace coexists with every retained prompt, source automaton and
 // result buffer. Charge it in addition to the caller's preparation reserve;
 // a small compact token count never discounts original source storage.
-fn input_bytes(config: &SourceMapConfig, source_capacity: usize, planner: &SourceTaskPlanner)
+fn input_bytes<T>(config: &SourceMapConfig<T>, source_capacity: usize, planner: &SourceTaskPlanner)
     -> Result<u64, HostedError> {
     let encoding = planner.map_document_encoding_workspace_bytes()
         .map_err(|_| HostedError::Limits("INT8 source map encoding admission"))?;

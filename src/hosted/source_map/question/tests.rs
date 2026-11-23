@@ -6,7 +6,7 @@ use crate::{execution_identity::{NumericsProfile, ThinkingMode, ToolMode},
     tokenizer::{pinned_controls, untrusted::{SafeBpeLimits, SafeBpeWorkLimits}},
     validation::grounded_fields::GroundingBudget};
 
-fn config() -> SourceMapConfig<SourceQuestion> {
+pub(super) fn config() -> SourceMapConfig<SourceQuestion> {
     let d = Sha256Digest::of_bytes(b"host-question-model-free-fixture");
     let identity = ExecutionIdentity { schema_version: 1, source_revision: "fixture".to_owned(), logical_model_digest: d,
         artifact_format: "fixture".to_owned(), quant_recipe: "int8-fixture".to_owned(), packing_set_digest: d,
@@ -31,7 +31,7 @@ fn config() -> SourceMapConfig<SourceQuestion> {
             run: RunLimits { max_elapsed: Duration::from_secs(1), max_checkpoints: 100, cleanup_reserve_bytes: 4096 } },
         preparation_reserve_bytes: 4096, reduction_reserve_bytes: 4096 }
 }
-fn planner() -> SourceTaskPlanner {
+pub(super) fn planner() -> SourceTaskPlanner {
     let controls = pinned_controls::pinned().unwrap();
     let eos = controls.template_controls().entries().iter()
         .find(|e| e.special && e.surface == "<|im_end|>").unwrap().id;
