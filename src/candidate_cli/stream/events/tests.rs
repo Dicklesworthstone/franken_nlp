@@ -552,3 +552,47 @@ fn int4_stop_suffix_and_output_failure_use_the_same_no_retry_protocol() {
         assert_eq!(before, (s.writer.calls, s.writer.flushes, s.writer.bytes.len()));
     }
 }
+
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn int8_compute_receipt_is_terminal_metadata_without_changing_token_or_result_bytes() {
+    let mut serial = sink(false); let mut threaded = sink(false);
+    for s in [&mut serial, &mut threaded] {
+        push(s, event(0, 1, b"a", false));
+        push(s, event(1, 166101, b"", false));
+    }
+    assert_eq!(serial.writer, threaded.writer);
+    let result = completion(&serial, GenerationFinish::Eos);
+    let receipt = crate::hosted::Int8ComputeReceipt { schedule: "int8-output-row-team-v1",
+        compute_threads: 4, completed_projections: 20, completed_rows: 400, completed_worker_rows: 300 };
+    serial.finish(&result).unwrap();
+    threaded.finish_with_compute(&result, &receipt).unwrap();
+    let serial_rows = rows(&serial.writer); let threaded_rows = rows(&threaded.writer);
+    assert_eq!(serial_rows[..3], threaded_rows[..3]);
+    assert!(serial_rows.iter().all(|row| row.get("compute").is_none()));
+    assert_eq!(threaded_rows[3]["data"], serial_rows[3]["data"]);
+    assert_eq!(threaded_rows[3]["compute"], serde_json::to_value(receipt).unwrap());
+    assert!(threaded.writer.len() as u64 <= threaded.bounds.stream_bytes);
+}
+
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn int8_compute_receipt_cannot_bypass_terminal_validation_or_reserved_capacity() {
+    let receipt = crate::hosted::Int8ComputeReceipt { schedule: "int8-output-row-team-v1",
+        compute_threads: 2, completed_projections: 1, completed_rows: 8, completed_worker_rows: 4 };
+    let mut s = sink(false); push(&mut s, event(0, 1, b"a", false));
+    let result = completion(&s, GenerationFinish::ByteLimit);
+    let mut wrong = result.clone(); wrong.result.content.push('b');
+    let before = s.writer.len();
+    assert!(s.finish_with_compute(&wrong, &receipt).is_err());
+    assert_eq!(s.writer.len(), before);
+
+    let mut s = sink(false); push(&mut s, event(0, 1, b"a", false));
+    let result = completion(&s, GenerationFinish::ByteLimit);
+    let serial_size = s.frame("run_complete", false, &result, s.bounds.terminal_bytes).unwrap().len();
+    s.bounds.terminal_bytes = serial_size;
+    let before = s.writer.len();
+    assert_eq!(s.finish_with_compute(&result, &receipt).unwrap_err().code, "stream_frame_limit");
+    assert_eq!(s.writer.len(), before);
+    assert!(s.finish(&result).is_err(), "a failed sink never retries terminal publication");
+}

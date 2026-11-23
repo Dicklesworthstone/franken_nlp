@@ -26,7 +26,7 @@ pub(super) struct StreamArgs {
     /// Independent of --max-output-bytes, which bounds generated content only.
     #[arg(long, default_value_t = 16_777_216)] pub max_stream_bytes: u64,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct StreamBounds {
     pub tokens: usize, pub content_bytes: usize, pub capture_logprobs: bool,
     pub event_bytes: usize, pub terminal_bytes: usize,
@@ -34,46 +34,60 @@ pub(super) struct StreamBounds {
 }
 impl StreamArgs {
     pub(super) fn validate(&self) -> Result<(Limits, StreamBounds), Failure> {
-        let limits = self.common.validate()?;
-        if self.max_stream_bytes == 0 || self.max_stream_bytes > 1024 * MIB {
-            return Err(Failure::usage("stream_transport_options"));
-        }
-        let a = &self.common;
-        let event_bytes = a.max_output_bytes.checked_mul(4).and_then(|n| n.checked_add(FRAME_BYTES))
-            .ok_or_else(|| Failure::usage("stream_size_arithmetic"))?;
-        let terminal_bytes = limits.result_bytes.checked_add(FRAME_BYTES)
-            .ok_or_else(|| Failure::usage("stream_size_arithmetic"))?;
-        // u8 JSON arrays cost at most four bytes per source byte. Fixed framing
-        // is bounded independently for EVERY token, including an empty EOS.
-        let wire_floor = (a.max_new_tokens as u64).checked_mul(FRAME_BYTES as u64)
-            .and_then(|n| n.checked_add(a.max_output_bytes as u64 * 4))
-            .and_then(|n| n.checked_add(FRAME_BYTES as u64 + terminal_bytes as u64))
-            .ok_or_else(|| Failure::usage("stream_size_arithmetic"))?;
-        if self.max_stream_bytes < wire_floor { return Err(Failure::usage("stream_transport_too_small")); }
-        // Retained byte/token/score reconciliation plus one staged permit and
-        // canonical serializer trees. This is a model, not an allocator cap.
-        let sink_memory_bytes = (event_bytes as u64).checked_add(terminal_bytes as u64)
-            .and_then(|n| n.checked_mul(8)).and_then(|n| n.checked_add(16 * MIB))
-            .and_then(|n| n.checked_add(a.max_output_bytes as u64 * 2))
-            .and_then(|n| n.checked_add(a.max_new_tokens as u64 * 64))
-            .ok_or_else(|| Failure::usage("stream_memory_arithmetic"))?;
-        let minimum = limits.preparation_bytes.checked_mul(2)
-            .and_then(|n| n.checked_add(sink_memory_bytes)).and_then(|n| n.checked_add(limits.weight_bytes))
-            .ok_or_else(|| Failure::usage("stream_memory_arithmetic"))?;
-        if minimum > limits.memory_bytes {
-            return Err(Failure { exit: ErrorCode::AdmissionOrResourceLimit, code: "stream_memory_floor", cancellation: None });
-        }
-        Ok((limits, StreamBounds { tokens: a.max_new_tokens, content_bytes: a.max_output_bytes,
-            capture_logprobs: a.logprobs, event_bytes, terminal_bytes,
-            stream_bytes: self.max_stream_bytes, sink_memory_bytes }))
+        admit(&self.common, self.max_stream_bytes)
     }
+}
+
+/// The public parser and runtime entry use the same complete stream quote.
+/// Physical scheduling cannot consume an earlier, smaller sink or worker quote.
+pub(in crate::candidate_cli) fn admit(a: &CandidateArgs, max_stream_bytes: u64)
+    -> Result<(Limits, StreamBounds), Failure> {
+    let limits = a.validate()?;
+    if max_stream_bytes == 0 || max_stream_bytes > 1024 * MIB {
+        return Err(Failure::usage("stream_transport_options"));
+    }
+    let event_bytes = a.max_output_bytes.checked_mul(4).and_then(|n| n.checked_add(FRAME_BYTES))
+        .ok_or_else(|| Failure::usage("stream_size_arithmetic"))?;
+    let terminal_bytes = limits.result_bytes.checked_add(FRAME_BYTES)
+        .ok_or_else(|| Failure::usage("stream_size_arithmetic"))?;
+    // u8 JSON arrays cost at most four bytes per source byte. Fixed framing
+    // is bounded independently for EVERY token, including an empty EOS.
+    let wire_floor = (a.max_new_tokens as u64).checked_mul(FRAME_BYTES as u64)
+        .and_then(|n| n.checked_add(a.max_output_bytes as u64 * 4))
+        .and_then(|n| n.checked_add(FRAME_BYTES as u64 + terminal_bytes as u64))
+        .ok_or_else(|| Failure::usage("stream_size_arithmetic"))?;
+    if max_stream_bytes < wire_floor { return Err(Failure::usage("stream_transport_too_small")); }
+    // Retained byte/token/score reconciliation plus one staged permit and
+    // canonical serializer trees. This is a model, not an allocator cap.
+    let sink_memory_bytes = (event_bytes as u64).checked_add(terminal_bytes as u64)
+        .and_then(|n| n.checked_mul(8)).and_then(|n| n.checked_add(16 * MIB))
+        .and_then(|n| n.checked_add(a.max_output_bytes as u64 * 2))
+        .and_then(|n| n.checked_add(a.max_new_tokens as u64 * 64))
+        .ok_or_else(|| Failure::usage("stream_memory_arithmetic"))?;
+    // CLI preparation, the moved plan, sink reconciliation, whole resident
+    // KV, coordinator prompt scratch and every fixed worker buffer coexist.
+    // Neither streaming nor a wider team discounts any other live owner.
+    let native = Int8MemoryRequirement::for_context(a.context_tokens)
+        .map_err(|_| Failure::usage("stream_memory_arithmetic"))?;
+    let prefill_bytes = a.policy.prefill()?.map(|prefill| prefill.max_extra_scratch_bytes).unwrap_or(0);
+    let minimum = compute::request_peak_bytes(limits, native, limits.result_bytes as u64,
+        a.max_new_tokens as u64, SAMPLER_BYTES, limits.preparation_bytes)?
+        .checked_add(sink_memory_bytes).and_then(|n| n.checked_add(prefill_bytes))
+        .ok_or_else(|| Failure::usage("stream_memory_arithmetic"))?;
+    if minimum > limits.memory_bytes {
+        return Err(Failure { exit: ErrorCode::AdmissionOrResourceLimit, code: "stream_memory_floor", cancellation: None });
+    }
+    Ok((limits, StreamBounds { tokens: a.max_new_tokens, content_bytes: a.max_output_bytes,
+        capture_logprobs: a.logprobs, event_bytes, terminal_bytes,
+        stream_bytes: max_stream_bytes, sink_memory_bytes }))
 }
 pub(super) fn definition() -> clap::Command {
     StreamCommand::augment_args(clap::Command::new("stream")
         .about("Stream native generation/chat as bounded provisional token NDJSON")
         .long_about("Explicit non-certified local INT8 model only. Emits run_start, token and, only after native drain and independent final validation, run_complete. Token data contains exact u8 byte arrays, which may split UTF-8 characters. EOF, an EOS token or a partial line is NOT successful completion. Errors emit a content-free run_error on stderr and exit nonzero; stdout is never retried after a failed write. The final frame contains the same complete task result as buffered generation. No network, thinking or tool execution. Blocking writes apply backpressure and are not safely preemptible."))
-        .mut_subcommand("generate", input_encoding::definition)
-        .mut_subcommand("chat", input_encoding::definition)
+        .after_long_help("--compute-threads 2..=64 selects one persistent INT8 row team across the complete stream; 1 retains serial execution. Combine it with --prefill-rows 1..=64 to reuse that team for bounded layer-major prompt morsels and every decoded token. The complete native, prompt, worker and transport memory is admitted before input/model IO. All workers join before run_complete, which reports physical compute separately from the unchanged task result.")
+        .mut_subcommand("generate", |command| compute::definition(input_encoding::definition(command)))
+        .mut_subcommand("chat", |command| compute::definition(input_encoding::definition(command)))
 }
 impl StreamCommand {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
@@ -84,6 +98,7 @@ impl StreamCommand {
             Operation::Generate(args) | Operation::Chat(args) => &mut args.common,
         };
         common.input_encoding = input_encoding::InputEncodingArgs::from_matches(request)?;
+        common.compute = compute::Args::from_matches(request)?;
         Ok(command)
     }
 

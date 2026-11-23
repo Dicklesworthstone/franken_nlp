@@ -70,7 +70,7 @@ backend and numerical profile; no cross-host parity claim is introduced.
 
 ## Persistent INT8 CPU teams
 
-Buffered `generate` and `chat` accept `--compute-threads N`, from 1 through 64.
+Buffered and streamed `generate` and `chat` accept `--compute-threads N`, from 1 through 64.
 Width 1 is the default and retains the existing serial response shape. A larger
 width forms one fixed CPU team for the complete request:
 
@@ -102,7 +102,7 @@ Threaded responses add a `compute` object with schedule
 work, not speedup or a numerical-fidelity certificate. Width 1 adds no such
 object. Compact encoding retains its ordinary request identity and input policy.
 
-Buffered generation and chat can combine the team with bounded layer-major
+Buffered and streamed generation and chat can combine the team with bounded layer-major
 prompt prefill. `--prefill-rows` accepts 1 through 64 rows per prompt morsel:
 
 ```sh
@@ -126,9 +126,12 @@ both prefill and decode. Vocabulary-head buffers retain single-row capacity.
 The same shared startup verifies the admitted width and batch workspace.
 
 Omitting `--prefill-rows` keeps token-ordered prefill. Width 1 keeps the existing
-serial path. INT8 streams, text batches and retained text jobs do not expose
-compute-team controls; source-task teams keep their separate single-row
-capability. The composed schedule has regression definitions, including an
+serial path. Live token streams retain their sink and preparation charges until
+every worker joins and the terminal frame has been delivered; only that frame
+includes the physical compute receipt. See [streaming](candidate-streaming.md#persistent-int8-workers).
+INT8 text batches and retained text jobs do not expose compute-team controls.
+One-shot source, extraction and scored tasks also compose workers and prompt
+prefill under their own admission contracts. The composed schedule has regression definitions, including an
 explicit artifact-dependent parity test, but no measured speedup or full-model
 equivalence claim.
 

@@ -49,6 +49,11 @@ fn preparation_cancelled(cause: DecodeCancellationKind) -> CandidateError {
 
 pub(in crate::candidate_cli) fn execute<W: Write + Send + 'static>(task: Task, args: CandidateArgs,
     limits: Limits, bounds: StreamBounds, input: &mut impl Read, output: W) -> Result<(), Failure> {
+    let current = crate::candidate_cli::stream::admit(&args, bounds.stream_bytes)?;
+    if current != (limits, bounds) {
+        return Err(Failure::usage("stream_admitted_options_mismatch"));
+    }
+    let prefill = args.policy.prefill()?;
     let encoding = args.input_encoding_policy(limits)?;
     // Declared first: initial input, token verification buffers, metadata and
     // planner allocations remain covered before transfer to the charged host.
@@ -66,15 +71,28 @@ pub(in crate::candidate_cli) fn execute<W: Write + Send + 'static>(task: Task, a
     let model = session.load(&args, limits, &facts, cancellation.clone())?;
     let stream_limits = ChatStreamLimits { native: session.native(&args)?, max_sampler_bytes: SAMPLER_BYTES,
         preparation_reserve_bytes: limits.preparation_bytes, sink_reserve_bytes: bounds.sink_memory_bytes };
-    let mut completed = match args.policy.prefill()? {
-        Some(prefill) => session.engine.execute_int8_chat_stream_layer_major(&model, prepared, 1,
-            stream_limits, prefill, sink, cancellation),
-        None => session.engine.execute_int8_chat_stream(&model, prepared, 1, stream_limits, sink, cancellation),
+    let mut completed = if limits.compute.threads > 1 {
+        match prefill {
+            Some(prefill) => session.engine.execute_int8_chat_stream_layer_major_parallel(&model, prepared, 1,
+                stream_limits, prefill, limits.compute.threads, sink, cancellation),
+            None => session.engine.execute_int8_chat_stream_parallel(&model, prepared, 1,
+                stream_limits, limits.compute.threads, sink, cancellation),
+        }
+    } else {
+        match prefill {
+            Some(prefill) => session.engine.execute_int8_chat_stream_layer_major(&model, prepared, 1,
+                stream_limits, prefill, sink, cancellation),
+            None => session.engine.execute_int8_chat_stream(&model, prepared, 1, stream_limits, sink, cancellation),
+        }
     }.map_err(host_failure)?;
     // No native callback can mint the terminal frame. This point is AFTER the
     // physical scope joins and dispatch's cancellation/stop precedence resolves.
     session.remaining()?;
-    completed.with_sink(|result, sink| sink.finish(result))
+    let compute = completed.compute().copied();
+    completed.with_sink(|result, sink| match compute.as_ref() {
+        Some(compute) => sink.finish_with_compute(result, compute),
+        None => sink.finish(result),
+    })
 }
 
 fn cancelled(cause: DecodeCancellationKind) -> Failure {

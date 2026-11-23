@@ -100,7 +100,7 @@ pub(crate) struct CandidateArgs {
     /// consumers of the shared arguments retain byte-fallback admission.
     #[arg(skip)]
     input_encoding: input_encoding::InputEncodingArgs,
-    /// Only buffered generate/chat explicitly expose the physical row team.
+    /// Supported text routes explicitly expose the physical row team.
     #[arg(skip)]
     compute: compute::Args,
 }
@@ -283,7 +283,7 @@ impl CandidateCommand {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Limits {
     memory_bytes: u64,
     weight_bytes: u64,

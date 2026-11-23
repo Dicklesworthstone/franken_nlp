@@ -103,3 +103,61 @@ fn disabled_profile_never_opens_input_model_or_output() {
         assert_eq!(error.code, "stream_profile_unavailable");
     }
 }
+
+#[test]
+fn stream_teams_compose_with_prefill_and_preserve_sampling_and_transport_contracts() {
+    use crate::native_engine::strict_int8::projection::int8_team_workspace_bytes_with_prefill;
+    for task in ["generate", "chat"] {
+        let serial = args(task, &[]);
+        let serial_quote = serial.validate().unwrap();
+        assert_eq!(serial_quote, args(task, &["--compute-threads", "1"]).validate().unwrap());
+        for (width, rows) in [(2, 1), (4, 4), (64, 64)] {
+            let mut threaded = args(task, &["--compute-threads", &width.to_string(),
+                "--prefill-rows", &rows.to_string()]);
+            threaded.common.memory_mib = 16384;
+            let (limits, bounds) = threaded.validate().unwrap();
+            assert_eq!(limits.compute.threads, width);
+            assert_eq!(limits.compute.workspace_bytes, int8_team_workspace_bytes_with_prefill(width, rows).unwrap());
+            assert_eq!(bounds, serial_quote.1);
+            assert_eq!(limits.kv_bytes, serial_quote.0.kv_bytes);
+            assert_eq!(limits.max_prompt_tokens, serial_quote.0.max_prompt_tokens);
+            assert!(threaded.common.options(166101).unwrap() == serial.common.options(166101).unwrap());
+        }
+    }
+}
+
+#[test]
+fn stream_memory_admits_native_prefill_workers_and_both_preparation_owners_before_io() {
+    for width in ["1", "4", "64"] {
+        let mut a = args("generate", &["--compute-threads", width, "--prefill-rows", "64"]);
+        a.common.memory_mib = 16384;
+        let (limits, bounds) = a.validate().unwrap();
+        let native = Int8MemoryRequirement::for_context(a.common.context_tokens).unwrap();
+        let prefill = a.common.policy.prefill().unwrap().unwrap().validate().unwrap();
+        let required = compute::request_peak_bytes(limits, native, limits.result_bytes as u64,
+            a.common.max_new_tokens as u64, SAMPLER_BYTES, limits.preparation_bytes).unwrap()
+            + bounds.sink_memory_bytes + prefill;
+        a.common.memory_mib = required.div_ceil(MIB);
+        a.validate().unwrap();
+        a.common.memory_mib -= 1;
+        assert_eq!(a.validate().err().unwrap().code, "stream_memory_floor");
+    }
+}
+
+#[test]
+fn impossible_stream_schedule_or_memory_never_touches_private_io() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("unadmitted input") } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("unadmitted output") }
+        fn flush(&mut self) -> io::Result<()> { panic!("unadmitted flush") }
+    }
+    for extra in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+        vec!["--compute-threads", "4", "--prefill-rows", "0"],
+        vec!["--compute-threads", "4", "--prefill-rows", "65"],
+        vec!["--compute-threads", "2", "--max-weight-mib", "8192"]] {
+        for (task, kind) in [("generate", Task::Generate), ("chat", Task::Chat)] {
+            assert!(execute(kind, args(task, &extra), &mut NoIo, NoIo).is_err());
+        }
+    }
+}

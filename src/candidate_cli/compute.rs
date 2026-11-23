@@ -1,4 +1,4 @@
-//! Physical INT8 row teams are explicitly exposed by supported one-shot routes.
+//! Physical INT8 row teams are explicitly exposed by supported task routes.
 use super::*;
 use crate::native_engine::strict_int8::{prefill::Int8PrefillLimits,
     projection::{int8_team_workspace_bytes, int8_team_workspace_bytes_with_prefill}};
@@ -31,7 +31,7 @@ pub(super) struct Admission { pub threads: usize, pub workspace_bytes: u64 }
 pub(super) fn definition(command: clap::Command) -> clap::Command {
     command.arg(clap::Arg::new("compute_threads").long("compute-threads")
         .value_name("N").value_parser(clap::value_parser!(usize)).default_value("1")
-        .help("Coordinator plus persistent INT8 row workers, 1..=64; 1 keeps serial execution. One fixed team serves this complete request across both decoder passes, prompt tokens and generation. Runtime threads are additional. Worker storage and native memory are admitted before input/model IO. Buffered generate/chat, schema extraction, one-request source tasks, classification, sentiment and judgment can combine workers with --prefill-rows on the same team. Maps, streams, batches and jobs do not expose this option"))
+        .help("Coordinator plus persistent INT8 row workers, 1..=64; 1 keeps serial execution. One fixed team serves this complete request across both decoder passes, prompt tokens and generation. Runtime threads are additional. Worker storage and native memory are admitted before input/model IO. Buffered and streamed generate/chat, schema extraction, one-request source tasks, classification, sentiment and judgment can combine workers with --prefill-rows on the same team. Maps, batches and jobs do not expose this option"))
 }
 
 /// Price the entire simultaneously live threaded request, including the

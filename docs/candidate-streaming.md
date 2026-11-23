@@ -56,6 +56,11 @@ The frame sequence is:
 | `token` | `provisional: true`; `data` is the existing `DecodeTokenEvent`: schema version, request sequence, zero-based token index, token ID, exact `decoded_bytes`, and optional raw logprob. |
 | `run_complete` | `provisional: false`; `data` is the complete validated `Int8ChatResult`, including final text, all token IDs, finish reason, effective seed, optional scores and complete native model work. |
 
+With `--compute-threads` greater than one, only `run_complete` additionally
+contains a top-level `compute` object. It reports the joined team's physical
+projection and row counters; the task `data` and provisional frame shape stay
+unchanged. The serial default omits this field.
+
 The completed result intentionally repeats the accumulated content once. This
 lets clients reconcile delivered token events with the same complete task result
 returned in the buffered response's `output` field. The outer wrappers differ.
@@ -140,6 +145,50 @@ same sink and output memory guards remain alive during final publication. Failed
 host invocations drop their owned sink after drain; earlier emitted tokens remain
 provisional. Embedders must price their own sink buffers and preserve that same
 terminal-completion discipline.
+
+## Persistent INT8 workers
+
+Live `generate` and `chat` accept `--compute-threads 1..=64`. Width one is the
+serial default. A larger width selects one coordinator and `N - 1` persistent
+output-row workers for the complete prompt and generated continuation. The same
+team can execute bounded layer-major prompt morsels with `--prefill-rows 1..=64`:
+
+```sh
+fnlp candidate stream chat messages.json \
+  --model ./model.fnlpq --memory-mib 8192 \
+  --compute-threads 4 --prefill-rows 4 \
+  --input-encoding safe-bpe-v1 --logprobs > chat-tokens.ndjson
+```
+
+Each worker uses the existing exact scalar row kernel. The coordinator retains
+causal KV order, both loop-boundary norms, the full-vocabulary head, sampler
+addressing and cumulative native work. The fixed team is reused throughout;
+projections do not create threads or renew a budget. Compact input, sampling,
+stop suffixes and minimum-token rules retain their existing request semantics.
+
+Admission checks the simultaneous model, native KV/RoPE/scratch, sampler,
+coordinator prefill workspace, fixed worker buffers, both preparation owners,
+sink reconciliation and output staging before private input or model IO. The
+runtime recomputes this same quote and rejects stale or changed limits before
+creating its resource host. A width or row count outside its bounds refuses;
+insufficient memory never silently selects a smaller schedule.
+
+The embedding methods are
+`NlpEngine::execute_int8_chat_stream_parallel(model, prepared, request_seq, limits, compute_threads, sink, cancellation)`
+and
+`NlpEngine::execute_int8_chat_stream_layer_major_parallel(model, prepared, request_seq, limits, prefill, compute_threads, sink, cancellation)`.
+Existing serial methods remain available. `HostedChatStream::compute()` returns
+the optional physical receipt only after the entire team joins. The original
+cancellation state is checked after drain; the sink and memory claims survive
+errors, cancellation and panic until that drain completes. A last token or EOS
+callback still cannot authorize terminal success.
+
+Regression definitions cover composed schedules, unchanged request identities
+and generation policy, full memory admission, stale quotes, terminal-only
+receipts, finite frame capacity and sink lifecycle. The artifact-dependent
+differential remains an explicit ignored qualification gate. Rust compilation,
+executable regressions, model parity and measured performance remain pending
+the repository-required DSR checkpoint; these changes make no speedup claim.
 
 ## Grouped INT4 streams with packed prompts and workers
 

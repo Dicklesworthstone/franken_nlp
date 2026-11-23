@@ -2,7 +2,7 @@ use super::*;
 use crate::candidate_cli::tests::args;
 
 #[test]
-fn buffered_generate_and_chat_expose_the_fixed_team_without_enabling_corpora() {
+fn buffered_and_streamed_text_expose_the_fixed_team_without_enabling_corpora() {
     for task in ["generate", "chat"] {
         for width in ["1", "2", "7", "64"] {
             let matches = super::super::definition().try_get_matches_from(["candidate", task,
@@ -14,9 +14,8 @@ fn buffered_generate_and_chat_expose_the_fixed_team_without_enabling_corpora() {
             assert_eq!(limits.compute.workspace_bytes, if width == "1" { 0 }
                 else { int8_team_workspace_bytes(limits.compute.threads).unwrap() });
         }
-        let matches = super::super::definition().try_get_matches_from(["candidate", "stream", task,
-            "--model", "m", "--memory-mib", "8192", "--compute-threads", "2"]);
-        assert_eq!(matches.unwrap_err().kind(), clap::error::ErrorKind::UnknownArgument);
+        let stream = crate::candidate_cli::stream::tests::args(task, &["--compute-threads", "2"]);
+        assert_eq!(stream.validate().unwrap().0.compute.threads, 2);
     }
     assert_eq!(super::super::definition().try_get_matches_from(["candidate", "text-batch",
         "--model", "m", "--memory-mib", "8192", "--compute-threads", "2"])

@@ -220,6 +220,13 @@ impl<W: Write> TokenSink<W> {
     pub(in crate::candidate_cli) fn finish(&mut self, result: &Int8ChatResult) -> Result<(), Failure> {
         self.finish_result(result, result.schema_version, &result.result, Backend::Int8, true, None::<&()>)
     }
+    /// A physical receipt belongs only to the post-join terminal frame. The
+    /// same result reconciliation and reserved transport bound still apply.
+    #[cfg(feature = "asupersync-runtime")]
+    pub(in crate::candidate_cli) fn finish_with_compute(&mut self, result: &Int8ChatResult,
+        compute: &crate::hosted::Int8ComputeReceipt) -> Result<(), Failure> {
+        self.finish_result(result, result.schema_version, &result.result, Backend::Int8, true, Some(compute))
+    }
     pub(in crate::candidate_cli) fn finish_int4(&mut self, result: &Int4ChatResult) -> Result<(), Failure> {
         self.finish_int4_receipt(result, None::<&()>)
     }

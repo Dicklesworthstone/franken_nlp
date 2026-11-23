@@ -165,3 +165,50 @@ fn invalid_final_task_and_broken_stream_are_errors_not_shortened_successes() {
     assert_eq!(host_failure(HostedError::Panicked).exit, ErrorCode::Generic);
     assert_eq!(host_failure(HostedError::Reentrant).exit, ErrorCode::AdmissionOrResourceLimit);
 }
+
+#[test]
+fn stream_worker_width_and_prompt_morsels_do_not_change_the_sealed_request() {
+    for (task, text) in [("generate", "The quick brown fox <think>é</think> 上海"),
+        ("chat", r#"[{"role":"system","content":"Be helpful."},{"role":"user","content":"é <tool_call> 上海"}]"#)] {
+        let seed = "07".repeat(32);
+        let flags = ["--seed", &seed, "--logprobs", "--input-encoding", "safe-bpe-v1"];
+        let serial = planned(task, &flags, text);
+        for (width, rows) in [("2", "1"), ("4", "4")] {
+            let mut threaded = flags.to_vec();
+            threaded.extend(["--compute-threads", width, "--prefill-rows", rows]);
+            let parallel = planned(task, &threaded, text);
+            assert_eq!(parallel.execution_identity(), serial.execution_identity());
+            assert_eq!(parallel.planned_work(), serial.planned_work());
+            assert!(parallel.native_plan().options() == serial.native_plan().options());
+        }
+    }
+}
+
+#[test]
+fn stale_stream_admission_cannot_reach_runtime_creation_or_private_io() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("unadmitted input") } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("unadmitted output") }
+        fn flush(&mut self) -> io::Result<()> { panic!("unadmitted flush") }
+    }
+    for axis in 0..11 {
+        let a = args("generate", &["--compute-threads", "4", "--prefill-rows", "4"]);
+        let (mut limits, mut bounds) = a.validate().unwrap();
+        match axis {
+            0 => limits.compute.workspace_bytes -= 1,
+            1 => limits.compute.threads = 1,
+            2 => limits.preparation_bytes -= 1,
+            3 => limits.kv_bytes -= 1,
+            4 => limits.result_bytes -= 1,
+            5 => limits.weight_bytes -= 1,
+            6 => bounds.sink_memory_bytes -= 1,
+            7 => bounds.tokens -= 1,
+            8 => bounds.content_bytes -= 1,
+            9 => bounds.terminal_bytes -= 1,
+            _ => bounds.capture_logprobs = true,
+        }
+        assert_eq!(execute(Task::Generate, a.common, limits, bounds, &mut NoIo, NoIo).unwrap_err().code,
+            "stream_admitted_options_mismatch", "axis {axis}");
+    }
+}
