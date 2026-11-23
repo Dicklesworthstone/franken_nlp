@@ -78,6 +78,15 @@ disk_check() {
     "$@" || { printf 'DISK_TEST RESULT=FAIL assertion=%s\n' "$*" >&2; exit 1; }
 }
 disk_pass() { printf 'DISK_TEST case=%s RESULT=PASS\n' "$1"; }
+disk_retained_one() {
+    disk_retained_count=0
+    for disk_retained_path in "$DEST/quarantine/$1".*; do
+        [ -f "$disk_retained_path" ] || continue
+        disk_check cmp "$2" "$disk_retained_path"
+        disk_retained_count=$((disk_retained_count + 1))
+    done
+    disk_check test "$disk_retained_count" -eq 1
+}
 
 disk_setup cached
 cp "$DISK_FIXTURE/alpha.bin" "$DEST/alpha.bin"
@@ -151,6 +160,74 @@ download_one alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA"
 disk_check test -s "$DEST/quarantine/quarantine.log"
 disk_check cmp "$DISK_FIXTURE/alpha.bin" "$DEST/alpha.bin"
 disk_pass same-length-corruption-never-earns-cache-credit
+
+disk_setup complete-verified
+cp "$DISK_FIXTURE/alpha.bin" "$DEST/alpha.bin.partial"
+disk_journal alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA"
+cp "$DISK_FIXTURE/beta.bin" "$DEST/beta.bin"
+DISK_FREE=0
+verify_existing_closure
+download_one alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA"
+disk_check cmp "$DISK_FIXTURE/alpha.bin" "$DEST/alpha.bin"
+disk_check test ! -e "$DEST/alpha.bin.partial"
+disk_check test ! -e "$DEST/transfers"
+disk_check test ! -e "$DEST/space-probes"
+disk_check test ! -e "$DEST/quarantine"
+disk_pass verified-complete-partial-publishes-without-transfer-or-free-space
+
+DISK_REJECTED="$DISK_WORK/rejected-alpha.bin"
+cp "$DISK_FIXTURE/alpha.bin" "$DISK_REJECTED"
+printf X | dd of="$DISK_REJECTED" bs=1 count=1 conv=notrunc 2>/dev/null
+disk_setup complete-rejected
+cp "$DISK_REJECTED" "$DEST/alpha.bin.partial"
+disk_journal alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA"
+cp "$JOURNAL_DIR/alpha.bin.journal" "$DISK_WORK/rejected-alpha.journal"
+cp "$DISK_FIXTURE/beta.bin" "$DEST/beta.bin"
+DISK_FREE=$((DISK_ALPHA + MARGIN_BYTES))
+verify_existing_closure
+download_one alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA"
+disk_retained_one alpha.bin.partial "$DISK_REJECTED"
+disk_retained_one alpha.bin.journal "$DISK_WORK/rejected-alpha.journal"
+disk_check cmp "$DISK_FIXTURE/alpha.bin" "$DEST/alpha.bin"
+disk_check test "$(wc -l < "$DEST/transfers" | tr -d '[:space:]')" -eq 1
+disk_check test "$DISK_FREE" -eq "$MARGIN_BYTES"
+disk_pass corrupt-complete-partial-is-preserved-and-replaced-in-one-invocation
+
+disk_setup complete-rejected-no-space
+cp "$DISK_REJECTED" "$DEST/alpha.bin.partial"
+disk_journal alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA"
+cp "$DISK_FIXTURE/beta.bin" "$DEST/beta.bin"
+DISK_FREE=$MARGIN_BYTES
+verify_existing_closure
+disk_check test "$(remaining_download_bytes)" -eq 0
+(download_one alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA")
+disk_check test "$?" -eq 4
+disk_retained_one alpha.bin.partial "$DISK_REJECTED"
+disk_retained_one alpha.bin.journal "$DISK_WORK/rejected-alpha.journal"
+disk_check test ! -e "$DEST/transfers"
+disk_check test ! -e "$DEST/alpha.bin"
+disk_check test ! -s "$DEST/alpha.bin.partial"
+disk_check test "$(remaining_download_bytes)" -eq "$DISK_ALPHA"
+disk_pass quarantined-partial-loses-disk-credit-before-fresh-transfer
+
+disk_setup incomplete-rejected
+head -c 5 "$DISK_REJECTED" > "$DEST/alpha.bin.partial"
+disk_journal alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA"
+cp "$DISK_FIXTURE/beta.bin" "$DEST/beta.bin"
+DISK_FREE=$((DISK_ALPHA - 5 + MARGIN_BYTES))
+verify_existing_closure
+(download_one alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA")
+disk_check test "$?" -eq 1
+disk_retained_one alpha.bin.partial "$DISK_REJECTED"
+disk_retained_one alpha.bin.journal "$DISK_WORK/rejected-alpha.journal"
+disk_check test ! -e "$DEST/alpha.bin"
+disk_check test ! -e "$DEST/alpha.bin.partial"
+disk_check test ! -e "$JOURNAL_DIR/alpha.bin.journal"
+DISK_FREE=$((DISK_ALPHA + MARGIN_BYTES))
+download_one alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA"
+disk_check cmp "$DISK_FIXTURE/alpha.bin" "$DEST/alpha.bin"
+disk_check test "$(wc -l < "$DEST/transfers" | tr -d '[:space:]')" -eq 2
+disk_pass rejected-resume-never-traps-the-next-invocation-in-a-bad-prefix
 
 disk_setup insufficient
 DISK_FREE=$((CATALOG_TOTAL + MARGIN_BYTES - 1))

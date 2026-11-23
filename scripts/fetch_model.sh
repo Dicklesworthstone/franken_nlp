@@ -295,6 +295,7 @@ acquire_lock() {
 }
 
 quarantine() {
+    check_interrupted
     original=$1
     reason=$2
     [ -e "$original" ] || [ -L "$original" ] || return 0
@@ -312,6 +313,7 @@ quarantine() {
     fi
     stamp=$(date -u +%Y%m%dT%H%M%SZ)
     target="$qdir/${original##*/}.$stamp.$$.${observed}"
+    check_interrupted
     mv "$original" "$target" || fail 4 "cannot quarantine path=$original"
     printf '%s QUARANTINE file=%s target=%s observed_sha256=%s reason=%s\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$original" "$target" "$observed" "$reason" >> "$qdir/quarantine.log"
@@ -529,30 +531,55 @@ download_one() {
     fi
     ensure_partial_and_journal "$partial" "$journal" "$url" "$name" "$length" "$digest"
     start=$(bytes "$partial")
+    partial_verified=0
     if [ "$start" -gt "$length" ]; then
         quarantine "$partial" "partial-longer-than-expected"
         quarantine "$journal" "partial-longer-than-expected"
         ensure_partial_and_journal "$partial" "$journal" "$url" "$name" "$length" "$digest"
         start=0
+    elif [ "$start" -eq "$length" ]; then
+        # A completed transfer may have stopped before publication. Authenticate
+        # it before treating a no-op transfer as a content-verified hit.
+        if verify_file "$partial" "$length" "$digest"; then
+            partial_verified=1
+            log "DECISION=RESUME_VERIFIED file=$name existing_bytes=$start"
+        else
+            log "DECISION=RESTART file=$name reason=completed-partial-verification-failed"
+            quarantine "$partial" "completed-partial-verification-failed"
+            quarantine "$journal" "completed-partial-verification-failed"
+            ensure_partial_and_journal "$partial" "$journal" "$url" "$name" "$length" "$digest"
+            start=0
+        fi
     fi
-    preflight_space
-    log "DECISION=$([ "$start" -gt 0 ] && printf RESUME || printf MISS) file=$name existing_bytes=$start expected_bytes=$length"
-    download_with_progress "$url" "$partial" "$length"
-    curl_status=$?
-    if [ "$curl_status" -eq 33 ] && [ "$start" -gt 0 ]; then
-        log "DECISION=RESTART file=$name reason=server-refused-range-resume"
-        quarantine "$partial" "server-refused-range-resume"
-        quarantine "$journal" "server-refused-range-resume"
-        ensure_partial_and_journal "$partial" "$journal" "$url" "$name" "$length" "$digest"
+    if [ "$partial_verified" -eq 0 ]; then
+        # Quarantine keeps the rejected bytes on disk. Recompute the required
+        # new bytes after replacing its journal-bound partial, before transport.
         preflight_space
+        log "DECISION=$([ "$start" -gt 0 ] && printf RESUME || printf MISS) file=$name existing_bytes=$start expected_bytes=$length"
         download_with_progress "$url" "$partial" "$length"
         curl_status=$?
-    fi
-    if [ "$curl_status" -ne 0 ]; then
-        fail 3 "network failure url=$url attempts=4 curl_exit=$curl_status log=$JOURNAL_DIR/${partial##*/}.curl.log"
-    fi
-    if ! verify_file "$partial" "$length" "$digest"; then
-        fail 1 "digest/length verification failure file=$name expected_bytes=$length expected_sha256=$digest"
+        check_interrupted
+        if [ "$curl_status" -eq 33 ] && [ "$start" -gt 0 ]; then
+            log "DECISION=RESTART file=$name reason=server-refused-range-resume"
+            quarantine "$partial" "server-refused-range-resume"
+            quarantine "$journal" "server-refused-range-resume"
+            ensure_partial_and_journal "$partial" "$journal" "$url" "$name" "$length" "$digest"
+            preflight_space
+            download_with_progress "$url" "$partial" "$length"
+            curl_status=$?
+            check_interrupted
+        fi
+        if [ "$curl_status" -ne 0 ]; then
+            fail 3 "network failure url=$url attempts=4 curl_exit=$curl_status log=$JOURNAL_DIR/${partial##*/}.curl.log"
+        fi
+        if ! verify_file "$partial" "$length" "$digest"; then
+            # Never trap future retries in the same full-length bad prefix.
+            # Retain its bytes and binding for inspection; the next invocation
+            # starts a fresh, separately admitted transfer.
+            quarantine "$partial" "completed-download-verification-failed"
+            quarantine "$journal" "completed-download-verification-failed"
+            fail 1 "digest/length verification failure file=$name expected_bytes=$length expected_sha256=$digest rejected_bytes=quarantined"
+        fi
     fi
     check_interrupted
     sync "$partial" 2>/dev/null || sync
