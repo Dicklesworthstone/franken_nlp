@@ -12,6 +12,11 @@ fn facts() -> ArtifactIdentity {
 fn assets(command: &RedactCommand) -> (SourceTaskPlanner, ExecutionIdentity, LongRedactionConfig) {
     let (_, limits) = command.validate().unwrap();
     let (planner, _) = planner().unwrap();
+    let (encoding, complete) = command.encoding_policy(limits).unwrap();
+    let planner = match complete {
+        Some(complete) => planner.with_map_document_encoding(encoding, complete).unwrap(),
+        None => planner,
+    };
     let identity = source_identity(&facts(), &planner, BuiltInTask::Ner).unwrap();
     let config = command.long.config(&command.host, limits, NerOptions::default()).unwrap();
     (planner, identity, config)
@@ -94,5 +99,126 @@ fn verification_receipt_must_cover_actual_transformed_text_and_exact_stage_total
             2 => run.verification.as_mut().unwrap().preflight.chunks += 1,
             3 => run.result.verification = VerificationStatus::NotRequested, _ => run.verification = None }
         assert!(check_completed(expected, &run, &request, &config).is_err(), "{axis}");
+    }
+}
+
+
+fn compact_command(extra: &[&str]) -> RedactCommand {
+    let mut args = vec!["--chunked", "--input-encoding", "safe-bpe-v1",
+        "--max-ner-chunk-bytes", "128", "--max-new-tokens", "64"];
+    args.extend_from_slice(extra);
+    let mut command = command(&args);
+    command.host.memory_mib = 16_384;
+    command
+}
+const COMPACT_SOURCE: &str = "Alice é 上海 <think> <|im_start|> alice@example.org. ";
+
+#[test]
+fn compact_document_preflight_and_reconstruction_keep_the_original_operation() {
+    let command = compact_command(&[]);
+    let (planner, identity, config) = assets(&command);
+    let planner = Arc::new(planner);
+    let source = COMPACT_SOURCE.repeat(48);
+    assert!(source.len() > command.host.context_tokens);
+    let expected = preflight_original(&planner, &identity, &config, &source, &mut Continue).unwrap();
+    assert!(expected.chunks > 1);
+    assert_eq!(expected.source_bytes, source.len());
+    assert_eq!(expected.source_scalars, source.chars().count());
+    let first = encoding_receipt(&planner).unwrap().unwrap().work;
+    assert!(first.input_bytes() > source.len(), "accepted/rejected probes and compiled chunks are all charged");
+    let hosted_owner = Arc::clone(&planner);
+    assert!(Arc::ptr_eq(&planner, &hosted_owner));
+    let reconstructed = preflight_original(&hosted_owner, &identity, &config, &source, &mut Continue).unwrap();
+    assert_eq!(reconstructed, expected);
+    assert_eq!(encoding_receipt(&planner).unwrap().unwrap().work, first.checked_add(first).unwrap());
+    // This is actual transformed-source planning only, not simulated NER
+    // success. The same native mapping path is used by fresh verification.
+    let transformed = source.replace("Alice", "[PERSON]").replace("alice@example.org", "[EMAIL]");
+    let edited = preflight_original(&hosted_owner, &identity, &config, &transformed, &mut Continue).unwrap();
+    assert_eq!(edited.source_bytes, transformed.len());
+    assert_eq!(edited.source_scalars, transformed.chars().count());
+    drop(hosted_owner);
+    let complete = encoding_receipt(&planner).unwrap().unwrap();
+    assert!(complete.work.input_bytes() > 2 * first.input_bytes());
+    assert_eq!(complete.complete_limits, command.encoding_policy(command.validate().unwrap().1).unwrap().1.unwrap());
+    assert_eq!(complete.policy, planner.document_encoding());
+    assert!(complete.work.input_bytes() as u64 <= complete.complete_limits.max_input_bytes);
+    assert!(complete.work.output_tokens() as u64 <= complete.complete_limits.max_output_tokens);
+    assert!(complete.work.pair_checks() <= complete.complete_limits.max_pair_checks);
+    assert!(complete.work.pair_bytes() <= complete.complete_limits.max_pair_bytes);
+}
+
+#[test]
+fn every_compact_document_work_axis_refuses_replanning_without_a_new_allowance() {
+    let source = COMPACT_SOURCE.repeat(6);
+    let baseline = compact_command(&[]);
+    let (planner, identity, config) = assets(&baseline);
+    preflight_original(&planner, &identity, &config, &source, &mut Continue).unwrap();
+    let first = encoding_receipt(&planner).unwrap().unwrap().work;
+    for (flag, limit) in [
+        ("--max-total-tokenizer-input-bytes", first.input_bytes() as u64),
+        ("--max-total-tokenizer-output-tokens", first.output_tokens() as u64),
+        ("--max-total-tokenizer-pair-checks", first.pair_checks()),
+        ("--max-total-tokenizer-pair-bytes", first.pair_bytes()),
+    ] {
+        assert!(limit > 0);
+        let limit = limit.to_string();
+        let command = compact_command(&[flag, &limit]);
+        let (planner, identity, config) = assets(&command);
+        preflight_original(&planner, &identity, &config, &source, &mut Continue).unwrap();
+        let spent = encoding_receipt(&planner).unwrap().unwrap().work;
+        assert_eq!(spent, first);
+        for text in [source.as_str(), "[PERSON] in 上海."] {
+            assert_eq!(preflight_original(&planner, &identity, &config, text, &mut Continue),
+                Err(CandidateError::Planning));
+            assert_eq!(encoding_receipt(&planner).unwrap().unwrap().work, spent,
+                "an exhausted original operation cannot refund or renew a probe");
+        }
+    }
+}
+
+#[test]
+fn document_preflight_and_nested_map_cancellation_keep_the_original_cause() {
+    struct Stop(DecodeCancellationKind);
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { Some(self.0) }
+    }
+    let command = compact_command(&[]);
+    let (planner, identity, config) = assets(&command);
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast,
+        RaceLost, ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let expected = match cause { Deadline | Timeout => CandidateError::Timeout, _ => CandidateError::Execution };
+        assert_eq!(preflight_original(&planner, &identity, &config, COMPACT_SOURCE, &mut Stop(cause)), Err(expected));
+        let nested = || crate::tasks::source_planning::quantized::long::Int8SourceMapError::Source(
+            Int8SourceError::Cancelled(cause));
+        assert_eq!(document_planning_error(LongRedactionError::Map(nested())), expected);
+        assert_eq!(execution_error(HostedError::SourceMap(nested())), expected);
+    }
+    assert_eq!(encoding_receipt(&planner).unwrap().unwrap().work, SafeBpeWork::default());
+}
+
+#[test]
+fn document_encoding_metadata_reports_actual_probes_without_changing_byte_framing() {
+    // Serialize genuine preflight geometry, explicitly not neural output.
+    let byte = command(&["--chunked", "--max-ner-chunk-bytes", "128", "--max-new-tokens", "64"]);
+    let (planner, identity, config) = assets(&byte);
+    let preflight = preflight_original(&planner, &identity, &config, COMPACT_SOURCE, &mut Continue).unwrap();
+    let wrapped = EncodedResponse { response: &preflight, input_encoding: encoding_receipt(&planner).unwrap() };
+    assert_eq!(serde_json::to_vec(&wrapped).unwrap(), serde_json::to_vec(&preflight).unwrap());
+    let compact = compact_command(&[]);
+    let (planner, identity, config) = assets(&compact);
+    let preflight = preflight_original(&planner, &identity, &config, COMPACT_SOURCE, &mut Continue).unwrap();
+    let wrapped = EncodedResponse { response: &preflight, input_encoding: encoding_receipt(&planner).unwrap() };
+    let bytes = serde_json::to_vec(&wrapped).unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(report["input_encoding"]["policy"], serde_json::to_value(planner.document_encoding()).unwrap());
+    assert_eq!(report["input_encoding"]["complete_limits"],
+        serde_json::to_value(planner.map_document_encoding_limits().unwrap()).unwrap());
+    assert_eq!(report["input_encoding"]["work"],
+        serde_json::to_value(planner.map_document_encoding_work().unwrap().unwrap()).unwrap());
+    let text = String::from_utf8(bytes).unwrap();
+    for private in [COMPACT_SOURCE, "alice@example.org", "prompt_digest", "source_digest", "key_commitment"] {
+        assert!(!text.contains(private));
     }
 }

@@ -230,3 +230,143 @@ fn cancellation_empty_input_and_wrong_identity_are_refused_without_inference() {
     let mut wrong = identity(&p); wrong.numerics_profile = NumericsProfile::HfBf16Eager;
     assert!(Int8DocumentRedactor::new(&p, wrong, config()).is_err());
 }
+
+
+fn compact_policy() -> crate::tokenizer::untrusted::UntrustedEncoding {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 4096,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 })
+}
+fn compact_work() -> crate::tokenizer::untrusted::SafeBpeWorkLimits {
+    crate::tokenizer::untrusted::SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 }
+}
+fn compact_config() -> LongRedactionConfig {
+    let mut c = config(); c.mapping.chunks.max_chunk_bytes = 64; c.mapping.chunks.max_chunk_tokens = 8; c
+}
+const COMPACT_SOURCE: &str = "The quick brown fox jumps over the lazy dog. 上海 <think> <|im_start|> ▁";
+
+#[test]
+fn compact_documents_require_cumulative_authority_and_exact_encoding_identity() {
+    let one_call = planner().with_document_encoding(compact_policy()).unwrap();
+    assert!(Int8DocumentRedactor::new(&one_call, identity(&one_call), compact_config()).is_err());
+    let p = planner().with_map_document_encoding(compact_policy(), compact_work()).unwrap();
+    assert!(p.map_document_encoding_workspace_bytes().unwrap() > 0);
+    Int8DocumentRedactor::new(&p, identity(&p), compact_config()).unwrap();
+    let mut wrong = identity(&p); wrong.template_digest = *planner().template_digest();
+    assert!(Int8DocumentRedactor::new(&p, wrong, compact_config()).is_err());
+}
+
+#[test]
+fn compact_preflight_uses_real_tokens_and_retains_complete_source_geometry() {
+    let mut c = compact_config(); c.mapping.chunks.max_chunk_bytes = 4096; c.mapping.chunks.max_chunk_tokens = 4096;
+    let byte = planner(); let old = Int8DocumentRedactor::new(&byte, identity(&byte), c.clone()).unwrap()
+        .preflight(COMPACT_SOURCE, &mut Continue).unwrap();
+    let p = planner().with_map_document_encoding(compact_policy(), compact_work()).unwrap();
+    let r = Int8DocumentRedactor::new(&p, identity(&p), c.clone()).unwrap();
+    let actual = r.prepare(COMPACT_SOURCE, c.mapping, &mut Continue).unwrap();
+    let sized = metadata(COMPACT_SOURCE, &actual);
+    assert_eq!(sized.chunks, 1); assert_eq!(sized.chunks, old.chunks);
+    assert_eq!(sized.source_bytes, old.source_bytes); assert_eq!(sized.source_scalars, old.source_scalars);
+    assert_eq!(actual.preflight_metadata().source_span(), extent(COMPACT_SOURCE, 0, COMPACT_SOURCE.len()));
+    assert!(sized.planned_model_work.forward_positions < old.planned_model_work.forward_positions);
+    assert_eq!(actual.execution_identities().next().unwrap().template_digest, *p.template_digest());
+    let used = p.map_document_encoding_work().unwrap().unwrap();
+    assert_eq!(used.input_bytes(), 2 * COMPACT_SOURCE.len(), "accepted probe plus actual prompt");
+    assert!(used.output_tokens() < used.input_bytes()); assert!(used.pair_checks() > 0);
+    assert!(byte.map_document_encoding_work().unwrap().is_none());
+}
+
+#[test]
+fn compact_preflight_original_and_fresh_expanded_edit_share_all_four_work_ceilings() {
+    let source = format!("é Alice\r\n{COMPACT_SOURCE} Alice");
+    let mut request = RedactionRequest::default(); request.actions.include_map = true;
+    let detected = collect(&source, &[(&source, &["Alice"])], &request, &mut GroundingBudget::default()).unwrap();
+    let edited = actions::apply(&detected, &request.actions, None, request.edit_budget).unwrap();
+    assert!(edited.text().len() > source.len()); assert!(!edited.text().contains("Alice"));
+    let spans = scan_occurrences(&source, "Alice", &mut GroundingBudget::default()).unwrap();
+    assert_eq!(edited.edits().len(), spans.len());
+    for (edit, span) in edited.edits().iter().zip(spans) { assert_eq!(edit.original.span, span); }
+
+    let probe = planner().with_map_document_encoding(compact_policy(), compact_work()).unwrap();
+    let c = compact_config(); let r = Int8DocumentRedactor::new(&probe, identity(&probe), c.clone()).unwrap();
+    let first = r.preflight(&source, &mut Continue).unwrap();
+    let after_preflight = probe.map_document_encoding_work().unwrap().unwrap();
+    assert!(first.chunks > 1);
+    assert!(after_preflight.input_bytes() > 2 * source.len(), "rejected chunk-fit probes stay charged");
+    let original = r.prepare(&source, c.mapping, &mut Continue).unwrap();
+    assert_eq!(metadata(&source, &original), first); drop(original);
+    let after_original = probe.map_document_encoding_work().unwrap().unwrap();
+    assert_eq!(after_original, after_preflight.checked_add(after_preflight).unwrap());
+    let verification = r.prepare(edited.text(), c.mapping, &mut Continue).unwrap();
+    assert_eq!(verification.preflight_metadata().source_span(), extent(edited.text(), 0, edited.text().len()));
+    let after_verification = probe.map_document_encoding_work().unwrap().unwrap();
+    assert!(after_verification.input_bytes() > after_original.input_bytes());
+    assert!(after_verification.output_tokens() > after_original.output_tokens());
+    assert!(after_verification.pair_checks() > after_original.pair_checks());
+    assert!(after_verification.pair_bytes() > after_original.pair_bytes());
+
+    for axis in 0..4 {
+        let mut cap = compact_work();
+        match axis { 0 => cap.max_input_bytes = after_original.input_bytes() as u64,
+            1 => cap.max_output_tokens = after_original.output_tokens() as u64,
+            2 => cap.max_pair_checks = after_original.pair_checks(),
+            _ => cap.max_pair_bytes = after_original.pair_bytes() }
+        let p = planner().with_map_document_encoding(compact_policy(), cap).unwrap();
+        let r = Int8DocumentRedactor::new(&p, identity(&p), c.clone()).unwrap();
+        r.preflight(&source, &mut Continue).unwrap();
+        drop(r.prepare(&source, c.mapping, &mut Continue).unwrap());
+        assert_eq!(p.map_document_encoding_work().unwrap().unwrap(), after_original);
+        assert!(r.prepare(edited.text(), c.mapping, &mut Continue).is_err(), "{axis}");
+        assert_eq!(p.map_document_encoding_work().unwrap().unwrap(), after_original,
+            "fresh verification cannot renew an exhausted operation axis");
+    }
+}
+
+#[test]
+fn compact_result_policy_binds_call_and_operation_limits_without_changing_byte_policy() {
+    let previous = Sha256Digest::of_bytes(b"public-action-policy");
+    let request = RedactionRequest::default(); let c = compact_config();
+    let byte = planner(); let r = Int8DocumentRedactor::new(&byte, identity(&byte), c.clone()).unwrap();
+    let established = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&(
+        LONG_REDACTION_EXECUTION, CHUNK_PROFILE, previous, &request, &c.ner, c.per_chunk, c.mapping.chunks,
+    )).unwrap());
+    assert_eq!(r.policy_digest(previous, &request).unwrap(), established);
+    let p = planner().with_map_document_encoding(compact_policy(), compact_work()).unwrap();
+    let compact = Int8DocumentRedactor::new(&p, identity(&p), c.clone()).unwrap()
+        .policy_digest(previous, &request).unwrap();
+    assert_ne!(compact, established);
+    for axis in 0..5 {
+        let mut work = compact_work(); let mut policy = compact_policy();
+        match axis {
+            0 => work.max_input_bytes -= 1, 1 => work.max_output_tokens -= 1,
+            2 => work.max_pair_checks -= 1, 3 => work.max_pair_bytes -= 1,
+            _ => { let crate::tokenizer::untrusted::UntrustedEncoding::SafeBpeV1(ref mut call) = policy
+                else { unreachable!() }; call.max_output_tokens -= 1; }
+        }
+        let next = planner().with_map_document_encoding(policy, work).unwrap();
+        let r = Int8DocumentRedactor::new(&next, identity(&next), c.clone()).unwrap();
+        assert_ne!(r.policy_digest(previous, &request).unwrap(), compact, "{axis}");
+        assert_ne!(next.template_digest(), p.template_digest());
+    }
+}
+
+#[test]
+fn compact_edited_stage_cancellation_preserves_cause_and_prior_work() {
+    struct Stop(DecodeCancellationKind);
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { Some(self.0) }
+    }
+    let p = planner().with_map_document_encoding(compact_policy(), compact_work()).unwrap();
+    let c = compact_config(); let r = Int8DocumentRedactor::new(&p, identity(&p), c.clone()).unwrap();
+    r.preflight("Alice", &mut Continue).unwrap();
+    drop(r.prepare("Alice", c.mapping, &mut Continue).unwrap());
+    let used = p.map_document_encoding_work().unwrap();
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let error = r.prepare("[redacted:person]", c.mapping, &mut Stop(cause)).err().unwrap();
+        assert_eq!(error.cancellation(), Some(cause));
+        assert_eq!(p.map_document_encoding_work().unwrap(), used);
+    }
+}

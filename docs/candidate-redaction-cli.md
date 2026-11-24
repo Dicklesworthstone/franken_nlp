@@ -37,8 +37,8 @@ not a promise that the model cannot follow document instructions. The changed
 prompt tokens do not imply identical model output, detector recall or measured
 speed. Both original and actual edited text must independently fit context.
 
-One nonrenewable tokenizer ledger spans original-source preflight, original
-execution planning and fresh edited-source verification. The
+Without `--chunked`, one nonrenewable tokenizer ledger spans original-source
+preflight, execution planning and fresh edited-source verification. The
 `--max-tokenizer-pair-checks` (4194304 default) and
 `--max-tokenizer-pair-bytes` (67108864 default) ceilings apply to their total.
 Consumed work stays consumed after a failed or cancelled planning call.
@@ -59,9 +59,11 @@ Compact responses add an `input_encoding` object containing `policy`,
 the exact per-call encoding and complete limits. Byte responses retain their
 existing shape and policy identity.
 
-This option currently covers single-document INT8 redaction only.
-Combinations with `--chunked`, `--ndjson` or retained jobs are refused before
-private IO; those modes require their own complete-operation admission.
+For a document larger than one NER context, combine compact input with
+`--chunked`. The [long-document guide](candidate-document-redaction.md) describes
+its per-call probe limits and separate `--max-total-tokenizer-*` allowance across
+all chunks, preflight, reconstruction and fresh verification. Compact `--ndjson`
+and retained jobs remain refused before private IO at this increment.
 Tokenizer work flags require `--input-encoding safe-bpe-v1`.
 
 ## Scope and verification

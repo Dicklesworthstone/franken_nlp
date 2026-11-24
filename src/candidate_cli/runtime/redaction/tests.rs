@@ -234,7 +234,7 @@ fn runtime_rejects_stale_or_invalid_admission_before_private_io() {
             0 => command.host.max_input_bytes = 0,
             1 => command.host.preparation_mib = 0,
             2 => command.host.context_tokens = command.host.max_new_tokens,
-            3 => command.long.chunked = true,
+            3 => command.host.max_new_tokens = 0,
             _ => command.corpus.ndjson = true,
         }
         assert_eq!(execute(command, common, limits, &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));

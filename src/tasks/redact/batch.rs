@@ -98,6 +98,9 @@ impl<A: Int8RedactionBatchAdmission> BatchProcessor for NativeInt8RedactionBatch
 }
 
 pub(crate) fn check_configuration(planner: &SourceTaskPlanner, config: &Int8RedactionBatchConfig) -> Result<(), BatchFault> {
+    // Item-local compact streams still need independent retained operation
+    // ledgers; the one-shot redactor's cumulative authority is not a factory.
+    planner.source_encoder().require_byte_encoding().map_err(|_| BatchCode::InvalidLimits)?;
     Int8Redactor::new(planner, config.ner_identity.clone(), config.detector.clone())
         .map_err(|_| BatchCode::Admission)?;
     check_limits(config)?;

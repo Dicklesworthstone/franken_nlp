@@ -204,3 +204,20 @@ fn residual_coordinates_are_dropped_and_transport_errors_are_content_free() {
     let cancelled = failure(LongRedactionError::Redaction(Int8RedactionError::Cancelled(DecodeCancellationKind::Deadline)));
     assert!(cancelled.stop); assert_eq!(cancelled.fault.cancellation, Some(DecodeCancellationKind::Deadline));
 }
+
+
+#[test]
+fn compact_corpus_requires_per_document_operation_retention_before_admission() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding};
+    let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 4096,
+        max_output_tokens: 4096, max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 });
+    let p = planner().with_map_document_encoding(policy, SafeBpeWorkLimits {
+        max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28,
+    }).unwrap();
+    let mut c = config(); c.ner_identity.tokenizer_digest = p.tokenizer_digest();
+    c.ner_identity.template_digest = *p.template_digest();
+    Int8DocumentRedactor::new(&p, c.ner_identity.clone(), c.detector.clone()).unwrap();
+    assert_eq!(check_configuration(&p, &c).unwrap_err().code, BatchCode::InvalidLimits);
+    assert_eq!(p.map_document_encoding_work().unwrap().unwrap().input_bytes(), 0);
+}

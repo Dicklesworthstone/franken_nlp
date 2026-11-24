@@ -80,9 +80,9 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("preparation_mib", |arg| arg
             .default_value_if("input_encoding", clap::builder::ArgPredicate::Equals("safe-bpe-v1".into()), "1024")
             .help("Preparation memory in MiB; defaults to 512 for byte input or 1024 for compact redaction, including edited-text tokenizer workspace"))
-        .mut_arg("max_tokenizer_pair_checks", |arg| arg.help("Cumulative BPE pair-comparison cap across original preflight, execution planning and fresh edited-text verification; safe-bpe-v1 only, default 4194304"))
-        .mut_arg("max_tokenizer_pair_bytes", |arg| arg.help("Cumulative BPE examined-pair byte cap across the complete redaction operation; safe-bpe-v1 only, default 67108864"))
-        .after_long_help("Single-document --input-encoding safe-bpe-v1 preserves exact source bytes and excludes template-control tokens. One tokenizer ledger covers original preflight, execution planning and fresh verification of the actual edited text. Pair-work ceilings apply to their sum, never reset per pass. Byte/token totals are bounded by the declared per-pass peak times two preparations, or three with verification. The edited text must independently fit context and result limits. Admission prices its possible expansion before private key, document or model IO. Compact results report exact policy, complete limits and consumed work; the policy digest binds both limits. Tokenizer exhaustion returns no successful result. Compact input is unavailable with --chunked, --ndjson or retained jobs. This changes prompt tokens and makes no claim of identical model output, detector quality or measured speed.")
+        .mut_arg("max_tokenizer_pair_checks", |arg| arg.help("BPE comparison cap for a complete short operation or each chunked encoding call; chunked totals use --max-total-tokenizer-pair-checks; safe-bpe-v1 only, default 4194304"))
+        .mut_arg("max_tokenizer_pair_bytes", |arg| arg.help("BPE examined-byte cap for a complete short operation or each chunked encoding call; chunked totals use --max-total-tokenizer-pair-bytes; safe-bpe-v1 only, default 67108864"))
+        .after_long_help("--input-encoding safe-bpe-v1 preserves exact source bytes and excludes template-control tokens. One tokenizer ledger covers original preflight, execution planning and fresh verification of the actual edited text. For short documents, pair-work ceilings apply to their sum and byte/token totals cover two preparations, or three with verification. With --chunked, pair flags bound each encoding call and --max-total-tokenizer-* bound the complete operation, including accepted/rejected probes and both detector stages. Total byte/token defaults are eight times the sum of original and edited byte ceilings; total pair defaults are 268435456 checks and 4294967296 examined bytes. Every accepted chunk independently fits context. Admission prices possible edited expansion and the complete map frontier before private key, document or model IO. Compact results report exact policy, complete limits and consumed work; the policy digest binds both limits. Exhaustion returns no successful result or fallback. Compact input is unavailable with --ndjson or retained jobs. This changes prompt tokens and makes no claim of identical model output, detector quality or measured speed.")
 }
 impl RedactCommand {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
@@ -91,10 +91,15 @@ impl RedactCommand {
         Ok(command)
     }
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), CandidateError> {
-        if !self.encoding.is_default() && (self.long.chunked || self.corpus.ndjson || self.retention.store_results) {
+        if !self.encoding.is_default() && (self.corpus.ndjson || self.retention.store_results) {
             return Err(CandidateError::Arguments);
         }
-        let (common, limits) = self.host.common_with_encoding(self.input.clone(), &self.encoding)?;
+        // Long documents encode bounded probes and chunks, never the entire
+        // original as one call. Price that workspace beside all retained plans.
+        let (mut common, limits) = if self.long.chunked {
+            self.host.common(self.input.clone())?
+        } else { self.host.common_with_encoding(self.input.clone(), &self.encoding)? };
+        common.input_encoding = self.encoding.clone();
         self.long.validate(&self.host, limits)?;
         if self.rules.is_empty() || !(1..=16_384).contains(&self.max_detections)
             || self.max_rule_work == 0 || self.max_rule_work > 1_000_000_000_000
@@ -121,6 +126,7 @@ impl RedactCommand {
     }
     pub(super) fn encoding_policy(&self, limits: Limits)
         -> Result<(UntrustedEncoding, Option<SafeBpeWorkLimits>), CandidateError> {
+        if self.long.chunked { return self.long.encoding_policy(&self.encoding, &self.host, limits); }
         // Verification can expand the source. Only its admitted encoding peak
         // grows; the original document reader still uses max_input_bytes.
         let input_bytes = self.host.max_input_bytes.max(self.host.max_result_bytes);
@@ -155,8 +161,14 @@ impl RedactCommand {
         // coexist with edited text, a fresh NER result, native KV and output.
         let peak = compute::request_peak_bytes(limits, native, self.host.max_result_bytes as u64,
             0, 0, limits.preparation_bytes)?;
-        [peak, self.host.max_input_bytes as u64 + 1, 4096,
-            self.host.max_result_bytes as u64 * 4, self.host.max_new_tokens as u64 * 8, edit_bytes]
+        let temporary = if self.long.chunked {
+            self.long.temporary_bytes(&self.host, edit_bytes)?
+        } else {
+            (self.host.max_result_bytes as u64).checked_mul(4)
+                .and_then(|n| n.checked_add(self.host.max_new_tokens as u64 * 8))
+                .and_then(|n| n.checked_add(edit_bytes)).ok_or(CandidateError::Arguments)?
+        };
+        [peak, self.host.max_input_bytes as u64 + 1, 4096, temporary]
             .into_iter().try_fold(0_u64, |sum, bytes| sum.checked_add(bytes))
             .ok_or(CandidateError::Arguments)
     }

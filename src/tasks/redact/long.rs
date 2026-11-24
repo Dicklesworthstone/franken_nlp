@@ -97,9 +97,10 @@ pub struct Int8DocumentRedactor<'p> {
 impl<'p> Int8DocumentRedactor<'p> {
     pub fn new(planner: &'p SourceTaskPlanner, identity: ExecutionIdentity, config: LongRedactionConfig)
         -> Result<Self, LongRedactionError> {
-        // Fresh redaction verification has its own second source frontier.
-        // Plain-map compact admission does not price this composed operation.
-        planner.source_encoder().require_byte_encoding().map_err(|_| RedactError::InvalidOptions)?;
+        // One compact operation owns caller preflight, original reconstruction
+        // and fresh edited-source mapping, including every discarded size probe.
+        // A per-call encoder alone cannot authorize this composed operation.
+        planner.map_document_encoding_workspace_bytes().map_err(Int8SourceError::from)?;
         config.ner.validate().map_err(|_| RedactError::InvalidOptions)?;
         config.per_chunk.validate().map_err(|_| RedactError::InvalidOptions)?;
         config.mapping.chunks.effective_token_limit().map_err(Int8SourceMapError::Chunk)?;
@@ -161,10 +162,7 @@ impl<'p> Int8DocumentRedactor<'p> {
         } else { None };
         poll(control)?;
         // Public detector/chunk policy only, never original/prompt/token hashes.
-        result.policy_digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&(
-            LONG_REDACTION_EXECUTION, CHUNK_PROFILE, result.policy_digest, request,
-            &self.config.ner, self.config.per_chunk, self.config.mapping.chunks,
-        )).map_err(|_| RedactError::Serialization)?);
+        result.policy_digest = self.policy_digest(result.policy_digest, request)?;
         result.check_size(request.edit_budget.max_output_bytes)?;
         let output = LongRedactionRun { schema_version: 1, execution: LONG_REDACTION_EXECUTION,
             numerics_profile: STRICT_INT8_PROFILE, detector_scope: "whole-source-rules-independent-ner-chunks-v1",
@@ -177,6 +175,22 @@ impl<'p> Int8DocumentRedactor<'p> {
             .map_err(Int8SourceError::from)?;
         poll(control)?;
         Ok(output)
+    }
+    fn policy_digest(&self, previous: Sha256Digest, request: &RedactionRequest)
+        -> Result<Sha256Digest, RedactError> {
+        let mut digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&(
+            LONG_REDACTION_EXECUTION, CHUNK_PROFILE, previous, request,
+            &self.config.ner, self.config.per_chunk, self.config.mapping.chunks,
+        )).map_err(|_| RedactError::Serialization)?);
+        // Preserve established byte-mode policy bytes. Compact source encoding
+        // changes the prompt policy and binds all finite operation ceilings.
+        if let Some(limits) = self.planner.map_document_encoding_limits() {
+            digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&(
+                "int8-document-redaction-input-policy-v1", digest,
+                self.planner.document_encoding(), limits,
+            )).map_err(|_| RedactError::Serialization)?);
+        }
+        Ok(digest)
     }
     #[allow(clippy::too_many_arguments)]
     fn detect<'s, C: DecodeStepControl>(&self, source: &'s str, request: &RedactionRequest,

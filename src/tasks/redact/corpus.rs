@@ -111,6 +111,9 @@ impl<A: Int8RedactionBatchAdmission> BatchProcessor
 }
 
 pub(crate) fn check_configuration(planner: &SourceTaskPlanner, config: &LongRedactionBatchConfig) -> Result<(), BatchFault> {
+    // The batch must retain a distinct compact operation for each document
+    // before it can admit compact preflight and edited-source reconstruction.
+    planner.source_encoder().require_byte_encoding().map_err(|_| BatchCode::InvalidLimits)?;
     Int8DocumentRedactor::new(planner, config.ner_identity.clone(), config.detector.clone())
         .map_err(|_| BatchCode::Admission)?;
     check_limits(config)?;

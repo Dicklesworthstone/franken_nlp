@@ -26,6 +26,71 @@ is unchanged. Long-mode options require `--chunked`; they are never silently
 ignored by the short path. Unavailable runtime builds refuse before key, source,
 NER-options or model I/O.
 
+## Compact INT8 document input
+
+Select compact input explicitly when running chunked redaction:
+
+```sh
+fnlp candidate redact report.txt --chunked \
+  --model ./model.fnlpq --memory-mib 12288 \
+  --input-encoding safe-bpe-v1 --max-ner-chunk-bytes 8192
+```
+
+`safe-bpe-v1` preserves exact UTF-8 bytes and excludes template-control token
+IDs. Original byte/scalar coordinates and untouched output slices remain exact.
+Compact tokens change the NER prompts; this does not establish identical model
+output, detector recall, prompt-injection resistance or a measured speedup.
+
+One nonrenewable tokenizer ledger covers original preflight, every accepted or
+rejected partition-sizing probe, native reconstruction and fresh verification
+of the actual edited document. Oversized probes may produce more tokens than
+the final native context; their work is charged before the partitioner shrinks
+them. Every accepted complete NER prompt still passes the exact context check.
+The per-call input and output-token caps both use the declared chunk byte cap,
+bounded by the larger original/edited byte envelope.
+
+| Compact long-mode option | Default | Scope |
+| --- | ---: | --- |
+| `--max-tokenizer-pair-checks` | 4194304 | One encoding call |
+| `--max-tokenizer-pair-bytes` | 67108864 | Examined pair bytes in one encoding call |
+| `--max-total-tokenizer-input-bytes` | 8 × (original input cap + result cap) | Complete document operation |
+| `--max-total-tokenizer-output-tokens` | Same as total input bytes | Complete document operation |
+| `--max-total-tokenizer-pair-checks` | 268435456 | Complete document operation |
+| `--max-total-tokenizer-pair-bytes` | 4294967296 | Complete document operation |
+
+The four total flags require both `--chunked` and compact input. Increasing
+the chunk count or requesting verification does not multiply an explicit
+allowance. Failed and cancelled attempts retain spent tokenizer work; exhaustion
+returns no successful result, without resetting the ledger or selecting byte
+fallback. These work limits are separate from tokenizer-call count, native
+inference work, masks and independent source-evidence scans.
+
+Compact preparation defaults to 1024 MiB. Admission includes a reusable encoder
+workspace beside all retained chunk plans, and checks the complete simultaneous
+model/native state, both preparation owners, map/result staging, source and key
+storage, editing and final output before private IO. The original reader still
+uses `--max-input-bytes`; edited expansion uses the separately admitted result
+envelope. The memory example above is illustrative.
+
+The optional top-level `input_encoding` receipt contains `policy`,
+`complete_limits` and actual `work`, including sizing probes and every stage.
+The semantic redaction policy digest binds the exact encoding and total limits.
+Byte-default responses and policy identities retain their existing shape.
+
+Embedding callers configure the planner with
+`SourceTaskPlanner::with_map_document_encoding(policy, complete_limits)` and
+retain that same planner through preflight and `redact_int8_document`.
+`Int8DocumentRedactor` rejects compact planners without cumulative admission;
+the hosted entry quotes their workspace before dispatch. At this increment,
+compact corpus and retained-job paths remain explicitly refused until their
+per-document operation ownership is wired.
+
+Regression definitions cover exact source controls and coordinates, repeated
+preparation and fresh edited maps, every cumulative work axis, cancellation,
+expanded workspace and complete-map memory boundaries, response metadata and
+the closed population boundary. They are source-reviewed but unexecuted pending
+the repository's required controller validation.
+
 ## Complete detection before one edit
 
 The rule scanner sees the ENTIRE source. An email, URL or other selected rule

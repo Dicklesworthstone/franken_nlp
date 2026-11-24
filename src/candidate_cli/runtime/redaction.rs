@@ -33,6 +33,7 @@ fn execution_error(error: HostedError) -> CandidateError {
         HostedError::Join { physical_error: Some(error), .. }
             | HostedError::Scope { physical_error: Some(error), .. } => execution_error(*error),
         HostedError::Redaction(error) => error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution),
+        HostedError::SourceMap(error) => error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution),
         HostedError::Reservation(_) => CandidateError::Memory,
         HostedError::ModelIdentity | HostedError::ResourceDomain => CandidateError::Identity,
         _ => CandidateError::Execution,

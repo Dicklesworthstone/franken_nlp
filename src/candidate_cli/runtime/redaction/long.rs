@@ -1,7 +1,8 @@
 //! Original-stage exact preflight, one resident model, complete redaction output.
 use super::*;
 use crate::tasks::{extract::ExtractionVocabulary, redact::{actions::VerificationStatus,
-    long::{Int8DocumentRedactor, LongRedactionConfig, LongRedactionPreflight, LongRedactionRun, LONG_REDACTION_EXECUTION}}};
+    long::{Int8DocumentRedactor, LongRedactionConfig, LongRedactionError,
+        LongRedactionPreflight, LongRedactionRun, LONG_REDACTION_EXECUTION}}};
 use crate::native_engine::strict_int8::STRICT_INT8_PROFILE;
 
 pub(super) struct Input {
@@ -18,29 +19,40 @@ pub(super) fn execute(command: &RedactCommand, common: &CandidateArgs, limits: L
     session: &Session, input: Input, output: &mut impl Write) -> Result<(), CandidateError> {
     let Input { source, ner, request, secret, facts, planner, vocabulary, identity } = input;
     let detector = command.long.config(&command.host, limits, ner)?;
+    // The configured planner owns one cumulative document operation. Keep this
+    // exact owner through caller preflight, host reconstruction and verification.
+    let planner = Arc::new(planner);
     // Compile EVERY original NER request before weights. Only compact geometry
     // survives; the temporary prepared grammars drain before the host rebuild.
     // Verification cannot be preplanned until the transformed bytes exist.
-    let expected = Int8DocumentRedactor::new(&planner, identity.clone(), detector.clone())
-        .map_err(|_| CandidateError::Planning)?.preflight(&source, &mut session.control())
-        .map_err(|_| CandidateError::Planning)?;
+    let expected = preflight_original(&planner, &identity, &detector, &source, &mut session.control())?;
     session.remaining()?;
     let cancellation = CancellationToken::default();
     let model = session.load(common, limits, &facts, cancellation.clone())?;
-    let result = session.engine.redact_int8_document(&model, source, Arc::new(planner), Arc::new(vocabulary), RedactConfig {
+    let result = session.engine.redact_int8_document(&model, source, Arc::clone(&planner), Arc::new(vocabulary), RedactConfig {
         ner_identity: identity, request: request.clone(), detector: detector.clone(), native: session.native(common)?,
         preparation_reserve_bytes: limits.preparation_bytes, edit_reserve_bytes: command.edit_reserve_mib * MIB,
-    }, secret, cancellation).map_err(|_| CandidateError::Execution)?;
+    }, secret, cancellation).map_err(execution_error)?;
     session.remaining()?;
     check_completed(expected, result.result(), &request, &detector)?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
         evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
         source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
         quant_recipe: &facts.recipe_id, output: &result };
+    let response = EncodedResponse { response: &response, input_encoding: encoding_receipt(&planner)? };
     // Only complete edited text and opt-in coordinates escape. The existing
     // result guard and caller Session survive canonical staging, write and flush.
     publish_checked(&response, command.host.max_result_bytes + 4096, output,
         &|| session.remaining().map(|_| ()))
+}
+fn preflight_original(planner: &SourceTaskPlanner, identity: &ExecutionIdentity,
+    detector: &LongRedactionConfig, source: &str, control: &mut impl DecodeStepControl)
+    -> Result<LongRedactionPreflight, CandidateError> {
+    Int8DocumentRedactor::new(planner, identity.clone(), detector.clone())
+        .map_err(document_planning_error)?.preflight(source, control).map_err(document_planning_error)
+}
+fn document_planning_error(error: LongRedactionError) -> CandidateError {
+    error.cancellation().map(cancelled).unwrap_or(CandidateError::Planning)
 }
 fn fits(work: Int8Work, ceiling: Int8Work) -> bool {
     work.forward_positions <= ceiling.forward_positions && work.projected_logits <= ceiling.projected_logits

@@ -7,6 +7,9 @@ impl NlpEngine {
     /// edit and optional fresh detection on the transformed document. Existing
     /// RedactConfig keeps its short-document default; this concrete detector
     /// specialization has independent complete-map and whole-run ceilings.
+    /// Compact input retains the caller's original operation ledger across
+    /// preflight, every sizing probe and both native maps. Its encoder workspace
+    /// must fit inside the transferred preparation reservation before dispatch.
     #[allow(clippy::too_many_arguments)]
     pub fn redact_int8_document(&self, model: &ResidentInt8, source: String,
         planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
@@ -17,6 +20,7 @@ impl NlpEngine {
         check_model_identity(model.artifact_identity(), &config.ner_identity)?;
         let required = requirements(config.native)?;
         validate_document(&config, source.len(), planner.tokenizer_digest(), *planner.template_digest(), required.kv_bytes)?;
+        check_encoding_preparation(&planner, config.preparation_reserve_bytes)?;
         let bytes = input_bytes(&source, &config, pseudonyms.as_ref())?;
         let temporary_bytes = document_temporary_bytes(&config)?;
         let run = config.native.run;

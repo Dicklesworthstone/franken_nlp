@@ -87,3 +87,37 @@ fn complete_owned_input_is_send_without_a_second_runtime_or_borrowed_key() {
     fn send<T: Send + 'static>() {}
     send::<RedactInput<LongRedactionConfig>>();
 }
+
+
+#[test]
+fn document_encoder_requires_cumulative_authority_and_exact_preparation_workspace() {
+    use crate::tokenizer::{pinned_controls, untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding}};
+    let controls = pinned_controls::pinned().unwrap();
+    let controls = controls.template_controls();
+    let eos = controls.entries().iter().find(|entry| entry.special && entry.surface == crate::template::IM_END)
+        .map(|entry| entry.id).unwrap();
+    let make = || SourceTaskPlanner::pinned(controls, eos).unwrap();
+    let byte = make();
+    check_encoding_preparation(&byte, 0).unwrap();
+    let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 256, max_output_tokens: 256,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 });
+    let per_call_only = make().with_document_encoding(policy.clone()).unwrap();
+    assert!(check_encoding_preparation(&per_call_only, u64::MAX).is_err(),
+        "a large reservation does not grant a cumulative document allowance");
+    let complete = SafeBpeWorkLimits { max_input_bytes: 4096, max_output_tokens: 4096,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 };
+    let planner = make().with_map_document_encoding(policy, complete).unwrap();
+    let workspace = planner.map_document_encoding_workspace_bytes().unwrap();
+    assert!(workspace > 1024);
+    assert!(check_encoding_preparation(&planner, workspace - 1).is_err());
+    let spent = planner.map_document_encoding_work().unwrap();
+    check_encoding_preparation(&planner, workspace).unwrap();
+    assert_eq!(planner.map_document_encoding_work().unwrap(), spent,
+        "host admission neither performs encoding nor replaces its original ledger");
+    let mut admitted = config();
+    admitted.preparation_reserve_bytes = workspace;
+    let source = String::from("Alice");
+    assert_eq!(input_bytes(&source, &admitted, None).unwrap(), source.capacity() as u64 + workspace);
+    assert_eq!(document_temporary_bytes(&admitted).unwrap(), document_temporary_bytes(&config()).unwrap(),
+        "encoder workspace is inside preparation, while the retained map/edit frontier stays independent");
+}

@@ -161,7 +161,7 @@ fn compact_redaction_refuses_unadmitted_composition_and_limits_before_private_io
             "--action", "pseudonymize", "--key-stdin", "--key-id", "rotation", "--namespace", "scope"]);
         cmd.host.memory_mib = 16_384;
         match mode {
-            0 => cmd.long.chunked = true,
+            0 => { cmd.long.chunked = true; cmd.corpus.ndjson = true; }
             1 => cmd.corpus.ndjson = true,
             2 => cmd.retention.store_results = true,
             3 => cmd.host.preparation_mib = 512,

@@ -35,6 +35,16 @@ pub(in crate::candidate_cli) struct LongArgs {
     max_dot_products: Option<u64>,
     #[arg(long, requires = "chunked")]
     max_multiply_accumulates: Option<u64>,
+    /// Cumulative encoded bytes across original preflight, chunk probes and fresh verification.
+    #[arg(long, requires = "chunked")]
+    max_total_tokenizer_input_bytes: Option<u64>,
+    /// Cumulative untrusted tokens, including rejected chunk-sizing probes.
+    #[arg(long, requires = "chunked")]
+    max_total_tokenizer_output_tokens: Option<u64>,
+    #[arg(long, requires = "chunked")]
+    max_total_tokenizer_pair_checks: Option<u64>,
+    #[arg(long, requires = "chunked")]
+    max_total_tokenizer_pair_bytes: Option<u64>,
 }
 impl LongArgs {
     fn chunks(&self) -> usize { self.max_ner_chunks.unwrap_or(64) }
@@ -52,7 +62,11 @@ impl LongArgs {
             if self.max_ner_chunks.is_some() || self.max_ner_chunk_bytes.is_some() || self.max_ner_tokenizer_calls.is_some()
                 || self.max_ner_map_bytes.is_some() || self.max_total_mask_node_visits.is_some()
                 || self.max_forward_positions.is_some() || self.max_projected_logits.is_some() || self.max_attention_pairs.is_some()
-                || self.max_dot_products.is_some() || self.max_multiply_accumulates.is_some() { return Err(CandidateError::Arguments); }
+                || self.max_dot_products.is_some() || self.max_multiply_accumulates.is_some()
+                || self.max_total_tokenizer_input_bytes.is_some() || self.max_total_tokenizer_output_tokens.is_some()
+                || self.max_total_tokenizer_pair_checks.is_some() || self.max_total_tokenizer_pair_bytes.is_some() {
+                return Err(CandidateError::Arguments);
+            }
             return Ok(());
         }
         let work = self.work();
@@ -66,17 +80,63 @@ impl LongArgs {
             || work.projections.dot_products == 0 || work.projections.multiply_accumulates == 0 {
             return Err(CandidateError::Arguments);
         }
+        if limits.preparation_bytes < self.preparation_floor(host)? { return Err(CandidateError::Arguments); }
+        Ok(())
+    }
+    fn preparation_floor(&self, host: &SourceHostArgs) -> Result<u64, CandidateError> {
         // All exact native grammars/prompts are prepared before each stage's
         // first forward. Reserve the complete set, not a single chunk's planner.
         let per_chunk = (host.context_tokens as u64).checked_mul(32)
             .and_then(|n| n.checked_add(u64::from(host.max_grammar_states).checked_mul(512)?))
             .ok_or(CandidateError::Arguments)?;
-        let floor = per_chunk.checked_mul(self.chunks() as u64)
+        per_chunk.checked_mul(self.chunks() as u64)
             .and_then(|n| n.checked_add(256 * MIB))
             .and_then(|n| n.checked_add(host.max_input_bytes.max(host.max_result_bytes) as u64 * 64))
-            .and_then(|n| n.checked_add(self.map_bytes() as u64 * 2)).ok_or(CandidateError::Arguments)?;
+            .and_then(|n| n.checked_add(self.map_bytes() as u64 * 2)).ok_or(CandidateError::Arguments)
+    }
+    pub(super) fn encoding_policy(&self, encoding: &input_encoding::InputEncodingArgs,
+        host: &SourceHostArgs, limits: Limits)
+        -> Result<(UntrustedEncoding, Option<SafeBpeWorkLimits>), CandidateError> {
+        if !self.chunked { return Err(CandidateError::Arguments); }
+        if encoding.is_default() {
+            if self.max_total_tokenizer_input_bytes.is_some() || self.max_total_tokenizer_output_tokens.is_some()
+                || self.max_total_tokenizer_pair_checks.is_some() || self.max_total_tokenizer_pair_bytes.is_some() {
+                return Err(CandidateError::Arguments);
+            }
+            return Ok((UntrustedEncoding::ByteFallback, None));
+        }
+        // A rejected sizing probe may exceed the eventual context. Admit its
+        // exact token count up to the chunk's byte cap, then let the existing
+        // partitioner shrink it; accepted full prompts still preflight exactly.
+        let bytes = self.max_ner_chunk_bytes.unwrap_or(host.context_tokens)
+            .min(host.max_input_bytes.max(host.max_result_bytes));
+        let policy = encoding.policy(bytes, bytes)?;
+        let UntrustedEncoding::SafeBpeV1(call) = &policy else { return Err(CandidateError::Arguments); };
+        let default_bytes = (host.max_input_bytes as u64).checked_add(host.max_result_bytes as u64)
+            .and_then(|bytes| bytes.checked_mul(8)).ok_or(CandidateError::Arguments)?;
+        let complete = SafeBpeWorkLimits {
+            max_input_bytes: self.max_total_tokenizer_input_bytes.unwrap_or(default_bytes),
+            max_output_tokens: self.max_total_tokenizer_output_tokens.unwrap_or(default_bytes),
+            max_pair_checks: self.max_total_tokenizer_pair_checks.unwrap_or(268_435_456),
+            max_pair_bytes: self.max_total_tokenizer_pair_bytes.unwrap_or(4_294_967_296),
+        };
+        complete.validate().map_err(|_| CandidateError::Arguments)?;
+        let workspace = call.requirements().map_err(|_| CandidateError::Arguments)?.workspace_bytes
+            .checked_add(1024).ok_or(CandidateError::Arguments)?;
+        let floor = self.preparation_floor(host)?.checked_add(workspace).ok_or(CandidateError::Arguments)?;
         if limits.preparation_bytes < floor { return Err(CandidateError::Arguments); }
-        Ok(())
+        Ok((policy, Some(complete)))
+    }
+    pub(super) fn temporary_bytes(&self, host: &SourceHostArgs, edit_bytes: u64) -> Result<u64, CandidateError> {
+        // Whole original/edited stages reuse the same native engine. At peak
+        // one complete map, its retained chunk results and edit staging coexist.
+        let native = (host.max_result_bytes as u64).checked_mul(self.chunks() as u64)
+            .ok_or(CandidateError::Arguments)?;
+        let staged = native.checked_add(self.map_bytes() as u64 * 2)
+            .and_then(|n| n.checked_mul(4)).ok_or(CandidateError::Arguments)?;
+        let tokens = (host.max_new_tokens as u64).checked_mul(self.chunks() as u64)
+            .and_then(|n| n.checked_mul(8)).ok_or(CandidateError::Arguments)?;
+        staged.checked_add(tokens).and_then(|n| n.checked_add(edit_bytes)).ok_or(CandidateError::Arguments)
     }
     pub(in crate::candidate_cli) fn config(&self, host: &SourceHostArgs, limits: Limits, ner: NerOptions)
         -> Result<LongRedactionConfig, CandidateError> {

@@ -291,3 +291,22 @@ fn real_runner_sink_failure_drains_output_and_does_not_execute_next_document() {
     let events = trace.borrow(); assert_eq!(events.iter().filter(|&&s| s == "execute").count(), 1);
     assert_eq!(&events[events.len() - 2..], ["body", "guard"]);
 }
+
+
+#[test]
+fn compact_item_streams_are_refused_until_their_operations_are_retained_per_document() {
+    use crate::tokenizer::{pinned_controls, untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding}};
+    let registry = pinned_controls::pinned().unwrap(); let controls = registry.template_controls();
+    let eos = controls.entries().iter().find(|e| e.special && e.surface == crate::template::IM_END).unwrap().id;
+    let p = SourceTaskPlanner::pinned(controls, eos).unwrap().with_map_document_encoding(
+        UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 4096,
+            max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 }),
+        SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+            max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 }).unwrap();
+    let mut c = config(); c.ner_identity.tokenizer_digest = p.tokenizer_digest();
+    c.ner_identity.template_digest = *p.template_digest();
+    c.ner_identity.task_spec = crate::tasks::ner::NER_TASK_VERSION.to_owned();
+    Int8Redactor::new(&p, c.ner_identity.clone(), c.detector.clone()).unwrap();
+    assert_eq!(check_configuration(&p, &c).unwrap_err().code, BatchCode::InvalidLimits);
+    assert_eq!(p.map_document_encoding_work().unwrap().unwrap().input_bytes(), 0);
+}
