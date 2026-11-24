@@ -20,6 +20,7 @@ use super::{
 
 mod source;
 pub use source::{SOURCE_JSON_RUNTIME_VERSION, SourceCompileError, SourceRuntimeLimits};
+pub(crate) use source::SourceValidationError;
 
 /// Versioned canonical byte-language and code-point length semantics.
 pub const JSON_RUNTIME_VERSION: &str = "canonical-json-runtime-v1";
@@ -223,8 +224,7 @@ impl JsonProgram {
     /// Independent whole-value verification, never acceptance by parser state.
     /// The existing validator receives schema data, not transitions or masks.
     pub fn validate_json(&self, text: &str) -> Result<(), SchemaError> {
-        let value = self.validated_value(text)?;
-        self.source_fields_for_value(&value).map(|_| ())
+        self.source_fields(text).map(|_| ())
     }
 
     /// Complete declarative validation for a composed value whose original

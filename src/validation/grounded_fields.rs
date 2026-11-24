@@ -86,8 +86,21 @@ impl<E: Error + 'static> Error for GroundingScanError<E> {
 pub fn verify_source_fields(
     schema: &SchemaNode, value: &JsonValue, source: &str, budget: GroundingBudget,
 ) -> Result<Vec<SourceFieldEvidence>, FieldGroundingError> {
+    match verify_source_fields_with_checkpoints(schema, value, source, budget,
+        || Ok::<(), std::convert::Infallible>(())) {
+        Ok(fields) => Ok(fields),
+        Err(GroundingScanError::Verification(error)) => Err(error),
+        Err(GroundingScanError::Checkpoint(never)) => match never {},
+    }
+}
+
+pub(crate) fn verify_source_fields_with_checkpoints<E>(
+    schema: &SchemaNode, value: &JsonValue, source: &str, budget: GroundingBudget,
+    mut checkpoint: impl FnMut() -> Result<(), E>,
+) -> Result<Vec<SourceFieldEvidence>, GroundingScanError<E>> {
     let mut state = Verification { source, budget, fields: Vec::new() };
-    state.walk(schema, value, "$", 0)?;
+    state.walk(schema, value, "$", 0, &mut checkpoint)?;
+    checkpoint().map_err(GroundingScanError::Checkpoint)?;
     Ok(state.fields)
 }
 
@@ -97,12 +110,14 @@ struct Verification<'a> {
     fields: Vec<SourceFieldEvidence>,
 }
 impl Verification<'_> {
-    fn walk(&mut self, schema: &SchemaNode, value: &JsonValue, path: &str, depth: usize) -> Result<(), FieldGroundingError> {
-        if depth > 128 { return Err(FieldGroundingError::Shape); }
+    fn walk<E>(&mut self, schema: &SchemaNode, value: &JsonValue, path: &str, depth: usize,
+        checkpoint: &mut impl FnMut() -> Result<(), E>) -> Result<(), GroundingScanError<E>> {
+        checkpoint().map_err(GroundingScanError::Checkpoint)?;
+        if depth > 128 { return Err(FieldGroundingError::Shape.into()); }
         match (schema, value) {
             (SchemaNode::String { source: SourceAnnotation::Verbatim, .. }, JsonValue::String(text)) => {
-                if self.fields.len() == self.budget.max_fields { return Err(FieldGroundingError::FieldBudget); }
-                let spans = scan_occurrences(self.source, text, &mut self.budget)?;
+                if self.fields.len() == self.budget.max_fields { return Err(FieldGroundingError::FieldBudget.into()); }
+                let spans = scan_occurrences_with_checkpoints(self.source, text, &mut self.budget, &mut *checkpoint)?;
                 let occurrence = if spans.len() == 1 { SourceOccurrence::Anchored } else { SourceOccurrence::Ambiguous };
                 self.fields.try_reserve(1).map_err(|_| FieldGroundingError::AllocationRefused)?;
                 self.fields.push(SourceFieldEvidence { json_pointer: path.to_owned(), occurrence, spans });
@@ -110,17 +125,17 @@ impl Verification<'_> {
             (SchemaNode::Object { properties, .. }, JsonValue::Object(values)) => {
                 for (name, value) in values {
                     let child = properties.get(name).ok_or(FieldGroundingError::Shape)?;
-                    self.walk(child, value, &pointer(path, &name.replace('~', "~0").replace('/', "~1")), depth + 1)?;
+                    self.walk(child, value, &pointer(path, &name.replace('~', "~0").replace('/', "~1")), depth + 1, checkpoint)?;
                 }
             }
             (SchemaNode::Array { items, .. }, JsonValue::Array(values)) => {
-                for (i, value) in values.iter().enumerate() { self.walk(items, value, &pointer(path, &i.to_string()), depth + 1)?; }
+                for (i, value) in values.iter().enumerate() { self.walk(items, value, &pointer(path, &i.to_string()), depth + 1, checkpoint)?; }
             }
             (SchemaNode::String { .. }, JsonValue::String(_))
             | (SchemaNode::Number { .. }, JsonValue::Number(_))
             | (SchemaNode::Boolean { .. }, JsonValue::Boolean(_))
             | (SchemaNode::Null { .. }, JsonValue::Null) => {}
-            _ => return Err(FieldGroundingError::Shape),
+            _ => return Err(FieldGroundingError::Shape.into()),
         }
         Ok(())
     }

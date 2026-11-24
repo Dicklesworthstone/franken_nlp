@@ -6,7 +6,11 @@
 use serde::{Deserialize, Serialize};
 use super::*;
 use crate::grammar::source_index::{SourceBuildError, SourceLanguageLimits};
-use crate::validation::grounded_fields::{GroundingBudget, SourceFieldEvidence, verify_source_fields};
+use crate::validation::grounded_fields::{
+    GroundingBudget, GroundingScanError, SourceFieldEvidence, verify_source_fields_with_checkpoints,
+};
+
+pub(crate) enum SourceValidationError<E> { Schema(SchemaError), Cancelled(E) }
 
 pub const SOURCE_JSON_RUNTIME_VERSION: &str = "canonical-source-json-runtime-v1";
 
@@ -91,15 +95,29 @@ impl JsonProgram {
     /// Return all exact occurrences using the validation-owned matcher, not
     /// the suffix index used to constrain token selection. Failure is atomic.
     pub fn source_fields(&self, text: &str) -> Result<Vec<SourceFieldEvidence>, SchemaError> {
-        let value = self.validated_value(text)?;
-        self.source_fields_for_value(&value)
-    }
-    pub(super) fn source_fields_for_value(&self, value: &ValidationValue) -> Result<Vec<SourceFieldEvidence>, SchemaError> {
-        match &self.source {
-            Some(binding) => verify_source_fields(self.schema.root(), value, binding.language.source(), binding.limits.verification)
-                .map_err(|e| SchemaError::Validation { pointer: "$".to_owned(), reason: e.to_string() }),
-            None => Ok(Vec::new()),
+        match self.source_fields_with_checkpoints(text, || Ok::<(), std::convert::Infallible>(())) {
+            Ok(fields) => Ok(fields),
+            Err(SourceValidationError::Schema(error)) => Err(error),
+            Err(SourceValidationError::Cancelled(never)) => match never {},
         }
+    }
+    /// Parse and validate the complete value, preserving the request's cancellation
+    /// cause across the independent occurrence census for every bound field.
+    pub(crate) fn source_fields_with_checkpoints<E>(&self, text: &str,
+        mut checkpoint: impl FnMut() -> Result<(), E>) -> Result<Vec<SourceFieldEvidence>, SourceValidationError<E>> {
+        checkpoint().map_err(SourceValidationError::Cancelled)?;
+        let value = self.validated_value(text).map_err(SourceValidationError::Schema)?;
+        let Some(binding) = &self.source else {
+            checkpoint().map_err(SourceValidationError::Cancelled)?;
+            return Ok(Vec::new());
+        };
+        verify_source_fields_with_checkpoints(self.schema.root(), &value, binding.language.source(),
+            binding.limits.verification, checkpoint).map_err(|error| match error {
+                GroundingScanError::Checkpoint(cause) => SourceValidationError::Cancelled(cause),
+                GroundingScanError::Verification(error) => SourceValidationError::Schema(SchemaError::Validation {
+                    pointer: "$".to_owned(), reason: error.to_string(),
+                }),
+            })
     }
 }
 

@@ -223,7 +223,7 @@ fn run<V: Vocabulary, D: Driver, S: Selection>(group_width: usize, prompt: &[u32
         tokens.push(selected);
         if selected == options.eos_token_id {
             let json = String::from_utf8(bytes).map_err(|_| JsonDecodeError::IndependentValidation)?;
-            program.validate_json(&json).map_err(|_| JsonDecodeError::IndependentValidation)?;
+            crate::native_engine::constrained::checked_source_fields(program, &json, driver.control(), step)?;
             let model_work = driver.work()?;
             if model_work != Int4Work::for_sequence(group_width, retained, positions, projected)? { return Err(Int4JsonError::WorkMismatch); }
             poll(driver.control(), step)?;

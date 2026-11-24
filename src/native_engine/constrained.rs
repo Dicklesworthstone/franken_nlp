@@ -87,6 +87,21 @@ impl fmt::Display for JsonDecodeError {
     }
 }
 impl Error for JsonDecodeError {}
+
+/// Use the same request control during independent validation as during
+/// sampling. Source membership can take many complete scans after scored EOS.
+pub(crate) fn checked_source_fields(program: &JsonProgram, json: &str,
+    control: &mut impl DecodeStepControl, step: usize,
+) -> Result<Vec<crate::validation::grounded_fields::SourceFieldEvidence>, JsonDecodeError> {
+    use crate::grammar::runtime::SourceValidationError;
+    program.source_fields_with_checkpoints(json, || match control.checkpoint(step) {
+        Some(cause) => Err(cause),
+        None => Ok(()),
+    }).map_err(|error| match error {
+        SourceValidationError::Cancelled(cause) => JsonDecodeError::Cancelled(cause),
+        SourceValidationError::Schema(_) => JsonDecodeError::IndependentValidation,
+    })
+}
 impl From<MaskOracleError> for JsonDecodeError {
     fn from(error: MaskOracleError) -> Self {
         match error {
@@ -216,7 +231,7 @@ fn run<V: Vocabulary, C: DecodeStepControl, F: FnMut(u32) -> Result<Vec<f32>, Js
         tokens.push(selected);
         if selected == options.eos_token_id {
             let json = String::from_utf8(bytes).map_err(|_| JsonDecodeError::IndependentValidation)?;
-            program.validate_json(&json).map_err(|_| JsonDecodeError::IndependentValidation)?;
+            checked_source_fields(program, &json, control, step)?;
             return Ok(JsonDecodeOutput {
                 schema_version: 1, numerics_profile: profile.to_owned(), token_ids: tokens, json,
                 forward_positions: positions, projected_logits: positions * vocabulary.width() as u64,
@@ -277,6 +292,36 @@ mod tests {
         assert_eq!(out.json, "true"); assert_eq!(out.token_ids, vec![1, 0]);
         assert_eq!(seen, vec![2, 1]); assert_eq!(out.forward_positions, 2);
         assert_eq!(out.projected_logits, 6); assert_eq!(out.mask_node_visit_charge, 6);
+    }
+
+    #[test]
+    fn scored_eos_can_cancel_inside_the_independent_occurrence_scan() {
+        use crate::grammar::runtime::SourceRuntimeLimits;
+
+        struct Control { eos_polls: usize, cancel_at: Option<usize> }
+        impl DecodeStepControl for Control {
+            fn checkpoint(&mut self, next: usize) -> Option<DecodeCancellationKind> {
+                if next != 1 { return None; }
+                self.eos_polls += 1;
+                (Some(self.eos_polls) == self.cancel_at).then_some(DecodeCancellationKind::Deadline)
+            }
+        }
+        let execute = |source: &str, control: &mut Control| {
+            let schema = r#"{"type":"string","x-fnlp-source":"verbatim"}"#;
+            let program = JsonProgram::compile_with_source(schema, source, CompileLimits::default(),
+                SourceRuntimeLimits::default()).unwrap();
+            let vocab = Table(vec![vec![], br#""needle""#.to_vec()]);
+            run(&[1], &program, &vocab, &options(2), budget(), "fixture", control,
+                |_| Ok(vec![2.0, 1.0]))
+        };
+        let mut short = Control { eos_polls: 0, cancel_at: None };
+        assert_eq!(execute("needle", &mut short).unwrap().json, r#""needle""#);
+        // Same prompt, token IDs, mask work and acceptance. The extra polls
+        // in the long case come from scanning past an already discovered match.
+        let long = format!("needle{}", "x".repeat(32_768));
+        let mut interrupted = Control { eos_polls: 0, cancel_at: Some(short.eos_polls + 1) };
+        assert!(matches!(execute(&long, &mut interrupted),
+            Err(JsonDecodeError::Cancelled(DecodeCancellationKind::Deadline))));
     }
 
     #[test]

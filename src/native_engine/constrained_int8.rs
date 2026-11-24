@@ -294,7 +294,7 @@ fn run<V: Vocabulary, D: Driver>(prompt: &[u32], program: &JsonProgram, vocabula
         tokens.push(selected);
         if selected == options.eos_token_id {
             let json = String::from_utf8(bytes).map_err(|_| JsonDecodeError::IndependentValidation)?;
-            program.validate_json(&json).map_err(|_| JsonDecodeError::IndependentValidation)?;
+            super::constrained::checked_source_fields(program, &json, driver.control(), step)?;
             let model_work = driver.work();
             if model_work != Int8Work::for_sequence(0, positions as usize, projected as usize)? {
                 return Err(Int8JsonError::WorkMismatch);

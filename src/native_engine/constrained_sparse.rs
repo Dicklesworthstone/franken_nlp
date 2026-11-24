@@ -256,7 +256,7 @@ fn run<V: Vocabulary, C: DecodeStepControl, M: CandidateLogits>(
         tokens.push(selected);
         if selected == options.eos_token_id {
             let json = String::from_utf8(bytes).map_err(|_| JsonDecodeError::IndependentValidation)?;
-            program.validate_json(&json).map_err(|_| JsonDecodeError::IndependentValidation)?;
+            super::constrained::checked_source_fields(program, &json, control, step)?;
             let positions = (prompt.len() as u64).checked_add(tokens.len() as u64 - 1)
                 .ok_or(JsonDecodeError::BudgetExceeded("position arithmetic"))?;
             let output = SparseJsonDecodeOutput { schema_version: 1, execution: SPARSE_JSON_EXECUTION.to_owned(),
@@ -266,6 +266,7 @@ fn run<V: Vocabulary, C: DecodeStepControl, M: CandidateLogits>(
             if canonjson::canonical_bytes(&output).map_err(|_| SparseJsonError::Serialization)?.len() > limits.max_output_bytes {
                 return Err(SparseJsonError::OutputBudget);
             }
+            poll(control, step)?;
             return Ok(output);
         }
         let emitted = vocabulary.bytes(selected).filter(|value| !value.is_empty()).ok_or(JsonDecodeError::IllegalTransition)?;

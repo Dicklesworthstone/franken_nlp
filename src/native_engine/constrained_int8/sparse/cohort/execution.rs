@@ -83,7 +83,8 @@ fn run<V: Vocabulary, D: GroupDriver>(requests: &[Int8JsonCohortRequest<'_>], vo
     let mut longest = 0; let mut masks = 0_u64;
     for (slot, row) in cursors.into_iter().enumerate() {
         let json = String::from_utf8(row.bytes).map_err(|_| JsonDecodeError::IndependentValidation)?;
-        requests[slot].program.validate_json(&json).map_err(|_| JsonDecodeError::IndependentValidation)?;
+        crate::native_engine::constrained::checked_source_fields(requests[slot].program, &json,
+            driver.control(), row.tokens.len())?;
         let work = driver.work(slot)?;
         let positions = requests[slot].prompt.len().checked_add(row.tokens.len() - 1).ok_or(StrictInt8Error::Work)?;
         if positions != row.positions || work != Int8Work::for_sequence(0, positions, row.projected)? {
