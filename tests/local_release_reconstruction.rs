@@ -163,6 +163,35 @@ fn absent_final_is_a_cache_miss_only_after_manifest_authentication() {
 }
 
 #[test]
+fn pinned_manifest_cannot_misidentify_checked_resources_on_publication_or_cache_hit() {
+    let fixture = Fixture::new("release-resource-identities");
+    let existing = fixture.root.join(LOGICAL_NAME);
+    for field in ["digests.tokenizer_sha256", "digests.template_sha256", "digests.census_sha256"] {
+        let mut manifest = fixture.manifest.clone();
+        let identity = match field {
+            "digests.tokenizer_sha256" => &mut manifest.digests.tokenizer_sha256,
+            "digests.template_sha256" => &mut manifest.digests.template_sha256,
+            _ => &mut manifest.digests.census_sha256,
+        };
+        *identity = "00".repeat(32);
+        let mut request = fixture.request(field);
+        request.manifest = fixture.root.join(format!("{field}.json"));
+        fs::write(&request.manifest, manifest.canonical_bytes().unwrap()).unwrap();
+        request.expected_release_manifest_sha256 = manifest.release_manifest_sha256().unwrap();
+
+        let cache = verify_local_release_cache(
+            &request.manifest, &request.expected_release_manifest_sha256, &existing, |_| None,
+        );
+        assert!(matches!(cache, Err(PullError::ContainerIdentity(actual)) if actual == field));
+        let publication = reconstruct_local_release(&request);
+        assert!(matches!(publication, Err(PullError::ContainerIdentity(actual)) if actual == field));
+        assert!(!request.output.exists());
+        assert_eq!(fs::read(request.staging_output).unwrap(), fixture.artifact);
+    }
+    assert_eq!(fs::read(existing).unwrap(), fixture.artifact);
+}
+
+#[test]
 fn existing_final_cache_rehashes_bytes_and_refuses_damage_without_mutation() {
     let fixture = Fixture::new("cache-corruption");
     let request = fixture.request("damaged");

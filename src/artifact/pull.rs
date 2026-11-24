@@ -31,11 +31,14 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use crate::artifact::{
+    converter::census_digest,
+    format::SectionKind,
     manifest::{
         release_manifest_sha256, ManifestError, ReleaseManifest, ReleasePart,
         NANBEIGE42_INT8_V1_COMPATIBILITY, MAX_RELEASE_MANIFEST_BYTES,
     },
     reader::{FnlpqRangeReader, FnlpqReadError},
+    safetensors::SafetensorDtype,
 };
 use crate::native_engine::decode::DecodeCancellationKind;
 
@@ -340,7 +343,7 @@ pub fn verify_local_release_cache(
         Err(FnlpqReadError::Cancelled(cause)) => return Err(PullError::Cancelled { cause, progress }),
         Err(error) => return Err(PullError::Container(error)),
     };
-    verify_container_identity(&reader, &manifest)?;
+    verify_container_identity(&reader, &manifest, progress, &mut checkpoint)?;
     reconstruction_checkpoint(progress, &mut checkpoint)?;
     check_staging_path(&file, artifact_path, manifest.artifact.bytes)?;
     Ok(Some(LocalArtifactVerificationReport {
@@ -491,7 +494,7 @@ fn verify_and_publish_staged_artifact(
         }
         Err(error) => return Err(PullError::Container(error)),
     };
-    verify_container_identity(&reader, manifest)?;
+    verify_container_identity(&reader, manifest, *progress, checkpoint)?;
 
     progress.phase = LocalReconstructPhase::Publish;
     reconstruction_checkpoint(*progress, checkpoint)?;
@@ -937,6 +940,8 @@ fn validate_request_paths(request: &LocalReconstructRequest) -> Result<(), PullE
 fn verify_container_identity(
     reader: &FnlpqRangeReader,
     manifest: &ReleaseManifest,
+    progress: LocalReconstructProgress,
+    checkpoint: &mut impl FnMut(LocalReconstructProgress) -> Option<DecodeCancellationKind>,
 ) -> Result<(), PullError> {
     if reader.prelude().file_len != manifest.artifact.bytes {
         return Err(PullError::ContainerIdentity("artifact.bytes"));
@@ -961,6 +966,32 @@ fn verify_container_identity(
     }
     if reader.license_bundle_sha256() != manifest.license_bundle_sha256 {
         return Err(PullError::ContainerIdentity("license_bundle_sha256"));
+    }
+    // The admitted Nanbeige reader has already checked all 201 sorted BF16
+    // names and shapes. Census rows use original logical bytes, even when
+    // the physical data mapping contains quantized weights.
+    let census = census_digest(reader.tensors().iter().map(|tensor| {
+        (tensor.name.as_str(), SafetensorDtype::Bf16, tensor.shape.as_slice(), tensor.logical_bytes)
+    })).map_err(|_| PullError::ContainerIdentity("digests.census_sha256"))?;
+    if census != manifest.digests.census_sha256 {
+        return Err(PullError::ContainerIdentity("digests.census_sha256"));
+    }
+    // Release manifests use raw SHA-256 for these assets. The directory's
+    // domain-framed stored digest binds different bytes.
+    for (kind, expected, field) in [
+        (SectionKind::TokenizerModel, &manifest.digests.tokenizer_sha256, "digests.tokenizer_sha256"),
+        (SectionKind::ChatTemplate, &manifest.digests.template_sha256, "digests.template_sha256"),
+    ] {
+        let section = reader.sections().iter().find(|section| section.kind == kind)
+            .ok_or(PullError::ContainerIdentity(field))?;
+        let raw = match reader.raw_section_sha256_with_checkpoint(section.ordinal, || checkpoint(progress)) {
+            Ok(digest) => digest,
+            Err(FnlpqReadError::Cancelled(cause)) => return Err(PullError::Cancelled { cause, progress }),
+            Err(error) => return Err(PullError::Container(error)),
+        };
+        if hex_lower(&raw) != *expected {
+            return Err(PullError::ContainerIdentity(field));
+        }
     }
     Ok(())
 }

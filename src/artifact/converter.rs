@@ -1154,7 +1154,9 @@ pub fn prepare_nanbeige42_input_with_checkpoint(
         .map(|entry| PanelPlan::for_tensor(entry, panel_cap))
         .collect::<Result<Vec<_>, _>>()?;
     let logical_payload_bytes = validate_pinned_logical_payload_bytes(&census)?;
-    let census_sha256 = census_digest(&census)?;
+    let census_sha256 = census_digest(census.iter().map(|tensor| {
+        (tensor.name.as_str(), tensor.dtype, tensor.shape.as_slice(), tensor.len)
+    }))?;
     source_checkpoint(&mut checkpoint)?;
     Ok(PreparedConversionInput {
         source,
@@ -2966,7 +2968,11 @@ fn source_root_digest(manifest: &ConversionSourceManifest) -> Result<String, Con
     Ok(hex_lower(&digest))
 }
 
-fn census_digest(census: &[TensorCensusEntry]) -> Result<String, ConverterError> {
+/// Hash sorted source census rows. The range reader stores checked dimensions
+/// as u32 and the converter as u64. Both use exactly the source's u64 framing.
+pub(crate) fn census_digest<'a, D: Copy + Into<u64> + 'a>(
+    census: impl ExactSizeIterator<Item = (&'a str, SafetensorDtype, &'a [D], u64)>,
+) -> Result<String, ConverterError> {
     let mut hasher = Sha256::new();
     hasher.update(digest_domain::CENSUS.as_bytes());
     hasher.update([0]);
@@ -2974,22 +2980,22 @@ fn census_digest(census: &[TensorCensusEntry]) -> Result<String, ConverterError>
         invariant: "census tensor count",
     })?;
     hasher.update(count.to_le_bytes());
-    for tensor in census {
+    for (name, dtype, shape, len) in census {
         let name_len =
-            u64::try_from(tensor.name.len()).map_err(|_| ConverterError::Arithmetic {
+            u64::try_from(name.len()).map_err(|_| ConverterError::Arithmetic {
                 invariant: "census tensor name length",
             })?;
         hasher.update(name_len.to_le_bytes());
-        hasher.update(tensor.name.as_bytes());
-        hasher.update(tensor.dtype.as_str().as_bytes());
-        let rank = u64::try_from(tensor.shape.len()).map_err(|_| ConverterError::Arithmetic {
+        hasher.update(name.as_bytes());
+        hasher.update(dtype.as_str().as_bytes());
+        let rank = u64::try_from(shape.len()).map_err(|_| ConverterError::Arithmetic {
             invariant: "census tensor rank",
         })?;
         hasher.update(rank.to_le_bytes());
-        for dimension in &tensor.shape {
+        for dimension in shape.iter().copied().map(Into::<u64>::into) {
             hasher.update(dimension.to_le_bytes());
         }
-        hasher.update(tensor.len.to_le_bytes());
+        hasher.update(len.to_le_bytes());
     }
     Ok(hex_lower(&hasher.finalize()))
 }
