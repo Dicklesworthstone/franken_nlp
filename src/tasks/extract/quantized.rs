@@ -171,7 +171,13 @@ impl Int8ExtractPlan {
         self.execute_with_prefill(engine, admitted, vocabulary, budget, None, control, finalize)
     }
 
+    #[cfg(test)]
     fn finalize(&self, run: Int8JsonRun) -> Result<Int8ExtractRun, Int8ExtractError> {
+        self.finalize_with_control(run, |_| None)
+    }
+
+    fn finalize_with_control(&self, run: Int8JsonRun,
+        mut checkpoint: impl FnMut(usize) -> Option<DecodeCancellationKind>) -> Result<Int8ExtractRun, Int8ExtractError> {
         if run.schema_version != 1 || run.execution != self.native_execution_version() {
             return Err(ExtractError::InvalidResult.into());
         }
@@ -180,7 +186,8 @@ impl Int8ExtractPlan {
             || run.output.projected_logits != expected.projected_logits {
             return Err(Int8JsonError::WorkMismatch.into());
         }
-        let result = self.extraction.finalize_profile(run.output, STRICT_INT8_PROFILE)?;
+        let step = run.output.token_ids.len();
+        let result = self.extraction.finalize_profile_with_control(run.output, STRICT_INT8_PROFILE, || checkpoint(step))?;
         let output = Int8ExtractRun { schema_version: 1, execution: self.execution_version().to_owned(),
             result, model_work: run.model_work };
         check_size(&output, self.max_result_bytes())?;

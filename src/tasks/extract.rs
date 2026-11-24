@@ -13,11 +13,11 @@ use crate::{
     grammar::{
         CompileLimits, SchemaError,
         mask::{VocabMaskOracle, VocabTrie},
-        runtime::{JSON_RUNTIME_VERSION, SOURCE_JSON_RUNTIME_VERSION, JsonProgram, SourceCompileError, SourceRuntimeLimits},
+        runtime::{JSON_RUNTIME_VERSION, SOURCE_JSON_RUNTIME_VERSION, JsonProgram, SourceCompileError, SourceRuntimeLimits, SourceValidationError},
     },
     native_engine::{
         constrained::{JsonDecodeError, JsonDecodeOptions, JsonDecodeOutput, JsonWorkBudget, decode_json_eager},
-        decode::{DecodeCancellationKind, DecodeStepControl},
+        decode::{DecodeCancellationKind, DecodeStepControl, SharedControl},
         hf_bf16_eager::{HF_BF16_EAGER_PROFILE, HfBf16EagerEngine},
         lmhead::NANBEIGE_VOCAB_SIZE,
     },
@@ -327,7 +327,8 @@ impl ExtractPlan {
         work.max_kv_bytes = work.max_kv_bytes.min(self.max_kv_bytes);
         let output = decode_json_eager(engine, &self.prompt, &self.program, &vocabulary.oracle, &self.options, work, control)
             .map_err(ExtractError::Decode)?;
-        self.finalize(output)
+        let step = output.token_ids.len();
+        self.finalize_profile_with_control(output, HF_BF16_EAGER_PROFILE, || control.checkpoint(step))
     }
 
     fn finalize(&self, output: JsonDecodeOutput) -> Result<ExtractResult, ExtractError> {
@@ -337,6 +338,11 @@ impl ExtractPlan {
     // Only closed native task drivers choose this profile. Public eager
     // finalization retains its exact original profile refusal.
     fn finalize_profile(&self, output: JsonDecodeOutput, profile: &str) -> Result<ExtractResult, ExtractError> {
+        self.finalize_profile_with_control(output, profile, || None)
+    }
+
+    fn finalize_profile_with_control(&self, output: JsonDecodeOutput, profile: &str,
+        mut checkpoint: impl FnMut() -> Option<DecodeCancellationKind>) -> Result<ExtractResult, ExtractError> {
         if output.schema_version != 1 || output.numerics_profile != profile
             || output.token_ids.is_empty() || output.token_ids.len() > self.options.max_new_tokens
             || output.token_ids.last() != Some(&self.options.eos_token_id)
@@ -344,7 +350,12 @@ impl ExtractPlan {
         if output.token_ids[..output.token_ids.len() - 1].iter().any(|id| {
             *id == self.options.eos_token_id || *id as usize >= NANBEIGE_VOCAB_SIZE || self.options.excluded_token_ids.contains(id)
         }) { return Err(ExtractError::InvalidResult); }
-        let source_fields = self.program.source_fields(&output.json).map_err(|_| ExtractError::InvalidResult)?;
+        let source_fields = self.program.recover_fields_with_checkpoints(&output.json, || match checkpoint() {
+            None => Ok(()), Some(cause) => Err(cause),
+        }).map_err(|error| match error {
+            SourceValidationError::Cancelled(cause) => ExtractError::Decode(JsonDecodeError::Cancelled(cause)),
+            SourceValidationError::Schema(_) => ExtractError::InvalidResult,
+        })?;
         let source_bound = self.program.requires_source();
         let result = ExtractResult {
             schema_version: if source_bound { 2 } else { 1 }, task_spec_version: self.task_identity.to_owned(),
@@ -352,8 +363,8 @@ impl ExtractPlan {
             grounding: if source_bound { ExtractionGrounding::SourceMembership } else { ExtractionGrounding::NotRequested },
             output, source_fields,
         };
-        let bytes = canonjson::canonical_bytes(&result).map_err(|_| ExtractError::Serialization)?;
-        if bytes.len() as u64 > self.max_result_bytes { return Err(ExtractError::OutputBudgetExceeded); }
+        quantized::check_size(&result, self.max_result_bytes)?;
+        if let Some(cause) = checkpoint() { return Err(ExtractError::Decode(JsonDecodeError::Cancelled(cause))); }
         Ok(result)
     }
 }

@@ -15,7 +15,7 @@ use crate::{canonjson, grammar::{
 }};
 use super::{
     constrained::{JsonDecodeError, JsonDecodeOptions, JsonDecodeOutput, JsonWorkBudget},
-    decode::{DecodeCancellationKind, DecodeStepControl},
+    decode::{DecodeStepControl, SharedControl},
     hf_bf16_eager::{HfBf16EagerEngine, HF_BF16_EAGER_PROFILE,
         candidate_scoring::{EagerPrefixSession, PrefixBudget, PrefixScoringError}},
     lmhead::{NANBEIGE_VOCAB_SIZE, scoring::{CandidateLogits, ProjectionRows}},
@@ -123,16 +123,6 @@ pub fn decode_json_eager_sparse<C: DecodeStepControl>(
     }
     drop(session); // Clear logical KV on success; all error/unwind paths also drop.
     Ok(result)
-}
-
-struct SharedControl<'a, 'b, C>(&'a RefCell<&'b mut C>);
-impl<C: DecodeStepControl> DecodeStepControl for SharedControl<'_, '_, C> {
-    fn checkpoint(&mut self, step: usize) -> Option<DecodeCancellationKind> {
-        self.0.borrow_mut().checkpoint(step)
-    }
-    fn prefill_checkpoint(&mut self, position: usize) -> Option<DecodeCancellationKind> {
-        self.0.borrow_mut().prefill_checkpoint(position)
-    }
 }
 
 fn preflight(prompt: &[u32], width: usize, options: &JsonDecodeOptions,
@@ -285,6 +275,7 @@ fn run<V: Vocabulary, C: DecodeStepControl, M: CandidateLogits>(
 
 #[cfg(test)]
 mod tests {
+    use crate::native_engine::decode::DecodeCancellationKind;
     use super::*;
     use std::collections::BTreeSet;
     use crate::grammar::CompileLimits;

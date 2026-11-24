@@ -34,7 +34,10 @@ impl Int8ExtractPlan {
                 "vocabulary control registry differs from int8 plan"))));
         }
         budget.json.max_kv_bytes = budget.json.max_kv_bytes.min(self.extraction.max_kv_bytes);
-        let finish = |run| finalize(self.finalize(run).map_err(E::from)?);
+        let shared = std::cell::RefCell::new(control);
+        let control = &mut SharedControl(&shared);
+        let finish = |run| finalize(self.finalize_with_control(run,
+            |step| shared.borrow_mut().checkpoint(step)).map_err(E::from)?);
         match (self.selected_rows, prefill) {
             (Some(rows), Some(prefill)) => selected_head::prefill::decode_json_int8_sparse_layer_major_with(
                 engine, admitted, &self.extraction.prompt, &self.extraction.program, &vocabulary.oracle,

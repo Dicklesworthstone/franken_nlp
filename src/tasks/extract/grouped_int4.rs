@@ -276,7 +276,10 @@ impl Int4ExtractPlan {
         budget.json.max_kv_bytes = budget.json.max_kv_bytes.min(self.extraction.max_kv_bytes);
         // The native session owns cleanup and remains live throughout source
         // validation, complete-result accounting and the final checkpoint.
-        let finish = |run| finalize(self.finalize(run).map_err(E::from)?);
+        let shared = std::cell::RefCell::new(control);
+        let control = &mut SharedControl(&shared);
+        let finish = |run| finalize(self.finalize_with_control(run,
+            |step| shared.borrow_mut().checkpoint(step)).map_err(E::from)?);
         match (self.selected_rows, prefill) {
             (Some(rows), Some(prefill)) => selected_head::prefill::decode_json_int4_sparse_layer_major_with(
                 engine, admitted, &self.extraction.prompt, &self.extraction.program, &vocabulary.oracle,
@@ -290,7 +293,13 @@ impl Int4ExtractPlan {
         }
     }
 
+    #[cfg(test)]
     fn finalize(&self, run: Int4JsonRun) -> Result<Int4ExtractRun, Int4ExtractError> {
+        self.finalize_with_control(run, |_| None)
+    }
+
+    fn finalize_with_control(&self, run: Int4JsonRun,
+        mut checkpoint: impl FnMut(usize) -> Option<DecodeCancellationKind>) -> Result<Int4ExtractRun, Int4ExtractError> {
         if run.schema_version != 1 || run.execution != self.native_execution_version() || run.group_width != self.group_width {
             return Err(ExtractError::InvalidResult.into());
         }
@@ -299,7 +308,8 @@ impl Int4ExtractPlan {
             || run.output.projected_logits != expected.projected_logits {
             return Err(Int4JsonError::WorkMismatch.into());
         }
-        let result = self.extraction.finalize_profile(run.output, STRICT_INT4_PROFILE)?;
+        let step = run.output.token_ids.len();
+        let result = self.extraction.finalize_profile_with_control(run.output, STRICT_INT4_PROFILE, || checkpoint(step))?;
         let output = Int4ExtractRun { schema_version: 1, execution: self.execution_version().to_owned(),
             group_width: self.group_width, result, model_work: run.model_work };
         // This existing bounded serializer accepts only trusted typed values;

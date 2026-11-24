@@ -344,6 +344,18 @@ pub trait DecodeStepControl {
     }
 }
 
+/// Cooperative access to one request control from separate synchronous native
+/// and finalization callbacks. The mutable borrow lasts for one poll only.
+pub(crate) struct SharedControl<'a, 'b, C>(pub(crate) &'a std::cell::RefCell<&'b mut C>);
+impl<C: DecodeStepControl> DecodeStepControl for SharedControl<'_, '_, C> {
+    fn checkpoint(&mut self, step: usize) -> Option<DecodeCancellationKind> {
+        self.0.borrow_mut().checkpoint(step)
+    }
+    fn prefill_checkpoint(&mut self, position: usize) -> Option<DecodeCancellationKind> {
+        self.0.borrow_mut().prefill_checkpoint(position)
+    }
+}
+
 /// Typed refusals from the eager greedy loop.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DecodeError {

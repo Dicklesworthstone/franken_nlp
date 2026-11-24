@@ -95,11 +95,15 @@ impl JsonProgram {
     /// Return all exact occurrences using the validation-owned matcher, not
     /// the suffix index used to constrain token selection. Failure is atomic.
     pub fn source_fields(&self, text: &str) -> Result<Vec<SourceFieldEvidence>, SchemaError> {
-        match self.check_fields(text, EvidenceMode::Recover, || Ok::<(), std::convert::Infallible>(())) {
+        match self.recover_fields_with_checkpoints(text, || Ok::<(), std::convert::Infallible>(())) {
             Ok(fields) => Ok(fields),
             Err(SourceValidationError::Schema(error)) => Err(error),
             Err(SourceValidationError::Cancelled(never)) => match never {},
         }
+    }
+    pub(crate) fn recover_fields_with_checkpoints<E>(&self, text: &str,
+        checkpoint: impl FnMut() -> Result<(), E>) -> Result<Vec<SourceFieldEvidence>, SourceValidationError<E>> {
+        self.check_fields(text, EvidenceMode::Recover, checkpoint)
     }
     /// Parse and validate the complete value, preserving the request's cancellation
     /// cause across the independent occurrence census for every bound field.

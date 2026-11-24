@@ -110,11 +110,11 @@ where C: DecodeStepControl, E: From<Int4ExtractError> + From<Int4JsonError>,
             selected_limits[slot] = request.prepared.selected_rows().ok_or_else(|| E::from(Int4JsonError::WorkMismatch))?;
         }
     }
+    let shared = std::cell::RefCell::new(control);
+    let control = &mut SharedControl(&shared);
     let finalize_native = |run| {
-        let output = match prefill {
-            Some(_) => finish_scheduled(requests, run, budget.max_result_bytes, prefill),
-            None => finish(requests, run, budget.max_result_bytes),
-        };
+        let output = finish_controlled(requests, run, budget.max_result_bytes, prefill,
+            |step| shared.borrow_mut().checkpoint(step));
         finalize(output.map_err(E::from)?)
     };
     match (selected, prefill) {
@@ -145,12 +145,19 @@ fn native_request<'a>(request: &Int4ExtractCohortRequest<'a>) -> Int4JsonCohortR
 
 /// Internal reconciliation of an actual native result; never an authentication
 /// API for deserialized scores or a substitute for native execution.
+#[cfg(test)]
 pub(super) fn finish(requests: &[Int4ExtractCohortRequest<'_>], raw: Int4JsonCohortRun, cap: u64)
     -> Result<Int4ExtractCohortRun, Int4ExtractError> {
     finish_scheduled(requests, raw, cap, None)
 }
+#[cfg(test)]
 fn finish_scheduled(requests: &[Int4ExtractCohortRequest<'_>], raw: Int4JsonCohortRun, cap: u64,
     prefill: Option<Int4PrefillLimits>) -> Result<Int4ExtractCohortRun, Int4ExtractError> {
+    finish_controlled(requests, raw, cap, prefill, |_| None)
+}
+fn finish_controlled(requests: &[Int4ExtractCohortRequest<'_>], raw: Int4JsonCohortRun, cap: u64,
+    prefill: Option<Int4PrefillLimits>, mut checkpoint: impl FnMut(usize) -> Option<DecodeCancellationKind>)
+    -> Result<Int4ExtractCohortRun, Int4ExtractError> {
     if let Some(limits) = prefill { limits.validate().map_err(Int4JsonError::from)?; }
     let selected = selected_policy(requests)?;
     let (native_execution, execution) = match (selected, prefill.is_some()) {
@@ -174,7 +181,7 @@ fn finish_scheduled(requests: &[Int4ExtractCohortRequest<'_>], raw: Int4JsonCoho
     let mut model_work = Int4Work::default(); let mut longest = 0;
     let mut all_projections = 0_u64; let mut longest_projection_sequence = 0;
     for (request, sequence) in requests.iter().zip(raw.sequences) {
-        let result = request.prepared.finalize(sequence)?;
+        let result = request.prepared.finalize_with_control(sequence, &mut checkpoint)?;
         model_work = model_work.checked_add(result.model_work).map_err(Int4JsonError::from)?;
         longest = longest.max(result.model_work.forward_positions);
         let projections = u64::try_from(result.result.output.token_ids.len()).map_err(|_| Int4JsonError::WorkMismatch)?;

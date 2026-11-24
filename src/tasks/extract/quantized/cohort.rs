@@ -70,12 +70,19 @@ where C: DecodeStepControl, E: From<Int8ExtractError> + From<Int8JsonError>,
             prompt: &plan.extraction.prompt, program: &plan.extraction.program, options: plan.options(),
             budget: work, limits: plan.selected_rows().ok_or_else(|| E::from(Int8ExtractError::Identity))? });
     }
-    native::execute_with(engine, &rows, &vocabulary.oracle, budget.decode, control,
-        |run| finalize(finish(requests, run, budget.max_result_bytes).map_err(E::from)?))
+    let shared = std::cell::RefCell::new(control);
+    native::execute_with(engine, &rows, &vocabulary.oracle, budget.decode, &mut SharedControl(&shared),
+        |run| finalize(finish_controlled(requests, run, budget.max_result_bytes,
+            |step| shared.borrow_mut().checkpoint(step)).map_err(E::from)?))
 }
 /// Closed composition check, not authentication of arbitrary deserialized work.
+#[cfg(test)]
 pub(super) fn finish(requests: &[Int8ExtractCohortRequest<'_>], raw: Int8JsonCohortRun, cap: u64)
     -> Result<Int8ExtractCohortRun, Int8ExtractError> {
+    finish_controlled(requests, raw, cap, |_| None)
+}
+fn finish_controlled(requests: &[Int8ExtractCohortRequest<'_>], raw: Int8JsonCohortRun, cap: u64,
+    mut checkpoint: impl FnMut(usize) -> Option<DecodeCancellationKind>) -> Result<Int8ExtractCohortRun, Int8ExtractError> {
     if raw.schema_version != 1 || raw.execution != INT8_JSON_COHORT_EXECUTION
         || raw.sequences.len() != requests.len() || requests.is_empty() {
         return Err(ExtractError::InvalidResult.into());
@@ -89,7 +96,7 @@ pub(super) fn finish(requests: &[Int8ExtractCohortRequest<'_>], raw: Int8JsonCoh
     let mut sequences = Vec::new(); sequences.try_reserve_exact(requests.len()).map_err(|_| ExtractError::AllocationRefused)?;
     let mut model_work = Int8Work::default(); let mut longest = 0;
     for (request, sequence) in requests.iter().zip(raw.sequences) {
-        let result = request.prepared.finalize(sequence)?;
+        let result = request.prepared.finalize_with_control(sequence, &mut checkpoint)?;
         model_work = model_work.checked_add(result.model_work).map_err(Int8JsonError::from)?;
         longest = longest.max(result.model_work.forward_positions);
         sequences.push(result);

@@ -435,6 +435,25 @@ mod tests {
         assert!(p.finalize(output("\"Carol\"")).is_err());
     }
     #[test]
+    fn occurrence_recovery_and_envelope_publication_preserve_each_interruption() {
+        let d = document("Alice Bob Alice");
+        let p = plan(&task(&d, true), &d).unwrap();
+        let mut polls = 0;
+        let full = p.finalize_profile_with_control(output("\"Alice\""), HF_BF16_EAGER_PROFILE,
+            || { polls += 1; None }).unwrap();
+        assert_eq!(full.source_fields[0].spans.len(), 2);
+        assert!(polls > 1);
+        for stop in 1..=polls {
+            let mut seen = 0;
+            let result = p.finalize_profile_with_control(output("\"Alice\""), HF_BF16_EAGER_PROFILE, || {
+                seen += 1;
+                (seen == stop).then_some(DecodeCancellationKind::ParentCancelled)
+            });
+            assert!(matches!(result, Err(ExtractError::Decode(JsonDecodeError::Cancelled(
+                DecodeCancellationKind::ParentCancelled)))));
+        }
+    }
+    #[test]
     fn source_runtime_and_limits_are_identity_bound() {
         let d = document("Alice"); let t = task(&d, true); let p = plan(&t, &d).unwrap();
         let mut id = p.bind_identity(identity()).unwrap();
