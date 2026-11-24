@@ -53,6 +53,62 @@ Existing `--action mask|placeholder|pseudonymize`, `--rules`, `--include-map` an
 detections suppress that document's successful result, not just its suspect
 fragments. Neither original nor intermediate NER text is emitted as a fallback.
 
+## Compact input for complete documents
+
+Add `--chunked --input-encoding safe-bpe-v1` to use bounded compact encoding
+for original NER chunks and fresh NER verification of the actual edited text:
+
+```sh
+fnlp candidate redact records.ndjson --ndjson --chunked \
+  --input-encoding safe-bpe-v1 \
+  --model ./model.fnlpq --memory-mib 16384 \
+  --max-new-tokens 128 --max-requests 100
+```
+
+Compact encoding preserves exact source bytes and original coordinates, and
+excludes template-control tokens from untrusted input. It changes prompt tokens;
+identical model output, detector recall and a measured speedup are not promised.
+Single-context compact populations, with or without retained results, remain
+refused. Omit the encoding option to preserve the existing byte-mode policy.
+
+Each original document attempt receives one cumulative tokenizer allowance:
+
+| Flag | Default | What it counts |
+| --- | --- | --- |
+| `--max-total-tokenizer-input-bytes` | Eight times the sum of `--max-input-bytes` and `--max-result-bytes` | Every encoded untrusted input byte |
+| `--max-total-tokenizer-output-tokens` | The same numeric default | Every emitted untrusted token |
+| `--max-total-tokenizer-pair-checks` | 268435456 | BPE candidate-pair comparisons |
+| `--max-total-tokenizer-pair-bytes` | 4294967296 | Bytes examined by those comparisons |
+
+These totals include original preflight, accepted and rejected chunk-size
+probes, execution-plan reconstruction, and fresh verification of expanded or
+shortened edited text. A chunk boundary, explicit flush, reconstruction or
+verification stage never resets them. A different independently admitted original
+record receives its own allowance. The existing whole-corpus native/mask
+reservations still span all records and epochs.
+
+`--max-tokenizer-pair-checks` and `--max-tokenizer-pair-bytes` instead limit
+each encoding call. A candidate probe may exceed its eventual context before
+the partitioner shrinks it; every accepted complete prompt still fits its
+admitted context. Exhaustion refuses the operation without an encoding fallback,
+partial redaction result or disabled verification.
+
+Live population provenance adds `input_encoding` with `policy`,
+`complete_document_limits`, and
+`budget_scope: "original_preflight_execution_and_edited_verification_per_document_attempt"`.
+It contains no `work` field: the unused factory counter cannot describe
+population-wide tokenizer consumption. Byte-mode output omits this metadata.
+No extra private source, prompt, token sequence or rejected edited text is exposed.
+
+Memory admission includes the compact workspace, complete prepared chunk set,
+possible edited-text expansion, live map results and transport staging before
+private IO. Default chunk/result limits can reserve substantially more memory
+than one short request. The 16384 MiB example is an illustrative process ceiling,
+not a measured requirement or a guarantee of admission; retained jobs may need a
+larger allowance, such as the illustrative 24576 MiB example in
+[candidate-redaction-jobs.md](candidate-redaction-jobs.md). An insufficient
+ceiling refuses setup instead of silently reducing the detector or chunk scope.
+
 ## One pseudonym scope
 
 For pseudonymization, provide an existing high-entropy binary key of 32 through

@@ -206,18 +206,75 @@ fn residual_coordinates_are_dropped_and_transport_errors_are_content_free() {
 }
 
 
-#[test]
-fn compact_corpus_requires_per_document_operation_retention_before_admission() {
-    use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding};
-    let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 4096,
-        max_output_tokens: 4096, max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 });
-    let p = planner().with_map_document_encoding(policy, SafeBpeWorkLimits {
-        max_input_bytes: 65_536, max_output_tokens: 65_536,
-        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28,
-    }).unwrap();
+fn compact_policy() -> crate::tokenizer::untrusted::UntrustedEncoding {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 4096,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 })
+}
+fn compact_factory(bytes: u64) -> SourceTaskPlanner {
+    planner().with_map_document_encoding(compact_policy(), crate::tokenizer::untrusted::SafeBpeWorkLimits {
+        max_input_bytes: bytes, max_output_tokens: 65_536, max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28,
+    }).unwrap()
+}
+fn operation_config(p: &SourceTaskPlanner) -> LongRedactionBatchConfig {
     let mut c = config(); c.ner_identity.tokenizer_digest = p.tokenizer_digest();
     c.ner_identity.template_digest = *p.template_digest();
-    Int8DocumentRedactor::new(&p, c.ner_identity.clone(), c.detector.clone()).unwrap();
-    assert_eq!(check_configuration(&p, &c).unwrap_err().code, BatchCode::InvalidLimits);
+    c.detector.mapping.max_model_work = Int8Work::for_sequence(0, 16384, 100_000_000).unwrap();
+    c.max_model_work = c.detector.mapping.max_model_work.checked_add(c.detector.mapping.max_model_work).unwrap();
+    c.detector.mapping.max_mask_visits = 64_000; c.max_mask_visits = 128_000; c
+}
+fn document(source: &str) -> BatchDocument<RedactionBatchArgs> {
+    BatchDocument { id: "opaque".to_owned(), text: source.to_owned(), task_args: None }
+}
+
+#[test]
+fn compact_corpus_requires_complete_operation_admission() {
+    let p = compact_factory(65_536); let c = operation_config(&p);
+    check_configuration(&p, &c).unwrap();
     assert_eq!(p.map_document_encoding_work().unwrap().unwrap().input_bytes(), 0);
+    let one = planner().with_document_encoding(compact_policy()).unwrap();
+    assert_eq!(check_configuration(&one, &operation_config(&one)).unwrap_err().code, BatchCode::InvalidLimits);
+}
+
+#[test]
+fn prepared_compact_documents_retain_preflight_work_but_never_share_another_records_allowance() {
+    let factory = compact_factory(20); let c = operation_config(&factory); let owner = Arc::new(());
+    let prepared = prepare_document(&factory, &owner, &c, document("alpha"), &mut Control::default()).unwrap();
+    check_owner(&owner, &prepared).unwrap();
+    let retained = encoding::retained(&factory, prepared.operation.as_ref()).unwrap();
+    let first = retained.map_document_encoding_work().unwrap().unwrap();
+    assert_eq!(first.input_bytes(), 10, "one accepted probe and one native prompt");
+    let r = Int8DocumentRedactor::new(retained, c.ner_identity.clone(), c.detector.clone()).unwrap();
+    assert_eq!(r.preflight(&prepared.source, &mut Control::default()).unwrap(), prepared.preflight);
+    let spent = retained.map_document_encoding_work().unwrap();
+    assert_eq!(spent.unwrap().input_bytes(), 20);
+    assert!(r.preflight("[redacted:person]", &mut Control::default()).is_err(),
+        "actual edited-source verification cannot renew the original operation");
+    assert_eq!(retained.map_document_encoding_work().unwrap(), spent);
+    let next = prepare_document(&factory, &owner, &c, document("alpha"), &mut Control::default()).unwrap();
+    assert_eq!(next.operation.as_ref().unwrap().map_document_encoding_work().unwrap().unwrap(), first);
+    assert_eq!(retained.map_document_encoding_work().unwrap(), spent);
+    assert_eq!(factory.map_document_encoding_work().unwrap().unwrap().input_bytes(), 0);
+}
+
+#[test]
+fn prepared_documents_bind_exact_processor_owner_and_complete_encoding_policy() {
+    let factory = compact_factory(65_536); let owner = Arc::new(()); let c = operation_config(&factory);
+    let prepared = prepare_document(&factory, &owner, &c, document("é\r\nalpha"), &mut Control::default()).unwrap();
+    check_owner(&Arc::clone(&owner), &prepared).unwrap();
+    assert_eq!(check_owner(&Arc::new(()), &prepared).unwrap_err().fault.code, BatchCode::Admission);
+    let changed = compact_factory(65_535);
+    assert_eq!(encoding::retained(&changed, prepared.operation.as_ref()).err().unwrap().fault.code, BatchCode::Admission);
+    assert_eq!(encoding::retained(&factory, None).err().unwrap().fault.code, BatchCode::Admission);
+    assert_eq!(prepared.source, "é\r\nalpha"); assert_eq!(prepared.preflight.source_bytes, prepared.source.len());
+    assert_eq!(prepared.preflight.source_scalars, prepared.source.chars().count());
+}
+
+#[test]
+fn byte_preparation_keeps_exact_source_and_requires_no_encoding_operation() {
+    let factory = planner(); let owner = Arc::new(()); let c = operation_config(&factory);
+    let prepared = prepare_document(&factory, &owner, &c, document("é\r\nalpha"), &mut Control::default()).unwrap();
+    assert!(prepared.operation.is_none()); check_owner(&owner, &prepared).unwrap();
+    assert!(std::ptr::eq(encoding::retained(&factory, None).unwrap(), &factory));
+    assert_eq!(prepared.source, "é\r\nalpha"); assert!(factory.map_document_encoding_work().unwrap().is_none());
 }

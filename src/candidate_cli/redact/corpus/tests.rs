@@ -108,3 +108,119 @@ fn binary_key_and_corpus_stdin_are_exclusive_and_commitment_is_checked_once() {
     let error = c.key(&mut std::io::Cursor::new([7_u8; 32])).err().unwrap();
     assert_eq!(error, CandidateError::Identity);
 }
+
+
+fn compact(extra: &[&str]) -> RedactCommand {
+    let mut flags = vec!["--ndjson", "--chunked", "--input-encoding", "safe-bpe-v1"];
+    flags.extend_from_slice(extra);
+    let mut command = command(&flags);
+    command.host.memory_mib = 16_384;
+    command
+}
+fn retained(extra: &[&str]) -> RedactCommand {
+    let mut flags = vec!["--store-results", "--job-dir", "private-job",
+        "--job-id", "0123456789abcdef0123456789abcdef",
+        "--job-key-file", "private-key", "--job-limits", "limits.json"];
+    flags.extend_from_slice(extra);
+    compact(&flags)
+}
+
+#[test]
+fn compact_populations_keep_per_original_document_encoding_and_whole_corpus_native_work() {
+    let a = compact(&["--max-requests", "2"]);
+    let b = compact(&["--max-requests", "3"]);
+    let (common, la) = a.validate().unwrap(); let (_, lb) = b.validate().unwrap();
+    assert_eq!(a.encoding_policy(la).unwrap(), b.encoding_policy(lb).unwrap());
+    let ea = a.corpus.envelope(&a, la).unwrap(); let eb = b.corpus.envelope(&b, lb).unwrap();
+    assert_eq!(common.max_input_bytes, a.host.max_input_bytes);
+    assert_eq!(ea.transport.max_document_bytes, a.host.max_input_bytes);
+    assert_eq!(ea.max_model_work.forward_positions / 2, eb.max_model_work.forward_positions / 3);
+    assert_eq!(ea.max_model_work.projected_logits / 2, eb.max_model_work.projected_logits / 3);
+    assert_eq!(ea.max_mask_visits / 2, eb.max_mask_visits / 3);
+    let (_, retained_limits) = retained(&[]).validate().unwrap();
+    assert_eq!(a.encoding_policy(la).unwrap(), retained(&[]).encoding_policy(retained_limits).unwrap());
+
+    for mut unsupported in [compact(&[]), retained(&[])] {
+        unsupported.long.chunked = false;
+        assert!(matches!(unsupported.validate(), Err(CandidateError::Arguments)));
+    }
+}
+
+#[test]
+fn compact_live_peak_prices_transport_native_output_rows_and_map_tokens_separately() {
+    let mut command = compact(&["--max-requests", "2"]);
+    let (_, limits) = command.validate().unwrap();
+    let envelope = command.corpus.envelope(&command, limits).unwrap();
+    let detector = command.long.config(&command.host, limits, NerOptions::default()).unwrap();
+    let native = Int8MemoryRequirement::for_context(command.host.context_tokens).unwrap();
+    let count = detector.mapping.chunks.max_chunks as u64;
+    let rows = detector.mapping.max_model_work.projected_logits / NANBEIGE_VOCAB_SIZE as u64;
+    let temporary = 4 * (detector.per_chunk.max_output_bytes * count
+        + detector.mapping.reduction.max_live_value_bytes as u64)
+        + 8 * u64::from(detector.per_chunk.max_output_tokens) * count + command.edit_reserve_mib * MIB;
+    let t = envelope.transport;
+    let expected = limits.weight_bytes + 128 * MIB + 64 * MIB
+        + 2 * limits.preparation_bytes + native.kv_bytes + native.rope_bytes
+        + native.scratch_payload_bound + 64 * MIB
+        + 4 * detector.max_result_bytes + 8 * rows + 4096 + 65_536 + 64 * 1024
+        + 8 * t.max_line_bytes as u64 + 4 * t.max_output_line_bytes as u64
+        + 128 * t.max_epoch_ids as u64 + t.max_epoch_id_bytes as u64 + envelope.io_bytes
+        + temporary + 4096;
+    assert!(rows > 0);
+    assert_eq!(command.corpus.compact_base_peak_bytes(&command, limits, command.edit_reserve_mib * MIB).unwrap(), expected);
+    command.host.memory_mib = expected.div_ceil(MIB) - 1;
+    assert!(command.host.common(command.input.clone()).is_ok());
+    assert!(matches!(command.validate(), Err(CandidateError::Arguments)));
+    command.host.memory_mib += 1;
+    assert!(command.validate().is_ok());
+}
+
+#[test]
+fn compact_retained_floor_prices_fixed_storage_and_does_not_pretend_to_cover_population() {
+    let command = retained(&[]);
+    let (_, limits) = command.validate().unwrap();
+    let native = Int8MemoryRequirement::for_context(command.host.context_tokens).unwrap();
+    let detector = command.long.config(&command.host, limits, NerOptions::default()).unwrap();
+    let rows = detector.mapping.max_model_work.projected_logits / NANBEIGE_VOCAB_SIZE as u64;
+    let base = compute::request_peak_bytes(limits, native, detector.max_result_bytes,
+        rows, 0, limits.preparation_bytes).unwrap();
+    let temporary = command.long.temporary_bytes(&command.host, command.edit_reserve_mib * MIB).unwrap();
+    let expected = base + temporary + 4096 + 2 * IO_BUFFER_BYTES as u64
+        + command.retention.journal_bytes().unwrap() + command.retention.serialization_bytes().unwrap()
+        + 4 * (MIB - 1024);
+    assert_eq!(command.corpus.compact_base_peak_bytes(&command, limits, command.edit_reserve_mib * MIB).unwrap(), expected);
+    // The bounded JobLimits file is deliberately unopened here; runtime adds
+    // its actual CompletePopulation/RetainedRecord owner before private keys.
+    let larger = retained(&["--journal-memory-mib", "128", "--serialization-memory-mib", "32"]);
+    let (_, larger_limits) = larger.validate().unwrap();
+    let larger_peak = larger.corpus.compact_base_peak_bytes(&larger, larger_limits, larger.edit_reserve_mib * MIB).unwrap();
+    assert_eq!(larger_peak - expected, 80 * MIB);
+    let resumed = retained(&["--resume", "--use-retained-input", "--max-retained-input-mib", "1"]);
+    let (_, resumed_limits) = resumed.validate().unwrap();
+    assert_eq!(resumed.encoding_policy(resumed_limits).unwrap(), command.encoding_policy(limits).unwrap());
+}
+
+#[test]
+fn compact_population_work_and_memory_refusals_precede_private_io() {
+    for extra in [
+        vec!["--max-total-tokenizer-pair-checks", "0"],
+        vec!["--max-total-tokenizer-input-bytes", "18446744073709551615"],
+        vec!["--max-corpus-forward-positions", "1"],
+        vec!["--max-requests", "100000"],
+    ] {
+        let command = compact(&extra);
+        assert_eq!(command.execute_owned(NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+    let mut low = compact(&[]);
+    low.host.memory_mib = 1024;
+    assert_eq!(low.execute_owned(NoIo, NoIo), Err(CandidateError::Arguments));
+}
+
+#[cfg(not(feature = "asupersync-runtime"))]
+#[test]
+fn compact_populations_without_runtime_do_not_consume_key_options_or_population() {
+    let command = compact(&["private.ndjson", "--action", "pseudonymize", "--key-stdin",
+        "--key-id", "rotation", "--namespace", "scope", "--ner-options", "private-options.json"]);
+    assert_eq!(command.execute_owned(NoIo, NoIo), Err(CandidateError::Unavailable));
+    assert_eq!(retained(&[]).execute_owned(NoIo, NoIo), Err(CandidateError::Unavailable));
+}

@@ -57,6 +57,38 @@ impl CorpusArgs {
             || self.max_corpus_mask_node_visits.is_some() { return Err(CandidateError::Arguments); }
         Ok(())
     }
+    /// Complete live-population peak, or the fixed retained-job floor.
+    /// Retained input buffers depend on the bounded JobLimits file and are
+    /// added by runtime before either key, population or model is opened.
+    pub(in crate::candidate_cli) fn compact_base_peak_bytes(&self, command: &RedactCommand,
+        limits: Limits, edit_bytes: u64) -> Result<u64, CandidateError> {
+        if !self.ndjson || !command.long.chunked { return Err(CandidateError::Arguments); }
+        let envelope = self.envelope(command, limits)?;
+        let detector = command.long.config(&command.host, limits, NerOptions::default())?;
+        let native = Int8MemoryRequirement::for_context(command.host.context_tokens)
+            .map_err(|_| CandidateError::Arguments)?;
+        // CorpusAdmission retains an output token claim derived from the
+        // complete item work, independently of the temporary map token owner.
+        let output_tokens = detector.mapping.max_model_work.projected_logits / NANBEIGE_VOCAB_SIZE as u64;
+        let base = compute::request_peak_bytes(limits, native, detector.max_result_bytes,
+            output_tokens, 0, limits.preparation_bytes)?;
+        let temporary = command.long.temporary_bytes(&command.host, edit_bytes)?;
+        let sum = |parts: &[u64]| parts.iter().try_fold(0_u64, |sum, &bytes| sum.checked_add(bytes))
+            .ok_or(CandidateError::Arguments);
+        let buffers = if command.retention.store_results {
+            // The private replay recipe has the same 1 MiB minus 1024-byte
+            // ceiling used by hosted/corpus/redact/jobs/recipe.rs.
+            sum(&[2 * IO_BUFFER_BYTES as u64, command.retention.journal_bytes()?,
+                command.retention.serialization_bytes()?, 4 * (MIB - 1024)])?
+        } else {
+            let t = envelope.transport;
+            let lines = (t.max_line_bytes as u64).checked_mul(8).ok_or(CandidateError::Arguments)?;
+            let output = (t.max_output_line_bytes as u64).checked_mul(4).ok_or(CandidateError::Arguments)?;
+            let ids = (t.max_epoch_ids as u64).checked_mul(128).ok_or(CandidateError::Arguments)?;
+            sum(&[lines, output, ids, t.max_epoch_id_bytes as u64, envelope.io_bytes])?
+        };
+        sum(&[base, temporary, buffers, 4096])
+    }
     pub(in crate::candidate_cli) fn envelope(&self, command: &RedactCommand, limits: Limits)
         -> Result<CorpusEnvelope, CandidateError> {
         let count = self.max_requests.unwrap_or(1000);

@@ -85,7 +85,10 @@ fn capacity(context: usize, kv_limit: u64, output: u64, edits: u64,
 }
 
 // Private closed set of native adapters, not an external model/permit factory.
-trait Native: BatchProcessor<Args = RedactionBatchArgs> { fn poisoned(&self) -> bool; }
+trait Native: BatchProcessor<Args = RedactionBatchArgs> {
+    fn poisoned(&self) -> bool;
+    fn check_prepared(&self, _: &Self::Prepared) -> Result<(), BatchItemFailure> { Ok(()) }
+}
 impl<A: Int8RedactionBatchAdmission> Native for NativeInt8RedactionBatch<'_, '_, '_, '_, '_, '_, A> {
     fn poisoned(&self) -> bool { self.is_poisoned() }
 }
@@ -112,6 +115,7 @@ impl<P: Native> DurableBatchProcessor for RedactionJob<P> {
     fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     fn job_recipe(&self) -> &Self::Recipe { &self.recipe }
     fn durable_work(&self, plan: &Self::Prepared) -> Result<JobWork, BatchItemFailure> {
+        self.native.check_prepared(plan)?;
         self.recipe.check_work(self.native.planned_work(plan), self.native.poisoned())
     }
     fn max_result_bytes(&self, _: &Self::Prepared) -> u64 { self.recipe.max_result_bytes }

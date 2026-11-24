@@ -2,6 +2,7 @@
 //! JobRunner persists only the existing domain-separated keyed commitment.
 use super::*;
 use serde::Serialize;
+use crate::tokenizer::untrusted::{SafeBpeWorkLimits, UntrustedEncoding};
 use crate::{
     grammar::{CompileLimits, mask::MaskWorkLimits, runtime::{SourceRuntimeLimits, SOURCE_JSON_RUNTIME_VERSION}},
     tasks::{ir::TaskBudget, ner::NerOptions, mapreduce::{ChunkLimits, ExecutionLimits, CHUNK_PROFILE},
@@ -21,8 +22,28 @@ pub(super) struct RedactionJobRecipe {
     detector: DetectorRecipe, request: RedactionRequest,
     max_model_work: Int8Work, max_mask_visits: u64,
     pseudonyms: Option<PseudonymIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<EncodingRecipe>,
     item_work: JobWork,
     pub(super) max_result_bytes: u64,
+}
+#[derive(Serialize)]
+struct EncodingRecipe {
+    policy: UntrustedEncoding,
+    complete_document_limits: SafeBpeWorkLimits,
+    budget_scope: &'static str,
+}
+fn encoding_recipe(planner: &SourceTaskPlanner) -> Result<Option<EncodingRecipe>, HostedError> {
+    planner.map_document_encoding_workspace_bytes()
+        .map_err(|_| HostedError::Limits("redaction job cumulative encoding admission"))?;
+    match (planner.document_encoding(), planner.map_document_encoding_limits()) {
+        (UntrustedEncoding::ByteFallback, None) => Ok(None),
+        (policy @ UntrustedEncoding::SafeBpeV1(_), Some(complete_document_limits)) => Ok(Some(EncodingRecipe {
+            policy: policy.clone(), complete_document_limits,
+            budget_scope: "original_preflight_execution_and_edited_verification_per_document_attempt",
+        })),
+        _ => Err(HostedError::Limits("redaction job cumulative encoding policy")),
+    }
 }
 // Untagged serialization preserves the original short-job recipe byte shape.
 // The top-level execution version distinguishes short and chunked pipelines.
@@ -110,11 +131,12 @@ impl RedactionJobRecipe {
                 max_model_work: *max_model_work, mask_limits: (*mask_limits).into(),
                 mask_visits_per_pass: *mask_visits_per_pass, max_mask_visits: *max_mask_visits, max_result_bytes: *max_result_bytes }),
             request: config.request.clone(), max_model_work: config.max_model_work, max_mask_visits: config.max_mask_visits,
-            pseudonyms, item_work: JobWork { model: *max_model_work, mask_node_visits: masks }, max_result_bytes: *max_result_bytes };
+            pseudonyms, input_encoding: None,
+            item_work: JobWork { model: *max_model_work, mask_node_visits: masks }, max_result_bytes: *max_result_bytes };
         bounded(&recipe)?;
         Ok(recipe)
     }
-    pub(super) fn long(config: &LongRedactionBatchConfig, context: Option<&Pseudonyms<'_>>)
+    pub(super) fn long(config: &LongRedactionBatchConfig, context: Option<&Pseudonyms<'_>>, planner: &SourceTaskPlanner)
         -> Result<Self, HostedError> {
         bounded(&config.request)?; bounded(&config.detector.ner)?;
         let pseudonyms = key_identity(&config.request, context)?;
@@ -129,7 +151,8 @@ impl RedactionJobRecipe {
             detector: DetectorRecipe::Long(LongDetector { ner: ner.clone(), per_chunk: *per_chunk,
                 planning: (*planning).into(), mapping: (*mapping).into(), max_result_bytes: *max_result_bytes }),
             request: config.request.clone(), max_model_work: config.max_model_work, max_mask_visits: config.max_mask_visits,
-            pseudonyms, item_work: JobWork { model: work, mask_node_visits: mapping.max_mask_visits },
+            pseudonyms, input_encoding: encoding_recipe(planner)?,
+            item_work: JobWork { model: work, mask_node_visits: mapping.max_mask_visits },
             max_result_bytes: *max_result_bytes };
         bounded(&recipe)?;
         Ok(recipe)

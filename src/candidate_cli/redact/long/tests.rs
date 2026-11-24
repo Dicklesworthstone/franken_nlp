@@ -173,6 +173,7 @@ fn complete_tokenizer_flags_require_compact_mode_and_refuse_invalid_caps_before_
     let (_, limits) = byte.validate().unwrap();
     assert_eq!(byte.encoding_policy(limits).unwrap(), (UntrustedEncoding::ByteFallback, None));
     let mut compact = compact(&[]);
+    compact.long.chunked = false;
     compact.corpus.ndjson = true;
     assert!(matches!(compact.validate(), Err(CandidateError::Arguments)));
 }

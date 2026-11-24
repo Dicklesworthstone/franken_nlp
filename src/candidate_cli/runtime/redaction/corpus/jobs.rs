@@ -3,8 +3,9 @@
 use super::*;
 use crate::{
     candidate_cli::{jobs as job_cli, runtime::owned_jobs::open_mode},
-    hosted::corpus::jobs::{JobHostLimits, SourceJobRequest},
-    jobs::{JobId, JobLimits, JobProgress, JobSecret, JobWork, population::PopulationReadLimits},
+    hosted::corpus::jobs::{HostedJobError, JobHostLimits, SourceJobRequest},
+    jobs::{JobError, JobId, JobInputMemory, JobLimits, JobProgress, JobSecret, JobWork,
+        population::PopulationReadLimits, runner::JobRunError},
 };
 
 fn host_limits(command: &RedactCommand, common: &CandidateArgs, limits: Limits,
@@ -23,9 +24,52 @@ fn read_config(session: &Session, path: &std::path::Path, cap: usize) -> Result<
     session.remaining()?; Ok(text)
 }
 
+// Quote the actual retained owner after bounded JobLimits parsing but before
+// protected keys, options, original/retained population IO or model loading.
+// Caller preparation and transferred preparation coexist; the host's buffer
+// quote includes only the transferred owner.
+fn retained_peak_bytes(command: &RedactCommand, common: &CandidateArgs, limits: Limits,
+    host: JobHostLimits, lifetime: JobLimits, input_memory: JobInputMemory) -> Result<u64, CandidateError> {
+    let native = Int8MemoryRequirement::for_context(common.context_tokens).map_err(|_| CandidateError::Memory)?;
+    let buffers = host.required_buffer_bytes_for_input(lifetime, input_memory).map_err(|_| CandidateError::Memory)?;
+    let edit = command.edit_reserve_mib.checked_mul(MIB).ok_or(CandidateError::Memory)?;
+    let (map_bytes, tokens, live_bytes, output_rows) = if command.long.chunked {
+        let detector = command.long.config(&command.host, limits, NerOptions::default())?;
+        let count = detector.mapping.chunks.max_chunks as u64;
+        (detector.per_chunk.max_output_bytes.checked_mul(count).ok_or(CandidateError::Memory)?,
+            u64::from(detector.per_chunk.max_output_tokens).checked_mul(count).ok_or(CandidateError::Memory)?,
+            detector.mapping.reduction.max_live_value_bytes as u64,
+            detector.mapping.max_model_work.projected_logits / crate::native_engine::lmhead::NANBEIGE_VOCAB_SIZE as u64)
+    } else {
+        let detector = short_detector(command, limits, NerOptions::default())?;
+        (detector.per_pass.max_output_bytes, u64::from(detector.per_pass.max_output_tokens), 0,
+            detector.max_model_work.projected_logits / crate::native_engine::lmhead::NANBEIGE_VOCAB_SIZE as u64)
+    };
+    // CorpusAdmission prices the full per-item projected rows in its output
+    // guard, independently of intermediate map token staging.
+    let base = crate::candidate_cli::compute::request_peak_bytes(limits, native,
+        command.host.max_result_bytes as u64, output_rows, 0, 0)?;
+    let staging = map_bytes.checked_add(live_bytes).and_then(|n| n.checked_mul(4)).ok_or(CandidateError::Memory)?;
+    let tokens = tokens.checked_mul(8).ok_or(CandidateError::Memory)?;
+    // Match the closed host's bounded private recipe copies and full256 key
+    // metadata. These reservations do not permit retaining any source text.
+    [base, buffers, staging, tokens, edit, 4096, 4 * (MIB - 1024)]
+        .into_iter().try_fold(0_u64, |sum, bytes| sum.checked_add(bytes)).ok_or(CandidateError::Memory)
+}
+fn job_execution_error(error: HostedJobError) -> CandidateError {
+    match error {
+        HostedJobError::Host(error) => corpus_execution_error(error),
+        HostedJobError::Job(JobRunError::Processor(error)) =>
+            error.cancellation.map(batch_cancelled).unwrap_or(CandidateError::Batch),
+        HostedJobError::Job(JobRunError::Storage(JobError::Cancelled(cause))) => batch_cancelled(cause),
+        _ => CandidateError::Batch,
+    }
+}
+
 pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
-    command: RedactCommand, common: CandidateArgs, limits: Limits, envelope: CorpusEnvelope,
+    command: RedactCommand, _common: CandidateArgs, admitted: Limits, admitted_envelope: CorpusEnvelope,
     mut input: R, mut output: W) -> Result<(), CandidateError> {
+    let (common, limits, envelope) = readmit(&command, admitted, admitted_envelope)?;
     let retention = &command.retention;
     let mode = retention.mode();
     retention.input_retention.validate(mode, &command.input).map_err(|_| CandidateError::Arguments)?;
@@ -36,9 +80,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     retention.check_limits(&command, envelope, lifetime)?;
     let host = host_limits(&command, &common, limits, envelope, &session)?;
     let input_memory = retention.input_retention.input_memory().map_err(|_| CandidateError::Arguments)?;
-    let minimum = host.required_buffer_bytes_for_input(lifetime, input_memory).map_err(|_| CandidateError::Memory)?
-        .checked_add(limits.preparation_bytes).and_then(|n| n.checked_add(limits.weight_bytes))
-        .ok_or(CandidateError::Memory)?;
+    let minimum = retained_peak_bytes(&command, &common, limits, host, lifetime, input_memory)?;
     if minimum > limits.memory_bytes { return Err(CandidateError::Memory); }
     // Independent protected job secret. Never substitute it for the user's
     // pseudonym key or create either key implicitly on start/resume.
@@ -52,6 +94,8 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     drop(detectors::detect("", &request.rules, request.rule_budget).map_err(|_| CandidateError::Planning)?);
     let facts = session.facts(&common)?;
     let (planner, vocabulary) = planner()?;
+    let planner = configure_planner(&command, limits, planner)?;
+    let input_encoding = population_encoding(&planner)?;
     let identity = source_identity(&facts, &planner, BuiltInTask::Ner)?;
     let prepared = prepare(&command, limits, envelope, &planner, identity, ner, request)?;
     session.remaining()?;
@@ -71,7 +115,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
             RedactionCorpusConfig { batch, edit_reserve_bytes }, secret, job, host, reader, cancellation),
         PreparedCorpus::Document(batch) => session.engine.job_int8_redact_document(&model, Arc::new(planner), Arc::new(vocabulary),
             RedactionCorpusConfig { batch, edit_reserve_bytes }, secret, job, host, reader, cancellation),
-    }.map_err(|_| CandidateError::Batch)?;
+    }.map_err(job_execution_error)?;
     session.remaining()?;
     let report = report(progress, job_id, lifetime, retention.resume, retention.materialize, command.long.chunked)?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate", evidence: "non_authoritative",
@@ -79,7 +123,9 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         logical_model_sha256: &facts.logical_model_sha256, quant_recipe: &facts.recipe_id, output: &report };
     // No CandidateWriter: no item events or private result prefix reaches
     // stdout. Report failure can follow durable progress; no rollback claim.
-    publish(&response, job_cli::REPORT_BYTES, &mut output)
+    let response = PopulationResponse { response: &response, input_encoding };
+    publish_checked(&response, job_cli::REPORT_BYTES, &mut output,
+        &|| session.remaining().map(|_| ()))
 }
 
 #[derive(Serialize)]

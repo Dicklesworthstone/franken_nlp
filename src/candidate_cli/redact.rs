@@ -82,7 +82,7 @@ pub(super) fn definition() -> clap::Command {
             .help("Preparation memory in MiB; defaults to 512 for byte input or 1024 for compact redaction, including edited-text tokenizer workspace"))
         .mut_arg("max_tokenizer_pair_checks", |arg| arg.help("BPE comparison cap for a complete short operation or each chunked encoding call; chunked totals use --max-total-tokenizer-pair-checks; safe-bpe-v1 only, default 4194304"))
         .mut_arg("max_tokenizer_pair_bytes", |arg| arg.help("BPE examined-byte cap for a complete short operation or each chunked encoding call; chunked totals use --max-total-tokenizer-pair-bytes; safe-bpe-v1 only, default 67108864"))
-        .after_long_help("--input-encoding safe-bpe-v1 preserves exact source bytes and excludes template-control tokens. One tokenizer ledger covers original preflight, execution planning and fresh verification of the actual edited text. For short documents, pair-work ceilings apply to their sum and byte/token totals cover two preparations, or three with verification. With --chunked, pair flags bound each encoding call and --max-total-tokenizer-* bound the complete operation, including accepted/rejected probes and both detector stages. Total byte/token defaults are eight times the sum of original and edited byte ceilings; total pair defaults are 268435456 checks and 4294967296 examined bytes. Every accepted chunk independently fits context. Admission prices possible edited expansion and the complete map frontier before private key, document or model IO. Compact results report exact policy, complete limits and consumed work; the policy digest binds both limits. Exhaustion returns no successful result or fallback. Compact input is unavailable with --ndjson or retained jobs. This changes prompt tokens and makes no claim of identical model output, detector quality or measured speed.")
+        .after_long_help("--input-encoding safe-bpe-v1 preserves exact source bytes and excludes template-control tokens. One tokenizer ledger covers original preflight, execution planning and fresh verification of the actual edited text. For short documents, pair-work ceilings apply to their sum and byte/token totals cover two preparations, or three with verification. With --chunked, pair flags bound each encoding call and --max-total-tokenizer-* bound the complete operation, including accepted/rejected probes and both detector stages. Total byte/token defaults are eight times the sum of original and edited byte ceilings; total pair defaults are 268435456 checks and 4294967296 examined bytes. Every accepted chunk independently fits context. Admission prices possible edited expansion and the complete map frontier before private key, document or model IO. One-shot compact results report exact policy, complete limits and consumed work; population metadata reports policy, limits and per-document scope. The policy digest binds both limits. Exhaustion returns no successful result or fallback. Compact populations require --chunked: each original document attempt retains one allowance through reconstruction and verification, while separate original records receive independent allowances. Retained jobs authenticate the policy and limits; explicit resume may start new invocation-local tokenizer work without refunding durable attempts or native/mask work. This changes prompt tokens and makes no claim of identical model output, detector quality or measured speed.")
 }
 impl RedactCommand {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
@@ -91,7 +91,8 @@ impl RedactCommand {
         Ok(command)
     }
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), CandidateError> {
-        if !self.encoding.is_default() && (self.corpus.ndjson || self.retention.store_results) {
+        if !self.encoding.is_default() && !self.long.chunked
+            && (self.corpus.ndjson || self.retention.store_results) {
             return Err(CandidateError::Arguments);
         }
         // Long documents encode bounded probes and chunks, never the entire
@@ -155,6 +156,7 @@ impl RedactCommand {
         Ok((policy, complete))
     }
     fn compact_peak_bytes(&self, limits: Limits, edit_bytes: u64) -> Result<u64, CandidateError> {
+        if self.corpus.ndjson { return self.corpus.compact_base_peak_bytes(self, limits, edit_bytes); }
         let native = Int8MemoryRequirement::for_context(self.host.context_tokens)
             .map_err(|_| CandidateError::Arguments)?;
         // The caller preparation and the transferred planner/source owner

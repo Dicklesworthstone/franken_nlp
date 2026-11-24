@@ -93,7 +93,7 @@ impl NlpEngine {
         })
     }
 }
-fn check_encoding_preparation(planner: &SourceTaskPlanner, preparation_bytes: u64) -> Result<(), HostedError> {
+pub(super) fn check_encoding_preparation(planner: &SourceTaskPlanner, preparation_bytes: u64) -> Result<(), HostedError> {
     let required = planner.map_document_encoding_workspace_bytes()
         .map_err(|_| HostedError::Limits("INT8 redaction cumulative encoding admission"))?;
     if preparation_bytes < required {

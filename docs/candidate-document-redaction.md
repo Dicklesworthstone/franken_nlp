@@ -81,14 +81,18 @@ Embedding callers configure the planner with
 `SourceTaskPlanner::with_map_document_encoding(policy, complete_limits)` and
 retain that same planner through preflight and `redact_int8_document`.
 `Int8DocumentRedactor` rejects compact planners without cumulative admission;
-the hosted entry quotes their workspace before dispatch. At this increment,
-compact corpus and retained-job paths remain explicitly refused until their
-per-document operation ownership is wired.
+the hosted entry quotes their workspace before dispatch. Compact `--ndjson`
+and retained jobs use an immutable factory and retain a separate operation for
+each original document attempt, through reconstruction and edited verification.
+See the [corpus guide](candidate-redaction-corpus.md) and
+[job guide](candidate-redaction-jobs.md) for population ownership, authenticated
+resume and the separate lifetime native/mask/attempt limits. Short compact
+populations without `--chunked` remain explicitly refused.
 
 Regression definitions cover exact source controls and coordinates, repeated
 preparation and fresh edited maps, every cumulative work axis, cancellation,
 expanded workspace and complete-map memory boundaries, response metadata and
-the closed population boundary. They are source-reviewed but unexecuted pending
+the closed short-population boundary. They are source-reviewed but unexecuted pending
 the repository's required controller validation.
 
 ## Complete detection before one edit

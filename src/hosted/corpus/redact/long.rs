@@ -10,7 +10,9 @@ impl NlpEngine {
     /// Every item uses whole-source rules and independently verified native NER
     /// maps, then optionally repartitions the actual transformed source. The
     /// complete per-item work ceiling is charged to the corpus before inference.
-    /// Flush and failed documents never renew native or mask authority.
+    /// Flush and failed documents never renew native or mask authority. Compact
+    /// encoding forks one cumulative operation per original document attempt;
+    /// preflight, reconstruction and fresh verification retain that operation.
     #[allow(clippy::too_many_arguments)]
     pub fn batch_int8_redact_document<R, W>(&self, model: &ResidentInt8,
         planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
@@ -21,6 +23,7 @@ impl NlpEngine {
         dispatch::preflight(self, limits.native.run)?;
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), &config.batch.ner_identity)?;
+        crate::hosted::redact::check_encoding_preparation(&planner, limits.preparation_reserve_bytes)?;
         document_batch::check_configuration(&planner, &config.batch).map_err(HostedError::BatchSetup)?;
         let required = requirements(limits.native)?;
         validate(&config, limits, required.kv_bytes)?;
@@ -114,6 +117,33 @@ mod tests {
         assert!(temporary_bytes(&d, 1).is_err());
         let mut d = detector(); d.mapping.reduction.max_live_value_bytes = usize::MAX;
         assert!(temporary_bytes(&d, u64::MAX).is_err());
+    }
+    #[test]
+    fn compact_factory_workspace_is_owned_before_stream_admission_without_spending_document_work() {
+        use crate::tokenizer::{embedded::EmbeddedTokenizer, pinned_controls,
+            untrusted::{SafeBpeLimits, SafeBpeWork, SafeBpeWorkLimits, UntrustedEncoding}};
+        let tokenizer = EmbeddedTokenizer::pinned().unwrap();
+        let controls = pinned_controls::pinned().unwrap();
+        let factory = || SourceTaskPlanner::pinned(controls.template_controls(), tokenizer.eos_token_id().unwrap()).unwrap();
+        let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 128, max_output_tokens: 128,
+            max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 });
+        let unbounded = factory().with_document_encoding(policy.clone()).unwrap();
+        assert!(crate::hosted::redact::check_encoding_preparation(&unbounded, u64::MAX).is_err());
+        let planner = factory().with_map_document_encoding(policy, SafeBpeWorkLimits {
+            max_input_bytes: 16384, max_output_tokens: 16384, max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 }).unwrap();
+        let workspace = planner.map_document_encoding_workspace_bytes().unwrap();
+        assert!(workspace > 1024);
+        assert!(crate::hosted::redact::check_encoding_preparation(&planner, workspace - 1).is_err());
+        crate::hosted::redact::check_encoding_preparation(&planner, workspace).unwrap();
+        let mut limits = CorpusLimits { native: NativeLimits { context_tokens: 8192, allocator_reserve_bytes: 4096,
+            run: RunLimits { max_elapsed: std::time::Duration::from_secs(60), max_checkpoints: 100000,
+                cleanup_reserve_bytes: 4096 } },
+            transport: BatchLimits::default(), preparation_reserve_bytes: 1, io_reserve_bytes: 4096 };
+        let before = limits.reservation_bytes().unwrap();
+        limits.preparation_reserve_bytes = workspace;
+        assert_eq!(limits.reservation_bytes().unwrap() - before, workspace - 1);
+        assert_eq!(planner.map_document_encoding_work().unwrap(), Some(SafeBpeWork::default()));
+        let _entry = NlpEngine::batch_int8_redact_document::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
     }
     #[test]
     fn unbounded_or_zero_frontiers_are_refused() {

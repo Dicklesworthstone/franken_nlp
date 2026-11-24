@@ -43,8 +43,9 @@ default; an explicit `--no-verify` changes the frozen job contract and must be
 preserved on resume. Clean verification means clean under the declared detector
 union, not proof that every kind of PII has been removed.
 
-Every invocation receives the COMPLETE original ordered NDJSON population:
-`{"id":"item-1","text":"original text"}`. Original inputs are not saved for you.
+Every invocation authenticates the COMPLETE original ordered NDJSON population:
+`{"id":"item-1","text":"original text"}`. Supply it again unless explicit
+[retained-input replay](retained-inputs.md) was selected when starting the job.
 Records may omit task_args or use `{}`; records cannot replace actions, detector
 types, rules, verification, budgets, chunking or keys. Flush records are not
 accepted in durable populations. Resume authenticates the original population,
@@ -57,6 +58,56 @@ or rewrites committed results. `--materialize` publishes the fixed protected
 `materialized.ndjson` only after all items commit. A failed invocation or stdout
 write may follow durable progress: preserve the inputs/keys and explicitly
 resume rather than assuming rollback. Storage is not promised to be encrypted.
+
+## Compact complete-document jobs
+
+Complete-document jobs also accept `--chunked --input-encoding safe-bpe-v1`.
+Use the same encoding and tokenizer limits on start and resume:
+
+```sh
+fnlp candidate redact original.ndjson --ndjson --chunked --store-results \
+  --input-encoding safe-bpe-v1 \
+  --model ./model.fnlpq --memory-mib 24576 \
+  --job-dir ./protected-job --job-id "$JOB_ID" \
+  --job-key-file ./job.key --job-limits ./job-limits.json
+```
+
+To continue that job, repeat its original population and semantic options and add
+`--resume`. Existing explicit [retained-input replay](retained-inputs.md) may
+supply the authenticated population instead. Compact single-context populations
+remain refused; both the original start and later resumes require `--chunked`.
+
+The four `--max-total-tokenizer-input-bytes`,
+`--max-total-tokenizer-output-tokens`, `--max-total-tokenizer-pair-checks` and
+`--max-total-tokenizer-pair-bytes` limits cover one original document attempt.
+Its preflight, rejected and accepted chunk probes, execution reconstruction and
+fresh edited-source verification share that allowance without a reset. Different
+original records have independent allowances. Per-call pair limits and the
+defaults are described in [candidate-redaction-corpus.md](candidate-redaction-corpus.md).
+
+The private authenticated recipe binds the exact encoding policy, every per-call
+limit, every complete-document limit and their scope. Changing any of them on
+resume refuses authentication before repair or inference. An explicit resumed
+invocation gives each pending document attempt a fresh tokenizer allowance under
+those same limits. It does **not** replenish persisted attempts, native work or
+mask visits; failed attempts keep their durable debit and committed items remain
+committed. Tokenizer totals describe an attempt, not a lifetime job-wide counter.
+
+Completion metadata includes `input_encoding` with `policy`,
+`complete_document_limits`, and
+`budget_scope: "original_preflight_execution_and_edited_verification_per_document_attempt"`.
+It deliberately has no population `work` total from the unused factory.
+Byte-mode reports omit the field and retain their existing recipe bytes.
+Compact input adds no private source, prompt, token sequence or rejected edited
+text to public metadata; completed redacted text and explicitly requested maps
+remain in protected result storage.
+
+The 24576 MiB ceiling above is illustrative, not a measured memory requirement
+or a guarantee that a particular configuration fits. Admission prices the complete
+chunk preparation and live result frontier, possible edited expansion, compact
+workspace, and retained population/journal/output memory before private IO.
+Default chunk limits can make this much larger than a short-document request.
+Insufficient memory refuses setup; it does not reduce scope or bypass verification.
 
 ## Pseudonym scope survives interruption
 

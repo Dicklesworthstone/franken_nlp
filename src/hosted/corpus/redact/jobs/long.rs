@@ -4,12 +4,17 @@ use crate::tasks::redact::corpus::{self as document_batch, LongRedactionBatchCon
 
 impl<A: Int8RedactionBatchAdmission> Native for NativeInt8DocumentRedactionBatch<'_, '_, '_, '_, '_, '_, A> {
     fn poisoned(&self) -> bool { self.is_poisoned() }
+    fn check_prepared(&self, plan: &Self::Prepared) -> Result<(), BatchItemFailure> {
+        NativeInt8DocumentRedactionBatch::check_prepared(self, plan)
+    }
 }
 impl NlpEngine {
     /// Durable long-document redaction. Rules still scan whole text, native NER
     /// uses original-source-aligned chunks, and verification re-chunks the ACTUAL
     /// edited text. Resume authenticates the complete partition/reduction recipe,
-    /// detector policy and key scope before any repair or model forward.
+    /// detector policy and key scope before any repair or model forward. Compact
+    /// encoding binds the exact per-call and per-document limits; each pending
+    /// attempt keeps one operation across preflight and both execution stages.
     #[allow(clippy::too_many_arguments)]
     pub fn job_int8_redact_document<R>(&self, model: &ResidentInt8,
         planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
@@ -21,6 +26,7 @@ impl NlpEngine {
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), &config.batch.ner_identity)?;
         recipe::bounded(&config.batch.request)?; recipe::bounded(&config.batch.detector.ner)?;
+        crate::hosted::redact::check_encoding_preparation(&planner, limits.preparation_reserve_bytes)?;
         document_batch::check_configuration(&planner, &config.batch).map_err(HostedError::BatchSetup)?;
         let required = requirements(limits.native)?;
         let d = &config.batch.detector;
@@ -43,7 +49,7 @@ impl NlpEngine {
                 .ok_or(HostedError::CompletionMissing)?;
             let context = pseudonym_context(secret.as_ref(), &config.batch.request)?;
             let identity = config.batch.ner_identity.clone();
-            let recipe = RedactionJobRecipe::long(&config.batch, context.as_ref())?;
+            let recipe = RedactionJobRecipe::long(&config.batch, context.as_ref(), &planner)?;
             let population = match read_population(&mut input.value.reader, &request,
                 limits.transport, control) {
                 Ok(p) => p, Err(e) => return Ok(Err(JobRunError::Storage(e))),

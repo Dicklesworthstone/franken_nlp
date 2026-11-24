@@ -62,8 +62,12 @@ existing shape and policy identity.
 For a document larger than one NER context, combine compact input with
 `--chunked`. The [long-document guide](candidate-document-redaction.md) describes
 its per-call probe limits and separate `--max-total-tokenizer-*` allowance across
-all chunks, preflight, reconstruction and fresh verification. Compact `--ndjson`
-and retained jobs remain refused before private IO at this increment.
+all chunks, preflight, reconstruction and fresh verification. Combine
+`--chunked --ndjson` for compact populations, including explicitly retained jobs;
+each original document attempt keeps its own cumulative operation. The
+[corpus](candidate-redaction-corpus.md) and [job](candidate-redaction-jobs.md)
+guides describe the memory and authenticated replay contracts. Compact
+populations without `--chunked` remain refused before private IO.
 Tokenizer work flags require `--input-encoding safe-bpe-v1`.
 
 ## Scope and verification

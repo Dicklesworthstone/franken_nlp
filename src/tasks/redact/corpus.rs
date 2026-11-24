@@ -2,6 +2,7 @@
 //! One native engine, fixed detector/key scope and nonrenewable corpus ledger.
 //! No per-row host invocation, partial redacted text, or native transcript.
 use serde::Serialize;
+use std::sync::Arc;
 use crate::{
     batch::{BatchCode, BatchDocument, BatchFault, BatchItemFailure, BatchProcessor,
         BatchRequestContext, BatchWork, generation::GuardedOutput},
@@ -16,6 +17,7 @@ use super::{RedactError, RedactionRequest, actions::VerificationStatus,
     long::{Int8DocumentRedactor, LongRedactionConfig, LongRedactionError,
         LongRedactionPreflight, LongRedactionRun, LongRedactionStage, LONG_REDACTION_EXECUTION},
     pseudonym::Pseudonyms, quantized::Int8RedactionError};
+mod encoding;
 
 /// The mapping ceilings cover BOTH stages of one document. These additional
 /// ceilings cover every admitted document, including failed documents/epochs.
@@ -39,12 +41,17 @@ impl LongRedactionBatchConfig {
 }
 
 /// A source and its exact original-stage plan geometry, never execution proof.
-pub struct PreparedDocumentRedaction { source: String, preflight: LongRedactionPreflight }
+/// The private owner binds preparation to this detector/action/key scope; its
+/// compact operation retains preflight work through fresh edited-source maps.
+pub struct PreparedDocumentRedaction {
+    source: String, preflight: LongRedactionPreflight, owner: Arc<()>,
+    operation: Option<SourceTaskPlanner>,
+}
 
 pub struct NativeInt8DocumentRedactionBatch<'p, 'e, 'w, 'v, 's, 'k, A: Int8RedactionBatchAdmission> {
-    redactor: Int8DocumentRedactor<'p>, config: LongRedactionBatchConfig,
+    planner: &'p SourceTaskPlanner, config: LongRedactionBatchConfig,
     engine: &'e mut StrictInt8Engine<'w>, vocabulary: &'v ExtractionVocabulary,
-    pseudonyms: Option<&'s Pseudonyms<'k>>, admission: A, ledger: Ledger,
+    pseudonyms: Option<&'s Pseudonyms<'k>>, admission: A, ledger: Ledger, owner: Arc<()>,
 }
 impl<'p, 'e, 'w, 'v, 's, 'k, A: Int8RedactionBatchAdmission>
     NativeInt8DocumentRedactionBatch<'p, 'e, 'w, 'v, 's, 'k, A> {
@@ -54,14 +61,18 @@ impl<'p, 'e, 'w, 'v, 's, 'k, A: Int8RedactionBatchAdmission>
         pseudonyms: Option<&'s Pseudonyms<'k>>, admission: A) -> Result<Self, BatchFault> {
         check_configuration(planner, &config)?;
         config.request.actions.check_key(pseudonyms).map_err(|_| BatchCode::Admission)?;
-        let redactor = Int8DocumentRedactor::new(planner, config.ner_identity.clone(), config.detector.clone())
-            .map_err(|_| BatchCode::Admission)?;
         capacity(engine, &config).map_err(|e| e.fault)?;
-        Ok(Self { redactor, config, engine, vocabulary, pseudonyms, admission, ledger: Ledger::default() })
+        Ok(Self { planner, config, engine, vocabulary, pseudonyms, admission,
+            ledger: Ledger::default(), owner: Arc::new(()) })
     }
     pub fn reserved_model_work(&self) -> Int8Work { self.ledger.reserved }
     pub fn reserved_mask_visits(&self) -> u64 { self.ledger.masks }
     pub fn is_poisoned(&self) -> bool { self.ledger.failed || !clean(self.engine) }
+    pub(crate) fn check_prepared(&self, prepared: &PreparedDocumentRedaction) -> Result<(), BatchItemFailure> {
+        check_owner(&self.owner, prepared)?;
+        encoding::retained(self.planner, prepared.operation.as_ref())?;
+        Ok(())
+    }
 }
 impl<A: Int8RedactionBatchAdmission> BatchProcessor
     for NativeInt8DocumentRedactionBatch<'_, '_, '_, '_, '_, '_, A> {
@@ -74,15 +85,7 @@ impl<A: Int8RedactionBatchAdmission> BatchProcessor
     fn prepare_with_control<C: DecodeStepControl>(&mut self, document: BatchDocument<Self::Args>,
         control: &mut C) -> Result<Self::Prepared, BatchItemFailure> {
         self.ledger.ready()?; self.ledger.failed = true;
-        let result = (|| {
-            checkpoint(control)?;
-            check_source(&document.text, &self.config)?;
-            // All exact original-stage plans are checked before its first
-            // forward. Verification is planned only from the actual edited text.
-            let preflight = self.redactor.preflight(&document.text, control).map_err(failure)?;
-            checkpoint(control)?;
-            Ok(PreparedDocumentRedaction { source: document.text, preflight })
-        })();
+        let result = prepare_document(self.planner, &self.owner, &self.config, document, control);
         self.ledger.finish(&result); result
     }
     fn planned_work(&self, _: &Self::Prepared) -> BatchWork {
@@ -94,12 +97,16 @@ impl<A: Int8RedactionBatchAdmission> BatchProcessor
     }
     fn execute_with_context<C: DecodeStepControl>(&mut self, prepared: Self::Prepared,
         context: BatchRequestContext, control: &mut C) -> Result<Self::Output, BatchItemFailure> {
-        let kv = match capacity(self.engine, &self.config) {
+        let kv = match self.check_prepared(&prepared).and_then(|()| capacity(self.engine, &self.config)) {
             Ok(kv) => kv, Err(error) => { self.ledger.failed = true; return Err(error); }
+        };
+        let planner = prepared.operation.as_ref().unwrap_or(self.planner);
+        let redactor = match Int8DocumentRedactor::new(planner, self.config.ner_identity.clone(), self.config.detector.clone()) {
+            Ok(redactor) => redactor,
+            Err(_) => { self.ledger.failed = true; return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
         };
         let engine = &mut *self.engine;
         let config = &self.config;
-        let redactor = &self.redactor;
         let vocabulary = self.vocabulary;
         let pseudonyms = self.pseudonyms;
         execute_reserved(&mut self.ledger, config, context, kv, &mut self.admission, control, |control| {
@@ -110,10 +117,30 @@ impl<A: Int8RedactionBatchAdmission> BatchProcessor
     }
 }
 
+fn prepare_document<C: DecodeStepControl>(factory: &SourceTaskPlanner, owner: &Arc<()>,
+    config: &LongRedactionBatchConfig, document: BatchDocument<RedactionBatchArgs>, control: &mut C)
+    -> Result<PreparedDocumentRedaction, BatchItemFailure> {
+    checkpoint(control)?;
+    check_source(&document.text, config)?;
+    // Fork once for this original record. The same owned planner is retained
+    // through reconstruction and actual edited-source verification.
+    let operation = encoding::operation(factory)?;
+    let preflight = {
+        let planner = encoding::retained(factory, operation.as_ref())?;
+        let redactor = Int8DocumentRedactor::new(planner, config.ner_identity.clone(), config.detector.clone())
+            .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
+        redactor.preflight(&document.text, control).map_err(failure)?
+    };
+    checkpoint(control)?;
+    Ok(PreparedDocumentRedaction { source: document.text, preflight, owner: Arc::clone(owner), operation })
+}
+fn check_owner(owner: &Arc<()>, prepared: &PreparedDocumentRedaction) -> Result<(), BatchItemFailure> {
+    if !Arc::ptr_eq(owner, &prepared.owner) { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
+    Ok(())
+}
+
 pub(crate) fn check_configuration(planner: &SourceTaskPlanner, config: &LongRedactionBatchConfig) -> Result<(), BatchFault> {
-    // The batch must retain a distinct compact operation for each document
-    // before it can admit compact preflight and edited-source reconstruction.
-    planner.source_encoder().require_byte_encoding().map_err(|_| BatchCode::InvalidLimits)?;
+    planner.map_document_encoding_workspace_bytes().map_err(|_| BatchCode::InvalidLimits)?;
     Int8DocumentRedactor::new(planner, config.ner_identity.clone(), config.detector.clone())
         .map_err(|_| BatchCode::Admission)?;
     check_limits(config)?;
