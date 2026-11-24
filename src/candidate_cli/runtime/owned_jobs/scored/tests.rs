@@ -73,3 +73,96 @@ fn metadata_report_retains_all_lifetime_counters_without_private_scores() {
         assert!(!text.contains(private));
     }
 }
+
+fn quoted_host(a: &ScoreJobArgs, limits: Limits) -> JobHostLimits {
+    JobHostLimits { native: crate::hosted::NativeLimits {
+        context_tokens: a.host.context_tokens, allocator_reserve_bytes: 64 * MIB,
+        run: crate::hosted::RunLimits { max_elapsed: Duration::from_secs(30),
+            max_checkpoints: 10000, cleanup_reserve_bytes: 65536 } },
+        transport: PopulationReadLimits { max_stream_bytes: a.max_stream_mib * MIB, max_lines: a.max_input_lines },
+        preparation_reserve_bytes: limits.preparation_bytes, io_reserve_bytes: (IO_BYTES * 2) as u64,
+        journal_reserve_bytes: a.journal_memory_mib * MIB,
+        serialization_reserve_bytes: a.serialization_memory_mib * MIB }
+}
+
+#[test]
+fn retained_scoring_admits_native_population_and_durable_staging_at_the_exact_boundary() {
+    for flags in [vec!["--compute-threads", "4", "--prefill-rows", "4"],
+        vec!["--compute-threads", "4", "--prefill-rows", "4", "--spool-input", "--max-retained-input-mib", "4"]] {
+        let a = args("classify", &flags); let (_, limits) = a.validate().unwrap();
+        let host = quoted_host(&a, limits); let job = lifetime();
+        let native = a.execution_memory_bytes(limits).unwrap();
+        let buffers = host.required_buffer_bytes_for_input(job, a.input_retention.input_memory().unwrap()).unwrap();
+        let peak = population_memory_bytes(&a, host, job, limits).unwrap();
+        assert_eq!(peak, native + buffers);
+        let mut exact = limits; exact.memory_bytes = peak;
+        check_population_memory(&a, host, job, exact).unwrap();
+        exact.memory_bytes -= 1;
+        assert_eq!(check_population_memory(&a, host, job, exact).unwrap_err().code, "score_job_population_memory");
+        let mut overflow = host; overflow.serialization_reserve_bytes = u64::MAX;
+        assert!(population_memory_bytes(&a, overflow, job, limits).is_err());
+    }
+}
+
+#[test]
+fn stale_worker_or_prompt_geometry_refuses_before_host_installation_or_private_io() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private input read") } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("output write") }
+        fn flush(&mut self) -> io::Result<()> { panic!("output flush") }
+    }
+    for task in ["classify", "sentiment", "judge"] {
+        for (old, current) in [
+            (vec![], vec!["--compute-threads", "4"]),
+            (vec!["--compute-threads", "4"], vec!["--compute-threads", "4", "--prefill-rows", "4"]),
+            (vec!["--compute-threads", "4", "--prefill-rows", "4"], vec!["--compute-threads", "4", "--prefill-rows", "8"]),
+        ] {
+            let prior = args(task, &old); let (old_common, old_limits) = prior.validate().unwrap();
+            let requested = args(task, &current);
+            let failure = execute(RunMode::Start, requested, old_common, old_limits, NoIo, &mut NoIo).unwrap_err();
+            assert_eq!(failure.code, "score_job_schedule_admission");
+        }
+    }
+}
+
+#[test]
+fn selected_job_schedules_are_optional_metadata_and_never_replace_private_results() {
+    let report = serde_json::json!({"output":{"committed":2,"attempts":3}});
+    let serial = ScheduledResponse { response: &report, compute_threads: None, prefill_rows: None };
+    assert_eq!(crate::canonjson::canonical_bytes(&serial).unwrap(), crate::canonjson::canonical_bytes(&report).unwrap());
+    let scheduled = ScheduledResponse { response: &report, compute_threads: Some(4), prefill_rows: Some(8) };
+    let value = serde_json::to_value(scheduled).unwrap();
+    assert_eq!(value["output"], report["output"]);
+    assert_eq!(value["compute_threads"], 4); assert_eq!(value["prefill_rows"], 8);
+    for private in ["labels", "dimensions", "candidate_weight", "source_text", "prompt_digest"] {
+        assert!(!value.to_string().contains(private));
+    }
+}
+
+#[test]
+fn cancelled_final_delivery_keeps_all_causes_and_never_claims_rollback() {
+    struct CancelOnFlush { token: CancellationToken, cause: DecodeCancellationKind, bytes: Vec<u8> }
+    impl Write for CancelOnFlush {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes); Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> { self.token.cancel(self.cause); Ok(()) }
+    }
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let expected = job_failure(JobError::Cancelled(cause));
+        let token = CancellationToken::default(); token.cancel(cause);
+        let mut untouched = Vec::new();
+        let error = publish_report(&serde_json::json!({"committed":2}), &mut untouched,
+            &|| Ok(Duration::from_secs(1)), &token).unwrap_err();
+        assert_eq!((error.exit, error.code), (expected.exit, expected.code)); assert!(untouched.is_empty());
+        let token = CancellationToken::default();
+        let mut writer = CancelOnFlush { token: token.clone(), cause, bytes: Vec::new() };
+        let error = publish_report(&serde_json::json!({"committed":2}), &mut writer,
+            &|| Ok(Duration::from_secs(1)), &token).unwrap_err();
+        assert_eq!((error.exit, error.code), (expected.exit, expected.code));
+        assert!(!writer.bytes.is_empty(), "durable progress is not rolled back by delivery failure");
+    }
+}

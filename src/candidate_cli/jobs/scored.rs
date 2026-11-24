@@ -25,6 +25,7 @@ pub(in crate::candidate_cli) struct ScoreJobArgs {
     pub task: String,
     #[command(flatten)] pub host: ScoredArgs,
     #[command(flatten)] pub prefill: crate::candidate_cli::scored::prefill::ScoringPrefillArgs,
+    #[arg(skip)] pub compute: compute::Args,
     /// Required consent to retain private native output in the protected spool.
     #[arg(long)] pub store_results: bool,
     #[command(flatten)] pub input_retention: InputRetentionArgs,
@@ -56,7 +57,8 @@ impl ScoreJobArgs {
     }
     pub(in crate::candidate_cli) fn validate(&self) -> Result<(CandidateArgs, Limits), Failure> {
         self.input_retention.limits()?;
-        self.prefill_limits()?;
+        let prefill = self.prefill_limits()?;
+        let admitted = self.compute.admit_prefill(prefill)?;
         let local = |p: &std::path::Path| !p.as_os_str().is_empty() && p.as_os_str() != "-";
         if !self.store_results || !local(&self.job_dir) || !local(&self.key_file) || !local(&self.limits_file)
             || self.defaults.as_ref().is_some_and(|p| !local(p))
@@ -65,13 +67,46 @@ impl ScoreJobArgs {
             || self.journal_memory_mib == 0 || self.serialization_memory_mib == 0 {
             return Err(Failure::usage("explicit_scored_job_storage"));
         }
-        let (common, limits) = self.host.common()?;
+        let (mut common, mut limits) = self.host.common()?;
+        common.compute = self.compute;
+        limits.compute = admitted;
         for mib in [self.journal_memory_mib, self.serialization_memory_mib] {
             if mib.checked_mul(MIB).is_none_or(|bytes| bytes > limits.memory_bytes) {
                 return Err(Failure::usage("score_job_memory"));
             }
         }
+        // Refuse impossible native occupancy before even the bounded limits
+        // file. The complete original/retained population quote follows parsing.
+        if self.execution_memory_bytes(limits)? > limits.memory_bytes {
+            return Err(Failure { exit: ErrorCode::AdmissionOrResourceLimit, code: "score_job_native_memory" });
+        }
         Ok((common, limits))
+    }
+    pub(in crate::candidate_cli) fn execution_memory_bytes(&self, limits: Limits) -> Result<u64, Failure> {
+        let prefill = self.prefill_limits()?;
+        if limits.compute != self.compute.admit_prefill(prefill)? {
+            return Err(Failure::usage("score_job_schedule_admission"));
+        }
+        let native = Int8MemoryRequirement::for_context(self.host.context_tokens)
+            .map_err(|_| Failure::usage("score_job_native_quote"))?;
+        let extra = prefill.map(|limits| limits.validate()).transpose()
+            .map_err(|_| Failure::usage("score_job_prefill_quote"))?.unwrap_or(0);
+        // Each result remains guarded through spool sync/journal commit. The
+        // complete invocation work ceiling conservatively bounds its tokens.
+        let output_tokens = self.host.work_ceiling().projected_logits
+            / crate::native_engine::lmhead::NANBEIGE_VOCAB_SIZE as u64;
+        let output = (self.host.max_result_bytes as u64).checked_mul(4)
+            .and_then(|bytes| bytes.checked_add(output_tokens.checked_mul(8)?))
+            .and_then(|bytes| bytes.checked_add(4096))
+            .ok_or_else(|| Failure::usage("score_job_memory_arithmetic"))?;
+        // Model metadata/slack, caller preparation, coordinator and worker
+        // scratch all coexist. Host-owned population/journal buffers are added
+        // separately after the immutable lifetime limits are read.
+        [limits.preparation_bytes, limits.weight_bytes, 128 * MIB, 64 * MIB,
+            native.kv_bytes, native.rope_bytes, native.scratch_payload_bound,
+            64 * MIB, extra, limits.compute.workspace_bytes, output, 65_536]
+            .into_iter().try_fold(0_u64, |total, bytes| total.checked_add(bytes)
+                .ok_or_else(|| Failure::usage("score_job_memory_arithmetic")))
     }
     pub(in crate::candidate_cli) fn parse_defaults(&self, json: Option<&str>, budget: crate::tasks::ir::TaskBudget)
         -> Result<scored_batch::Defaults, Failure> {
@@ -82,10 +117,23 @@ impl ScoreJobArgs {
 pub(in crate::candidate_cli) fn definition() -> clap::Command {
     ScoreJobCommand::augment_args(clap::Command::new("score-job")
         .about("Start or resume retained native classification/sentiment/judgment corpus jobs")
-        .long_about("Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64. The input is the COMPLETE original NDJSON {id,text,task_args?} population; resume can explicitly restore it from retained input storage. Uses the same full-vocabulary scorers and defaults as score-batch; no generated-label shortcut or calibrated-confidence claim. All scoring flags and defaults are frozen for resume. Judge jobs accept --prefill-rows for bounded grouped prompts; the effective schedule is also frozen and cannot change on resume. Other tasks refuse that option. Lifetime work and failed attempts remain debited. Explicit --store-results, protected directory, original secret and immutable JobLimits are mandatory. Stdout is metadata only, not private document scores. No automatic retry.")
+        .long_about("Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64. The input is the COMPLETE original NDJSON {id,text,task_args?} population; resume can explicitly restore it from retained input storage. Uses the same full-vocabulary scorers and defaults as score-batch; no generated-label shortcut or calibrated-confidence claim. Task settings and defaults are frozen for resume. All three tasks accept --prefill-rows for bounded prompts and --compute-threads for one persistent INT8 row team across every pending record and scoring head. Both workspace owners are admitted together. Worker width may change on authenticated resume; classification/sentiment prompt width may also change. Judgment preserves its existing frozen prompt-schedule recipe and rejects a changed prefill schedule on resume. Lifetime work and failed attempts remain debited. Explicit --store-results, protected directory, original secret and immutable JobLimits are mandatory. Stdout is completion metadata only, emitted after all workers physically join. No automatic retry.")
         .after_help(INPUT_RETENTION_HELP))
+        .mut_subcommand("start", compute::definition)
+        .mut_subcommand("resume", compute::definition)
 }
 impl ScoreJobCommand {
+    pub(crate) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let mut command = Self::from_arg_matches(matches)?;
+        let (_, request) = matches.subcommand().ok_or_else(||
+            clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "score job operation required"))?;
+        let args = match &mut command.operation {
+            ScoreOperation::Start(args) => args,
+            ScoreOperation::Resume(args) => &mut args.common,
+        };
+        args.compute = compute::Args::from_matches(request)?;
+        Ok(command)
+    }
     fn into_parts(self) -> (RunMode, ScoreJobArgs) {
         match self.operation { ScoreOperation::Start(args) => (RunMode::Start, args),
             ScoreOperation::Resume(args) => (RunMode::Resume { discard_uncommitted: args.discard_uncommitted_tail }, args.common) }

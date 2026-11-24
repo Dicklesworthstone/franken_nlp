@@ -132,12 +132,6 @@ impl NlpEngine {
 }
 
 impl<R: BufRead> GenerationExecution<R> {
-    fn commit_native(&mut self) -> Result<(), HostedError> {
-        self._kv = Some(self.kv.take().ok_or(HostedError::Limits("text job KV admission consumed"))?.commit()?);
-        self._scratch = Some(self.scratch.take().ok_or(HostedError::Limits("text job scratch admission consumed"))?.commit()?);
-        Ok(())
-    }
-
     fn run<'weights>(&mut self, model: &'weights CurrentCandidateInt8Model,
         kernel: Option<Int8Kernel>, projection: Option<&'weights mut (dyn Int8ProjectionExecutor + 'weights)>,
         control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
@@ -166,7 +160,10 @@ impl<R: BufRead> GenerationExecution<R> {
             Some(projection) => engine.with_projection_executor(projection).map_err(HostedError::Native)?,
             None => engine,
         };
-        self.commit_native()?;
+        // Retained-input population holds a borrow of input.reader. Commit
+        // these disjoint fields without borrowing the entire owner again.
+        self._kv = Some(self.kv.take().ok_or(HostedError::Limits("text job KV admission consumed"))?.commit()?);
+        self._scratch = Some(self.scratch.take().ok_or(HostedError::Limits("text job scratch admission consumed"))?.commit()?);
         let admission = CorpusAdmission { lease: &self.lease, model: model.artifact_identity(),
             kv_bytes: self.required.kv_bytes, sampler_bytes: planner.native_limits().max_sampler_bytes,
             output_bytes: request.limits.max_result_bytes as u64 };

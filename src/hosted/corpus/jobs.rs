@@ -5,7 +5,7 @@
 use super::*;
 mod manage;
 mod extract;
-mod scored;
+pub(super) mod scored;
 mod generation;
 mod source_document;
 pub use manage::{JobManagementLimits, StoredJobOperation, StoredJobRequest};

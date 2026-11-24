@@ -197,7 +197,7 @@ impl CandidateCommand {
             return classify_map::ClassifyMapCommand::from_matches(matches).map(Self::ClassifyMap);
         }
         if name == "score-job" {
-            return jobs::scored::ScoreJobCommand::from_arg_matches(matches).map(Self::ScoreJob);
+            return jobs::scored::ScoreJobCommand::from_matches(matches).map(Self::ScoreJob);
         }
         if name == "job" {
             return jobs::JobCommand::from_matches(matches).map(Self::Job);

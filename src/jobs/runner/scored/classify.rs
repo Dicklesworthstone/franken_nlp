@@ -6,7 +6,7 @@ use crate::{
             Int8ClassificationBatchPlanner, NativeInt8ClassificationBatch, PreparedInt8BatchClassification}}},
     execution_identity::ExecutionIdentity,
     jobs::{JobWork, runner::DurableBatchProcessor},
-    native_engine::{decode::DecodeStepControl, strict_int8::{Int8Work, StrictInt8Engine}},
+    native_engine::{decode::DecodeStepControl, strict_int8::{Int8Work, StrictInt8Engine, prefill::Int8PrefillLimits}},
     tasks::{classify::{ClassificationLimits, ClassificationPlanner, quantized::Int8ClassificationRun}, ir::TaskBudget},
 };
 
@@ -47,6 +47,16 @@ impl<'p, 'e, 'w, A: Int8ClassificationAdmission> Int8ClassificationJobProcessor<
         -> Result<Self, BatchFault> {
         let Int8ClassificationJobPlanner { compiler, identity, recipe } = planner;
         let native = NativeInt8ClassificationBatch::new(compiler, engine, admission, recipe.max_model_work)?;
+        Ok(Self { native, identity, recipe })
+    }
+    /// Physical prompt scheduling changes neither the authenticated semantic
+    /// recipe nor any durable attempt/work debit. The host retains and prices
+    /// one prompt workspace across every pending record.
+    pub fn new_layer_major(planner: Int8ClassificationJobPlanner<'p>, engine: &'e mut StrictInt8Engine<'w>,
+        admission: A, prefill: Int8PrefillLimits) -> Result<Self, BatchFault> {
+        let Int8ClassificationJobPlanner { compiler, identity, recipe } = planner;
+        let native = NativeInt8ClassificationBatch::new_layer_major(compiler, engine, admission,
+            recipe.max_model_work, prefill)?;
         Ok(Self { native, identity, recipe })
     }
 }

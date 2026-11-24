@@ -26,11 +26,18 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     // First local owner: settings, planners, reader and report drop before the
     // CLI preparation charge. The host separately owns the transferred state.
     let prefill = args.prefill_limits()?;
-    let session = Session::new(&common, limits)?;
+    if common.compute != args.compute {
+        return Err(Failure::usage("score_job_schedule_admission"));
+    }
+    let native_bytes = args.execution_memory_bytes(limits)?;
+    if native_bytes > limits.memory_bytes {
+        return Err(Failure { exit: ErrorCode::AdmissionOrResourceLimit, code: "score_job_native_memory" });
+    }
+    let session = Session::new_with_prefill(&common, limits, prefill)?;
     let lifetime = command::parse_limits(&read_config(&session, &args.limits_file, command::LIMIT_BYTES)?)?;
     result_ceiling(&args, lifetime)?;
-    preflight_memory(host_limits(&args, &common, limits, &session)?, lifetime, limits,
-        args.input_retention.input_memory()?, 0)?;
+    let host = host_limits(&args, &common, limits, &session)?;
+    check_population_memory(&args, host, lifetime, limits)?;
     let key = JobSecret::read(&args.key_file).map_err(job_failure)?;
     session.remaining()?;
     let defaults = args.defaults.as_ref().map(|p| read_config(&session, p, command::DEFAULT_BYTES)).transpose()?;
@@ -47,18 +54,34 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     let job_id = args.job_id; let materialize = args.materialize;
     let request = SourceJobRequest { root: args.job_dir, key, job_id,
         limits: lifetime, mode: open_mode(mode, args.input_retention)?, materialize };
-    let progress = match corpus {
-        Corpus::Classify(planner, config) => session.engine.job_int8_classify(&model, planner,
-            config, request, host, reader, cancellation),
-        Corpus::Sentiment(planner, config) => session.engine.job_int8_sentiment(&model, planner,
-            config, request, host, reader, cancellation),
-        Corpus::Judge(planner, config) => match prefill {
-            Some(prefill) => session.engine.job_int8_judge_layer_major(&model, planner,
-                config, request, host, prefill, reader, cancellation),
-            None => session.engine.job_int8_judge(&model, planner,
-                config, request, host, reader, cancellation),
-        },
+    let kernel = crate::native_engine::simd::config::process_kernel();
+    let progress = match (corpus, limits.compute.threads, prefill) {
+        (Corpus::Classify(planner, config), 1, None) => session.engine.job_int8_classify(&model,
+            planner, config, request, host, reader, cancellation.clone()),
+        (Corpus::Classify(planner, config), 1, Some(prefill)) => session.engine.job_int8_classify_layer_major(&model,
+            planner, config, request, host, prefill, reader, cancellation.clone()),
+        (Corpus::Classify(planner, config), width, None) => session.engine.job_int8_classify_with_threads(&model,
+            planner, config, request, host, kernel, width, reader, cancellation.clone()),
+        (Corpus::Classify(planner, config), width, Some(prefill)) => session.engine.job_int8_classify_layer_major_with_threads(
+            &model, planner, config, request, host, kernel, width, prefill, reader, cancellation.clone()),
+        (Corpus::Sentiment(planner, config), 1, None) => session.engine.job_int8_sentiment(&model,
+            planner, config, request, host, reader, cancellation.clone()),
+        (Corpus::Sentiment(planner, config), 1, Some(prefill)) => session.engine.job_int8_sentiment_layer_major(&model,
+            planner, config, request, host, prefill, reader, cancellation.clone()),
+        (Corpus::Sentiment(planner, config), width, None) => session.engine.job_int8_sentiment_with_threads(&model,
+            planner, config, request, host, kernel, width, reader, cancellation.clone()),
+        (Corpus::Sentiment(planner, config), width, Some(prefill)) => session.engine.job_int8_sentiment_layer_major_with_threads(
+            &model, planner, config, request, host, kernel, width, prefill, reader, cancellation.clone()),
+        (Corpus::Judge(planner, config), 1, None) => session.engine.job_int8_judge(&model,
+            planner, config, request, host, reader, cancellation.clone()),
+        (Corpus::Judge(planner, config), 1, Some(prefill)) => session.engine.job_int8_judge_layer_major(&model,
+            planner, config, request, host, prefill, reader, cancellation.clone()),
+        (Corpus::Judge(planner, config), width, None) => session.engine.job_int8_judge_with_threads(&model,
+            planner, config, request, host, kernel, width, reader, cancellation.clone()),
+        (Corpus::Judge(planner, config), width, Some(prefill)) => session.engine.job_int8_judge_layer_major_with_threads(
+            &model, planner, config, request, host, kernel, width, prefill, reader, cancellation.clone()),
     }.map_err(host_failure)?;
+    if let Some(cause) = cancellation.cause() { return Err(job_failure(JobError::Cancelled(cause))); }
     session.remaining()?;
     let report = progress_report(progress, job_id, lifetime, materialize, mode, &args.task)?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
@@ -67,7 +90,50 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
         quant_recipe: &facts.recipe_id, output: &report };
     // No item ids, labels, texts or native scores enter this metadata report.
     // Delivery failure can follow durable progress; never imply rollback.
-    publish(&response, command::REPORT_BYTES, output).map_err(Failure::from)
+    let response = ScheduledResponse { response: &response,
+        compute_threads: (limits.compute.threads > 1).then_some(limits.compute.threads),
+        prefill_rows: prefill.map(|limits| limits.max_batch_rows) };
+    publish_report(&response, output, &|| session.remaining(), &cancellation)
+}
+
+/// Include the actual input mode: retained replay keeps an index plus one
+/// record, while ordinary original-input jobs retain the complete population.
+fn population_memory_bytes(args: &ScoreJobArgs, host: JobHostLimits, job: JobLimits, limits: Limits)
+    -> Result<u64, Failure> {
+    let buffers = host.required_buffer_bytes_for_input(job, args.input_retention.input_memory()?)
+        .map_err(host_failure)?;
+    args.execution_memory_bytes(limits)?.checked_add(buffers)
+        .ok_or_else(|| Failure::usage("score_job_memory_arithmetic"))
+}
+fn check_population_memory(args: &ScoreJobArgs, host: JobHostLimits, job: JobLimits, limits: Limits)
+    -> Result<(), Failure> {
+    if population_memory_bytes(args, host, job, limits)? > limits.memory_bytes {
+        return Err(Failure { exit: ErrorCode::AdmissionOrResourceLimit, code: "score_job_population_memory" });
+    }
+    Ok(())
+}
+
+fn publish_report<T: Serialize>(response: &T, output: &mut impl Write,
+    remaining: &impl Fn() -> Result<Duration, CandidateError>, cancellation: &CancellationToken)
+    -> Result<(), Failure> {
+    publish_checked(response, command::REPORT_BYTES, output, &|| {
+        if cancellation.cause().is_some() { return Err(CandidateError::Execution); }
+        remaining().map(|_| ())
+    }).map_err(|error| match (error, cancellation.cause()) {
+        (CandidateError::Execution, Some(cause)) => job_failure(JobError::Cancelled(cause)),
+        (error, _) => Failure::from(error),
+    })
+}
+
+/// Selected physical schedule, reported only after hosted worker drain.
+/// Omitted default fields preserve the existing serial metadata bytes.
+#[derive(Serialize)]
+struct ScheduledResponse<'a, T: Serialize> {
+    #[serde(flatten)] response: &'a T,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compute_threads: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefill_rows: Option<usize>,
 }
 
 #[cfg(test)] mod tests;

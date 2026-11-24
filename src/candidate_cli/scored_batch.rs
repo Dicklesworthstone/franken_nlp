@@ -173,13 +173,11 @@ impl ScoreBatchCommand {
         parse_defaults(self.kind()?, &self.host, json, budget)
     }
 }
-/// Retained score jobs still admit prompt scheduling only for their judgment
-/// adapter. Live score-batch capability must not widen this separate contract.
+/// Every retained scoring adapter implements bounded prompt scheduling.
+/// Keep capability selection exhaustive when another task family is added.
 pub(super) fn corpus_prefill(kind: ScoreTask, args: &ScoringPrefillArgs)
     -> Result<Option<Int8PrefillLimits>, CandidateError> {
-    let limits = args.limits()?;
-    if limits.is_some() && kind != ScoreTask::Judge { return Err(CandidateError::Arguments); }
-    Ok(limits)
+    match kind { ScoreTask::Classify | ScoreTask::Sentiment | ScoreTask::Judge => args.limits() }
 }
 
 /// Shared by live and durable scoring. Retention cannot change option parsing,

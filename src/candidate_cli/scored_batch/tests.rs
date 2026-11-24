@@ -242,12 +242,17 @@ fn malformed_thread_counts_never_silently_select_a_serial_stream() {
 }
 
 #[test]
-fn live_stream_prefill_does_not_silently_enable_unimplemented_retained_job_schedules() {
-    for task in ["classify", "sentiment"] {
-        let c = command(task, &["--prefill-rows", "4"]);
-        assert_eq!(c.prefill_limits().unwrap().unwrap().max_batch_rows, 4);
-        assert!(matches!(corpus_prefill(c.kind().unwrap(), &c.prefill), Err(CandidateError::Arguments)));
+fn live_and_retained_scoring_adapters_share_explicit_bounded_prefill_capability() {
+    for task in ["classify", "sentiment", "judge"] {
+        for rows in ["1", "4", "64"] {
+            let c = command(task, &["--prefill-rows", rows]);
+            let retained = corpus_prefill(c.kind().unwrap(), &c.prefill).unwrap().unwrap();
+            assert_eq!(retained.max_batch_rows, c.prefill_limits().unwrap().unwrap().max_batch_rows);
+            assert_eq!(retained.max_batch_rows, rows.parse::<usize>().unwrap());
+        }
+        for rows in ["0", "65"] {
+            let c = command(task, &["--prefill-rows", rows]);
+            assert!(corpus_prefill(c.kind().unwrap(), &c.prefill).is_err());
+        }
     }
-    let judge = command("judge", &["--prefill-rows", "4"]);
-    assert_eq!(corpus_prefill(judge.kind().unwrap(), &judge.prefill).unwrap().unwrap().max_batch_rows, 4);
 }

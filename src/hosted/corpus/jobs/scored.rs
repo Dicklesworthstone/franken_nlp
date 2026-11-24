@@ -7,101 +7,157 @@ use crate::{
     tasks::{classify::ClassificationPlanner, sentiment::SentimentPlanner, ir::TaskBudget},
 };
 
+mod execution;
+pub(in crate::hosted::corpus) use execution::{run, ScoredJobTask};
+use crate::native_engine::{simd::Int8Kernel, strict_int8::{StrictInt8Engine, prefill::Int8PrefillLimits}};
+
 impl NlpEngine {
-    /// Start/resume exact exclusive or independent-label native scoring. The
-    /// original population and private recipe authenticate before any job-file
-    /// repair or model forward. No caller-supplied admission provider exists.
+    /// Start/resume complete exclusive or independent-label scoring with the
+    /// existing authenticated population, semantic recipe and durable debits.
     #[allow(clippy::too_many_arguments)]
     pub fn job_int8_classify<R>(&self, model: &ResidentInt8, planner: Arc<ClassificationPlanner>,
         config: ClassificationCorpusConfig, request: SourceJobRequest, limits: JobHostLimits,
         reader: R, cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
-        self.check_resident_domain(model)?;
-        check_model_identity(model.artifact_identity(), &config.identity)?;
-        validate_work(config.max_model_work)?;
-        let bytes = limits.required_buffer_bytes_for_input(request.limits, request.mode.input_memory())?;
-        let required = requirements(limits.native)?;
-        let output_bytes = capacity(config.task_ceiling, required.kv_bytes, request.limits.max_result_bytes)?;
-        let lease = self.resources().acquire_lease();
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
-            || Ok(StreamInput { planner: Some((planner, config, request)), reader, writer: () }))?;
-        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-        let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound, limits.native.allocator_reserve_bytes])?)?;
-        let model = model.clone();
-        let completed = dispatch::run(self, limits.native.run, cancellation, move |control| {
-            // Keep the WHOLE input owner, including queued cancellation paths.
-            let mut input = input;
-            let (planner, config, request) = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
-            let factory = Int8ClassificationJobPlanner::new(&planner, config.identity,
-                config.task_ceiling, config.planning, config.defaults, config.max_model_work)
-                .map_err(HostedError::BatchSetup)?;
-            let population = match read_population(&mut input.value.reader, &request,
-                limits.transport, control) {
-                Ok(p) => p, Err(e) => return Ok(Err(JobRunError::Storage(e))),
-            };
-            let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value
-                .engine(limits.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            let admission = ClassificationJobAdmission { output_bytes, inner: CorpusAdmission {
-                lease: &lease, model: model.artifact_identity(), kv_bytes: required.kv_bytes,
-                sampler_bytes: 0, output_bytes: request.limits.max_result_bytes as u64 } };
-            let result = (|| {
-                let processor = Int8ClassificationJobProcessor::new(factory, &mut engine.value, admission)
-                    .map_err(JobRunError::Processor)?;
-                run_population(request, &population, processor, control)
-            })();
-            // The runner/journal/native borrow drops before engine and inputs;
-            // each output guard already survived spool sync and commit.
-            drop(engine); drop(population); drop(planner); drop(input); drop(lease);
-            Ok(result)
-        })?;
-        completed.map_err(HostedJobError::Job)
+        run(self, model, ClassificationTask { planner, config }, request, limits,
+            None, None, reader, cancellation)
     }
 
-    /// One complete independent-axis result per durable item. Resume skips
-    /// committed items; partial-axis failures never become successful records.
-    /// Mode/EOS/policy remain bound to the actual immutable sentiment planner.
+    /// Bound every classification head's prompt without changing the private
+    /// semantic recipe. Prompt width may change on authenticated resume.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int8_classify_layer_major<R>(&self, model: &ResidentInt8, planner: Arc<ClassificationPlanner>,
+        config: ClassificationCorpusConfig, request: SourceJobRequest, limits: JobHostLimits,
+        prefill: Int8PrefillLimits, reader: R, cancellation: CancellationToken)
+        -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        run(self, model, ClassificationTask { planner, config }, request, limits,
+            Some(prefill), None, reader, cancellation)
+    }
+
+    /// Reuse one admitted projection team across every pending record and
+    /// scoring head. Width is physical scheduling, not new work authority.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int8_classify_with_threads<R>(&self, model: &ResidentInt8, planner: Arc<ClassificationPlanner>,
+        config: ClassificationCorpusConfig, request: SourceJobRequest, limits: JobHostLimits,
+        kernel: Int8Kernel, compute_threads: usize, reader: R, cancellation: CancellationToken)
+        -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        run(self, model, ClassificationTask { planner, config }, request, limits,
+            None, Some((kernel, compute_threads)), reader, cancellation)
+    }
+
+    /// Compose packed prompts with one persistent team. Coordinator and child
+    /// storage coexist through physical drain; neither width renews attempts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int8_classify_layer_major_with_threads<R>(&self, model: &ResidentInt8,
+        planner: Arc<ClassificationPlanner>, config: ClassificationCorpusConfig,
+        request: SourceJobRequest, limits: JobHostLimits, kernel: Int8Kernel, compute_threads: usize,
+        prefill: Int8PrefillLimits, reader: R, cancellation: CancellationToken)
+        -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        run(self, model, ClassificationTask { planner, config }, request, limits,
+            Some(prefill), Some((kernel, compute_threads)), reader, cancellation)
+    }
+
+    /// Commit one complete independently scored axis bundle per durable item.
+    /// Committed records are skipped and failed attempts remain debited.
     #[allow(clippy::too_many_arguments)]
     pub fn job_int8_sentiment<R>(&self, model: &ResidentInt8, planner: Arc<SentimentPlanner>,
         config: SentimentCorpusConfig, request: SourceJobRequest, limits: JobHostLimits,
         reader: R, cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
-        self.check_resident_domain(model)?;
-        check_model_identity(model.artifact_identity(), &config.identity)?;
-        config.validate(&planner).map_err(HostedError::BatchSetup)?;
-        let bytes = limits.required_buffer_bytes_for_input(request.limits, request.mode.input_memory())?;
-        let required = requirements(limits.native)?;
-        capacity(config.task_ceiling, required.kv_bytes, request.limits.max_result_bytes)?;
-        let lease = self.resources().acquire_lease();
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
-            || Ok(StreamInput { planner: Some((planner, config, request)), reader, writer: () }))?;
-        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-        let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound, limits.native.allocator_reserve_bytes])?)?;
-        let model = model.clone();
-        let completed = dispatch::run(self, limits.native.run, cancellation, move |control| {
-            let mut input = input;
-            let (planner, config, request) = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
-            let factory = Int8SentimentJobPlanner::new(&planner, config).map_err(HostedError::BatchSetup)?;
-            let population = match read_population(&mut input.value.reader, &request,
-                limits.transport, control) {
-                Ok(p) => p, Err(e) => return Ok(Err(JobRunError::Storage(e))),
-            };
-            let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value
-                .engine(limits.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            let admission = CorpusAdmission { lease: &lease, model: model.artifact_identity(),
-                kv_bytes: required.kv_bytes, sampler_bytes: 0, output_bytes: request.limits.max_result_bytes as u64 };
-            let result = (|| {
-                let processor = Int8SentimentJobProcessor::new(factory, &mut engine.value, admission)
-                    .map_err(JobRunError::Processor)?;
-                run_population(request, &population, processor, control)
-            })();
-            drop(engine); drop(population); drop(planner); drop(input); drop(lease);
-            Ok(result)
-        })?;
-        completed.map_err(HostedJobError::Job)
+        run(self, model, SentimentTask { planner, config }, request, limits,
+            None, None, reader, cancellation)
+    }
+
+    /// Bound prompts for every axis while retaining the unchanged semantic
+    /// recipe, original ordinals and all durable native work counters.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int8_sentiment_layer_major<R>(&self, model: &ResidentInt8, planner: Arc<SentimentPlanner>,
+        config: SentimentCorpusConfig, request: SourceJobRequest, limits: JobHostLimits,
+        prefill: Int8PrefillLimits, reader: R, cancellation: CancellationToken)
+        -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        run(self, model, SentimentTask { planner, config }, request, limits,
+            Some(prefill), None, reader, cancellation)
+    }
+
+    /// A fixed projection team spans every pending document and complete axis
+    /// bundle. Every worker joins before progress or failure is returned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int8_sentiment_with_threads<R>(&self, model: &ResidentInt8, planner: Arc<SentimentPlanner>,
+        config: SentimentCorpusConfig, request: SourceJobRequest, limits: JobHostLimits,
+        kernel: Int8Kernel, compute_threads: usize, reader: R, cancellation: CancellationToken)
+        -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        run(self, model, SentimentTask { planner, config }, request, limits,
+            None, Some((kernel, compute_threads)), reader, cancellation)
+    }
+
+    /// Share admitted worker batch capacity across packed prompts and candidate
+    /// continuations. Explicit resume may change these physical widths.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int8_sentiment_layer_major_with_threads<R>(&self, model: &ResidentInt8,
+        planner: Arc<SentimentPlanner>, config: SentimentCorpusConfig,
+        request: SourceJobRequest, limits: JobHostLimits, kernel: Int8Kernel, compute_threads: usize,
+        prefill: Int8PrefillLimits, reader: R, cancellation: CancellationToken)
+        -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        run(self, model, SentimentTask { planner, config }, request, limits,
+            Some(prefill), Some((kernel, compute_threads)), reader, cancellation)
+    }
+}
+
+struct ClassificationTask { planner: Arc<ClassificationPlanner>, config: ClassificationCorpusConfig }
+impl ScoredJobTask for ClassificationTask {
+    fn identity(&self) -> &ExecutionIdentity { &self.config.identity }
+    fn validate(&self, native: Int8MemoryRequirement, job: JobLimits) -> Result<(), HostedError> {
+        validate_work(self.config.max_model_work)?;
+        capacity(self.config.task_ceiling, native.kv_bytes, job.max_result_bytes)?;
+        Ok(())
+    }
+    fn execute(self, engine: &mut StrictInt8Engine<'_>, admission: CorpusAdmission<'_>,
+        request: SourceJobRequest, population: &Population<'_>, prefill: Option<Int8PrefillLimits>,
+        control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
+        let Self { planner, config } = self;
+        let output_bytes = config.task_ceiling.max_output_bytes;
+        let factory = Int8ClassificationJobPlanner::new(&planner, config.identity,
+            config.task_ceiling, config.planning, config.defaults, config.max_model_work)
+            .map_err(HostedError::BatchSetup)?;
+        let admission = ClassificationJobAdmission { output_bytes, inner: admission };
+        let result = (|| {
+            let processor = match prefill {
+                None => Int8ClassificationJobProcessor::new(factory, engine, admission),
+                Some(prefill) => Int8ClassificationJobProcessor::new_layer_major(factory, engine, admission, prefill),
+            }.map_err(JobRunError::Processor)?;
+            run_population(request, population, processor, control)
+        })();
+        Ok(result)
+    }
+}
+
+struct SentimentTask { planner: Arc<SentimentPlanner>, config: SentimentCorpusConfig }
+impl ScoredJobTask for SentimentTask {
+    fn identity(&self) -> &ExecutionIdentity { &self.config.identity }
+    fn validate(&self, native: Int8MemoryRequirement, job: JobLimits) -> Result<(), HostedError> {
+        self.config.validate(&self.planner).map_err(HostedError::BatchSetup)?;
+        capacity(self.config.task_ceiling, native.kv_bytes, job.max_result_bytes)?;
+        Ok(())
+    }
+    fn execute(self, engine: &mut StrictInt8Engine<'_>, admission: CorpusAdmission<'_>,
+        request: SourceJobRequest, population: &Population<'_>, prefill: Option<Int8PrefillLimits>,
+        control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
+        let Self { planner, config } = self;
+        let factory = Int8SentimentJobPlanner::new(&planner, config).map_err(HostedError::BatchSetup)?;
+        let result = (|| {
+            let processor = match prefill {
+                None => Int8SentimentJobProcessor::new(factory, engine, admission),
+                Some(prefill) => Int8SentimentJobProcessor::new_layer_major(factory, engine, admission, prefill),
+            }.map_err(JobRunError::Processor)?;
+            run_population(request, population, processor, control)
+        })();
+        Ok(result)
     }
 }
 

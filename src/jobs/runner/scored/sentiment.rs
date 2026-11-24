@@ -5,7 +5,7 @@ use crate::{
         BatchWork, generation::GuardedOutput},
     execution_identity::ExecutionIdentity,
     jobs::{JobWork, runner::DurableBatchProcessor},
-    native_engine::{decode::DecodeStepControl, strict_int8::StrictInt8Engine},
+    native_engine::{decode::DecodeStepControl, strict_int8::{StrictInt8Engine, prefill::Int8PrefillLimits}},
     tasks::{ir::TaskBudget, sentiment::{SentimentPlanner,
         batch::{SentimentBatchArgs, SentimentBatchConfig, Int8SentimentAdmission,
             Int8SentimentBatchPlanner, NativeInt8SentimentBatch, PreparedInt8BatchSentiment},
@@ -44,6 +44,14 @@ impl<'p, 'e, 'w, A: Int8SentimentAdmission> Int8SentimentJobProcessor<'p, 'e, 'w
         -> Result<Self, BatchFault> {
         let Int8SentimentJobPlanner { compiler, identity, recipe } = planner;
         let native = NativeInt8SentimentBatch::new(compiler, engine, admission)?;
+        Ok(Self { native, identity, recipe })
+    }
+    /// Share bounded prompt morsels across every complete axis bundle while
+    /// preserving the original semantic recipe and nonrefundable durable work.
+    pub fn new_layer_major(planner: Int8SentimentJobPlanner<'p>, engine: &'e mut StrictInt8Engine<'w>,
+        admission: A, prefill: Int8PrefillLimits) -> Result<Self, BatchFault> {
+        let Int8SentimentJobPlanner { compiler, identity, recipe } = planner;
+        let native = NativeInt8SentimentBatch::new_layer_major(compiler, engine, admission, prefill)?;
         Ok(Self { native, identity, recipe })
     }
 }

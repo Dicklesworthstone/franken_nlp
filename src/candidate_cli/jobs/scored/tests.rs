@@ -157,7 +157,7 @@ fn judgment_job_start_and_resume_preserve_the_same_explicit_schedule() {
     }
 }
 #[test]
-fn unsupported_or_invalid_job_prefill_refuses_before_key_and_population_io() {
+fn invalid_job_prefill_refuses_before_key_and_population_io() {
     struct NoIo;
     impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("input read") } }
     impl Write for NoIo {
@@ -165,10 +165,79 @@ fn unsupported_or_invalid_job_prefill_refuses_before_key_and_population_io() {
         fn flush(&mut self) -> io::Result<()> { panic!("output flush") }
     }
     for operation in ["start", "resume"] {
-        for (task, rows) in [("judge", "0"), ("judge", "65"), ("classify", "4"), ("sentiment", "4")] {
+        for (task, rows) in [("judge", "0"), ("judge", "65"), ("classify", "0"),
+            ("classify", "65"), ("sentiment", "0"), ("sentiment", "65")] {
             let (mode, a) = command(operation, task, &["--prefill-rows", rows]).into_parts();
             assert!(a.validate().is_err());
             assert!(execute_owned(mode, a, NoIo, &mut NoIo).is_err());
+        }
+    }
+}
+
+#[test]
+fn all_retained_tasks_compose_prefill_and_persistent_workers_for_start_and_resume() {
+    for operation in ["start", "resume"] { for task in ["classify", "sentiment", "judge"] {
+        let serial = args(task, &[]);
+        let before_work = serial.host.work_ceiling();
+        let before_budget = serial.host.budget(serial.validate().unwrap().1);
+        for width in ["1", "2", "4", "64"] { for rows in [None, Some("1"), Some("4"), Some("64")] {
+            let mut flags = vec!["--compute-threads", width];
+            if let Some(rows) = rows { flags.extend_from_slice(&["--prefill-rows", rows]); }
+            let (_, mut a) = command(operation, task, &flags).into_parts();
+            a.host.memory_mib = 65536;
+            let (common, admitted) = a.validate().unwrap();
+            assert_eq!(common.compute, a.compute);
+            assert_eq!(admitted.compute.threads, width.parse::<usize>().unwrap());
+            assert_eq!(admitted.compute, a.compute.admit_prefill(a.prefill_limits().unwrap()).unwrap());
+            assert_eq!(a.host.work_ceiling(), before_work);
+            assert_eq!(a.host.budget(admitted), before_budget);
+        } }
+    } }
+}
+
+#[test]
+fn invalid_worker_width_refuses_before_any_private_or_output_io() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("input read") } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("output write") }
+        fn flush(&mut self) -> io::Result<()> { panic!("output flush") }
+    }
+    for operation in ["start", "resume"] { for task in ["classify", "sentiment", "judge"] {
+        for width in ["0", "65", "1000000"] {
+            let (mode, a) = command(operation, task, &["--compute-threads", width, "--prefill-rows", "4"]).into_parts();
+            assert!(a.validate().is_err());
+            assert!(execute_owned(mode, a, NoIo, &mut NoIo).is_err());
+        }
+        for width in ["-1", "NaN", "4.0", "999999999999999999999999999999999999"] {
+            assert!(parse(operation, task, &["--compute-threads", width]).is_err());
+        }
+    } }
+}
+
+#[test]
+fn complete_native_quote_prices_both_scratch_owners_and_rejects_underfunded_invocations() {
+    let serial = args("classify", &[]); let (_, ordinary) = serial.validate().unwrap();
+    let before = serial.execution_memory_bytes(ordinary).unwrap();
+    let scheduled = args("classify", &["--compute-threads", "4", "--prefill-rows", "4"]);
+    let (_, admitted) = scheduled.validate().unwrap();
+    let extra = scheduled.prefill_limits().unwrap().unwrap().validate().unwrap();
+    let peak = scheduled.execution_memory_bytes(admitted).unwrap();
+    assert_eq!(peak, before + extra + admitted.compute.workspace_bytes);
+    let mut under = args("classify", &["--compute-threads", "4", "--prefill-rows", "4"]);
+    under.host.memory_mib = (peak - 1) / MIB;
+    assert!(under.validate().is_err());
+    let mut stale = admitted; stale.compute = ordinary.compute;
+    assert_eq!(scheduled.execution_memory_bytes(stale).unwrap_err().code, "score_job_schedule_admission");
+}
+
+#[test]
+fn retained_scoring_does_not_silently_accept_compact_or_generated_task_options() {
+    for task in ["classify", "sentiment", "judge"] {
+        assert!(parse("start", task, &["--compute-threads", "4", "--prefill-rows", "4"]).is_ok());
+        for (flag, value) in [("--input-encoding", "safe-bpe-v1"), ("--seed", "00"),
+            ("--schema", "schema.json"), ("--cohort-rows", "4"), ("--active-rows", "4")] {
+            assert!(parse("start", task, &[flag, value]).is_err(), "{task} {flag}");
         }
     }
 }

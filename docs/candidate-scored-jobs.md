@@ -1,4 +1,4 @@
-# Durable native classification and sentiment jobs
+# Durable native classification, sentiment and judgment jobs
 
 `fnlp candidate score-job start` and `resume` connect the existing finite-score
 engines to the authenticated owned-job journal. This closes the gap between a
@@ -17,8 +17,10 @@ candidate/EOS scoring, not calibrated correctness confidence.
 Supply a fresh random 128-bit job ID as 32 lowercase hex characters, an existing
 protected owner-only directory, and a separately protected regular file containing
 exactly 32 RAW random secret bytes. A text/hex encoding of the secret is not the
-key-file format. The command does not create a directory, generate a key, save
-original input, silently adopt existing storage or retry automatically.
+key-file format. The command does not create a directory, generate a key,
+silently adopt existing storage or retry automatically. Original-input retention
+requires the separate explicit `--spool-input` start option; an explicit
+`resume --use-retained-input` can replay that authenticated snapshot.
 
 The examples below assume `JOB_ID` is that generated ID, `protected-job` is the
 prepared directory, `protected.key` is the raw key, and the settings/limits files
@@ -33,7 +35,8 @@ fnlp candidate score-job start corpus.ndjson \
   --limits ./job-limits.json --materialize
 ```
 
-After interruption, repeat the SAME invocation with `resume` instead of `start`:
+After interruption, repeat the original semantic options with `resume` instead
+of `start`. Physical worker and prompt schedules may change as described below:
 
 ```sh
 fnlp candidate score-job resume corpus.ndjson \
@@ -44,8 +47,10 @@ fnlp candidate score-job resume corpus.ndjson \
   --limits ./job-limits.json --materialize
 ```
 
-Resume requires the COMPLETE original ordered population, not just pending
-records. It authenticates the original identity, recipe, population, limits and
+Ordinary resume requires the COMPLETE original ordered population, not just
+pending records. Explicit retained-input replay authenticates the previously
+stored exact envelopes without reading a new input stream. Both routes
+authenticate the original identity, recipe, population, limits and
 committed result frames. Already committed records are read from the protected
 spool, never regenerated to reconstruct output. Failed or interrupted attempts
 remain charged; a new processor cannot reset lifetime work or attempt ceilings.
@@ -98,7 +103,12 @@ Its score mode, EOS, anchors and policy are bound by the ACTUAL pinned planner's
 template digest, not a caller-provided second description. One complete axis
 bundle is one durable item; a failed axis never becomes a committed partial result.
 
-Both settings formats reject duplicate keys, unknown fields and injected
+Use `--task judge` for pairwise, rubric and faithfulness judgments. A durable
+item includes both pairwise orders, every rubric criterion or the complete
+faithfulness evidence bundle. The existing judgment defaults and typed record
+arguments are described in [candidate-judge-corpus.md](candidate-judge-corpus.md).
+
+Both classification and sentiment settings formats reject duplicate keys, unknown fields and injected
 `document`, `budget` or model/identity settings. Per-record `task_args` uses the
 existing typed batch schema and is part of the exact original population; it may
 narrow admitted task limits but cannot increase them. Overrides do not mutate
@@ -167,28 +177,118 @@ With `--materialize`, the existing verified ordered publication produces
 contain private native output, not anonymized data. Existing stored-job status,
 verification and materialization APIs remain available without model inference.
 
-The host reserves the complete bounded input population, journal allocations,
-configuration/graph preparation, serialization staging, full resident KV and
-scratch storage. The real process admission authority supplies each output guard,
+The host reserves the actual input owner: the complete bounded original
+population, or the authenticated index and one retained record. Journal
+allocations, configuration/graph preparation, serialization staging, full
+resident KV, native scratch, optional prompt workspace and persistent worker
+buffers coexist. The real process admission authority supplies each output guard,
 which remains alive through spool sync and journal acknowledgement. Owned readers
-and configuration survive the blocking invocation; native state drops before its
+and native claims survive physical worker join; native state drops before its
 resource guards. Reservations are modeled ledger commitments, not measured or
 OS-enforced RSS bounds. Blocking I/O and bounded compiler calls are cooperative,
 not preempted mid-operation.
 
-The CLI validates settings, immutable result ceilings and a necessary population
-memory floor before weight loading. It then loads the selected model once. Full
-population ingestion and replay authentication occur inside the hosted invocation
-after weights are resident and before job-file repair or the first native forward.
-This path does not claim pre-weight authentication of the complete corpus.
+The CLI checks native, model and requested scheduling memory before reading
+even the bounded lifetime-limits file. After parsing that file it includes the
+actual original/retained input owner, both preparation owners, journal and
+serialization staging, native KV and scratch, worker/prompt buffers and the
+complete output guard in one simultaneous memory quote. Impossible envelopes
+refuse before key, defaults, population or weight access. The selected model
+loads once. Population ingestion and replay authentication occur inside the
+hosted invocation after weights are resident and before job-file repair or the
+first native forward. This does not claim pre-weight authentication of the
+complete corpus.
 
-For embedding, the concrete entry points are `NlpEngine::job_int8_classify` and
-`NlpEngine::job_int8_sentiment`, taking the existing resident model, pinned planner
+For embedding, the serial entry points are `NlpEngine::job_int8_classify`,
+`NlpEngine::job_int8_sentiment` and `NlpEngine::job_int8_judge`, taking the existing resident model, pinned planner
 Arc, corpus configuration, `SourceJobRequest`, `JobHostLimits`, owned reader and
 cancellation token. The durable adapters reuse `JobRunner` and existing native
 batch processors; no public fake-native or replacement-admission hook is added
 to these hosted entry points. Existing `candidate job` source/extraction and
 `candidate score-batch` live streaming semantics are unchanged.
+
+## Persistent workers and bounded prompts for INT8 jobs
+
+All three INT8 `score-job start` and `resume` tasks accept
+`--compute-threads N` and `--prefill-rows N`. Worker width is 1 through 64,
+including the coordinator; runtime threads are additional. Width one uses the
+existing serial route. Prompt rows are independently bounded to 1 through 64,
+and omitting that option uses ordinary token-major prompts. The two options
+can be composed:
+
+```sh
+fnlp candidate score-job start corpus.ndjson \
+  --task classify --defaults labels.json \
+  --model ./model.fnlpq --memory-mib 16384 \
+  --compute-threads 4 --prefill-rows 32 \
+  --store-results --job-dir ./protected-job \
+  --job-id "$JOB_ID" --key-file ./protected.key \
+  --limits ./job-limits.json --materialize
+```
+
+One admitted team spans population authentication, all pending records and
+their scoring heads, durable commits, and optional materialization. Prompt
+workspace and per-worker batch buffers are priced together before source
+access. The implementation uses the existing native scoring engines and
+projection team. Candidate traversal, scored EOS, result ordering, complete
+bundle validation and all five durable native work counters keep their
+existing semantics. There are no native head cohorts or partial-token
+checkpoints on this job route.
+
+Worker width may change on any explicit resume. Classification and sentiment
+also permit changing or removing the prompt row setting: their existing
+authenticated recipes remain unchanged. Judgment preserves its pre-existing
+recipe contract, which includes the prompt setting; retain the same
+`--prefill-rows` value, including its absence, when resuming a judgment job.
+A schedule change never authorizes a changed model, task, source population,
+defaults, limits or tokenizer profile. Committed records stay committed, and
+abandoned attempts and prior native work remain charged.
+
+Every worker joins before the API returns progress or failure. The CLI then
+stages metadata and checks the original cancellation/deadline before and
+after delivery, including flush. Delivery failure can follow durable progress;
+it does not acknowledge a rollback. Default serial metadata retains its
+existing shape. Selected schedules add only optional top-level metadata:
+
+```json
+{"compute_threads":4,"prefill_rows":32}
+```
+
+Those values describe requested physical configuration. They contain no
+private input or scores and are not measurements of achieved parallelism,
+throughput or speedup.
+
+For each task, library callers can select its existing serial entry point or
+the corresponding `_layer_major`, `_with_threads`, and
+`_layer_major_with_threads` methods. For example,
+`NlpEngine::job_int8_classify_layer_major_with_threads` takes the same resident
+model, pinned planner, corpus configuration, storage request and host limits,
+followed by the selected kernel, width, validated `Int8PrefillLimits`, owned
+reader and cancellation token. The explicit threaded methods require widths
+2 through 64 within the installed process envelope.
+
+Eleven focused regression definitions cover complete memory admission,
+original versus retained input ownership, malformed and stale schedule
+admission, metadata compatibility, all eleven cancellation causes and
+post-flush failure. A separate ignored actual-artifact gate compares complete
+stored results and durable work across serial, prompt, team and combined
+schedules for classification, sentiment and all three judgment modes. It
+also checks original-input and retained-input replay at a different physical
+schedule without new work or attempts. A deterministic pre-forward
+interruption fixture abandons the real classification planner's first
+durable debit, then resumes through the actual model and compares final
+results while requiring that abandoned debit to remain charged.
+
+The gate is in
+`src/hosted/corpus/jobs/scored/execution/tests/native.rs`. The designated
+controller supplies `FNLP_INT8_SCORE_JOB_TEAM_MODEL`, independent
+`FNLP_INT8_SCORE_JOB_TEAM_LOGICAL_SHA256` and
+`FNLP_INT8_SCORE_JOB_TEAM_SOURCE_ROOT_SHA256` pins, admitted
+`FNLP_INT8_SCORE_JOB_TEAM_MEMORY_MIB` and a protected
+`FNLP_INT8_SCORE_JOB_TEAM_PARENT` directory. It leaves isolated job artifacts
+for inspection. All new executable checks are **UNRUN** in this editing
+session; this source change claims no demonstrated output parity, mid-kernel
+crash qualification or measured performance result.
 
 ## Validation scope
 

@@ -1,83 +1,81 @@
 //! Retained complete judgments using the SAME processor as the live corpus.
 //! No public injected scorer, renewed task budget, or generated-label fallback.
 use super::*;
-use super::super::jobs::{read_population, run_population, HostedJobError, JobHostLimits, SourceJobRequest};
+use super::super::jobs::{run_population, HostedJobError, JobHostLimits, Population, SourceJobRequest,
+    scored::{self as scored_job, ScoredJobTask}};
 use crate::{
-    jobs::{JobProgress, JobWork,
+    jobs::{JobLimits, JobProgress, JobWork,
         runner::{DurableBatchProcessor, JobRunError}},
-    native_engine::lmhead::scoring::ScoringLimits,
+    native_engine::{lmhead::scoring::ScoringLimits, simd::Int8Kernel},
     tasks::judge::{JUDGE_PROMPT_VERSION, quantized::INT8_JUDGE_EXECUTION},
 };
 
 impl NlpEngine {
-    /// Start or explicitly resume item-local pairwise, rubric or faithfulness
-    /// work. Original input and the private recipe authenticate before repair
-    /// or inference. Each committed item is one COMPLETE judgment bundle.
+    /// Authenticate the exact original population and private recipe before
+    /// repair or inference. Each committed item is a COMPLETE judgment bundle.
     #[allow(clippy::too_many_arguments)]
     pub fn job_int8_judge<R>(&self, model: &ResidentInt8, planner: Arc<JudgePlanner>,
         config: JudgeCorpusConfig, request: SourceJobRequest, limits: JobHostLimits,
         reader: R, cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        self.job_int8_judge_scheduled(model, planner, config, request, limits, None, reader, cancellation)
+        scored_job::run(self, model, JudgeTask { planner, config }, request, limits,
+            None, None, reader, cancellation)
     }
-    /// Explicit physical prompt scheduling, frozen in the private job recipe.
-    /// The extra scratch charge is retained across ALL pending item attempts.
+
+    /// Preserve the existing frozen-prefill recipe contract while sharing
+    /// the admitted prompt workspace across every pending judgment.
     #[allow(clippy::too_many_arguments)]
     pub fn job_int8_judge_layer_major<R>(&self, model: &ResidentInt8, planner: Arc<JudgePlanner>,
         config: JudgeCorpusConfig, request: SourceJobRequest, limits: JobHostLimits,
         prefill: Int8PrefillLimits, reader: R, cancellation: CancellationToken)
         -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        self.job_int8_judge_scheduled(model, planner, config, request, limits, Some(prefill), reader, cancellation)
+        scored_job::run(self, model, JudgeTask { planner, config }, request, limits,
+            Some(prefill), None, reader, cancellation)
     }
+
+    /// Reuse one fixed team for every comparison order, rubric criterion and
+    /// evidence head. Width may change on resume without renewing any work.
     #[allow(clippy::too_many_arguments)]
-    fn job_int8_judge_scheduled<R>(&self, model: &ResidentInt8, planner: Arc<JudgePlanner>,
+    pub fn job_int8_judge_with_threads<R>(&self, model: &ResidentInt8, planner: Arc<JudgePlanner>,
         config: JudgeCorpusConfig, request: SourceJobRequest, limits: JobHostLimits,
-        prefill: Option<Int8PrefillLimits>, reader: R, cancellation: CancellationToken)
+        kernel: Int8Kernel, compute_threads: usize, reader: R, cancellation: CancellationToken)
         -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
-        self.check_resident_domain(model)?;
-        check_model_identity(model.artifact_identity(), &config.identity)?;
-        config.validate(&planner)?;
-        let bytes = limits.required_buffer_bytes_for_input(request.limits, request.mode.input_memory())?;
-        let required = requirements(limits.native)?;
-        check_capacity(config.task_ceiling, required.kv_bytes, request.limits.max_result_bytes)?;
-        let scratch_bytes = crate::hosted::scored::scoring_scratch(sum(&[required.rope_bytes,
-            required.scratch_payload_bound, limits.native.allocator_reserve_bytes])?, prefill)?;
-        let lease = self.resources().acquire_lease();
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
-            || Ok(StreamInput { planner: Some((planner, config, request)), reader, writer: () }))?;
-        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-        let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch_bytes)?;
-        let model = model.clone();
-        let completed = dispatch::run(self, limits.native.run, cancellation, move |control| {
-            // Capture the entire storage-before-charge aggregate, including
-            // queued cancellation. Recipe and population remain inside it.
-            let mut input = input;
-            let (planner, config, request) = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
-            let recipe = JudgeJobRecipe::new(&config, prefill)?;
-            let population = match read_population(&mut input.value.reader, &request,
-                limits.transport, control) {
-                Ok(population) => population,
-                Err(error) => return Ok(Err(JobRunError::Storage(error))),
-            };
-            let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value
-                .engine(limits.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            let admission = CorpusAdmission { lease: &lease, model: model.artifact_identity(),
-                kv_bytes: required.kv_bytes, sampler_bytes: 0, output_bytes: request.limits.max_result_bytes as u64 };
-            let result = {
-                let ledger = WorkLedger::new(config.max_model_work);
-                let native = JudgeProcessor { planner: &planner, config, engine: &mut engine.value,
-                    admission, ledger, prefill };
-                run_population(request, &population, JudgeJobProcessor { native, recipe }, control)
-            };
-            // The common runner drops journal/lock/processor first. Every
-            // output guard survived spool synchronization and acknowledgement.
-            drop(engine); drop(population); drop(planner); drop(input); drop(lease);
-            Ok(result)
-        })?;
-        completed.map_err(HostedJobError::Job)
+        scored_job::run(self, model, JudgeTask { planner, config }, request, limits,
+            None, Some((kernel, compute_threads)), reader, cancellation)
+    }
+
+    /// Compose the frozen prompt schedule with one admitted persistent team.
+    /// Team width is physical; the pre-existing prompt recipe remains frozen.
+    /// All workers join before progress or failure becomes observable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int8_judge_layer_major_with_threads<R>(&self, model: &ResidentInt8,
+        planner: Arc<JudgePlanner>, config: JudgeCorpusConfig, request: SourceJobRequest,
+        limits: JobHostLimits, kernel: Int8Kernel, compute_threads: usize,
+        prefill: Int8PrefillLimits, reader: R, cancellation: CancellationToken)
+        -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        scored_job::run(self, model, JudgeTask { planner, config }, request, limits,
+            Some(prefill), Some((kernel, compute_threads)), reader, cancellation)
+    }
+}
+
+struct JudgeTask { planner: Arc<JudgePlanner>, config: JudgeCorpusConfig }
+impl ScoredJobTask for JudgeTask {
+    fn identity(&self) -> &ExecutionIdentity { &self.config.identity }
+    fn validate(&self, native: Int8MemoryRequirement, job: JobLimits) -> Result<(), HostedError> {
+        self.config.validate(&self.planner)?;
+        check_capacity(self.config.task_ceiling, native.kv_bytes, job.max_result_bytes)
+    }
+    fn execute(self, engine: &mut StrictInt8Engine<'_>, admission: CorpusAdmission<'_>,
+        request: SourceJobRequest, population: &Population<'_>, prefill: Option<Int8PrefillLimits>,
+        control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
+        let Self { planner, config } = self;
+        let recipe = JudgeJobRecipe::new(&config, prefill)?;
+        let ledger = WorkLedger::new(config.max_model_work);
+        let native = JudgeProcessor { planner: &planner, config, engine, admission, ledger, prefill };
+        Ok(run_population(request, population, JudgeJobProcessor { native, recipe }, control))
     }
 }
 
