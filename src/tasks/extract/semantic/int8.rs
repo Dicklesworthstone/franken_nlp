@@ -46,6 +46,23 @@ impl Int8SemanticOptions {
         check_size(s, 1024 * 1024)?;
         Ok(())
     }
+
+    /// Pure bounded preflight before model IO. Execution repeats this check
+    /// against the consumed extraction's own sealed schema and original source.
+    pub fn validate_source_schema(&self, schema: &crate::grammar::SchemaNode, source: &str)
+        -> Result<(), Int8SemanticError> {
+        self.validate_schema(schema)?;
+        partition_evidence(source, self.specification.judge_policy).map_err(SemanticError::from)?;
+        Ok(())
+    }
+
+    /// Check fixed claim rules without reading a source or loading weights.
+    pub fn validate_schema(&self, schema: &crate::grammar::SchemaNode)
+        -> Result<(), Int8SemanticError> {
+        self.validate()?;
+        claims::validate_rules(schema, &self.specification.claims, self.limits)?;
+        Ok(())
+    }
 }
 
 pub enum Int8SemanticError {
@@ -114,9 +131,17 @@ impl PreparedInt8SemanticExtraction {
     pub fn execution_identity(&self) -> &ExecutionIdentity { self.extraction.execution_identity() }
     pub fn judge_identity(&self) -> &ExecutionIdentity { &self.judge_identity }
     pub fn extraction_reserved_work(&self) -> Int8Work { self.extraction.planned_work() }
+    pub fn extraction_selected_rows(&self) -> Option<crate::native_engine::constrained_int8::sparse::Int8JsonSparseLimits> {
+        self.extraction.extraction_plan().selected_rows()
+    }
     pub fn max_model_work(&self) -> Int8Work { self.options.max_model_work }
     pub fn extraction_budget(&self) -> TaskBudget { *self.extraction.task_plan().ir().budget() }
     pub fn judge_budget(&self) -> TaskBudget { self.options.specification.judge_budget }
+    pub fn judge_planning_limits(&self) -> JudgeLimits { self.judge_limits }
+    pub fn source_bytes(&self) -> usize { self.extraction.source().text().len() }
+    pub fn input_encoding(&self) -> &crate::tokenizer::untrusted::UntrustedEncoding {
+        self.extraction.source().document_encoding()
+    }
     pub fn semantic_limits(&self) -> SemanticLimits { self.options.limits }
     pub fn max_result_bytes(&self) -> u64 { self.options.limits.max_output_bytes }
 

@@ -207,3 +207,40 @@ fn bounded_output_and_late_cancellation_do_not_publish_partial_second_reader_res
         assert!(!format!("{error:?}").contains("source"));
     }
 }
+
+#[test]
+fn pure_schema_and_complete_source_preflight_refuse_before_model_preparation() {
+    let program = JsonProgram::compile(r#"{"type":"number"}"#, CompileLimits::default()).unwrap();
+    let schema = program.declarative_schema();
+    options(vec![rule()]).validate_schema(schema).unwrap();
+    options(vec![rule()]).validate_source_schema(schema, "The amount is 42.").unwrap();
+    let mut bad = rule(); bad.path = vec![ClaimPathStep::Property("missing".into())];
+    assert!(options(vec![bad]).validate_schema(schema).is_err());
+    let mut bad = rule(); bad.value_kind = ClaimValueKind::String;
+    assert!(options(vec![bad]).validate_source_schema(schema, "source").is_err());
+    assert!(options(vec![rule(), rule()]).validate_schema(schema).is_err());
+    let mut bad = options(vec![rule()]); bad.specification.experimental_opt_in = false;
+    assert!(bad.validate_source_schema(schema, "source").is_err());
+    let mut too_short = options(vec![rule()]);
+    too_short.specification.judge_policy.evidence_window_bytes = 1;
+    too_short.specification.judge_policy.max_evidence_windows = 1;
+    too_short.specification.judge_policy.max_evidence_spans = 1;
+    too_short.validate_schema(schema).unwrap();
+    assert!(too_short.validate_source_schema(schema, "complete source cannot fit one byte").is_err());
+}
+
+#[test]
+fn host_quotes_the_consumed_source_and_judge_limits_without_replacement_metadata() {
+    let source = "The café reports an amount of 42.";
+    let prepared = prepare(r#"{"type":"number"}"#, source, false, options(vec![rule()])).unwrap();
+    assert_eq!(prepared.source_bytes(), source.len());
+    assert_eq!(prepared.input_encoding(), &crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback);
+    assert!(prepared.extraction_selected_rows().is_none());
+    let (actual, expected) = (prepared.judge_planning_limits(), JudgeLimits::default());
+    assert_eq!((actual.max_total_prompt_tokens, actual.max_total_candidate_tokens,
+        actual.max_total_projected_logits, actual.max_output_bytes,
+        actual.per_head.max_candidates, actual.per_head.max_candidate_id_bytes),
+        (expected.max_total_prompt_tokens, expected.max_total_candidate_tokens,
+        expected.max_total_projected_logits, expected.max_output_bytes,
+        expected.per_head.max_candidates, expected.per_head.max_candidate_id_bytes));
+}
