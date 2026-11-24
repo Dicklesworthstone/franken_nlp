@@ -2,15 +2,30 @@
 //! Journal attempts price WHOLE documents, never partially committed chunks.
 use super::*;
 use crate::{
-    batch::extract::quantized::long::{Int8ExtractionMapLimits, Int8ExtractionMapRun,
-        INT8_EXTRACTION_MAP_EXECUTION, stream::{ExtractionDocumentArgs,
+    batch::extract::quantized::long::{Int8ExtractionMapLimits,
+        INT8_EXTRACTION_MAP_EXECUTION,
+        object::{Int8ObjectExtractionMapError, INT8_OBJECT_MAP_EXECUTION, ROOT_OBJECT_MAP_PROMPT},
+        stream::{DocumentCompiler, Int8ExtractionDocumentRun, ExtractionDocumentArgs,
             ExtractionDocumentBatchAdmission, ExtractionDocumentBatchConfig,
             NativeInt8DocumentExtractionBatch, PreparedExtractionDocument}},
     jobs::JobLimits,
     tasks::{mapreduce::{ChunkLimits, ExecutionLimits, CHUNK_PROFILE},
+        extract::object_reconcile::{RootObjectError, RootObjectLimits,
+            ROOT_OBJECT_DERIVATION, ROOT_OBJECT_RECONCILIATION},
         source_planning::quantized::long::Int8SourceMapLimits},
     validation::grounded_fields::GroundingBudget,
 };
+
+/// The original schema remains in `request`. Its derived partial schema and
+/// task-owned prompt are deterministic under these versions and the exact
+/// compiler bounds; no public raw content hash becomes resume authority.
+#[derive(Serialize)]
+struct RootObjectRecipe {
+    policy: &'static str,
+    schema_derivation: &'static str,
+    prompt_version: &'static str,
+    limits: RootObjectLimits,
+}
 
 /// Private settings projected into a keyed manifest commitment, never a public
 /// executable recipe or a wire constructor. Exact schema bytes remain strings.
@@ -30,13 +45,16 @@ pub struct Int8DocumentExtractionJobRecipe {
     max_mask_visits_per_document: u64,
     verification: GroundingBudget,
     max_verification: GroundingBudget,
+    /// Absent preserves the original independent-map recipe bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_object_reconciliation: Option<RootObjectRecipe>,
 }
 
 /// Model-free, immutable factory. The compiler, frozen recipe and native
 /// adapter are built from these SAME settings. No externally supplied compiler
 /// can omit its tokenizer/template/source-limit settings from the commitment.
 pub struct Int8DocumentExtractionJobPlanner {
-    compiler: Int8ExtractionBatchPlanner,
+    compiler: DocumentCompiler,
     identity: ExecutionIdentity,
     config: ExtractionDocumentBatchConfig,
     recipe: Int8DocumentExtractionJobRecipe,
@@ -68,15 +86,54 @@ impl Int8DocumentExtractionJobPlanner {
             execution: INT8_EXTRACTION_MAP_EXECUTION, chunk_profile: CHUNK_PROFILE,
             reservation_policy: "whole-document-ceiling-per-durable-attempt-v1", extraction, request,
             chunks, reduction, per_document_work, mask_visits_per_chunk,
-            max_mask_visits_per_document: document_masks, verification, max_verification };
+            max_mask_visits_per_document: document_masks, verification, max_verification,
+            root_object_reconciliation: None };
         bounded_json(&recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
-        Ok(Self { compiler, identity, config, recipe })
+        Ok(Self { compiler: DocumentCompiler::Map(compiler), identity, config, recipe })
     }
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn task_ceiling(&self) -> TaskBudget { self.recipe.extraction.task_ceiling }
     pub fn document_limits(&self) -> Int8ExtractionMapLimits { self.config.limits }
     pub fn document_budget(&self) -> TaskBudget { self.config.request.budget }
     pub fn job_recipe(&self) -> &Int8DocumentExtractionJobRecipe { &self.recipe }
+    pub fn request(&self) -> &ExtractionBatchArgs { &self.config.request }
+    pub fn compiler_limits(&self) -> CompileLimits {
+        let CompilerRecipe { max_schema_bytes, max_string_bytes, max_array_items, max_output_bytes,
+            max_states, max_transitions, max_mask_bytes } = &self.recipe.extraction.compiler;
+        CompileLimits { max_schema_bytes: *max_schema_bytes, max_string_bytes: *max_string_bytes,
+            max_array_items: *max_array_items, max_output_bytes: *max_output_bytes,
+            max_states: *max_states, max_transitions: *max_transitions, max_mask_bytes: *max_mask_bytes }
+    }
+    pub fn root_object_reconciliation(&self) -> Option<RootObjectLimits> {
+        self.compiler.root_object_reconciliation()
+    }
+
+    /// Explicitly reconcile all partial chunk objects into one complete result
+    /// validated against the exact ORIGINAL schema. This changes task semantics,
+    /// the real compiler's template identity and the authenticated private
+    /// recipe before any storage recovery. Only the root required set relaxes;
+    /// nested values stay atomic and conflicts or missing fields never commit.
+    /// The existing invocation tokenizer ledger travels with the compiler.
+    /// Repeating the identical policy is a no-op; a different installed policy
+    /// is refused instead of silently changing a resumable job.
+    pub fn with_root_object_reconciliation(mut self, reconciliation: RootObjectLimits)
+        -> Result<Self, BatchFault> {
+        self.check_document_encoding()?;
+        if self.root_object_reconciliation() == Some(reconciliation) { return Ok(self); }
+        self.compiler = self.compiler.with_root_object_reconciliation(
+            &self.config.request, self.config.limits, reconciliation).map_err(object_failure)?;
+        self.identity = self.compiler.base_planner().base_execution_identity().clone();
+        self.recipe.execution = INT8_OBJECT_MAP_EXECUTION;
+        self.recipe.extraction.prompt_version = ROOT_OBJECT_MAP_PROMPT;
+        self.recipe.root_object_reconciliation = Some(RootObjectRecipe {
+            policy: ROOT_OBJECT_RECONCILIATION, schema_derivation: ROOT_OBJECT_DERIVATION,
+            prompt_version: ROOT_OBJECT_MAP_PROMPT, limits: reconciliation,
+        });
+        self.check_document_encoding()?;
+        bounded_json(&self.recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
+        Ok(self)
+    }
+
     /// Configure one bounded tokenizer allowance for this invocation before
     /// authenticating storage. All document probes, chunk compilation and
     /// reconstruction share the same compiler-owned ledger. Resume recreates
@@ -95,8 +152,8 @@ impl Int8DocumentExtractionJobPlanner {
             return Err(BatchCode::InvalidExecution.into());
         }
         let total = total.ok_or(BatchCode::InvalidLimits)?;
-        self.compiler = self.compiler.with_map_document_encoding(policy.clone(), total)?;
-        self.identity = self.compiler.base_execution_identity().clone();
+        self.compiler = self.compiler.with_document_encoding(policy.clone(), Some(total))?;
+        self.identity = self.compiler.base_planner().base_execution_identity().clone();
         self.recipe.extraction.input_encoding = Some(policy);
         self.recipe.extraction.encoding_work_limits = Some(total);
         self.check_document_encoding()?;
@@ -105,24 +162,35 @@ impl Int8DocumentExtractionJobPlanner {
     }
     pub fn document_encoding(&self) -> &UntrustedEncoding { self.compiler.document_encoding() }
     pub fn encoding_work_limits(&self) -> Option<SafeBpeWorkLimits> {
-        self.compiler.map_document_encoding_limits()
+        self.compiler.base_planner().map_document_encoding_limits()
     }
     pub fn encoding_work(&self) -> Result<Option<SafeBpeWork>, BatchFault> {
-        self.compiler.map_document_encoding_work()
+        self.compiler.base_planner().map_document_encoding_work()
     }
     pub fn encoding_workspace_bytes(&self) -> Result<u64, BatchFault> {
         self.check_document_encoding()?;
-        self.compiler.map_document_encoding_workspace_bytes()
+        self.compiler.encoding_workspace_bytes()
     }
     fn check_document_encoding(&self) -> Result<(), BatchFault> {
         let recipe = &self.recipe.extraction;
         let expected = recipe.input_encoding.as_ref().unwrap_or(&UntrustedEncoding::ByteFallback);
         if matches!(recipe.input_encoding.as_ref(), Some(UntrustedEncoding::ByteFallback))
             || self.document_encoding() != expected || self.encoding_work_limits() != recipe.encoding_work_limits
-            || &self.identity != self.compiler.base_execution_identity() {
+            || &self.identity != self.compiler.base_planner().base_execution_identity() {
             return Err(BatchCode::Admission.into());
         }
-        self.compiler.map_document_encoding_workspace_bytes()?;
+        match (&self.recipe.root_object_reconciliation, self.root_object_reconciliation()) {
+            (None, None) if self.recipe.execution == INT8_EXTRACTION_MAP_EXECUTION
+                && recipe.prompt_version == EXTRACTION_BATCH_PROMPT => {}
+            (Some(object), Some(limits)) if object.limits == limits
+                && object.policy == ROOT_OBJECT_RECONCILIATION
+                && object.schema_derivation == ROOT_OBJECT_DERIVATION
+                && object.prompt_version == ROOT_OBJECT_MAP_PROMPT
+                && self.recipe.execution == INT8_OBJECT_MAP_EXECUTION
+                && recipe.prompt_version == ROOT_OBJECT_MAP_PROMPT => {}
+            _ => return Err(BatchCode::Admission.into()),
+        }
+        self.compiler.encoding_workspace_bytes()?;
         Ok(())
     }
     pub fn document_work(&self) -> JobWork {
@@ -146,6 +214,21 @@ impl Int8DocumentExtractionJobPlanner {
         Ok(())
     }
 }
+fn object_failure(error: Int8ObjectExtractionMapError) -> BatchFault {
+    if let Some(cause) = error.cancellation() { return BatchFault::cancelled(cause); }
+    match error {
+        Int8ObjectExtractionMapError::Admission => BatchCode::Admission.into(),
+        Int8ObjectExtractionMapError::Map(_) => BatchCode::Planning.into(),
+        Int8ObjectExtractionMapError::Reconciliation(error) => match error {
+            RootObjectError::InvalidLimits | RootObjectError::Limit => BatchCode::InvalidLimits.into(),
+            RootObjectError::Schema => BatchCode::Planning.into(),
+            RootObjectError::Allocation => BatchCode::Allocation.into(),
+            RootObjectError::Serialization => BatchCode::Serialization.into(),
+            _ => BatchCode::InvalidExecution.into(),
+        },
+    }
+}
+
 fn verification_covers_attempts(per: GroundingBudget, max: GroundingBudget, attempts: u64) -> bool {
     let Ok(count) = usize::try_from(attempts) else { return false; };
     count != 0 && per.max_fields.checked_mul(count).is_some_and(|n| n <= max.max_fields)
@@ -170,11 +253,8 @@ impl<'p, 'e, 'w, 'v, A: ExtractionDocumentBatchAdmission>
         vocabulary: &'v ExtractionVocabulary, admission: A, prefill: Option<Int8PrefillLimits>) -> Result<Self, BatchFault> {
         planner.check_document_encoding()?;
         let config = planner.config.clone();
-        let native = match prefill {
-            None => NativeInt8DocumentExtractionBatch::new(&planner.compiler, config, engine, vocabulary, admission),
-            Some(prefill) => NativeInt8DocumentExtractionBatch::new_layer_major(&planner.compiler, config,
-                engine, vocabulary, admission, prefill),
-        }?;
+        let native = NativeInt8DocumentExtractionBatch::new_scheduled(
+            &planner.compiler, config, engine, vocabulary, admission, prefill)?;
         Ok(Self { native, planner })
     }
 }
@@ -182,7 +262,7 @@ impl<A: ExtractionDocumentBatchAdmission> BatchProcessor
     for Int8DocumentExtractionJobProcessor<'_, '_, '_, '_, A> {
     type Args = ExtractionDocumentArgs;
     type Prepared = PreparedExtractionDocument;
-    type Output = GuardedOutput<Int8ExtractionMapRun, A::Guard>;
+    type Output = GuardedOutput<Int8ExtractionDocumentRun, A::Guard>;
     fn prepare(&mut self, document: BatchDocument<Self::Args>) -> Result<Self::Prepared, BatchItemFailure> {
         self.native.prepare(document)
     }

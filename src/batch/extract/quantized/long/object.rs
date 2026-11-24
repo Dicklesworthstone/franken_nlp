@@ -231,6 +231,15 @@ impl PreparedInt8ObjectExtractionMap<'_> {
         self.mapped.execution_identities()
     }
     pub fn max_result_bytes(&self) -> u64 { self.expected.max_result_bytes }
+    /// Only sibling native adapters and private fixtures can supply a driver.
+    /// The complete map and original-schema reconciliation stay inseparable.
+    pub(super) fn execute_with_driver<D: Driver, C: DecodeStepControl>(self,
+        admitted: &[ExecutionIdentity], driver: D, control: &mut C)
+        -> Result<Int8ObjectExtractionMapRun, Int8ObjectExtractionMapError> {
+        let Self { source, schema, mapped, limits, expected } = self;
+        let partial = mapped.execute_with_driver(admitted, driver, control)?;
+        finish(source, schema, limits, expected, partial, control)
+    }
     pub fn execute_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
         engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
         -> Result<Int8ObjectExtractionMapRun, Int8ObjectExtractionMapError> {

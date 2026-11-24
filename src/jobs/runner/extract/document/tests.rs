@@ -74,7 +74,7 @@ fn compact() -> Int8DocumentExtractionJobPlanner {
 fn compact_resume_authenticates_every_encoding_axis_and_keeps_spent_work_out_of_the_recipe() {
     let p = compact(); let input = r#"{"id":"item","text":"éAéAéAéA"}"#.as_bytes();
     let frozen = freeze(&p, input);
-    let plan = p.compiler.plan_document_with_control("éAéAéAéA", &p.config.request, p.config.limits, &mut Continue).unwrap();
+    let plan = p.compiler.base_planner().plan_document_with_control("éAéAéAéA", &p.config.request, p.config.limits, &mut Continue).unwrap();
     assert!(plan.preflight_metadata().chunk_count() > 1);
     for child in plan.execution_identities() {
         assert_eq!(child.template_digest, p.execution_identity().template_digest);
@@ -110,12 +110,12 @@ fn compact_job_reconfiguration_preserves_spent_work_and_refuses_incomplete_or_ch
         assert!(factory(config()).with_document_encoding(compact_policy(), Some(total)).is_err());
     }
     let p = compact();
-    let first = p.compiler.plan_document_with_control("éAéAéAéA", &p.config.request, p.config.limits, &mut Continue).unwrap();
+    let first = p.compiler.base_planner().plan_document_with_control("éAéAéAéA", &p.config.request, p.config.limits, &mut Continue).unwrap();
     let expected = first.preflight_metadata(); let ids: Vec<_> = first.execution_identities().cloned().collect();
     drop(first); let spent = p.encoding_work().unwrap().unwrap();
     let p = p.with_document_encoding(compact_policy(), Some(encoding_limits())).unwrap();
     assert_eq!(p.encoding_work().unwrap(), Some(spent));
-    let rebuilt = p.compiler.plan_document_with_control("éAéAéAéA", &p.config.request, p.config.limits, &mut Continue).unwrap();
+    let rebuilt = p.compiler.base_planner().plan_document_with_control("éAéAéAéA", &p.config.request, p.config.limits, &mut Continue).unwrap();
     assert_eq!(rebuilt.preflight_metadata(), expected);
     assert_eq!(rebuilt.execution_identities().cloned().collect::<Vec<_>>(), ids);
     assert_eq!(p.encoding_work().unwrap(), Some(spent.checked_add(spent).unwrap()));
@@ -137,6 +137,9 @@ fn byte_job_defaults_preserve_the_original_recipe_identity_and_workspace() {
     let value = serde_json::to_value(p.job_recipe()).unwrap();
     assert!(value["extraction"].get("input_encoding").is_none());
     assert!(value["extraction"].get("encoding_work_limits").is_none());
+    assert!(value.get("root_object_reconciliation").is_none());
+    assert_eq!(value["execution"], INT8_EXTRACTION_MAP_EXECUTION);
+    assert_eq!(value["extraction"]["prompt_version"], EXTRACTION_BATCH_PROMPT);
 }
 #[test]
 fn compact_job_workspace_is_additive_to_the_complete_document_frontier() {
@@ -170,7 +173,7 @@ fn a_changed_encoding_recipe_or_identity_refuses_before_storage() {
 fn original_document_planning_uses_every_exact_child_and_one_whole_document_debit() {
     let p = factory(config()); p.check_job_limits(limits()).unwrap();
     let text = "éAéAéAéA";
-    let plan = p.compiler.plan_document_with_control(text, &p.config.request, p.config.limits, &mut Continue).unwrap();
+    let plan = p.compiler.base_planner().plan_document_with_control(text, &p.config.request, p.config.limits, &mut Continue).unwrap();
     let expected = plan.preflight_metadata();
     assert!(expected.chunk_count() > 1);
     assert_eq!(expected.source_span().byte_end, text.len());
@@ -299,6 +302,219 @@ fn compiler_ceiling_and_cancellation_cannot_be_bypassed_by_document_mode() {
         fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { Some(DecodeCancellationKind::Deadline) }
     }
     let p = factory(config());
-    let error = p.compiler.plan_document_with_control("Alice", &p.config.request, p.config.limits, &mut Stop).err().unwrap();
+    let error = p.compiler.base_planner().plan_document_with_control("Alice", &p.config.request, p.config.limits, &mut Stop).err().unwrap();
     assert_eq!(error.cancellation(), Some(DecodeCancellationKind::Deadline));
+}
+
+const OBJECT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"city":{"type":"string","enum":["Paris"]},"name":{"type":"string","enum":["Alice"]}},"required":["city","name"]}"#;
+fn object_limits() -> RootObjectLimits {
+    RootObjectLimits { max_properties: 8, max_origins: 32, max_input_bytes: 262144,
+        max_json_bytes: 4096, max_nodes: 1024, max_result_bytes: 32768 }
+}
+fn object_config(schema: &str) -> ExtractionDocumentBatchConfig {
+    let mut c = config(); c.request.schema = schema.to_owned();
+    c.limits.mapping.reduction.map_batch_chunks = 2;
+    c.limits.mapping.reduction.reduce_fan_in = 2;
+    c
+}
+fn object_factory(schema: &str, reconciliation: RootObjectLimits) -> Int8DocumentExtractionJobPlanner {
+    factory(object_config(schema)).with_root_object_reconciliation(reconciliation).unwrap()
+}
+
+#[test]
+fn object_jobs_bind_the_original_schema_and_actual_partial_prompt_before_storage() {
+    let original = format!("  {OBJECT_SCHEMA}\n");
+    let p = object_factory(&original, object_limits());
+    p.check_job_limits(limits()).unwrap();
+    assert_eq!(p.request().schema, original);
+    assert_eq!(p.root_object_reconciliation(), Some(object_limits()));
+    assert_eq!(p.compiler_limits().max_schema_bytes, CompileLimits::default().max_schema_bytes);
+    let recipe = serde_json::to_value(p.job_recipe()).unwrap();
+    assert_eq!(recipe["request"]["schema"], original);
+    assert_eq!(recipe["execution"], INT8_OBJECT_MAP_EXECUTION);
+    assert_eq!(recipe["extraction"]["prompt_version"], ROOT_OBJECT_MAP_PROMPT);
+    assert_eq!(recipe["root_object_reconciliation"]["policy"], ROOT_OBJECT_RECONCILIATION);
+    assert_eq!(recipe["root_object_reconciliation"]["schema_derivation"], ROOT_OBJECT_DERIVATION);
+    assert_eq!(recipe["root_object_reconciliation"]["prompt_version"], ROOT_OBJECT_MAP_PROMPT);
+    assert_ne!(p.execution_identity().template_digest, factory(config()).execution_identity().template_digest);
+    let source = "Alice Paris";
+    let plan = p.compiler.plan(source, p.request(), p.document_limits(), &mut Continue).unwrap();
+    let expected = plan.preflight_metadata();
+    assert!(expected.chunk_count() > 1);
+    assert_eq!(expected.source_span().byte_end, source.len());
+    for child in plan.execution_identities() {
+        assert_eq!(child.template_digest, p.execution_identity().template_digest);
+        assert_eq!(child.tokenizer_digest, p.execution_identity().tokenizer_digest);
+        assert_ne!(child.schema_digest, Sha256Digest::of_bytes(original.as_bytes()));
+    }
+    assert!(JobWork { model: expected.planned_work(), mask_node_visits: expected.reserved_mask_visits() }
+        .fits(p.document_work()));
+    assert_eq!(p.document_work(), factory(config()).document_work());
+}
+
+#[test]
+fn original_required_sets_cannot_share_durable_authority_despite_identical_partial_maps() {
+    let a = object_factory(OBJECT_SCHEMA, object_limits());
+    let changed = OBJECT_SCHEMA.replace(r#""required":["city","name"]"#, r#""required":["name"]"#);
+    assert_ne!(changed, OBJECT_SCHEMA);
+    let b = object_factory(&changed, object_limits());
+    let source = "Alice Paris";
+    let first = a.compiler.plan(source, a.request(), a.document_limits(), &mut Continue).unwrap();
+    let second = b.compiler.plan(source, b.request(), b.document_limits(), &mut Continue).unwrap();
+    assert_eq!(first.execution_identities().cloned().collect::<Vec<_>>(),
+        second.execution_identities().cloned().collect::<Vec<_>>());
+    assert!(first.preflight_metadata() != second.preflight_metadata());
+    let input = br#"{"id":"item","text":"Alice Paris"}"#;
+    assert_eq!(freeze(&a, input).binding.compare(&freeze(&b, input).binding),
+        Err(JobError::Mismatch(MismatchField::Recipe)));
+    let spaced = object_factory(&format!("{OBJECT_SCHEMA}\n"), object_limits());
+    assert_eq!(freeze(&a, input).binding.compare(&freeze(&spaced, input).binding),
+        Err(JobError::Mismatch(MismatchField::Recipe)));
+}
+
+#[test]
+fn every_root_object_limit_authenticates_resume_without_renewing_native_work() {
+    let input = br#"{"id":"item","text":"Alice Paris"}"#;
+    let p = object_factory(OBJECT_SCHEMA, object_limits());
+    let frozen = freeze(&p, input);
+    frozen.binding.compare(&freeze(&object_factory(OBJECT_SCHEMA, object_limits()), input).binding).unwrap();
+    for axis in 0..6 {
+        let mut changed = object_limits();
+        match axis { 0 => changed.max_properties += 1, 1 => changed.max_origins += 1,
+            2 => changed.max_input_bytes += 1, 3 => changed.max_json_bytes += 1,
+            4 => changed.max_nodes += 1, _ => changed.max_result_bytes += 1 }
+        let other = object_factory(OBJECT_SCHEMA, changed);
+        assert_eq!(other.document_work(), p.document_work());
+        assert_eq!(frozen.binding.compare(&freeze(&other, input).binding),
+            Err(JobError::Mismatch(MismatchField::Recipe)), "axis {axis}");
+    }
+    let mut too_many_attempts = limits(); too_many_attempts.max_attempts += 1;
+    assert!(p.check_job_limits(too_many_attempts).is_err());
+    let mut short_result = limits(); short_result.max_result_bytes -= 1;
+    assert!(p.check_job_limits(short_result).is_err());
+}
+
+#[test]
+fn object_recipe_drift_is_rejected_before_population_or_storage() {
+    for axis in 0..8 {
+        let mut p = object_factory(OBJECT_SCHEMA, object_limits());
+        match axis {
+            0 => p.recipe.root_object_reconciliation = None,
+            1 => p.recipe.root_object_reconciliation.as_mut().unwrap().policy = "different-reducer",
+            2 => p.recipe.root_object_reconciliation.as_mut().unwrap().schema_derivation = "different-derivation",
+            3 => p.recipe.root_object_reconciliation.as_mut().unwrap().prompt_version = "different-prompt",
+            4 => p.recipe.root_object_reconciliation.as_mut().unwrap().limits.max_properties += 1,
+            5 => p.recipe.extraction.prompt_version = EXTRACTION_BATCH_PROMPT,
+            6 => p.recipe.execution = INT8_EXTRACTION_MAP_EXECUTION,
+            _ => p.identity.template_digest = Sha256Digest::of_bytes(b"other-template"),
+        }
+        let error = super::super::super::freeze(&JobSecret::from_bytes([7; 32]), JobId([9; 16]), limits(),
+            &[], &NoNative(&p), &mut Continue).err().unwrap();
+        assert_eq!(error, JobRunError::Processor(BatchCode::Admission.into()), "axis {axis}");
+    }
+}
+
+#[test]
+fn both_object_compact_setup_orders_rebuild_exactly_and_identical_settings_preserve_spent_work() {
+    let configured = |encoding_first| {
+        let p = factory(object_config(OBJECT_SCHEMA));
+        if encoding_first {
+            p.with_document_encoding(compact_policy(), Some(encoding_limits())).unwrap()
+                .with_root_object_reconciliation(object_limits()).unwrap()
+        } else {
+            p.with_root_object_reconciliation(object_limits()).unwrap()
+                .with_document_encoding(compact_policy(), Some(encoding_limits())).unwrap()
+        }
+    };
+    let input = br#"{"id":"item","text":"Alice Paris"}"#;
+    // The existing template wrappers bind their installation order. Resume
+    // authenticates the actual execution identity as well as the same recipe.
+    assert_eq!(freeze(&configured(false), input).binding.compare(&freeze(&configured(true), input).binding),
+        Err(JobError::Mismatch(MismatchField::Execution)));
+    for encoding_first in [false, true] {
+        let p = configured(encoding_first); let frozen = freeze(&p, input);
+        frozen.binding.compare(&freeze(&configured(encoding_first), input).binding).unwrap();
+        let first = p.compiler.plan("Alice Paris", p.request(), p.document_limits(), &mut Continue).unwrap();
+        let expected = first.preflight_metadata();
+        let identities = first.execution_identities().cloned().collect::<Vec<_>>();
+        drop(first);
+        let spent = p.encoding_work().unwrap().unwrap(); assert!(spent.input_bytes() > 0);
+        let p = p.with_root_object_reconciliation(object_limits()).unwrap()
+            .with_document_encoding(compact_policy(), Some(encoding_limits())).unwrap();
+        assert_eq!(p.encoding_work().unwrap(), Some(spent));
+        frozen.binding.compare(&freeze(&p, input).binding).unwrap();
+        let rebuilt = p.compiler.plan("Alice Paris", p.request(), p.document_limits(), &mut Continue).unwrap();
+        assert_eq!(rebuilt.preflight_metadata(), expected);
+        assert_eq!(rebuilt.execution_identities().cloned().collect::<Vec<_>>(), identities);
+        drop(rebuilt);
+        assert_eq!(p.encoding_work().unwrap(), Some(spent.checked_add(spent).unwrap()));
+        let mut changed = object_limits(); changed.max_origins += 1;
+        assert!(p.with_root_object_reconciliation(changed).is_err());
+    }
+}
+
+#[test]
+fn object_reconstruction_exhausts_the_same_declared_compact_invocation_allowance() {
+    let p = object_factory(OBJECT_SCHEMA, object_limits())
+        .with_document_encoding(compact_policy(), Some(encoding_limits())).unwrap();
+    drop(p.compiler.plan("Alice Paris", p.request(), p.document_limits(), &mut Continue).unwrap());
+    let used = p.encoding_work().unwrap().unwrap();
+    let once = SafeBpeWorkLimits { max_input_bytes: used.input_bytes() as u64,
+        max_output_tokens: (used.output_tokens() as u64).max(1), max_pair_checks: used.pair_checks().max(1),
+        max_pair_bytes: used.pair_bytes().max(1) };
+    let p = object_factory(OBJECT_SCHEMA, object_limits()).with_document_encoding(compact_policy(), Some(once)).unwrap();
+    drop(p.compiler.plan("Alice Paris", p.request(), p.document_limits(), &mut Continue).unwrap());
+    assert_eq!(p.encoding_work().unwrap(), Some(used));
+    assert!(p.compiler.plan("Alice Paris", p.request(), p.document_limits(), &mut Continue).is_err());
+    assert_eq!(p.encoding_work().unwrap().unwrap().input_bytes(), used.input_bytes());
+    // A separately authenticated resume gets this same bounded invocation
+    // allowance, never a larger native/attempt/verification lifetime budget.
+    let resumed = object_factory(OBJECT_SCHEMA, object_limits()).with_document_encoding(compact_policy(), Some(once)).unwrap();
+    assert_eq!(p.document_work(), resumed.document_work());
+    let input = br#"{"id":"item","text":"Alice Paris"}"#;
+    freeze(&p, input).binding.compare(&freeze(&resumed, input).binding).unwrap();
+}
+
+#[test]
+fn object_jobs_refuse_nonobjects_invalid_limits_and_changed_verification_authority() {
+    for schema in [r#"{"type":"boolean"}"#,
+        r#"{"type":"array","items":{"type":"boolean"},"maxItems":2}"#,
+        r#"{"type":"object","properties":{},"additionalProperties":true}"#] {
+        assert!(factory(object_config(schema)).with_root_object_reconciliation(object_limits()).is_err());
+    }
+    for axis in 0..6 {
+        let mut invalid = object_limits();
+        match axis { 0 => invalid.max_properties = 0, 1 => invalid.max_origins = 0,
+            2 => invalid.max_input_bytes = 0, 3 => invalid.max_json_bytes = 0,
+            4 => invalid.max_nodes = 0, _ => invalid.max_result_bytes = 0 }
+        assert!(factory(object_config(OBJECT_SCHEMA)).with_root_object_reconciliation(invalid).is_err(), "axis {axis}");
+    }
+    for axis in 0..3 {
+        let mut c = object_config(OBJECT_SCHEMA);
+        match axis { 0 => c.max_verification.max_fields -= 1,
+            1 => c.max_verification.max_matches -= 1, _ => c.max_verification.max_scan_steps -= 1 }
+        let p = factory(c).with_root_object_reconciliation(object_limits()).unwrap();
+        assert!(p.check_job_limits(limits()).is_err(), "axis {axis}");
+    }
+}
+
+#[test]
+fn object_job_preparation_retains_the_original_cancellation_without_spending_work() {
+    struct Stop(DecodeCancellationKind);
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { Some(self.0) }
+    }
+    let p = object_factory(OBJECT_SCHEMA, object_limits())
+        .with_document_encoding(compact_policy(), Some(encoding_limits())).unwrap();
+    for cause in [DecodeCancellationKind::User, DecodeCancellationKind::Timeout,
+        DecodeCancellationKind::Deadline, DecodeCancellationKind::PollQuota,
+        DecodeCancellationKind::CostBudget, DecodeCancellationKind::FailFast,
+        DecodeCancellationKind::RaceLost, DecodeCancellationKind::ParentCancelled,
+        DecodeCancellationKind::ResourceUnavailable, DecodeCancellationKind::Shutdown,
+        DecodeCancellationKind::LinkedExit] {
+        let error = p.compiler.plan("Alice Paris", p.request(), p.document_limits(), &mut Stop(cause)).err().unwrap();
+        assert_eq!(error.cancellation(), Some(cause));
+        assert_eq!(object_failure(error), BatchFault::cancelled(cause));
+        assert_eq!(p.encoding_work().unwrap(), Some(SafeBpeWork::default()));
+    }
 }

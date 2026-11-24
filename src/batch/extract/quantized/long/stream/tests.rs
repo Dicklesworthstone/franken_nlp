@@ -131,7 +131,7 @@ fn compact_stream_keeps_exact_sources_and_spends_both_planning_passes_across_epo
         let out = execute_document(&p, &c, &mut d, &mut a, &mut l, prepared,
             context(index as u64 + 1, index as u64 + 1), &mut Control::default()).unwrap();
         assert_eq!(encoding_work(&p), after_prepare.checked_add(pass).unwrap());
-        for chunk in out.result().mapped.root().value().chunks() {
+        for chunk in out.result().mapped().mapped.root().value().chunks() {
             let value: serde_json::Value = serde_json::from_str(&chunk.native.result.output.json).unwrap();
             let exact = &source[chunk.source_span.byte_start..chunk.source_span.byte_end];
             assert_eq!(value["quote"].as_str(), Some(exact));
@@ -317,3 +317,5 @@ fn sequence_replay_cannot_execute_again_after_a_successful_epoch() {
     let error = execute_document(&p, &c, &mut d, &mut a, &mut l, prepared, context(1, 2), &mut Control::default()).err().unwrap();
     assert!(error.stop); assert_eq!(d.calls, 1); assert_eq!(a.calls, 1);
 }
+
+mod object;

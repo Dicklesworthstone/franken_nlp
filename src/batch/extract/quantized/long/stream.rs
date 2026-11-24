@@ -2,6 +2,10 @@
 //! One resident native driver; no context-sized truncation or per-row runtime.
 use super::*;
 use crate::batch::{BatchRequestContext, BatchProcessor, BatchWork};
+use super::object::{Int8ObjectExtractionPlanner, Int8ObjectExtractionMapLimits,
+    Int8ObjectExtractionMapError, Int8ObjectExtractionMapPreflight,
+    Int8ObjectExtractionMapRun, PreparedInt8ObjectExtractionMap};
+use crate::tasks::extract::object_reconcile::{RootObjectError, RootObjectLimits, RootObjectSchema};
 
 /// The schema, grounding policy and partition limits are fixed for the stream.
 /// Each document's exact native work and mask reservation, plus its complete
@@ -16,9 +20,217 @@ pub struct ExtractionDocumentBatchConfig {
 }
 
 /// Records cannot replace the admitted schema, profile, chunking or budgets.
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Accept only an empty object, including refusal of serde's sequence form.
+#[derive(Default)]
 pub struct ExtractionDocumentArgs {}
+impl<'de> Deserialize<'de> for ExtractionDocumentArgs {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EmptyMap;
+        impl<'de> serde::de::Visitor<'de> for EmptyMap {
+            type Value = ExtractionDocumentArgs;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an empty object of document arguments")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                if map.next_key::<String>()?.is_some() {
+                    return Err(serde::de::Error::custom("document arguments cannot override the shared extraction policy"));
+                }
+                Ok(ExtractionDocumentArgs {})
+            }
+        }
+        deserializer.deserialize_map(EmptyMap)
+    }
+}
+
+/// The ordinary map keeps its exact existing wire. Object mode contains the
+/// unchanged partial map plus the independently checked original-schema object.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum Int8ExtractionDocumentRun {
+    Map(Int8ExtractionMapRun),
+    Object(Int8ObjectExtractionMapRun),
+}
+impl Int8ExtractionDocumentRun {
+    pub fn mapped(&self) -> &Int8ExtractionMapRun {
+        match self { Self::Map(run) => run, Self::Object(run) => &run.partial_map }
+    }
+    /// Object mode spends additional original-source verification after every
+    /// partial chunk has completed; that charge is part of the same allowance.
+    pub fn verification_used(&self) -> ExtractionMapVerification {
+        match self { Self::Map(run) => run.verification_used, Self::Object(run) => run.verification_used }
+    }
+}
+
+/// Both live and retained factories hold the actual compiler and its complete
+/// map-encoding ledger. A new record cannot create a new tokenizer allowance.
+pub(crate) enum DocumentCompiler {
+    Map(Int8ExtractionBatchPlanner),
+    Object { planner: Int8ObjectExtractionPlanner, limits: RootObjectLimits },
+}
+impl DocumentCompiler {
+    pub(crate) fn base_planner(&self) -> &Int8ExtractionBatchPlanner {
+        match self { Self::Map(planner) => planner, Self::Object { planner, .. } => planner.base_planner() }
+    }
+    pub(crate) fn root_object_reconciliation(&self) -> Option<RootObjectLimits> {
+        match self { Self::Map(_) => None, Self::Object { limits, .. } => Some(*limits) }
+    }
+    pub(crate) fn document_encoding(&self) -> &UntrustedEncoding { self.base_planner().document_encoding() }
+    pub(crate) fn encoding_workspace_bytes(&self) -> Result<u64, BatchFault> {
+        self.base_planner().map_document_encoding_workspace_bytes()
+    }
+    pub(crate) fn with_document_encoding(self, policy: UntrustedEncoding,
+        total: Option<SafeBpeWorkLimits>) -> Result<Self, BatchFault> {
+        policy.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        self.encoding_workspace_bytes()?;
+        if self.document_encoding() == &policy && self.base_planner().map_document_encoding_limits() == total {
+            return Ok(self);
+        }
+        if self.document_encoding() != &UntrustedEncoding::ByteFallback {
+            return Err(BatchCode::InvalidExecution.into());
+        }
+        let total = total.ok_or(BatchCode::InvalidLimits)?;
+        match self {
+            Self::Map(planner) => Ok(Self::Map(planner.with_map_document_encoding(policy, total)?)),
+            Self::Object { planner, limits } => Ok(Self::Object {
+                planner: planner.with_map_document_encoding(policy, total)?, limits }),
+        }
+    }
+    pub(crate) fn with_root_object_reconciliation(self, request: &ExtractionBatchArgs,
+        mapping: Int8ExtractionMapLimits, reconciliation: RootObjectLimits)
+        -> Result<Self, Int8ObjectExtractionMapError> {
+        validate_object_schema(request, mapping, reconciliation, self.base_planner().compiler.compiler_limits)?;
+        match self {
+            Self::Map(planner) => Ok(Self::Object {
+                planner: Int8ObjectExtractionPlanner::new(planner)?, limits: reconciliation }),
+            Self::Object { planner, limits } if limits == reconciliation => Ok(Self::Object { planner, limits }),
+            Self::Object { .. } => Err(Int8ObjectExtractionMapError::Admission),
+        }
+    }
+    pub(crate) fn plan<'s, C: DecodeStepControl>(&self, source: &'s str,
+        request: &ExtractionBatchArgs, limits: Int8ExtractionMapLimits, control: &mut C)
+        -> Result<DocumentPlan<'s>, Int8ObjectExtractionMapError> {
+        match self {
+            Self::Map(planner) => Ok(DocumentPlan::Map(planner.plan_document_with_control(source, request, limits, control)?)),
+            Self::Object { planner, limits: reconciliation } => Ok(DocumentPlan::Object(
+                planner.plan_document_with_control(source, request,
+                    Int8ObjectExtractionMapLimits { mapping: limits, reconciliation: *reconciliation }, control)?)),
+        }
+    }
+}
+
+fn validate_object_schema(request: &ExtractionBatchArgs, mapping: Int8ExtractionMapLimits,
+    reconciliation: RootObjectLimits, compiler: CompileLimits) -> Result<(), Int8ObjectExtractionMapError> {
+    Int8ObjectExtractionMapLimits { mapping, reconciliation }.reconciliation_workspace_bytes()?;
+    // Fixed, bounded schema-only admission before a population is opened.
+    // Real source preparation repeats it with the original caller's control.
+    let schema = RootObjectSchema::derive(&request.schema, compiler, reconciliation, &mut VerificationOnly)?;
+    if schema.requires_source() != (request.grounding == ExtractionBatchGrounding::SourceMembership) {
+        return Err(Int8ObjectExtractionMapError::Admission);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum CompilerRef<'p> {
+    Map(&'p Int8ExtractionBatchPlanner),
+    Configured(&'p DocumentCompiler),
+    #[cfg(feature = "asupersync-runtime")]
+    Object { planner: &'p Int8ObjectExtractionPlanner, limits: RootObjectLimits },
+}
+impl<'p> From<&'p Int8ExtractionBatchPlanner> for CompilerRef<'p> {
+    fn from(planner: &'p Int8ExtractionBatchPlanner) -> Self { Self::Map(planner) }
+}
+impl<'p> From<&'p DocumentCompiler> for CompilerRef<'p> {
+    fn from(planner: &'p DocumentCompiler) -> Self { Self::Configured(planner) }
+}
+impl CompilerRef<'_> {
+    fn base_planner(&self) -> &Int8ExtractionBatchPlanner {
+        match self { Self::Map(planner) => planner, Self::Configured(compiler) => compiler.base_planner(),
+            #[cfg(feature = "asupersync-runtime")]
+            Self::Object { planner, .. } => planner.base_planner() }
+    }
+    fn validate(&self, config: &ExtractionDocumentBatchConfig) -> Result<(), BatchFault> {
+        config.validate()?;
+        self.base_planner().map_document_encoding_workspace_bytes()?;
+        let reconciliation = match self {
+            Self::Map(_) => None,
+            Self::Configured(compiler) => compiler.root_object_reconciliation(),
+            #[cfg(feature = "asupersync-runtime")]
+            Self::Object { limits, .. } => Some(*limits),
+        };
+        if let Some(limits) = reconciliation {
+            validate_object_schema(&config.request, config.limits, limits,
+                self.base_planner().compiler.compiler_limits).map_err(|e| document_failure(e, true).fault)?;
+        }
+        Ok(())
+    }
+    fn plan<'s, C: DecodeStepControl>(&self, source: &'s str,
+        request: &ExtractionBatchArgs, limits: Int8ExtractionMapLimits, control: &mut C)
+        -> Result<DocumentPlan<'s>, Int8ObjectExtractionMapError> {
+        match self {
+            Self::Map(planner) => Ok(DocumentPlan::Map(planner.plan_document_with_control(source, request, limits, control)?)),
+            Self::Configured(compiler) => compiler.plan(source, request, limits, control),
+            #[cfg(feature = "asupersync-runtime")]
+            Self::Object { planner, limits: reconciliation } => Ok(DocumentPlan::Object(
+                planner.plan_document_with_control(source, request,
+                    Int8ObjectExtractionMapLimits { mapping: limits, reconciliation: *reconciliation }, control)?)),
+        }
+    }
+}
+
+pub(crate) enum DocumentPlan<'s> {
+    Map(PreparedInt8ExtractionMap<'s>),
+    Object(PreparedInt8ObjectExtractionMap<'s>),
+}
+impl DocumentPlan<'_> {
+    pub(crate) fn mapped(&self) -> &PreparedInt8ExtractionMap<'_> {
+        match self { Self::Map(plan) => plan, Self::Object(plan) => plan.mapped() }
+    }
+    pub(crate) fn preflight_metadata(&self) -> DocumentPreflight {
+        match self { Self::Map(plan) => DocumentPreflight::Map(plan.preflight_metadata()),
+            Self::Object(plan) => DocumentPreflight::Object(plan.preflight_metadata()) }
+    }
+    pub(crate) fn execution_identities(&self) -> impl ExactSizeIterator<Item = &ExecutionIdentity> {
+        self.mapped().execution_identities()
+    }
+    pub(crate) fn max_result_bytes(&self) -> u64 { self.mapped().max_result_bytes() }
+    fn execute_with_driver<D: Driver, C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        driver: D, control: &mut C) -> Result<Int8ExtractionDocumentRun, Int8ObjectExtractionMapError> {
+        match self {
+            Self::Map(plan) => Ok(Int8ExtractionDocumentRun::Map(plan.execute_with_driver(admitted, driver, control)?)),
+            Self::Object(plan) => Ok(Int8ExtractionDocumentRun::Object(plan.execute_with_driver(admitted, driver, control)?)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum DocumentPreflight {
+    Map(Int8ExtractionMapPreflight),
+    Object(Int8ObjectExtractionMapPreflight),
+}
+impl fmt::Debug for DocumentPreflight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DocumentPreflight").field("mapped", &self.mapped())
+            .field("root_object_reconciliation", &matches!(self, Self::Object(_))).finish()
+    }
+}
+impl DocumentPreflight {
+    pub(crate) fn mapped(&self) -> Int8ExtractionMapPreflight {
+        match self { Self::Map(proof) => *proof, Self::Object(proof) => proof.mapped() }
+    }
+    pub(crate) fn source_span(&self) -> VerifiedSourceSpan { self.mapped().source_span() }
+    pub(crate) fn chunk_count(&self) -> usize { self.mapped().chunk_count() }
+    pub(crate) fn planned_work(&self) -> Int8Work { self.mapped().planned_work() }
+    pub(crate) fn reserved_mask_visits(&self) -> u64 { self.mapped().reserved_mask_visits() }
+    pub(crate) fn verify_completed_with_control<C: DecodeStepControl>(&self,
+        run: &Int8ExtractionDocumentRun, control: &mut C) -> Result<(), Int8ObjectExtractionMapError> {
+        match (self, run) {
+            (Self::Map(proof), Int8ExtractionDocumentRun::Map(run)) => Ok(proof.verify_completed_with_control(run, control)?),
+            (Self::Object(proof), Int8ExtractionDocumentRun::Object(run)) => proof.verify_completed_with_control(run, control),
+            _ => Err(Int8ObjectExtractionMapError::Admission),
+        }
+    }
+}
 
 /// Admission sees ALL exact chunk identities, not a representative first chunk
 /// or a compiler identity that omits the actual source/schema binding.
@@ -41,12 +253,13 @@ pub trait ExtractionDocumentBatchAdmission {
 /// execution. Neither the source nor this snapshot has a wire constructor.
 pub struct PreparedExtractionDocument {
     source: String,
-    expected: Int8ExtractionMapPreflight,
+    expected: DocumentPreflight,
     identities: Vec<ExecutionIdentity>,
+    owner: Arc<()>,
 }
 
 pub struct NativeInt8DocumentExtractionBatch<'p, 'e, 'w, 'v, A: ExtractionDocumentBatchAdmission> {
-    planner: &'p Int8ExtractionBatchPlanner,
+    planner: CompilerRef<'p>,
     config: ExtractionDocumentBatchConfig,
     driver: NativeDriver<'e, 'w, 'v>,
     admission: A,
@@ -60,11 +273,7 @@ impl<'p, 'e, 'w, 'v, A: ExtractionDocumentBatchAdmission>
         // A compact stream requires the complete-map ledger, not merely a
         // record-local encoding policy. The same borrowed planner retains
         // every probe, chunk and reconstruction debit across all records.
-        planner.map_document_encoding_workspace_bytes()?;
-        config.validate()?;
-        let driver = NativeDriver { engine, vocabulary, prefill: None };
-        capacity(&driver, &config).map_err(|e| e.fault)?;
-        Ok(Self { planner, config, driver, admission, ledger: Ledger::default() })
+        Self::configured(planner.into(), config, engine, vocabulary, admission, None)
     }
     /// The same engine and fixed prompt workspace span every immutable chunk
     /// in every original document. Whole-corpus work and exact reconstruction
@@ -72,10 +281,29 @@ impl<'p, 'e, 'w, 'v, A: ExtractionDocumentBatchAdmission>
     pub fn new_layer_major(planner: &'p Int8ExtractionBatchPlanner, config: ExtractionDocumentBatchConfig,
         engine: &'e mut StrictInt8Engine<'w>, vocabulary: &'v ExtractionVocabulary, admission: A,
         prefill: Int8PrefillLimits) -> Result<Self, BatchFault> {
-        prefill.validate().map_err(|_| BatchCode::InvalidLimits)?;
-        let mut processor = Self::new(planner, config, engine, vocabulary, admission)?;
-        processor.driver.prefill = Some(prefill);
-        Ok(processor)
+        Self::configured(planner.into(), config, engine, vocabulary, admission, Some(prefill))
+    }
+    pub(crate) fn new_scheduled(compiler: &'p DocumentCompiler, config: ExtractionDocumentBatchConfig,
+        engine: &'e mut StrictInt8Engine<'w>, vocabulary: &'v ExtractionVocabulary, admission: A,
+        prefill: Option<Int8PrefillLimits>) -> Result<Self, BatchFault> {
+        Self::configured(compiler.into(), config, engine, vocabulary, admission, prefill)
+    }
+    #[cfg(feature = "asupersync-runtime")]
+    pub(crate) fn new_object_scheduled(planner: &'p Int8ObjectExtractionPlanner,
+        reconciliation: RootObjectLimits, config: ExtractionDocumentBatchConfig,
+        engine: &'e mut StrictInt8Engine<'w>, vocabulary: &'v ExtractionVocabulary, admission: A,
+        prefill: Option<Int8PrefillLimits>) -> Result<Self, BatchFault> {
+        Self::configured(CompilerRef::Object { planner, limits: reconciliation },
+            config, engine, vocabulary, admission, prefill)
+    }
+    fn configured(planner: CompilerRef<'p>, config: ExtractionDocumentBatchConfig,
+        engine: &'e mut StrictInt8Engine<'w>, vocabulary: &'v ExtractionVocabulary, admission: A,
+        prefill: Option<Int8PrefillLimits>) -> Result<Self, BatchFault> {
+        if let Some(prefill) = prefill { prefill.validate().map_err(|_| BatchCode::InvalidLimits)?; }
+        planner.validate(&config)?;
+        let driver = NativeDriver { engine, vocabulary, prefill };
+        capacity(&driver, &config).map_err(|e| e.fault)?;
+        Ok(Self { planner, config, driver, admission, ledger: Ledger::default() })
     }
     pub fn reserved_model_work(&self) -> Int8Work { self.ledger.work }
     pub fn reserved_mask_visits(&self) -> u64 { self.ledger.masks }
@@ -86,7 +314,7 @@ impl<A: ExtractionDocumentBatchAdmission> BatchProcessor
     for NativeInt8DocumentExtractionBatch<'_, '_, '_, '_, A> {
     type Args = ExtractionDocumentArgs;
     type Prepared = PreparedExtractionDocument;
-    type Output = GuardedOutput<Int8ExtractionMapRun, A::Guard>;
+    type Output = GuardedOutput<Int8ExtractionDocumentRun, A::Guard>;
     fn prepare(&mut self, _: BatchDocument<Self::Args>) -> Result<Self::Prepared, BatchItemFailure> {
         self.ledger.failed = true;
         Err(BatchItemFailure::fatal(BatchCode::InvalidExecution))
@@ -140,18 +368,22 @@ fn add_verification(a: GroundingBudget, b: GroundingBudget) -> Option<GroundingB
     Some(GroundingBudget { max_fields: a.max_fields.checked_add(b.max_fields)?,
         max_matches: a.max_matches.checked_add(b.max_matches)?, max_scan_steps: a.max_scan_steps.checked_add(b.max_scan_steps)? })
 }
-struct Ledger { work: Int8Work, masks: u64, verification: GroundingBudget, sequence: u64, failed: bool }
+struct Ledger {
+    work: Int8Work, masks: u64, verification: GroundingBudget, sequence: u64, failed: bool,
+    owner: Arc<()>,
+}
 impl Default for Ledger {
     fn default() -> Self {
         Self { work: Int8Work::default(), masks: 0,
-            verification: GroundingBudget { max_fields: 0, max_matches: 0, max_scan_steps: 0 }, sequence: 0, failed: false }
+            verification: GroundingBudget { max_fields: 0, max_matches: 0, max_scan_steps: 0 },
+            sequence: 0, failed: false, owner: Arc::new(()) }
     }
 }
 impl Ledger {
     fn ready(&self) -> Result<(), BatchItemFailure> {
         if self.failed { Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)) } else { Ok(()) }
     }
-    fn begin(&mut self, config: &ExtractionDocumentBatchConfig, expected: Int8ExtractionMapPreflight,
+    fn begin(&mut self, config: &ExtractionDocumentBatchConfig, expected: DocumentPreflight,
         context: BatchRequestContext) -> Result<(), BatchItemFailure> {
         self.ready()?;
         self.failed = true; // Unwinding or ANY execution failure closes this adapter.
@@ -194,10 +426,26 @@ fn map_failure(error: Int8SourceMapError, fatal: bool) -> BatchItemFailure {
     };
     if terminal { BatchItemFailure::fatal(code) } else { BatchItemFailure::reject(code) }
 }
-fn prepare_document<D: Driver, C: DecodeStepControl>(planner: &Int8ExtractionBatchPlanner,
+fn document_failure(error: Int8ObjectExtractionMapError, fatal: bool) -> BatchItemFailure {
+    if let Some(cause) = error.cancellation() { return BatchItemFailure::fatal(BatchFault::cancelled(cause)); }
+    let code = match error {
+        Int8ObjectExtractionMapError::Map(error) => return map_failure(error, fatal),
+        Int8ObjectExtractionMapError::Admission => BatchCode::Admission,
+        Int8ObjectExtractionMapError::Reconciliation(RootObjectError::InvalidLimits) => BatchCode::InvalidLimits,
+        Int8ObjectExtractionMapError::Reconciliation(RootObjectError::Schema) => BatchCode::Planning,
+        Int8ObjectExtractionMapError::Reconciliation(RootObjectError::Allocation) => BatchCode::Allocation,
+        Int8ObjectExtractionMapError::Reconciliation(RootObjectError::Limit) => BatchCode::WorkLimit,
+        Int8ObjectExtractionMapError::Reconciliation(_) => BatchCode::InvalidExecution,
+    };
+    // Object reconciliation is required item semantics. No conflict, missing
+    // required field or failed final verification can publish partial chunks.
+    BatchItemFailure::fatal(code)
+}
+fn prepare_document<'p, D: Driver, C: DecodeStepControl>(planner: impl Into<CompilerRef<'p>>,
     config: &ExtractionDocumentBatchConfig, driver: &D, ledger: &mut Ledger,
     document: BatchDocument<ExtractionDocumentArgs>, control: &mut C)
     -> Result<PreparedExtractionDocument, BatchItemFailure> {
+    let planner = planner.into();
     ledger.ready()?; ledger.failed = true;
     let result = (|| {
         checkpoint(control)?;
@@ -205,19 +453,23 @@ fn prepare_document<D: Driver, C: DecodeStepControl>(planner: &Int8ExtractionBat
         if document.text.is_empty() || document.text.len() > config.limits.mapping.chunks.max_input_bytes {
             return Err(BatchItemFailure::reject(BatchCode::DocumentLimit));
         }
-        let plan = planner.plan_document_with_control(&document.text, &config.request, config.limits, control)
-            .map_err(|e| map_failure(e, false))?;
+        let plan = planner.plan(&document.text, &config.request, config.limits, control)
+            .map_err(|e| document_failure(e, false))?;
         let expected = plan.preflight_metadata();
+        if expected.source_span().byte_start != 0 || expected.source_span().byte_end != document.text.len()
+            || plan.execution_identities().len() != expected.chunk_count() {
+            return Err(BatchItemFailure::fatal(BatchCode::Admission));
+        }
         let mut identities = Vec::new();
         identities.try_reserve_exact(expected.chunk_count()).map_err(|_| BatchItemFailure::fatal(BatchCode::Allocation))?;
-        for chunk in &plan.plans {
+        for chunk in &plan.mapped().plans {
             checkpoint(control)?;
             preflight(chunk, driver)?;
             identities.push(chunk.execution_identity().clone());
         }
         drop(plan);
         checkpoint(control)?;
-        Ok(PreparedExtractionDocument { source: document.text, expected, identities })
+        Ok(PreparedExtractionDocument { source: document.text, expected, identities, owner: Arc::clone(&ledger.owner) })
     })();
     if !result.as_ref().is_err_and(|e: &BatchItemFailure| e.stop) { ledger.failed = false; }
     result
@@ -226,21 +478,29 @@ fn prepare_document<D: Driver, C: DecodeStepControl>(planner: &Int8ExtractionBat
 // Only this closed helper can compose a test driver with a completed map. The
 // public adapter always supplies NativeDriver. No public result-injection hook.
 #[allow(clippy::too_many_arguments)]
-fn execute_document<D: Driver, A: ExtractionDocumentBatchAdmission, C: DecodeStepControl>(
-    planner: &Int8ExtractionBatchPlanner, config: &ExtractionDocumentBatchConfig,
+fn execute_document<'p, D: Driver, A: ExtractionDocumentBatchAdmission, C: DecodeStepControl>(
+    planner: impl Into<CompilerRef<'p>>, config: &ExtractionDocumentBatchConfig,
     driver: &mut D, admission: &mut A, ledger: &mut Ledger,
     prepared: PreparedExtractionDocument, context: BatchRequestContext, control: &mut C)
-    -> Result<GuardedOutput<Int8ExtractionMapRun, A::Guard>, BatchItemFailure> {
+    -> Result<GuardedOutput<Int8ExtractionDocumentRun, A::Guard>, BatchItemFailure> {
+    let planner = planner.into();
+    // Preparation and reconstruction must spend THIS invocation's shared
+    // compact allowance. Equal semantic identities do not transfer that debt
+    // from another adapter or a prior durable invocation.
+    if !Arc::ptr_eq(&prepared.owner, &ledger.owner) {
+        ledger.failed = true;
+        return Err(BatchItemFailure::fatal(BatchCode::Admission));
+    }
     ledger.begin(config, prepared.expected, context)?;
     let result = (|| {
         checkpoint(control)?;
         let kv = capacity(driver, config)?;
-        let plan = planner.plan_document_with_control(&prepared.source, &config.request, config.limits, control)
-            .map_err(|e| map_failure(e, true))?;
-        if plan.preflight_metadata() != prepared.expected || plan.plans.len() != prepared.identities.len() {
+        let plan = planner.plan(&prepared.source, &config.request, config.limits, control)
+            .map_err(|e| document_failure(e, true))?;
+        if plan.preflight_metadata() != prepared.expected || plan.execution_identities().len() != prepared.identities.len() {
             return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
         }
-        for (chunk, expected) in plan.plans.iter().zip(&prepared.identities) {
+        for (chunk, expected) in plan.mapped().plans.iter().zip(&prepared.identities) {
             checkpoint(control)?;
             chunk.verify_identity(expected).map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
             preflight(chunk, driver)?;
@@ -254,8 +514,8 @@ fn execute_document<D: Driver, A: ExtractionDocumentBatchAdmission, C: DecodeSte
         // The map preflights EVERY returned identity before its first forward.
         // Borrowing the driver preserves the SAME resident engine across items.
         let output = plan.execute_with_driver(&admitted, BorrowedDriver(driver), control)
-            .map_err(|e| map_failure(e, true))?;
-        prepared.expected.verify_completed_with_control(&output, control).map_err(|e| map_failure(e, true))?;
+            .map_err(|e| document_failure(e, true))?;
+        prepared.expected.verify_completed_with_control(&output, control).map_err(|e| document_failure(e, true))?;
         if !driver.clean() { return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)); }
         checkpoint(control)?;
         Ok(GuardedOutput::new(output, guard))

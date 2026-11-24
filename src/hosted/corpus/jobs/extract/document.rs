@@ -65,9 +65,20 @@ impl scored::Int8JobTask for DocumentExtractionTask {
 pub(crate) fn extraction_document_job_workspace(planner: &Int8DocumentExtractionJobPlanner, reserve: u64)
     -> Result<u64, HostedError> {
     let mapping = planner.document_limits();
+    let object = match planner.root_object_reconciliation() {
+        None => 0,
+        Some(reconciliation) => {
+            use crate::tasks::extract::object_reconcile::RootObjectSchema;
+            let limits = crate::batch::extract::quantized::long::object::Int8ObjectExtractionMapLimits {
+                mapping, reconciliation };
+            sum(&[limits.reconciliation_workspace_bytes().map_err(HostedError::Int8ObjectExtractionMap)?,
+                RootObjectSchema::workspace_bytes(planner.compiler_limits())
+                    .map_err(|error| HostedError::Int8ObjectExtractionMap(error.into()))?])?
+        }
+    };
     sum(&[crate::hosted::extraction_map::document_workspace_bytes(planner.document_budget(), mapping,
         mapping.mapping.chunks.max_chunks, reserve)?,
-        planner.encoding_workspace_bytes().map_err(HostedError::BatchSetup)?])
+        planner.encoding_workspace_bytes().map_err(HostedError::BatchSetup)?, object])
 }
 
 fn check_capacity(budget: TaskBudget, planned_context: usize, resident_context: usize,
