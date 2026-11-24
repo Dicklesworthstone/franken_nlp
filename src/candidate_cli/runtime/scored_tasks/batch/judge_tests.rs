@@ -87,20 +87,23 @@ fn one_faithfulness_window_reuses_the_complete_source_head() {
 }
 
 #[test]
-fn grouped_prompt_schedule_preserves_the_exact_pinned_judgment_identity() {
-    let serial = command("judge", &[]);
-    let grouped = command("judge", &["--prefill-rows", "4"]);
-    let (_, a, _) = serial.validate().unwrap(); let (_, b, _) = grouped.validate().unwrap();
+fn every_physical_schedule_preserves_exact_pairwise_rubric_and_faithfulness_plans() {
+    let serial = command("judge", &[]); let (_, a, _) = serial.validate().unwrap();
     for value in defaults() {
         let text = value.to_string();
         let left = serial.parse_defaults(Some(&text), serial.host.budget(a)).unwrap();
-        let right = grouped.parse_defaults(Some(&text), grouped.host.budget(b)).unwrap();
         let Corpus::Judge(p, pc) = configure(&serial, &facts(), a, left).unwrap() else { panic!("serial") };
-        let Corpus::Judge(q, qc) = configure(&grouped, &facts(), b, right).unwrap() else { panic!("grouped") };
-        let x = plan(&p, &pc, pc.defaults.clone().unwrap());
-        let y = plan(&q, &qc, qc.defaults.clone().unwrap());
-        assert_eq!(x.execution_identity(), y.execution_identity());
-        assert_eq!(x.planned_work(), y.planned_work());
-        assert_eq!(x.head_count(), y.head_count());
+        let expected = plan(&p, &pc, pc.defaults.clone().unwrap());
+        for options in [&["--prefill-rows", "4"][..], &["--compute-threads", "4"][..],
+            &["--compute-threads", "4", "--prefill-rows", "4"][..]] {
+            let selected = command("judge", options); let (_, b, _) = selected.validate().unwrap();
+            let right = selected.parse_defaults(Some(&text), selected.host.budget(b)).unwrap();
+            let Corpus::Judge(q, qc) = configure(&selected, &facts(), b, right).unwrap() else { panic!("selected") };
+            let actual = plan(&q, &qc, qc.defaults.clone().unwrap());
+            assert_eq!(actual.execution_identity(), expected.execution_identity());
+            assert_eq!(actual.planned_work(), expected.planned_work());
+            assert_eq!(actual.head_count(), expected.head_count());
+            assert_eq!(qc.max_model_work, pc.max_model_work);
+        }
     }
 }

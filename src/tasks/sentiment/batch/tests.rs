@@ -177,13 +177,16 @@ fn synthetic(c: &Int8SentimentBatchPlanner<'_>, prepared: &PreparedInt8BatchSent
         numerics_profile: STRICT_INT8_PROFILE.to_owned(), result: plan.execute(&mut Uniform).unwrap(),
         head_count: prepared.head_count(), model_work: prepared.model_work(), rewound_positions: 0 }
 }
-struct Fixture { output: Int8SentimentRun, calls: usize, capacity: usize, clean: bool, fail: bool }
+struct Fixture { output: Int8SentimentRun, calls: usize, capacity: usize, clean: bool, fail: bool,
+    prefill_rows: Option<usize> }
 impl Driver for Fixture {
     fn clean(&self) -> bool { self.clean }
     fn capacity(&self) -> usize { self.capacity }
     fn execute<C: DecodeStepControl>(&mut self, p: &PreparedInt8Sentiment, _: &ExecutionIdentity,
-        budget: Int8ScoringBudget, _: &mut C) -> Result<Int8SentimentRun, Int8SentimentError> {
+        budget: Int8ScoringBudget, prefill: Option<Int8PrefillLimits>, _: &mut C)
+        -> Result<Int8SentimentRun, Int8SentimentError> {
         self.calls += 1;
+        self.prefill_rows = prefill.map(|limits| limits.max_batch_rows);
         assert_eq!(budget.native.max_forward_positions, p.planned_work().forward_positions);
         assert_eq!(budget.native.max_attention_pairs, p.planned_work().attention_pairs);
         if self.fail { self.clean = false; return Err(Int8SentimentError::Native(StrictInt8Error::Attention)); }
@@ -204,7 +207,8 @@ impl Int8SentimentAdmission for Admission {
     }
 }
 fn driver(c: &Int8SentimentBatchPlanner<'_>, prepared: &PreparedInt8BatchSentiment) -> Fixture {
-    Fixture { output: synthetic(c, prepared), calls: 0, capacity: 4096, clean: true, fail: false }
+    Fixture { output: synthetic(c, prepared), calls: 0, capacity: 4096, clean: true, fail: false,
+        prefill_rows: None }
 }
 fn admission() -> Admission { Admission { drops: Arc::new(AtomicUsize::new(0)), wrong_identity: false } }
 #[test]
@@ -243,7 +247,8 @@ fn incomplete_or_mislabeled_native_envelopes_poison_without_partial_results() {
     let original = prepare(&c); let output = synthetic(&c, &original);
     for field in 0..5 {
         let prepared = prepare(&c); let mut state = RunState::new(prepared.model_work());
-        let mut d = Fixture { output: output.clone(), calls: 0, capacity: 4096, clean: true, fail: false };
+        let mut d = Fixture { output: output.clone(), calls: 0, capacity: 4096, clean: true, fail: false,
+            prefill_rows: None };
         match field { 0 => { d.output.result.dimensions.pop(); }, 1 => d.output.head_count -= 1,
             2 => d.output.model_work.attention_pairs += 1, 3 => d.output.numerics_profile = "hf-bf16-eager".to_owned(),
             _ => d.output.result.dimensions.swap(0, 1) }
@@ -273,4 +278,41 @@ fn native_failure_and_foreign_factory_seals_never_become_successful_abstention()
         let e = execute_admitted(prepared, binding, &mut d, &mut a, &mut state, context(1, 1), &mut Continue).err().unwrap();
         assert!(e.stop); assert!(state.failed); assert_eq!(d.calls, usize::from(!foreign));
     }
+}
+
+#[test]
+fn packed_prompt_schedule_survives_epochs_without_renewing_native_work_or_identity() {
+    let p = planner(); let compiler = Int8SentimentBatchPlanner::new(&p, config(&p)).unwrap();
+    let first = prepare(&compiler); let identity = first.execution_identity().clone();
+    let work = first.model_work(); let mut d = driver(&compiler, &first); let mut a = admission();
+    let mut state = RunState::new(work.checked_add(work).unwrap());
+    state.prefill = Some(Int8PrefillLimits { max_batch_rows: 4,
+        max_extra_scratch_bytes: Int8PrefillLimits::required_extra_scratch_bytes(4).unwrap() });
+    for (seq, epoch) in [(1, 1), (9, 3)] {
+        let prepared = prepare(&compiler);
+        assert_eq!(prepared.execution_identity(), &identity);
+        let result = execute_admitted(prepared, compiler.binding, &mut d, &mut a,
+            &mut state, context(seq, epoch), &mut Continue).unwrap();
+        assert_eq!(result.result().model_work, work); assert_eq!(d.prefill_rows, Some(4));
+        drop(result);
+    }
+    assert_eq!(d.calls, 2); assert_eq!(state.remaining, Int8Work::default());
+    let error = execute_admitted(prepare(&compiler), compiler.binding, &mut d, &mut a,
+        &mut state, context(10, 4), &mut Continue).err().unwrap();
+    assert_eq!(error.fault.code, BatchCode::WorkLimit); assert_eq!(d.calls, 2);
+    assert_eq!(a.drops.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn packed_prompt_schedule_cannot_bypass_exact_admission_identity_or_refund_work() {
+    let p = planner(); let compiler = Int8SentimentBatchPlanner::new(&p, config(&p)).unwrap();
+    let prepared = prepare(&compiler); let mut state = RunState::new(prepared.model_work());
+    state.prefill = Some(Int8PrefillLimits { max_batch_rows: 3,
+        max_extra_scratch_bytes: Int8PrefillLimits::required_extra_scratch_bytes(3).unwrap() });
+    let mut d = driver(&compiler, &prepared); let mut a = admission(); a.wrong_identity = true;
+    let error = execute_admitted(prepared, compiler.binding, &mut d, &mut a,
+        &mut state, context(1, 1), &mut Continue).err().unwrap();
+    assert_eq!(error.fault.code, BatchCode::Admission); assert!(error.stop);
+    assert_eq!(d.calls, 0); assert_eq!(state.remaining, Int8Work::default());
+    assert_eq!(a.drops.load(Ordering::SeqCst), 1);
 }

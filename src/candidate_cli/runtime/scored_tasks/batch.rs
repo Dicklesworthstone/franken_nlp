@@ -86,6 +86,10 @@ struct Provenance<'a> {
     logical_model_sha256: &'a str, quant_recipe: &'a str, task: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     input_encoding: Option<&'a UntrustedEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compute_threads: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefill_rows: Option<usize>,
 }
 pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     command: ScoreBatchCommand, args: CandidateArgs, limits: Limits, envelope: ScoreEnvelope,
@@ -94,8 +98,10 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Sen
     // Session is the first owning local: preparation authority outlives every
     // setting, planner, source metadata, input buffer and output staging value.
     let prefill = command.prefill_limits()?;
+    command.check_scheduling_memory(limits, envelope, prefill)?;
+    if args.compute != command.compute { return Err(CandidateError::Arguments); }
     let encoding = command.host.encoding_policy(&command.encoding)?;
-    let session = Session::new(&args, limits)?;
+    let session = Session::new_with_prefill(&args, limits, prefill)?;
     let raw_defaults = command.defaults.as_ref()
         .map(|path| session.read(path, &mut input, DEFAULTS_BYTES)).transpose()?;
     let defaults = command.parse_defaults(raw_defaults.as_deref(), command.host.budget(limits))?;
@@ -106,7 +112,9 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Sen
         scope: "real-artifact-current-candidate", evidence: "non_authoritative",
         model_id: &facts.model_id, source_revision: &facts.revision, source_root_sha256: &facts.source_root_sha256,
         logical_model_sha256: &facts.logical_model_sha256, quant_recipe: &facts.recipe_id, task: &command.task,
-        input_encoding: input_encoding::reported_policy(&encoding) };
+        input_encoding: input_encoding::reported_policy(&encoding),
+        compute_threads: (limits.compute.threads > 1).then_some(limits.compute.threads),
+        prefill_rows: prefill.map(|limits| limits.max_batch_rows) };
     let writer = CandidateWriter::new(output, &provenance, envelope.transport.max_output_line_bytes, envelope.output_bytes)?;
     let reader: Box<dyn BufRead + Send> = if args.input.as_os_str() == "-" {
         Box::new(BufReader::with_capacity(IO_BUFFER_BYTES, input))
@@ -117,17 +125,50 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Sen
     let model = session.load(&args, limits, &facts, cancellation.clone())?;
     let corpus_limits = CorpusLimits { native: session.native(&args)?, transport: envelope.transport,
         preparation_reserve_bytes: limits.preparation_bytes, io_reserve_bytes: envelope.io_bytes };
-    let summary = match corpus {
-        Corpus::Classify(planner, config) => session.engine.batch_int8_classify(&model, planner, config,
-            corpus_limits, reader, writer, cancellation),
-        Corpus::Sentiment(planner, config) => session.engine.batch_int8_sentiment(&model, planner, config,
-            corpus_limits, reader, writer, cancellation),
-        Corpus::Judge(planner, config) => match prefill {
-            Some(prefill) => session.engine.batch_int8_judge_layer_major(&model, planner, config,
-                corpus_limits, prefill, reader, writer, cancellation),
-            None => session.engine.batch_int8_judge(&model, planner, config,
-                corpus_limits, reader, writer, cancellation),
-        },
+    let width = limits.compute.threads;
+    let summary = if width == 1 {
+        match corpus {
+            Corpus::Classify(planner, config) => match prefill {
+                Some(prefill) => session.engine.batch_int8_classify_layer_major(&model, planner, config,
+                    corpus_limits, prefill, reader, writer, cancellation),
+                None => session.engine.batch_int8_classify(&model, planner, config,
+                    corpus_limits, reader, writer, cancellation),
+            },
+            Corpus::Sentiment(planner, config) => match prefill {
+                Some(prefill) => session.engine.batch_int8_sentiment_layer_major(&model, planner, config,
+                    corpus_limits, prefill, reader, writer, cancellation),
+                None => session.engine.batch_int8_sentiment(&model, planner, config,
+                    corpus_limits, reader, writer, cancellation),
+            },
+            Corpus::Judge(planner, config) => match prefill {
+                Some(prefill) => session.engine.batch_int8_judge_layer_major(&model, planner, config,
+                    corpus_limits, prefill, reader, writer, cancellation),
+                None => session.engine.batch_int8_judge(&model, planner, config,
+                    corpus_limits, reader, writer, cancellation),
+            },
+        }
+    } else {
+        let kernel = crate::native_engine::simd::config::process_kernel();
+        match corpus {
+            Corpus::Classify(planner, config) => match prefill {
+                Some(prefill) => session.engine.batch_int8_classify_layer_major_with_threads(&model,
+                    planner, config, corpus_limits, kernel, width, prefill, reader, writer, cancellation),
+                None => session.engine.batch_int8_classify_with_threads(&model,
+                    planner, config, corpus_limits, kernel, width, reader, writer, cancellation),
+            },
+            Corpus::Sentiment(planner, config) => match prefill {
+                Some(prefill) => session.engine.batch_int8_sentiment_layer_major_with_threads(&model,
+                    planner, config, corpus_limits, kernel, width, prefill, reader, writer, cancellation),
+                None => session.engine.batch_int8_sentiment_with_threads(&model,
+                    planner, config, corpus_limits, kernel, width, reader, writer, cancellation),
+            },
+            Corpus::Judge(planner, config) => match prefill {
+                Some(prefill) => session.engine.batch_int8_judge_layer_major_with_threads(&model,
+                    planner, config, corpus_limits, kernel, width, prefill, reader, writer, cancellation),
+                None => session.engine.batch_int8_judge_with_threads(&model,
+                    planner, config, corpus_limits, kernel, width, reader, writer, cancellation),
+            },
+        }
     }.map_err(|_| CandidateError::Batch)?;
     // Earlier complete records may exist. Never append a second terminal event,
     // retry a poisoned sink or conflate EOF with every document succeeding.

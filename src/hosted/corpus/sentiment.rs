@@ -5,54 +5,79 @@ use crate::tasks::sentiment::{SentimentPlanner, batch::{Int8SentimentBatchPlanne
 pub use crate::tasks::sentiment::batch::SentimentBatchConfig as SentimentCorpusConfig;
 
 impl NlpEngine {
-    /// Run complete sentiment bundles through one actual blocking-pool/scoped
-    /// invocation. No per-document model/runtime, caller-supplied no-op permit,
-    /// collecting output buffer, retry or partial-axis response is introduced.
-    /// Score-space and policy are fixed by the immutable pinned planner.
+    /// Run complete independent-axis bundles through one process-owned native
+    /// invocation. Policy and score space remain fixed by the pinned planner.
     #[allow(clippy::too_many_arguments)]
     pub fn batch_int8_sentiment<R, W>(&self, model: &ResidentInt8,
         planner: Arc<SentimentPlanner>, config: SentimentCorpusConfig,
         limits: CorpusLimits, reader: R, writer: W, cancellation: CancellationToken)
         -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
-        self.check_resident_domain(model)?;
-        check_model_identity(model.artifact_identity(), &config.identity)?;
-        config.validate_with_document_encoding(&planner).map_err(HostedError::BatchSetup)?;
-        let encoder_bytes = super::classify::encoding_workspace_bytes(planner.document_encoding())?;
-        let required = requirements(limits.native)?;
-        validate_capacity(config.task_ceiling, required.kv_bytes, limits.transport.max_output_line_bytes)?;
-        let lease = self.resources().acquire_lease();
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers,
-            sum(&[limits.reservation_bytes()?, encoder_bytes])?)?,
-            || Ok(StreamInput { planner: Some((planner, config)), reader, writer }))?;
-        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-        let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound, limits.native.allocator_reserve_bytes])?)?;
-        let model = model.clone();
-        dispatch::run(self, limits.native.run, cancellation, move |control| {
-            // Consume/capture the whole input aggregate so queued disposal also
-            // drops stored planner/IO before their charge and completion signal.
-            let mut input = input;
-            let (planner, config) = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
-            let compiler = Int8SentimentBatchPlanner::new_with_document_encoding(&planner, config).map_err(HostedError::BatchSetup)?;
-            let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value
-                .engine(limits.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            let admission = CorpusAdmission { lease: &lease, model: model.artifact_identity(),
-                kv_bytes: required.kv_bytes, sampler_bytes: 0,
-                output_bytes: limits.transport.max_output_line_bytes as u64 };
-            let result = {
-                let mut processor = NativeInt8SentimentBatch::new(compiler, &mut engine.value, admission)
-                    .map_err(HostedError::BatchSetup)?;
-                batch::run_ndjson(&mut input.value.reader, &mut input.value.writer,
-                    &mut processor, limits.transport, control).map_err(HostedError::Batch)
-            };
-            drop(engine);
-            drop(planner);
-            drop(input);
-            drop(lease);
-            result
-        })
+        scored::run(self, model, SentimentStream { planner, config }, limits,
+            None, None, reader, writer, cancellation)
+    }
+
+    /// Evaluate bounded prompt morsels for every independent axis while
+    /// retaining exact candidate scoring and the whole-stream native ledger.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_sentiment_layer_major<R, W>(&self, model: &ResidentInt8,
+        planner: Arc<SentimentPlanner>, config: SentimentCorpusConfig,
+        limits: CorpusLimits, prefill: crate::native_engine::strict_int8::prefill::Int8PrefillLimits,
+        reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        scored::run(self, model, SentimentStream { planner, config }, limits,
+            Some(prefill), None, reader, writer, cancellation)
+    }
+
+    /// Keep one persistent numerical team across every document and axis.
+    /// Per-record outputs remain complete; terminal success is deferred until
+    /// every worker joins, with reader/writer reservations still owned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_sentiment_with_threads<R, W>(&self, model: &ResidentInt8,
+        planner: Arc<SentimentPlanner>, config: SentimentCorpusConfig,
+        limits: CorpusLimits, kernel: crate::native_engine::simd::Int8Kernel,
+        compute_threads: usize, reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        scored::run(self, model, SentimentStream { planner, config }, limits,
+            None, Some((kernel, compute_threads)), reader, writer, cancellation)
+    }
+
+    /// Compose packed prompts and persistent workers without renewing work,
+    /// tokenizer, transport or deadline limits at document/axis boundaries.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_sentiment_layer_major_with_threads<R, W>(&self, model: &ResidentInt8,
+        planner: Arc<SentimentPlanner>, config: SentimentCorpusConfig,
+        limits: CorpusLimits, kernel: crate::native_engine::simd::Int8Kernel,
+        compute_threads: usize, prefill: crate::native_engine::strict_int8::prefill::Int8PrefillLimits,
+        reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        scored::run(self, model, SentimentStream { planner, config }, limits,
+            Some(prefill), Some((kernel, compute_threads)), reader, writer, cancellation)
+    }
+}
+
+struct SentimentStream { planner: Arc<SentimentPlanner>, config: SentimentCorpusConfig }
+impl scored::ScoredTask for SentimentStream {
+    fn identity(&self) -> &ExecutionIdentity { &self.config.identity }
+    fn validate(&self, limits: CorpusLimits, native: Int8MemoryRequirement) -> Result<u64, HostedError> {
+        self.config.validate_with_document_encoding(&self.planner).map_err(HostedError::BatchSetup)?;
+        validate_capacity(self.config.task_ceiling, native.kv_bytes, limits.transport.max_output_line_bytes)?;
+        super::classify::encoding_workspace_bytes(self.planner.document_encoding())
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn execute<R: BufRead, W: Write>(self, engine: &mut crate::native_engine::strict_int8::StrictInt8Engine<'_>,
+        admission: CorpusAdmission<'_>, prefill: Option<crate::native_engine::strict_int8::prefill::Int8PrefillLimits>,
+        reader: &mut R, writer: &mut W, limits: BatchLimits, defer: bool,
+        control: &mut RunControl) -> Result<scored::Completion, HostedError> {
+        let Self { planner, config } = self;
+        let compiler = Int8SentimentBatchPlanner::new_with_document_encoding(&planner, config)
+            .map_err(HostedError::BatchSetup)?;
+        let mut processor = match prefill {
+            Some(prefill) => NativeInt8SentimentBatch::new_layer_major(compiler, engine, admission, prefill),
+            None => NativeInt8SentimentBatch::new(compiler, engine, admission),
+        }.map_err(HostedError::BatchSetup)?;
+        scored::execute_stream(reader, writer, &mut processor, limits, defer, control)
     }
 }
 

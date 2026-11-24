@@ -22,58 +22,89 @@ pub struct ClassificationCorpusConfig {
 
 impl NlpEngine {
     /// Run exclusive or multi-label NDJSON requests on one resident INT8 engine.
-    /// Uses the existing classifier, full candidate scorer and result finalizer;
-    /// no replacement tokenizer, sampled-label path or caller admission trait.
-    /// Planning and blocking IO retain the underlying adapters' cooperative
-    /// cancellation granularity. Successful return does not imply zero rejects.
+    /// Full candidate/EOS scoring and exact finalization retain their original
+    /// semantics. Successful return does not imply zero rejected records.
     #[allow(clippy::too_many_arguments)]
     pub fn batch_int8_classify<R, W>(&self, model: &ResidentInt8,
         planner: Arc<ClassificationPlanner>, config: ClassificationCorpusConfig,
         limits: CorpusLimits, reader: R, writer: W, cancellation: CancellationToken)
         -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
-        self.check_resident_domain(model)?;
-        check_model_identity(model.artifact_identity(), &config.identity)?;
-        validate_work(config.max_model_work)?;
-        let encoder_bytes = encoding_workspace_bytes(planner.document_encoding())?;
-        let output_bytes = output_ceiling(config.task_ceiling, limits.transport.max_output_line_bytes)?;
-        let required = requirements(limits.native)?;
-        if required.kv_bytes > config.task_ceiling.max_kv_bytes {
+        scored::run(self, model, ClassificationStream { planner, config }, limits,
+            None, None, reader, writer, cancellation)
+    }
+
+    /// Bound each head's prompt morsels while preserving all five whole-run
+    /// work counters and the same ordered transport through every flush.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_classify_layer_major<R, W>(&self, model: &ResidentInt8,
+        planner: Arc<ClassificationPlanner>, config: ClassificationCorpusConfig,
+        limits: CorpusLimits, prefill: crate::native_engine::strict_int8::prefill::Int8PrefillLimits,
+        reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        scored::run(self, model, ClassificationStream { planner, config }, limits,
+            Some(prefill), None, reader, writer, cancellation)
+    }
+
+    /// Reuse one admitted output-row team throughout the scoring stream.
+    /// Complete item records remain ordered; run_complete follows physical
+    /// worker join under the original invocation's cancellation and deadline.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_classify_with_threads<R, W>(&self, model: &ResidentInt8,
+        planner: Arc<ClassificationPlanner>, config: ClassificationCorpusConfig,
+        limits: CorpusLimits, kernel: crate::native_engine::simd::Int8Kernel,
+        compute_threads: usize, reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        scored::run(self, model, ClassificationStream { planner, config }, limits,
+            None, Some((kernel, compute_threads)), reader, writer, cancellation)
+    }
+
+    /// One fixed worker batch capacity covers packed prompts and candidate
+    /// continuations. Coordinator and child buffers are separately admitted;
+    /// changing the physical schedule grants no extra work or scoring authority.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_classify_layer_major_with_threads<R, W>(&self, model: &ResidentInt8,
+        planner: Arc<ClassificationPlanner>, config: ClassificationCorpusConfig,
+        limits: CorpusLimits, kernel: crate::native_engine::simd::Int8Kernel,
+        compute_threads: usize, prefill: crate::native_engine::strict_int8::prefill::Int8PrefillLimits,
+        reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        scored::run(self, model, ClassificationStream { planner, config }, limits,
+            Some(prefill), Some((kernel, compute_threads)), reader, writer, cancellation)
+    }
+}
+
+struct ClassificationStream {
+    planner: Arc<ClassificationPlanner>,
+    config: ClassificationCorpusConfig,
+}
+impl scored::ScoredTask for ClassificationStream {
+    fn identity(&self) -> &ExecutionIdentity { &self.config.identity }
+    fn validate(&self, limits: CorpusLimits, native: Int8MemoryRequirement) -> Result<u64, HostedError> {
+        validate_work(self.config.max_model_work)?;
+        output_ceiling(self.config.task_ceiling, limits.transport.max_output_line_bytes)?;
+        if native.kv_bytes > self.config.task_ceiling.max_kv_bytes {
             return Err(HostedError::Limits("classification corpus whole KV allocation"));
         }
-        let lease = self.resources().acquire_lease();
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers,
-            sum(&[limits.reservation_bytes()?, encoder_bytes])?)?,
-            || Ok(StreamInput { planner: Some((planner, config)), reader, writer }))?;
-        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-        let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound, limits.native.allocator_reserve_bytes])?)?;
-        let model = model.clone();
-        dispatch::run(self, limits.native.run, cancellation, move |control| {
-            // Retain the complete drop-ordered input package even when queued
-            // work is discarded before it runs; do not capture its fields alone.
-            let mut input = input;
-            let (planner, config) = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
-            let compiler = Int8ClassificationBatchPlanner::new_with_document_encoding(&planner, config.identity,
-                config.task_ceiling, config.planning, config.defaults).map_err(HostedError::BatchSetup)?;
-            let mut engine = allocate_native(kv, workspace, || model.inner.loaded.value
-                .engine(limits.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            let admission = ClassificationAdmission { output_bytes, inner: CorpusAdmission {
-                lease: &lease, model: model.artifact_identity(), kv_bytes: required.kv_bytes,
-                sampler_bytes: 0, output_bytes: limits.transport.max_output_line_bytes as u64 } };
-            let result = {
-                let mut processor = NativeInt8ClassificationBatch::new(compiler, &mut engine.value,
-                    admission, config.max_model_work).map_err(HostedError::BatchSetup)?;
-                batch::run_ndjson(&mut input.value.reader, &mut input.value.writer,
-                    &mut processor, limits.transport, control).map_err(HostedError::Batch)
-            };
-            drop(engine);
-            drop(planner);
-            drop(input);
-            drop(lease);
-            result
-        })
+        encoding_workspace_bytes(self.planner.document_encoding())
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn execute<R: BufRead, W: Write>(self, engine: &mut crate::native_engine::strict_int8::StrictInt8Engine<'_>,
+        admission: CorpusAdmission<'_>, prefill: Option<crate::native_engine::strict_int8::prefill::Int8PrefillLimits>,
+        reader: &mut R, writer: &mut W, limits: BatchLimits, defer: bool,
+        control: &mut RunControl) -> Result<scored::Completion, HostedError> {
+        let Self { planner, config } = self;
+        let output_bytes = output_ceiling(config.task_ceiling, limits.max_output_line_bytes)?;
+        let compiler = Int8ClassificationBatchPlanner::new_with_document_encoding(&planner, config.identity,
+            config.task_ceiling, config.planning, config.defaults).map_err(HostedError::BatchSetup)?;
+        let admission = ClassificationAdmission { output_bytes, inner: admission };
+        let mut processor = match prefill {
+            Some(prefill) => NativeInt8ClassificationBatch::new_layer_major(compiler, engine,
+                admission, config.max_model_work, prefill),
+            None => NativeInt8ClassificationBatch::new(compiler, engine, admission, config.max_model_work),
+        }.map_err(HostedError::BatchSetup)?;
+        scored::execute_stream(reader, writer, &mut processor, limits, defer, control)
     }
 }
 

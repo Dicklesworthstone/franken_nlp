@@ -219,3 +219,107 @@ fn worker_and_coordinator_panics_join_every_child_before_scope_completion() {
 }
 
 mod prefill;
+
+struct EmptyStream;
+impl crate::batch::BatchProcessor for EmptyStream {
+    type Args = (); type Prepared = (); type Output = ();
+    fn prepare(&mut self, _: crate::batch::BatchDocument<()>) -> Result<(), crate::batch::BatchItemFailure> {
+        panic!("empty fixture stream produced an item")
+    }
+    fn planned_work(&self, _: &()) -> crate::batch::BatchWork { crate::batch::BatchWork::default() }
+    fn execute<C: DecodeStepControl>(&mut self, _: (), _: &mut C) -> Result<(), crate::batch::BatchItemFailure> {
+        panic!("empty fixture stream executed an item")
+    }
+}
+fn stage_empty_footer(writer: &mut Vec<u8>, control: &mut RunControl)
+    -> Result<crate::batch::deferred::DeferredCompletion, HostedError> {
+    crate::batch::deferred::run_ndjson_deferred(&mut std::io::Cursor::new(b""), writer,
+        &mut EmptyStream, crate::batch::BatchLimits::default(), control).map_err(HostedError::Batch)
+}
+
+#[test]
+fn scoring_footer_follows_actual_join_and_spends_the_original_control_allowance() {
+    let fixture = ProjectionFixture::new(41); let weights = fixture.weights(); let input = fixture.input();
+    let mut workspace = Workspace::with_batch_rows(3, 4).unwrap();
+    let dropped = track_children(&mut workspace); let cx = Cx::for_testing();
+    let shared = RunShared::new(limits(10000), CancellationToken::default()).unwrap();
+    let original_deadline = shared.deadline; let mut output = Vec::new();
+    let completion = run_scope(&cx, &weights, &mut workspace, 3, Int8Kernel::scalar(),
+        Arc::clone(&shared), |control, executor| {
+            executor.project_f32_into(Int8ProjectionOp::Head, &input, LinearRows::All,
+                &mut [0.0; 10], control).map_err(HostedError::Native)?;
+            assert_eq!(dropped.load(Ordering::SeqCst), 0);
+            stage_empty_footer(&mut output, control)
+        }).unwrap();
+    assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    assert!(!std::str::from_utf8(&output).unwrap().contains("run_complete"));
+    let remaining = shared.state.lock().unwrap().remaining;
+    let summary = finalize_after_join(&cx, &shared, completion, |completion, control| {
+        assert_eq!(dropped.load(Ordering::SeqCst), 2, "footer observed a live child");
+        assert!(Arc::ptr_eq(&control.shared, &shared));
+        assert_eq!(control.shared.deadline, original_deadline);
+        completion.publish(&mut output, control).map_err(HostedError::Batch)
+    }).unwrap();
+    assert_eq!(summary.succeeded, 0); assert_eq!(summary.failed, 0);
+    assert!(shared.state.lock().unwrap().remaining < remaining);
+    assert_eq!(std::str::from_utf8(&output).unwrap().matches("run_complete").count(), 1);
+}
+
+#[test]
+fn every_post_join_cancellation_cause_suppresses_the_terminal_stream_frame() {
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let fixture = ProjectionFixture::new(42); let weights = fixture.weights();
+        let mut workspace = Workspace::new(3).unwrap(); let dropped = track_children(&mut workspace);
+        let cx = Cx::for_testing(); let token = CancellationToken::default();
+        let shared = RunShared::new(limits(10000), token.clone()).unwrap();
+        let mut output = Vec::new();
+        let completion = run_scope(&cx, &weights, &mut workspace, 3, Int8Kernel::scalar(),
+            Arc::clone(&shared), |control, _| stage_empty_footer(&mut output, control)).unwrap();
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+        let prefix = output.clone(); token.cancel(cause);
+        let error = finalize_after_join(&cx, &shared, completion, |_, _| -> Result<(), HostedError> {
+            panic!("cancelled finalizer attempted footer IO")
+        }).unwrap_err();
+        assert!(matches!(error, HostedError::Stopped { stop: RunStop { kind, .. }, .. } if kind == cause));
+        assert_eq!(output, prefix);
+        assert!(!std::str::from_utf8(&output).unwrap().contains("run_complete"));
+    }
+}
+
+#[test]
+fn exhausted_original_quota_after_join_cannot_be_replaced_for_footer_delivery() {
+    let fixture = ProjectionFixture::new(43); let weights = fixture.weights();
+    let mut workspace = Workspace::new(3).unwrap(); let dropped = track_children(&mut workspace);
+    let cx = Cx::for_testing(); let shared = RunShared::new(limits(10000), CancellationToken::default()).unwrap();
+    let mut output = Vec::new();
+    let completion = run_scope(&cx, &weights, &mut workspace, 3, Int8Kernel::scalar(),
+        Arc::clone(&shared), |control, _| stage_empty_footer(&mut output, control)).unwrap();
+    assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    shared.state.lock().unwrap().remaining = 0;
+    let error = finalize_after_join(&cx, &shared, completion, |_, _| -> Result<(), HostedError> {
+        panic!("footer received a renewed checkpoint allowance")
+    }).unwrap_err();
+    assert!(matches!(error, HostedError::Stopped {
+        stop: RunStop { kind: DecodeCancellationKind::PollQuota, .. }, .. }));
+    assert!(!std::str::from_utf8(&output).unwrap().contains("run_complete"));
+}
+
+#[test]
+fn cancellation_at_worker_exit_never_reaches_the_scoring_footer_finalizer() {
+    let fixture = ProjectionFixture::new(44); let weights = fixture.weights();
+    let cx = Cx::for_testing(); let token = CancellationToken::default();
+    let shared = RunShared::new(limits(10000), token.clone()).unwrap();
+    let mut workspace = Workspace::new(3).unwrap();
+    workspace.cancel_on_exit = Some((token, DecodeCancellationKind::Shutdown));
+    let dropped = track_children(&mut workspace); let mut output = Vec::new();
+    let result = run_scope(&cx, &weights, &mut workspace, 3, Int8Kernel::scalar(),
+        Arc::clone(&shared), |control, _| stage_empty_footer(&mut output, control))
+        .and_then(|completion| finalize_after_join(&cx, &shared, completion,
+            |_, _| -> Result<(), HostedError> { panic!("worker-exit stop published success") }));
+    assert!(matches!(result, Err(HostedError::Stopped {
+        stop: RunStop { kind: DecodeCancellationKind::Shutdown, .. }, .. })));
+    assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    assert!(!std::str::from_utf8(&output).unwrap().contains("run_complete"));
+}

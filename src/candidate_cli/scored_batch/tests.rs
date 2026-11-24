@@ -146,3 +146,108 @@ fn disabled_runtime_never_opens_defaults_or_reads_or_writes_streams() {
         assert_eq!(c.execute_owned(Never, Never), Err(CandidateError::Unavailable));
     }
 }
+
+#[test]
+fn every_scored_stream_composes_threads_and_prompt_rows_without_changing_authority() {
+    for task in ["classify", "sentiment", "judge"] {
+        let serial = command(task, &[]); let (_, baseline, base_envelope) = serial.validate().unwrap();
+        assert_eq!(serial.compute.threads(), 1); assert!(serial.prefill_limits().unwrap().is_none());
+        for threads in ["1", "4", "64"] {
+            for rows in [None, Some("1"), Some("4"), Some("64")] {
+                let mut flags = vec!["--compute-threads", threads];
+                if let Some(rows) = rows { flags.extend_from_slice(&["--prefill-rows", rows]); }
+                let mut selected = command(task, &flags); selected.host.memory_mib = 32768;
+                let (args, limits, envelope) = selected.validate().unwrap();
+                let prefill = selected.prefill_limits().unwrap();
+                assert_eq!(args.compute, selected.compute);
+                assert_eq!(limits.compute, selected.compute.admit_prefill(prefill).unwrap());
+                assert_eq!(limits.compute.threads, threads.parse::<usize>().unwrap());
+                assert_eq!(prefill.map(|p| p.max_batch_rows), rows.map(|r| r.parse::<usize>().unwrap()));
+                assert_eq!(selected.host.budget(limits), serial.host.budget(baseline));
+                assert_eq!(selected.host.work_ceiling(), serial.host.work_ceiling());
+                assert_eq!(envelope.transport.max_work, base_envelope.transport.max_work);
+                assert_eq!(envelope.transport.max_requests, base_envelope.transport.max_requests);
+            }
+        }
+    }
+}
+
+#[test]
+fn combined_stream_admission_accepts_the_exact_peak_and_refuses_one_byte_less() {
+    for task in ["classify", "sentiment", "judge"] {
+        let c = command(task, &["--compute-threads", "4", "--prefill-rows", "4"]);
+        let (_, mut limits, envelope) = c.validate().unwrap(); let prefill = c.prefill_limits().unwrap();
+        let peak = c.peak_bytes(limits, envelope, prefill).unwrap();
+        limits.memory_bytes = peak;
+        c.check_scheduling_memory(limits, envelope, prefill).unwrap();
+        limits.memory_bytes = peak - 1;
+        assert_eq!(c.check_scheduling_memory(limits, envelope, prefill), Err(CandidateError::Arguments));
+        limits.memory_bytes = peak;
+        limits.compute.workspace_bytes -= 1;
+        assert_eq!(c.check_scheduling_memory(limits, envelope, prefill), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
+fn packed_prompt_and_fixed_worker_memory_are_both_added_to_the_complete_stream_quote() {
+    let serial = command("classify", &[]); let (_, base, envelope) = serial.validate().unwrap();
+    let grouped = command("classify", &["--prefill-rows", "4"]);
+    let (_, grouped_limits, _) = grouped.validate().unwrap(); let prefill = grouped.prefill_limits().unwrap();
+    let threaded = command("classify", &["--compute-threads", "4", "--prefill-rows", "4"]);
+    let (_, threaded_limits, _) = threaded.validate().unwrap();
+    let baseline = serial.peak_bytes(base, envelope, None).unwrap();
+    let prompt_bytes = prefill.unwrap().validate().unwrap();
+    assert_eq!(grouped.peak_bytes(grouped_limits, envelope, prefill).unwrap(), baseline + prompt_bytes);
+    assert_eq!(threaded.peak_bytes(threaded_limits, envelope, prefill).unwrap(),
+        baseline + prompt_bytes + threaded_limits.compute.workspace_bytes);
+    let mut larger = envelope; larger.io_bytes += 31;
+    assert_eq!(threaded.peak_bytes(threaded_limits, larger, prefill).unwrap(),
+        baseline + prompt_bytes + threaded_limits.compute.workspace_bytes + 31);
+    larger.io_bytes = u64::MAX;
+    assert!(threaded.peak_bytes(threaded_limits, larger, prefill).is_err());
+}
+
+#[test]
+fn invalid_team_and_combined_memory_limits_refuse_before_defaults_model_or_stream_io() {
+    struct Never;
+    impl Read for Never { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("input read"); } }
+    impl Write for Never {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("output write"); }
+        fn flush(&mut self) -> io::Result<()> { panic!("output flush"); }
+    }
+    for task in ["classify", "sentiment", "judge"] {
+        for threads in ["0", "65", "999999"] {
+            let c = command(task, &["--compute-threads", threads, "--prefill-rows", "4",
+                "--defaults", "never-open.json"]);
+            assert_eq!(c.execute_owned(Never, Never), Err(CandidateError::Arguments));
+        }
+        let mut c = command(task, &["--compute-threads", "4", "--prefill-rows", "4",
+            "--defaults", "never-open.json"]);
+        let (_, limits, envelope) = c.validate().unwrap();
+        let peak = c.peak_bytes(limits, envelope, c.prefill_limits().unwrap()).unwrap();
+        c.host.memory_mib = (peak - 1) / MIB;
+        assert_eq!(c.execute_owned(Never, Never), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
+fn malformed_thread_counts_never_silently_select_a_serial_stream() {
+    for task in ["classify", "sentiment", "judge"] {
+        for count in ["-1", "1.5", "NaN", "999999999999999999999999999999999999"] {
+            assert!(crate::candidate_cli::definition().try_get_matches_from(["candidate", "score-batch",
+                "--task", task, "--model", "m", "--memory-mib", "8192",
+                "--compute-threads", count]).is_err());
+        }
+    }
+}
+
+#[test]
+fn live_stream_prefill_does_not_silently_enable_unimplemented_retained_job_schedules() {
+    for task in ["classify", "sentiment"] {
+        let c = command(task, &["--prefill-rows", "4"]);
+        assert_eq!(c.prefill_limits().unwrap().unwrap().max_batch_rows, 4);
+        assert!(matches!(corpus_prefill(c.kind().unwrap(), &c.prefill), Err(CandidateError::Arguments)));
+    }
+    let judge = command("judge", &["--prefill-rows", "4"]);
+    assert_eq!(corpus_prefill(judge.kind().unwrap(), &judge.prefill).unwrap().unwrap().max_batch_rows, 4);
+}

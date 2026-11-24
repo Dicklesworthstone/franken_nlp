@@ -14,7 +14,7 @@ use crate::{
         kv::KV_BYTES_PER_TOKEN,
         portable_int8::ProjectionWork,
         strict_int8::{Int8RunBudget, Int8Work, StrictInt8Engine, StrictInt8Error,
-            STRICT_INT8_PROFILE, scoring::{Int8ScoringBudget, Int8ScoringError}}},
+            STRICT_INT8_PROFILE, prefill::Int8PrefillLimits, scoring::{Int8ScoringBudget, Int8ScoringError}}},
     tasks::ir::{PlanContext, TaskBudget},
 };
 use super::{SentimentAxis, SentimentError, SentimentLimits, SentimentPlanner,
@@ -159,6 +159,15 @@ impl<'p, 'e, 'w, A: Int8SentimentAdmission> NativeInt8SentimentBatch<'p, 'e, 'w,
         let run = RunState::new(compiler.config.max_model_work);
         Ok(Self { compiler, driver, admission, run })
     }
+    /// Use one admitted prompt workspace for every independent axis while
+    /// keeping the original complete bundle and nonrenewable stream ledger.
+    pub fn new_layer_major(compiler: Int8SentimentBatchPlanner<'p>, engine: &'e mut StrictInt8Engine<'w>,
+        admission: A, prefill: Int8PrefillLimits) -> Result<Self, BatchFault> {
+        prefill.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        let mut processor = Self::new(compiler, engine, admission)?;
+        processor.run.prefill = Some(prefill);
+        Ok(processor)
+    }
     pub fn remaining_work(&self) -> Int8Work { self.run.remaining }
     pub fn is_poisoned(&self) -> bool { self.run.failed || !self.driver.clean() }
 }
@@ -197,9 +206,9 @@ impl<A: Int8SentimentAdmission> BatchProcessor for NativeInt8SentimentBatch<'_, 
     }
 }
 
-struct RunState { remaining: Int8Work, last_sequence: u64, failed: bool }
+struct RunState { remaining: Int8Work, last_sequence: u64, failed: bool, prefill: Option<Int8PrefillLimits> }
 impl RunState {
-    fn new(remaining: Int8Work) -> Self { Self { remaining, last_sequence: 0, failed: false } }
+    fn new(remaining: Int8Work) -> Self { Self { remaining, last_sequence: 0, failed: false, prefill: None } }
     fn ready(&self) -> Result<(), BatchItemFailure> {
         if self.failed { Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)) } else { Ok(()) }
     }
@@ -221,17 +230,20 @@ trait Driver {
     fn clean(&self) -> bool;
     fn capacity(&self) -> usize;
     fn execute<C: DecodeStepControl>(&mut self, plan: &PreparedInt8Sentiment,
-        identity: &ExecutionIdentity, budget: Int8ScoringBudget, control: &mut C)
-        -> Result<Int8SentimentRun, Int8SentimentError>;
+        identity: &ExecutionIdentity, budget: Int8ScoringBudget, prefill: Option<Int8PrefillLimits>,
+        control: &mut C) -> Result<Int8SentimentRun, Int8SentimentError>;
 }
 struct NativeDriver<'e, 'w>(&'e mut StrictInt8Engine<'w>);
 impl Driver for NativeDriver<'_, '_> {
     fn clean(&self) -> bool { !self.0.is_poisoned() && self.0.kv_cache().all_slots_have_len(0) }
     fn capacity(&self) -> usize { self.0.kv_cache().capacity_positions() }
     fn execute<C: DecodeStepControl>(&mut self, plan: &PreparedInt8Sentiment,
-        identity: &ExecutionIdentity, budget: Int8ScoringBudget, control: &mut C)
-        -> Result<Int8SentimentRun, Int8SentimentError> {
-        plan.execute_with_control(identity, self.0, budget, control)
+        identity: &ExecutionIdentity, budget: Int8ScoringBudget, prefill: Option<Int8PrefillLimits>,
+        control: &mut C) -> Result<Int8SentimentRun, Int8SentimentError> {
+        match prefill {
+            Some(prefill) => plan.execute_layer_major_with_control(identity, self.0, budget, prefill, control),
+            None => plan.execute_with_control(identity, self.0, budget, control),
+        }
     }
 }
 fn preflight(plan: &PreparedInt8BatchSentiment, driver: &impl Driver) -> Result<u64, BatchItemFailure> {
@@ -261,7 +273,7 @@ fn execute_admitted<D: Driver, A: Int8SentimentAdmission, C: DecodeStepControl>(
         checkpoint(control)?;
         let result = driver.execute(&prepared.plan, &identity, Int8ScoringBudget {
             native: Int8RunBudget::exact(work), max_kv_bytes: kv_bytes,
-        }, control).map_err(execution_failure)?;
+        }, run.prefill, control).map_err(execution_failure)?;
         if result.schema_version != 1 || result.execution != INT8_SENTIMENT_EXECUTION
             || result.numerics_profile != STRICT_INT8_PROFILE || result.model_work != work
             || result.head_count != prepared.head_count() || result.result.task_spec != "sentiment-v1"

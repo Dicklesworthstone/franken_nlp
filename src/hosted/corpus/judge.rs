@@ -28,17 +28,17 @@ pub struct JudgeCorpusConfig {
 }
 
 impl NlpEngine {
-    /// Execute bounded ordered NDJSON judge requests using the common argument
-    /// schema. `text` means A for pairwise, the rubric document, or the full
-    /// faithfulness source. No model text is parsed into a judgment; every
-    /// decision comes from complete full-vocabulary/EOS candidate scoring.
+    /// Execute bounded ordered judgments using complete full-vocabulary/EOS
+    /// scoring. No generated-label shortcut or parsed model text is introduced.
     #[allow(clippy::too_many_arguments)]
     pub fn batch_int8_judge<R, W>(&self, model: &ResidentInt8,
         planner: Arc<JudgePlanner>, config: JudgeCorpusConfig, limits: CorpusLimits,
         reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        self.batch_int8_judge_scheduled(model, planner, config, limits, None, reader, writer, cancellation)
+        scored::run(self, model, JudgeStream { planner, config }, limits,
+            None, None, reader, writer, cancellation)
     }
+
     /// Bounded prompt groups for every comparison order, criterion and evidence
     /// window. This does not batch documents or change the score space.
     #[allow(clippy::too_many_arguments)]
@@ -47,53 +47,55 @@ impl NlpEngine {
         prefill: Int8PrefillLimits, reader: R, writer: W, cancellation: CancellationToken)
         -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        self.batch_int8_judge_scheduled(model, planner, config, limits, Some(prefill), reader, writer, cancellation)
+        scored::run(self, model, JudgeStream { planner, config }, limits,
+            Some(prefill), None, reader, writer, cancellation)
     }
+
+    /// Use one persistent row team throughout every complete judgment and
+    /// flush. All children physically join before terminal success is emitted.
     #[allow(clippy::too_many_arguments)]
-    fn batch_int8_judge_scheduled<R, W>(&self, model: &ResidentInt8,
+    pub fn batch_int8_judge_with_threads<R, W>(&self, model: &ResidentInt8,
         planner: Arc<JudgePlanner>, config: JudgeCorpusConfig, limits: CorpusLimits,
-        prefill: Option<Int8PrefillLimits>, reader: R, writer: W, cancellation: CancellationToken)
+        kernel: crate::native_engine::simd::Int8Kernel, compute_threads: usize,
+        reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        scored::run(self, model, JudgeStream { planner, config }, limits,
+            None, Some((kernel, compute_threads)), reader, writer, cancellation)
+    }
+
+    /// Share the admitted worker batch capacity across packed prompts and
+    /// every candidate continuation, retaining complete evidence and budgets.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_judge_layer_major_with_threads<R, W>(&self, model: &ResidentInt8,
+        planner: Arc<JudgePlanner>, config: JudgeCorpusConfig, limits: CorpusLimits,
+        kernel: crate::native_engine::simd::Int8Kernel, compute_threads: usize,
+        prefill: Int8PrefillLimits, reader: R, writer: W, cancellation: CancellationToken)
         -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
-        self.check_resident_domain(model)?;
-        check_model_identity(model.artifact_identity(), &config.identity)?;
-        config.validate(&planner)?;
-        let required = requirements(limits.native)?;
-        if required.kv_bytes > config.task_ceiling.max_kv_bytes {
+        scored::run(self, model, JudgeStream { planner, config }, limits,
+            Some(prefill), Some((kernel, compute_threads)), reader, writer, cancellation)
+    }
+}
+
+struct JudgeStream { planner: Arc<JudgePlanner>, config: JudgeCorpusConfig }
+impl scored::ScoredTask for JudgeStream {
+    fn identity(&self) -> &ExecutionIdentity { &self.config.identity }
+    fn validate(&self, _limits: CorpusLimits, native: Int8MemoryRequirement) -> Result<u64, HostedError> {
+        self.config.validate(&self.planner)?;
+        if native.kv_bytes > self.config.task_ceiling.max_kv_bytes {
             return Err(HostedError::Limits("judge corpus whole KV allocation"));
         }
-        let scratch_bytes = crate::hosted::scored::scoring_scratch(sum(&[required.rope_bytes,
-            required.scratch_payload_bound, limits.native.allocator_reserve_bytes])?, prefill)?;
-        let lease = self.resources().acquire_lease();
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, limits.reservation_bytes()?)?,
-            || Ok(StreamInput { planner: Some((planner, config)), reader, writer }))?;
-        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-        let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch_bytes)?;
-        let model = model.clone();
-        dispatch::run(self, limits.native.run, cancellation, move |control| {
-            // Preserve the entire storage-before-charge package if queued work
-            // is discarded; capturing individual fields would lose that order.
-            let mut input = input;
-            let (planner, config) = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
-            let mut engine = allocate_native(kv, workspace, || model.inner.loaded.value
-                .engine(limits.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            let admission = CorpusAdmission { lease: &lease, model: model.artifact_identity(),
-                kv_bytes: required.kv_bytes, sampler_bytes: 0,
-                output_bytes: limits.transport.max_output_line_bytes as u64 };
-            let result = {
-                let ledger = WorkLedger::new(config.max_model_work);
-                let mut processor = JudgeProcessor { planner: &planner, config,
-                    engine: &mut engine.value, admission, ledger, prefill };
-                batch::run_ndjson(&mut input.value.reader, &mut input.value.writer,
-                    &mut processor, limits.transport, control).map_err(HostedError::Batch)
-            };
-            drop(engine);
-            drop(planner);
-            drop(input);
-            drop(lease);
-            result
-        })
+        Ok(0)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn execute<R: BufRead, W: Write>(self, engine: &mut StrictInt8Engine<'_>,
+        admission: CorpusAdmission<'_>, prefill: Option<Int8PrefillLimits>,
+        reader: &mut R, writer: &mut W, limits: BatchLimits, defer: bool,
+        control: &mut RunControl) -> Result<scored::Completion, HostedError> {
+        let Self { planner, config } = self;
+        let ledger = WorkLedger::new(config.max_model_work);
+        let mut processor = JudgeProcessor { planner: &planner, config, engine, admission, ledger, prefill };
+        scored::execute_stream(reader, writer, &mut processor, limits, defer, control)
     }
 }
 

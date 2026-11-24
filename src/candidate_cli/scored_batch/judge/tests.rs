@@ -122,14 +122,14 @@ fn grouped_bulk_judgments_derive_exact_geometry_without_buying_more_work() {
     }
 }
 #[test]
-fn invalid_or_unsupported_bulk_schedules_refuse_before_any_io() {
+fn invalid_bulk_schedules_refuse_before_any_io() {
     struct NoIo;
     impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("input read") } }
     impl Write for NoIo {
         fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("output write") }
         fn flush(&mut self) -> io::Result<()> { panic!("output flush") }
     }
-    for (task, rows) in [("judge", "0"), ("judge", "65"), ("classify", "4"), ("sentiment", "4")] {
+    for (task, rows) in [("judge", "0"), ("judge", "65"), ("classify", "0"), ("sentiment", "65")] {
         let c = command(task, &["--prefill-rows", rows, "--defaults", "never-open.json"]);
         assert!(matches!(c.execute_owned(NoIo, NoIo), Err(CandidateError::Arguments)));
     }

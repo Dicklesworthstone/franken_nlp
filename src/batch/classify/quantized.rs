@@ -8,7 +8,7 @@ use crate::{canonjson,
     native_engine::{decode::{DecodeCancellationKind, DecodeStepControl},
         portable_int8::ProjectionWork,
         strict_int8::{Int8RunBudget, Int8Work, StrictInt8Engine, StrictInt8Error, STRICT_INT8_EXECUTION,
-            scoring::{Int8ScoringBudget, Int8ScoringError}}},
+            prefill::Int8PrefillLimits, scoring::{Int8ScoringBudget, Int8ScoringError}}},
     tasks::{classify::{ClassificationLimits, ClassificationPlanner, ClassificationPlanningError,
         quantized::{Int8ClassificationError, Int8ClassificationRun, PreparedInt8Classification}},
         ir::{PlanContext, TaskBudget}}};
@@ -92,13 +92,24 @@ impl<'p> Int8ClassificationBatchPlanner<'p> {
 
 pub struct NativeInt8ClassificationBatch<'p, 'e, 'w, A: Int8ClassificationAdmission> {
     compiler: Int8ClassificationBatchPlanner<'p>, engine: &'e mut StrictInt8Engine<'w>,
-    admission: A, ledger: WorkLedger,
+    admission: A, ledger: WorkLedger, prefill: Option<Int8PrefillLimits>,
 }
 impl<'p, 'e, 'w, A: Int8ClassificationAdmission> NativeInt8ClassificationBatch<'p, 'e, 'w, A> {
     pub fn new(compiler: Int8ClassificationBatchPlanner<'p>, engine: &'e mut StrictInt8Engine<'w>,
         admission: A, total_work: Int8Work) -> Result<Self, BatchFault> {
         if engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) { return Err(BatchCode::InvalidExecution.into()); }
-        Ok(Self { compiler, engine, admission, ledger: WorkLedger { remaining: total_work, state: State::Ready } })
+        Ok(Self { compiler, engine, admission, ledger: WorkLedger { remaining: total_work, state: State::Ready },
+            prefill: None })
+    }
+    /// Preserve every full-vocabulary/EOS candidate score while evaluating
+    /// each head's prompt in bounded layer-major morsels. The host reserves
+    /// the additional prompt workspace once for the entire stream.
+    pub fn new_layer_major(compiler: Int8ClassificationBatchPlanner<'p>, engine: &'e mut StrictInt8Engine<'w>,
+        admission: A, total_work: Int8Work, prefill: Int8PrefillLimits) -> Result<Self, BatchFault> {
+        prefill.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        let mut processor = Self::new(compiler, engine, admission, total_work)?;
+        processor.prefill = Some(prefill);
+        Ok(processor)
     }
     pub fn remaining_work(&self) -> Int8Work { self.ledger.remaining }
     pub fn ready(&self) -> bool { self.ledger.state == State::Ready }
@@ -134,8 +145,11 @@ impl<A: Int8ClassificationAdmission> BatchProcessor for NativeInt8Classification
         // Set Running before all fallible host/native callbacks. Failed work
         // remains charged; an unwind never restores a reusable adapter.
         let result = with_admission(&mut self.admission, &prepared.plan, control, |admitted, control| {
-            let run = prepared.plan.execute_with_control(admitted, self.engine, budget(&prepared.plan), control)
-                .map_err(execution_failure)?;
+            let run = match self.prefill {
+                Some(prefill) => prepared.plan.execute_layer_major_with_control(
+                    admitted, self.engine, budget(&prepared.plan), prefill, control),
+                None => prepared.plan.execute_with_control(admitted, self.engine, budget(&prepared.plan), control),
+            }.map_err(execution_failure)?;
             if self.engine.is_poisoned() || !self.engine.kv_cache().all_slots_have_len(0)
                 || run.model_work != prepared.model_work() { return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)); }
             Ok(run)

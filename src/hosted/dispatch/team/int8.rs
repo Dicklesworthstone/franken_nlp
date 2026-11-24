@@ -1,6 +1,6 @@
 //! One persistent INT8 row team, owned by the existing blocking dispatcher.
 //! The coordinator owns sequence order, KV, quantization and native work debit.
-use super::{allocate, cap, capacity_one_lane, run_blocking, preflight, Arc, Bf16,
+use super::{allocate, cap, capacity_one_lane, finalize_after_join, run_blocking, preflight, Arc, Bf16,
     CancellationToken, CapacityOneReceiver, CapacityOneSender, Cx, DecodeCancellationKind,
     DecodeStepControl, EntryGate, HostedError, MAX_MODEL_K, MemoryClass, NANBEIGE_VOCAB_SIZE,
     NativeEntry, NlpEngine, Pending, ResidentInt8, RunControl, RunLimits, RunShared,
@@ -74,6 +74,38 @@ pub(in crate::hosted) fn run_int8_prefill_team<T, A, F>(engine: &NlpEngine, limi
 where T: Send + 'static, A: Send + 'static,
     F: FnOnce(&CurrentCandidateInt8Model, &mut A, &mut RunControl, &mut dyn Int8ProjectionExecutor)
         -> Result<T, HostedError> + Send + 'static {
+    // Preserve existing callers' exact checkpoint schedule.
+    run_int8_team_then(engine, limits, cancellation, model, width, kernel,
+        max_batch_rows, admission, work, |value, _, _, _| Ok(value))
+}
+
+/// Finalize an owned stream only after every persistent worker physically
+/// joins. Input, output staging and native reservations remain in admission
+/// through final delivery; the finalizer shares the original run authority.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::hosted) fn run_int8_prefill_team_with_finalize<T, U, A, F, G>(
+    engine: &NlpEngine, limits: RunLimits, cancellation: CancellationToken,
+    model: ResidentInt8, width: usize, kernel: Int8Kernel, max_batch_rows: usize,
+    admission: A, work: F, finalize: G) -> Result<U, HostedError>
+where T: Send + 'static, U: Send + 'static, A: Send + 'static,
+    F: FnOnce(&CurrentCandidateInt8Model, &mut A, &mut RunControl, &mut dyn Int8ProjectionExecutor)
+        -> Result<T, HostedError> + Send + 'static,
+    G: FnOnce(T, &mut A, &mut RunControl) -> Result<U, HostedError> + Send + 'static {
+    run_int8_team_then(engine, limits, cancellation, model, width, kernel,
+        max_batch_rows, admission, work, move |value, admission, cx, shared| {
+            finalize_after_join(cx, shared, value,
+                |value, control| finalize(value, admission, control))
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_int8_team_then<T, U, A, F, G>(engine: &NlpEngine, limits: RunLimits,
+    cancellation: CancellationToken, model: ResidentInt8, width: usize, kernel: Int8Kernel,
+    max_batch_rows: usize, admission: A, work: F, finalize: G) -> Result<U, HostedError>
+where T: Send + 'static, U: Send + 'static, A: Send + 'static,
+    F: FnOnce(&CurrentCandidateInt8Model, &mut A, &mut RunControl, &mut dyn Int8ProjectionExecutor)
+        -> Result<T, HostedError> + Send + 'static,
+    G: FnOnce(T, &mut A, &Cx, &Arc<RunShared>) -> Result<U, HostedError> + Send + 'static {
     preflight_int8_team(engine, limits, width)?;
     if !Arc::ptr_eq(engine.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
     let shared = RunShared::new(limits, cancellation)?;
@@ -90,7 +122,8 @@ where T: Send + 'static, A: Send + 'static,
         let native_model = &model.inner.loaded.value;
         let weights = native_model.weight_view().map_err(HostedError::Native)?.with_kernel(kernel);
         let physical = run_scope(&blocking_cx, &weights, &mut workspace.value, width, kernel,
-            Arc::clone(&shared), |control, team| work(native_model, &mut admission, control, team));
+            Arc::clone(&shared), |control, team| work(native_model, &mut admission, control, team))
+            .and_then(|value| finalize(value, &mut admission, &blocking_cx, &shared));
         drop(workspace);
         drop(admission);
         drop(model);

@@ -2,6 +2,7 @@
 //! No user-defined admission provider, per-document runtime or model reload.
 
 use super::*;
+mod scored;
 mod sentiment;
 pub use sentiment::SentimentCorpusConfig;
 mod classify;
