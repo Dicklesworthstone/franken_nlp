@@ -8,7 +8,7 @@ use crate::{
     native_engine::{constrained::JsonWorkBudget, constrained_int8::Int8JsonBudget,
         decode::{DecodeCancellationKind, DecodeStepControl}, kv::KV_BYTES_PER_TOKEN,
         strict_int8::{Int8RunBudget, Int8Work, StrictInt8Engine, STRICT_INT8_PROFILE,
-            scoring::Int8ScoringBudget}},
+            scoring::Int8ScoringBudget, prefill::Int8PrefillLimits}},
     tasks::{extract::{ExtractionVocabulary, quantized::{Int8ExtractError, Int8ExtractRun, check_size}},
         judge::{partition_evidence, quantized::{Int8JudgeError, Int8JudgeRun, PreparedInt8Judge, INT8_JUDGE_EXECUTION}}},
     grammar::mask::MaskWorkLimits,
@@ -195,16 +195,41 @@ impl PreparedInt8SemanticExtraction {
     pub fn execute_with_control<C: DecodeStepControl>(self, engine: &mut StrictInt8Engine<'_>,
         vocabulary: &ExtractionVocabulary, masks: MaskWorkLimits, mask_visits: u64, control: &mut C)
         -> Result<Int8SemanticExtractionRun, Int8SemanticError> {
+        self.execute_with_prefill(engine, vocabulary, masks, mask_visits, None, control)
+    }
+
+    /// Reuse bounded layer-major prompt scratch across extraction and every
+    /// complete judge head. Full-vocabulary scoring and the all-judges
+    /// preflight barrier are identical to sequential prompt execution.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_layer_major_with_control<C: DecodeStepControl>(self, engine: &mut StrictInt8Engine<'_>,
+        vocabulary: &ExtractionVocabulary, masks: MaskWorkLimits, mask_visits: u64,
+        prefill: Int8PrefillLimits, control: &mut C)
+        -> Result<Int8SemanticExtractionRun, Int8SemanticError> {
+        self.execute_with_prefill(engine, vocabulary, masks, mask_visits, Some(prefill), control)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_with_prefill<C: DecodeStepControl>(self, engine: &mut StrictInt8Engine<'_>,
+        vocabulary: &ExtractionVocabulary, masks: MaskWorkLimits, mask_visits: u64,
+        prefill: Option<Int8PrefillLimits>, control: &mut C)
+        -> Result<Int8SemanticExtractionRun, Int8SemanticError> {
         poll(control)?;
+        if let Some(limits) = prefill { limits.validate().map_err(Int8JudgeError::from)?; }
         if masks.max_trie_node_visits == 0 || masks.checkpoint_interval_nodes == 0 || mask_visits == 0 {
             return Err(Int8SemanticError::Contract);
         }
         let kv = self.check_capacity(engine)?;
         let reserved = self.extraction.planned_work();
-        let extraction = self.extraction.extraction_plan().execute(engine, self.execution_identity(), vocabulary,
-            Int8JsonBudget { native: Int8RunBudget::exact(reserved), json: JsonWorkBudget {
-                max_forward_positions: reserved.forward_positions, max_projected_logits: reserved.projected_logits,
-                max_kv_bytes: kv, max_total_mask_node_visits: mask_visits, mask_limits: masks } }, control)?;
+        let budget = Int8JsonBudget { native: Int8RunBudget::exact(reserved), json: JsonWorkBudget {
+            max_forward_positions: reserved.forward_positions, max_projected_logits: reserved.projected_logits,
+            max_kv_bytes: kv, max_total_mask_node_visits: mask_visits, mask_limits: masks } };
+        let extraction = match prefill {
+            None => self.extraction.extraction_plan().execute(engine, self.execution_identity(),
+                vocabulary, budget, control),
+            Some(prefill) => self.extraction.extraction_plan().execute_layer_major(engine,
+                self.execution_identity(), vocabulary, budget, prefill, control),
+        }?;
         self.check_capacity(engine)?;
         let review = self.prepare_review(extraction, control)?;
         for plan in &review.judges {
@@ -215,8 +240,12 @@ impl PreparedInt8SemanticExtraction {
         let mut results = vector(review.judges.len())?;
         for plan in &review.judges {
             poll(control)?;
-            results.push(plan.execute_with_control(plan.execution_identity(), engine,
-                Int8ScoringBudget { native: Int8RunBudget::exact(plan.planned_work()), max_kv_bytes: kv }, control)?);
+            let budget = Int8ScoringBudget { native: Int8RunBudget::exact(plan.planned_work()), max_kv_bytes: kv };
+            results.push(match prefill {
+                None => plan.execute_with_control(plan.execution_identity(), engine, budget, control),
+                Some(prefill) => plan.execute_layer_major_with_control(plan.execution_identity(), engine,
+                    budget, prefill, control),
+            }?);
             self.check_capacity(engine)?;
         }
         self.finish(review, results, control)

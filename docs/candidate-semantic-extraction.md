@@ -46,11 +46,21 @@ The example uses a 2,048-position context. Its judge `max_kv_bytes` is `36909875
 
 The five native ceilings cover forward positions, projected logits, attention pairs, projection dot products, and projection multiply-accumulates. The maximum extraction reservation remains charged even when extraction stops early. Actual values determine the review prompts, so every dynamic judge is compiled and preflighted after extraction and before the first review forward. All judges run within the remaining complete-request allowance.
 
-This CLI route uses serial execution and full-vocabulary projections. Byte-fallback input remains the default; compact input is explicit. The command does not accept selected-row, sampling, or worker-schedule flags. The deadline spans preparation, loading, extraction, review, checked serialization, write, and flush; output and preparation charges remain held through delivery. Memory values describe the process resource ledger, not a measured operating-system RSS limit.
+This CLI route keeps full-vocabulary projections. Serial execution, sequential prompt processing and byte-fallback input remain the defaults; compact input, prompt morsels and worker teams are explicit choices. The command does not accept selected-row or sampling flags. The deadline spans preparation, loading, extraction, review, checked serialization, write, and flush; output and preparation charges remain held through delivery. Memory values describe the process resource ledger, not a measured operating-system RSS limit.
 
 ## Rust API
 
-Prepare a real `PreparedInt8SemanticExtraction` from a pinned extraction plan, judge planner, and explicit `Int8SemanticOptions`. Use `Int8SemanticHostLimits::requirements` for the complete quote, then call `NlpEngine::execute_int8_semantic_extract`. The host consumes the plan, reuses one strict INT8 engine for both stages, preserves typed cancellation causes, and returns a guarded `HostedOutput<Int8SemanticExtractionRun>`.
+Prepare a real `PreparedInt8SemanticExtraction` from a pinned extraction plan, judge planner, and explicit `Int8SemanticOptions`. Use `Int8SemanticHostLimits::requirements` for the default complete quote, `requirements_with_encoding` for compact input, or `requirements_with_schedule` for an explicit `Option<Int8PrefillLimits>`. The host consumes the plan, reuses one strict INT8 engine for both stages, and preserves typed cancellation causes.
+
+The default entry point is `NlpEngine::execute_int8_semantic_extract`.
+`execute_int8_semantic_extract_layer_major` adds bounded prompt morsels;
+`execute_int8_semantic_extract_with_threads` adds one persistent row team; and
+`execute_int8_semantic_extract_layer_major_with_threads` combines them.
+Serial entries return a guarded `HostedOutput<Int8SemanticExtractionRun>`;
+team entries return `HostedInt8TeamResult<Int8SemanticExtractionRun>` with the
+same guarded result and compute receipt. Caller preparation, complete retained
+review data, coordinator prompt scratch, child workspace and output all require
+separate admission.
 
 ## Compact input across extraction and every review
 
@@ -95,3 +105,33 @@ Regression definitions cover policy mismatch, all four cumulative ceilings,
 retained original work, exact schema/source preservation, byte-default output,
 and additive admission. Compilation, execution, actual-model behavior and
 performance remain subject to the repository's controller-owned DSR gates.
+
+## Prompt morsels and one persistent review team
+
+Add `--prefill-rows 8` to process bounded groups of prompt tokens throughout
+extraction and every judge head. Add `--compute-threads 4` to admit one
+persistent numerical row team for the complete operation. Both flags accept
+values from 1 through 64; the width includes the coordinator and runtime
+threads are additional. They compose with either input encoding.
+
+The same native engine and worker team stay attached from original extraction
+through every complete review. Field count does not create new teams or new
+model-work allowances. Every dynamic judge still compiles and preflights
+before the first review forward. Full-vocabulary scoring, exact extraction
+JSON, evidence coordinates, semantic status rules and all original native
+ceilings are unchanged.
+
+Coordinator prompt scratch and fixed child workspace are priced separately,
+before schema/source/model IO. Neither replaces full resident KV, retained
+field plans, source copies or output storage. Cancellation and deadline
+checks span the whole operation, and no combined result escapes until every
+worker has physically joined. The guarded output remains owned through
+serialization and flushing. Width one omits a compute extension; a team adds
+the existing top-level `compute` receipt with the admitted width and completed
+projection/row counters.
+
+Regression definitions cover invalid geometry, source and preparation
+retention, exact memory boundaries, independent coordinator/child admission,
+schedule mismatch before IO, and unchanged serial publication. They do not
+establish actual-model parity or throughput. These explicit schedules remain
+candidates pending controller-owned DSR validation.

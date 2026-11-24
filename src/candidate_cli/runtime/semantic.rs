@@ -7,7 +7,8 @@ use crate::{
     candidate_cli::semantic::{self as command, SemanticCommand},
     grammar::runtime::JsonProgram,
     hosted::{HostedError, Int8SemanticHostLimits, Int8SemanticHostRequirements},
-    native_engine::{decode::DecodeCancellationKind, strict_int8::{Int8Work, STRICT_INT8_PROFILE}},
+    native_engine::{decode::DecodeCancellationKind,
+        strict_int8::{Int8Work, STRICT_INT8_PROFILE, prefill::Int8PrefillLimits}},
     tasks::{extract::semantic::int8::{Int8SemanticError, Int8SemanticOptions,
         Int8SemanticExtractionRun, PreparedInt8SemanticExtraction, INT8_SEMANTIC_EXECUTION},
         judge::JudgePlanner},
@@ -36,9 +37,13 @@ fn execution_error(error: HostedError) -> CandidateError {
 pub(in crate::candidate_cli) fn execute(command: SemanticCommand, args: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
     let encoding = command.encoding_policy()?;
+    let prefill = command.prefill()?;
+    if limits.compute != command.compute.admit_prefill(prefill)? || args.compute != command.compute {
+        return Err(CandidateError::Arguments);
+    }
     // This owner is established before any private options/source/schema or
     // output allocation and lives through the final external flush.
-    let session = Session::new(&args, limits)?;
+    let session = Session::new_with_prefill(&args, limits, prefill)?;
     let options = command::parse_options(&session.read(&command.semantic_options, input, command::OPTIONS_BYTES)?)?;
     let envelope_bytes = command.admit_options(&args, limits, &options)?;
     let budget = command.host.task_budget(limits);
@@ -47,21 +52,21 @@ pub(in crate::candidate_cli) fn execute(command: SemanticCommand, args: Candidat
     let planning = command::judge_limits(&options);
     let max_work = options.max_model_work;
     let host = host_limits(&session, &args, &command, limits)?;
-    let upper = host.requirements_with_encoding(budget, judge_budget, semantic_limits, planning,
-        args.max_input_bytes, &encoding)
+    let upper = host.requirements_with_schedule(budget, judge_budget, semantic_limits, planning,
+        args.max_input_bytes, &encoding, prefill)
         .map_err(|_| CandidateError::Arguments)?;
-    admit_memory(&args, limits, upper)?;
+    admit_memory(&args, limits, upper, prefill)?;
     // Fixed policy and whole-source capacity are admitted before these reads.
     let schema = session.read(&command.schema, input, extract::SCHEMA_BYTES)?;
     let document = session.read(&command.input, input, args.max_input_bytes)?;
     let source_bytes = document.len();
     let request = source_schema(&command, &options, schema, &document, budget)?;
     session.remaining()?;
-    let quote = host.requirements_with_encoding(budget, judge_budget, semantic_limits, planning,
-        source_bytes, &encoding)
+    let quote = host.requirements_with_schedule(budget, judge_budget, semantic_limits, planning,
+        source_bytes, &encoding, prefill)
         .map_err(|_| CandidateError::Arguments)?;
     if !quote_fits(quote, upper) { return Err(CandidateError::Identity); }
-    admit_memory(&args, limits, quote)?;
+    admit_memory(&args, limits, quote, prefill)?;
     let facts = session.facts(&args)?;
     let compiler = super::extraction::planner(&facts, &command.host, limits, None)?;
     let document = BatchDocument { id: "cli".to_owned(), text: document, task_args: Some(request) };
@@ -89,23 +94,38 @@ pub(in crate::candidate_cli) fn execute(command: SemanticCommand, args: Candidat
     judge_identity.template_digest = *judge.template_digest();
     let prepared = PreparedInt8SemanticExtraction::new(extraction, judge, judge_identity,
         planning, options, &mut session.control()).map_err(planning_error)?;
-    let actual = host.requirements_with_encoding(prepared.extraction_budget(), prepared.judge_budget(),
-        prepared.semantic_limits(), prepared.judge_planning_limits(), prepared.source_bytes(), prepared.input_encoding())
+    let actual = host.requirements_with_schedule(prepared.extraction_budget(), prepared.judge_budget(),
+        prepared.semantic_limits(), prepared.judge_planning_limits(), prepared.source_bytes(),
+        prepared.input_encoding(), prefill)
         .map_err(|_| CandidateError::Arguments)?;
     if prepared.extraction_budget() != budget || prepared.judge_budget() != judge_budget
         || prepared.semantic_limits() != semantic_limits || prepared.source_bytes() != source_bytes
         || prepared.max_model_work() != max_work || prepared.input_encoding() != &encoding || actual != quote {
         return Err(CandidateError::Identity);
     }
-    admit_memory(&args, limits, actual)?;
+    admit_memory(&args, limits, actual, prefill)?;
     let reserved = prepared.extraction_reserved_work();
     let initial_encoding_work = prepared.input_encoding_work().unwrap_or_default();
     let vocabulary = super::extraction::vocabulary()?;
     session.remaining()?;
     let cancellation = CancellationToken::default();
     let model = session.load(&args, limits, &facts, cancellation.clone())?;
-    let result = session.engine.execute_int8_semantic_extract(&model, prepared, vocabulary,
-        host_limits(&session, &args, &command, limits)?, cancellation).map_err(execution_error)?;
+    let host = host_limits(&session, &args, &command, limits)?;
+    let result = if limits.compute.threads == 1 {
+        compute::Completion::Serial(match prefill {
+            None => session.engine.execute_int8_semantic_extract(&model, prepared, vocabulary, host, cancellation),
+            Some(prefill) => session.engine.execute_int8_semantic_extract_layer_major(&model, prepared,
+                vocabulary, host, prefill, cancellation),
+        }.map_err(execution_error)?)
+    } else {
+        let kernel = crate::native_engine::simd::config::process_kernel();
+        compute::Completion::Team(match prefill {
+            None => session.engine.execute_int8_semantic_extract_with_threads(&model, prepared,
+                vocabulary, host, kernel, limits.compute.threads, cancellation),
+            Some(prefill) => session.engine.execute_int8_semantic_extract_layer_major_with_threads(&model,
+                prepared, vocabulary, host, kernel, limits.compute.threads, prefill, cancellation),
+        }.map_err(execution_error)?)
+    };
     check_result(result.result(), reserved, max_work)?;
     result.result().verify_input_encoding(&encoding, initial_encoding_work).map_err(|_| CandidateError::Execution)?;
     session.remaining()?;
@@ -115,6 +135,7 @@ pub(in crate::candidate_cli) fn execute(command: SemanticCommand, args: Candidat
         quant_recipe: &facts.recipe_id, output: result.result() };
     // The original JSON remains an exact string, never a floating-point Value.
     // Result and caller preparation guards remain live through write and flush.
+    let response = compute::Response { response: &response, compute: result.compute() };
     publish_checked(&response, envelope_bytes, output, &|| session.remaining().map(|_| ()))
 }
 
@@ -139,24 +160,28 @@ fn host_limits(session: &Session, args: &CandidateArgs, command: &SemanticComman
         preparation_reserve_bytes: limits.preparation_bytes })
 }
 
-fn minimum_memory(args: &CandidateArgs, limits: Limits, quote: Int8SemanticHostRequirements)
-    -> Result<u64, CandidateError> {
+fn minimum_memory(args: &CandidateArgs, limits: Limits, quote: Int8SemanticHostRequirements,
+    prefill: Option<Int8PrefillLimits>) -> Result<u64, CandidateError> {
     let required = Int8MemoryRequirement::for_context(args.context_tokens).map_err(|_| CandidateError::Arguments)?;
+    let extra = prefill.map(Int8PrefillLimits::validate).transpose()
+        .map_err(|_| CandidateError::Arguments)?.unwrap_or(0);
+    let coordinator = required.rope_bytes.checked_add(required.scratch_payload_bound)
+        .and_then(|n| n.checked_add(64 * MIB)).and_then(|n| n.checked_add(extra))
+        .ok_or(CandidateError::Arguments)?;
     if quote.native != required || limits.kv_bytes != required.kv_bytes
-        || limits.compute != compute::Args::default().admit_prefill(None)?
-        || args.compute.threads() != 1 {
+        || quote.native_workspace_bytes < coordinator || limits.compute != args.compute.admit_prefill(prefill)? {
         return Err(CandidateError::Arguments);
     }
     let sum = |values: &[u64]| values.iter().try_fold(0_u64,
         |total, &bytes| total.checked_add(bytes).ok_or(CandidateError::Arguments));
     let load = sum(&[limits.weight_bytes, 192 * MIB, 64 * 1024, 65_536])?;
     let execution = sum(&[limits.weight_bytes, 192 * MIB,
-        quote.total_bytes().map_err(|_| CandidateError::Arguments)?, 65_536])?;
+        quote.total_bytes().map_err(|_| CandidateError::Arguments)?, limits.compute.workspace_bytes, 65_536])?;
     sum(&[limits.preparation_bytes, load.max(execution)])
 }
-fn admit_memory(args: &CandidateArgs, limits: Limits, quote: Int8SemanticHostRequirements)
-    -> Result<(), CandidateError> {
-    if minimum_memory(args, limits, quote)? > limits.memory_bytes { return Err(CandidateError::Arguments); }
+fn admit_memory(args: &CandidateArgs, limits: Limits, quote: Int8SemanticHostRequirements,
+    prefill: Option<Int8PrefillLimits>) -> Result<(), CandidateError> {
+    if minimum_memory(args, limits, quote, prefill)? > limits.memory_bytes { return Err(CandidateError::Arguments); }
     Ok(())
 }
 fn quote_fits(actual: Int8SemanticHostRequirements, ceiling: Int8SemanticHostRequirements) -> bool {

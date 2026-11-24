@@ -67,7 +67,7 @@ fn semantic_route_keeps_serial_byte_defaults_and_full_projection_scope() {
     assert_eq!(limits.compute, compute::Args::default().admit_prefill(None).unwrap());
     assert_eq!(args.input_encoding_policy(limits).unwrap(), UntrustedEncoding::ByteFallback);
     assert!(args.policy.prefill().unwrap().is_none());
-    for option in ["--compute-threads", "--prefill-rows", "--selected-rows",
+    for option in ["--selected-rows",
         "--seed", "--temperature-milli", "--top-k", "--top-p-ppm", "--options"] {
         assert!(super::super::definition().try_get_matches_from([
             "candidate", "extract-semantic", "--model", "m", "--memory-mib", "8192",
@@ -204,4 +204,40 @@ fn compact_semantic_workspace_does_not_replace_original_schema_or_options_memory
     compact.validate().unwrap();
     compact.host.preparation_mib = 511;
     assert!(compact.validate().is_err());
+}
+
+#[test]
+fn semantic_cli_admits_one_shared_prefill_and_compute_schedule() {
+    for width in [1, 2, 4, 64] {
+        for rows in [None, Some(1), Some(4), Some(64)] {
+            let width_text = width.to_string();
+            let row_text = rows.map(|n| n.to_string());
+            let mut extra = vec!["--compute-threads", width_text.as_str()];
+            if let Some(text) = &row_text { extra.extend(["--prefill-rows", text.as_str()]); }
+            let command = command(&extra);
+            let (args, limits) = command.validate().unwrap();
+            let prefill = command.prefill().unwrap();
+            assert_eq!(prefill.map(|limits| limits.max_batch_rows), rows);
+            assert_eq!(args.compute.threads(), width);
+            assert_eq!(limits.compute, args.compute.admit_prefill(prefill).unwrap());
+            assert_eq!(limits.compute.workspace_bytes == 0, width == 1);
+            assert!(args.policy.prefill().unwrap().is_none());
+            assert_eq!(command.encoding_policy().unwrap(), UntrustedEncoding::ByteFallback);
+        }
+    }
+    let command = command(&["--input-encoding", "safe-bpe-v1", "--compute-threads", "4", "--prefill-rows", "8"]);
+    let (args, limits) = command.validate().unwrap();
+    assert_eq!(limits.compute, args.compute.admit_prefill(command.prefill().unwrap()).unwrap());
+    assert!(matches!(command.encoding_policy().unwrap(), UntrustedEncoding::SafeBpeV1(_)));
+}
+
+#[test]
+fn semantic_cli_refuses_unbounded_worker_or_prompt_geometry_before_io() {
+    for flag in ["--compute-threads", "--prefill-rows"] {
+        let largest = usize::MAX.to_string();
+        for value in ["0", "65", largest.as_str()] {
+            let command = command(&[flag, value]);
+            assert!(command.validate().is_err(), "{flag} accepted {value}");
+        }
+    }
 }

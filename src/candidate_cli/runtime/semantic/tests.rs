@@ -1,5 +1,6 @@
-//! Pure admission, pinned preparation and publication fixtures. No model
-//! weights, neural output, semantic accuracy or performance are exercised.
+//! Admission, pinned preparation and publication fixtures. Ordinary tests do
+//! not load weights. The ignored controller-only gate requires independent
+//! artifact pins and supplies no parity evidence until actually executed.
 use super::*;
 use std::cell::Cell;
 use crate::{
@@ -24,7 +25,10 @@ fn command() -> SemanticCommand {
 fn options(limits: Limits) -> Int8SemanticOptions {
     let mut work = Int8Work::default();
     work.forward_positions = 4096; work.projected_logits = 64_000_000;
-    work.attention_pairs = 16_777_216; work.projections.dot_products = 100_000_000_000;
+    // Every charged position may attend to the full 2,048-position context
+    // in all 44 effective layers and all 48 query heads.
+    work.attention_pairs = work.forward_positions * 2048 * 44 * 48;
+    work.projections.dot_products = 100_000_000_000;
     work.projections.multiply_accumulates = 1_000_000_000_000_000;
     Int8SemanticOptions {
         specification: SemanticVerificationSpec {
@@ -153,20 +157,20 @@ fn whole_process_memory_boundary_includes_caller_owner_and_both_stage_retention(
     let quote = host(&command, &args, limits).requirements(command.host.task_budget(limits),
         options.specification.judge_budget, options.limits, command::judge_limits(&options),
         args.max_input_bytes).unwrap();
-    let required = minimum_memory(&args, limits, quote).unwrap();
+    let required = minimum_memory(&args, limits, quote, None).unwrap();
     assert!(required > limits.weight_bytes + limits.preparation_bytes + quote.preparation_bytes);
     limits.memory_bytes = required;
-    admit_memory(&args, limits, quote).unwrap();
+    admit_memory(&args, limits, quote, None).unwrap();
     limits.memory_bytes -= 1;
-    assert_eq!(admit_memory(&args, limits, quote), Err(CandidateError::Arguments));
+    assert_eq!(admit_memory(&args, limits, quote, None), Err(CandidateError::Arguments));
     let mut too_large = quote; too_large.preparation_bytes += 1;
     assert!(!quote_fits(too_large, quote));
     let mut wrong_native = quote; wrong_native.native.kv_bytes -= 1;
-    assert_eq!(minimum_memory(&args, limits, wrong_native), Err(CandidateError::Arguments));
+    assert_eq!(minimum_memory(&args, limits, wrong_native, None), Err(CandidateError::Arguments));
     let overflow = Int8SemanticHostRequirements { preparation_bytes: u64::MAX, ..quote };
-    assert_eq!(minimum_memory(&args, limits, overflow), Err(CandidateError::Arguments));
+    assert_eq!(minimum_memory(&args, limits, overflow, None), Err(CandidateError::Arguments));
     let mut wrong_schedule = limits; wrong_schedule.compute.threads = 2;
-    assert_eq!(minimum_memory(&args, wrong_schedule, quote), Err(CandidateError::Arguments));
+    assert_eq!(minimum_memory(&args, wrong_schedule, quote, None), Err(CandidateError::Arguments));
 }
 
 // Private receipt fixture for accounting/serialization only. Public execution
@@ -271,6 +275,7 @@ fn complete_publication_preserves_exact_json_and_refuses_capacity_deadline_or_fl
         evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
         source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
         quant_recipe: &facts.recipe_id, output: &run };
+    let response = compute::Response { response: &response, compute: None };
     let mut bytes = Vec::new();
     publish_checked(&response, 1_048_576, &mut bytes, &|| Ok(())).unwrap();
     assert_eq!(bytes.last(), Some(&b'\n'));
@@ -341,10 +346,218 @@ fn compact_runtime_preparation_and_quote_keep_one_policy_with_original_schema_by
     assert_eq!(compact.preparation_bytes - byte.preparation_bytes, prepared.encoding_workspace_bytes().unwrap());
     assert_eq!(compact.output_bytes, byte.output_bytes);
     assert_eq!(compact.native_workspace_bytes, byte.native_workspace_bytes);
-    assert_eq!(minimum_memory(&args, limits, compact).unwrap() - minimum_memory(&args, limits, byte).unwrap(),
+    assert_eq!(minimum_memory(&args, limits, compact, None).unwrap() - minimum_memory(&args, limits, byte, None).unwrap(),
         prepared.encoding_workspace_bytes().unwrap());
     let UntrustedEncoding::SafeBpeV1(actual) = prepared.input_encoding() else { panic!("compact policy"); };
     assert_eq!(actual.max_input_bytes, 65_536);
     assert_eq!(actual.max_output_tokens, 8192);
     assert_eq!(actual.max_pair_checks, SafeBpeLimits::MAX_PAIR_CHECKS);
+}
+
+fn scheduled_command(extra: &[&str]) -> SemanticCommand {
+    let mut argv = vec!["extract-semantic", "--model", "must-not-open.fnlpq", "--memory-mib", "8192",
+        "--schema", "schema.json", "--semantic-options", "semantic.json",
+        "--max-input-bytes", "512", "--max-new-tokens", "128", "--max-result-bytes", "16384"];
+    argv.extend_from_slice(extra);
+    let matches = command::definition().try_get_matches_from(argv).unwrap();
+    SemanticCommand::from_matches(&matches).unwrap()
+}
+
+#[test]
+fn complete_semantic_memory_admits_coordinator_and_persistent_children_separately() {
+    for compact in [false, true] {
+        let policy = if compact { vec!["--input-encoding", "safe-bpe-v1"] } else { vec![] };
+        let sequential = scheduled_command(&policy);
+        let (serial_args, serial_limits) = sequential.validate().unwrap();
+        let options = options(serial_limits); let planning = command::judge_limits(&options);
+        let serial = host(&sequential, &serial_args, serial_limits).requirements_with_schedule(
+            sequential.host.task_budget(serial_limits), options.specification.judge_budget, options.limits,
+            planning, serial_args.max_input_bytes, &sequential.encoding_policy().unwrap(), None).unwrap();
+        let base = minimum_memory(&serial_args, serial_limits, serial, None).unwrap();
+
+        let mut flags = policy;
+        flags.extend(["--compute-threads", "4", "--prefill-rows", "4"]);
+        let scheduled = scheduled_command(&flags);
+        let (args, mut limits) = scheduled.validate().unwrap();
+        let prefill = scheduled.prefill().unwrap();
+        let quote = host(&scheduled, &args, limits).requirements_with_schedule(
+            scheduled.host.task_budget(limits), options.specification.judge_budget, options.limits,
+            planning, args.max_input_bytes, &scheduled.encoding_policy().unwrap(), prefill).unwrap();
+        let coordinator = prefill.unwrap().validate().unwrap();
+        assert_eq!(quote.native, serial.native);
+        assert_eq!(quote.preparation_bytes, serial.preparation_bytes);
+        assert_eq!(quote.output_bytes, serial.output_bytes);
+        let required = minimum_memory(&args, limits, quote, prefill).unwrap();
+        assert_eq!(required - base, coordinator + limits.compute.workspace_bytes);
+        limits.memory_bytes = required;
+        admit_memory(&args, limits, quote, prefill).unwrap();
+        limits.memory_bytes -= 1;
+        assert_eq!(admit_memory(&args, limits, quote, prefill), Err(CandidateError::Arguments));
+        assert_eq!(minimum_memory(&args, limits, serial, prefill), Err(CandidateError::Arguments));
+        let mut missing_children = limits; missing_children.compute.workspace_bytes -= 1;
+        assert_eq!(minimum_memory(&args, missing_children, quote, prefill), Err(CandidateError::Arguments));
+        assert_eq!(minimum_memory(&args, limits, quote, None), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
+fn semantic_runtime_refuses_changed_schedule_before_options_source_or_model_io() {
+    struct NoInput;
+    impl Read for NoInput {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private input opened before admission"); }
+    }
+    for changed in 0..2 {
+        let command = scheduled_command(&["--compute-threads", "4", "--prefill-rows", "4"]);
+        let (mut args, mut limits) = command.validate().unwrap();
+        if changed == 0 { limits.compute.workspace_bytes -= 1; }
+        else { args.compute = compute::Args::default(); }
+        let mut output = Vec::new();
+        assert_eq!(execute(command, args, limits, &mut NoInput, &mut output), Err(CandidateError::Arguments));
+        assert!(output.is_empty());
+    }
+}
+
+#[test]
+fn team_publication_attaches_only_the_admitted_compute_receipt_to_exact_semantic_output() {
+    let (run, _) = completion();
+    let facts = facts();
+    let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
+        evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
+        source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
+        quant_recipe: &facts.recipe_id, output: &run };
+    let serial = compute::Response { response: &response, compute: None };
+    let mut serial_bytes = Vec::new();
+    publish_checked(&serial, 1_048_576, &mut serial_bytes, &|| Ok(())).unwrap();
+    let serial: serde_json::Value = serde_json::from_slice(&serial_bytes).unwrap();
+    assert!(serial.get("compute").is_none());
+    // Private publication fixture only; these counters are not model evidence.
+    let compute = crate::hosted::Int8ComputeReceipt { schedule: "int8-output-row-team-v1",
+        compute_threads: 4, completed_projections: 9, completed_rows: 42, completed_worker_rows: 30 };
+    let team = compute::Response { response: &response, compute: Some(&compute) };
+    let mut team_bytes = Vec::new();
+    publish_checked(&team, 1_048_576, &mut team_bytes, &|| Ok(())).unwrap();
+    let team: serde_json::Value = serde_json::from_slice(&team_bytes).unwrap();
+    assert_eq!(team["output"], serial["output"]);
+    assert_eq!(team["compute"]["compute_threads"], 4);
+    assert_eq!(team["compute"]["completed_worker_rows"], 30);
+    assert_eq!(team["evidence"], "non_authoritative");
+}
+
+#[test]
+#[ignore = "controller-only real INT8 artifact and fresh resource-host process; no parity claim until executed"]
+fn complete_semantic_results_match_across_workers_and_prompt_schedules() {
+    use crate::native_engine::simd::config::process_kernel;
+    let path = std::env::var_os("FNLP_INT8_SEMANTIC_TEAM_MODEL").expect("admitted INT8 artifact required");
+    let logical = std::env::var("FNLP_INT8_SEMANTIC_TEAM_LOGICAL_SHA256")
+        .expect("independent logical model pin required");
+    let source_root = std::env::var("FNLP_INT8_SEMANTIC_TEAM_SOURCE_ROOT_SHA256")
+        .expect("independent source root pin required");
+    Sha256Digest::from_hex(&logical).unwrap(); Sha256Digest::from_hex(&source_root).unwrap();
+    let mut command = scheduled_command(&["--compute-threads", "4", "--prefill-rows", "3"]);
+    command.host.model = path.into(); command.host.memory_mib = 16_384;
+    let (args, limits) = command.validate().unwrap();
+    let schedule = command.prefill().unwrap();
+    let session = Session::new_with_prefill(&args, limits, schedule).unwrap();
+    let options = options(limits); let planning = command::judge_limits(&options);
+    let budget = command.host.task_budget(limits);
+    let quote = host_limits(&session, &args, &command, limits).unwrap().requirements_with_schedule(
+        budget, options.specification.judge_budget, options.limits, planning,
+        args.max_input_bytes, &UntrustedEncoding::ByteFallback, schedule).unwrap();
+    admit_memory(&args, limits, quote, schedule).unwrap();
+    let facts = session.facts(&args).unwrap();
+    assert_eq!(facts.logical_model_sha256, logical); assert_eq!(facts.source_root_sha256, source_root);
+    assert_eq!(facts.revision, "f56ec5a9650268aa098496734743c25ea778bd2d");
+    let compiler = super::super::extraction::planner(&facts, &command.host, limits, None).unwrap();
+    let registry = pinned_controls::pinned().unwrap(); let controls = registry.template_controls();
+    let eos = controls.entries().iter().find(|entry| entry.special && entry.surface == crate::template::IM_END)
+        .unwrap().id;
+    let judge = Arc::new(JudgePlanner::pinned(controls, eos).unwrap());
+    let vocabulary = super::super::extraction::vocabulary().unwrap();
+    let model = session.load(&args, limits, &facts, CancellationToken::default()).unwrap();
+    // A constrained non-null scalar must create one actual correlated review.
+    // No supplied extraction, fake judge score or repaired output enters this path.
+    let schema = r#"{"type":"number","const":42}"#;
+    let source = "The amount is 42.";
+    let prepare = || {
+        let request = source_schema(&command, &options, schema.into(), source, budget).unwrap();
+        let extraction = compiler.prepare_with_control(BatchDocument {
+            id: "semantic-real-model-gate".into(), text: source.into(), task_args: Some(request),
+        }, &mut session.control()).unwrap();
+        let mut identity = extraction.execution_identity().clone(); identity.task_spec = "judge-v1".into();
+        identity.tokenizer_digest = judge.tokenizer_digest(); identity.template_digest = *judge.template_digest();
+        PreparedInt8SemanticExtraction::new(extraction, Arc::clone(&judge), identity,
+            planning, options.clone(), &mut session.control()).unwrap()
+    };
+    let baseline = session.engine.resources().memory_snapshot().committed_bytes;
+    let drained = || {
+        let memory = session.engine.resources().memory_snapshot();
+        assert_eq!(memory.committed_bytes, baseline); assert_eq!(memory.reserved_bytes, 0);
+        assert_eq!(memory.recorded_leaks, 0);
+        assert_eq!(session.engine.resources().outstanding_closure_snapshot().active_closures, 0);
+        assert_eq!(Arc::strong_count(&judge), 1); assert_eq!(Arc::strong_count(&vocabulary), 1);
+    };
+    let run = |width: usize, prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken|
+        -> Result<compute::Completion<Int8SemanticExtractionRun>, HostedError> {
+        let prepared = prepare(); let reserved = prepared.extraction_reserved_work();
+        let host = host_limits(&session, &args, &command, limits).unwrap();
+        let result = if width == 1 {
+            compute::Completion::Serial(match prefill {
+                None => session.engine.execute_int8_semantic_extract(&model, prepared,
+                    Arc::clone(&vocabulary), host, cancellation),
+                Some(prefill) => session.engine.execute_int8_semantic_extract_layer_major(&model,
+                    prepared, Arc::clone(&vocabulary), host, prefill, cancellation),
+            }?)
+        } else {
+            compute::Completion::Team(match prefill {
+                None => session.engine.execute_int8_semantic_extract_with_threads(&model, prepared,
+                    Arc::clone(&vocabulary), host, process_kernel(), width, cancellation),
+                Some(prefill) => session.engine.execute_int8_semantic_extract_layer_major_with_threads(&model,
+                    prepared, Arc::clone(&vocabulary), host, process_kernel(), width, prefill, cancellation),
+            }?)
+        };
+        let output = result.result();
+        check_result(output, reserved, options.max_model_work).unwrap();
+        output.verify_input_encoding(&UntrustedEncoding::ByteFallback, Default::default()).unwrap();
+        assert_eq!(output.semantic.attempted_fields, 1); assert_eq!(output.semantic.fields.len(), 1);
+        assert!(output.semantic.fields[0].rendered_claim.is_some());
+        assert!(output.semantic.fields[0].judge.is_some()); assert!(output.judge_head_count > 0);
+        assert!(output.extraction.model_work.forward_positions > 0);
+        assert!(output.semantic_model_work.forward_positions > 0);
+        Ok(result)
+    };
+    let prefill = |rows| Int8PrefillLimits { max_batch_rows: rows,
+        max_extra_scratch_bytes: Int8PrefillLimits::required_extra_scratch_bytes(rows).unwrap() };
+    let result = run(1, None, CancellationToken::default()).unwrap();
+    let expected = crate::canonjson::canonical_bytes(result.result()).unwrap();
+    let work = result.result().model_work; let review_work = result.result().semantic_model_work;
+    drop(result); drained();
+    for width in [1, 2, 4] { for schedule in [None, Some(prefill(1)), Some(prefill(3))] {
+        if width == 1 && schedule.is_none() { continue; }
+        let result = run(width, schedule, CancellationToken::default()).unwrap();
+        assert_eq!(crate::canonjson::canonical_bytes(result.result()).unwrap(), expected);
+        assert_eq!(result.result().model_work, work);
+        assert_eq!(result.result().semantic_model_work, review_work);
+        if let Some(receipt) = result.compute() {
+            assert_eq!(receipt.compute_threads, width);
+            assert_eq!(receipt.completed_rows, work.projections.dot_products);
+            assert!(receipt.completed_projections > 0);
+        }
+        drop(result); drained();
+    } }
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        for width in [1, 4] {
+            let cancellation = CancellationToken::default(); cancellation.cancel(cause);
+            let error = run(width, Some(prefill(3)), cancellation).err()
+                .expect("a real two-stage request must preserve pre-cancellation");
+            assert!(matches!(error, HostedError::Stopped { stop, .. } if stop.kind == cause));
+            drained();
+        }
+    }
+    drop(vocabulary); drop(judge); drop(compiler); drop(model);
+    let memory = session.engine.resources().memory_snapshot();
+    assert_eq!(memory.committed_bytes, limits.preparation_bytes); assert_eq!(memory.reserved_bytes, 0);
+    assert_eq!(memory.recorded_leaks, 0);
+    assert_eq!(session.engine.resources().outstanding_closure_snapshot().active_closures, 0);
 }

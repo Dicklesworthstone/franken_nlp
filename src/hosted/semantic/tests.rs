@@ -206,11 +206,16 @@ fn all_typed_cancellation_causes_remain_available_without_private_diagnostics() 
 fn complete_native_plan_vocabulary_and_output_cross_one_owned_boundary() {
     fn send<T: Send + 'static>() {}
     send::<SemanticInput>();
+    send::<SemanticAdmission>();
     send::<PreparedInt8SemanticExtraction>();
     send::<Int8SemanticExtractionRun>();
     send::<Arc<ExtractionVocabulary>>();
     send::<HostedOutput<Int8SemanticExtractionRun>>();
     let _entry = NlpEngine::execute_int8_semantic_extract;
+    let _prefill = NlpEngine::execute_int8_semantic_extract_layer_major;
+    let _team = NlpEngine::execute_int8_semantic_extract_with_threads;
+    let _both = NlpEngine::execute_int8_semantic_extract_layer_major_with_threads;
+    send::<HostedInt8TeamResult<Int8SemanticExtractionRun>>();
 }
 
 #[test]
@@ -237,4 +242,34 @@ fn compact_semantic_admission_adds_one_workspace_without_discounting_retained_fi
         more_byte.preparation_bytes - byte.preparation_bytes);
     let bad = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_pair_checks: 0, ..limits });
     assert!(host.requirements_with_encoding(extraction, judge, semantic, planning, 1024, &bad).is_err());
+}
+
+#[test]
+fn prompt_scheduling_keeps_full_native_and_retained_semantic_owners() {
+    let (host, extraction, judge, semantic, planning) = fixture();
+    let byte = UntrustedEncoding::ByteFallback;
+    let ordinary = host.requirements_with_encoding(extraction, judge, semantic, planning, 1024, &byte).unwrap();
+    assert_eq!(ordinary, host.requirements_with_schedule(extraction, judge, semantic,
+        planning, 1024, &byte, None).unwrap());
+    for rows in [1, 4, 64] {
+        let extra = Int8PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+        let prefill = Int8PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: extra };
+        let scheduled = host.requirements_with_schedule(extraction, judge, semantic,
+            planning, 1024, &byte, Some(prefill)).unwrap();
+        assert_eq!(scheduled.native, ordinary.native);
+        assert_eq!(scheduled.preparation_bytes, ordinary.preparation_bytes);
+        assert_eq!(scheduled.output_bytes, ordinary.output_bytes);
+        assert_eq!(scheduled.native_workspace_bytes - ordinary.native_workspace_bytes, extra);
+        assert_eq!(scheduled.total_bytes().unwrap() - ordinary.total_bytes().unwrap(), extra);
+        if let Some(short) = extra.checked_sub(1) {
+            let short = Int8PrefillLimits { max_extra_scratch_bytes: short, ..prefill };
+            assert!(host.requirements_with_schedule(extraction, judge, semantic,
+                planning, 1024, &byte, Some(short)).is_err());
+        }
+    }
+    for rows in [0, 65, usize::MAX] {
+        let invalid = Int8PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX };
+        assert!(host.requirements_with_schedule(extraction, judge, semantic,
+            planning, 1024, &byte, Some(invalid)).is_err());
+    }
 }

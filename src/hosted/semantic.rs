@@ -3,7 +3,8 @@
 use super::*;
 use crate::{
     grammar::mask::MaskWorkLimits,
-    native_engine::{decode::DecodeStepControl, strict_int8::{Int8Work, STRICT_INT8_PROFILE}},
+    native_engine::{decode::DecodeStepControl, simd::Int8Kernel,
+        strict_int8::{Int8Work, StrictInt8Engine, STRICT_INT8_PROFILE, prefill::Int8PrefillLimits}},
     tasks::{ir::TaskBudget, judge::JudgeLimits,
         extract::{quantized::INT8_EXTRACT_VERSION, semantic::{SemanticLimits, int8::{
             Int8SemanticError, Int8SemanticExtractionRun, PreparedInt8SemanticExtraction,
@@ -56,7 +57,21 @@ impl Int8SemanticHostLimits {
     pub fn requirements_with_encoding(self, extraction: TaskBudget, judge: TaskBudget,
         semantic: SemanticLimits, judge_planning: JudgeLimits, source_bytes: usize, encoding: &UntrustedEncoding)
         -> Result<Int8SemanticHostRequirements, HostedError> {
+        self.requirements_with_schedule(extraction, judge, semantic, judge_planning,
+            source_bytes, encoding, None)
+    }
+
+    /// Quote the same retained preparation and output plus one reusable prompt
+    /// morsel workspace. Persistent worker scratch is admitted independently by
+    /// the process dispatcher and never discounts this coordinator reservation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn requirements_with_schedule(self, extraction: TaskBudget, judge: TaskBudget,
+        semantic: SemanticLimits, judge_planning: JudgeLimits, source_bytes: usize,
+        encoding: &UntrustedEncoding, prefill: Option<Int8PrefillLimits>)
+        -> Result<Int8SemanticHostRequirements, HostedError> {
         self.native.run.validate()?;
+        let extra = prefill.map(Int8PrefillLimits::validate).transpose()
+            .map_err(HostedError::Native)?.unwrap_or(0);
         let encoding_workspace_bytes = match encoding {
             UntrustedEncoding::ByteFallback => 0,
             UntrustedEncoding::SafeBpeV1(limits) => limits.requirements()
@@ -104,7 +119,7 @@ impl Int8SemanticHostLimits {
             product(semantic.max_template_bytes as u64, 4)?,
         ])?;
         let native_workspace_bytes = sum(&[native.rope_bytes, native.scratch_payload_bound,
-            self.native.allocator_reserve_bytes])?;
+            self.native.allocator_reserve_bytes, extra])?;
         let output_bytes = sum(&[product(semantic.max_output_bytes, 4)?,
             product(u64::from(extraction.max_output_tokens), 8)?, 4096])?;
         let required = Int8SemanticHostRequirements { native, native_workspace_bytes, preparation_bytes, output_bytes };
@@ -121,6 +136,65 @@ struct SemanticInput {
     vocabulary: Arc<ExtractionVocabulary>,
 }
 
+/// The dispatcher owns this aggregate outside its scoped-team callback.
+/// Native storage drops before its charges; preparation, output and native
+/// reservations remain owned until every persistent child has physically joined.
+struct SemanticAdmission {
+    input: Charged<SemanticInput>,
+    kv: Option<Pending>, scratch: Option<Pending>, output: Option<Pending>,
+    _kv: Option<CommittedMemory>, _scratch: Option<CommittedMemory>, _lease: EngineLease,
+}
+impl SemanticAdmission {
+    fn commit_native(&mut self) -> Result<(), HostedError> {
+        self._kv = Some(self.kv.take().ok_or(HostedError::CompletionMissing)?.commit()?);
+        self._scratch = Some(self.scratch.take().ok_or(HostedError::CompletionMissing)?.commit()?);
+        Ok(())
+    }
+    fn finish(&mut self, result: Int8SemanticExtractionRun)
+        -> Result<HostedOutput<Int8SemanticExtractionRun>, HostedError> {
+        let output = self.output.take().ok_or(HostedError::CompletionMissing)?;
+        match output.commit() {
+            Ok(memory) => Ok(GuardedOutput::new(result, memory)),
+            Err(error) => { drop(result); Err(error) }
+        }
+    }
+}
+fn admit(host: &NlpEngine, prepared: PreparedInt8SemanticExtraction,
+    vocabulary: Arc<ExtractionVocabulary>, required: Int8SemanticHostRequirements)
+    -> Result<SemanticAdmission, HostedError> {
+    let lease = host.resources().acquire_lease();
+    let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.preparation_bytes)?,
+        || Ok(SemanticInput { prepared: Some(prepared), vocabulary }))?;
+    let output = Pending::reserve(&lease, MemoryClass::JobBuffers, required.output_bytes)?;
+    let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
+    let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.native_workspace_bytes)?;
+    Ok(SemanticAdmission { input, kv: Some(kv), scratch: Some(scratch), output: Some(output),
+        _kv: None, _scratch: None, _lease: lease })
+}
+fn execute_prepared(input: &mut SemanticInput, engine: &mut StrictInt8Engine<'_>,
+    limits: Int8SemanticHostLimits, prefill: Option<Int8PrefillLimits>, control: &mut RunControl)
+    -> Result<Int8SemanticExtractionRun, HostedError> {
+    checkpoint(control)?;
+    let prepared = input.prepared.take().ok_or(HostedError::CompletionMissing)?;
+    let extraction_work = prepared.extraction_reserved_work();
+    let max_work = prepared.max_model_work();
+    let encoding = prepared.input_encoding().clone();
+    let initial_encoding_work = prepared.input_encoding_work().unwrap_or_default();
+    let result = match prefill {
+        None => prepared.execute_with_control(engine, &input.vocabulary,
+            limits.masks, limits.max_mask_node_visits, control),
+        Some(prefill) => prepared.execute_layer_major_with_control(engine, &input.vocabulary,
+            limits.masks, limits.max_mask_node_visits, prefill, control),
+    }.map_err(HostedError::SemanticExtraction)?;
+    check_completion(&result, extraction_work, max_work)?;
+    result.verify_input_encoding(&encoding, initial_encoding_work).map_err(HostedError::SemanticExtraction)?;
+    if engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) {
+        return Err(HostedError::SemanticExtraction(Int8SemanticError::Accounting));
+    }
+    checkpoint(control)?;
+    Ok(result)
+}
+
 impl NlpEngine {
     /// Preserve the real extraction and attach each configured scalar's
     /// complete-source faithfulness judgment. The same-model diagnostic is
@@ -135,46 +209,94 @@ impl NlpEngine {
         prepared: PreparedInt8SemanticExtraction, vocabulary: Arc<ExtractionVocabulary>,
         limits: Int8SemanticHostLimits, cancellation: CancellationToken)
         -> Result<HostedOutput<Int8SemanticExtractionRun>, HostedError> {
+        self.execute_int8_semantic_extract_with_prefill(model, prepared, vocabulary, limits, None, cancellation)
+    }
+
+    /// Reuse bounded prompt morsels through extraction and all correlated
+    /// review heads while retaining complete-source and full-head contracts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_int8_semantic_extract_layer_major(&self, model: &ResidentInt8,
+        prepared: PreparedInt8SemanticExtraction, vocabulary: Arc<ExtractionVocabulary>,
+        limits: Int8SemanticHostLimits, prefill: Int8PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int8SemanticExtractionRun>, HostedError> {
+        self.execute_int8_semantic_extract_with_prefill(model, prepared, vocabulary, limits, Some(prefill), cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_int8_semantic_extract_with_prefill(&self, model: &ResidentInt8,
+        prepared: PreparedInt8SemanticExtraction, vocabulary: Arc<ExtractionVocabulary>,
+        limits: Int8SemanticHostLimits, prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int8SemanticExtractionRun>, HostedError> {
         dispatch::preflight(self, limits.native.run)?;
-        let required = checked_requirements(self, model, &prepared, limits)?;
-        let extraction_work = prepared.extraction_reserved_work();
-        let max_work = prepared.max_model_work();
-        let encoding = prepared.input_encoding().clone();
-        let initial_encoding_work = prepared.input_encoding_work().unwrap_or_default();
-        let lease = self.resources().acquire_lease();
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.preparation_bytes)?,
-            || Ok(SemanticInput { prepared: Some(prepared), vocabulary }))?;
-        let output = Pending::reserve(&lease, MemoryClass::JobBuffers, required.output_bytes)?;
-        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
-        let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.native_workspace_bytes)?;
+        let required = checked_requirements(self, model, &prepared, limits, prefill)?;
+        let admission = admit(self, prepared, vocabulary, required)?;
         let model = model.clone();
         dispatch::run(self, limits.native.run, cancellation, move |control| {
-            let mut input = input;
+            let mut admission = admission;
             checkpoint(control)?;
-            let prepared = input.value.prepared.take().ok_or(HostedError::CompletionMissing)?;
-            let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value
-                .engine(limits.native.context_tokens, memory_budget(required.native)).map_err(HostedError::Model))?;
-            let result = allocate(output, || {
-                let result = prepared.execute_with_control(&mut engine.value, &input.value.vocabulary,
-                    limits.masks, limits.max_mask_node_visits, control).map_err(HostedError::SemanticExtraction)?;
-                check_completion(&result, extraction_work, max_work)?;
-                result.verify_input_encoding(&encoding, initial_encoding_work).map_err(HostedError::SemanticExtraction)?;
-                if engine.value.is_poisoned() || !engine.value.kv_cache().all_slots_have_len(0) {
-                    return Err(HostedError::SemanticExtraction(Int8SemanticError::Accounting));
-                }
-                checkpoint(control)?;
-                Ok(result)
-            })?;
+            let mut engine = model.inner.loaded.value.engine(limits.native.context_tokens,
+                memory_budget(required.native)).map_err(HostedError::Model)?;
+            admission.commit_native()?;
+            let result = execute_prepared(&mut admission.input.value, &mut engine, limits, prefill, control)?;
             drop(engine);
-            drop(input);
-            drop(lease);
-            Ok(GuardedOutput::new(result.value, result._memory))
+            admission.finish(result)
         })
+    }
+
+    /// One persistent numerical team covers extraction and every review.
+    /// Width includes the coordinator; no child is admitted anew per field,
+    /// and no combined output escapes before complete physical worker join.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_int8_semantic_extract_with_threads(&self, model: &ResidentInt8,
+        prepared: PreparedInt8SemanticExtraction, vocabulary: Arc<ExtractionVocabulary>,
+        limits: Int8SemanticHostLimits, kernel: Int8Kernel, compute_threads: usize,
+        cancellation: CancellationToken) -> Result<HostedInt8TeamResult<Int8SemanticExtractionRun>, HostedError> {
+        self.execute_int8_semantic_extract_team(model, prepared, vocabulary, limits,
+            kernel, compute_threads, None, cancellation)
+    }
+
+    /// Keep that same team and one admitted prompt workspace across the whole
+    /// request. Shared cancellation, exact JSON, full-vocabulary scores and
+    /// the all-judges preflight barrier remain unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_int8_semantic_extract_layer_major_with_threads(&self, model: &ResidentInt8,
+        prepared: PreparedInt8SemanticExtraction, vocabulary: Arc<ExtractionVocabulary>,
+        limits: Int8SemanticHostLimits, kernel: Int8Kernel, compute_threads: usize,
+        prefill: Int8PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8SemanticExtractionRun>, HostedError> {
+        self.execute_int8_semantic_extract_team(model, prepared, vocabulary, limits,
+            kernel, compute_threads, Some(prefill), cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_int8_semantic_extract_team(&self, model: &ResidentInt8,
+        prepared: PreparedInt8SemanticExtraction, vocabulary: Arc<ExtractionVocabulary>,
+        limits: Int8SemanticHostLimits, kernel: Int8Kernel, compute_threads: usize,
+        prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8SemanticExtractionRun>, HostedError> {
+        dispatch::preflight_int8_team(self, limits.native.run, compute_threads)?;
+        let required = checked_requirements(self, model, &prepared, limits, prefill)?;
+        let max_batch_rows = prefill.map_or(1, |limits| limits.max_batch_rows);
+        sum(&[required.total_bytes()?,
+            dispatch::int8_prefill_team_workspace_bytes(compute_threads, max_batch_rows)?])?;
+        let admission = admit(self, prepared, vocabulary, required)?;
+        dispatch::run_int8_prefill_team(self, limits.native.run, cancellation, model.clone(),
+            compute_threads, kernel, max_batch_rows, admission, move |model, admission, control, team| {
+                checkpoint(control)?;
+                let mut engine = model.engine(limits.native.context_tokens, memory_budget(required.native))
+                    .map_err(HostedError::Model)?.with_kernel(kernel)
+                    .with_projection_executor(team).map_err(HostedError::Native)?;
+                admission.commit_native()?;
+                let result = execute_prepared(&mut admission.input.value, &mut engine, limits, prefill, control)?;
+                drop(engine);
+                let compute = team.stats().into();
+                Ok(HostedInt8TeamResult::from_guarded(admission.finish(result)?, compute))
+            })
     }
 }
 
 fn checked_requirements(host: &NlpEngine, model: &ResidentInt8,
-    prepared: &PreparedInt8SemanticExtraction, limits: Int8SemanticHostLimits)
+    prepared: &PreparedInt8SemanticExtraction, limits: Int8SemanticHostLimits, prefill: Option<Int8PrefillLimits>)
     -> Result<Int8SemanticHostRequirements, HostedError> {
     host.check_resident_domain(model)?;
     for identity in [prepared.execution_identity(), prepared.judge_identity()] {
@@ -187,8 +309,9 @@ fn checked_requirements(host: &NlpEngine, model: &ResidentInt8,
         || !fits(work, prepared.max_model_work()) {
         return Err(HostedError::Limits("INT8 semantic original extraction reservation and full-head policy"));
     }
-    limits.requirements_with_encoding(prepared.extraction_budget(), prepared.judge_budget(),
-        prepared.semantic_limits(), prepared.judge_planning_limits(), prepared.source_bytes(), prepared.input_encoding())
+    limits.requirements_with_schedule(prepared.extraction_budget(), prepared.judge_budget(),
+        prepared.semantic_limits(), prepared.judge_planning_limits(), prepared.source_bytes(),
+        prepared.input_encoding(), prefill)
 }
 fn check_completion(run: &Int8SemanticExtractionRun, extraction: Int8Work, ceiling: Int8Work)
     -> Result<(), HostedError> {
