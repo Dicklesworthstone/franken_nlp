@@ -93,6 +93,58 @@ impl Write for NoWrite {
 fn invalid_schema_path_is_refused_before_input_or_output() {
     assert_eq!(command("extract", &["--schema", "-"]).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
 }
+#[test]
+fn document_prompt_morsels_and_workers_preserve_task_and_whole_document_budgets() {
+    let serial = extract(&[]);
+    let (_, baseline) = serial.validate().unwrap();
+    for width in ["1", "2", "7", "64"] {
+        for rows in ["1", "4", "64"] {
+            let mut c = extract(&["--compute-threads", width, "--prefill-rows", rows]);
+            c.host.memory_mib = 16384;
+            let (args, limits) = c.validate().unwrap();
+            let prefill = c.extraction.prefill().unwrap().unwrap();
+            assert_eq!(limits.compute.threads, width.parse::<usize>().unwrap());
+            assert_eq!(args.compute.admit_prefill(Some(prefill)).unwrap(), limits.compute);
+            assert_eq!(prefill.max_batch_rows, rows.parse::<usize>().unwrap());
+            assert_eq!(c.host.task_budget(limits), serial.host.task_budget(baseline));
+            assert_eq!(c.work_ceiling(), serial.work_ceiling());
+            assert_eq!(c.max_total_mask_node_visits, serial.max_total_mask_node_visits);
+            assert_eq!(c.extraction_mapping().unwrap().verification, serial.extraction_mapping().unwrap().verification);
+        }
+    }
+}
+#[test]
+fn invalid_or_unfunded_document_schedules_refuse_before_private_io() {
+    for flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+        vec!["--prefill-rows", "0"], vec!["--prefill-rows", "65"],
+        vec!["--compute-threads", "4", "--prefill-rows", "4", "--max-weight-mib", "8192"]] {
+        assert_eq!(extract(&flags).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+    }
+    for task in ["ner", "keyphrases", "summarize"] {
+        assert_eq!(command(task, &["--compute-threads", "2"]).execute(&mut NoRead, &mut NoWrite),
+            Err(CandidateError::Arguments));
+    }
+}
+#[test]
+fn scheduled_document_peak_accounts_for_prompt_workers_and_the_complete_frontier() {
+    let mut c = extract(&["--compute-threads", "4", "--prefill-rows", "4"]);
+    c.host.memory_mib = 16384;
+    let (args, mut limits) = c.validate().unwrap();
+    let peak = c.extraction.schedule_peak_bytes(&c, &args, limits).unwrap();
+    limits.memory_bytes = peak;
+    c.extraction.check_schedule_memory(&c, &args, limits).unwrap();
+    limits.memory_bytes -= 1;
+    assert_eq!(c.extraction.check_schedule_memory(&c, &args, limits), Err(CandidateError::Arguments));
+    let mut no_children = limits; no_children.compute.workspace_bytes = 0;
+    assert_eq!(peak - c.extraction.schedule_peak_bytes(&c, &args, no_children).unwrap(),
+        limits.compute.workspace_bytes);
+    let mut larger = c;
+    larger.max_chunks += 1;
+    let per_chunk = larger.host.max_result_bytes as u64 * 4 + args.max_new_tokens as u64 * 16;
+    assert_eq!(larger.extraction.schedule_peak_bytes(&larger, &args, limits).unwrap() - peak, per_chunk);
+    larger.reduction_reserve_mib = u64::MAX;
+    assert_eq!(larger.extraction.schedule_peak_bytes(&larger, &args, limits), Err(CandidateError::Arguments));
+}
 #[cfg(not(feature = "asupersync-runtime"))]
 #[test]
 fn disabled_runtime_never_opens_schema_source_model_or_output() {

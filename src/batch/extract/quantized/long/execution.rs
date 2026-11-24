@@ -1,6 +1,7 @@
 //! One native engine/control, ordered immutable values and independently lifted fields.
 use super::*;
 use std::cell::RefCell;
+use crate::native_engine::strict_int8::prefill::Int8PrefillLimits;
 
 impl PreparedInt8ExtractionMap<'_> {
     fn preflight_driver<D: Driver>(&self, admitted: &[ExecutionIdentity], driver: &D) -> Result<(), Int8SourceMapError> {
@@ -19,6 +20,17 @@ impl PreparedInt8ExtractionMap<'_> {
         engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
         -> Result<Int8ExtractionMapRun, Int8SourceMapError> {
         self.execute_with_driver(admitted, NativeDriver { engine, vocabulary }, control)
+    }
+    /// Bounded prompt morsels for every exact-schema chunk. The caller owns
+    /// one additional prefill reservation across the entire document; neither
+    /// model work, source verification nor mask allowances renew per chunk.
+    /// The same sealed plans, finalizers and original-coordinate checks apply.
+    pub fn execute_layer_major_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary,
+        prefill: Int8PrefillLimits, control: &mut C) -> Result<Int8ExtractionMapRun, Int8SourceMapError> {
+        step(control)?;
+        prefill.validate().map_err(|_| Int8SourceMapError::InvalidLimits)?;
+        self.execute_with_driver(admitted, LayerMajorDriver { engine, vocabulary, prefill }, control)
     }
     // Private fault-injection seam only; public execution always owns the real
     // native extraction driver and cannot accept a fabricated map result.
@@ -57,6 +69,21 @@ impl PreparedInt8ExtractionMap<'_> {
         check_size(&run, self.max_result_bytes()).map_err(Int8SourceError::from)?;
         step(&mut **control.borrow_mut())?;
         Ok(run)
+    }
+}
+
+struct LayerMajorDriver<'e, 'weights, 'v> {
+    engine: &'e mut StrictInt8Engine<'weights>,
+    vocabulary: &'v ExtractionVocabulary,
+    prefill: Int8PrefillLimits,
+}
+impl Driver for LayerMajorDriver<'_, '_, '_> {
+    fn capacity(&self) -> usize { self.engine.kv_cache().capacity_positions() }
+    fn clean(&self) -> bool { !self.engine.is_poisoned() && self.engine.kv_cache().all_slots_have_len(0) }
+    fn execute<C: DecodeStepControl>(&mut self, prepared: &PreparedInt8BatchExtraction,
+        identity: &ExecutionIdentity, budget: Int8JsonBudget, control: &mut C)
+        -> Result<Int8ExtractRun, Int8ExtractError> {
+        prepared.plan.execute_layer_major(self.engine, identity, self.vocabulary, budget, self.prefill, control)
     }
 }
 

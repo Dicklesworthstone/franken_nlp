@@ -3,8 +3,9 @@
 use super::*;
 use crate::{
     batch::extract::{ExtractionBatchArgs, quantized::{Int8ExtractionBatchPlanner,
-        long::{Int8ExtractionMapLimits, Int8ExtractionMapRun}}},
-    native_engine::{constrained_int8, decode::DecodeStepControl},
+        long::{Int8ExtractionMapLimits, Int8ExtractionMapRun, PreparedInt8ExtractionMap}}},
+    native_engine::{constrained_int8, decode::DecodeStepControl, simd::Int8Kernel,
+        strict_int8::{StrictInt8Engine, prefill::Int8PrefillLimits}},
     tasks::{ir::TaskBudget, source_planning::quantized::{Int8SourceError, long::Int8SourceMapError}},
     validation::grounded_fields::{SourceFieldEvidence, VerifiedSourceSpan},
 };
@@ -28,6 +29,19 @@ struct ExtractionMapInput {
     config: ExtractionMapConfig,
 }
 
+/// All source, output and native charges outlive the scoped callback. Worker
+/// shutdown on cancellation or unwind happens before this aggregate drops.
+struct ExtractionMapAdmission {
+    input: Charged<ExtractionMapInput>,
+    kv: Option<Pending>,
+    scratch: Option<Pending>,
+    output: Option<Pending>,
+    reduction: Option<Pending>,
+    _kv: Option<CommittedMemory>,
+    _scratch: Option<CommittedMemory>,
+    lease: EngineLease,
+}
+
 impl NlpEngine {
     /// Extract independent, exact-schema JSON values from every source chunk.
     /// One physical invocation owns all preparation, native work, cancellation
@@ -38,12 +52,32 @@ impl NlpEngine {
         planner: Arc<Int8ExtractionBatchPlanner>, vocabulary: Arc<ExtractionVocabulary>,
         config: ExtractionMapConfig, cancellation: CancellationToken)
         -> Result<HostedOutput<Int8ExtractionMapRun>, HostedError> {
+        self.extract_int8_document_scheduled(model, source, planner, vocabulary, config, None, cancellation)
+    }
+
+    /// Reuse one charged prompt workspace across every exact-schema chunk.
+    /// This changes only scheduling; complete-document binding, independent
+    /// JSON values and source-coordinate verification retain their authority.
+    #[allow(clippy::too_many_arguments)]
+    pub fn extract_int8_document_layer_major(&self, model: &ResidentInt8, source: String,
+        planner: Arc<Int8ExtractionBatchPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: ExtractionMapConfig, prefill: Int8PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int8ExtractionMapRun>, HostedError> {
+        self.extract_int8_document_scheduled(model, source, planner, vocabulary, config, Some(prefill), cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn extract_int8_document_scheduled(&self, model: &ResidentInt8, source: String,
+        planner: Arc<Int8ExtractionBatchPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: ExtractionMapConfig, prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int8ExtractionMapRun>, HostedError> {
         dispatch::preflight(self, config.native.run)?;
         self.check_resident_domain(model)?;
         planner.map_document_encoding_workspace_bytes().map_err(HostedError::BatchSetup)?;
         let identity = planner.base_execution_identity();
         check_model_identity(model.artifact_identity(), identity)?;
         let required = requirements(config.native)?;
+        let scratch_bytes = scratch_bytes(config.native, required, prefill)?;
         validate(&config, identity, source.len(), required.kv_bytes)?;
         let bytes = input_bytes(source.capacity(), &config, &planner)?;
         let run = config.native.run;
@@ -56,43 +90,19 @@ impl NlpEngine {
             // charge while queued source/schema/compiler storage is still live.
             let input = input;
             let config = &input.value.config;
-            let prepared = input.value.planner.plan_document_with_control(&input.value.source,
-                &config.request, config.limits, control).map_err(HostedError::SourceMap)?;
-            let expected = prepared.preflight_metadata();
-            let count = expected.chunk_count();
+            let (prepared, admitted) = prepare(&input.value, model.artifact_identity(), control)?;
+            let count = prepared.preflight_metadata().chunk_count();
             let reduction = Pending::reserve(&lease, MemoryClass::JobBuffers,
                 reduction_bytes(config, count)?)?;
             let tokens = (count as u64).checked_mul(u64::from(config.request.budget.max_output_tokens))
                 .ok_or(HostedError::Limits("extraction map token arithmetic"))?;
             let output = output_claim(&lease, prepared.max_result_bytes(), tokens)?;
-            let mut admitted = Vec::new();
-            admitted.try_reserve_exact(count)
-                .map_err(|_| HostedError::SourceMap(Int8SourceMapError::Allocation))?;
-            for identity in prepared.execution_identities() {
-                poll(control)?;
-                check_model_identity(model.artifact_identity(), identity)?;
-                check_identity(identity)?;
-                // Compilation may bind prompts/schema/policy, never change the
-                // tokenizer or template belonging to this immutable compiler.
-                let base = input.value.planner.base_execution_identity();
-                if identity.tokenizer_digest != base.tokenizer_digest
-                    || identity.template_digest != base.template_digest {
-                    return Err(HostedError::ModelIdentity);
-                }
-                admitted.push(identity.clone());
-            }
-            poll(control)?;
             let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-            let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-                sum(&[required.rope_bytes, required.scratch_payload_bound, config.native.allocator_reserve_bytes])?)?;
+            let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch_bytes)?;
             let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value
                 .engine(config.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
             let result = allocate(output, || {
-                let result = prepared.execute_with_control(&admitted, &mut engine.value,
-                    &input.value.vocabulary, control).map_err(HostedError::SourceMap)?;
-                expected.verify_completed_with_control(&result, control).map_err(HostedError::SourceMap)?;
-                poll(control)?;
-                Ok(result)
+                execute(prepared, &admitted, &mut engine.value, &input.value.vocabulary, prefill, control)
             })?;
             drop(engine);
             drop(admitted);
@@ -102,6 +112,125 @@ impl NlpEngine {
             Ok(GuardedOutput::new(result.value, result._memory))
         })
     }
+
+    /// Keep one fixed numerical team across all chunks, both model passes and
+    /// constrained decode. Complete results are returned only after worker join.
+    #[allow(clippy::too_many_arguments)]
+    pub fn extract_int8_document_with_threads(&self, model: &ResidentInt8, source: String,
+        planner: Arc<Int8ExtractionBatchPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: ExtractionMapConfig, kernel: Int8Kernel, compute_threads: usize,
+        cancellation: CancellationToken) -> Result<HostedInt8TeamResult<Int8ExtractionMapRun>, HostedError> {
+        self.extract_int8_document_team(model, source, planner, vocabulary, config,
+            kernel, compute_threads, None, cancellation)
+    }
+
+    /// Compose bounded layer-major prompts with the same persistent team used
+    /// for decoding. Coordinator and worker prompt buffers are separate charges.
+    #[allow(clippy::too_many_arguments)]
+    pub fn extract_int8_document_layer_major_with_threads(&self, model: &ResidentInt8, source: String,
+        planner: Arc<Int8ExtractionBatchPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: ExtractionMapConfig, kernel: Int8Kernel, compute_threads: usize,
+        prefill: Int8PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8ExtractionMapRun>, HostedError> {
+        self.extract_int8_document_team(model, source, planner, vocabulary, config,
+            kernel, compute_threads, Some(prefill), cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn extract_int8_document_team(&self, model: &ResidentInt8, source: String,
+        planner: Arc<Int8ExtractionBatchPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: ExtractionMapConfig, kernel: Int8Kernel, compute_threads: usize,
+        prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8ExtractionMapRun>, HostedError> {
+        dispatch::preflight_int8_team(self, config.native.run, compute_threads)?;
+        self.check_resident_domain(model)?;
+        planner.map_document_encoding_workspace_bytes().map_err(HostedError::BatchSetup)?;
+        check_model_identity(model.artifact_identity(), planner.base_execution_identity())?;
+        let required = requirements(config.native)?;
+        validate(&config, planner.base_execution_identity(), source.len(), required.kv_bytes)?;
+        let scratch_bytes = scratch_bytes(config.native, required, prefill)?;
+        let max_batch_rows = prefill.map_or(1, |limits| limits.max_batch_rows);
+        sum(&[scratch_bytes, dispatch::int8_prefill_team_workspace_bytes(compute_threads, max_batch_rows)?])?;
+        let run = config.native.run;
+        let lease = self.resources().acquire_lease();
+        let bytes = input_bytes(source.capacity(), &config, &planner)?;
+        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
+        let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch_bytes)?;
+        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
+            || Ok(ExtractionMapInput { source, planner, vocabulary, config }))?;
+        let admission = ExtractionMapAdmission { input, kv: Some(kv), scratch: Some(scratch),
+            output: None, reduction: None, _kv: None, _scratch: None, lease };
+        let artifact = model.artifact_identity().clone();
+        dispatch::run_int8_prefill_team(self, run, cancellation, model.clone(), compute_threads,
+            kernel, max_batch_rows, admission, move |model, admission, control, team| {
+                let input = &admission.input.value;
+                let config = &input.config;
+                let (prepared, admitted) = prepare(input, &artifact, control)?;
+                let count = prepared.preflight_metadata().chunk_count();
+                admission.reduction = Some(Pending::reserve(&admission.lease, MemoryClass::JobBuffers,
+                    reduction_bytes(config, count)?)?);
+                let tokens = (count as u64).checked_mul(u64::from(config.request.budget.max_output_tokens))
+                    .ok_or(HostedError::Limits("extraction map token arithmetic"))?;
+                admission.output = Some(output_claim(&admission.lease, prepared.max_result_bytes(), tokens)?);
+                let mut engine = model.engine(config.native.context_tokens, memory_budget(required))
+                    .map_err(HostedError::Model)?.with_kernel(kernel)
+                    .with_projection_executor(team).map_err(HostedError::Native)?;
+                admission._kv = Some(admission.kv.take()
+                    .ok_or(HostedError::Limits("extraction map KV admission consumed"))?.commit()?);
+                admission._scratch = Some(admission.scratch.take()
+                    .ok_or(HostedError::Limits("extraction map scratch admission consumed"))?.commit()?);
+                let result = execute(prepared, &admitted, &mut engine, &input.vocabulary, prefill, control)?;
+                drop(engine);
+                let compute = team.stats().into();
+                let output = admission.output.take()
+                    .ok_or(HostedError::Limits("extraction map output admission consumed"))?;
+                let memory = match output.commit() {
+                    Ok(memory) => memory,
+                    Err(error) => { drop(result); return Err(error); }
+                };
+                Ok(HostedInt8TeamResult::from_guarded(GuardedOutput::new(result, memory), compute))
+            })
+    }
+}
+
+fn scratch_bytes(limits: NativeLimits, native: Int8MemoryRequirement, prefill: Option<Int8PrefillLimits>)
+    -> Result<u64, HostedError> {
+    let extra = prefill.map(Int8PrefillLimits::validate).transpose().map_err(HostedError::Native)?.unwrap_or(0);
+    sum(&[native.rope_bytes, native.scratch_payload_bound, limits.allocator_reserve_bytes, extra])
+}
+
+fn prepare<'s>(input: &'s ExtractionMapInput, artifact: &ArtifactIdentity, control: &mut RunControl)
+    -> Result<(PreparedInt8ExtractionMap<'s>, Vec<ExecutionIdentity>), HostedError> {
+    let prepared = input.planner.plan_document_with_control(&input.source,
+        &input.config.request, input.config.limits, control).map_err(HostedError::SourceMap)?;
+    let mut admitted = Vec::new();
+    admitted.try_reserve_exact(prepared.preflight_metadata().chunk_count())
+        .map_err(|_| HostedError::SourceMap(Int8SourceMapError::Allocation))?;
+    for identity in prepared.execution_identities() {
+        poll(control)?;
+        check_model_identity(artifact, identity)?;
+        check_identity(identity)?;
+        let base = input.planner.base_execution_identity();
+        if identity.tokenizer_digest != base.tokenizer_digest || identity.template_digest != base.template_digest {
+            return Err(HostedError::ModelIdentity);
+        }
+        admitted.push(identity.clone());
+    }
+    poll(control)?;
+    Ok((prepared, admitted))
+}
+
+fn execute(prepared: PreparedInt8ExtractionMap<'_>, admitted: &[ExecutionIdentity],
+    engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary,
+    prefill: Option<Int8PrefillLimits>, control: &mut RunControl) -> Result<Int8ExtractionMapRun, HostedError> {
+    let expected = prepared.preflight_metadata();
+    let result = match prefill {
+        None => prepared.execute_with_control(admitted, engine, vocabulary, control),
+        Some(prefill) => prepared.execute_layer_major_with_control(admitted, engine, vocabulary, prefill, control),
+    }.map_err(HostedError::SourceMap)?;
+    expected.verify_completed_with_control(&result, control).map_err(HostedError::SourceMap)?;
+    poll(control)?;
+    Ok(result)
 }
 fn check_identity(identity: &ExecutionIdentity) -> Result<(), HostedError> {
     identity.validate().map_err(|_| HostedError::ModelIdentity)?;

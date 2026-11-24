@@ -202,3 +202,69 @@ fn compact_cli_extraction_preserves_cancellation_at_preflight_and_host_boundarie
         assert_eq!(host_error(HostedError::SourceMap(error.into())), cancelled(cause));
     }
 }
+
+#[test]
+fn document_schedule_envelope_preserves_serial_bytes_and_exact_nested_json_strings() {
+    // Serialization fixture only: these strings are never accepted as native
+    // task success. Decimal spelling, escapes and whitespace must survive the
+    // new compute envelope without a parsed-object round trip or global merge.
+    let exact = [
+        concat!(r#" {"value":0.12345678901234567890123456789012345678,"label":"\u00e9","text":"<tool_call>\r\n上海"} "#, "\r\n"),
+        r#"{"value":0.12345678901234567890123456789012345679,"label":"é"}"#,
+    ];
+    let output = serde_json::json!({"mapped":{"root":{"value":[
+        {"native":{"result":{"output":{"json":exact[0]}}}},
+        {"native":{"result":{"output":{"json":exact[1]}}}},
+    ]}}});
+    let facts = facts();
+    let receipt = crate::hosted::Int8ComputeReceipt { schedule: "int8-output-row-team-v1",
+        compute_threads: 4, completed_projections: 11, completed_rows: 123, completed_worker_rows: 91 };
+    for compact in [false, true] {
+        let cmd = command("extract", &["--schema", "s", "--input-encoding", "safe-bpe-v1",
+            "--max-chunk-bytes", "128", "--max-new-tokens", "16"]);
+        let (planner, request, mapping) = if compact { compact_fixture(&cmd) } else { fixture() };
+        preflight(SOURCE, &request, &planner, mapping, &mut continuing()).unwrap();
+        let report = encoding::extraction_report(&planner).unwrap();
+        let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
+            evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
+            source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
+            quant_recipe: &facts.recipe_id, output: &output };
+        let response = encoding::EncodedResponse { response, input_encoding: report.as_ref() };
+        let mut original = Vec::new();
+        publish_checked(&response, 65536, &mut original, &|| Ok(())).unwrap();
+        for compute in [None, Some(&receipt)] {
+            let scheduled = compute::Response { response: &response, compute };
+            let mut wire = Vec::new();
+            publish_checked(&scheduled, 65536, &mut wire, &|| Ok(())).unwrap();
+            if compute.is_none() { assert_eq!(wire, original); }
+            let decoded: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+            assert_eq!(decoded["output"], output);
+            assert_eq!(decoded.get("compute"), compute.map(|value| serde_json::to_value(value).unwrap()).as_ref());
+            assert_eq!(decoded.get("input_encoding"), report.as_ref().map(|value| serde_json::to_value(value).unwrap()).as_ref());
+            for (index, exact) in exact.iter().enumerate() {
+                assert_eq!(decoded["output"]["mapped"]["root"]["value"][index]
+                    ["native"]["result"]["output"]["json"].as_str().unwrap().as_bytes(), exact.as_bytes());
+            }
+        }
+    }
+}
+
+#[test]
+fn native_team_cancellation_preserves_timeout_classification_through_physical_scope_errors() {
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let expected = match cause { Deadline | Timeout => CandidateError::Timeout,
+            _ => CandidateError::Execution };
+        for scopes in [0, 1, 2] {
+            let mut error = HostedError::Native(crate::native_engine::strict_int8::StrictInt8Error::Cancelled(cause));
+            for _ in 0..scopes {
+                error = HostedError::Scope {
+                    source: asupersync::cx::ScopedCpuError::WorkerCapExceeded { cap: 1 },
+                    physical_error: Some(Box::new(error)),
+                };
+            }
+            assert_eq!(host_error(error), expected);
+        }
+    }
+}

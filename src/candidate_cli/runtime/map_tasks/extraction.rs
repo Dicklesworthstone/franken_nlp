@@ -29,9 +29,11 @@ fn planning_error(error: Int8SourceMapError) -> CandidateError {
 
 pub(super) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+    let prefill = command.extraction.prefill()?;
+    if limits.compute != command.compute.admit_prefill(prefill)? { return Err(CandidateError::Arguments); }
     // Declared before source/schema/compiler allocations: this preparation
     // charge remains live until external serialization, write and flush finish.
-    let session = Session::new(&args, limits)?;
+    let session = Session::new_with_prefill(&args, limits, prefill)?;
     let schema_text = session.read(command.extraction.path()?, input, schema::SCHEMA_BYTES)?;
     let text = session.read(&command.input, input, args.max_input_bytes)?;
     if text.is_empty() { return Err(CandidateError::Input); }
@@ -60,8 +62,22 @@ pub(super) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
     // The actual hosted plans spend the SAME allowance as the discarded CLI
     // preflight. Retain the owner until cumulative usage has been reported.
     let planner = Arc::new(planner);
-    let result = session.engine.extract_int8_document(&model, text, Arc::clone(&planner), vocabulary,
-        config, cancellation).map_err(host_error)?;
+    let result = if limits.compute.threads == 1 {
+        compute::Completion::Serial(match prefill {
+            None => session.engine.extract_int8_document(&model, text, Arc::clone(&planner), vocabulary,
+                config, cancellation),
+            Some(prefill) => session.engine.extract_int8_document_layer_major(&model, text, Arc::clone(&planner),
+                vocabulary, config, prefill, cancellation),
+        }.map_err(host_error)?)
+    } else {
+        let kernel = crate::native_engine::simd::config::process_kernel();
+        compute::Completion::Team(match prefill {
+            None => session.engine.extract_int8_document_with_threads(&model, text, Arc::clone(&planner), vocabulary,
+                config, kernel, limits.compute.threads, cancellation),
+            Some(prefill) => session.engine.extract_int8_document_layer_major_with_threads(&model, text,
+                Arc::clone(&planner), vocabulary, config, kernel, limits.compute.threads, prefill, cancellation),
+        }.map_err(host_error)?)
+    };
     expected.verify_completed_with_control(result.result(), &mut session.control()).map_err(|error| {
         match error.cancellation() {
             Some(DecodeCancellationKind::Deadline | DecodeCancellationKind::Timeout) => CandidateError::Timeout,
@@ -70,8 +86,8 @@ pub(super) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
     })?;
     // Exact native JSON remains a STRING. No serde Value roundtrip, repair,
     // object merge, source-field synthesis or partially successful publication.
-    deliver_encoded(&session, &facts, &result, encoding::extraction_report(&planner)?.as_ref(),
-        command.max_map_result_bytes + 4096, output)
+    deliver_scheduled(&session, &facts, result.result(), encoding::extraction_report(&planner)?.as_ref(),
+        result.compute(), command.max_map_result_bytes + 4096, output)
 }
 
 #[cfg(test)] mod tests;

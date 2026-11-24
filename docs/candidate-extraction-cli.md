@@ -159,8 +159,8 @@ completed physical projections. The exact extraction result remains unchanged
 in shape, including its JSON string and source occurrences. Serial results
 omit this field, retaining the previous default response shape. Output memory
 and the caller's preparation remain held through serialization, writing and
-flushing. These options apply to one-request extraction; extraction corpora
-and retained jobs retain their existing schedules. Numerical equivalence,
+flushing. These options also have the complete-document counterpart below;
+extraction corpora and retained jobs retain their existing schedules. Numerical equivalence,
 extraction quality and measured speed require model-present evidence.
 
 The library offers `execute_int8_extract_layer_major`,
@@ -171,6 +171,48 @@ preparation and native/mask bounds. Threaded variants also take the kernel
 and compute width; the layer-major variant places `Int8PrefillLimits`
 before the cancellation token. The original sequential
 `execute_int8_extract` API retains its existing contract.
+
+## Complete-document extraction with one persistent team
+
+`fnlp candidate map --task extract --schema schema.json` accepts the same
+`--compute-threads 1..=64` and `--prefill-rows 1..=64` options. One admitted team
+and native context span the complete original document, including prompt
+prefill and constrained decoding for every source-aligned chunk. The two
+options can be selected independently; their defaults retain serial execution.
+Other `candidate map` tasks reject these scheduling options before private IO.
+
+Every chunk still uses the exact original schema and the existing independently
+validated extraction plan. The output retains independent JSON strings with
+their original decimal lexemes. Required fields must be satisfiable within
+each chunk; objects are not merged or repaired. Source-membership evidence
+uses original document coordinates. The complete source/result binding is
+checked again before output. Native work, grammar-mask work and independent
+source-verification budgets never renew at a chunk boundary.
+
+Memory admission includes all retained prompts and grammars, both preparation
+owners, worker and coordinator storage, the complete chunk-result frontier,
+source-evidence buffers and final serialization. The CLI checks that complete
+peak before schema, source or model reads. Increase the explicit preparation
+and process ceilings when a larger declared chunk/result frontier requires it;
+fewer prompt tokens do not discount retained schema or original source bytes.
+The host independently reserves the actual prepared operation. Cancellation,
+errors and panic retain those claims until physical worker drain, and any
+failed chunk prevents successful document publication.
+
+Threaded success adds a separate `compute` receipt after join. Existing compact
+input metadata remains separate, and serial responses omit the compute field.
+Result ownership and caller preparation survive serialization, writing and
+flushing. The hosted APIs are `extract_int8_document_with_threads` and
+`extract_int8_document_layer_major_with_threads`; serial prefill uses
+`extract_int8_document_layer_major`. They reuse the same complete-document
+finalizer and exact schema/source identity as `extract_int8_document`.
+
+Regression definitions cover combined schedules, all admitted widths and
+prompt geometry boundaries, complete-frontier memory, one-byte refusal,
+unchanged whole-document limits, exact JSON-string transport and original
+native cancellation categories. These source-reviewed definitions remain
+unexecuted pending the required DSR checkpoint and do not establish model
+parity, extraction quality or measured throughput.
 
 ## Evidence scope
 

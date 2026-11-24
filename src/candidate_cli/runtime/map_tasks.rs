@@ -42,6 +42,7 @@ fn source_error(error: Int8SourceError) -> CandidateError {
 fn host_error(error: HostedError) -> CandidateError {
     match error {
         HostedError::Stopped { stop, .. } => cancelled(stop.kind),
+        HostedError::Native(crate::native_engine::strict_int8::StrictInt8Error::Cancelled(cause)) => cancelled(cause),
         HostedError::Join { physical_error: Some(error), .. }
             | HostedError::Scope { physical_error: Some(error), .. } => host_error(*error),
         HostedError::SourceMap(error) => error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution),
@@ -128,6 +129,11 @@ fn deliver<T: Serialize>(session: &Session, facts: &ArtifactIdentity, result: &T
 fn deliver_encoded<T: Serialize>(session: &Session, facts: &ArtifactIdentity, result: &T,
     input_encoding: Option<&encoding::EncodingReport>, cap: usize, output: &mut impl Write)
     -> Result<(), CandidateError> {
+    deliver_scheduled(session, facts, result, input_encoding, None, cap, output)
+}
+fn deliver_scheduled<T: Serialize>(session: &Session, facts: &ArtifactIdentity, result: &T,
+    input_encoding: Option<&encoding::EncodingReport>, compute: Option<&crate::hosted::Int8ComputeReceipt>,
+    cap: usize, output: &mut impl Write) -> Result<(), CandidateError> {
     session.remaining()?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
         evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
@@ -136,6 +142,7 @@ fn deliver_encoded<T: Serialize>(session: &Session, facts: &ArtifactIdentity, re
     // Both host output ownership and the CLI's aggregate staging reservation
     // remain live through complete serialization, external write and flush.
     let response = encoding::EncodedResponse { response, input_encoding };
+    let response = compute::Response { response: &response, compute };
     publish_checked(&response, cap, output, &|| session.remaining().map(|_| ()))
 }
 

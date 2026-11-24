@@ -179,3 +179,31 @@ fn cancellation_is_typed_and_does_not_echo_schema_or_source() {
     assert!(!diagnostic.contains(&config().request.schema));
     assert!(!diagnostic.contains("host-extraction-map-model-free-fixture"));
 }
+
+#[test]
+fn prompt_workspace_is_additional_to_native_and_worker_storage_for_the_whole_document() {
+    let c = config();
+    let native = requirements(c.native).unwrap();
+    let serial = scratch_bytes(c.native, native, None).unwrap();
+    for rows in [1, 4, 64] {
+        let extra = Int8PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+        let prefill = Int8PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: extra };
+        assert_eq!(scratch_bytes(c.native, native, Some(prefill)).unwrap(), serial + extra);
+        let larger_cap = Int8PrefillLimits { max_extra_scratch_bytes: u64::MAX, ..prefill };
+        assert_eq!(scratch_bytes(c.native, native, Some(larger_cap)).unwrap(), serial + extra);
+        for width in [2, 7, 64] {
+            let worker_bytes = dispatch::int8_prefill_team_workspace_bytes(width, rows).unwrap();
+            assert!(worker_bytes > 0);
+            assert_eq!(sum(&[scratch_bytes(c.native, native, Some(prefill)).unwrap(), worker_bytes]).unwrap(),
+                serial + extra + worker_bytes);
+        }
+        let short = Int8PrefillLimits { max_extra_scratch_bytes: extra - 1, ..prefill };
+        assert!(scratch_bytes(c.native, native, Some(short)).is_err());
+    }
+    for rows in [0, 65, usize::MAX] {
+        assert!(scratch_bytes(c.native, native, Some(Int8PrefillLimits {
+            max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX })).is_err());
+    }
+    let mut native_limits = c.native; native_limits.allocator_reserve_bytes = u64::MAX;
+    assert!(scratch_bytes(native_limits, native, None).is_err());
+}
