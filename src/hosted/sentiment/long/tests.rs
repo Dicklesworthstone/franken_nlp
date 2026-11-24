@@ -343,3 +343,159 @@ fn retained_input_and_guarded_output_can_cross_the_owned_blocking_boundary() {
     let _serial = NlpEngine::map_int8_sentiment;
     let _prefill = NlpEngine::map_int8_sentiment_layer_major;
 }
+
+
+fn prefill(rows: usize) -> Int8PrefillLimits {
+    Int8PrefillLimits { max_batch_rows: rows,
+        max_extra_scratch_bytes: Int8PrefillLimits::required_extra_scratch_bytes(rows).unwrap() }
+}
+
+#[test]
+fn document_schedules_add_both_scratch_owners_without_multiplying_native_storage() {
+    let (mut config, request) = fixture();
+    for chunks in [1, 8, 64] {
+        config.mapping.chunks.max_chunks = chunks;
+        let plain = config.requirements(request.budget, 4, &UntrustedEncoding::ByteFallback).unwrap();
+        for width in [2, 3, 64] {
+            for schedule in [None, Some(prefill(1)), Some(prefill(7)), Some(prefill(64))] {
+                let quote = scheduled_requirements(&config, request.budget, 4,
+                    &UntrustedEncoding::ByteFallback, schedule, Some(width)).unwrap();
+                assert_eq!(quote.native, plain.native);
+                assert_eq!(quote.input_bytes, plain.input_bytes);
+                assert_eq!(quote.output_reservation_bytes, plain.output_reservation_bytes);
+                assert_eq!(quote.task_workspace_bytes, plain.task_workspace_bytes);
+                assert_eq!(quote.workspace_bytes, plain.workspace_bytes
+                    + schedule.map_or(0, |limits| limits.validate().unwrap()));
+                let workers = dispatch::int8_prefill_team_workspace_bytes(
+                    width, schedule.map_or(1, |limits| limits.max_batch_rows)).unwrap();
+                assert!(workers > 0);
+                assert_eq!(scheduled_requirements(&config, request.budget, 4,
+                    &UntrustedEncoding::ByteFallback, schedule, None).unwrap(), quote);
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_team_geometry_and_unfunded_prompt_scratch_refuse_before_dispatch() {
+    let (config, request) = fixture();
+    for width in [0, 1, 65, usize::MAX] {
+        assert!(scheduled_requirements(&config, request.budget, 4,
+            &UntrustedEncoding::ByteFallback, Some(prefill(7)), Some(width)).is_err());
+    }
+    for rows in [0, 65, usize::MAX] {
+        assert!(scheduled_requirements(&config, request.budget, 4,
+            &UntrustedEncoding::ByteFallback,
+            Some(Int8PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX }),
+            Some(2)).is_err());
+    }
+    let short = Int8PrefillLimits { max_extra_scratch_bytes: prefill(7).max_extra_scratch_bytes - 1,
+        ..prefill(7) };
+    assert!(scheduled_requirements(&config, request.budget, 4,
+        &UntrustedEncoding::ByteFallback, Some(short), Some(2)).is_err());
+    let mut overflow = config.clone();
+    overflow.native.allocator_reserve_bytes = u64::MAX;
+    assert!(scheduled_requirements(&overflow, request.budget, 4,
+        &UntrustedEncoding::ByteFallback, Some(prefill(7)), Some(2)).is_err());
+}
+
+struct Continue;
+impl DecodeStepControl for Continue {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
+}
+fn planned_input(model: &ArtifactIdentity, encoding: UntrustedEncoding) -> MapInput {
+    use crate::{native_engine::portable_int8::ProjectionWork,
+        tasks::sentiment::{SentimentOptions, SentimentPolicy}, tokenizer::pinned_controls};
+    let registry = pinned_controls::pinned().unwrap();
+    let eos = registry.template_controls().entries().iter()
+        .find(|entry| entry.surface == crate::template::IM_END).unwrap().id;
+    let planner = SentimentPlanner::pinned(registry.template_controls(), SentimentOptions {
+        mode: crate::native_engine::lmhead::scoring::ScoringMode::FullVocabulary,
+        eos_token_id: eos, policy: SentimentPolicy {
+            minimum_peak_weight_ppm: 0, maximum_normalized_entropy_ppm: 1_000_000 },
+    }).unwrap().with_document_encoding(encoding).unwrap();
+    let (mut config, mut request) = fixture();
+    config.identity.source_revision = model.revision.clone();
+    config.identity.quant_recipe = model.recipe_id.clone();
+    config.identity.logical_model_digest = Sha256Digest::from_hex(&model.logical_model_sha256).unwrap();
+    config.identity.tokenizer_digest = planner.tokenizer_digest();
+    config.identity.template_digest = *planner.template_digest();
+    config.native.context_tokens = 2048;
+    config.native.allocator_reserve_bytes = 64 << 20;
+    config.native.run.max_elapsed = Duration::from_secs(3600);
+    config.native.run.max_checkpoints = 1_000_000_000;
+    request.document = "I love the maps.\r\nThis duplicate charge worries me. Café 上海 <think> literal.".to_owned();
+    request.axes = vec![SentimentAxis::Approach, SentimentAxis::Valence];
+    request.budget.max_input_tokens = 1920;
+    request.budget.max_kv_bytes = Int8MemoryRequirement::for_context(2048).unwrap().kv_bytes * 4;
+    config.mapping.chunks.max_chunk_bytes = 36;
+    config.mapping.chunks.max_chunk_tokens = 1920;
+    config.mapping.chunks.context_tokens = 2048;
+    config.mapping.max_model_work = Int8Work { forward_positions: 262_144,
+        projected_logits: 10_000_000_000, attention_pairs: 1_000_000_000_000,
+        projections: ProjectionWork { dot_products: 10_000_000_000_000_000,
+            multiply_accumulates: 10_000_000_000_000_000 } };
+    MapInput { request, planner: Arc::new(planner), config }
+}
+fn fixture_model() -> ArtifactIdentity {
+    ArtifactIdentity { model_id: "Nanbeige4.2-3B".to_owned(),
+        revision: "f56ec5a9650268aa098496734743c25ea778bd2d".to_owned(),
+        recipe_id: "sentiment-document-team-fixture".to_owned(),
+        source_root_sha256: "ab".repeat(32), logical_model_sha256: "cd".repeat(32) }
+}
+fn compact_encoding() -> UntrustedEncoding {
+    UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 262_144, max_output_tokens: 131_072,
+        max_pair_checks: 4 << 20, max_pair_bytes: 64 << 20,
+    })
+}
+
+#[test]
+fn physical_document_schedules_preserve_all_sealed_chunk_identities_and_work() {
+    let facts = fixture_model();
+    for encoding in [UntrustedEncoding::ByteFallback, compact_encoding()] {
+        let input = planned_input(&facts, encoding);
+        validate_input(&input.request, &input.planner, &input.config, &facts).unwrap();
+        let (plan, identities) = prepare_map(&input, &facts, &mut Continue).unwrap();
+        assert!(plan.chunk_count() > 1);
+        assert_eq!(plan.head_count(), 2);
+        assert_eq!(identities.len(), plan.chunk_count());
+        let sealed = crate::canonjson::canonical_bytes(&identities).unwrap();
+        let work = plan.planned_work();
+        for width in [2, 4, 64] {
+            for schedule in [None, Some(prefill(1)), Some(prefill(7))] {
+                scheduled_requirements(&input.config, input.request.budget, input.request.axes.len(),
+                    input.planner.document_encoding(), schedule, Some(width)).unwrap();
+                let (again, admitted) = prepare_map(&input, &facts, &mut Continue).unwrap();
+                assert_eq!(crate::canonjson::canonical_bytes(&admitted).unwrap(), sealed);
+                assert_eq!(again.planned_work(), work);
+                assert_eq!(again.head_count(), plan.head_count());
+                assert_eq!(again.chunk_count(), plan.chunk_count());
+            }
+        }
+    }
+}
+
+#[test]
+fn original_model_and_planner_binding_are_required_for_both_document_schedules() {
+    let facts = fixture_model();
+    let input = planned_input(&facts, UntrustedEncoding::ByteFallback);
+    for field in 0..4 {
+        let mut config = input.config.clone();
+        match field {
+            0 => config.identity.logical_model_digest = Sha256Digest::of_bytes(b"foreign"),
+            1 => config.identity.tokenizer_digest = Sha256Digest::of_bytes(b"foreign tokenizer"),
+            2 => config.identity.template_digest = Sha256Digest::of_bytes(b"foreign template"),
+            _ => config.identity.task_spec = "classify-v1".to_owned(),
+        }
+        assert!(matches!(validate_input(&input.request, &input.planner, &config, &facts),
+            Err(HostedError::ModelIdentity)), "field {field}");
+    }
+    fn send<T: Send + 'static>() {}
+    send::<MapTeamAdmission>();
+    send::<HostedInt8TeamResult<Int8SentimentMapRun>>();
+    let _team = NlpEngine::map_int8_sentiment_with_threads;
+    let _team_prefill = NlpEngine::map_int8_sentiment_layer_major_with_threads;
+}
+
+mod model;

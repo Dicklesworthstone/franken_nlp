@@ -13,6 +13,7 @@ use crate::{
             },
         },
     },
+    native_engine::strict_int8::prefill::Int8PrefillLimits,
     tokenizer::untrusted::UntrustedEncoding,
 };
 
@@ -21,6 +22,7 @@ pub(crate) struct SentimentMapCommand {
     pub(super) mapping: MappingArgs,
     pub(super) prefill: ScoringPrefillArgs,
     pub(super) encoding: input_encoding::DocumentInputEncodingArgs,
+    pub(super) compute: compute::Args,
 }
 #[derive(Args)]
 pub(super) struct MappingArgs {
@@ -48,7 +50,7 @@ pub(super) fn definition() -> clap::Command {
             .about("Score every chunk of a complete INT8 document and aggregate independent affect dimensions")
             .long_about("Read one strict {document, axes?, policy?} JSON object. Losslessly partition the original source, plan every selected dimension of every chunk, then reuse one admitted native INT8 cache. Every five-bin candidate includes EOS and a full-vocabulary denominator. Whole-document model and tokenizer work never renew per chunk. Output retains all original byte/scalar spans and chunk distributions alongside an original-scalar-weighted mixture, including abstained chunks. Coverage and the original peak/entropy policy govern each aggregate estimate. This descriptive mixture is uncalibrated and is not equivalent to a single full-context model posterior. Any failed chunk, late cancellation or exhausted output allowance returns no completed document. --prefill-rows explicitly uses bounded layer-major prompts without changing the candidate language. No sampling, thinking, tools or caller-supplied chunk scores.");
     let command = ScoringPrefillArgs::augment_args(ScoredArgs::augment_args(command));
-    input_encoding::document_definition(MappingArgs::augment_args(command))
+    compute::definition(input_encoding::document_definition(MappingArgs::augment_args(command)))
         .mut_arg("max_input_bytes", |arg| arg.default_value("1048576"))
         .mut_arg("max_result_bytes", |arg| arg.default_value("65536")
             .help("Complete result ceiling for each native chunk; document output has its own cap"))
@@ -58,7 +60,7 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("max_attention_pairs", |arg| arg.default_value("1000000000000"))
         .mut_arg("max_dot_products", |arg| arg.default_value("10000000000000000"))
         .mut_arg("max_multiply_accumulates", |arg| arg.default_value("10000000000000000"))
-        .after_long_help("Compact input is explicit: --input-encoding safe-bpe-v1 preserves exact source bytes while excluding template-control tokens. One bounded tokenizer ledger covers every successful or rejected sizing probe and every final chunk/dimension plan. --max-tokenizer-input-bytes, --max-tokenizer-output-tokens, --max-tokenizer-pair-checks and --max-tokenizer-pair-bytes apply to that whole preparation, separately from native context and model work. There is no per-chunk reset or fallback. The complete result records the selected policy and actual tokenizer work. Compact prompts make no output-parity, quality or speed claim. The cooperative deadline spans input, model loading, planning, inference, reduction and publication; blocking IO is not preempted.")
+        .after_long_help("Compact input is explicit: --input-encoding safe-bpe-v1 preserves exact source bytes while excluding template-control tokens. One bounded tokenizer ledger covers every successful or rejected sizing probe and every final chunk/dimension plan. --max-tokenizer-input-bytes, --max-tokenizer-output-tokens, --max-tokenizer-pair-checks and --max-tokenizer-pair-bytes apply to that whole preparation, separately from native context and model work. There is no per-chunk reset or fallback. The complete result records the selected policy and actual tokenizer work. --compute-threads 2..=64 reuses one persistent numerical team across every chunk, affect axis and candidate continuation; --prefill-rows uses that same team for bounded prompt morsels. Worker buffers and coordinator prompt scratch are both admitted before private IO. Physical compute counters are reported separately after every worker joins; source binding, score spaces and complete results remain independent of width. Compact prompts make no output-parity, quality or speed claim. The cooperative deadline spans input, model loading, planning, inference, reduction and publication; blocking IO is not preempted.")
 }
 
 pub(super) struct MapLimits {
@@ -68,6 +70,7 @@ pub(super) struct MapLimits {
     pub mapping: Int8SentimentMapLimits,
     pub memory: Int8SentimentMapMemoryRequirement,
     pub encoding: UntrustedEncoding,
+    pub prefill: Option<Int8PrefillLimits>,
     pub envelope_bytes: usize,
 }
 impl SentimentMapCommand {
@@ -77,12 +80,15 @@ impl SentimentMapCommand {
             mapping: MappingArgs::from_arg_matches(matches)?,
             prefill: ScoringPrefillArgs::from_arg_matches(matches)?,
             encoding: input_encoding::DocumentInputEncodingArgs::from_matches(matches)?,
+            compute: compute::Args::from_matches(matches)?,
         })
     }
     pub(super) fn validate(&self) -> Result<MapLimits, CandidateError> {
         let prefill = self.prefill.limits()?;
         let encoding = self.encoding.policy()?;
-        let (common, shared) = self.args.common()?;
+        let (mut common, mut shared) = self.args.common()?;
+        common.compute = self.compute;
+        shared.compute = self.compute.admit_prefill(prefill)?;
         let m = &self.mapping;
         if !(1..=256).contains(&m.max_chunks)
             || !(1..=1_000_000).contains(&m.max_tokenizer_calls)
@@ -148,13 +154,16 @@ impl SentimentMapCommand {
             memory.input_bytes,
             memory.output_reservation_bytes,
             extra,
+            shared.compute.workspace_bytes,
+            shared.weight_bytes,
+            192 * MIB,
             65_536,
         ])?;
-        let loading = 128 * MIB + 64 * MIB + 65_536;
+        // Resident model metadata/allocator ownership survives load. Its
+        // 192-MiB reserve coexists with the complete map and all workers.
+        let loading = checked_sum(&[shared.weight_bytes, 192 * MIB, 64 * 1024, 65_536])?;
         let minimum = checked_sum(&[
             shared.preparation_bytes,
-            shared.weight_bytes,
-            64 * MIB,
             execution.max(loading),
         ])?;
         if minimum > shared.memory_bytes {
@@ -167,6 +176,7 @@ impl SentimentMapCommand {
             mapping,
             memory,
             encoding,
+            prefill,
             envelope_bytes,
         })
     }

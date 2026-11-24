@@ -126,6 +126,8 @@ fn invalid_work_and_resource_axes_refuse_before_any_private_io() {
         vec!["--max-multiply-accumulates", "0"],
         vec!["--prefill-rows", "0"],
         vec!["--prefill-rows", "65"],
+        vec!["--compute-threads", "0"],
+        vec!["--compute-threads", "65"],
         vec!["--max-checkpoints", "1"],
         vec!["--timeout-seconds", "0"],
     ] {
@@ -170,11 +172,12 @@ fn every_declared_buffer_and_optional_prefill_is_in_the_aggregate_quote() {
             + limits.memory.input_bytes
             + limits.memory.output_reservation_bytes
             + extra
-            + 65_536;
-        let minimum = limits.shared.preparation_bytes
+            + limits.shared.compute.workspace_bytes
             + limits.shared.weight_bytes
-            + 64 * MIB
-            + execution.max(192 * MIB + 65_536);
+            + 192 * MIB
+            + 65_536;
+        let loading = limits.shared.weight_bytes + 192 * MIB + 64 * 1024 + 65_536;
+        let minimum = limits.shared.preparation_bytes + execution.max(loading);
         assert!(minimum <= limits.shared.memory_bytes);
         command.args.memory_mib = (minimum - 1) / MIB;
         assert_eq!(
@@ -240,7 +243,6 @@ fn unsupported_execution_modes_are_not_silently_accepted() {
         vec!["--think"],
         vec!["--cohort-heads", "2"],
         vec!["--cohort-chunks", "2"],
-        vec!["--compute-threads", "2"],
         vec!["--tools", "tools.json"],
         vec!["--source-dir", "source"],
         vec!["--schema", "schema.json"],
@@ -268,4 +270,81 @@ fn unavailable_runtime_refuses_before_input_model_or_output_access() {
         command(&[]).execute(&mut NoRead, &mut NoWrite),
         Err(CandidateError::Unavailable)
     );
+}
+
+
+#[test]
+fn explicit_document_teams_compose_with_prefill_and_keep_semantic_limits() {
+    let ordinary = command(&[]).validate().unwrap();
+    assert_eq!(ordinary.shared.compute.threads, 1);
+    assert_eq!(ordinary.shared.compute.workspace_bytes, 0);
+    assert!(ordinary.prefill.is_none());
+    for width in ["1", "2", "4", "64"] {
+        for rows in [None, Some("1"), Some("7"), Some("64")] {
+            let mut flags = vec!["--compute-threads", width];
+            if let Some(rows) = rows { flags.extend(["--prefill-rows", rows]); }
+            let command = command(&flags);
+            let admitted = command.validate().unwrap();
+            assert_eq!(admitted.shared.compute.threads, width.parse::<usize>().unwrap());
+            assert_eq!(admitted.shared.compute,
+                admitted.common.compute.admit_prefill(admitted.prefill).unwrap());
+            assert_eq!(admitted.prefill.map(|p| (p.max_batch_rows, p.max_extra_scratch_bytes)),
+                command.prefill.limits().unwrap().map(|p| (p.max_batch_rows, p.max_extra_scratch_bytes)));
+            assert_eq!(admitted.task, ordinary.task);
+            assert_eq!(admitted.mapping.max_model_work, ordinary.mapping.max_model_work);
+            assert_eq!(admitted.memory, ordinary.memory);
+            assert_eq!(admitted.mapping.chunks, ordinary.mapping.chunks);
+            assert_eq!(admitted.mapping.max_result_bytes, ordinary.mapping.max_result_bytes);
+            assert_eq!(admitted.mapping.max_retained_result_bytes, ordinary.mapping.max_retained_result_bytes);
+            assert_eq!(admitted.encoding, ordinary.encoding);
+            assert_eq!(admitted.shared.compute.workspace_bytes > 0, width != "1");
+        }
+    }
+}
+
+#[test]
+fn document_team_workers_prefill_and_resident_metadata_must_fit_together_before_input() {
+    for width in ["2", "4", "64"] {
+        for rows in [None, Some("1"), Some("7")] {
+            let mut flags = vec!["--compute-threads", width];
+            if let Some(rows) = rows { flags.extend(["--prefill-rows", rows]); }
+            let mut command = command(&flags);
+            let admitted = command.validate().unwrap();
+            let extra = admitted.prefill.map(|p| p.validate().unwrap()).unwrap_or(0);
+            let execution = admitted.shared.weight_bytes + 192 * MIB
+                + admitted.memory.native.kv_bytes + admitted.memory.workspace_bytes
+                + admitted.memory.input_bytes + admitted.memory.output_reservation_bytes
+                + admitted.shared.compute.workspace_bytes + extra + 65_536;
+            let loading = admitted.shared.weight_bytes + 192 * MIB + 64 * 1024 + 65_536;
+            let peak = admitted.shared.preparation_bytes + execution.max(loading);
+            assert!(execution > loading);
+            command.args.memory_mib = (peak - 1) / MIB;
+            assert_eq!(command.execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+        }
+    }
+}
+
+#[test]
+fn compact_document_team_policy_keeps_one_tokenizer_allowance_across_all_chunks() {
+    let flags = ["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "500000",
+        "--max-tokenizer-output-tokens", "400000", "--max-tokenizer-pair-checks", "1000000",
+        "--max-tokenizer-pair-bytes", "16000000"];
+    let serial = command(&flags).validate().unwrap();
+    let mut threaded = flags.to_vec();
+    threaded.extend(["--compute-threads", "4", "--prefill-rows", "7"]);
+    let team = command(&threaded).validate().unwrap();
+    assert_eq!(team.encoding, serial.encoding);
+    assert_eq!(team.memory, serial.memory);
+    assert_eq!(team.task, serial.task);
+    assert_eq!(team.mapping.max_model_work, serial.mapping.max_model_work);
+    assert!(team.shared.compute.workspace_bytes > 0);
+}
+
+#[cfg(not(feature = "asupersync-runtime"))]
+#[test]
+fn unsupported_team_build_refuses_before_private_io_for_every_prompt_schedule() {
+    for flags in [vec!["--compute-threads", "2"],
+        vec!["--compute-threads", "4", "--prefill-rows", "7"]] {
+        assert_eq!(command(&flags).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Unavailable));
+    }
 }
