@@ -224,7 +224,11 @@ impl JsonProgram {
     /// Independent whole-value verification, never acceptance by parser state.
     /// The existing validator receives schema data, not transitions or masks.
     pub fn validate_json(&self, text: &str) -> Result<(), SchemaError> {
-        self.source_fields(text).map(|_| ())
+        match self.validate_json_with_checkpoints(text, || Ok::<(), std::convert::Infallible>(())) {
+            Ok(()) => Ok(()),
+            Err(SourceValidationError::Schema(error)) => Err(error),
+            Err(SourceValidationError::Cancelled(never)) => match never {},
+        }
     }
 
     /// Complete declarative validation for a composed value whose original

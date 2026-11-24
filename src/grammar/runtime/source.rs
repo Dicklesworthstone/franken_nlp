@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::*;
 use crate::grammar::source_index::{SourceBuildError, SourceLanguageLimits};
 use crate::validation::grounded_fields::{
-    GroundingBudget, GroundingScanError, SourceFieldEvidence, verify_source_fields_with_checkpoints,
+    EvidenceMode, GroundingBudget, GroundingScanError, SourceFieldEvidence, verify_source_fields_with_checkpoints,
 };
 
 pub(crate) enum SourceValidationError<E> { Schema(SchemaError), Cancelled(E) }
@@ -95,7 +95,7 @@ impl JsonProgram {
     /// Return all exact occurrences using the validation-owned matcher, not
     /// the suffix index used to constrain token selection. Failure is atomic.
     pub fn source_fields(&self, text: &str) -> Result<Vec<SourceFieldEvidence>, SchemaError> {
-        match self.source_fields_with_checkpoints(text, || Ok::<(), std::convert::Infallible>(())) {
+        match self.check_fields(text, EvidenceMode::Recover, || Ok::<(), std::convert::Infallible>(())) {
             Ok(fields) => Ok(fields),
             Err(SourceValidationError::Schema(error)) => Err(error),
             Err(SourceValidationError::Cancelled(never)) => match never {},
@@ -103,7 +103,12 @@ impl JsonProgram {
     }
     /// Parse and validate the complete value, preserving the request's cancellation
     /// cause across the independent occurrence census for every bound field.
-    pub(crate) fn source_fields_with_checkpoints<E>(&self, text: &str,
+    pub(crate) fn validate_json_with_checkpoints<E>(&self, text: &str,
+        checkpoint: impl FnMut() -> Result<(), E>) -> Result<(), SourceValidationError<E>> {
+        self.check_fields(text, EvidenceMode::CheckOnly, checkpoint).map(drop)
+    }
+
+    fn check_fields<E>(&self, text: &str, mode: EvidenceMode,
         mut checkpoint: impl FnMut() -> Result<(), E>) -> Result<Vec<SourceFieldEvidence>, SourceValidationError<E>> {
         checkpoint().map_err(SourceValidationError::Cancelled)?;
         let value = self.validated_value(text).map_err(SourceValidationError::Schema)?;
@@ -112,7 +117,7 @@ impl JsonProgram {
             return Ok(Vec::new());
         };
         verify_source_fields_with_checkpoints(self.schema.root(), &value, binding.language.source(),
-            binding.limits.verification, checkpoint).map_err(|error| match error {
+            binding.limits.verification, mode, checkpoint).map_err(|error| match error {
                 GroundingScanError::Checkpoint(cause) => SourceValidationError::Cancelled(cause),
                 GroundingScanError::Verification(error) => SourceValidationError::Schema(SchemaError::Validation {
                     pointer: "$".to_owned(), reason: error.to_string(),

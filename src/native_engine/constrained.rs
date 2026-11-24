@@ -92,9 +92,9 @@ impl Error for JsonDecodeError {}
 /// sampling. Source membership can take many complete scans after scored EOS.
 pub(crate) fn checked_source_fields(program: &JsonProgram, json: &str,
     control: &mut impl DecodeStepControl, step: usize,
-) -> Result<Vec<crate::validation::grounded_fields::SourceFieldEvidence>, JsonDecodeError> {
+) -> Result<(), JsonDecodeError> {
     use crate::grammar::runtime::SourceValidationError;
-    program.source_fields_with_checkpoints(json, || match control.checkpoint(step) {
+    program.validate_json_with_checkpoints(json, || match control.checkpoint(step) {
         Some(cause) => Err(cause),
         None => Ok(()),
     }).map_err(|error| match error {

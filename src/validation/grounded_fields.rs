@@ -86,7 +86,7 @@ impl<E: Error + 'static> Error for GroundingScanError<E> {
 pub fn verify_source_fields(
     schema: &SchemaNode, value: &JsonValue, source: &str, budget: GroundingBudget,
 ) -> Result<Vec<SourceFieldEvidence>, FieldGroundingError> {
-    match verify_source_fields_with_checkpoints(schema, value, source, budget,
+    match verify_source_fields_with_checkpoints(schema, value, source, budget, EvidenceMode::Recover,
         || Ok::<(), std::convert::Infallible>(())) {
         Ok(fields) => Ok(fields),
         Err(GroundingScanError::Verification(error)) => Err(error),
@@ -94,20 +94,25 @@ pub fn verify_source_fields(
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum EvidenceMode { Recover, CheckOnly }
+
 pub(crate) fn verify_source_fields_with_checkpoints<E>(
     schema: &SchemaNode, value: &JsonValue, source: &str, budget: GroundingBudget,
+    mode: EvidenceMode,
     mut checkpoint: impl FnMut() -> Result<(), E>,
 ) -> Result<Vec<SourceFieldEvidence>, GroundingScanError<E>> {
-    let mut state = Verification { source, budget, fields: Vec::new() };
+    let fields = match mode { EvidenceMode::Recover => Some(Vec::new()), EvidenceMode::CheckOnly => None };
+    let mut state = Verification { source, budget, fields };
     state.walk(schema, value, "$", 0, &mut checkpoint)?;
     checkpoint().map_err(GroundingScanError::Checkpoint)?;
-    Ok(state.fields)
+    Ok(state.fields.unwrap_or_default())
 }
 
 struct Verification<'a> {
     source: &'a str,
     budget: GroundingBudget,
-    fields: Vec<SourceFieldEvidence>,
+    fields: Option<Vec<SourceFieldEvidence>>,
 }
 impl Verification<'_> {
     fn walk<E>(&mut self, schema: &SchemaNode, value: &JsonValue, path: &str, depth: usize,
@@ -116,20 +121,27 @@ impl Verification<'_> {
         if depth > 128 { return Err(FieldGroundingError::Shape.into()); }
         match (schema, value) {
             (SchemaNode::String { source: SourceAnnotation::Verbatim, .. }, JsonValue::String(text)) => {
-                if self.fields.len() == self.budget.max_fields { return Err(FieldGroundingError::FieldBudget.into()); }
-                let spans = scan_occurrences_with_checkpoints(self.source, text, &mut self.budget, &mut *checkpoint)?;
-                let occurrence = if spans.len() == 1 { SourceOccurrence::Anchored } else { SourceOccurrence::Ambiguous };
-                self.fields.try_reserve(1).map_err(|_| FieldGroundingError::AllocationRefused)?;
-                self.fields.push(SourceFieldEvidence { json_pointer: path.to_owned(), occurrence, spans });
+                self.budget.max_fields = self.budget.max_fields.checked_sub(1).ok_or(FieldGroundingError::FieldBudget)?;
+                let mut spans = Vec::new();
+                scan(self.source, text, &mut self.budget, self.fields.is_some().then_some(&mut spans), &mut *checkpoint)?;
+                if let Some(fields) = &mut self.fields {
+                    let occurrence = if spans.len() == 1 { SourceOccurrence::Anchored } else { SourceOccurrence::Ambiguous };
+                    fields.try_reserve(1).map_err(|_| FieldGroundingError::AllocationRefused)?;
+                    fields.push(SourceFieldEvidence { json_pointer: path.to_owned(), occurrence, spans });
+                }
             }
             (SchemaNode::Object { properties, .. }, JsonValue::Object(values)) => {
                 for (name, value) in values {
                     let child = properties.get(name).ok_or(FieldGroundingError::Shape)?;
-                    self.walk(child, value, &pointer(path, &name.replace('~', "~0").replace('/', "~1")), depth + 1, checkpoint)?;
+                    let child_path = self.fields.is_some().then(|| pointer(path, &name.replace('~', "~0").replace('/', "~1")));
+                    self.walk(child, value, child_path.as_deref().unwrap_or(""), depth + 1, checkpoint)?;
                 }
             }
             (SchemaNode::Array { items, .. }, JsonValue::Array(values)) => {
-                for (i, value) in values.iter().enumerate() { self.walk(items, value, &pointer(path, &i.to_string()), depth + 1, checkpoint)?; }
+                for (i, value) in values.iter().enumerate() {
+                    let child_path = self.fields.is_some().then(|| pointer(path, &i.to_string()));
+                    self.walk(items, value, child_path.as_deref().unwrap_or(""), depth + 1, checkpoint)?;
+                }
             }
             (SchemaNode::String { .. }, JsonValue::String(_))
             | (SchemaNode::Number { .. }, JsonValue::Number(_))
@@ -160,7 +172,17 @@ pub fn scan_occurrences(source: &str, text: &str, budget: &mut GroundingBudget) 
 /// retains its full original work debit on cancellation; it never publishes a
 /// partial occurrence set or refunds work for an unsuccessful search.
 pub fn scan_occurrences_with_checkpoints<E>(source: &str, text: &str, budget: &mut GroundingBudget,
-    mut checkpoint: impl FnMut() -> Result<(), E>) -> Result<Vec<VerifiedSourceSpan>, GroundingScanError<E>> {
+    checkpoint: impl FnMut() -> Result<(), E>) -> Result<Vec<VerifiedSourceSpan>, GroundingScanError<E>> {
+    let mut spans = Vec::new();
+    scan(source, text, budget, Some(&mut spans), checkpoint)?;
+    Ok(spans)
+}
+
+/// Always prove presence and enforce the complete overlapping-match budget.
+/// Decoders checking only validity do not allocate a vector of coordinates.
+fn scan<E>(source: &str, text: &str, budget: &mut GroundingBudget,
+    mut spans: Option<&mut Vec<VerifiedSourceSpan>>, mut checkpoint: impl FnMut() -> Result<(), E>,
+) -> Result<(), GroundingScanError<E>> {
     checkpoint().map_err(GroundingScanError::Checkpoint)?;
     let mut until_checkpoint = SCAN_CHECKPOINT_STEPS;
     let mut step = || -> Result<(), GroundingScanError<E>> {
@@ -174,11 +196,15 @@ pub fn scan_occurrences_with_checkpoints<E>(source: &str, text: &str, budget: &m
     let cost = (source.len() as u64).checked_add(text.len() as u64)
         .and_then(|n| n.checked_add(1)).and_then(|n| n.checked_mul(8)).ok_or(FieldGroundingError::WorkBudget)?;
     budget.max_scan_steps = budget.max_scan_steps.checked_sub(cost).ok_or(FieldGroundingError::WorkBudget)?;
-    let mut output = Vec::new();
+    let mut matches = 0;
     let mut push = |span| -> Result<(), FieldGroundingError> {
-        if output.len() == budget.max_matches { return Err(FieldGroundingError::MatchBudget); }
-        output.try_reserve(1).map_err(|_| FieldGroundingError::AllocationRefused)?;
-        output.push(span); Ok(())
+        if matches == budget.max_matches { return Err(FieldGroundingError::MatchBudget); }
+        if let Some(output) = &mut spans {
+            output.try_reserve(1).map_err(|_| FieldGroundingError::AllocationRefused)?;
+            output.push(span);
+        }
+        matches += 1;
+        Ok(())
     };
     if text.is_empty() {
         for (scalar, byte) in source.char_indices().map(|(i, _)| i).chain(std::iter::once(source.len())).enumerate() {
@@ -227,9 +253,9 @@ pub fn scan_occurrences_with_checkpoints<E>(source: &str, text: &str, budget: &m
     drop(push);
     drop(step);
     checkpoint().map_err(GroundingScanError::Checkpoint)?;
-    if output.is_empty() { return Err(FieldGroundingError::Absent.into()); }
-    budget.max_matches -= output.len();
-    Ok(output)
+    if matches == 0 { return Err(FieldGroundingError::Absent.into()); }
+    budget.max_matches -= matches;
+    Ok(())
 }
 
 const SCAN_CHECKPOINT_STEPS: usize = 4096;
@@ -238,6 +264,29 @@ const SCAN_CHECKPOINT_STEPS: usize = 4096;
 mod tests {
     use super::*;
     use crate::{grammar::{compile_json_schema, CompileLimits}, validation::{parse_json, validate_source_span, SourceSpan}};
+
+    #[test]
+    fn check_only_enforces_the_same_aggregate_field_match_and_scan_limits() {
+        let schema = compile_json_schema(r#"{"type":"array","maxItems":4,"items":{"type":"string","x-fnlp-source":"verbatim"}}"#,
+            CompileLimits::default()).unwrap();
+        let source = "éaaaa";
+        let value = parse_json(r#"["aa","é",""]"#).unwrap();
+        // Three overlapping pairs, one accent, and six empty boundary spans.
+        let exact = GroundingBudget { max_fields: 3, max_matches: 10,
+            max_scan_steps: 8 * (3 * (source.len() as u64 + 1) + 4) };
+        for (budget, expected) in [
+            (exact, Ok(())),
+            (GroundingBudget { max_matches: 9, ..exact }, Err(FieldGroundingError::MatchBudget)),
+            (GroundingBudget { max_fields: 2, ..exact }, Err(FieldGroundingError::FieldBudget)),
+            (GroundingBudget { max_scan_steps: exact.max_scan_steps - 1, ..exact }, Err(FieldGroundingError::WorkBudget)),
+        ] {
+            let recover = verify_source_fields(schema.root(), &value, source, budget);
+            assert_eq!(recover.as_ref().map(|_| ()).map_err(|error| *error), expected);
+            let checked = verify_source_fields_with_checkpoints(schema.root(), &value, source,
+                budget, EvidenceMode::CheckOnly, || Ok::<(), ()>(()));
+            assert_eq!(checked, expected.map(|_| Vec::new()).map_err(GroundingScanError::Verification));
+        }
+    }
 
     #[test]
     fn checkpointed_scans_preserve_complete_unicode_overlap_and_budget_results() {
