@@ -14,52 +14,47 @@ impl NlpEngine {
         limits: JobHostLimits, reader: R, cancellation: CancellationToken)
         -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
-        self.check_resident_domain(model)?;
-        let encoder_bytes = planner.encoding_workspace_bytes().map_err(HostedError::BatchSetup)?;
-        let bytes = sum(&[limits.required_buffer_bytes_for_input(request.limits, request.mode.input_memory())?,
-            encoder_bytes])?;
-        let required = requirements(limits.native)?;
-        check_model_identity(model.artifact_identity(), planner.execution_identity())?;
-        check_storage(planner.task_ceiling(), request.limits, required.kv_bytes)?;
-        let lease = self.resources().acquire_lease();
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
-            || Ok(StreamInput { planner: Some((planner, vocabulary, request)), reader, writer: () }))?;
-        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-        let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound, limits.native.allocator_reserve_bytes])?)?;
-        let model = model.clone();
-        let completed = dispatch::run(self, limits.native.run, cancellation, move |control| {
-            let mut input = input; // Capture the complete storage-before-charge package.
-            let (planner, vocabulary, request) = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
-            let population = match read_population(&mut input.value.reader, &request,
-                limits.transport, control) {
-                Ok(population) => population,
-                Err(error) => return Ok(Err(JobRunError::Storage(error))),
-            };
-            let mut engine = allocate_native(kv, workspace, || model.inner.loaded.value
-                .engine(limits.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            let admission = CorpusAdmission { lease: &lease, model: model.artifact_identity(),
-                kv_bytes: required.kv_bytes, sampler_bytes: 0, output_bytes: request.limits.max_result_bytes as u64 };
-            let result = (|| {
-                let processor = Int8ExtractionJobProcessor::new(planner, &mut engine.value, &vocabulary, admission)
-                    .map_err(JobRunError::Processor)?;
-                // The exact recipe/original population authenticates BEFORE
-                // resume can repair a tail or admit any pending native work.
-                run_population(request, &population, processor, control)
-            })();
-            // Journal/spool/lock and processor drop inside run_population.
-            // Result guards have already survived spool sync + journal commit.
-            drop(engine);
-            drop(population);
-            drop(vocabulary);
-            drop(input);
-            drop(lease);
-            Ok(result)
-        })?;
-        completed.map_err(HostedJobError::Job)
+        self.job_int8_extract_scheduled(model, planner, vocabulary, request, limits,
+            None, None, reader, cancellation)
+    }
+
+    /// Run the authenticated schema job with optional bounded prompt morsels
+    /// and one persistent projection team. The planner retains its exact
+    /// schema, encoding ledger and resume commitment across scheduling choices.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int8_extract_scheduled<R>(&self, model: &ResidentInt8, planner: Int8ExtractionJobPlanner,
+        vocabulary: Arc<ExtractionVocabulary>, request: SourceJobRequest, limits: JobHostLimits,
+        prefill: Option<Int8PrefillLimits>, team: Option<(Int8Kernel, usize)>, reader: R,
+        cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        scored::run(self, model, ExtractionJobTask { planner, vocabulary }, request, limits,
+            prefill, team, reader, cancellation)
     }
 }
+
+struct ExtractionJobTask {
+    planner: Int8ExtractionJobPlanner,
+    vocabulary: Arc<ExtractionVocabulary>,
+}
+
+impl scored::Int8JobTask for ExtractionJobTask {
+    fn identity(&self) -> &ExecutionIdentity { self.planner.execution_identity() }
+    fn validate(&self, native: Int8MemoryRequirement, job: JobLimits) -> Result<(), HostedError> {
+        check_storage(self.planner.task_ceiling(), job, native.kv_bytes)
+    }
+    fn preparation_workspace_bytes(&self) -> Result<u64, HostedError> {
+        self.planner.encoding_workspace_bytes().map_err(HostedError::BatchSetup)
+    }
+    fn execute(self, engine: &mut StrictInt8Engine<'_>, admission: CorpusAdmission<'_>,
+        request: SourceJobRequest, population: &Population<'_>, prefill: Option<Int8PrefillLimits>,
+        control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
+        let result = Int8ExtractionJobProcessor::scheduled(self.planner, engine, &self.vocabulary,
+            admission, prefill).map_err(JobRunError::Processor)
+            .and_then(|processor| run_population(request, population, processor, control));
+        Ok(result)
+    }
+}
+
 fn check_storage(task: crate::tasks::ir::TaskBudget, job: JobLimits, kv: u64) -> Result<(), HostedError> {
     if kv == 0 || kv > task.max_kv_bytes || task.max_output_bytes > job.max_result_bytes as u64 {
         return Err(HostedError::Limits("extraction job whole KV and stored-result envelope"));

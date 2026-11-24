@@ -1,11 +1,12 @@
-//! One physical lifetime for authenticated INT8 scoring jobs.
+//! One physical lifetime for authenticated INT8 jobs.
 //! Private task adapters reuse the existing spool-first/journal-second runner.
 use super::*;
 use crate::native_engine::strict_int8::projection::Int8ProjectionExecutor;
 
-pub(in crate::hosted::corpus) trait ScoredJobTask: Send + Sized + 'static {
+pub(in crate::hosted::corpus) trait Int8JobTask: Send + Sized + 'static {
     fn identity(&self) -> &ExecutionIdentity;
     fn validate(&self, native: Int8MemoryRequirement, job: JobLimits) -> Result<(), HostedError>;
+    fn preparation_workspace_bytes(&self) -> Result<u64, HostedError> { Ok(0) }
     fn execute(self, engine: &mut StrictInt8Engine<'_>, admission: CorpusAdmission<'_>,
         request: SourceJobRequest, population: &Population<'_>, prefill: Option<Int8PrefillLimits>,
         control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError>;
@@ -25,9 +26,9 @@ impl Requirements {
     }
 }
 fn quote(limits: JobHostLimits, job: JobLimits, input: JobInputMemory,
-    native: Int8MemoryRequirement, prefill: Option<Int8PrefillLimits>, width: Option<usize>)
+    native: Int8MemoryRequirement, task_bytes: u64, prefill: Option<Int8PrefillLimits>, width: Option<usize>)
     -> Result<Requirements, HostedJobError> {
-    let input_bytes = limits.required_buffer_bytes_for_input(job, input)?;
+    let input_bytes = sum(&[limits.required_buffer_bytes_for_input(job, input)?, task_bytes])?;
     let scratch_bytes = crate::hosted::scored::scoring_scratch(sum(&[native.rope_bytes,
         native.scratch_payload_bound, limits.native.allocator_reserve_bytes])?, prefill)?;
     let max_batch_rows = prefill.map_or(1, |limits| limits.max_batch_rows);
@@ -58,7 +59,7 @@ pub(in crate::hosted::corpus) fn run<P, R>(host: &NlpEngine, model: &ResidentInt
     task: P, request: SourceJobRequest, limits: JobHostLimits,
     prefill: Option<Int8PrefillLimits>, team: Option<(Int8Kernel, usize)>,
     reader: R, cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
-where P: ScoredJobTask, R: BufRead + Send + 'static {
+where P: Int8JobTask, R: BufRead + Send + 'static {
     match team {
         None => dispatch::preflight(host, limits.native.run)?,
         Some((_, width)) => dispatch::preflight_int8_team(host, limits.native.run, width)?,
@@ -68,7 +69,7 @@ where P: ScoredJobTask, R: BufRead + Send + 'static {
     let native = requirements(limits.native)?;
     task.validate(native, request.limits)?;
     let required = quote(limits, request.limits, request.mode.input_memory(),
-        native, prefill, team.map(|(_, width)| width))?;
+        native, task.preparation_workspace_bytes()?, prefill, team.map(|(_, width)| width))?;
     let lease = host.resources().acquire_lease();
     let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
         || Ok(StreamInput { planner: Some((task, request)), reader, writer: () }))?;
@@ -90,7 +91,7 @@ where P: ScoredJobTask, R: BufRead + Send + 'static {
     completed.map_err(HostedJobError::Job)
 }
 
-impl<P: ScoredJobTask, R: BufRead> Execution<P, R> {
+impl<P: Int8JobTask, R: BufRead> Execution<P, R> {
     fn run<'weights>(&mut self, model: &'weights CurrentCandidateInt8Model,
         kernel: Option<Int8Kernel>, projection: Option<&'weights mut (dyn Int8ProjectionExecutor + 'weights)>,
         control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
@@ -120,9 +121,9 @@ impl<P: ScoredJobTask, R: BufRead> Execution<P, R> {
         // Population may retain the reader for protected input spooling.
         // Commit only disjoint claim fields, never reborrow the entire owner.
         self._kv = Some(self.kv.take()
-            .ok_or(HostedError::Limits("scored job KV admission consumed"))?.commit()?);
+            .ok_or(HostedError::Limits("job KV admission consumed"))?.commit()?);
         self._scratch = Some(self.scratch.take()
-            .ok_or(HostedError::Limits("scored job scratch admission consumed"))?.commit()?);
+            .ok_or(HostedError::Limits("job scratch admission consumed"))?.commit()?);
         let admission = CorpusAdmission { lease: &self.lease, model: model.artifact_identity(),
             kv_bytes: self.required.native.kv_bytes, sampler_bytes: 0,
             output_bytes: request.limits.max_result_bytes as u64 };

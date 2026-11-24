@@ -11,7 +11,7 @@ use crate::{
     grammar::{CompileLimits, mask::MaskWorkLimits, runtime::{SourceRuntimeLimits, SOURCE_JSON_RUNTIME_VERSION}},
     jobs::{JobWork, manifest::bounded_json},
     execution_identity::ExecutionIdentity,
-    native_engine::{decode::DecodeStepControl, strict_int8::{Int8Work, StrictInt8Engine}},
+    native_engine::{decode::DecodeStepControl, strict_int8::{Int8Work, StrictInt8Engine, prefill::Int8PrefillLimits}},
     tasks::{extract::ExtractionVocabulary, ir::TaskBudget,
         source_planning::{SourcePlanningLimits, SourceTaskPlanner, SOURCE_PROMPT_VERSION,
             quantized::{Int8SourceTaskRun, PreparedInt8SourceTask, INT8_SOURCE_EXECUTION}}},
@@ -101,6 +101,14 @@ impl<'p, 'e, 'weights, 'v, A: Int8SourceBatchAdmission> Int8SourceJobProcessor<'
         planning: SourcePlanningLimits, defaults: Option<SourceBatchArgs>,
         engine: &'e mut StrictInt8Engine<'weights>, vocabulary: &'v ExtractionVocabulary,
         admission: A, native_limits: Int8SourceBatchLimits) -> Result<Self, BatchFault> {
+        Self::scheduled(planner, identity, task_ceiling, planning, defaults, engine, vocabulary, admission, native_limits, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn scheduled(planner: &'p SourceTaskPlanner, identity: ExecutionIdentity, task_ceiling: TaskBudget,
+        planning: SourcePlanningLimits, defaults: Option<SourceBatchArgs>,
+        engine: &'e mut StrictInt8Engine<'weights>, vocabulary: &'v ExtractionVocabulary,
+        admission: A, native_limits: Int8SourceBatchLimits,
+        prefill: Option<Int8PrefillLimits>) -> Result<Self, BatchFault> {
         // Bound private defaults before cloning and retain the same exact
         // configuration in the compiler and the keyed job recipe.
         planner.map_document_encoding_workspace_bytes().map_err(|_| BatchCode::InvalidLimits)?;
@@ -112,7 +120,10 @@ impl<'p, 'e, 'weights, 'v, A: Int8SourceBatchAdmission> Int8SourceJobProcessor<'
         // Bound the whole projection, not only its optional default arguments.
         // Leave space for the runner's outer protocol/input-profile envelope.
         bounded_json(&recipe, 1024 * 1024 - 1024).map_err(|_| BatchFault::from(BatchCode::InvalidLimits))?;
-        let native = NativeInt8SourceBatch::new(compiler, engine, vocabulary, admission, native_limits)?;
+        let native = match prefill {
+            None => NativeInt8SourceBatch::new(compiler, engine, vocabulary, admission, native_limits),
+            Some(prefill) => NativeInt8SourceBatch::new_layer_major(compiler, engine, vocabulary, admission, native_limits, prefill),
+        }?;
         Ok(Self { native, identity, recipe })
     }
 }

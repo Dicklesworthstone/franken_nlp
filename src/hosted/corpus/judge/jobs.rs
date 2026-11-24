@@ -2,7 +2,7 @@
 //! No public injected scorer, renewed task budget, or generated-label fallback.
 use super::*;
 use super::super::jobs::{run_population, HostedJobError, JobHostLimits, Population, SourceJobRequest,
-    scored::{self as scored_job, ScoredJobTask}};
+    scored::{self as scored_job, Int8JobTask}};
 use crate::{
     jobs::{JobLimits, JobProgress, JobWork,
         runner::{DurableBatchProcessor, JobRunError}},
@@ -62,7 +62,7 @@ impl NlpEngine {
 }
 
 struct JudgeTask { planner: Arc<JudgePlanner>, config: JudgeCorpusConfig }
-impl ScoredJobTask for JudgeTask {
+impl Int8JobTask for JudgeTask {
     fn identity(&self) -> &ExecutionIdentity { &self.config.identity }
     fn validate(&self, native: Int8MemoryRequirement, job: JobLimits) -> Result<(), HostedError> {
         self.config.validate(&self.planner)?;

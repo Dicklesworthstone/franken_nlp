@@ -15,7 +15,8 @@ use crate::{
         runner::{DurableBatchProcessor, JobRunError, JobRunner, source::Int8SourceJobProcessor}},
     batch::source::quantized as source_batch,
     tasks::source_planning::SourceTaskPlanner,
-    native_engine::decode::DecodeStepControl,
+    native_engine::{decode::DecodeStepControl, simd::Int8Kernel,
+        strict_int8::{StrictInt8Engine, prefill::Int8PrefillLimits}},
 };
 use std::cell::Cell;
 
@@ -145,59 +146,55 @@ impl NlpEngine {
         request: SourceJobRequest, limits: JobHostLimits, reader: R,
         cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
-        self.check_resident_domain(model)?;
-        let encoder_bytes = planner.map_document_encoding_workspace_bytes()
-            .map_err(|_| HostedError::Limits("source job cumulative encoding admission"))?;
-        let bytes = sum(&[limits.required_buffer_bytes_for_input(request.limits, request.mode.input_memory())?,
-            encoder_bytes])?;
-        let required = requirements(limits.native)?;
-        check_model_identity(model.artifact_identity(), &config.identity)?;
-        source_batch::check_configuration(&planner, &config.identity, config.task_ceiling,
+        self.job_int8_source_scheduled(model, planner, vocabulary, config, request, limits,
+            None, None, reader, cancellation)
+    }
+
+    /// Set prompt and projection widths for the pending NER, keyphrase, summary
+    /// or QA records. The widths affect this invocation only. A projection team
+    /// includes its coordinator and requires at least two compute threads.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int8_source_scheduled<R>(&self, model: &ResidentInt8, planner: Arc<SourceTaskPlanner>,
+        vocabulary: Arc<ExtractionVocabulary>, config: SourceCorpusConfig, request: SourceJobRequest,
+        limits: JobHostLimits, prefill: Option<Int8PrefillLimits>, team: Option<(Int8Kernel, usize)>,
+        reader: R, cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        scored::run(self, model, SourceJobTask { planner, vocabulary, config }, request, limits,
+            prefill, team, reader, cancellation)
+    }
+}
+
+struct SourceJobTask {
+    planner: Arc<SourceTaskPlanner>,
+    vocabulary: Arc<ExtractionVocabulary>,
+    config: SourceCorpusConfig,
+}
+
+impl scored::Int8JobTask for SourceJobTask {
+    fn identity(&self) -> &ExecutionIdentity { &self.config.identity }
+    fn validate(&self, native: Int8MemoryRequirement, _: JobLimits) -> Result<(), HostedError> {
+        let config = &self.config;
+        source_batch::check_configuration(&self.planner, &config.identity, config.task_ceiling,
             config.planning, config.defaults.as_ref()).map_err(HostedError::BatchSetup)?;
         source_batch::validate_limits(config.native_work).map_err(HostedError::BatchSetup)?;
-        if required.kv_bytes == 0 || required.kv_bytes > config.task_ceiling.max_kv_bytes {
-            return Err(HostedError::Limits("job complete KV reservation").into());
+        if native.kv_bytes == 0 || native.kv_bytes > config.task_ceiling.max_kv_bytes {
+            return Err(HostedError::Limits("job complete KV reservation"));
         }
-        let lease = self.resources().acquire_lease();
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
-            || Ok(StreamInput { planner: Some((planner, vocabulary, config, request)), reader, writer: () }))?;
-        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-        let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound, limits.native.allocator_reserve_bytes])?)?;
-        let model = model.clone();
-        let completed = dispatch::run(self, limits.native.run, cancellation, move |control| {
-            // Force whole-aggregate capture: queued cancellation must drop
-            // owned reader/configuration storage BEFORE its ledger charge.
-            let mut input = input;
-            let (planner, vocabulary, config, request) = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
-            let population = match read_population(&mut input.value.reader, &request,
-                limits.transport, control) {
-                Ok(population) => population,
-                Err(error) => return Ok(Err(JobRunError::Storage(error))),
-            };
-            let mut engine = allocate_native(kv, workspace, || model.inner.loaded.value
-                .engine(limits.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            let admission = CorpusAdmission { lease: &lease, model: model.artifact_identity(),
-                kv_bytes: required.kv_bytes, sampler_bytes: 0, output_bytes: request.limits.max_result_bytes as u64 };
-            let result = (|| {
-                let processor = Int8SourceJobProcessor::new(&planner, config.identity, config.task_ceiling,
-                    config.planning, config.defaults, &mut engine.value, &vocabulary, admission, config.native_work)
-                    .map_err(JobRunError::Processor)?;
-                run_population(request, &population, processor, control)
-            })();
-            // run_population drops its runner (journal, spool, lock and native
-            // processor borrow) first. Output guards already survived each
-            // spool sync/journal acknowledgement. No job object escapes.
-            drop(engine);
-            drop(population);
-            drop(vocabulary);
-            drop(planner);
-            drop(input);
-            drop(lease);
-            Ok(result)
-        })?;
-        completed.map_err(HostedJobError::Job)
+        Ok(())
+    }
+    fn preparation_workspace_bytes(&self) -> Result<u64, HostedError> {
+        self.planner.map_document_encoding_workspace_bytes()
+            .map_err(|_| HostedError::Limits("source job cumulative encoding admission"))
+    }
+    fn execute(self, engine: &mut StrictInt8Engine<'_>, admission: CorpusAdmission<'_>,
+        request: SourceJobRequest, population: &Population<'_>, prefill: Option<Int8PrefillLimits>,
+        control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
+        let Self { planner, vocabulary, config } = self;
+        let result = Int8SourceJobProcessor::scheduled(&planner, config.identity, config.task_ceiling,
+            config.planning, config.defaults, engine, &vocabulary, admission, config.native_work, prefill)
+            .map_err(JobRunError::Processor)
+            .and_then(|processor| run_population(request, population, processor, control));
+        Ok(result)
     }
 }
 

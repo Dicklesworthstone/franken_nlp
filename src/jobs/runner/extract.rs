@@ -12,7 +12,7 @@ use crate::{
     grammar::{CompileLimits, mask::MaskWorkLimits,
         runtime::{SourceRuntimeLimits, JSON_RUNTIME_VERSION, SOURCE_JSON_RUNTIME_VERSION}},
     jobs::{JobWork, manifest::bounded_json},
-    native_engine::{decode::DecodeStepControl, strict_int8::{Int8Work, StrictInt8Engine}},
+    native_engine::{decode::DecodeStepControl, strict_int8::{Int8Work, StrictInt8Engine, prefill::Int8PrefillLimits}},
     tasks::{extract::{ExtractionVocabulary, quantized::{Int8ExtractRun, INT8_EXTRACT_VERSION}}, ir::TaskBudget},
     tokenizer::{specials::TemplateControlIds,
         untrusted::{SafeBpeWork, SafeBpeWorkLimits, UntrustedEncoding}},
@@ -177,9 +177,17 @@ pub struct Int8ExtractionJobProcessor<'e, 'weights, 'v, A: Int8ExtractionBatchAd
 impl<'e, 'weights, 'v, A: Int8ExtractionBatchAdmission> Int8ExtractionJobProcessor<'e, 'weights, 'v, A> {
     pub fn new(planner: Int8ExtractionJobPlanner, engine: &'e mut StrictInt8Engine<'weights>,
         vocabulary: &'v ExtractionVocabulary, admission: A) -> Result<Self, BatchFault> {
+        Self::scheduled(planner, engine, vocabulary, admission, None)
+    }
+    pub(crate) fn scheduled(planner: Int8ExtractionJobPlanner, engine: &'e mut StrictInt8Engine<'weights>,
+        vocabulary: &'v ExtractionVocabulary, admission: A,
+        prefill: Option<Int8PrefillLimits>) -> Result<Self, BatchFault> {
         planner.check_document_encoding()?;
         let Int8ExtractionJobPlanner { compiler, identity, recipe, native, encoding_work } = planner;
-        let native = NativeInt8ExtractionBatch::new(compiler, engine, vocabulary, admission, native)?;
+        let native = match prefill {
+            None => NativeInt8ExtractionBatch::new(compiler, engine, vocabulary, admission, native),
+            Some(prefill) => NativeInt8ExtractionBatch::new_layer_major(compiler, engine, vocabulary, admission, native, prefill),
+        }?;
         Ok(Self { native, identity, recipe, encoding_work })
     }
 }

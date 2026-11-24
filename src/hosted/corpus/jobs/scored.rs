@@ -8,7 +8,7 @@ use crate::{
 };
 
 mod execution;
-pub(in crate::hosted::corpus) use execution::{run, ScoredJobTask};
+pub(in crate::hosted::corpus) use execution::{run, Int8JobTask};
 use crate::native_engine::{simd::Int8Kernel, strict_int8::{StrictInt8Engine, prefill::Int8PrefillLimits}};
 
 impl NlpEngine {
@@ -110,7 +110,7 @@ impl NlpEngine {
 }
 
 struct ClassificationTask { planner: Arc<ClassificationPlanner>, config: ClassificationCorpusConfig }
-impl ScoredJobTask for ClassificationTask {
+impl Int8JobTask for ClassificationTask {
     fn identity(&self) -> &ExecutionIdentity { &self.config.identity }
     fn validate(&self, native: Int8MemoryRequirement, job: JobLimits) -> Result<(), HostedError> {
         validate_work(self.config.max_model_work)?;
@@ -138,7 +138,7 @@ impl ScoredJobTask for ClassificationTask {
 }
 
 struct SentimentTask { planner: Arc<SentimentPlanner>, config: SentimentCorpusConfig }
-impl ScoredJobTask for SentimentTask {
+impl Int8JobTask for SentimentTask {
     fn identity(&self) -> &ExecutionIdentity { &self.config.identity }
     fn validate(&self, native: Int8MemoryRequirement, job: JobLimits) -> Result<(), HostedError> {
         self.config.validate(&self.planner).map_err(HostedError::BatchSetup)?;
