@@ -70,3 +70,24 @@ fn cancellation_applies_to_source_verification_and_pair_preparation() {
     let (p,id) = planner(&facts()).unwrap();
     assert!(p.prepare_int8(&graph,&id,cmd.scoring(limits),&mut Stop).is_err());
 }
+
+#[test]
+fn stale_worker_or_prompt_quotes_refuse_every_route_before_io_or_host_creation() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("read") } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("write") }
+        fn flush(&mut self) -> io::Result<()> { panic!("flush") }
+    }
+    for mode in [vec![], vec!["--discover-entities"], vec!["--discover-entities", "--chunked"]] {
+        for stale_common in [false, true] {
+            let mut flags = mode.clone();
+            flags.extend(["--compute-threads", "4", "--prefill-rows", "3", "--graph-reserve-mib", "256"]);
+            let mut cmd = command(&flags); cmd.host.memory_mib = 16_384;
+            let (mut common, mut limits) = cmd.validate().unwrap();
+            if stale_common { common.compute = compute::Args::default(); }
+            else { limits.compute = cmd.compute.admit_prefill(None).unwrap(); }
+            assert_eq!(execute(cmd, common, limits, &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+        }
+    }
+}

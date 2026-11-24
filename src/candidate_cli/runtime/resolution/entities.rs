@@ -23,8 +23,9 @@ fn check_result(result: &Int8EntityRun, expected: Expected) -> Result<(), Candid
 pub(super) fn execute(command: ResolveCommand, common: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
     let prefill = command.prefill.limits()?;
+    command.check_compute_memory(limits, prefill)?;
     if command.discovery.long.chunked { return long::execute(command, common, limits, input, output); }
-    let session = Session::new(&common, limits)?;
+    let session = Session::new_with_prefill(&common, limits, prefill)?;
     let text = session.read(&common.input, input, common.max_input_bytes)?;
     let raw = command.discovery.input(&command, &text)?;
     session.remaining()?;
@@ -53,10 +54,20 @@ pub(super) fn execute(command: ResolveCommand, common: CandidateArgs, limits: Li
     session.remaining()?;
     let cancellation = CancellationToken::default();
     let model = session.load(&common, limits, &facts, cancellation.clone())?;
-    let result = session.engine.execute_int8_entities(&model, prepared, Arc::new(vocabulary), session.native(&common)?,
-        limits.preparation_bytes, command.graph_reserve_mib * MIB, cancellation).map_err(|_| CandidateError::Execution)?;
+    let vocabulary = Arc::new(vocabulary);
+    let native = session.native(&common)?;
+    let result = if limits.compute.threads == 1 {
+        compute::Completion::Serial(session.engine.execute_int8_entities(&model, prepared, vocabulary, native,
+            limits.preparation_bytes, command.graph_reserve_mib * MIB, cancellation)
+            .map_err(|_| CandidateError::Execution)?)
+    } else {
+        compute::Completion::Team(session.engine.execute_int8_entities_with_threads(&model, prepared, vocabulary, native,
+            limits.preparation_bytes, command.graph_reserve_mib * MIB,
+            crate::native_engine::simd::config::process_kernel(), limits.compute.threads, cancellation)
+            .map_err(|_| CandidateError::Execution)?)
+    };
     check_result(result.result(), expected)?;
-    super::deliver(&session, &facts, &result, command.host.max_result_bytes + 4096, output)
+    super::deliver_scheduled(&session, &facts, &result, command.host.max_result_bytes + 4096, output)
 }
 
 #[cfg(test)] mod tests;

@@ -16,6 +16,8 @@ pub(crate) struct ResolveCommand {
     pub(super) discovery: discovery::DiscoveryArgs,
     #[command(flatten)]
     pub(super) prefill: ScoringPrefillArgs,
+    #[arg(skip)]
+    pub(super) compute: compute::Args,
     #[arg(long, default_value_t = 256)]
     max_documents: usize,
     #[arg(long, default_value_t = 4096)]
@@ -42,14 +44,20 @@ pub(super) struct Input {
 }
 
 pub(super) fn definition() -> clap::Command {
-    ResolveCommand::augment_args(clap::Command::new("resolve")
+    compute::definition(ResolveCommand::augment_args(clap::Command::new("resolve")
         .about("Resolve exact source-anchored mentions across a bounded document snapshot")
-        .after_help("Input is {documents:[{id,text,mentions:[{entity_type,surface,span}]}],options:{blocking,context_scalars,minimum_margin_milli}}. Original source and byte/scalar offsets are required. Lexical overlap only selects candidates; both model presentation orders must agree, and complete-link clustering refuses missing or conflicting cross-pairs. Scores are uncalibrated and cluster IDs are snapshot-local. Add --discover-entities for raw {id,text} documents and optional top-level ner options. Without that flag, explicit mentions are required. Neither mode truncates an oversized graph. --prefill-rows applies to every pair-scoring prompt and, with discovery, every NER prompt or NER chunk. It changes neither the chunk partition nor the whole-snapshot work allowance."))
+        .after_help("Input is {documents:[{id,text,mentions:[{entity_type,surface,span}]}],options:{blocking,context_scalars,minimum_margin_milli}}. Original source and byte/scalar offsets are required. Lexical overlap only selects candidates; both model presentation orders must agree, and complete-link clustering refuses missing or conflicting cross-pairs. Scores are uncalibrated and cluster IDs are snapshot-local. Add --discover-entities for raw {id,text} documents and optional top-level ner options. Without that flag, explicit mentions are required. Neither mode truncates an oversized graph. --prefill-rows applies to every pair-scoring prompt and, with discovery, every NER prompt or NER chunk. It changes neither the chunk partition nor the whole-snapshot work allowance. --compute-threads reuses one persistent numerical team across all NER documents/chunks and both orders of every comparison; native counters and semantic output are unchanged.")))
 }
 impl ResolveCommand {
+    pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let mut command = Self::from_arg_matches(matches)?;
+        command.compute = compute::Args::from_matches(matches)?;
+        Ok(command)
+    }
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), CandidateError> {
-        self.prefill.limits()?;
-        let (common, limits) = self.host.common()?;
+        let prefill = self.prefill.limits()?;
+        let (common, limits) = self.host.common_with_compute(
+            &input_encoding::InputEncodingArgs::default(), self.compute, prefill, true)?;
         if !(1..=4096).contains(&self.max_documents) || !(1..=16_384).contains(&self.max_mentions)
             || self.max_pairs > 65_536 || self.max_pair_visits == 0 || self.max_pair_visits > 1_000_000_000
             || self.max_cluster_checks == 0 || self.max_cluster_checks > 1_000_000_000
@@ -65,7 +73,54 @@ impl ResolveCommand {
             .and_then(|n| n.checked_add(MIB))
             .and_then(|n| n.checked_add(discovery_bytes)).ok_or(CandidateError::Arguments)?;
         if bytes < floor || bytes > limits.memory_bytes { return Err(CandidateError::Arguments); }
+        self.check_compute_memory(limits, prefill)?;
         Ok((common, limits))
+    }
+    /// All threaded execution storage must coexist before private input or
+    /// artifact IO: resident model, both preparation owners, source capacities,
+    /// graph/intermediate output, full native context, prompt and worker rows.
+    pub(super) fn check_compute_memory(&self, limits: Limits,
+        prefill: Option<crate::native_engine::strict_int8::prefill::Int8PrefillLimits>)
+        -> Result<(), CandidateError> {
+        if limits.compute != self.compute.admit_prefill(prefill)? { return Err(CandidateError::Arguments); }
+        if limits.compute.threads > 1 && self.compute_peak_bytes(limits, prefill)? > limits.memory_bytes {
+            return Err(CandidateError::Arguments);
+        }
+        Ok(())
+    }
+    fn compute_peak_bytes(&self, limits: Limits,
+        prefill: Option<crate::native_engine::strict_int8::prefill::Int8PrefillLimits>)
+        -> Result<u64, CandidateError> {
+        let native = Int8MemoryRequirement::for_context(self.host.context_tokens)
+            .map_err(|_| CandidateError::Arguments)?;
+        let prompt = prefill.map(|p| p.validate()).transpose()
+            .map_err(|_| CandidateError::Arguments)?.unwrap_or(0);
+        let graph = self.graph_reserve_mib.checked_mul(MIB).ok_or(CandidateError::Arguments)?;
+        // The host separately prices actual String/Vec capacities. The CLI
+        // admits a conservative wire-derived capacity ceiling plus all possible
+        // chunk witnesses before it reads or deserializes the original input.
+        let documents = (self.max_documents as u64).checked_mul(256).ok_or(CandidateError::Arguments)?;
+        let mentions = (self.max_mentions as u64).checked_mul(512).ok_or(CandidateError::Arguments)?;
+        let discovery = self.discovery.extra_graph_bytes(self.host.context_tokens)?;
+        let source = (self.host.max_input_bytes as u64).checked_mul(32)
+            .and_then(|n| n.checked_add(documents)).and_then(|n| n.checked_add(mentions))
+            .and_then(|n| n.checked_add(discovery)).ok_or(CandidateError::Arguments)?;
+        let mut temporary = graph;
+        if self.discovery.discover_entities {
+            let config = self.discovery.config(self, limits, Default::default(), Default::default());
+            temporary = temporary.checked_add(config.ner_budget.max_output_bytes.checked_mul(4)
+                .ok_or(CandidateError::Arguments)?)
+                .and_then(|n| n.checked_add(u64::from(config.ner_budget.max_output_tokens) * 8))
+                .ok_or(CandidateError::Arguments)?;
+        }
+        if self.discovery.long.chunked {
+            // Chunk preflight witnesses retain their original graph owner while
+            // the hosted snapshot independently reserves its complete frontier.
+            temporary = temporary.checked_add(graph).ok_or(CandidateError::Arguments)?;
+        }
+        let transferred = limits.preparation_bytes.checked_add(source).ok_or(CandidateError::Arguments)?;
+        compute::request_peak_bytes(limits, native, self.host.max_result_bytes as u64, 0, 0, transferred)?
+            .checked_add(prompt).and_then(|n| n.checked_add(temporary)).ok_or(CandidateError::Arguments)
     }
     pub(super) fn graph(&self) -> ResolveLimits {
         ResolveLimits { max_documents: self.max_documents, max_mentions: self.max_mentions,

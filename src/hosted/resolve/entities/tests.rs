@@ -47,3 +47,11 @@ fn typed_cancellation_survives_both_stage_error_mappings() {
     let HostedError::Resolution(error)=graph else { panic!("resolution category") };
     assert_eq!(error.cancellation(),Some(cause));
 }
+
+#[test]
+fn prepared_entity_team_owner_and_complete_output_can_cross_the_join_boundary() {
+    fn send<T: Send>() {}
+    send::<TeamAdmission<Input>>();
+    send::<HostedInt8TeamResult<Int8EntityRun>>();
+    send::<HostedInt8TeamResult<crate::corpus::entities_int8::long::Int8DocumentEntityRun>>();
+}

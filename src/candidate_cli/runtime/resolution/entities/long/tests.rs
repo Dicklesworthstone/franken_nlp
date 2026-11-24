@@ -89,3 +89,30 @@ fn actual_snapshot_chunks_and_masks_are_checked_not_just_document_lower_bounds()
         assert!(prepare(&cmd, false).is_err());
     }
 }
+
+#[test]
+fn team_schedule_preserves_chunk_partition_and_complete_snapshot_allowances() {
+    let serial = command(&["--discover-entities", "--chunked", "--max-ner-tokens", "64",
+        "--max-ner-chunk-bytes", "6"]);
+    let baseline = prepare(&serial, false).unwrap();
+    let mut threaded = command(&["--discover-entities", "--chunked", "--max-ner-tokens", "64",
+        "--max-ner-chunk-bytes", "6", "--compute-threads", "4", "--prefill-rows", "3",
+        "--graph-reserve-mib", "256"]);
+    threaded.host.memory_mib = 16_384;
+    let schedule = threaded.prefill.limits().unwrap().unwrap();
+    let prepared = prepare(&threaded, false).unwrap().with_layer_major_prefill(schedule).unwrap();
+    assert_eq!(prepared.source_identity(), baseline.source_identity());
+    assert_eq!(prepared.resolution_identity(), baseline.resolution_identity());
+    assert_eq!(prepared.chunk_count(), baseline.chunk_count());
+    assert_eq!(prepared.document_count(), baseline.document_count());
+    assert_eq!(prepared.ner_reserved_work(), baseline.ner_reserved_work());
+    assert_eq!(prepared.reserved_mask_visits(), baseline.reserved_mask_visits());
+    assert_eq!(prepared.required_ner_context_tokens(), baseline.required_ner_context_tokens());
+    assert_eq!(prepared.prefill_limits().unwrap().max_batch_rows, schedule.max_batch_rows);
+    assert_eq!(prepared.prefill_limits().unwrap().max_extra_scratch_bytes, schedule.max_extra_scratch_bytes);
+    let expected = prepare(&serial, true).unwrap().finalize_without_model(&mut Continue).unwrap();
+    let actual = prepare(&threaded, true).unwrap().with_layer_major_prefill(schedule).unwrap()
+        .finalize_without_model(&mut Continue).unwrap();
+    assert_eq!(crate::canonjson::canonical_bytes(&actual).unwrap(),
+        crate::canonjson::canonical_bytes(&expected).unwrap());
+}

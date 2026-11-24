@@ -28,7 +28,8 @@ fn check_document_result(result: &Int8DocumentEntityRun, expected: DocumentExpec
 pub(super) fn execute(command: ResolveCommand, common: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
     let prefill = command.prefill.limits()?;
-    let session = Session::new(&common, limits)?;
+    command.check_compute_memory(limits, prefill)?;
+    let session = Session::new_with_prefill(&common, limits, prefill)?;
     let lease = session.engine.resources().acquire_lease();
     // Conservative preflight staging/witness charge stays alive until the host
     // consumes and drains the prepared snapshot. Overlap with host reservations
@@ -60,11 +61,21 @@ pub(super) fn execute(command: ResolveCommand, common: CandidateArgs, limits: Li
     session.remaining()?;
     let cancellation = CancellationToken::default();
     let model = session.load(&common, limits, &facts, cancellation.clone())?;
-    let result = session.engine.execute_int8_document_entities(&model, prepared, Arc::new(vocabulary), session.native(&common)?,
-        limits.preparation_bytes, command.graph_reserve_mib * MIB, cancellation).map_err(|_| CandidateError::Execution)?;
+    let vocabulary = Arc::new(vocabulary);
+    let native = session.native(&common)?;
+    let result = if limits.compute.threads == 1 {
+        compute::Completion::Serial(session.engine.execute_int8_document_entities(&model, prepared, vocabulary, native,
+            limits.preparation_bytes, command.graph_reserve_mib * MIB, cancellation)
+            .map_err(|_| CandidateError::Execution)?)
+    } else {
+        compute::Completion::Team(session.engine.execute_int8_document_entities_with_threads(&model, prepared,
+            vocabulary, native, limits.preparation_bytes, command.graph_reserve_mib * MIB,
+            crate::native_engine::simd::config::process_kernel(), limits.compute.threads, cancellation)
+            .map_err(|_| CandidateError::Execution)?)
+    };
     drop(preflight); drop(lease);
     check_document_result(result.result(), expected)?;
-    super::super::deliver(&session, &facts, &result, command.host.max_result_bytes + 4096, output)
+    super::super::deliver_scheduled(&session, &facts, &result, command.host.max_result_bytes + 4096, output)
 }
 
 #[cfg(test)] mod tests;

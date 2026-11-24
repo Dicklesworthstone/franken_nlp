@@ -176,7 +176,7 @@ impl CandidateCommand {
             return stream::StreamCommand::from_matches(matches).map(Self::Stream);
         }
         if name == "resolve" {
-            return resolve::ResolveCommand::from_arg_matches(matches).map(Self::Resolve);
+            return resolve::ResolveCommand::from_matches(matches).map(Self::Resolve);
         }
         if name == "redact" {
             return redact::RedactCommand::from_matches(matches).map(Self::Redact);

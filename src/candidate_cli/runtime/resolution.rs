@@ -37,8 +37,9 @@ fn check_result(result: &Int8ResolutionRun, expected: Expected) -> Result<(), Ca
 pub(in crate::candidate_cli) fn execute(command: ResolveCommand, common: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
     let prefill = command.prefill.limits()?;
+    command.check_compute_memory(limits, prefill)?;
     if command.discovery.discover_entities { return entities::execute(command, common, limits, input, output); }
-    let session = Session::new(&common, limits)?;
+    let session = Session::new_with_prefill(&common, limits, prefill)?;
     let lease = session.engine.resources().acquire_lease();
     // A separate modeled commitment covers the temporary preflight graph. It
     // precedes its allocations and is released before the hosted graph is built.
@@ -81,20 +82,41 @@ pub(in crate::candidate_cli) fn execute(command: ResolveCommand, common: Candida
         graph_reserve_bytes: command.graph_reserve_mib * MIB,
     };
     let planner = Arc::new(planner);
-    let result = match prefill {
-        Some(prefill) => session.engine.resolve_int8_layer_major(&model, population.documents, planner, config, prefill, cancellation),
-        None => session.engine.resolve_int8(&model, population.documents, planner, config, cancellation),
-    }.map_err(|_| CandidateError::Execution)?;
+    let result = if limits.compute.threads == 1 {
+        compute::Completion::Serial(match prefill {
+            Some(prefill) => session.engine.resolve_int8_layer_major(&model, population.documents,
+                planner, config, prefill, cancellation),
+            None => session.engine.resolve_int8(&model, population.documents, planner, config, cancellation),
+        }.map_err(|_| CandidateError::Execution)?)
+    } else {
+        let kernel = crate::native_engine::simd::config::process_kernel();
+        compute::Completion::Team(match prefill {
+            Some(prefill) => session.engine.resolve_int8_layer_major_with_threads(&model, population.documents,
+                planner, config, kernel, limits.compute.threads, prefill, cancellation),
+            None => session.engine.resolve_int8_with_threads(&model, population.documents,
+                planner, config, kernel, limits.compute.threads, cancellation),
+        }.map_err(|_| CandidateError::Execution)?)
+    };
     check_result(result.result(), expected)?;
-    deliver(&session, &facts, &result, command.host.max_result_bytes + 4096, output)
+    deliver_scheduled(&session, &facts, &result, command.host.max_result_bytes + 4096, output)
 }
 fn deliver<T: Serialize>(session: &Session, facts: &ArtifactIdentity, result: &T,
     cap: usize, output: &mut impl Write) -> Result<(), CandidateError> {
+    deliver_with_compute(session, facts, result, None, cap, output)
+}
+fn deliver_scheduled<T: Serialize>(session: &Session, facts: &ArtifactIdentity, result: &compute::Completion<T>,
+    cap: usize, output: &mut impl Write) -> Result<(), CandidateError> {
+    deliver_with_compute(session, facts, result.result(), result.compute(), cap, output)
+}
+fn deliver_with_compute<T: Serialize>(session: &Session, facts: &ArtifactIdentity, result: &T,
+    compute: Option<&crate::hosted::Int8ComputeReceipt>, cap: usize, output: &mut impl Write)
+    -> Result<(), CandidateError> {
     session.remaining()?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
         evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
         source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
         quant_recipe: &facts.recipe_id, output: result };
+    let response = compute::Response { response: &response, compute };
     publish_checked(&response, cap, output, &|| session.remaining().map(|_| ()))
 }
 
