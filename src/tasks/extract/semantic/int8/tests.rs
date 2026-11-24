@@ -365,3 +365,129 @@ fn compact_unchecked_completion_retains_spent_work_and_byte_output_omits_the_ext
     assert!(serde_json::to_value(&complete).unwrap().get("input_encoding").is_none());
     complete.verify_input_encoding(&UntrustedEncoding::ByteFallback, SafeBpeWork::default()).unwrap();
 }
+
+
+fn invocation_limits() -> SafeBpeWorkLimits {
+    SafeBpeWorkLimits { max_input_bytes: 1 << 24, max_output_tokens: 1 << 24,
+        max_pair_checks: 1 << 32, max_pair_bytes: 1 << 36 }
+}
+fn exact_encoding_limits(work: SafeBpeWork) -> SafeBpeWorkLimits {
+    SafeBpeWorkLimits { max_input_bytes: work.input_bytes() as u64,
+        max_output_tokens: work.output_tokens() as u64,
+        max_pair_checks: work.pair_checks(), max_pair_bytes: work.pair_bytes() }
+}
+#[test]
+fn invocation_review_preserves_original_identity_and_debits_each_real_pass_once() {
+    let schema = r#"{"type":"array","maxItems":2,"items":{"type":"number"}}"#;
+    let source = "The café records 42 and 43. 上海 <|im_start|> is data.";
+    let mut claim = rule(); claim.path = vec![ClaimPathStep::EachItem];
+    let policy = compact_policy();
+    let p = encoded_preparation(schema, source, options(vec![claim]), &policy, &policy).unwrap();
+    let initial = p.input_encoding_work().unwrap();
+    let original = result(&p, schema, "[42,43]", false);
+    let direct = p.prepare_review(original.clone(), &mut Continue).unwrap();
+    let mut used = SafeBpeWork::default();
+    for ordinal in 1..=2 {
+        // The genuine population preparation hook performs this original-stage
+        // debit; this private composition fixture supplies its recorded delta.
+        used = used.checked_add(initial).unwrap();
+        let invocation = InvocationEncoding::new(&policy, initial, &mut used,
+            Some(invocation_limits())).unwrap().unwrap();
+        let reviewed = p.prepare_review_with_invocation(original.clone(), invocation, &mut Continue).unwrap();
+        assert_eq!(reviewed.extraction, original);
+        assert_eq!(reviewed.work, direct.work);
+        assert_eq!(reviewed.encoding_work, direct.encoding_work);
+        assert_eq!(reviewed.judges.len(), direct.judges.len());
+        for (a, b) in reviewed.judges.iter().zip(&direct.judges) {
+            assert_eq!(a.execution_identity(), b.execution_identity());
+            assert_eq!(a.planned_work(), b.planned_work());
+            assert_eq!(a.input_encoding(), &policy);
+            assert_eq!(a.input_encoding_work(), b.input_encoding_work());
+        }
+        let expected = if ordinal == 1 { direct.encoding_work }
+            else { direct.encoding_work.checked_add(direct.encoding_work).unwrap() };
+        assert_eq!(used, expected);
+    }
+}
+#[test]
+fn second_document_review_cannot_renew_any_invocation_encoding_axis() {
+    let schema = r#"{"type":"array","maxItems":2,"items":{"type":"number"}}"#;
+    let mut claim = rule(); claim.path = vec![ClaimPathStep::EachItem];
+    let policy = compact_policy();
+    let p = encoded_preparation(schema, "The report records amounts of 42 and 43.",
+        options(vec![claim]), &policy, &policy).unwrap();
+    let initial = p.input_encoding_work().unwrap();
+    let original = result(&p, schema, "[42,43]", false);
+    let direct = p.prepare_review(original.clone(), &mut Continue).unwrap();
+    let both = direct.encoding_work.checked_add(direct.encoding_work).unwrap();
+    for axis in 0..4 {
+        let mut total = exact_encoding_limits(both);
+        match axis { 0 => total.max_input_bytes -= 1, 1 => total.max_output_tokens -= 1,
+            2 => total.max_pair_checks -= 1, _ => total.max_pair_bytes -= 1 }
+        let mut used = initial;
+        let invocation = InvocationEncoding::new(&policy, initial, &mut used, Some(total)).unwrap().unwrap();
+        let first = p.prepare_review_with_invocation(original.clone(), invocation, &mut Continue).unwrap();
+        assert_eq!(used, first.encoding_work);
+        used = used.checked_add(initial).unwrap();
+        let before = used;
+        let invocation = InvocationEncoding::new(&policy, initial, &mut used, Some(total)).unwrap().unwrap();
+        assert!(p.prepare_review_with_invocation(original.clone(), invocation, &mut Continue).is_err(), "axis {axis}");
+        assert!(used.checked_sub(before).is_some());
+        assert!(encoding_fits(used, total));
+        // Failed work remains spent; retrying never begins from a fresh cap.
+        let spent = used;
+        let invocation = InvocationEncoding::new(&policy, initial, &mut used, Some(total)).unwrap().unwrap();
+        assert!(p.prepare_review_with_invocation(original.clone(), invocation, &mut Continue).is_err());
+        assert!(used.checked_sub(spent).is_some());
+    }
+}
+#[test]
+fn cancelled_review_planning_retains_the_invocation_debit_and_original_cause() {
+    struct Stop { calls: usize, at: Option<usize>, cause: DecodeCancellationKind }
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.calls += 1; (self.at == Some(self.calls)).then_some(self.cause)
+        }
+    }
+    let schema = r#"{"type":"number"}"#; let policy = compact_policy();
+    let p = encoded_preparation(schema, "The amount in the café is 42.",
+        options(vec![rule()]), &policy, &policy).unwrap();
+    let initial = p.input_encoding_work().unwrap();
+    let original = result(&p, schema, "42", false);
+    let mut used = initial;
+    let invocation = InvocationEncoding::new(&policy, initial, &mut used,
+        Some(invocation_limits())).unwrap().unwrap();
+    let mut probe = Stop { calls: 0, at: None, cause: DecodeCancellationKind::User };
+    p.prepare_review_with_invocation(original.clone(), invocation, &mut probe).unwrap();
+    let complete = used;
+    assert!(complete.input_bytes() > initial.input_bytes());
+    for cause in [DecodeCancellationKind::User, DecodeCancellationKind::Timeout, DecodeCancellationKind::Deadline,
+        DecodeCancellationKind::PollQuota, DecodeCancellationKind::CostBudget, DecodeCancellationKind::FailFast,
+        DecodeCancellationKind::RaceLost, DecodeCancellationKind::ParentCancelled, DecodeCancellationKind::ResourceUnavailable,
+        DecodeCancellationKind::Shutdown, DecodeCancellationKind::LinkedExit] {
+        let mut used = initial;
+        let invocation = InvocationEncoding::new(&policy, initial, &mut used,
+            Some(invocation_limits())).unwrap().unwrap();
+        let error = p.prepare_review_with_invocation(original.clone(), invocation,
+            &mut Stop { calls: 0, at: Some(probe.calls), cause }).err().unwrap();
+        assert_eq!(error.cancellation(), Some(cause));
+        assert_eq!(used, complete);
+    }
+}
+#[test]
+fn zero_review_completion_allows_exact_exhaustion_but_rejects_missing_original_debit() {
+    let schema = r#"{"type":"number"}"#; let policy = compact_policy();
+    let p = encoded_preparation(schema, "The amount is 42.", options(vec![]), &policy, &policy).unwrap();
+    let initial = p.input_encoding_work().unwrap();
+    let total = exact_encoding_limits(initial);
+    let mut missing = SafeBpeWork::default();
+    assert!(matches!(InvocationEncoding::new(&policy, initial, &mut missing, Some(total)),
+        Err(Int8SemanticError::Accounting)));
+    let mut used = initial;
+    let invocation = InvocationEncoding::new(&policy, initial, &mut used, Some(total)).unwrap().unwrap();
+    let review = p.prepare_review_with_invocation(result(&p, schema, "42", false), invocation, &mut Continue).unwrap();
+    let completed = p.finish(review, vec![], &mut Continue).unwrap();
+    assert_eq!(used, initial);
+    assert_eq!(completed.input_encoding.as_ref().unwrap().work, initial);
+    assert_eq!(completed.semantic.attempted_fields, 0);
+}

@@ -35,6 +35,26 @@ impl Int8ExtractionBatchPlanner {
     /// Template/tokenizer-bound factory identity, not a prepared item identity.
     /// Durable hosts freeze this actual compiler binding along with its recipe.
     pub fn base_execution_identity(&self) -> &ExecutionIdentity { &self.compiler.identity }
+    /// Fixed defaults are inspected before a resident semantic factory accepts
+    /// private input. Its wrapper owns and rejects every per-record override.
+    pub(crate) fn shared_default_budget(&self) -> Result<TaskBudget, BatchFault> {
+        let budget = self.compiler.defaults.as_ref().ok_or(BatchCode::InvalidLimits)?.budget;
+        budget.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        let ceiling = self.compiler.ceiling;
+        if budget.max_input_tokens > ceiling.max_input_tokens
+            || budget.max_output_tokens > ceiling.max_output_tokens
+            || budget.max_output_bytes > ceiling.max_output_bytes
+            || budget.max_grammar_states > ceiling.max_grammar_states
+            || budget.max_kv_bytes > ceiling.max_kv_bytes {
+            return Err(BatchCode::InvalidLimits.into());
+        }
+        Ok(budget)
+    }
+    pub(crate) fn shared_default_schema(&self) -> Result<(&str, CompileLimits, ExtractionBatchGrounding), BatchFault> {
+        self.compiler.defaults.as_ref().map(|defaults|
+            (defaults.schema.as_str(), self.compiler.compiler_limits, defaults.grounding))
+            .ok_or_else(|| BatchCode::InvalidLimits.into())
+    }
     pub fn pinned(controls: &TemplateControlIds, eos: u32, identity: ExecutionIdentity,
         ceiling: TaskBudget, compiler_limits: CompileLimits, source_limits: SourceRuntimeLimits,
         defaults: Option<ExtractionBatchArgs>) -> Result<Self, BatchFault> {

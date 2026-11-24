@@ -256,7 +256,19 @@ impl JudgePlanner {
     fn plan_with_profile_and_work<C: DecodeStepControl>(&self, request: &JudgeRequest,
         context: &PlanContext<'_>, limits: JudgeLimits, profile: NumericsProfile,
         control: &mut C, work: &mut SafeBpeWork) -> Result<PreparedJudge, JudgeError> {
+        self.plan_with_profile_and_encoding_budget(request, context, limits, profile,
+            control, &self.document_encoding, work)
+    }
+    // A composed invocation may only tighten the admitted tokenizer policy.
+    // Prompt and receipt identity keep the original declaration; this smaller
+    // allowance exists solely to bound the next actual planning pass.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_with_profile_and_encoding_budget<C: DecodeStepControl>(&self, request: &JudgeRequest,
+        context: &PlanContext<'_>, limits: JudgeLimits, profile: NumericsProfile,
+        control: &mut C, encoding: &UntrustedEncoding, work: &mut SafeBpeWork)
+        -> Result<PreparedJudge, JudgeError> {
         planning_checkpoint(control)?;
+        check_encoding_budget(&self.document_encoding, encoding)?;
         self.check_context(context, profile)?;
         let before = *work;
         let budget = request.budget();
@@ -271,9 +283,9 @@ impl JudgePlanner {
                 if self.document_encoding == UntrustedEncoding::ByteFallback {
                     check_prompt_lengths(&[len, len], &self.pairwise_fragments, budget, limits)?;
                 }
-                let criterion = self.encode_with_work(criterion, work, control)?;
-                let a = self.encode_with_work(a, work, control)?;
-                let b = self.encode_with_work(b, work, control)?;
+                let criterion = self.encode_with_work(criterion, encoding, work, control)?;
+                let a = self.encode_with_work(a, encoding, work, control)?;
+                let b = self.encode_with_work(b, encoding, work, control)?;
                 let tokens = add(add(criterion.len(), a.len(), "prompt_tokens")?, b.len(), "prompt_tokens")?;
                 check_prompt_lengths(&[tokens, tokens], &self.pairwise_fragments, budget, limits)?;
                 let ab = task(&self.pairwise_fragments, &[&criterion, &a, &b], &self.pairwise_candidates, context, budget)?;
@@ -293,13 +305,13 @@ impl JudgePlanner {
                 if self.document_encoding == UntrustedEncoding::ByteFallback {
                     check_prompt_lengths(&lengths, fragments, budget, limits)?;
                 }
-                let document = self.encode_with_work(document, work, control)?;
+                let document = self.encode_with_work(document, encoding, work, control)?;
                 let candidates = &self.rubric_candidates[..=usize::from(rubric.scale_maximum)];
                 let mut inputs = reserved(ordered.len())?;
                 let mut token_lengths = reserved(ordered.len())?;
                 for criterion in &ordered {
                     planning_checkpoint(control)?;
-                    let description = self.encode_with_work(&criterion.description, work, control)?;
+                    let description = self.encode_with_work(&criterion.description, encoding, work, control)?;
                     token_lengths.push(add(description.len(), document.len(), "prompt_tokens")?);
                     check_prompt_lengths(&token_lengths, fragments, budget, limits)?;
                     inputs.push(RubricHeadInput { criterion_id: criterion.id.clone(), weight: criterion.weight,
@@ -314,7 +326,7 @@ impl JudgePlanner {
             }
             JudgeRequest::Faithfulness { source, claim, policy, .. } => {
                 let plan = self.faithfulness.plan_with_encoding_work(source, claim, *policy, context,
-                    budget, &self.controls, self.eos, limits, &self.document_encoding, work, control)?;
+                    budget, &self.controls, self.eos, limits, encoding, work, control)?;
                 (Executable::Faithfulness(plan), digest(&("judge-faithfulness-result-v1", FAITHFULNESS_VERSION))?,
                     digest(&(FAITHFULNESS_VERSION, EVIDENCE_PARTITION_VERSION, policy, self.eos, JUDGE_SCORER_VERSION))?)
             }
@@ -338,12 +350,12 @@ impl JudgePlanner {
         }
         Ok(())
     }
-    fn encode_with_work<C: DecodeStepControl>(&self, source: &str, work: &mut SafeBpeWork,
-        control: &mut C) -> Result<Vec<u32>, JudgeError> {
+    fn encode_with_work<C: DecodeStepControl>(&self, source: &str, encoding: &UntrustedEncoding,
+        work: &mut SafeBpeWork, control: &mut C) -> Result<Vec<u32>, JudgeError> {
         planning_checkpoint(control)?;
         let mut cancelled = None;
         let doc = UntrustedDocumentEncoder::new(self.tokenizer.tokenizer(), &self.controls)
-            .encode_with_policy(source.as_bytes(), &self.document_encoding, work, &mut || {
+            .encode_with_policy(source.as_bytes(), encoding, work, &mut || {
                 cancelled = control.prefill_checkpoint(0); cancelled.is_none()
             });
         if let Some(cause) = cancelled { return Err(JudgeError::Cancelled(cause)); }
@@ -353,6 +365,20 @@ impl JudgePlanner {
         }
         planning_checkpoint(control)?;
         Ok(doc.ids().to_vec())
+    }
+}
+fn check_encoding_budget(declared: &UntrustedEncoding, effective: &UntrustedEncoding)
+    -> Result<(), JudgeError> {
+    declared.validate().map_err(|_| JudgeError::Contract("invalid declared judge encoding"))?;
+    effective.validate().map_err(|_| JudgeError::Contract("invalid effective judge encoding"))?;
+    match (declared, effective) {
+        (UntrustedEncoding::ByteFallback, UntrustedEncoding::ByteFallback) => Ok(()),
+        (UntrustedEncoding::SafeBpeV1(declared), UntrustedEncoding::SafeBpeV1(effective))
+            if effective.max_input_bytes <= declared.max_input_bytes
+                && effective.max_output_tokens <= declared.max_output_tokens
+                && effective.max_pair_checks <= declared.max_pair_checks
+                && effective.max_pair_bytes <= declared.max_pair_bytes => Ok(()),
+        _ => Err(JudgeError::Contract("effective judge encoding exceeds declaration")),
     }
 }
 fn planning_checkpoint<C: DecodeStepControl>(control: &mut C) -> Result<(), JudgeError> {

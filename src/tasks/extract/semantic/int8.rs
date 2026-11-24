@@ -12,7 +12,7 @@ use crate::{
     tasks::{extract::{ExtractionVocabulary, quantized::{Int8ExtractError, Int8ExtractRun, check_size}},
         judge::{partition_evidence, quantized::{Int8JudgeError, Int8JudgeRun, PreparedInt8Judge, INT8_JUDGE_EXECUTION}}},
     grammar::mask::MaskWorkLimits,
-    tokenizer::untrusted::{SafeBpeWork, UntrustedEncoding},
+    tokenizer::untrusted::{SafeBpeWork, SafeBpeWorkLimits, UntrustedEncoding},
 };
 
 pub const INT8_SEMANTIC_EXECUTION: &str = "portable-int8-extraction-correlated-second-reader-v1";
@@ -147,13 +147,7 @@ impl PreparedInt8SemanticExtraction {
         }
         Int8SemanticEncoding::from_work(source.document_encoding(),
             source.input_encoding_work().unwrap_or_default())?;
-        judge_identity.validate().map_err(|_| Int8SemanticError::Contract)?;
-        let a = extraction.execution_identity();
-        crate::native_engine::constrained_int8::check_profile(a).map_err(Int8ExtractError::from)?;
-        crate::native_engine::constrained_int8::check_profile(&judge_identity).map_err(Int8ExtractError::from)?;
-        if judge_identity.task_spec != "judge-v1" || judge_identity.tokenizer_digest != judge.tokenizer_digest()
-            || judge_identity.template_digest != *judge.template_digest() { return Err(Int8SemanticError::Contract); }
-        same_model(a, &judge_identity)?;
+        check_judge_binding(extraction.execution_identity(), &judge, &judge_identity)?;
         let schema = extraction.extraction_plan().semantic_schema(extraction.task_plan(), extraction.source())?;
         claims::validate_rules(schema, &options.specification.claims, options.limits)?;
         // Refuse source/evidence-policy mismatch BEFORE extraction. Claims and
@@ -195,7 +189,7 @@ impl PreparedInt8SemanticExtraction {
     pub fn execute_with_control<C: DecodeStepControl>(self, engine: &mut StrictInt8Engine<'_>,
         vocabulary: &ExtractionVocabulary, masks: MaskWorkLimits, mask_visits: u64, control: &mut C)
         -> Result<Int8SemanticExtractionRun, Int8SemanticError> {
-        self.execute_with_prefill(engine, vocabulary, masks, mask_visits, None, control)
+        self.execute_with_prefill(engine, vocabulary, masks, mask_visits, None, None, control)
     }
 
     /// Reuse bounded layer-major prompt scratch across extraction and every
@@ -206,13 +200,29 @@ impl PreparedInt8SemanticExtraction {
         vocabulary: &ExtractionVocabulary, masks: MaskWorkLimits, mask_visits: u64,
         prefill: Int8PrefillLimits, control: &mut C)
         -> Result<Int8SemanticExtractionRun, Int8SemanticError> {
-        self.execute_with_prefill(engine, vocabulary, masks, mask_visits, Some(prefill), control)
+        self.execute_with_prefill(engine, vocabulary, masks, mask_visits, Some(prefill), None, control)
+    }
+
+    /// Resident adapters own this nonrenewable invocation ledger. The original
+    /// extraction preparation has already debited it exactly once; only actual
+    /// review deltas are added here, including failed or cancelled planning.
+    /// Every record still obeys its original complete-document policy.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_with_invocation_encoding_work<C: DecodeStepControl>(self,
+        engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary,
+        masks: MaskWorkLimits, mask_visits: u64, prefill: Option<Int8PrefillLimits>,
+        used: &mut SafeBpeWork, total: Option<SafeBpeWorkLimits>, control: &mut C)
+        -> Result<Int8SemanticExtractionRun, Int8SemanticError> {
+        poll(control)?;
+        let invocation = InvocationEncoding::new(self.input_encoding(),
+            self.input_encoding_work().unwrap_or_default(), used, total)?;
+        self.execute_with_prefill(engine, vocabulary, masks, mask_visits, prefill, invocation, control)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn execute_with_prefill<C: DecodeStepControl>(self, engine: &mut StrictInt8Engine<'_>,
         vocabulary: &ExtractionVocabulary, masks: MaskWorkLimits, mask_visits: u64,
-        prefill: Option<Int8PrefillLimits>, control: &mut C)
+        prefill: Option<Int8PrefillLimits>, invocation: Option<InvocationEncoding<'_>>, control: &mut C)
         -> Result<Int8SemanticExtractionRun, Int8SemanticError> {
         poll(control)?;
         if let Some(limits) = prefill { limits.validate().map_err(Int8JudgeError::from)?; }
@@ -231,7 +241,10 @@ impl PreparedInt8SemanticExtraction {
                 self.execution_identity(), vocabulary, budget, prefill, control),
         }?;
         self.check_capacity(engine)?;
-        let review = self.prepare_review(extraction, control)?;
+        let review = match invocation {
+            None => self.prepare_review(extraction, control),
+            Some(invocation) => self.prepare_review_with_invocation(extraction, invocation, control),
+        }?;
         for plan in &review.judges {
             poll(control)?;
             plan.preflight(plan.execution_identity(), engine, Int8ScoringBudget {
@@ -264,6 +277,14 @@ impl PreparedInt8SemanticExtraction {
     // value from the real native extraction, never from caller-supplied output.
     fn prepare_review<C: DecodeStepControl>(&self, extraction: Int8ExtractRun, control: &mut C)
         -> Result<Review, Int8SemanticError> {
+        self.prepare_review_inner(extraction, None, control)
+    }
+    fn prepare_review_with_invocation<C: DecodeStepControl>(&self, extraction: Int8ExtractRun,
+        invocation: InvocationEncoding<'_>, control: &mut C) -> Result<Review, Int8SemanticError> {
+        self.prepare_review_inner(extraction, Some(invocation), control)
+    }
+    fn prepare_review_inner<C: DecodeStepControl>(&self, extraction: Int8ExtractRun,
+        mut invocation: Option<InvocationEncoding<'_>>, control: &mut C) -> Result<Review, Int8SemanticError> {
         poll(control)?;
         self.extraction.extraction_plan().verify_completed(&extraction)?;
         let l = self.options.limits;
@@ -293,8 +314,20 @@ impl PreparedInt8SemanticExtraction {
                 ..self.judge_limits };
             let request = JudgeRequest::Faithfulness { source: copy(self.extraction.source().text())?, claim: copy(claim)?,
                 policy: s.judge_policy, budget: s.judge_budget };
-            let plan = self.judge.plan_int8_with_encoding_work(&request, &context, limits,
-                control, &mut encoding_work)?;
+            let plan = match invocation.as_mut() {
+                None => self.judge.plan_int8_with_encoding_work(&request, &context, limits,
+                    control, &mut encoding_work),
+                Some(invocation) => {
+                    let effective = invocation.remaining_policy(self.input_encoding(), encoding_work)?;
+                    let mut delta = SafeBpeWork::default();
+                    let result = self.judge.plan_int8_with_encoding_budget(&request, &context,
+                        limits, control, &effective, &mut delta);
+                    // Commit both counters before propagating a failed planner.
+                    // A rejected claim never restores already consumed work.
+                    invocation.debit(&mut encoding_work, delta)?;
+                    result
+                }
+            }?;
             logits_left = logits_left.checked_sub(plan.planned_work().projected_logits).ok_or(Int8SemanticError::WorkBudget)?;
             work = plus(work, plan.planned_work())?;
             // Charge the original maximum extraction reservation, NOT its
@@ -383,6 +416,55 @@ struct Review {
     work: Int8Work, encoding_work: SafeBpeWork,
 }
 
+/// Borrowed only while a complete document executes; the resident processor
+/// remains the sole owner of the invocation counter between records/epochs.
+struct InvocationEncoding<'a> {
+    used: &'a mut SafeBpeWork,
+    limits: SafeBpeWorkLimits,
+}
+impl<'a> InvocationEncoding<'a> {
+    fn new(policy: &UntrustedEncoding, initial: SafeBpeWork, used: &'a mut SafeBpeWork,
+        limits: Option<SafeBpeWorkLimits>) -> Result<Option<Self>, Int8SemanticError> {
+        Int8SemanticEncoding::from_work(policy, initial)?;
+        match (policy, limits) {
+            (UntrustedEncoding::ByteFallback, None) if *used == SafeBpeWork::default() => Ok(None),
+            (UntrustedEncoding::SafeBpeV1(_), Some(limits)) => {
+                limits.validate().map_err(|_| Int8SemanticError::Contract)?;
+                if used.checked_sub(initial).is_none() { return Err(Int8SemanticError::Accounting); }
+                if !encoding_fits(*used, limits) { return Err(Int8SemanticError::WorkBudget); }
+                Ok(Some(Self { used, limits }))
+            }
+            _ => Err(Int8SemanticError::Contract),
+        }
+    }
+    fn remaining_policy(&self, policy: &UntrustedEncoding, document: SafeBpeWork)
+        -> Result<UntrustedEncoding, Int8SemanticError> {
+        let UntrustedEncoding::SafeBpeV1(call) = policy else { return Err(Int8SemanticError::Contract); };
+        let document_limits = SafeBpeWorkLimits {
+            max_input_bytes: call.max_input_bytes as u64, max_output_tokens: call.max_output_tokens as u64,
+            max_pair_checks: call.max_pair_checks, max_pair_bytes: call.max_pair_bytes,
+        };
+        let left = document_limits.remaining_call(document, *call)
+            .map_err(|_| Int8SemanticError::WorkBudget)?;
+        self.limits.remaining_call(*self.used, left).map(UntrustedEncoding::SafeBpeV1)
+            .map_err(|_| Int8SemanticError::WorkBudget)
+    }
+    fn debit(&mut self, document: &mut SafeBpeWork, delta: SafeBpeWork)
+        -> Result<(), Int8SemanticError> {
+        let next_document = document.checked_add(delta).ok_or(Int8SemanticError::Accounting)?;
+        let next_invocation = self.used.checked_add(delta).ok_or(Int8SemanticError::Accounting)?;
+        if !encoding_fits(next_invocation, self.limits) { return Err(Int8SemanticError::Accounting); }
+        *document = next_document;
+        *self.used = next_invocation;
+        Ok(())
+    }
+}
+fn encoding_fits(work: SafeBpeWork, limits: SafeBpeWorkLimits) -> bool {
+    work.input_bytes() as u64 <= limits.max_input_bytes
+        && work.output_tokens() as u64 <= limits.max_output_tokens
+        && work.pair_checks() <= limits.max_pair_checks && work.pair_bytes() <= limits.max_pair_bytes
+}
+
 #[derive(Serialize)]
 pub struct Int8SemanticExtractionRun {
     pub schema_version: u32,
@@ -415,6 +497,19 @@ impl Int8SemanticExtractionRun {
 }
 fn poll(control: &mut impl DecodeStepControl) -> Result<(), Int8SemanticError> {
     match control.prefill_checkpoint(0) { Some(c) => Err(Int8SemanticError::Cancelled(c)), None => Ok(()) }
+}
+/// Validate the fixed genuine compiler pair without inventing a document.
+pub(crate) fn check_judge_binding(extraction: &ExecutionIdentity, judge: &JudgePlanner,
+    identity: &ExecutionIdentity) -> Result<(), Int8SemanticError> {
+    identity.validate().map_err(|_| Int8SemanticError::Contract)?;
+    crate::native_engine::constrained_int8::check_profile(extraction).map_err(Int8ExtractError::from)?;
+    crate::native_engine::constrained_int8::check_profile(identity).map_err(Int8ExtractError::from)?;
+    if extraction.task_spec != "extract-v1" || identity.task_spec != "judge-v1"
+        || identity.tokenizer_digest != judge.tokenizer_digest()
+        || identity.template_digest != *judge.template_digest() {
+        return Err(Int8SemanticError::Contract);
+    }
+    same_model(extraction, identity)
 }
 fn same_model(a: &ExecutionIdentity, b: &ExecutionIdentity) -> Result<(), Int8SemanticError> {
     // Normalize ONLY task-owned identities; all model, host and future fields

@@ -98,10 +98,22 @@ impl JudgePlanner {
     pub(crate) fn plan_int8_with_encoding_work<C: DecodeStepControl>(&self, request: &JudgeRequest,
         context: &PlanContext<'_>, limits: JudgeLimits, control: &mut C, work: &mut SafeBpeWork)
         -> Result<PreparedInt8Judge, Int8JudgeError> {
+        self.plan_int8_with_encoding_budget(request, context, limits, control,
+            self.document_encoding(), work)
+    }
+
+    /// An invocation's remaining allowance may tighten one actual planning
+    /// pass without changing the immutable policy or any successful identity.
+    /// The caller retains completed work even if planning returns an error.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan_int8_with_encoding_budget<C: DecodeStepControl>(&self, request: &JudgeRequest,
+        context: &PlanContext<'_>, limits: JudgeLimits, control: &mut C,
+        encoding: &UntrustedEncoding, work: &mut SafeBpeWork)
+        -> Result<PreparedInt8Judge, Int8JudgeError> {
         checkpoint(control)?;
         check_profile(context.execution_identity())?;
-        let inner = self.plan_with_profile_and_work(request, context, limits,
-            NumericsProfile::StrictQuantized { version: 1 }, control, work)?;
+        let inner = self.plan_with_profile_and_encoding_budget(request, context, limits,
+            NumericsProfile::StrictQuantized { version: 1 }, control, encoding, work)?;
         checkpoint(control)?;
         let mut schedules = reserved(inner.executable.bundle().heads.len())?;
         let mut work = Int8Work::default();

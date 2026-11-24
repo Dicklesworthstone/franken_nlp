@@ -24,6 +24,8 @@ use crate::{
 
 /// Complete-document root-object extraction and full-source review populations.
 pub mod document;
+/// Resident native INT8 extraction and correlated complete-source field review.
+pub mod int8;
 
 /// Six invocation-wide ceilings, never renewed by a flush or failed attempt.
 /// Int4SemanticOptions supplies the independent whole-document native ceiling.
