@@ -594,9 +594,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(206 if start else 200)
         if start:
             self.send_header("Content-Range", "bytes {}-{}/{}".format(start, len(payload) - 1, len(payload)))
-        self.send_header("Content-Length", str(len(payload) - start))
+        body = payload[start:]
+        sizing = urlsplit(self.path).query
+        if sizing in ("overlong-declared", "overlong-unframed"):
+            body += bytes(256 * 1024)
+        if sizing != "overlong-unframed":
+            self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(payload[start:])
+        self.wfile.write(body)
 
     def log_message(self, _format, *_args):
         pass
@@ -794,6 +799,27 @@ if [ "$lock_status" -eq 4 ] && [ -f "$DEST19/.fnlp-fetch-lock-$REV/owner.txt" ] 
     [ "$(cat "$DEST19/.fnlp-fetch-lock-$REV/owner.txt")" = 'another invocation owns this lock' ] &&
     ! grep -q 'LOCK_RELEASE_DEFERRED' "$WORK/case19.err"; then pass_case 19 nonempty-contended-lock-untouched
 else fail_case 19 nonempty-contended-lock-untouched; fi
+
+# An oversized response is terminal even when its permitted prefix has exactly
+# the pinned digest. Keep existing progress when headers reject the transfer.
+for sizing in overlong-declared overlong-unframed; do
+    CASES=$((CASES + 1)); size_dest="$WORK/$sizing"
+    secure_mkdir "$size_dest/.fnlp-fetch-journals"
+    head -c 5 "$FIXTURE/alpha.bin" > "$size_dest/alpha.bin.partial"
+    printf 'url=https://huggingface.co/Nanbeige/Nanbeige4.2-3B/resolve/%s/alpha.bin\nrevision=%s\nname=alpha.bin\nbytes=%s\nsha256=%s\n' \
+        "$REV" "$REV" "$ALPHA_BYTES" "$ALPHA_SHA" > "$size_dest/.fnlp-fetch-journals/alpha.bin.journal"
+    run_redirect_policy_fetch us.aws.cdn.hf.co "$size_dest" "$WORK/$sizing.out" "$WORK/$sizing.err" "/redirect-final/{name}?$sizing"
+    size_status=$?
+    if [ "$size_status" -ne 1 ] || [ -e "$size_dest/alpha.bin" ] ||
+        ! grep -q 'response exceeds catalog byte limit' "$WORK/$sizing.err" ||
+        [ "$(wc -l < "$REDIRECT_TRACE" | tr -d '[:space:]')" -ne 2 ]; then
+        fail_case "$sizing" refusal-before-retry-or-publication
+    elif [ "$sizing" = overlong-declared ] && [ "$(wc -c < "$size_dest/alpha.bin.partial")" -ne 5 ]; then
+        fail_case "$sizing" existing-prefix-changed
+    else
+        pass_case "$sizing" byte-limit-and-resume
+    fi
+done
 
 run_disk_cases
 run_interrupt_cases

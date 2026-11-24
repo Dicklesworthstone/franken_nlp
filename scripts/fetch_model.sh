@@ -438,10 +438,22 @@ download_with_progress() {
             # Disable user curl config so it cannot add credentials/redirects.
             set -- curl --disable --globoff --silent --show-error --fail --location --max-redirs 0
             if [ -z "$TEST_BASE" ]; then set -- "$@" --proto =https --proto-redir =https; fi
-            set -- "$@" --connect-timeout 30 --user-agent "$USER_AGENT"
-            "$@" --continue-at - --output "$transfer_partial" --write-out '%{http_code}
+            set -- "$@" --connect-timeout 30 --speed-limit 1 --speed-time 60 --user-agent "$USER_AGENT"
+            # Price the remaining response, including after a redirect or retry.
+            # Pre-8.4 curl does not enforce --max-filesize on an unframed body.
+            # Backstop it with a child-only POSIX file-size limit (512-byte
+            # blocks). Allow 64 KiB for curl's diagnostics / redirect URL.
+            transfer_blocks=$(((transfer_expected - 1) / 512 + 1))
+            if [ "$transfer_blocks" -lt 128 ]; then transfer_blocks=128; fi
+            (
+                current_blocks=$(ulimit -f) || exit 90
+                if [ "$current_blocks" = unlimited ] || [ "$current_blocks" -gt "$transfer_blocks" ]; then
+                    ulimit -f "$transfer_blocks" || exit 90
+                fi
+                exec "$@" --max-filesize "$((transfer_expected - transfer_start))" --continue-at - --output "$transfer_partial" --write-out '%{http_code}
 %{redirect_url}
-' "$transfer_url" > "$curl_meta" 2> "$curl_log" &
+' "$transfer_url"
+            ) > "$curl_meta" 2> "$curl_log" &
             CURL_PID=$!
             check_interrupted
             while kill -0 "$CURL_PID" 2>/dev/null; do
@@ -458,6 +470,13 @@ download_with_progress() {
             check_interrupted
             CURL_PID=
             transfer_status=$(sed -n '1p' "$curl_meta" | tr -d '\r')
+            # A curl size refusal can leave exactly the permitted prefix on
+            # disk. Do not treat it as a completed transfer on a later retry.
+            transfer_length=$(bytes "$transfer_partial")
+            if [ "$curl_status" -eq 63 ] || [ "$transfer_length" -gt "$transfer_expected" ] ||
+                { [ "$curl_status" -ne 0 ] && [ "$transfer_length" -eq "$transfer_expected" ]; }; then
+                return 63
+            fi
             if [ "$curl_status" -eq 47 ]; then
                 case "$transfer_status" in 301|302|303|307|308) ;; *) return 47;; esac
                 if [ "$(bytes "$transfer_partial")" != "$transfer_start" ]; then
@@ -568,11 +587,18 @@ download_one() {
             quarantine "$journal" "server-refused-range-resume"
             ensure_partial_and_journal "$partial" "$journal" "$url" "$name" "$length" "$digest"
             preflight_space
+            start=0
             download_with_progress "$url" "$partial" "$length"
             curl_status=$?
             check_interrupted
         fi
-        if [ "$curl_status" -ne 0 ]; then
+        if [ "$curl_status" -eq 63 ]; then
+            if [ "$(bytes "$partial")" -gt "$start" ]; then
+                quarantine "$partial" "response-exceeds-catalog-length"
+                quarantine "$journal" "response-exceeds-catalog-length"
+            fi
+            fail 1 "response exceeds catalog byte limit file=$name expected_bytes=$length"
+        elif [ "$curl_status" -ne 0 ]; then
             fail 3 "network failure url=$url attempts=4 curl_exit=$curl_status log=$JOURNAL_DIR/${partial##*/}.curl.log"
         fi
         if ! verify_file "$partial" "$length" "$digest"; then
