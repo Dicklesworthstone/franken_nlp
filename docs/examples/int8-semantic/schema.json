@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "revenue_usd",
+    "quote"
+  ],
+  "properties": {
+    "revenue_usd": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "quote": {
+      "type": "string",
+      "maxLength": 256,
+      "x-fnlp-source": "verbatim"
+    }
+  }
+}

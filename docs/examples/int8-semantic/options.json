@@ -1,0 +1,55 @@
+{
+  "specification": {
+    "schema_version": 1,
+    "experimental_opt_in": true,
+    "revision": "revenue-demo-v1",
+    "claims": [
+      {
+        "id": "revenue-usd",
+        "path": [
+          {
+            "kind": "property",
+            "name": "revenue_usd"
+          }
+        ],
+        "value_kind": "integer",
+        "prefix": "Acme reported revenue of ",
+        "suffix": " US dollars for 2025."
+      }
+    ],
+    "judge_policy": {
+      "minimum_candidate_weight_ppm": 600000,
+      "minimum_margin_milli": 200,
+      "evidence_window_bytes": 512,
+      "max_evidence_windows": 1,
+      "max_evidence_spans": 1
+    },
+    "judge_budget": {
+      "max_input_tokens": 2016,
+      "max_output_tokens": 32,
+      "max_output_bytes": 65536,
+      "max_grammar_states": 128,
+      "max_kv_bytes": 369098752
+    }
+  },
+  "limits": {
+    "max_fields": 2,
+    "max_claim_bytes": 256,
+    "max_total_claim_bytes": 1024,
+    "max_template_bytes": 2048,
+    "max_walk_nodes": 128,
+    "max_input_json_bytes": 16384,
+    "max_total_prompt_tokens": 8192,
+    "max_total_projected_logits": 16777216,
+    "max_output_bytes": 1048576
+  },
+  "max_model_work": {
+    "forward_positions": 4096,
+    "projected_logits": 64000000,
+    "attention_pairs": 16777216,
+    "projections": {
+      "dot_products": 100000000000,
+      "multiply_accumulates": 1000000000000000
+    }
+  }
+}

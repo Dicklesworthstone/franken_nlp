@@ -30,6 +30,7 @@ mod sentiment_map;
 mod classify_map;
 mod scored_batch;
 mod extract;
+mod semantic;
 mod jobs;
 mod map;
 mod judge;
@@ -115,6 +116,7 @@ pub(crate) enum CandidateCommand {
     SentimentMap(sentiment_map::SentimentMapCommand),
     ClassifyMap(classify_map::ClassifyMapCommand),
     Extract(extract::ExtractCommand),
+    SemanticExtract(semantic::SemanticCommand),
     Map(map::MapCommand),
     Judge(judge::JudgeCommand),
     FaithfulnessMap(faithfulness_map::FaithfulnessMapCommand),
@@ -140,6 +142,7 @@ pub(crate) fn definition() -> clap::Command {
         .subcommand(batch::definition())
         .subcommand(scored_batch::definition())
         .subcommand(extract::definition())
+        .subcommand(semantic::definition())
         .subcommand(jobs::definition())
         .subcommand(jobs::scored::definition())
         .subcommand(map::definition())
@@ -202,6 +205,9 @@ impl CandidateCommand {
         if name == "score-batch" {
             return scored_batch::ScoreBatchCommand::from_matches(matches).map(Self::ScoreBatch);
         }
+        if name == "extract-semantic" {
+            return semantic::SemanticCommand::from_arg_matches(matches).map(Self::SemanticExtract);
+        }
         if name == "extract" {
             return extract::ExtractCommand::from_matches(matches).map(Self::Extract);
         }
@@ -261,6 +267,7 @@ impl CandidateCommand {
             Self::SentimentMap(command) => return command.execute(input, output),
             Self::ClassifyMap(command) => return command.execute(input, output),
             Self::Extract(command) => return command.execute(input, output),
+            Self::SemanticExtract(command) => return command.execute(input, output),
             Self::Map(command) => return command.execute(input, output),
             Self::Judge(command) => return command.execute(input, output),
             Self::FaithfulnessMap(command) => return command.execute(input, output),

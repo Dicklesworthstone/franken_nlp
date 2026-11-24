@@ -5,6 +5,7 @@ pub(super) mod scored_tasks;
 pub(super) mod sentiment_map;
 pub(super) mod classify_map;
 pub(super) mod extraction;
+pub(super) mod semantic;
 pub(super) mod map_tasks;
 pub(super) mod judgment;
 pub(super) mod faithfulness_map;

@@ -42,6 +42,15 @@ original document, not schema names or invented evidence. Unannotated fields
 remain ordinary semantic extraction. Membership proves that a quote occurs,
 not that a field is semantically correct or that the model found every fact.
 
+## Explicit semantic field review
+
+Use `fnlp candidate extract-semantic` with a separate `--semantic-options FILE`
+to review configured scalar claims against the complete original source after
+extraction. This route preserves the original JSON and adds explicit correlated,
+uncalibrated field diagnostics; it does not repair or automatically accept the
+result. See [the complete INT8 semantic extraction example](candidate-semantic-extraction.md)
+for the schema, source, options, bounds, and result fields.
+
 ## Planning, execution and limits
 
 The actual grammar is checked against the actual source before model metadata

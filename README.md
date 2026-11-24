@@ -61,6 +61,10 @@
 > [held-out sentiment ratings and paired model comparison](#native-int4-sentiment-evaluation-and-comparison).
 > INT8 `candidate map` also supports [bounded compact input for complete
 > NER, keyphrase and cited-summary documents](#implemented-candidate-int8-compact-document-maps).
+> INT8 schema maps add [explicit complete-document root-object extraction](#implemented-candidate-int8-complete-document-root-object-extraction)
+> for required properties supplied by different chunks.
+> INT8 extraction also supports [explicit semantic field review](#implemented-candidate-int8-semantic-extraction)
+> with preserved original JSON and same-model correlation disclosed.
 > INT8 document QA supports [bounded hierarchical answers from verified
 > quotations](docs/candidate-question-synthesis.md#hierarchical-answers-for-evidence-exceeding-one-context).
 > Buffered INT8 generation and chat support [persistent scoped CPU
@@ -599,7 +603,9 @@ Native INT8 `candidate batch --task extract` also accepts
 source share one record allowance, encoder workspace is admitted before private
 IO, and every corpus frame carries the fixed policy. Original cancellation
 continues through source indexing and plan sealing. Complete-document INT8
-maps remain byte-only; see the [resident extraction contract](docs/candidate-extraction-batch-cli.md).
+maps use the separately bounded [compact document policy](#implemented-candidate-int8-compact-document-maps).
+See the [resident extraction contract](docs/candidate-extraction-batch-cli.md)
+for the record-local streaming policy.
 
 Retained INT8 `candidate job start|resume` supports the same compact input for
 `--task extract|ner|keyphrases|summarize|answer`. In addition to per-record
@@ -712,10 +718,13 @@ and optional `--source-membership` with the compact flag. The same cumulative
 ledger charges initial schema sizing, rejected source probes and every repeated
 schema/source prompt in preflight and hosted reconstruction. Original schema
 bytes, exact decimal constants and source coordinates remain intact. Each chunk
-retains its independently validated JSON string; no global object merge is
-inferred. The host admits the encoder workspace beside the retained schema and
-source plans. Complete-document extraction corpora and retained extraction jobs
-keep their separate byte-mode contracts.
+retains its independently validated JSON string. Explicit
+[`--reconcile-object`](#implemented-candidate-int8-complete-document-root-object-extraction)
+combines complementary root properties under a separately derived partial
+schema; the default keeps the independent chunk objects. The host admits the
+encoder workspace beside the retained schema and source plans.
+Complete-document extraction corpora and retained extraction jobs keep their
+separate byte-mode contracts.
 
 For passage QA, use `--task answer --question question.txt` with the same compact
 flag. The repeated question, passage manifests, discarded source probes and
@@ -758,6 +767,115 @@ evidence; changed prompt tokens establish no output-parity, quality or speed
 claim. See the [CLI contract](docs/candidate-long-document-cli.md#bounded-compact-input)
 and [library contract](docs/int8-long-source.md#compact-source-encoding).
 Rust and model qualification remain pending.
+
+## Implemented candidate INT8 complete-document root-object extraction
+
+Use `fnlp candidate map --task extract --reconcile-object` when required
+properties may appear in different chunks of one document. The mode derives
+a partial schema by emptying only the root `required` set. Each chunk can omit
+an absent root property; every property it emits must satisfy its complete
+original nested schema. Nested objects and arrays remain atomic values.
+
+For example, save this as `record.schema.json` and supply your complete source
+as `long-document.txt`:
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "invoice_id": {
+      "type": "string",
+      "maxLength": 64,
+      "x-fnlp-source": "verbatim"
+    },
+    "customer": {
+      "type": "string",
+      "maxLength": 64,
+      "x-fnlp-source": "verbatim"
+    }
+  },
+  "required": ["invoice_id", "customer"]
+}
+```
+
+```sh
+fnlp candidate map long-document.txt --task extract \
+  --schema record.schema.json --reconcile-object --source-membership \
+  --model ./model.fnlpq --memory-mib 16384 --max-chunks 64 \
+  --max-object-properties 16 --max-object-origins 1024 \
+  --max-object-input-bytes 1048576 --max-object-json-bytes 65536 \
+  --max-object-nodes 4096 --max-object-result-bytes 1048576 \
+  --max-map-result-bytes 16777216 > complete-record.json
+```
+
+The reducer combines complementary root properties and coalesces exactly equal
+values while retaining every origin. A conflicting value or missing final
+required property refuses the complete document. It does not choose a
+first/last winner, synthesize nulls, recursively merge partial nested objects,
+or retry the model to repair a result. The final object independently validates
+against the untouched original schema.
+
+All six `--max-object-*` options require `--reconcile-object`. Properties and
+origins bound the retained provenance; input bytes count every partial JSON
+string, including duplicates. JSON bytes bound the final exact-number JSON
+string; nodes cover all partial values plus its independent final parse.
+Object result bytes include the final object and its provenance.
+`--max-map-result-bytes` additionally bounds the complete partial-map-plus-object
+envelope. These are whole-document allowances.
+
+With `--source-membership`, annotated final fields are checked against the
+complete original source using the remaining field, occurrence and scan
+budgets after chunk verification. The output retains exact native JSON strings
+under `output.partial_map`, the final JSON string at `output.object.json`, property
+origins, and original UTF-8-byte/Unicode-scalar evidence. Top-level
+`root_object` records the selected policy and limits. Syntax and verbatim
+membership do not establish semantic truth or extraction completeness.
+
+The mode supports `--input-encoding safe-bpe-v1` with one cumulative tokenizer
+ledger, and `--compute-threads 4 --prefill-rows 4` for one persistent team across
+all chunks. Memory admission includes both original/partial schemas,
+reconciliation, retained chunk results, native context and optional worker
+storage before private IO. Library callers use `Int8ObjectExtractionPlanner`,
+`Int8ObjectExtractionMapConfig` and
+`NlpEngine::extract_int8_object_document` with the corresponding layer-major and
+threaded variants. Omitting `--reconcile-object` preserves independent chunk
+extraction.
+
+## Implemented candidate INT8 semantic extraction
+
+`fnlp candidate extract-semantic` combines one real constrained extraction with
+explicit per-field faithfulness review against the complete original source.
+A versioned options file supplies schema-aware scalar claim templates, evidence
+policy, judge budgets, semantic bounds, and all five complete-request native
+work ceilings. The original extraction remains unchanged.
+
+A complete small example is checked in:
+
+```sh
+fnlp candidate extract-semantic docs/examples/int8-semantic/source.txt \
+  --schema docs/examples/int8-semantic/schema.json --source-membership \
+  --semantic-options docs/examples/int8-semantic/options.json \
+  --model ./model.fnlpq --memory-mib 16384 \
+  --context-tokens 2048 --max-new-tokens 128 \
+  --max-input-bytes 512 --max-result-bytes 16384
+```
+
+The original exact JSON string is in `output.extraction.result.output.json`;
+`output.semantic.fields` reports `entailed`, `contradicted`, `unsupported`, or
+`not_checked` with the corresponding reason and available evidence. Verbatim,
+null, unmapped, and empty values retain explicit not-checked reasons. These are
+same-model-correlated, uncalibrated diagnostics; no result repairs a field or
+automatically authorizes acceptance. Any failed stage returns no combined result.
+
+Both stages share one owned invocation and strict INT8 engine. Every actual
+field judge compiles and preflights before the first review forward, and early
+extraction EOS never refunds its original maximum work reservation. The initial
+CLI route uses serial execution, byte-fallback input, and full projection.
+The host retains preparation, native, and output admission through physical
+completion and delivery. See the [semantic extraction guide](docs/candidate-semantic-extraction.md)
+for the complete configuration, context/KV relationship, and Rust API. Rust and
+real-model qualification remain pending.
 
 ## Implemented candidate INT8 complete-document sentiment
 
