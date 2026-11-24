@@ -46,8 +46,52 @@ The example uses a 2,048-position context. Its judge `max_kv_bytes` is `36909875
 
 The five native ceilings cover forward positions, projected logits, attention pairs, projection dot products, and projection multiply-accumulates. The maximum extraction reservation remains charged even when extraction stops early. Actual values determine the review prompts, so every dynamic judge is compiled and preflighted after extraction and before the first review forward. All judges run within the remaining complete-request allowance.
 
-This initial CLI route uses serial execution, byte-fallback input, and full-vocabulary projections. Its command does not accept compact-input, selected-row, sampling, or worker-schedule flags. The deadline spans preparation, loading, extraction, review, checked serialization, write, and flush; output and preparation charges remain held through delivery. Memory values describe the process resource ledger, not a measured operating-system RSS limit.
+This CLI route uses serial execution and full-vocabulary projections. Byte-fallback input remains the default; compact input is explicit. The command does not accept selected-row, sampling, or worker-schedule flags. The deadline spans preparation, loading, extraction, review, checked serialization, write, and flush; output and preparation charges remain held through delivery. Memory values describe the process resource ledger, not a measured operating-system RSS limit.
 
 ## Rust API
 
 Prepare a real `PreparedInt8SemanticExtraction` from a pinned extraction plan, judge planner, and explicit `Int8SemanticOptions`. Use `Int8SemanticHostLimits::requirements` for the complete quote, then call `NlpEngine::execute_int8_semantic_extract`. The host consumes the plan, reuses one strict INT8 engine for both stages, preserves typed cancellation causes, and returns a guarded `HostedOutput<Int8SemanticExtractionRun>`.
+
+## Compact input across extraction and every review
+
+Add `--input-encoding safe-bpe-v1` to encode the original schema/source and
+every generated claim and evidence prompt compactly while preserving their
+decoded bytes and excluding template-control token IDs. One allowance covers
+the complete operation: the work already spent preparing extraction is carried
+into semantic planning, and none of the four ceilings renews between fields.
+
+```sh
+fnlp candidate extract-semantic docs/examples/int8-semantic/source.txt \
+  --model /models/candidate-int8.fnlpq --memory-mib 16384 \
+  --context-tokens 2048 --max-new-tokens 128 --max-input-bytes 512 \
+  --max-result-bytes 16384 --schema docs/examples/int8-semantic/schema.json \
+  --source-membership --semantic-options docs/examples/int8-semantic/options.json \
+  --input-encoding safe-bpe-v1 \
+  --max-tokenizer-input-bytes 65536 --max-tokenizer-output-tokens 8192 \
+  --max-tokenizer-pair-checks 1000000 --max-tokenizer-pair-bytes 8000000
+```
+
+The cumulative byte/token ceilings are distinct from the original document
+byte cap and from each native context. The pair ceilings count comparisons and
+examined bytes across both stages. All fields still compile and preflight
+before review inference. Exceeding a ceiling returns no combined result; there
+is no renewed per-field allowance or fallback.
+
+Compact mode defaults the caller preparation reservation to 1,024 MiB.
+The host separately prices one transient encoder workspace beside all retained
+source copies, prompts, field results, exact JSON and output storage. Existing
+field-count and output limits remain in force.
+
+`output.input_encoding` records the exact policy and actual cumulative work.
+Byte-default output omits that extension. Library callers configure the pinned
+extraction and judge with the same policy and quote
+`Int8SemanticHostLimits::requirements_with_encoding` before execution; a
+mismatched policy or changed ceiling is refused. The original source bytes,
+schema numbers and extraction JSON remain unchanged. Compact prompt tokens
+differ from byte fallback, so this is not a tokenizer-parity, identical-output,
+model-quality or measured-speed claim.
+
+Regression definitions cover policy mismatch, all four cumulative ceilings,
+retained original work, exact schema/source preservation, byte-default output,
+and additive admission. Compilation, execution, actual-model behavior and
+performance remain subject to the repository's controller-owned DSR gates.

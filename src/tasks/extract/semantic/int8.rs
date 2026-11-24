@@ -12,6 +12,7 @@ use crate::{
     tasks::{extract::{ExtractionVocabulary, quantized::{Int8ExtractError, Int8ExtractRun, check_size}},
         judge::{partition_evidence, quantized::{Int8JudgeError, Int8JudgeRun, PreparedInt8Judge, INT8_JUDGE_EXECUTION}}},
     grammar::mask::MaskWorkLimits,
+    tokenizer::untrusted::{SafeBpeWork, UntrustedEncoding},
 };
 
 pub const INT8_SEMANTIC_EXECUTION: &str = "portable-int8-extraction-correlated-second-reader-v1";
@@ -95,6 +96,34 @@ impl Int8SemanticError {
     }
 }
 
+/// The exact input policy and cumulative preparation work across the original
+/// schema/source and every correlated claim/evidence prompt. Byte-default
+/// output omits this extension; compact input remains an explicit candidate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct Int8SemanticEncoding {
+    pub policy: UntrustedEncoding,
+    pub work: SafeBpeWork,
+}
+impl Int8SemanticEncoding {
+    pub(crate) fn from_work(policy: &UntrustedEncoding, work: SafeBpeWork)
+        -> Result<Option<Self>, Int8SemanticError> {
+        policy.validate().map_err(|_| Int8SemanticError::Contract)?;
+        match policy {
+            UntrustedEncoding::ByteFallback => {
+                if work != SafeBpeWork::default() { return Err(Int8SemanticError::Accounting); }
+                Ok(None)
+            }
+            UntrustedEncoding::SafeBpeV1(limits) => {
+                if work.input_bytes() > limits.max_input_bytes || work.output_tokens() > limits.max_output_tokens
+                    || work.pair_checks() > limits.max_pair_checks || work.pair_bytes() > limits.max_pair_bytes {
+                    return Err(Int8SemanticError::WorkBudget);
+                }
+                Ok(Some(Self { policy: policy.clone(), work }))
+            }
+        }
+    }
+}
+
 /// Construct from the real pinned extraction factory, not a saved JSON result.
 /// The exact original source and schema stay attached throughout both stages.
 pub struct PreparedInt8SemanticExtraction {
@@ -110,6 +139,14 @@ impl PreparedInt8SemanticExtraction {
         options: Int8SemanticOptions, control: &mut C) -> Result<Self, Int8SemanticError> {
         poll(control)?;
         options.validate()?;
+        let source = extraction.source();
+        if source.document_encoding() != judge.document_encoding()
+            || matches!(source.document_encoding(), UntrustedEncoding::SafeBpeV1(_))
+                != source.input_encoding_work().is_some() {
+            return Err(Int8SemanticError::Contract);
+        }
+        Int8SemanticEncoding::from_work(source.document_encoding(),
+            source.input_encoding_work().unwrap_or_default())?;
         judge_identity.validate().map_err(|_| Int8SemanticError::Contract)?;
         let a = extraction.execution_identity();
         crate::native_engine::constrained_int8::check_profile(a).map_err(Int8ExtractError::from)?;
@@ -139,8 +176,15 @@ impl PreparedInt8SemanticExtraction {
     pub fn judge_budget(&self) -> TaskBudget { self.options.specification.judge_budget }
     pub fn judge_planning_limits(&self) -> JudgeLimits { self.judge_limits }
     pub fn source_bytes(&self) -> usize { self.extraction.source().text().len() }
-    pub fn input_encoding(&self) -> &crate::tokenizer::untrusted::UntrustedEncoding {
+    pub fn input_encoding(&self) -> &UntrustedEncoding {
         self.extraction.source().document_encoding()
+    }
+    /// Includes the original schema and source, never a fresh review allowance.
+    pub fn input_encoding_work(&self) -> Option<SafeBpeWork> {
+        self.extraction.source().input_encoding_work()
+    }
+    pub fn encoding_workspace_bytes(&self) -> Result<u64, Int8SemanticError> {
+        self.judge.document_encoding_workspace_bytes().map_err(SemanticError::from).map_err(Into::into)
     }
     pub fn semantic_limits(&self) -> SemanticLimits { self.options.limits }
     pub fn max_result_bytes(&self) -> u64 { self.options.limits.max_output_bytes }
@@ -204,6 +248,7 @@ impl PreparedInt8SemanticExtraction {
         let count = fields.iter().filter(|f| f.claim.is_some()).count();
         let mut judges = vector(count)?;
         let mut work = Int8Work::default();
+        let mut encoding_work = self.input_encoding_work().unwrap_or_default();
         let s = &self.options.specification;
         let context = PlanContext::new(&self.judge_identity, s.judge_budget).map_err(|_| Int8SemanticError::Contract)?;
         let mut logits_left = l.max_total_projected_logits;
@@ -219,7 +264,8 @@ impl PreparedInt8SemanticExtraction {
                 ..self.judge_limits };
             let request = JudgeRequest::Faithfulness { source: copy(self.extraction.source().text())?, claim: copy(claim)?,
                 policy: s.judge_policy, budget: s.judge_budget };
-            let plan = self.judge.plan_int8_with_control(&request, &context, limits, control)?;
+            let plan = self.judge.plan_int8_with_encoding_work(&request, &context, limits,
+                control, &mut encoding_work)?;
             logits_left = logits_left.checked_sub(plan.planned_work().projected_logits).ok_or(Int8SemanticError::WorkBudget)?;
             work = plus(work, plan.planned_work())?;
             // Charge the original maximum extraction reservation, NOT its
@@ -229,14 +275,16 @@ impl PreparedInt8SemanticExtraction {
             }
             judges.push(plan);
         }
+        Int8SemanticEncoding::from_work(self.input_encoding(), encoding_work)?;
         poll(control)?;
-        Ok(Review { extraction, fields, judges, work })
+        Ok(Review { extraction, fields, judges, work, encoding_work })
     }
     fn finish<C: DecodeStepControl>(&self, review: Review, results: Vec<Int8JudgeRun>, control: &mut C)
         -> Result<Int8SemanticExtractionRun, Int8SemanticError> {
         poll(control)?;
         if results.len() != review.judges.len() { return Err(Int8SemanticError::Accounting); }
         let mut work = Int8Work::default(); let mut scoring = ScoringWork { prefix_evaluations: 0, scored_edges: 0, projected_logits: 0 };
+        let mut encoding_work = self.input_encoding_work().unwrap_or_default();
         let (mut head_count, mut rewound) = (0_usize, 0_u64);
         let mut verified = vector(results.len())?;
         for (plan, run) in review.judges.iter().zip(results) {
@@ -245,14 +293,25 @@ impl PreparedInt8SemanticExtraction {
                 || run.model_work != plan.planned_work() || run.head_count != plan.head_count() {
                 return Err(Int8SemanticError::Accounting);
             }
+            if plan.input_encoding() != self.input_encoding()
+                || plan.input_encoding_work().is_some() != self.input_encoding_work().is_some() {
+                return Err(Int8SemanticError::Accounting);
+            }
+            encoding_work = encoding_work.checked_add(plan.input_encoding_work().unwrap_or_default())
+                .ok_or(Int8SemanticError::Accounting)?;
             let JudgeResult::Faithfulness(result) = run.result else { return Err(Int8SemanticError::Accounting); };
+            if result.work.projected_logits != run.model_work.projected_logits {
+                return Err(Int8SemanticError::Accounting);
+            }
             work = plus(work, run.model_work)?;
             scoring = super::add_work(scoring, result.work)?;
             head_count = head_count.checked_add(run.head_count).ok_or(Int8SemanticError::Accounting)?;
             rewound = rewound.checked_add(run.rewound_positions).ok_or(Int8SemanticError::Accounting)?;
             verified.push(result);
         }
-        if work != review.work { return Err(Int8SemanticError::Accounting); }
+        if work != review.work || encoding_work != review.encoding_work {
+            return Err(Int8SemanticError::Accounting);
+        }
         let attempted = verified.len(); let mut verified = verified.into_iter(); let mut fields = vector(review.fields.len())?;
         let mut checked = 0;
         for field in review.fields {
@@ -279,6 +338,7 @@ impl PreparedInt8SemanticExtraction {
             numerics_profile: STRICT_INT8_PROFILE, extraction_reserved_work: self.extraction_reserved_work(),
             semantic_model_work: work, reserved_model_work: reserved, model_work: actual,
             judge_head_count: head_count, rewound_positions: rewound, extraction: review.extraction,
+            input_encoding: Int8SemanticEncoding::from_work(self.input_encoding(), review.encoding_work)?,
             semantic: SemanticVerificationReceipt { schema_version: 1, algorithm: SEMANTIC_VERIFICATION_VERSION.to_owned(),
                 claim_rendering: CLAIM_RENDER_VERSION.to_owned(), judge_algorithm: FAITHFULNESS_VERSION.to_owned(),
                 specification_revision: self.options.specification.revision.clone(),
@@ -289,7 +349,10 @@ impl PreparedInt8SemanticExtraction {
         Ok(run)
     }
 }
-struct Review { extraction: Int8ExtractRun, fields: Vec<RenderedField>, judges: Vec<PreparedInt8Judge>, work: Int8Work }
+struct Review {
+    extraction: Int8ExtractRun, fields: Vec<RenderedField>, judges: Vec<PreparedInt8Judge>,
+    work: Int8Work, encoding_work: SafeBpeWork,
+}
 
 #[derive(Serialize)]
 pub struct Int8SemanticExtractionRun {
@@ -304,7 +367,22 @@ pub struct Int8SemanticExtractionRun {
     pub rewound_positions: u64,
     /// Original JSON and native evidence are never rewritten or replaced.
     pub extraction: Int8ExtractRun,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_encoding: Option<Int8SemanticEncoding>,
     pub semantic: SemanticVerificationReceipt,
+}
+impl Int8SemanticExtractionRun {
+    /// The completed report must retain the admitted policy and every byte,
+    /// token and pair operation already spent preparing the original request.
+    pub(crate) fn verify_input_encoding(&self, policy: &UntrustedEncoding, initial: SafeBpeWork)
+        -> Result<(), Int8SemanticError> {
+        let actual = self.input_encoding.as_ref().map(|encoding| encoding.work).unwrap_or_default();
+        if actual.checked_sub(initial).is_none()
+            || self.input_encoding != Int8SemanticEncoding::from_work(policy, actual)? {
+            return Err(Int8SemanticError::Accounting);
+        }
+        Ok(())
+    }
 }
 fn poll(control: &mut impl DecodeStepControl) -> Result<(), Int8SemanticError> {
     match control.prefill_checkpoint(0) { Some(c) => Err(Int8SemanticError::Cancelled(c)), None => Ok(()) }

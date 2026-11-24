@@ -206,7 +206,7 @@ impl CandidateCommand {
             return scored_batch::ScoreBatchCommand::from_matches(matches).map(Self::ScoreBatch);
         }
         if name == "extract-semantic" {
-            return semantic::SemanticCommand::from_arg_matches(matches).map(Self::SemanticExtract);
+            return semantic::SemanticCommand::from_matches(matches).map(Self::SemanticExtract);
         }
         if name == "extract" {
             return extract::ExtractCommand::from_matches(matches).map(Self::Extract);

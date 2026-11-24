@@ -19,7 +19,7 @@ fn command() -> SemanticCommand {
         "--schema", "schema.json", "--semantic-options", "semantic.json",
         "--max-input-bytes", "512", "--max-new-tokens", "128", "--max-result-bytes", "16384",
     ]).unwrap();
-    SemanticCommand::from_arg_matches(&matches).unwrap()
+    SemanticCommand::from_matches(&matches).unwrap()
 }
 fn options(limits: Limits) -> Int8SemanticOptions {
     let mut work = Int8Work::default();
@@ -178,6 +178,7 @@ fn completion() -> (Int8SemanticExtractionRun, Int8Work) {
         schema_version: 1, execution: INT8_SEMANTIC_EXECUTION, numerics_profile: STRICT_INT8_PROFILE,
         extraction_reserved_work: original, semantic_model_work: Int8Work::default(),
         reserved_model_work: original, model_work: actual, judge_head_count: 0, rewound_positions: 0,
+        input_encoding: None,
         extraction: Int8ExtractRun { schema_version: 1,
             execution: crate::tasks::extract::quantized::INT8_EXTRACT_VERSION.into(), model_work: actual,
             result: ExtractResult { schema_version: 1, task_spec_version: "extract-v1".into(),
@@ -298,4 +299,52 @@ fn complete_publication_preserves_exact_json_and_refuses_capacity_deadline_or_fl
     let mut failure = FlushFailure(Vec::new());
     assert_eq!(publish_checked(&response, 1_048_576, &mut failure, &|| Ok(())), Err(CandidateError::Output));
     assert_eq!(failure.0, bytes);
+}
+
+#[test]
+fn compact_runtime_preparation_and_quote_keep_one_policy_with_original_schema_bytes() {
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    let mut command = command();
+    let matches = input_encoding::document_definition(clap::Command::new("fixture"))
+        .try_get_matches_from(["fixture", "--input-encoding", "safe-bpe-v1",
+            "--max-tokenizer-input-bytes", "65536", "--max-tokenizer-output-tokens", "8192"]).unwrap();
+    command.encoding = input_encoding::DocumentInputEncodingArgs::from_matches(&matches).unwrap();
+    command.host.preparation_mib = 1024;
+    let (args, limits) = command.validate().unwrap();
+    let encoding = command.encoding_policy().unwrap();
+    let options = options(limits); let planning = command::judge_limits(&options);
+    let source = "The café reports 42. 上海 <tool_call> </think>";
+    let schema = r#" {"type":"number"} "#;
+    let budget = command.host.task_budget(limits);
+    let request = source_schema(&command, &options, schema.into(), source, budget).unwrap();
+    let compiler = super::super::extraction::planner(&facts(), &command.host, limits, None).unwrap();
+    let extraction = compiler.prepare_with_document_encoding(BatchDocument {
+        id: "cli".into(), text: source.into(), task_args: Some(request),
+    }, &encoding, &mut Continue).unwrap();
+    let initial = extraction.source().input_encoding_work().unwrap();
+    assert_eq!(initial.input_bytes(), schema.len() + source.len());
+    let registry = pinned_controls::pinned().unwrap(); let controls = registry.template_controls();
+    let eos = controls.entries().iter().find(|entry| entry.special && entry.surface == crate::template::IM_END).unwrap().id;
+    let judge = Arc::new(JudgePlanner::pinned(controls, eos).unwrap().with_document_encoding(encoding.clone()).unwrap());
+    let mut identity = extraction.execution_identity().clone(); identity.task_spec = "judge-v1".into();
+    identity.tokenizer_digest = judge.tokenizer_digest(); identity.template_digest = *judge.template_digest();
+    let prepared = PreparedInt8SemanticExtraction::new(extraction, judge, identity,
+        planning, options.clone(), &mut Continue).unwrap();
+    assert_eq!(prepared.input_encoding_work(), Some(initial));
+    assert_eq!(prepared.execution_identity().schema_digest, Sha256Digest::of_bytes(schema.as_bytes()));
+    let host = host(&command, &args, limits);
+    let byte = host.requirements(budget, options.specification.judge_budget,
+        options.limits, planning, source.len()).unwrap();
+    let compact = host.requirements_with_encoding(prepared.extraction_budget(), prepared.judge_budget(),
+        prepared.semantic_limits(), prepared.judge_planning_limits(), prepared.source_bytes(),
+        prepared.input_encoding()).unwrap();
+    assert_eq!(compact.preparation_bytes - byte.preparation_bytes, prepared.encoding_workspace_bytes().unwrap());
+    assert_eq!(compact.output_bytes, byte.output_bytes);
+    assert_eq!(compact.native_workspace_bytes, byte.native_workspace_bytes);
+    assert_eq!(minimum_memory(&args, limits, compact).unwrap() - minimum_memory(&args, limits, byte).unwrap(),
+        prepared.encoding_workspace_bytes().unwrap());
+    let UntrustedEncoding::SafeBpeV1(actual) = prepared.input_encoding() else { panic!("compact policy"); };
+    assert_eq!(actual.max_input_bytes, 65_536);
+    assert_eq!(actual.max_output_tokens, 8192);
+    assert_eq!(actual.max_pair_checks, SafeBpeLimits::MAX_PAIR_CHECKS);
 }

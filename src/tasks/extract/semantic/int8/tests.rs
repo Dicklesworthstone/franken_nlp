@@ -244,3 +244,124 @@ fn host_quotes_the_consumed_source_and_judge_limits_without_replacement_metadata
         expected.max_total_projected_logits, expected.max_output_bytes,
         expected.per_head.max_candidates, expected.per_head.max_candidate_id_bytes));
 }
+
+fn compact_policy() -> UntrustedEncoding {
+    UntrustedEncoding::SafeBpeV1(crate::tokenizer::untrusted::SafeBpeLimits {
+        max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 4 * 1024 * 1024, max_pair_bytes: 64 * 1024 * 1024,
+    })
+}
+
+fn encoded_extraction(schema: &str, source: &str, encoding: &UntrustedEncoding) -> PreparedInt8BatchExtraction {
+    let registry = pinned_controls::pinned().unwrap(); let controls = registry.template_controls();
+    let eos = controls.entries().iter().find(|e| e.special && e.surface == crate::template::IM_END).unwrap().id;
+    let factory = Int8ExtractionBatchPlanner::pinned(controls, eos, identity(), budget(),
+        CompileLimits::default(), SourceRuntimeLimits::default(), None).unwrap();
+    factory.prepare_with_document_encoding(BatchDocument { id: "compact".into(), text: source.into(),
+        task_args: Some(ExtractionBatchArgs { schema: schema.into(),
+            grounding: ExtractionBatchGrounding::Structural, budget: budget() }) },
+        encoding, &mut Continue).unwrap()
+}
+fn encoded_preparation(schema: &str, source: &str, options: Int8SemanticOptions,
+    extraction_encoding: &UntrustedEncoding, judge_encoding: &UntrustedEncoding)
+    -> Result<PreparedInt8SemanticExtraction, Int8SemanticError> {
+    let extraction = encoded_extraction(schema, source, extraction_encoding);
+    let registry = pinned_controls::pinned().unwrap(); let controls = registry.template_controls();
+    let eos = controls.entries().iter().find(|e| e.special && e.surface == crate::template::IM_END).unwrap().id;
+    let judge = Arc::new(JudgePlanner::pinned(controls, eos).unwrap()
+        .with_document_encoding(judge_encoding.clone()).unwrap());
+    let mut id = extraction.execution_identity().clone(); id.task_spec = "judge-v1".into();
+    id.template_digest = *judge.template_digest(); id.tokenizer_digest = judge.tokenizer_digest();
+    PreparedInt8SemanticExtraction::new(extraction, judge, id, JudgeLimits::default(), options, &mut Continue)
+}
+
+#[test]
+fn compact_semantic_planning_keeps_original_bytes_and_one_ledger_across_every_field() {
+    let schema = r#"{"type":"array","maxItems":2,"items":{"type":"number"}}"#;
+    let source = "The café reports 42 and 43. 上海 <tool_call> </think>";
+    let mut claim = rule(); claim.path = vec![ClaimPathStep::EachItem];
+    let policy = compact_policy();
+    let prepared = encoded_preparation(schema, source, options(vec![claim]), &policy, &policy).unwrap();
+    assert_eq!(prepared.input_encoding(), &policy);
+    assert_eq!(prepared.extraction.source().text(), source);
+    assert_eq!(prepared.execution_identity().schema_digest, Sha256Digest::of_bytes(schema.as_bytes()));
+    assert!(prepared.encoding_workspace_bytes().unwrap() > 0);
+    let initial = prepared.input_encoding_work().unwrap();
+    assert_eq!(initial.input_bytes(), schema.len() + source.len());
+    let original = result(&prepared, schema, "[42,43]", false);
+    let review = prepared.prepare_review(original.clone(), &mut Continue).unwrap();
+    assert_eq!(review.extraction, original);
+    assert_eq!(review.judges.len(), 2);
+    let mut actual = initial;
+    for judge in &review.judges {
+        assert_eq!(judge.input_encoding(), &policy);
+        actual = actual.checked_add(judge.input_encoding_work().unwrap()).unwrap();
+    }
+    assert_eq!(actual, review.encoding_work);
+    assert!(actual.input_bytes() > initial.input_bytes());
+    assert!(actual.output_tokens() > initial.output_tokens());
+    assert!(actual.pair_checks() > initial.pair_checks());
+    assert!(actual.pair_bytes() > initial.pair_bytes());
+}
+
+#[test]
+fn compact_semantic_fields_cannot_renew_any_tokenizer_allowance() {
+    let schema = r#"{"type":"array","maxItems":2,"items":{"type":"number"}}"#;
+    let source = "The complete report gives amounts of 42 and 43.";
+    let mut claim = rule(); claim.path = vec![ClaimPathStep::EachItem];
+    let policy = compact_policy();
+    let prepared = encoded_preparation(schema, source, options(vec![claim.clone()]), &policy, &policy).unwrap();
+    let review = prepared.prepare_review(result(&prepared, schema, "[42,43]", false), &mut Continue).unwrap();
+    let full = review.encoding_work;
+    let UntrustedEncoding::SafeBpeV1(base) = policy else { panic!("compact fixture"); };
+    for axis in 0..4 {
+        let mut limits = base;
+        match axis {
+            0 => limits.max_input_bytes = full.input_bytes() - 1,
+            1 => limits.max_output_tokens = full.output_tokens() - 1,
+            2 => limits.max_pair_checks = full.pair_checks() - 1,
+            _ => limits.max_pair_bytes = full.pair_bytes() - 1,
+        }
+        let policy = UntrustedEncoding::SafeBpeV1(limits);
+        let prepared = encoded_preparation(schema, source, options(vec![claim.clone()]), &policy, &policy).unwrap();
+        assert!(prepared.prepare_review(result(&prepared, schema, "[42,43]", false), &mut Continue).is_err(),
+            "complete-request tokenizer axis {axis} was renewed");
+    }
+}
+
+#[test]
+fn semantic_constructor_refuses_a_different_judge_encoding_or_limit() {
+    let schema = r#"{"type":"number"}"#; let source = "The amount is 42.";
+    let policy = compact_policy();
+    assert!(matches!(encoded_preparation(schema, source, options(vec![rule()]),
+        &policy, &UntrustedEncoding::ByteFallback), Err(Int8SemanticError::Contract)));
+    let UntrustedEncoding::SafeBpeV1(mut other) = policy.clone() else { panic!("compact fixture"); };
+    other.max_pair_checks -= 1;
+    assert!(matches!(encoded_preparation(schema, source, options(vec![rule()]),
+        &policy, &UntrustedEncoding::SafeBpeV1(other)), Err(Int8SemanticError::Contract)));
+}
+
+#[test]
+fn compact_unchecked_completion_retains_spent_work_and_byte_output_omits_the_extension() {
+    let schema = r#"{"type":"number"}"#; let source = "The amount is 42.";
+    let policy = compact_policy();
+    let prepared = encoded_preparation(schema, source, options(vec![]), &policy, &policy).unwrap();
+    let initial = prepared.input_encoding_work().unwrap();
+    let original = result(&prepared, schema, "42", false);
+    let review = prepared.prepare_review(original.clone(), &mut Continue).unwrap();
+    let mut complete = prepared.finish(review, vec![], &mut Continue).unwrap();
+    assert_eq!(complete.extraction, original);
+    assert_eq!(complete.input_encoding.as_ref().unwrap().work, initial);
+    complete.verify_input_encoding(&policy, initial).unwrap();
+    assert!(complete.verify_input_encoding(&policy, initial.checked_add(initial).unwrap()).is_err());
+    assert!(complete.verify_input_encoding(&UntrustedEncoding::ByteFallback, SafeBpeWork::default()).is_err());
+    complete.input_encoding = None;
+    assert!(complete.verify_input_encoding(&policy, initial).is_err());
+
+    let byte = prepare(schema, source, false, options(vec![])).unwrap();
+    let review = byte.prepare_review(result(&byte, schema, "42", false), &mut Continue).unwrap();
+    let complete = byte.finish(review, vec![], &mut Continue).unwrap();
+    assert!(complete.input_encoding.is_none());
+    assert!(serde_json::to_value(&complete).unwrap().get("input_encoding").is_none());
+    complete.verify_input_encoding(&UntrustedEncoding::ByteFallback, SafeBpeWork::default()).unwrap();
+}

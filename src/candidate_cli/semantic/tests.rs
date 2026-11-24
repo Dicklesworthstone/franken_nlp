@@ -60,14 +60,14 @@ fn semantic_route_requires_explicit_schema_options_model_and_memory() {
 }
 
 #[test]
-fn semantic_route_accepts_only_its_explicit_serial_byte_full_projection_scope() {
+fn semantic_route_keeps_serial_byte_defaults_and_full_projection_scope() {
     let command = command(&[]);
     let (args, limits) = command.validate().unwrap();
     assert_eq!(args.compute.threads(), 1);
     assert_eq!(limits.compute, compute::Args::default().admit_prefill(None).unwrap());
     assert_eq!(args.input_encoding_policy(limits).unwrap(), UntrustedEncoding::ByteFallback);
     assert!(args.policy.prefill().unwrap().is_none());
-    for option in ["--compute-threads", "--prefill-rows", "--input-encoding", "--selected-rows",
+    for option in ["--compute-threads", "--prefill-rows", "--selected-rows",
         "--seed", "--temperature-milli", "--top-k", "--top-p-ppm", "--options"] {
         assert!(super::super::definition().try_get_matches_from([
             "candidate", "extract-semantic", "--model", "m", "--memory-mib", "8192",
@@ -164,4 +164,44 @@ fn judge_limits_preserve_complete_three_way_heads_and_shared_whole_request_caps(
     assert_eq!(planned.max_total_projected_logits, 7_000_000);
     assert_eq!(planned.per_head.max_projected_logits, 7_000_000);
     assert_eq!(planned.max_output_bytes, options.specification.judge_budget.max_output_bytes);
+}
+
+#[test]
+fn compact_semantic_cli_admits_one_complete_request_allowance_before_io() {
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    let compact = command(&["--input-encoding", "safe-bpe-v1",
+        "--max-tokenizer-input-bytes", "65536", "--max-tokenizer-output-tokens", "8192",
+        "--max-tokenizer-pair-checks", "1000000", "--max-tokenizer-pair-bytes", "8000000"]);
+    let (_, limits) = compact.validate().unwrap();
+    assert_eq!(compact.host.preparation_mib, 1024);
+    assert_eq!(compact.encoding_policy().unwrap(), UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 65_536, max_output_tokens: 8192,
+        max_pair_checks: 1_000_000, max_pair_bytes: 8_000_000,
+    }));
+    assert!(compact.encoding.workspace_bytes().unwrap() > 0);
+    assert_eq!(limits.compute.threads, 1);
+
+    for flag in ["--max-tokenizer-input-bytes", "--max-tokenizer-output-tokens",
+        "--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
+        let matches = definition().try_get_matches_from(["extract-semantic",
+            "--model", "m", "--memory-mib", "8192", "--schema", "s", "--semantic-options", "o", flag, "1"]).unwrap();
+        assert!(SemanticCommand::from_matches(&matches).is_err(), "{flag} accepted for byte input");
+        let invalid = command(&["--input-encoding", "safe-bpe-v1", flag, "0"]);
+        assert!(invalid.validate().is_err(), "{flag} accepted zero");
+    }
+}
+
+#[test]
+fn compact_semantic_workspace_does_not_replace_original_schema_or_options_memory() {
+    let mut compact = command(&["--input-encoding", "safe-bpe-v1",
+        "--max-tokenizer-input-bytes", "65536", "--max-tokenizer-output-tokens", "8192"]);
+    compact.validate().unwrap();
+    let encoder = compact.encoding.workspace_bytes().unwrap();
+    let floor = 256 * MIB + compact.host.max_input_bytes as u64 * 32
+        + extract::SCHEMA_BYTES as u64 * 32 + compact.host.max_result_bytes as u64 * 16
+        + OPTIONS_BYTES as u64 * 16 + encoder;
+    compact.host.preparation_mib = floor.div_ceil(MIB).max(512);
+    compact.validate().unwrap();
+    compact.host.preparation_mib = 511;
+    assert!(compact.validate().is_err());
 }

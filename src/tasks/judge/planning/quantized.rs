@@ -95,7 +95,7 @@ impl JudgePlanner {
 
     /// Composed document planning shares the original tokenizer allowance
     /// across claim-capacity checks, source probes and every complete head.
-    fn plan_int8_with_encoding_work<C: DecodeStepControl>(&self, request: &JudgeRequest,
+    pub(crate) fn plan_int8_with_encoding_work<C: DecodeStepControl>(&self, request: &JudgeRequest,
         context: &PlanContext<'_>, limits: JudgeLimits, control: &mut C, work: &mut SafeBpeWork)
         -> Result<PreparedInt8Judge, Int8JudgeError> {
         checkpoint(control)?;
@@ -121,6 +121,8 @@ impl JudgePlanner {
 }
 impl PreparedInt8Judge {
     pub fn execution_identity(&self) -> &ExecutionIdentity { self.inner.execution_identity() }
+    pub fn input_encoding(&self) -> &UntrustedEncoding { self.inner.input_encoding() }
+    pub fn input_encoding_work(&self) -> Option<SafeBpeWork> { self.inner.input_encoding_work() }
     pub fn planned_work(&self) -> Int8Work { self.work }
     pub fn head_count(&self) -> usize { self.schedules.len() }
     pub fn required_context(&self) -> usize { self.schedules.iter().map(|s| s.context).max().unwrap_or(0) }

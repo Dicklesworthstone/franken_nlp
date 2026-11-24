@@ -41,12 +41,27 @@ impl Int8SemanticHostLimits {
     /// Pure quote usable before model/source IO. Every field judge retains its
     /// full source and complete head plans; all plans coexist before any review
     /// forward and while results accumulate. Final output capacity does not
-    /// replace or discount these intermediates. This route uses byte fallback
-    /// and full-vocabulary projection for both stages.
+    /// replace or discount these intermediates. Full-vocabulary projection
+    /// remains the scoring contract for both stages.
     pub fn requirements(self, extraction: TaskBudget, judge: TaskBudget,
         semantic: SemanticLimits, judge_planning: JudgeLimits, source_bytes: usize)
         -> Result<Int8SemanticHostRequirements, HostedError> {
+        self.requirements_with_encoding(extraction, judge, semantic, judge_planning,
+            source_bytes, &UntrustedEncoding::ByteFallback)
+    }
+
+    /// Original extraction and all field reviews reuse one transient encoder
+    /// workspace. Its charge is additional to every retained prompt and result.
+    #[allow(clippy::too_many_arguments)]
+    pub fn requirements_with_encoding(self, extraction: TaskBudget, judge: TaskBudget,
+        semantic: SemanticLimits, judge_planning: JudgeLimits, source_bytes: usize, encoding: &UntrustedEncoding)
+        -> Result<Int8SemanticHostRequirements, HostedError> {
         self.native.run.validate()?;
+        let encoding_workspace_bytes = match encoding {
+            UntrustedEncoding::ByteFallback => 0,
+            UntrustedEncoding::SafeBpeV1(limits) => limits.requirements()
+                .map_err(|_| HostedError::Limits("INT8 semantic input encoding policy"))?.workspace_bytes,
+        };
         extraction.validate().map_err(|_| HostedError::Limits("INT8 semantic extraction budget"))?;
         judge.validate().map_err(|_| HostedError::Limits("INT8 semantic judge budget"))?;
         if self.preparation_reserve_bytes == 0 || self.native.allocator_reserve_bytes == 0
@@ -83,7 +98,7 @@ impl Int8SemanticHostLimits {
         // each leaf. The parsed tree/walk and exact claims remain live together.
         let pointers = product(product(fields, semantic.max_input_json_bytes as u64)?, 2)?;
         let preparation_bytes = sum(&[
-            self.preparation_reserve_bytes, sources, prompts, candidates, ids, plans, judge_results, pointers,
+            self.preparation_reserve_bytes, encoding_workspace_bytes, sources, prompts, candidates, ids, plans, judge_results, pointers,
             product(extraction.max_output_bytes, 4)?, product(semantic.max_input_json_bytes as u64, 128)?,
             product(semantic.max_walk_nodes as u64, 128)?, product(semantic.max_total_claim_bytes as u64, 4)?,
             product(semantic.max_template_bytes as u64, 4)?,
@@ -124,6 +139,8 @@ impl NlpEngine {
         let required = checked_requirements(self, model, &prepared, limits)?;
         let extraction_work = prepared.extraction_reserved_work();
         let max_work = prepared.max_model_work();
+        let encoding = prepared.input_encoding().clone();
+        let initial_encoding_work = prepared.input_encoding_work().unwrap_or_default();
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.preparation_bytes)?,
             || Ok(SemanticInput { prepared: Some(prepared), vocabulary }))?;
@@ -141,6 +158,7 @@ impl NlpEngine {
                 let result = prepared.execute_with_control(&mut engine.value, &input.value.vocabulary,
                     limits.masks, limits.max_mask_node_visits, control).map_err(HostedError::SemanticExtraction)?;
                 check_completion(&result, extraction_work, max_work)?;
+                result.verify_input_encoding(&encoding, initial_encoding_work).map_err(HostedError::SemanticExtraction)?;
                 if engine.value.is_poisoned() || !engine.value.kv_cache().all_slots_have_len(0) {
                     return Err(HostedError::SemanticExtraction(Int8SemanticError::Accounting));
                 }
@@ -164,13 +182,13 @@ fn checked_requirements(host: &NlpEngine, model: &ResidentInt8,
     }
     let work = prepared.extraction_reserved_work();
     if prepared.execution_identity().task_spec != "extract-v1" || prepared.judge_identity().task_spec != "judge-v1"
-        || prepared.input_encoding() != &UntrustedEncoding::ByteFallback || prepared.extraction_selected_rows().is_some()
+        || prepared.extraction_selected_rows().is_some()
         || work.forward_positions == 0 || work.forward_positions > limits.native.context_tokens as u64
         || !fits(work, prepared.max_model_work()) {
-        return Err(HostedError::Limits("INT8 semantic original extraction reservation and byte/full-head policy"));
+        return Err(HostedError::Limits("INT8 semantic original extraction reservation and full-head policy"));
     }
-    limits.requirements(prepared.extraction_budget(), prepared.judge_budget(),
-        prepared.semantic_limits(), prepared.judge_planning_limits(), prepared.source_bytes())
+    limits.requirements_with_encoding(prepared.extraction_budget(), prepared.judge_budget(),
+        prepared.semantic_limits(), prepared.judge_planning_limits(), prepared.source_bytes(), prepared.input_encoding())
 }
 fn check_completion(run: &Int8SemanticExtractionRun, extraction: Int8Work, ceiling: Int8Work)
     -> Result<(), HostedError> {

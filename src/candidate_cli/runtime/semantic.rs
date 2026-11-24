@@ -35,6 +35,7 @@ fn execution_error(error: HostedError) -> CandidateError {
 
 pub(in crate::candidate_cli) fn execute(command: SemanticCommand, args: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+    let encoding = command.encoding_policy()?;
     // This owner is established before any private options/source/schema or
     // output allocation and lives through the final external flush.
     let session = Session::new(&args, limits)?;
@@ -46,7 +47,8 @@ pub(in crate::candidate_cli) fn execute(command: SemanticCommand, args: Candidat
     let planning = command::judge_limits(&options);
     let max_work = options.max_model_work;
     let host = host_limits(&session, &args, &command, limits)?;
-    let upper = host.requirements(budget, judge_budget, semantic_limits, planning, args.max_input_bytes)
+    let upper = host.requirements_with_encoding(budget, judge_budget, semantic_limits, planning,
+        args.max_input_bytes, &encoding)
         .map_err(|_| CandidateError::Arguments)?;
     admit_memory(&args, limits, upper)?;
     // Fixed policy and whole-source capacity are admitted before these reads.
@@ -55,16 +57,20 @@ pub(in crate::candidate_cli) fn execute(command: SemanticCommand, args: Candidat
     let source_bytes = document.len();
     let request = source_schema(&command, &options, schema, &document, budget)?;
     session.remaining()?;
-    let quote = host.requirements(budget, judge_budget, semantic_limits, planning, source_bytes)
+    let quote = host.requirements_with_encoding(budget, judge_budget, semantic_limits, planning,
+        source_bytes, &encoding)
         .map_err(|_| CandidateError::Arguments)?;
     if !quote_fits(quote, upper) { return Err(CandidateError::Identity); }
     admit_memory(&args, limits, quote)?;
     let facts = session.facts(&args)?;
     let compiler = super::extraction::planner(&facts, &command.host, limits, None)?;
-    let extraction = compiler.prepare_with_control(BatchDocument {
-        id: "cli".to_owned(), text: document, task_args: Some(request),
-    }, &mut session.control()).map_err(|error|
-        error.fault.cancellation.map(cancelled).unwrap_or(CandidateError::Planning))?;
+    let document = BatchDocument { id: "cli".to_owned(), text: document, task_args: Some(request) };
+    let extraction = match &encoding {
+        crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback =>
+            compiler.prepare_with_control(document, &mut session.control()),
+        crate::tokenizer::untrusted::UntrustedEncoding::SafeBpeV1(_) =>
+            compiler.prepare_with_document_encoding(document, &encoding, &mut session.control()),
+    }.map_err(|error| error.fault.cancellation.map(cancelled).unwrap_or(CandidateError::Planning))?;
     if extraction.planned_work().forward_positions > args.context_tokens as u64 {
         return Err(CandidateError::Planning);
     }
@@ -75,23 +81,25 @@ pub(in crate::candidate_cli) fn execute(command: SemanticCommand, args: Candidat
     let eos = controls.entries().iter()
         .find(|entry| entry.special && entry.surface == crate::template::IM_END)
         .map(|entry| entry.id).ok_or(CandidateError::Identity)?;
-    let judge = Arc::new(JudgePlanner::pinned(controls, eos).map_err(|_| CandidateError::Planning)?);
+    let judge = Arc::new(JudgePlanner::pinned(controls, eos).map_err(|_| CandidateError::Planning)?
+        .with_document_encoding(encoding.clone()).map_err(|_| CandidateError::Planning)?);
     let mut judge_identity = extraction.execution_identity().clone();
     judge_identity.task_spec = "judge-v1".to_owned();
     judge_identity.tokenizer_digest = judge.tokenizer_digest();
     judge_identity.template_digest = *judge.template_digest();
     let prepared = PreparedInt8SemanticExtraction::new(extraction, judge, judge_identity,
         planning, options, &mut session.control()).map_err(planning_error)?;
-    let actual = host.requirements(prepared.extraction_budget(), prepared.judge_budget(),
-        prepared.semantic_limits(), prepared.judge_planning_limits(), prepared.source_bytes())
+    let actual = host.requirements_with_encoding(prepared.extraction_budget(), prepared.judge_budget(),
+        prepared.semantic_limits(), prepared.judge_planning_limits(), prepared.source_bytes(), prepared.input_encoding())
         .map_err(|_| CandidateError::Arguments)?;
     if prepared.extraction_budget() != budget || prepared.judge_budget() != judge_budget
         || prepared.semantic_limits() != semantic_limits || prepared.source_bytes() != source_bytes
-        || prepared.max_model_work() != max_work || actual != quote {
+        || prepared.max_model_work() != max_work || prepared.input_encoding() != &encoding || actual != quote {
         return Err(CandidateError::Identity);
     }
     admit_memory(&args, limits, actual)?;
     let reserved = prepared.extraction_reserved_work();
+    let initial_encoding_work = prepared.input_encoding_work().unwrap_or_default();
     let vocabulary = super::extraction::vocabulary()?;
     session.remaining()?;
     let cancellation = CancellationToken::default();
@@ -99,6 +107,7 @@ pub(in crate::candidate_cli) fn execute(command: SemanticCommand, args: Candidat
     let result = session.engine.execute_int8_semantic_extract(&model, prepared, vocabulary,
         host_limits(&session, &args, &command, limits)?, cancellation).map_err(execution_error)?;
     check_result(result.result(), reserved, max_work)?;
+    result.result().verify_input_encoding(&encoding, initial_encoding_work).map_err(|_| CandidateError::Execution)?;
     session.remaining()?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
         evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,

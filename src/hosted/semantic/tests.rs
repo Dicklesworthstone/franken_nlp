@@ -123,6 +123,7 @@ fn completion() -> (Int8SemanticExtractionRun, Int8Work) {
         schema_version: 1, execution: INT8_SEMANTIC_EXECUTION, numerics_profile: STRICT_INT8_PROFILE,
         extraction_reserved_work: extraction, semantic_model_work: Int8Work::default(),
         reserved_model_work: extraction, model_work: actual, judge_head_count: 0, rewound_positions: 0,
+        input_encoding: None,
         extraction: Int8ExtractRun { schema_version: 1, execution: INT8_EXTRACT_VERSION.into(), model_work: actual,
             result: ExtractResult { schema_version: 1, task_spec_version: "extract-v1".into(),
                 score_space: ScoreSpace::NotComputed, grounding: ExtractionGrounding::NotRequested,
@@ -210,4 +211,30 @@ fn complete_native_plan_vocabulary_and_output_cross_one_owned_boundary() {
     send::<Arc<ExtractionVocabulary>>();
     send::<HostedOutput<Int8SemanticExtractionRun>>();
     let _entry = NlpEngine::execute_int8_semantic_extract;
+}
+
+#[test]
+fn compact_semantic_admission_adds_one_workspace_without_discounting_retained_fields() {
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    let (host, extraction, judge, semantic, planning) = fixture();
+    let byte = host.requirements(extraction, judge, semantic, planning, 1024).unwrap();
+    assert_eq!(byte, host.requirements_with_encoding(extraction, judge, semantic, planning,
+        1024, &UntrustedEncoding::ByteFallback).unwrap());
+    let limits = SafeBpeLimits { max_input_bytes: 65_536, max_output_tokens: 8192,
+        max_pair_checks: 1_000_000, max_pair_bytes: 8_000_000 };
+    let policy = UntrustedEncoding::SafeBpeV1(limits);
+    let compact = host.requirements_with_encoding(extraction, judge, semantic, planning, 1024, &policy).unwrap();
+    assert_eq!(compact.native, byte.native);
+    assert_eq!(compact.native_workspace_bytes, byte.native_workspace_bytes);
+    assert_eq!(compact.output_bytes, byte.output_bytes);
+    assert_eq!(compact.preparation_bytes - byte.preparation_bytes, limits.requirements().unwrap().workspace_bytes);
+    let mut more = semantic; more.max_fields *= 2;
+    let more_byte = host.requirements(extraction, judge, more, planning, 1024).unwrap();
+    let more_compact = host.requirements_with_encoding(extraction, judge, more, planning, 1024, &policy).unwrap();
+    assert_eq!(more_compact.preparation_bytes - more_byte.preparation_bytes,
+        compact.preparation_bytes - byte.preparation_bytes);
+    assert_eq!(more_compact.preparation_bytes - compact.preparation_bytes,
+        more_byte.preparation_bytes - byte.preparation_bytes);
+    let bad = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_pair_checks: 0, ..limits });
+    assert!(host.requirements_with_encoding(extraction, judge, semantic, planning, 1024, &bad).is_err());
 }
