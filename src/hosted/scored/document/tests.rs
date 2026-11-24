@@ -128,6 +128,50 @@ fn compact_encoder_memory_is_charged_once_without_replacing_retained_plans() {
     assert!(overflow.with_input_encoding(&encoding).is_err());
 }
 
+fn prefill(rows: usize) -> Int8PrefillLimits {
+    Int8PrefillLimits { max_batch_rows: rows,
+        max_extra_scratch_bytes: Int8PrefillLimits::required_extra_scratch_bytes(rows).unwrap() }
+}
+
+#[test]
+fn prefill_and_worker_quotes_do_not_multiply_native_storage_by_chunks_or_labels() {
+    let (request, mut config) = fixture();
+    let batch = prefill(4);
+    let mut previous_input = 0;
+    for chunks in [1, 8, 64] {
+        config.mapping.chunks.max_chunks = chunks;
+        let plain = scheduled_requirements(config, request.budget, &UntrustedEncoding::ByteFallback,
+            None, None).unwrap();
+        let grouped = scheduled_requirements(config, request.budget, &UntrustedEncoding::ByteFallback,
+            Some(batch), None).unwrap();
+        assert_eq!(grouped.workspace_bytes, plain.workspace_bytes + batch.validate().unwrap());
+        assert_eq!(grouped.native, plain.native);
+        assert_eq!(grouped.input_bytes, plain.input_bytes);
+        assert_eq!(grouped.output_reservation_bytes, plain.output_reservation_bytes);
+        assert!(grouped.input_bytes > previous_input);
+        previous_input = grouped.input_bytes;
+        for width in [2, 4, 64] {
+            // Worker ownership is quoted and reserved by the team dispatcher;
+            // it must never be hidden in, or replace, coordinator storage.
+            let threaded = scheduled_requirements(config, request.budget, &UntrustedEncoding::ByteFallback,
+                Some(batch), Some(width)).unwrap();
+            assert_eq!(threaded, grouped);
+            assert!(dispatch::int8_prefill_team_workspace_bytes(width, batch.max_batch_rows).unwrap() > 0);
+        }
+    }
+    let quote = config.requirements(request.budget).unwrap();
+    let oversized_allowance = Int8PrefillLimits { max_extra_scratch_bytes: u64::MAX, ..batch };
+    assert_eq!(quote.with_prefill(oversized_allowance).unwrap(), quote.with_prefill(batch).unwrap());
+    let unfunded = Int8PrefillLimits { max_extra_scratch_bytes: batch.max_extra_scratch_bytes - 1, ..batch };
+    assert!(quote.with_prefill(unfunded).is_err());
+    for width in [0, 1, 65, usize::MAX] {
+        assert!(scheduled_requirements(config, request.budget, &UntrustedEncoding::ByteFallback,
+            Some(batch), Some(width)).is_err());
+    }
+    let mut overflow = quote; overflow.workspace_bytes = u64::MAX;
+    assert!(overflow.with_prefill(batch).is_err());
+}
+
 #[test]
 fn source_labels_and_identity_spare_capacities_survive_transfer_with_their_charge() {
     let (mut request, config) = fixture();
@@ -200,6 +244,15 @@ fn all_original_cancellation_causes_keep_their_typed_host_boundary() {
         assert_eq!(error.to_string(), "hosted native classification document failed");
         let HostedError::ClassificationMap(error) = error else { panic!("typed map error required") };
         assert_eq!(error.cancellation(), Some(cause));
+        let (request, config) = fixture();
+        let identity = identity(&planner(UntrustedEncoding::ByteFallback));
+        let model = ArtifactIdentity { model_id: "Nanbeige4.2-3B".to_owned(),
+            revision: identity.source_revision.clone(), recipe_id: identity.quant_recipe.clone(),
+            source_root_sha256: "ab".repeat(32), logical_model_sha256: identity.logical_model_digest.to_hex() };
+        let input = MapInput { request, config, identity, encoding: UntrustedEncoding::ByteFallback };
+        let error = prepare_map(&input, &model, &mut Stop(cause)).err().expect("cancelled preparation must fail");
+        let HostedError::ClassificationMap(error) = error else { panic!("typed preparation error required") };
+        assert_eq!(error.cancellation(), Some(cause));
     }
 }
 
@@ -207,8 +260,15 @@ fn all_original_cancellation_causes_keep_their_typed_host_boundary() {
 fn owned_map_inputs_and_complete_guarded_results_cross_the_blocking_boundary() {
     fn send<T: Send + 'static>() {}
     send::<MapInput>();
+    send::<MapTeamAdmission>();
     send::<Int8ClassificationMapRun>();
     send::<HostedOutput<Int8ClassificationMapRun>>();
+    send::<HostedInt8TeamResult<Int8ClassificationMapRun>>();
     let _byte = NlpEngine::map_int8_classify;
     let _compact = NlpEngine::map_int8_classify_with_encoding;
+    let _prefill = NlpEngine::map_int8_classify_layer_major_with_encoding;
+    let _team = NlpEngine::map_int8_classify_with_threads;
+    let _team_prefill = NlpEngine::map_int8_classify_layer_major_with_threads;
 }
+
+mod model;

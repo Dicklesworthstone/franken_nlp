@@ -5,6 +5,7 @@ use crate::{
     tasks::{classify::{ClassificationAggregationPolicy, ClassificationLimits, ClassificationRequest,
         quantized::long::Int8ClassificationMapLimits}, ir::TaskBudget, mapreduce::ChunkLimits},
     tokenizer::untrusted::UntrustedEncoding,
+    native_engine::strict_int8::prefill::Int8PrefillLimits,
 };
 
 #[derive(Args)]
@@ -33,6 +34,8 @@ pub(crate) struct ClassifyMapCommand {
     pub(super) scoring: scored::ScoredArgs,
     pub(super) mapping: MappingArgs,
     pub(super) encoding: input_encoding::DocumentInputEncodingArgs,
+    pub(super) compute: compute::Args,
+    pub(super) prefill: scored::prefill::ScoringPrefillArgs,
 }
 
 pub(super) struct MapLimits {
@@ -42,31 +45,37 @@ pub(super) struct MapLimits {
     pub(super) planning: ClassificationLimits,
     pub(super) mapping: Int8ClassificationMapLimits,
     pub(super) encoding: UntrustedEncoding,
+    pub(super) prefill: Option<Int8PrefillLimits>,
     pub(super) envelope_bytes: usize,
 }
 
 pub(super) fn definition() -> clap::Command {
-    input_encoding::document_definition(MappingArgs::augment_args(scored::ScoredArgs::augment_args(
+    compute::definition(input_encoding::document_definition(scored::prefill::ScoringPrefillArgs::augment_args(MappingArgs::augment_args(scored::ScoredArgs::augment_args(
         clap::Command::new("classify-map")
             .about("Classify a complete document with bounded native INT8 chunks and a source-weighted aggregate")
-            .long_about("Read one complete {document,labels,mode?,policy?} JSON request. Losslessly partition the exact UTF-8 source into nonoverlapping chunks that fit every classification head. Preflight every chunk and all five native work axes before loading weights. Execute on one resident INT8 model and reuse one native context. Return every complete chunk result with original byte/scalar coordinates, plus the existing source-scalar-weighted classification mixture. Exclusive classification and independent multi-label decisions retain their declared thresholds and full-vocabulary sequence scores. Aggregate weights are descriptive and uncalibrated; chunk mixtures are not single-context equivalents. A failed chunk, exhausted budget or cancellation returns no document result."))))
+            .long_about("Read one complete {document,labels,mode?,policy?} JSON request. Losslessly partition the exact UTF-8 source into nonoverlapping chunks that fit every classification head. Preflight every chunk and all five native work axes before loading weights. Execute on one resident INT8 model and reuse one native context. Return every complete chunk result with original byte/scalar coordinates, plus the existing source-scalar-weighted classification mixture. Exclusive classification and independent multi-label decisions retain their declared thresholds and full-vocabulary sequence scores. Aggregate weights are descriptive and uncalibrated; chunk mixtures are not single-context equivalents. A failed chunk, exhausted budget or cancellation returns no document result."))))))
         .mut_arg("preparation_mib", |arg| arg.default_value_if("input_encoding",
             clap::builder::ArgPredicate::Equals("safe-bpe-v1".into()), "1024"))
-        .after_long_help("Compact input: --input-encoding safe-bpe-v1 preserves exact untrusted source and label bytes. One bounded tokenizer ledger covers capacity sizing, accepted and rejected partition probes, and all final chunk/head plans in each complete preparation. The CLI preflight and later owned hosted preparation each use the same fixed policy with a fresh per-preparation ledger; neither replenishes work per chunk. Tokenizer byte/token ceilings are cumulative and separate from per-chunk context. Compact input changes prompt tokens and carries no parity, quality or speed claim. One process memory ledger prices retained plans, tokenizer workspace, complete chunk results, native scratch and final output staging before input/model IO. No cohorts, prompt prefill scheduling, sampling, thinking, tools or retained jobs are accepted by this command.")
+        .after_long_help("Compact input: --input-encoding safe-bpe-v1 preserves exact untrusted source and label bytes. One bounded tokenizer ledger covers capacity sizing, accepted and rejected partition probes, and all final chunk/head plans in each complete preparation. The CLI preflight and later owned hosted preparation each use the same fixed policy with a fresh per-preparation ledger; neither replenishes work per chunk. Tokenizer byte/token ceilings are cumulative and separate from per-chunk context. Compact input changes prompt tokens and carries no parity, quality or speed claim. Optional --compute-threads reuses one bounded persistent CPU team across every chunk and head; --prefill-rows bounds layer-major prompt staging. Both preserve the sealed work ceiling and source binding. One process memory ledger prices retained plans, tokenizer workspace, complete chunk results, native scratch, worker buffers and final output staging before input/model IO. No cohorts, sampling, thinking, tools or retained jobs are accepted by this command.")
 }
 
 impl ClassifyMapCommand {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         Ok(Self { scoring: scored::ScoredArgs::from_arg_matches(matches)?,
             mapping: MappingArgs::from_arg_matches(matches)?,
-            encoding: input_encoding::DocumentInputEncodingArgs::from_matches(matches)? })
+            encoding: input_encoding::DocumentInputEncodingArgs::from_matches(matches)?,
+            compute: compute::Args::from_matches(matches)?,
+            prefill: scored::prefill::ScoringPrefillArgs::from_arg_matches(matches)? })
     }
 
     pub(super) fn validate(&self) -> Result<MapLimits, CandidateError> {
         // One-context common arithmetic remains unchanged. Document encoding
         // has distinct cumulative limits and is admitted below, not injected
         // into a per-request token ceiling that would reset between chunks.
-        let (common, limits) = self.scoring.common()?;
+        let (mut common, mut limits) = self.scoring.common()?;
+        let prefill = self.prefill.limits()?;
+        common.compute = self.compute;
+        limits.compute = self.compute.admit_prefill(prefill)?;
         let encoding = self.encoding.policy()?;
         let m = &self.mapping;
         if self.scoring.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
@@ -103,7 +112,7 @@ impl ClassifyMapCommand {
             .and_then(|n| n.checked_add(encoder_bytes)).ok_or(CandidateError::Arguments)?;
         if floor > limits.preparation_bytes { return Err(CandidateError::Arguments); }
         let admitted = MapLimits { common, limits, task, planning: self.scoring.classification_limits(),
-            mapping, encoding, envelope_bytes };
+            mapping, encoding, prefill, envelope_bytes };
         #[cfg(feature = "asupersync-runtime")]
         runtime::classify_map::admit(&admitted)?;
         Ok(admitted)

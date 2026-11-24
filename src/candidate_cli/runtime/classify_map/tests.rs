@@ -81,7 +81,78 @@ fn original_typed_cancellation_reaches_preparation_and_host_failure_boundaries()
             crate::tasks::classify::quantized::Int8ClassificationError::Planning(
                 crate::tasks::classify::ClassificationPlanningError::Cancelled(cause)));
         assert_eq!(host_error(HostedError::ClassificationMap(error)), stopped(cause));
+        assert_eq!(host_error(HostedError::Native(
+            crate::native_engine::strict_int8::StrictInt8Error::Cancelled(cause))), stopped(cause));
     }
+}
+
+#[test]
+fn scheduling_never_changes_complete_request_authority_or_five_axis_work() {
+    for compact in [false, true] {
+        let mut flags = vec!["--max-chunk-bytes", "64"];
+        if compact { flags.extend(["--input-encoding", "safe-bpe-v1"]); }
+        let serial = command(&flags).validate().unwrap();
+        let source = "Exact é\r\n<|im_start|> Shanghai. ".repeat(4);
+        for mode in ["exclusive", "multi_label"] {
+            let request = request(&serial, &source, mode);
+            let expected = prepare(&request, &facts(), &serial, &mut Continue).unwrap();
+            for schedule in [&["--compute-threads", "4"][..], &["--prefill-rows", "4"][..],
+                &["--compute-threads", "4", "--prefill-rows", "4"][..]] {
+                let mut scheduled_flags = flags.clone(); scheduled_flags.extend_from_slice(schedule);
+                let scheduled = command(&scheduled_flags).validate().unwrap();
+                let actual = prepare(&request, &facts(), &scheduled, &mut Continue).unwrap();
+                assert_eq!(actual, expected);
+                assert_eq!(request.document, source);
+            }
+        }
+    }
+}
+
+#[test]
+fn complete_peak_admits_coordinator_and_workers_once_and_refuses_stale_quotes() {
+    let mut scheduled = command(&["--compute-threads", "4", "--prefill-rows", "4"])
+        .validate().unwrap();
+    let quote = admit(&scheduled).unwrap();
+    let plain = admit(&command(&[]).validate().unwrap()).unwrap();
+    let prefill_bytes = scheduled.prefill.unwrap().validate().unwrap();
+    assert_eq!(quote.native, plain.native);
+    assert_eq!(quote.input_bytes, plain.input_bytes);
+    assert_eq!(quote.workspace_bytes, plain.workspace_bytes + prefill_bytes);
+    assert!(scheduled.limits.compute.workspace_bytes > 0);
+    let execution = scheduled.limits.weight_bytes + 192 * MIB + quote.input_bytes
+        + quote.native.kv_bytes + quote.workspace_bytes + scheduled.limits.compute.workspace_bytes
+        + quote.output_reservation_bytes + 65_536;
+    let loading = scheduled.limits.weight_bytes + 192 * MIB + 64 * 1024 + 65_536;
+    let exact = scheduled.limits.preparation_bytes + execution.max(loading).max(quote.input_bytes);
+    scheduled.limits.memory_bytes = exact;
+    assert!(admit(&scheduled).is_ok());
+    scheduled.limits.memory_bytes -= 1;
+    assert!(matches!(admit(&scheduled), Err(CandidateError::Arguments)));
+    scheduled.limits.memory_bytes = exact;
+    scheduled.limits.compute.workspace_bytes -= 1;
+    assert!(matches!(admit(&scheduled), Err(CandidateError::Arguments)));
+    scheduled.limits.compute = scheduled.common.compute.admit_prefill(scheduled.prefill).unwrap();
+    scheduled.prefill = None;
+    assert!(matches!(admit(&scheduled), Err(CandidateError::Arguments)));
+}
+
+#[test]
+fn serial_response_bytes_stay_unchanged_and_worker_receipt_is_separate() {
+    let output = serde_json::json!({"kind":"int8-classification-map-v1","chunks":[]});
+    let facts = facts();
+    let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
+        evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
+        source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
+        quant_recipe: &facts.recipe_id, output: &output };
+    let original = serde_json::to_vec(&response).unwrap();
+    let serial = compute::Response { response: &response, compute: None };
+    assert_eq!(serde_json::to_vec(&serial).unwrap(), original);
+    let receipt = crate::hosted::Int8ComputeReceipt { schedule: "int8-output-row-team-v1",
+        compute_threads: 4, completed_projections: 2, completed_rows: 8, completed_worker_rows: 6 };
+    let threaded = compute::Response { response: &response, compute: Some(&receipt) };
+    let json = serde_json::to_value(threaded).unwrap();
+    assert_eq!(json["output"], output);
+    assert_eq!(json["compute"]["compute_threads"], 4);
 }
 
 #[test]

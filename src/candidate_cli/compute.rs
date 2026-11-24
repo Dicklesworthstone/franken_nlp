@@ -31,7 +31,7 @@ pub(super) struct Admission { pub threads: usize, pub workspace_bytes: u64 }
 pub(super) fn definition(command: clap::Command) -> clap::Command {
     command.arg(clap::Arg::new("compute_threads").long("compute-threads")
         .value_name("N").value_parser(clap::value_parser!(usize)).default_value("1")
-        .help("Coordinator plus persistent INT8 row workers, 1..=64; 1 keeps serial execution. One fixed team serves this complete request across both decoder passes, prompt tokens and generation. Runtime threads are additional. Worker storage and native memory are admitted before input/model IO. Buffered and streamed generate/chat, schema extraction, one-request source tasks, classification, sentiment, judgment and retained text-job start/resume can combine workers with --prefill-rows on the same team. A retained text job reuses its team across every pending item. Maps and live batches do not expose this option"))
+        .help("Coordinator plus persistent INT8 row workers, 1..=64; 1 keeps serial execution. One fixed team serves this complete request across both decoder passes, prompt tokens and generation. Runtime threads are additional. Worker storage and native memory are admitted before input/model IO. Buffered and streamed generate/chat, schema extraction, one-request source tasks, classification, sentiment, judgment and retained text-job start/resume can combine workers with --prefill-rows on the same team. A retained text job reuses its team across every pending item; classify-map reuses it across every chunk and head. Other maps and live batches do not expose this option"))
 }
 
 /// Price the entire simultaneously live threaded request, including the

@@ -354,10 +354,33 @@ impl PreparedInt8ClassificationMap<'_> {
     pub fn execute_with_control<C: DecodeStepControl>(&self, admitted: &[ExecutionIdentity],
         engine: &mut StrictInt8Engine<'_>, budget: Int8ScoringBudget, control: &mut C)
         -> Result<Int8ClassificationMapRun, Int8ClassificationMapError> {
+        self.execute_scheduled(admitted, engine, budget, None, control)
+    }
+    /// Process every chunk's complete head prompts in bounded layer-major
+    /// morsels. The same native context is reused between heads and chunks;
+    /// scheduling never renews the document work allowance or changes its
+    /// sealed request, full-vocabulary score space or aggregate semantics.
+    /// The caller separately admits the coordinator and any worker storage.
+    pub fn execute_layer_major_with_control<C: DecodeStepControl>(&self, admitted: &[ExecutionIdentity],
+        engine: &mut StrictInt8Engine<'_>, budget: Int8ScoringBudget,
+        prefill: Int8PrefillLimits, control: &mut C)
+        -> Result<Int8ClassificationMapRun, Int8ClassificationMapError> {
+        self.execute_scheduled(admitted, engine, budget, Some(prefill), control)
+    }
+    fn execute_scheduled<C: DecodeStepControl>(&self, admitted: &[ExecutionIdentity],
+        engine: &mut StrictInt8Engine<'_>, budget: Int8ScoringBudget,
+        prefill: Option<Int8PrefillLimits>, control: &mut C)
+        -> Result<Int8ClassificationMapRun, Int8ClassificationMapError> {
+        if let Some(prefill) = prefill { prefill.validate()?; }
         self.preflight_with_control(admitted, engine, budget, control)?;
         self.collect_with_control(control, |index, plan, control| {
-            let run = plan.execute_with_control(&admitted[index], engine, Int8ScoringBudget {
-                native: Int8RunBudget::exact(plan.planned_work()), max_kv_bytes: budget.max_kv_bytes }, control)?;
+            let budget = Int8ScoringBudget {
+                native: Int8RunBudget::exact(plan.planned_work()), max_kv_bytes: budget.max_kv_bytes };
+            let run = match prefill {
+                Some(prefill) => plan.execute_layer_major_with_control(&admitted[index],
+                    engine, budget, prefill, control),
+                None => plan.execute_with_control(&admitted[index], engine, budget, control),
+            }?;
             if engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) {
                 return Err(Int8ClassificationMapError::Admission);
             }

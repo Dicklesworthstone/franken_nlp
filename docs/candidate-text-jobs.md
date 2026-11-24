@@ -153,8 +153,8 @@ model-parity claim.
 
 `--compute-threads 2..=64` selects one fixed native row team for the entire
 retained invocation, including every pending generate or chat item. Width one
-keeps the existing serial path. The runtime/coordinator thread is additional to
-the requested worker count. `--prefill-rows` composes with the same team; it does
+keeps the existing serial path. The requested width includes the numerical
+coordinator; runtime infrastructure threads are additional. `--prefill-rows` composes with the same team; it does
 not start a second pool or replenish the job's lifetime work allowance.
 
 For example, add `--compute-threads 4 --prefill-rows 4` to either command above.

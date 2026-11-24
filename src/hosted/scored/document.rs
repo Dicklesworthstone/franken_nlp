@@ -3,8 +3,8 @@
 use super::*;
 use crate::{
     execution_identity::{NumericsProfile, ThinkingMode, ToolMode},
-    native_engine::{decode::DecodeStepControl,
-        strict_int8::STRICT_INT8_EXECUTION},
+    native_engine::{decode::DecodeStepControl, simd::Int8Kernel,
+        strict_int8::{StrictInt8Engine, STRICT_INT8_EXECUTION}},
     tasks::{classify::{ClassificationLabel, ClassificationLimits, ClassificationMode,
         ClassificationPlanner, ClassificationPlanningError, ClassificationRequest,
         quantized::long::{Int8ClassificationMapError, Int8ClassificationMapLimits,
@@ -31,7 +31,8 @@ pub struct Int8ClassificationMapHostConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Int8ClassificationMapMemoryRequirement {
     pub native: Int8MemoryRequirement,
-    /// RoPE, native scratch and allocator reserve; excludes KV.
+    /// RoPE, coordinator scratch and allocator reserve; excludes KV and
+    /// persistent worker storage. Explicit prefill adds its derived payload.
     pub workspace_bytes: u64,
     /// Source, labels, compiler, retained plans and complete result frontier.
     pub input_bytes: u64,
@@ -123,6 +124,15 @@ impl Int8ClassificationMapMemoryRequirement {
         sum(&[self.native.kv_bytes, self.workspace_bytes, self.input_bytes, self.output_reservation_bytes])?;
         Ok(self)
     }
+
+    /// Add one reusable coordinator prompt workspace. Persistent children
+    /// have a separate geometry-derived quote and reservation; neither this
+    /// payload nor the resident KV allocation is multiplied by chunk count.
+    pub fn with_prefill(mut self, prefill: Int8PrefillLimits) -> Result<Self, HostedError> {
+        self.workspace_bytes = scoring_scratch(self.workspace_bytes, Some(prefill))?;
+        sum(&[self.native.kv_bytes, self.workspace_bytes, self.input_bytes, self.output_reservation_bytes])?;
+        Ok(self)
+    }
 }
 
 struct MapInput {
@@ -130,6 +140,37 @@ struct MapInput {
     identity: ExecutionIdentity,
     config: Int8ClassificationMapHostConfig,
     encoding: UntrustedEncoding,
+}
+
+/// Native claims are a separate field so preparation can borrow the exact
+/// admitted request while allocation commits its own reservations. The whole
+/// owner remains outside the scoped callback until every worker has joined.
+struct MapNativeClaims {
+    kv: Option<Pending>, scratch: Option<Pending>,
+    _kv: Option<CommittedMemory>, _scratch: Option<CommittedMemory>,
+}
+impl MapNativeClaims {
+    fn commit(&mut self) -> Result<(), HostedError> {
+        self._kv = Some(self.kv.take().ok_or(HostedError::Limits("INT8 classification map KV consumed"))?.commit()?);
+        self._scratch = Some(self.scratch.take().ok_or(HostedError::Limits("INT8 classification map scratch consumed"))?.commit()?);
+        Ok(())
+    }
+}
+struct MapTeamAdmission {
+    input: Charged<MapInput>,
+    native: MapNativeClaims,
+    output: Option<Pending>,
+    _lease: EngineLease,
+}
+impl MapTeamAdmission {
+    fn finish(&mut self, result: Int8ClassificationMapRun, compute: Int8ComputeReceipt)
+        -> Result<HostedInt8TeamResult<Int8ClassificationMapRun>, HostedError> {
+        let pending = self.output.take().ok_or(HostedError::Limits("INT8 classification map output consumed"))?;
+        match pending.commit() {
+            Ok(memory) => Ok(HostedInt8TeamResult::from_guarded(GuardedOutput::new(result, memory), compute)),
+            Err(error) => { drop(result); Err(error) }
+        }
+    }
 }
 
 impl NlpEngine {
@@ -152,11 +193,31 @@ impl NlpEngine {
         base_identity: ExecutionIdentity, config: Int8ClassificationMapHostConfig,
         encoding: UntrustedEncoding, cancellation: CancellationToken)
         -> Result<HostedOutput<Int8ClassificationMapRun>, HostedError> {
+        self.map_int8_classify_scheduled(model, request, base_identity, config, encoding, None, cancellation)
+    }
+
+    /// Reuse bounded layer-major prompt storage across every independent
+    /// chunk/head, with the original document budget and completion seal.
+    /// This preserves the sequential map API's one-context memory contract.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_int8_classify_layer_major_with_encoding(&self, model: &ResidentInt8,
+        request: ClassificationRequest, base_identity: ExecutionIdentity,
+        config: Int8ClassificationMapHostConfig, encoding: UntrustedEncoding,
+        prefill: Int8PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int8ClassificationMapRun>, HostedError> {
+        self.map_int8_classify_scheduled(model, request, base_identity, config, encoding, Some(prefill), cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn map_int8_classify_scheduled(&self, model: &ResidentInt8, request: ClassificationRequest,
+        base_identity: ExecutionIdentity, config: Int8ClassificationMapHostConfig,
+        encoding: UntrustedEncoding, prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int8ClassificationMapRun>, HostedError> {
         dispatch::preflight(self, config.native.run)?;
         self.check_resident_domain(model)?;
         validate_base_identity(&base_identity)?;
         check_model_identity(model.artifact_identity(), &base_identity)?;
-        let required = config.requirements_with_encoding(request.budget, &encoding)?;
+        let required = scheduled_requirements(config, request.budget, &encoding, prefill, None)?;
         validate_request(&request, config)?;
         let bytes = owned_input_bytes(&request, &base_identity, config, required)?;
         let lease = self.resources().acquire_lease();
@@ -170,41 +231,135 @@ impl NlpEngine {
             // Preserve the whole aggregate: its charge cannot drop while a
             // queued closure still owns source, identity or preparation state.
             let input = input;
-            checkpoint(control)?;
-            let registry = pinned_controls::pinned()
-                .map_err(|_| planning_error(ClassificationPlanningError::ControlRegistry))?;
-            let controls = registry.template_controls();
-            let eos = controls.entries().iter()
-                .find(|entry| entry.special && entry.surface == crate::template::IM_END)
-                .map(|entry| entry.id)
-                .ok_or_else(|| planning_error(ClassificationPlanningError::ControlRegistry))?;
-            let planner = ClassificationPlanner::pinned(controls, eos)
-                .and_then(|planner| planner.with_document_encoding(input.value.encoding.clone()))
-                .map_err(planning_error)?;
-            check_planner_binding(&planner, &input.value.identity, &input.value.encoding)?;
-            let context = PlanContext::new(&input.value.identity, input.value.request.budget)
-                .map_err(|_| HostedError::ModelIdentity)?;
-            let prepared = planner.plan_int8_document_with_control(&input.value.request, &context,
-                input.value.config.planning, input.value.config.mapping, control).map_err(map_error)?;
-            let admitted = admit_prepared(&prepared, &input.value, &model, control)?;
-            let expected = prepared.preflight_metadata();
+            let (prepared, admitted) = prepare_map(&input.value, model.artifact_identity(), control)?;
             let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value
                 .engine(config.native.context_tokens, memory_budget(required.native)).map_err(HostedError::Model))?;
-            let result = allocate(output, || {
-                let result = prepared.execute_with_control(&admitted, &mut engine.value,
-                    Int8ScoringBudget { native: Int8RunBudget::exact(prepared.planned_work()),
-                        max_kv_bytes: required.native.kv_bytes }, control).map_err(map_error)?;
-                expected.verify_completed_with_control(&result, control).map_err(map_error)?;
-                if engine.value.is_poisoned() || !engine.value.kv_cache().all_slots_have_len(0) {
-                    return Err(map_error(Int8ClassificationMapError::Admission));
-                }
-                checkpoint(control)?;
-                Ok(result)
-            })?;
-            drop(engine); drop(admitted); drop(prepared); drop(planner); drop(registry); drop(input); drop(lease);
+            let result = allocate(output, || execute_prepared(&prepared, &admitted,
+                &mut engine.value, required.native.kv_bytes, prefill, control))?;
+            drop(engine); drop(admitted); drop(prepared); drop(input); drop(lease);
             Ok(GuardedOutput::new(result.value, result._memory))
         })
     }
+
+    /// One persistent numerical team spans every chunk and all of its label
+    /// heads. Chunk order, candidate language, full-vocabulary denominators
+    /// and scalar-weighted aggregation retain their existing exact contracts.
+    /// Width includes the coordinator and must fit the installed process host.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_int8_classify_with_threads(&self, model: &ResidentInt8, request: ClassificationRequest,
+        base_identity: ExecutionIdentity, config: Int8ClassificationMapHostConfig,
+        encoding: UntrustedEncoding, kernel: Int8Kernel, compute_threads: usize,
+        cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8ClassificationMapRun>, HostedError> {
+        self.map_int8_classify_team(model, request, base_identity, config, encoding,
+            kernel, compute_threads, None, cancellation)
+    }
+
+    /// Compose bounded prompt morsels with that same fixed team for the
+    /// entire document. Coordinator scratch and fixed child batch storage
+    /// are separately admitted before work and retained through physical join.
+    /// No semantic identity, work allowance or result seal includes the width.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_int8_classify_layer_major_with_threads(&self, model: &ResidentInt8,
+        request: ClassificationRequest, base_identity: ExecutionIdentity,
+        config: Int8ClassificationMapHostConfig, encoding: UntrustedEncoding,
+        kernel: Int8Kernel, compute_threads: usize, prefill: Int8PrefillLimits,
+        cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8ClassificationMapRun>, HostedError> {
+        self.map_int8_classify_team(model, request, base_identity, config, encoding,
+            kernel, compute_threads, Some(prefill), cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn map_int8_classify_team(&self, model: &ResidentInt8, request: ClassificationRequest,
+        base_identity: ExecutionIdentity, config: Int8ClassificationMapHostConfig,
+        encoding: UntrustedEncoding, kernel: Int8Kernel, compute_threads: usize,
+        prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8ClassificationMapRun>, HostedError> {
+        dispatch::preflight_int8_team(self, config.native.run, compute_threads)?;
+        self.check_resident_domain(model)?;
+        validate_base_identity(&base_identity)?;
+        check_model_identity(model.artifact_identity(), &base_identity)?;
+        let required = scheduled_requirements(config, request.budget, &encoding, prefill, Some(compute_threads))?;
+        validate_request(&request, config)?;
+        let bytes = owned_input_bytes(&request, &base_identity, config, required)?;
+        let lease = self.resources().acquire_lease();
+        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
+            || Ok(MapInput { request, identity: base_identity, config, encoding }))?;
+        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
+        let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes)?;
+        let output = Pending::reserve(&lease, MemoryClass::JobBuffers, required.output_reservation_bytes)?;
+        let admission = MapTeamAdmission { input, native: MapNativeClaims {
+            kv: Some(kv), scratch: Some(scratch), _kv: None, _scratch: None },
+            output: Some(output), _lease: lease };
+        let max_batch_rows = prefill.map_or(1, |limits| limits.max_batch_rows);
+        dispatch::run_int8_prefill_team(self, config.native.run, cancellation, model.clone(),
+            compute_threads, kernel, max_batch_rows, admission, move |model, admission, control, team| {
+                let (prepared, admitted) = prepare_map(&admission.input.value, model.artifact_identity(), control)?;
+                let mut engine = model.engine(config.native.context_tokens, memory_budget(required.native))
+                    .map_err(HostedError::Model)?.with_kernel(kernel)
+                    .with_projection_executor(team).map_err(HostedError::Native)?;
+                admission.native.commit()?;
+                let result = execute_prepared(&prepared, &admitted, &mut engine,
+                    required.native.kv_bytes, prefill, control)?;
+                drop(engine); drop(admitted); drop(prepared);
+                let compute = team.stats().into();
+                admission.finish(result, compute)
+            })
+    }
+}
+
+fn scheduled_requirements(config: Int8ClassificationMapHostConfig, task: TaskBudget,
+    encoding: &UntrustedEncoding, prefill: Option<Int8PrefillLimits>, width: Option<usize>)
+    -> Result<Int8ClassificationMapMemoryRequirement, HostedError> {
+    let mut required = config.requirements_with_encoding(task, encoding)?;
+    if let Some(prefill) = prefill { required = required.with_prefill(prefill)?; }
+    if let Some(width) = width {
+        let workers = dispatch::int8_prefill_team_workspace_bytes(width,
+            prefill.map_or(1, |limits| limits.max_batch_rows))?;
+        sum(&[required.native.kv_bytes, required.workspace_bytes, required.input_bytes,
+            required.output_reservation_bytes, workers])?;
+    }
+    Ok(required)
+}
+
+fn prepare_map<'a>(input: &'a MapInput, model: &ArtifactIdentity, control: &mut impl DecodeStepControl)
+    -> Result<(PreparedInt8ClassificationMap<'a>, Vec<ExecutionIdentity>), HostedError> {
+    checkpoint(control)?;
+    let registry = pinned_controls::pinned()
+        .map_err(|_| planning_error(ClassificationPlanningError::ControlRegistry))?;
+    let controls = registry.template_controls();
+    let eos = controls.entries().iter()
+        .find(|entry| entry.special && entry.surface == crate::template::IM_END)
+        .map(|entry| entry.id)
+        .ok_or_else(|| planning_error(ClassificationPlanningError::ControlRegistry))?;
+    let planner = ClassificationPlanner::pinned(controls, eos)
+        .and_then(|planner| planner.with_document_encoding(input.encoding.clone()))
+        .map_err(planning_error)?;
+    check_planner_binding(&planner, &input.identity, &input.encoding)?;
+    let context = PlanContext::new(&input.identity, input.request.budget)
+        .map_err(|_| HostedError::ModelIdentity)?;
+    let prepared = planner.plan_int8_document_with_control(&input.request, &context,
+        input.config.planning, input.config.mapping, control).map_err(map_error)?;
+    let admitted = admit_prepared(&prepared, input, model, control)?;
+    Ok((prepared, admitted))
+}
+
+fn execute_prepared(prepared: &PreparedInt8ClassificationMap<'_>, admitted: &[ExecutionIdentity],
+    engine: &mut StrictInt8Engine<'_>, kv_bytes: u64, prefill: Option<Int8PrefillLimits>,
+    control: &mut impl DecodeStepControl) -> Result<Int8ClassificationMapRun, HostedError> {
+    let expected = prepared.preflight_metadata();
+    let budget = Int8ScoringBudget { native: Int8RunBudget::exact(prepared.planned_work()), max_kv_bytes: kv_bytes };
+    let result = match prefill {
+        Some(prefill) => prepared.execute_layer_major_with_control(admitted, engine, budget, prefill, control),
+        None => prepared.execute_with_control(admitted, engine, budget, control),
+    }.map_err(map_error)?;
+    expected.verify_completed_with_control(&result, control).map_err(map_error)?;
+    if engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) {
+        return Err(map_error(Int8ClassificationMapError::Admission));
+    }
+    checkpoint(control)?;
+    Ok(result)
 }
 
 fn validate_base_identity(identity: &ExecutionIdentity) -> Result<(), HostedError> {
@@ -232,7 +387,7 @@ fn check_planner_binding(planner: &ClassificationPlanner, identity: &ExecutionId
 }
 
 fn admit_prepared(prepared: &PreparedInt8ClassificationMap<'_>, input: &MapInput,
-    model: &ResidentInt8, control: &mut impl DecodeStepControl) -> Result<Vec<ExecutionIdentity>, HostedError> {
+    model: &ArtifactIdentity, control: &mut impl DecodeStepControl) -> Result<Vec<ExecutionIdentity>, HostedError> {
     let expected_heads = if input.request.mode == ClassificationMode::Exclusive { 1 } else { input.request.labels.len() };
     if prepared.head_count() != expected_heads || prepared.chunk_count() == 0
         || prepared.chunk_count() > input.config.mapping.chunks.max_chunks
@@ -248,7 +403,7 @@ fn admit_prepared(prepared: &PreparedInt8ClassificationMap<'_>, input: &MapInput
     for identity in &admitted {
         checkpoint(control)?;
         validate_base_identity(identity)?;
-        check_model_identity(model.artifact_identity(), identity)?;
+        check_model_identity(model, identity)?;
         if identity.tokenizer_digest != input.identity.tokenizer_digest
             || identity.template_digest != input.identity.template_digest {
             return Err(HostedError::ModelIdentity);

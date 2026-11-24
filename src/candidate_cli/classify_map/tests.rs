@@ -54,8 +54,7 @@ fn document_and_labels_remain_exact_with_independent_multilabel_thresholds() {
 #[test]
 fn command_cannot_accept_generation_or_unimplemented_schedules() {
     for flag in ["--seed", "--temperature-milli", "--top-k", "--max-new-tokens",
-        "--prefill-rows", "--cohort-rows", "--cohort-heads", "--cohort-chunks",
-        "--compute-threads", "--max-mask-node-visits"] {
+        "--cohort-rows", "--cohort-heads", "--cohort-chunks", "--max-mask-node-visits"] {
         assert!(super::super::definition().try_get_matches_from([
             "candidate", "classify-map", "--model", "m", "--memory-mib", "16384", flag, "1"]).is_err());
     }
@@ -79,6 +78,8 @@ fn invalid_mapping_and_arithmetic_fail_without_reading_input_or_writing_output()
         ("--max-map-result-bytes", "0"), ("--max-map-result-bytes", "67108865"),
         ("--max-retained-result-bytes", "1"), ("--max-retained-result-bytes", "67108865"),
         ("--minimum-classified-coverage-ppm", "1000001"), ("--max-forward-positions", "0"),
+        ("--compute-threads", "0"), ("--compute-threads", "65"),
+        ("--prefill-rows", "0"), ("--prefill-rows", "65"),
         ("--context-tokens", "16"), ("--max-input-bytes", "3"),
         ("--preparation-mib", "511"), ("--timeout-seconds", "0")] {
         let command = command(&[flag, value]);
@@ -89,6 +90,40 @@ fn invalid_mapping_and_arithmetic_fail_without_reading_input_or_writing_output()
     let mut command = command(&[]);
     command.scoring.memory_mib = u64::MAX;
     assert!(command.validate().is_err());
+}
+
+#[test]
+fn physical_schedules_preserve_document_work_context_and_serial_defaults() {
+    let serial = command(&[]).validate().unwrap();
+    assert_eq!(serial.limits.compute.threads, 1);
+    assert_eq!(serial.limits.compute.workspace_bytes, 0);
+    assert!(serial.prefill.is_none());
+    for threads in ["1", "2", "4", "64"] {
+        for rows in [None, Some("1"), Some("4"), Some("64")] {
+            let mut flags = vec!["--compute-threads", threads];
+            if let Some(rows) = rows { flags.extend(["--prefill-rows", rows]); }
+            let admitted = command(&flags).validate().unwrap();
+            assert_eq!(admitted.task, serial.task);
+            assert_eq!(admitted.mapping.max_model_work, serial.mapping.max_model_work);
+            assert_eq!(admitted.mapping.max_result_bytes, serial.mapping.max_result_bytes);
+            assert_eq!(admitted.mapping.max_retained_result_bytes, serial.mapping.max_retained_result_bytes);
+            assert_eq!(admitted.mapping.aggregation.minimum_classified_coverage_ppm,
+                serial.mapping.aggregation.minimum_classified_coverage_ppm);
+            let chunks = admitted.mapping.chunks;
+            let expected = serial.mapping.chunks;
+            assert_eq!((chunks.max_input_bytes, chunks.max_chunk_bytes, chunks.max_chunk_tokens,
+                chunks.context_tokens, chunks.reserved_tokens, chunks.max_chunks, chunks.max_tokenizer_calls),
+                (expected.max_input_bytes, expected.max_chunk_bytes, expected.max_chunk_tokens,
+                    expected.context_tokens, expected.reserved_tokens, expected.max_chunks, expected.max_tokenizer_calls));
+            assert_eq!(admitted.encoding, serial.encoding);
+            assert_eq!(admitted.envelope_bytes, serial.envelope_bytes);
+            assert_eq!(admitted.common.context_tokens, serial.common.context_tokens);
+            assert_eq!(admitted.limits.compute,
+                admitted.common.compute.admit_prefill(admitted.prefill).unwrap());
+            assert_eq!(admitted.prefill.map(|limits| limits.max_batch_rows),
+                rows.map(|rows| rows.parse::<usize>().unwrap()));
+        }
+    }
 }
 
 #[test]
@@ -131,7 +166,9 @@ fn disabled_runtime_refuses_without_private_input_or_output() {
     impl Read for NoRead {
         fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("disabled map read private input"); }
     }
-    for flags in [&[][..], &["--input-encoding", "safe-bpe-v1"][..]] {
+    for flags in [&[][..], &["--input-encoding", "safe-bpe-v1"][..],
+        &["--compute-threads", "4"][..], &["--prefill-rows", "4"][..],
+        &["--compute-threads", "4", "--prefill-rows", "4", "--input-encoding", "safe-bpe-v1"][..]] {
         let mut output = Vec::new();
         assert_eq!(command(flags).execute(&mut NoRead, &mut output), Err(CandidateError::Unavailable));
         assert!(output.is_empty());
