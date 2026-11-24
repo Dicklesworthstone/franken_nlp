@@ -53,7 +53,9 @@ fn retained_peak_bytes(command: &RedactCommand, common: &CandidateArgs, limits: 
     let tokens = tokens.checked_mul(8).ok_or(CandidateError::Memory)?;
     // Match the closed host's bounded private recipe copies and full256 key
     // metadata. These reservations do not permit retaining any source text.
-    [base, buffers, staging, tokens, edit, 4096, 4 * (MIB - 1024)]
+    let prompt = command.prefill.limits()?.map(|limits| limits.validate())
+        .transpose().map_err(|_| CandidateError::Memory)?.unwrap_or(0);
+    [base, buffers, staging, tokens, edit, 4096, 4 * (MIB - 1024), prompt]
         .into_iter().try_fold(0_u64, |sum, bytes| sum.checked_add(bytes)).ok_or(CandidateError::Memory)
 }
 fn job_execution_error(error: HostedJobError) -> CandidateError {
@@ -73,7 +75,8 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let retention = &command.retention;
     let mode = retention.mode();
     retention.input_retention.validate(mode, &command.input).map_err(|_| CandidateError::Arguments)?;
-    let session = Session::new(&common, limits)?;
+    let prefill = command.prefill.limits()?;
+    let session = Session::new_with_prefill(&common, limits, prefill)?;
     let path = retention.job_limits.as_ref().ok_or(CandidateError::Arguments)?;
     let lifetime = job_cli::parse_limits(&read_config(&session, path, job_cli::LIMIT_BYTES)?)
         .map_err(|_| CandidateError::Input)?;
@@ -110,11 +113,39 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let job = SourceJobRequest { root: retention.job_dir.clone().ok_or(CandidateError::Arguments)?,
         key, job_id, limits: lifetime, mode, materialize: retention.materialize };
     let edit_reserve_bytes = command.edit_reserve_mib.checked_mul(MIB).ok_or(CandidateError::Arguments)?;
+    let planner = Arc::new(planner); let vocabulary = Arc::new(vocabulary);
+    let width = limits.compute.threads;
+    let kernel = crate::native_engine::simd::config::process_kernel();
     let progress = match prepared {
-        PreparedCorpus::Short(batch) => session.engine.job_int8_redact(&model, Arc::new(planner), Arc::new(vocabulary),
-            RedactionCorpusConfig { batch, edit_reserve_bytes }, secret, job, host, reader, cancellation),
-        PreparedCorpus::Document(batch) => session.engine.job_int8_redact_document(&model, Arc::new(planner), Arc::new(vocabulary),
-            RedactionCorpusConfig { batch, edit_reserve_bytes }, secret, job, host, reader, cancellation),
+        PreparedCorpus::Short(batch) => {
+            let config = RedactionCorpusConfig { batch, edit_reserve_bytes };
+            if width == 1 { match prefill {
+                None => session.engine.job_int8_redact(&model, planner, vocabulary,
+                    config, secret, job, host, reader, cancellation),
+                Some(prefill) => session.engine.job_int8_redact_layer_major(&model, planner, vocabulary,
+                    config, secret, job, host, prefill, reader, cancellation),
+            } } else { match prefill {
+                None => session.engine.job_int8_redact_with_threads(&model, planner, vocabulary,
+                    config, secret, job, host, kernel, width, reader, cancellation),
+                Some(prefill) => session.engine.job_int8_redact_layer_major_with_threads(&model, planner, vocabulary,
+                    config, secret, job, host, kernel, width, prefill, reader, cancellation),
+            } }
+        },
+        PreparedCorpus::Document(batch) => {
+            let config = RedactionCorpusConfig { batch, edit_reserve_bytes };
+            if width == 1 { match prefill {
+                None => session.engine.job_int8_redact_document(&model, planner, vocabulary,
+                    config, secret, job, host, reader, cancellation),
+                Some(prefill) => session.engine.job_int8_redact_document_layer_major(&model, planner, vocabulary,
+                    config, secret, job, host, prefill, reader, cancellation),
+            } } else { match prefill {
+                None => session.engine.job_int8_redact_document_with_threads(&model, planner, vocabulary,
+                    config, secret, job, host, kernel, width, reader, cancellation),
+                Some(prefill) => session.engine.job_int8_redact_document_layer_major_with_threads(
+                    &model, planner, vocabulary, config, secret, job, host,
+                    kernel, width, prefill, reader, cancellation),
+            } }
+        },
     }.map_err(job_execution_error)?;
     session.remaining()?;
     let report = report(progress, job_id, lifetime, retention.resume, retention.materialize, command.long.chunked)?;

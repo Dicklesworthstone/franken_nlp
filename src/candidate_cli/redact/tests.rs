@@ -267,7 +267,7 @@ fn redaction_worker_and_prompt_storage_coexist_with_both_preparation_owners() {
 }
 
 #[test]
-fn invalid_or_unimplemented_redaction_schedules_refuse_before_private_io() {
+fn invalid_redaction_schedules_refuse_before_private_io() {
     struct NoIo;
     impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private input"); } }
     impl Write for NoIo {
@@ -277,9 +277,6 @@ fn invalid_or_unimplemented_redaction_schedules_refuse_before_private_io() {
     for extra in [
         vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
         vec!["--prefill-rows", "0"], vec!["--prefill-rows", "65"],
-        vec!["--ndjson", "--store-results", "--compute-threads", "4",
-            "--job-dir", "private-job", "--job-id", "0123456789abcdef0123456789abcdef",
-            "--job-key-file", "private-key", "--job-limits", "limits.json"],
     ] {
         let command = scheduled(&extra);
         assert!(matches!(command.validate(), Err(CandidateError::Arguments)));

@@ -150,9 +150,9 @@ I/O. Failures use closed diagnostics and no candidate result prefix is printed.
 
 ## Persistent INT8 workers and bounded prompt prefill
 
-One-shot short redaction, `--chunked` complete-document redaction and live
-`--ndjson` populations accept `--compute-threads 1..=64` and
-`--prefill-rows 1..=64`. Omit the
+One-shot short redaction, `--chunked` complete-document redaction, live
+`--ndjson` populations and retained-job start/resume accept
+`--compute-threads 1..=64` and `--prefill-rows 1..=64`. Omit the
 prefill option for sequential prompt processing; width one retains the serial
 projection path. The options can be selected independently or together.
 
@@ -188,8 +188,11 @@ Live streams reuse one team across every record, original/verification stage
 and flush epoch. Their terminal completion frame is published only after the
 workers join under the original control; previously delivered document events
 remain valid if later work fails. See the [corpus guide](candidate-redaction-corpus.md).
-Retained jobs currently reject multiple workers and explicit prefill before
-private IO; their existing serial schedule remains available.
+Retained jobs likewise keep one team for the complete invocation, including
+every pending original and verification stage. Resume may change worker width
+or prompt rows without changing the authenticated detector/encoding recipe or
+refunding durable attempts and work. Completion metadata remains the existing
+job report and optional encoding policy; see the [job guide](candidate-redaction-jobs.md).
 
 Embedding applications use `NlpEngine::redact_int8_layer_major`,
 `redact_int8_with_threads` or `redact_int8_layer_major_with_threads`; the

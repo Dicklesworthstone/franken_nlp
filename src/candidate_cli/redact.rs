@@ -82,7 +82,7 @@ pub(super) fn definition() -> clap::Command {
         .about("Redact with native source-bound NER plus rules; verify the edited text afresh")
         .after_help("Verification covers only the selected detector union, not all PII. Model omissions and Unicode obfuscations remain possible. Pseudonyms are not anonymization. By default this candidate command emits one completed JSON object, never intermediate NER text. Pseudonymization always uses full 256-bit HMAC; raw key bytes have no argv option. Add --chunked for long documents: rules scan whole text while NER uses source-aligned chunks, then verification re-chunks the actual edited text. NER chunk boundaries may split entities; per-document work ceilings never renew per chunk. Add --ndjson for an owned corpus stream with one resident engine, fixed policy/key scope and independent whole-corpus ceilings. Completed document events remain valid if later records fail; any failed record yields a nonzero exit. Records cannot override actions, keys, types, chunking or verification. Add --store-results with --job-dir, --job-id, --job-key-file and --job-limits for explicit private retention. Save original envelopes only with --spool-input --max-retained-input-mib N; --resume --use-retained-input --max-retained-input-mib N restores them without a population positional argument or population stdin read. Otherwise resume requires the complete original population. Policy and both key scopes remain unchanged. Retained mode emits metadata only, and an error may follow durable progress. It requires metadata-store on supported Linux targets. The independent fnlp redact --rules-only command remains model-free."))
     ))
-        .mut_arg("compute_threads", |arg| arg.help("Coordinator plus persistent INT8 row workers, 1..=64; one team spans original detection and fresh edited-text verification, including every chunk. Runtime threads are additional. Composes with --prefill-rows. One-shot and live corpus redaction; retained-job scheduling is refused"))
+        .mut_arg("compute_threads", |arg| arg.help("Coordinator plus persistent INT8 row workers, 1..=64; one team spans original detection and fresh edited-text verification, including every chunk. Runtime threads are additional. Composes with --prefill-rows. One-shot, live corpus and retained start/resume share this schedule; a population reuses one team for its complete invocation"))
         .mut_arg("preparation_mib", |arg| arg
             .default_value_if("input_encoding", clap::builder::ArgPredicate::Equals("safe-bpe-v1".into()), "1024")
             .help("Preparation memory in MiB; defaults to 512 for byte input or 1024 for compact redaction, including edited-text tokenizer workspace"))
@@ -100,11 +100,6 @@ impl RedactCommand {
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), CandidateError> {
         let prefill = self.prefill.limits()?;
         let compute = self.compute.admit_prefill(prefill)?;
-        // Retained scheduling additionally needs authenticated job storage
-        // and lifetime ownership across the complete resumed invocation.
-        if (compute.threads > 1 || prefill.is_some()) && self.retention.store_results {
-            return Err(CandidateError::Arguments);
-        }
         if !self.encoding.is_default() && !self.long.chunked
             && (self.corpus.ndjson || self.retention.store_results) {
             return Err(CandidateError::Arguments);

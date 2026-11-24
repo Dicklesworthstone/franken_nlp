@@ -59,6 +59,75 @@ or rewrites committed results. `--materialize` publishes the fixed protected
 write may follow durable progress: preserve the inputs/keys and explicitly
 resume rather than assuming rollback. Storage is not promised to be encrypted.
 
+## INT8 numerical workers and bounded prompt prefill
+
+Retained INT8 jobs accept the same physical schedules as live redaction.
+`--compute-threads N` defaults to one and accepts widths one through 64.
+`--prefill-rows N` enables bounded layer-major prompt prefill with one through
+64 rows. The two options work independently or together, for both the
+single-context route and `--chunked` complete documents. They apply to the
+whole invocation, including every pending record and its original and fresh
+edited-source detection passes. Input records cannot override them.
+
+For example, start a complete-document job with both schedules, then explicitly
+resume the same job with a smaller team and prompt tile:
+
+```sh
+fnlp candidate redact original.ndjson --ndjson --chunked --store-results \
+  --compute-threads 4 --prefill-rows 8 \
+  --model ./model.fnlpq --memory-mib 24576 \
+  --job-dir ./protected-job --job-id "$JOB_ID" \
+  --job-key-file ./job.key --job-limits ./job-limits.json
+
+fnlp candidate redact original.ndjson --ndjson --chunked --store-results --resume \
+  --compute-threads 2 --prefill-rows 3 \
+  --model ./model.fnlpq --memory-mib 24576 \
+  --job-dir ./protected-job --job-id "$JOB_ID" \
+  --job-key-file ./job.key --job-limits ./job-limits.json --materialize
+```
+
+Omit `--chunked` on both invocations for the single-context route. Compact
+encoding still requires complete-document mode; workers or prefill do not make
+compact single-context populations admissible. Both external-population resume
+and explicitly authorized retained-input replay support these schedules.
+
+Worker width and prompt tile size describe physical execution and stay outside
+the authenticated semantic recipe. A resume may change either, return to one
+worker, or omit prefill. The complete original population, model identity,
+detectors, actions, verification, key/scope, chunking, encoding and semantic
+limits must still authenticate before repair or inference. A physical schedule
+change never refunds persisted attempts, any of the five native work axes, or
+mask visits. Committed records remain committed; each failed attempt keeps its
+complete reserved debit. Chunk and verification boundaries remain internal to
+one durable document result.
+
+One native engine and, when requested, one persistent numerical team serve the
+complete invocation. Admission includes the actual external or retained input
+owner, full KV capacity, bounded prefill scratch, worker workspace, process
+thread envelope, journal and output lifetimes. Invalid schedules or insufficient
+admission refuse setup before native work or a durable attempt debit. The
+original cancellation/deadline control remains in force through runner
+completion and physical worker join; completion metadata is delivered afterward.
+A later cancellation or output failure can still follow durable progress and
+does not imply rollback.
+
+The existing metadata-only completion report and optional `input_encoding`
+field remain unchanged. Stored redacted results and original serial recipe
+bytes keep the same format. The report adds no per-item projection counts,
+worker-count receipt, prefill measurements or performance claim.
+
+Library callers can use
+`NlpEngine::job_int8_redact_layer_major`,
+`job_int8_redact_with_threads`, or
+`job_int8_redact_layer_major_with_threads`; the corresponding
+`job_int8_redact_document_*` methods handle complete documents. They return
+the existing `JobProgress` and use the same authenticated runner, storage
+format and immutable lifetime limits as the serial entry points.
+
+The memory ceiling in this example is illustrative. It does not establish a
+measured requirement or guarantee admission for a particular model and limit
+configuration.
+
 ## Compact complete-document jobs
 
 Complete-document jobs also accept `--chunked --input-encoding safe-bpe-v1`.
@@ -233,8 +302,20 @@ DSR validation.
 
 ## Validation scope
 
-Added tests cover keyed scope/recipe mismatches, work and memory boundaries,
-chunk/reduction limits, strict consent and no-IO failures, shared actual pinned
-configuration, and metadata-only completion. They are test sources, not
-execution receipts. Rust/DSR execution, native-model behavior, task quality,
-numerical parity and performance have not been established for these changes.
+Added test definitions cover keyed scope/recipe mismatches, work and memory
+boundaries, chunk/reduction limits, strict consent and no-IO failures, shared
+actual pinned configuration, and metadata-only completion. Scheduling
+regressions cover independent and composed INT8 schedules without changing
+durable work, input ownership or authentication.
+
+A controller-only ignored real-artifact fixture defines serial/prefill/team
+comparisons for short byte and complete-document byte/compact jobs, exact
+materialized output, changed physical schedules on resume, retained-input
+replay without an external read, unchanged durable work/attempt counters,
+semantic-recipe refusal and physical drain. Its successful job cases explicitly
+use `--no-verify` semantics; they establish no detector recall or clean
+verification claim.
+
+These are test sources, not execution receipts. Rust/DSR execution, native-model
+behavior, task quality, numerical parity, crash-recovery execution and performance
+remain **UNRUN** for these changes pending controller-authorized validation.

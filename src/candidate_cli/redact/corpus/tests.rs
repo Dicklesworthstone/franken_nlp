@@ -312,7 +312,7 @@ fn live_scheduling_prices_one_team_full_transport_and_both_detector_stages_befor
 }
 
 #[test]
-fn invalid_live_and_unsupported_retained_schedules_fail_before_owned_private_io() {
+fn invalid_live_and_retained_schedules_fail_before_owned_private_io() {
     for flags in [
         vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
         vec!["--prefill-rows", "0"], vec!["--prefill-rows", "65"],
@@ -322,8 +322,8 @@ fn invalid_live_and_unsupported_retained_schedules_fail_before_owned_private_io(
         assert_eq!(scheduled_live(&flags).execute_owned(NoIo, NoIo), Err(CandidateError::Arguments));
     }
     for flags in [
-        vec!["--compute-threads", "2"], vec!["--prefill-rows", "1"],
-        vec!["--compute-threads", "4", "--prefill-rows", "7"],
+        vec!["--compute-threads", "0"], vec!["--prefill-rows", "65"],
+        vec!["--compute-threads", "4", "--prefill-rows", "0"],
     ] {
         let command = retained(&flags);
         assert!(matches!(command.validate(), Err(CandidateError::Arguments)));
@@ -341,5 +341,30 @@ fn scheduled_live_mode_without_runtime_never_reads_key_options_population_or_mod
             "--ner-options", "private-options.json"];
         if chunked { flags.extend(["--chunked", "--input-encoding", "safe-bpe-v1"]); }
         assert_eq!(scheduled_live(&flags).execute_owned(NoIo, NoIo), Err(CandidateError::Unavailable));
+    }
+}
+
+#[test]
+fn retained_start_and_resume_accept_physical_schedules_without_changing_saved_policy() {
+    for mode in [vec![], vec!["--resume"],
+        vec!["--resume", "--use-retained-input", "--max-retained-input-mib", "4"]] {
+        let ordinary = retained(&mode); let (_, ordinary_limits) = ordinary.validate().unwrap();
+        let envelope = ordinary.corpus.envelope(&ordinary, ordinary_limits).unwrap();
+        for schedule in [
+            vec!["--compute-threads", "4"], vec!["--prefill-rows", "7"],
+            vec!["--compute-threads", "4", "--prefill-rows", "7"],
+        ] {
+            let mut flags = mode.clone(); flags.extend(schedule);
+            let command = retained(&flags); let (common, limits) = command.validate().unwrap();
+            let current = command.corpus.envelope(&command, limits).unwrap();
+            assert_eq!(common.compute, command.compute);
+            assert!(common.policy.prefill().unwrap().is_none());
+            assert_eq!(current.transport, envelope.transport);
+            assert_eq!(current.max_model_work, envelope.max_model_work);
+            assert_eq!(current.max_mask_visits, envelope.max_mask_visits);
+            assert_eq!(command.encoding_policy(limits).unwrap(), ordinary.encoding_policy(ordinary_limits).unwrap());
+            assert_eq!(serde_json::to_vec(&command.request()).unwrap(),
+                serde_json::to_vec(&ordinary.request()).unwrap());
+        }
     }
 }

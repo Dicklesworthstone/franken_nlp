@@ -152,8 +152,10 @@ the completed prefix into a successful whole-stream result.
 These are physical scheduling choices. They do not change the inner semantic
 events, invent per-document worker counts, or make a measured speed/parity claim.
 The hosted methods continue to return the existing `BatchSummary`.
-Retained `--store-results` mode currently requires one compute thread and no
-explicit prefill option; requests for retained scheduling refuse before private IO.
+Retained `--store-results` start and resume also support these schedule
+options across the complete invocation. Their authenticated recipe and durable
+work remain unchanged when width or prompt rows change on resume; see the
+[job guide](candidate-redaction-jobs.md).
 
 Library callers can use `batch_int8_redact_layer_major`,
 `batch_int8_redact_with_threads`, or

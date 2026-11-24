@@ -210,6 +210,76 @@ fn retained_processor_and_storage_cancellation_keep_the_original_timeout_cause()
         ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
         let expected = match cause { Deadline | Timeout => CandidateError::Timeout, _ => CandidateError::Batch };
         assert_eq!(job_execution_error(HostedJobError::Job(JobRunError::Storage(JobError::Cancelled(cause)))), expected);
+        assert_eq!(job_execution_error(HostedJobError::Host(HostedError::Native(
+            crate::native_engine::strict_int8::StrictInt8Error::Cancelled(cause)))), expected);
         assert_eq!(job_execution_error(HostedJobError::Job(JobRunError::Processor(crate::batch::BatchFault::cancelled(cause)))), expected);
     }
+}
+
+fn scheduled_command(chunked: bool, compact: bool, extra: &[&str]) -> RedactCommand {
+    let mut flags = Vec::new();
+    if chunked { flags.push("--chunked"); }
+    if compact { flags.extend(["--input-encoding", "safe-bpe-v1"]); }
+    flags.extend_from_slice(extra);
+    let mut command = command(&flags); command.host.memory_mib = 16_384;
+    command
+}
+
+#[test]
+fn retained_schedules_add_only_one_worker_and_prompt_workspace_for_either_input_owner() {
+    use crate::native_engine::strict_int8::{prefill::Int8PrefillLimits,
+        projection::int8_team_workspace_bytes_with_prefill};
+    for (chunked, compact) in [(false, false), (true, false), (true, true)] {
+        let plain = scheduled_command(chunked, compact, &[]);
+        let threaded = scheduled_command(chunked, compact, &["--compute-threads", "4", "--prefill-rows", "7"]);
+        let (plain_args, a) = plain.validate().unwrap();
+        let (threaded_args, b) = threaded.validate().unwrap();
+        let plain_envelope = plain.corpus.envelope(&plain, a).unwrap();
+        let threaded_envelope = threaded.corpus.envelope(&threaded, b).unwrap();
+        let plain_host = admitted_host(&plain, &plain_args, a, plain_envelope);
+        let threaded_host = admitted_host(&threaded, &threaded_args, b, threaded_envelope);
+        let job_limits = lifetime(&plain);
+        let extra = int8_team_workspace_bytes_with_prefill(4, 7).unwrap()
+            + Int8PrefillLimits::required_extra_scratch_bytes(7).unwrap();
+        for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
+            let serial = retained_peak_bytes(&plain, &plain_args, a, plain_host, job_limits, input).unwrap();
+            let scheduled = retained_peak_bytes(&threaded, &threaded_args, b, threaded_host, job_limits, input).unwrap();
+            assert_eq!(scheduled, serial + extra);
+            assert!(scheduled > b.weight_bytes + 2 * b.preparation_bytes);
+        }
+        let original = retained_peak_bytes(&threaded, &threaded_args, b, threaded_host,
+            job_limits, JobInputMemory::CompletePopulation).unwrap();
+        let replay = retained_peak_bytes(&threaded, &threaded_args, b, threaded_host,
+            job_limits, JobInputMemory::RetainedRecord).unwrap();
+        assert_eq!(original - replay, 2 * job_limits.max_snapshot_bytes);
+        let floor = threaded.corpus.compact_base_peak_bytes(&threaded, b, threaded.edit_reserve_mib * MIB).unwrap();
+        let input_bytes = JobInputMemory::RetainedRecord.buffer_bytes(job_limits).unwrap();
+        assert_eq!(replay, floor + input_bytes,
+            "the final pre-secret quote adds the actual retained-record owner, not another team");
+    }
+}
+
+#[test]
+fn retained_schedule_readmission_precedes_limits_file_both_keys_and_original_or_saved_input() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> { panic!("private read"); } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> { panic!("output"); }
+        fn flush(&mut self) -> std::io::Result<()> { panic!("flush"); }
+    }
+    for resume in [false, true] { for axis in 0..5 {
+        let mut flags = vec!["--compute-threads", "4", "--prefill-rows", "7"];
+        if resume { flags.extend(["--resume", "--use-retained-input", "--max-retained-input-mib", "4"]); }
+        let mut command = scheduled_command(true, true, &flags);
+        let (common, mut limits) = command.validate().unwrap();
+        let mut envelope = command.corpus.envelope(&command, limits).unwrap();
+        match axis {
+            0 => limits.compute.workspace_bytes -= 1,
+            1 => limits.compute.threads = 3,
+            2 => command.prefill = Default::default(),
+            3 => command.compute = Default::default(),
+            _ => envelope.max_model_work.projections.multiply_accumulates -= 1,
+        }
+        assert_eq!(execute(command, common, limits, envelope, NoIo, NoIo), Err(CandidateError::Arguments));
+    } }
 }

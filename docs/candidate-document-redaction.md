@@ -249,8 +249,10 @@ See the [redaction CLI guide](candidate-redaction-cli.md#persistent-int8-workers
 for invocation examples and the matching hosted/native APIs. Live
 `--ndjson` streams also reuse one team across every record and flush, with
 terminal publication after physical join; see the [corpus guide](candidate-redaction-corpus.md).
-Retained jobs keep their serial schedule and refuse explicit prefill or
-multiple workers before private IO.
+Retained-job start and resume also support these physical schedules, with
+one team across all pending document attempts; see the [job guide](candidate-redaction-jobs.md).
+Changing the schedule on resume preserves the authenticated detector policy
+and existing durable work debits.
 Regression definitions have received source review; compilation, executable
 tests, real-model equivalence and performance remain pending the required
 controller-owned DSR checkpoint.

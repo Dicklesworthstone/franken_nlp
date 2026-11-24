@@ -10,14 +10,12 @@ use crate::{
 };
 mod recipe;
 mod long;
+mod team;
 use recipe::{RedactionJobRecipe, RECIPE_BYTES};
 
 impl NlpEngine {
-    /// Create or explicitly resume one item-local redaction job. Original
-    /// inputs, model, all policies/limits and the ACTUAL pseudonym key/scope
-    /// authenticate before repair or inference. Only complete edited results
-    /// meeting the declared verification policy may commit. The request is
-    /// explicit retention consent; results and optional maps remain sensitive.
+    /// Create or explicitly resume one authenticated item-local redaction job.
+    /// The owned runner retains the existing spool/journal commit protocol.
     #[allow(clippy::too_many_arguments)]
     pub fn job_int8_redact<R>(&self, model: &ResidentInt8,
         planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
@@ -25,52 +23,80 @@ impl NlpEngine {
         request: SourceJobRequest, limits: JobHostLimits, reader: R,
         cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
-        self.check_resident_domain(model)?;
-        check_model_identity(model.artifact_identity(), &config.batch.ner_identity)?;
-        recipe::bounded(&config.batch.request)?;
-        recipe::bounded(&config.batch.detector.ner)?;
-        redaction_batch::check_configuration(&planner, &config.batch).map_err(HostedError::BatchSetup)?;
-        let required = requirements(limits.native)?;
-        capacity(config.batch.detector.planning.max_context_tokens, config.batch.detector.per_pass.max_kv_bytes,
-            config.batch.detector.max_result_bytes, config.edit_reserve_bytes,
-            limits.native.context_tokens, required.kv_bytes, request.limits.max_result_bytes)?;
-        let buffers = sum(&[limits.required_buffer_bytes_for_input(request.limits, request.mode.input_memory())?, temporary_bytes(&config)?,
-            secret_bytes(pseudonyms.as_ref())?, 4 * RECIPE_BYTES as u64])?;
-        let lease = self.resources().acquire_lease();
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, buffers)?,
-            || Ok(StreamInput { planner: Some((planner, vocabulary, config, pseudonyms, request)), reader, writer: () }))?;
-        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-        let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound, limits.native.allocator_reserve_bytes])?)?;
-        let model = model.clone();
-        let completed = dispatch::run(self, limits.native.run, cancellation, move |control| {
-            // Capture the entire charged owner, also on queued cancellation.
-            let mut input = input;
-            let (planner, vocabulary, config, secret, request) = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
-            let context = pseudonym_context(secret.as_ref(), &config.batch.request)?;
-            let identity = config.batch.ner_identity.clone();
-            let recipe = RedactionJobRecipe::short(&config.batch, context.as_ref())?;
-            let population = match read_population(&mut input.value.reader, &request,
-                limits.transport, control) {
-                Ok(p) => p, Err(e) => return Ok(Err(JobRunError::Storage(e))),
-            };
-            let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value
-                .engine(limits.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            let admission = CorpusAdmission { lease: &lease, model: model.artifact_identity(),
-                kv_bytes: required.kv_bytes, sampler_bytes: 0, output_bytes: request.limits.max_result_bytes as u64 };
-            let result = (|| {
-                let native = NativeInt8RedactionBatch::new(&planner, config.batch,
-                    &mut engine.value, &vocabulary, context.as_ref(), admission).map_err(JobRunError::Processor)?;
-                run_population(request, &population, RedactionJob { native, identity, recipe }, control)
-            })();
-            // Runner/journal/processor and guarded outputs finish first. No
-            // native text, secret, journal or live runtime escapes this call.
-            drop(engine); drop(population); drop(context); drop(secret);
-            drop(vocabulary); drop(planner); drop(input); drop(lease);
-            Ok(result)
-        })?;
-        completed.map_err(HostedJobError::Job)
+        team::run(self, model, planner, vocabulary, config, pseudonyms, request,
+            limits, None, None, reader, cancellation)
+    }
+
+    /// Reuse one bounded prompt workspace across every pending original and
+    /// edited-text pass. Physical scheduling does not change the saved recipe.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int8_redact_layer_major<R>(&self, model: &ResidentInt8,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: RedactionCorpusConfig, pseudonyms: Option<RedactionPseudonyms>,
+        request: SourceJobRequest, limits: JobHostLimits, prefill: Int8PrefillLimits,
+        reader: R, cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        team::run(self, model, planner, vocabulary, config, pseudonyms, request,
+            limits, Some(prefill), None, reader, cancellation)
+    }
+
+    /// All pending attempts share one physical team. Workers join before any
+    /// progress or failure returns; authenticated lifetime debits never renew.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int8_redact_with_threads<R>(&self, model: &ResidentInt8,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: RedactionCorpusConfig, pseudonyms: Option<RedactionPseudonyms>,
+        request: SourceJobRequest, limits: JobHostLimits, kernel: Int8Kernel,
+        compute_threads: usize, reader: R, cancellation: CancellationToken)
+        -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        team::run(self, model, planner, vocabulary, config, pseudonyms, request,
+            limits, None, Some((kernel, compute_threads)), reader, cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int8_redact_layer_major_with_threads<R>(&self, model: &ResidentInt8,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: RedactionCorpusConfig, pseudonyms: Option<RedactionPseudonyms>,
+        request: SourceJobRequest, limits: JobHostLimits, kernel: Int8Kernel,
+        compute_threads: usize, prefill: Int8PrefillLimits, reader: R, cancellation: CancellationToken)
+        -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        team::run(self, model, planner, vocabulary, config, pseudonyms, request,
+            limits, Some(prefill), Some((kernel, compute_threads)), reader, cancellation)
+    }
+}
+
+impl team::Policy for RedactionCorpusConfig {
+    fn identity(&self) -> &ExecutionIdentity { &self.batch.ner_identity }
+    fn request(&self) -> &RedactionRequest { &self.batch.request }
+    fn validate(&self, planner: &SourceTaskPlanner, request: &SourceJobRequest,
+        limits: JobHostLimits, native: Int8MemoryRequirement) -> Result<u64, HostedError> {
+        recipe::bounded(&self.batch.request)?; recipe::bounded(&self.batch.detector.ner)?;
+        redaction_batch::check_configuration(planner, &self.batch).map_err(HostedError::BatchSetup)?;
+        let d = &self.batch.detector;
+        capacity(d.planning.max_context_tokens, d.per_pass.max_kv_bytes,
+            d.max_result_bytes, self.edit_reserve_bytes, limits.native.context_tokens,
+            native.kv_bytes, request.limits.max_result_bytes)?;
+        temporary_bytes(self)
+    }
+    fn recipe(&self, _: &SourceTaskPlanner, context: Option<&Pseudonyms<'_>>)
+        -> Result<RedactionJobRecipe, HostedError> {
+        RedactionJobRecipe::short(&self.batch, context)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn execute<C: DecodeStepControl>(self, planner: &SourceTaskPlanner,
+        vocabulary: &ExtractionVocabulary, context: Option<&Pseudonyms<'_>>,
+        engine: &mut StrictInt8Engine<'_>, admission: CorpusAdmission<'_>, prefill: Option<Int8PrefillLimits>,
+        request: SourceJobRequest, population: &crate::hosted::corpus::jobs::Population<'_>,
+        recipe: RedactionJobRecipe, control: &mut C) -> Result<JobProgress, JobRunError> {
+        let identity = self.batch.ner_identity.clone();
+        let native = match prefill {
+            None => NativeInt8RedactionBatch::new(planner, self.batch, engine, vocabulary, context, admission),
+            Some(prefill) => NativeInt8RedactionBatch::new_layer_major(
+                planner, self.batch, engine, vocabulary, context, admission, prefill),
+        }.map_err(JobRunError::Processor)?;
+        run_population(request, population, RedactionJob { native, identity, recipe }, control)
     }
 }
 
