@@ -228,14 +228,20 @@ pub struct Int8SourceDocumentJobProcessor<'p, 'e, 'w, 'v, A: SourceDocumentBatch
     vocabulary: &'v ExtractionVocabulary,
     admission: A,
     ledger: Ledger,
+    prefill: Option<Int8PrefillLimits>,
 }
 impl<'p, 'e, 'w, 'v, A: SourceDocumentBatchAdmission> Int8SourceDocumentJobProcessor<'p, 'e, 'w, 'v, A> {
     pub fn new(planner: &'p Int8SourceDocumentJobPlanner, engine: &'e mut StrictInt8Engine<'w>,
         vocabulary: &'v ExtractionVocabulary, admission: A) -> Result<Self, BatchFault> {
+        Self::scheduled(planner, engine, vocabulary, admission, None)
+    }
+    pub(crate) fn scheduled(planner: &'p Int8SourceDocumentJobPlanner, engine: &'e mut StrictInt8Engine<'w>,
+        vocabulary: &'v ExtractionVocabulary, admission: A, prefill: Option<Int8PrefillLimits>) -> Result<Self, BatchFault> {
         // A reduced recipe must never execute through the ordinary map route.
         if planner.reduction_policy().is_some() { return Err(BatchCode::InvalidLimits.into()); }
         check_capacity(planner, engine).map_err(|e| e.fault)?;
-        Ok(Self { planner, engine, vocabulary, admission, ledger: Ledger::default() })
+        if let Some(limits) = prefill { limits.validate().map_err(|_| BatchCode::InvalidLimits)?; }
+        Ok(Self { planner, engine, vocabulary, admission, ledger: Ledger::default(), prefill })
     }
 }
 impl<A: SourceDocumentBatchAdmission> BatchProcessor for Int8SourceDocumentJobProcessor<'_, '_, '_, '_, A> {
@@ -279,7 +285,10 @@ impl<A: SourceDocumentBatchAdmission> BatchProcessor for Int8SourceDocumentJobPr
         poll(control)?;
         // Rechecks EVERY returned identity, not only the first chunk, before
         // the first forward. The actual driver keeps the same clean engine.
-        let output = plan.execute_with_control(&admitted, self.engine, self.vocabulary, control).map_err(map_failure)?;
+        let output = match self.prefill {
+            None => plan.execute_with_control(&admitted, self.engine, self.vocabulary, control),
+            Some(prefill) => plan.execute_layer_major_with_control(&admitted, self.engine, self.vocabulary, prefill, control),
+        }.map_err(map_failure)?;
         if output.planned_model_work != prepared.work.model
             || output.reserved_mask_node_visits != prepared.work.mask_node_visits
             || !(JobWork { model: output.model_work, mask_node_visits: output.mask_node_visit_charge }).fits(prepared.work)

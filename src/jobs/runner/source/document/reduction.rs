@@ -58,12 +58,18 @@ impl SourceDocumentReduction {
             Self::Keyphrases { limits, .. } => plan.check_keyphrases(limits).map_err(keyphrase_failure) }
     }
     fn execute<C: DecodeStepControl>(self, plan: PreparedInt8SourceMap<'_>, identities: &[ExecutionIdentity],
-        engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
+        engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary, prefill: Option<Int8PrefillLimits>, control: &mut C)
         -> Result<Int8ReducedSourceDocumentRun, BatchItemFailure> {
         match self {
-            Self::Summary { limits, .. } => plan.execute_summary_with_control(identities, engine, vocabulary, limits, control)
+            Self::Summary { limits, .. } => match prefill {
+                Some(prefill) => plan.execute_summary_layer_major_with_control(identities, engine, vocabulary, limits, prefill, control),
+                None => plan.execute_summary_with_control(identities, engine, vocabulary, limits, control),
+            }
                 .map(Int8ReducedSourceDocumentRun::Summary).map_err(summary_failure),
-            Self::Keyphrases { limits, .. } => plan.execute_keyphrases_with_control(identities, engine, vocabulary, limits, control)
+            Self::Keyphrases { limits, .. } => match prefill {
+                Some(prefill) => plan.execute_keyphrases_layer_major_with_control(identities, engine, vocabulary, limits, prefill, control),
+                None => plan.execute_keyphrases_with_control(identities, engine, vocabulary, limits, control),
+            }
                 .map(Int8ReducedSourceDocumentRun::Keyphrases).map_err(keyphrase_failure),
         }
     }

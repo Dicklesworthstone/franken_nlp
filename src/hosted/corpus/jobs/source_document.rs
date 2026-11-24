@@ -15,60 +15,61 @@ impl NlpEngine {
         reduction_reserve_bytes: u64, reader: R, cancellation: CancellationToken)
         -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
-        self.check_resident_domain(model)?;
+        self.job_int8_source_document_scheduled(model, planner, vocabulary, request, limits,
+            reduction_reserve_bytes, None, None, reader, cancellation)
+    }
+
+    /// Execute all pending document maps or exact reducers with one physical
+    /// schedule. Every chunk identity and complete result remains authenticated.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int8_source_document_scheduled<R>(&self, model: &ResidentInt8, planner: Int8SourceDocumentJobPlanner,
+        vocabulary: Arc<ExtractionVocabulary>, request: SourceJobRequest, limits: JobHostLimits,
+        reduction_reserve_bytes: u64, prefill: Option<Int8PrefillLimits>, team: Option<(Int8Kernel, usize)>,
+        reader: R, cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
         planner.check_job_limits(request.limits).map_err(JobRunError::Processor)?;
-        check_model_identity(model.artifact_identity(), planner.execution_identity())?;
-        let required = requirements(limits.native)?;
-        if required.kv_bytes == 0 || required.kv_bytes > planner.task_budget().max_kv_bytes
-            || planner.planning_limits().max_context_tokens > limits.native.context_tokens {
-            return Err(HostedError::Limits("source document job complete native capacity").into());
-        }
-        let bytes = sum(&[limits.required_buffer_bytes_for_input(request.limits, request.mode.input_memory())?,
-            document_workspace(&planner, reduction_reserve_bytes)?])?;
-        let lease = self.resources().acquire_lease();
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
-            || Ok(StreamInput { planner: Some((planner, vocabulary, request)), reader, writer: () }))?;
-        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-        let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound, limits.native.allocator_reserve_bytes])?)?;
-        let model = model.clone();
-        let completed = dispatch::run(self, limits.native.run, cancellation, move |control| {
-            // Whole aggregate capture also protects queued-cancellation drops.
-            let mut input = input;
-            let (planner, vocabulary, request) = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
-            let population = match read_population(&mut input.value.reader, &request,
-                limits.transport, control) {
-                Ok(population) => population,
-                Err(error) => return Ok(Err(JobRunError::Storage(error))),
-            };
-            let mut engine = allocate_native(kv, workspace, || model.inner.loaded.value
-                .engine(limits.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            let admission = DocumentAdmissionHost { task: &planner.execution_identity().task_spec,
-                inner: CorpusAdmission { lease: &lease, model: model.artifact_identity(),
-                    kv_bytes: required.kv_bytes, sampler_bytes: 0, output_bytes: request.limits.max_result_bytes as u64 } };
-            let result = (|| {
-                if planner.reduction_policy().is_some() {
-                    let processor = Int8ReducedSourceDocumentJobProcessor::new(&planner, &mut engine.value,
-                        &vocabulary, admission).map_err(JobRunError::Processor)?;
-                    run_population(request, &population, processor, control)
-                } else {
-                    let processor = Int8SourceDocumentJobProcessor::new(&planner, &mut engine.value,
-                        &vocabulary, admission).map_err(JobRunError::Processor)?;
-                    run_population(request, &population, processor, control)
-                }
-            })();
-            // Runner/journal/spool and guarded results finish inside the call.
-            // Native and retained preparation storage drop BEFORE their charge.
-            drop(engine); drop(population); drop(vocabulary); drop(planner);
-            drop(input); drop(lease);
-            Ok(result)
-        })?;
-        completed.map_err(HostedJobError::Job)
+        let task = SourceDocumentTask { planner, vocabulary, reduction_reserve_bytes,
+            context_tokens: limits.native.context_tokens };
+        scored::run(self, model, task, request, limits, prefill, team, reader, cancellation)
     }
 }
 
-fn document_workspace(planner: &Int8SourceDocumentJobPlanner, reserve: u64) -> Result<u64, HostedError> {
+struct SourceDocumentTask {
+    planner: Int8SourceDocumentJobPlanner,
+    vocabulary: Arc<ExtractionVocabulary>,
+    reduction_reserve_bytes: u64,
+    context_tokens: usize,
+}
+impl scored::Int8JobTask for SourceDocumentTask {
+    fn identity(&self) -> &ExecutionIdentity { self.planner.execution_identity() }
+    fn validate(&self, native: Int8MemoryRequirement, _: JobLimits) -> Result<(), HostedError> {
+        if native.kv_bytes == 0 || native.kv_bytes > self.planner.task_budget().max_kv_bytes
+            || self.planner.planning_limits().max_context_tokens > self.context_tokens {
+            return Err(HostedError::Limits("source document job complete native capacity"));
+        }
+        Ok(())
+    }
+    fn preparation_workspace_bytes(&self) -> Result<u64, HostedError> {
+        source_document_job_workspace(&self.planner, self.reduction_reserve_bytes)
+    }
+    fn execute(self, engine: &mut StrictInt8Engine<'_>, admission: CorpusAdmission<'_>,
+        request: SourceJobRequest, population: &Population<'_>, prefill: Option<Int8PrefillLimits>,
+        control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
+        let admission = DocumentAdmissionHost { task: &self.planner.execution_identity().task_spec, inner: admission };
+        let result = if self.planner.reduction_policy().is_some() {
+            Int8ReducedSourceDocumentJobProcessor::scheduled(&self.planner, engine, &self.vocabulary,
+                admission, prefill).map_err(JobRunError::Processor)
+                .and_then(|processor| run_population(request, population, processor, control))
+        } else {
+            Int8SourceDocumentJobProcessor::scheduled(&self.planner, engine, &self.vocabulary,
+                admission, prefill).map_err(JobRunError::Processor)
+                .and_then(|processor| run_population(request, population, processor, control))
+        };
+        Ok(result)
+    }
+}
+
+pub(crate) fn source_document_job_workspace(planner: &Int8SourceDocumentJobPlanner, reserve: u64) -> Result<u64, HostedError> {
     let mapping = planner.document_limits();
     let budget = planner.task_budget();
     if reserve == 0 { return Err(HostedError::Limits("source document reduction reservation")); }

@@ -22,16 +22,16 @@ fn workspace_prices_the_maximum_frontier_not_a_single_chunks_output() {
     let b = p.task_budget(); let m = p.document_limits(); let chunks = m.chunks.max_chunks as u64;
     let expected = (b.max_output_bytes * chunks + m.reduction.max_live_value_bytes as u64) * 4
         + u64::from(b.max_output_tokens) * chunks * 8 + headroom;
-    assert_eq!(document_workspace(&p, headroom).unwrap(), expected);
+    assert_eq!(source_document_job_workspace(&p, headroom).unwrap(), expected);
     assert!(expected > b.max_output_bytes * chunks);
-    assert!(document_workspace(&p, 0).is_err());
-    assert!(document_workspace(&p, u64::MAX).is_err());
+    assert!(source_document_job_workspace(&p, 0).is_err());
+    assert!(source_document_job_workspace(&p, u64::MAX).is_err());
 }
 #[test]
 fn compact_workspace_is_added_to_the_complete_frontier_and_not_renewed_per_document() {
     use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding};
     let byte = factory(); let reserve = 1 << 20;
-    let original = document_workspace(&byte, reserve).unwrap();
+    let original = source_document_job_workspace(&byte, reserve).unwrap();
     let call = SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 4096,
         max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
     let total = SafeBpeWorkLimits { max_input_bytes: 1 << 20, max_output_tokens: 1 << 20,
@@ -39,8 +39,8 @@ fn compact_workspace_is_added_to_the_complete_frontier_and_not_renewed_per_docum
     let compact = byte.with_document_encoding(UntrustedEncoding::SafeBpeV1(call), Some(total)).unwrap();
     let workspace = compact.encoding_workspace_bytes().unwrap();
     assert_eq!(workspace, call.requirements().unwrap().workspace_bytes + 1024);
-    assert_eq!(document_workspace(&compact, reserve).unwrap(), original + workspace);
-    assert!(document_workspace(&compact, u64::MAX - (original - reserve)).is_err());
+    assert_eq!(source_document_job_workspace(&compact, reserve).unwrap(), original + workspace);
+    assert!(source_document_job_workspace(&compact, u64::MAX - (original - reserve)).is_err());
     assert_eq!(compact.encoding_work_limits(), Some(total));
     assert_eq!(compact.encoding_work().unwrap(), Some(crate::tokenizer::untrusted::SafeBpeWork::default()));
 }

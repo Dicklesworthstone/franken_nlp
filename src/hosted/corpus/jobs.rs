@@ -8,6 +8,8 @@ mod extract;
 pub(super) mod scored;
 mod generation;
 mod source_document;
+pub(crate) use extract::document::extraction_document_job_workspace;
+pub(crate) use source_document::source_document_job_workspace;
 pub use manage::{JobManagementLimits, StoredJobOperation, StoredJobRequest};
 use crate::{
     jobs::{InputRetentionLimits, JobError, JobId, JobInputMemory, JobLimits, JobProgress, JobSecret, TailPolicy,

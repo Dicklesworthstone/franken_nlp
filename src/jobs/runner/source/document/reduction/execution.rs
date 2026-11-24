@@ -57,10 +57,15 @@ pub struct Int8ReducedSourceDocumentJobProcessor<'p, 'e, 'w, 'v, A: SourceDocume
 impl<'p, 'e, 'w, 'v, A: SourceDocumentBatchAdmission> Int8ReducedSourceDocumentJobProcessor<'p, 'e, 'w, 'v, A> {
     pub fn new(planner: &'p Int8SourceDocumentJobPlanner, engine: &'e mut StrictInt8Engine<'w>,
         vocabulary: &'v ExtractionVocabulary, admission: A) -> Result<Self, BatchFault> {
+        Self::scheduled(planner, engine, vocabulary, admission, None)
+    }
+    pub(crate) fn scheduled(planner: &'p Int8SourceDocumentJobPlanner, engine: &'e mut StrictInt8Engine<'w>,
+        vocabulary: &'v ExtractionVocabulary, admission: A, prefill: Option<Int8PrefillLimits>) -> Result<Self, BatchFault> {
+        if let Some(limits) = prefill { limits.validate().map_err(|_| BatchCode::InvalidLimits)?; }
         let policy = planner.reduction_policy().ok_or(BatchCode::InvalidLimits)?;
         policy.validate(&planner.task, planner.mapping, planner.limits)?;
         check_capacity(planner, engine).map_err(|e| e.fault)?;
-        Ok(Self { inner: Int8SourceDocumentJobProcessor { planner, engine, vocabulary, admission, ledger: Ledger::default() } })
+        Ok(Self { inner: Int8SourceDocumentJobProcessor { planner, engine, vocabulary, admission, ledger: Ledger::default(), prefill } })
     }
 }
 impl<A: SourceDocumentBatchAdmission> BatchProcessor for Int8ReducedSourceDocumentJobProcessor<'_, '_, '_, '_, A> {
@@ -94,7 +99,7 @@ impl<A: SourceDocumentBatchAdmission> BatchProcessor for Int8ReducedSourceDocume
             poll(control)?;
             // Real reducers recheck every admitted identity and retain every
             // candidate until the root, with one controller throughout.
-            let output = policy.execute(plan, &admitted, inner.engine, inner.vocabulary, control)?;
+            let output = policy.execute(plan, &admitted, inner.engine, inner.vocabulary, inner.prefill, control)?;
             output.check(policy, &prepared)?;
             check_capacity(inner.planner, inner.engine)?;
             poll(control)?;

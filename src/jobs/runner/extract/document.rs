@@ -115,8 +115,16 @@ impl<'p, 'e, 'w, 'v, A: ExtractionDocumentBatchAdmission>
     Int8DocumentExtractionJobProcessor<'p, 'e, 'w, 'v, A> {
     pub fn new(planner: &'p Int8DocumentExtractionJobPlanner, engine: &'e mut StrictInt8Engine<'w>,
         vocabulary: &'v ExtractionVocabulary, admission: A) -> Result<Self, BatchFault> {
-        let native = NativeInt8DocumentExtractionBatch::new(&planner.compiler, planner.config.clone(),
-            engine, vocabulary, admission)?;
+        Self::scheduled(planner, engine, vocabulary, admission, None)
+    }
+    pub(crate) fn scheduled(planner: &'p Int8DocumentExtractionJobPlanner, engine: &'e mut StrictInt8Engine<'w>,
+        vocabulary: &'v ExtractionVocabulary, admission: A, prefill: Option<Int8PrefillLimits>) -> Result<Self, BatchFault> {
+        let config = planner.config.clone();
+        let native = match prefill {
+            None => NativeInt8DocumentExtractionBatch::new(&planner.compiler, config, engine, vocabulary, admission),
+            Some(prefill) => NativeInt8DocumentExtractionBatch::new_layer_major(&planner.compiler, config,
+                engine, vocabulary, admission, prefill),
+        }?;
         Ok(Self { native, planner })
     }
 }

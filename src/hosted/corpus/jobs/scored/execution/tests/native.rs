@@ -3,6 +3,11 @@
 //! parent directory. No downloads, fake neural output or parity claim if UNRUN.
 use super::*;
 use crate::{
+    batch::extract::ExtractionMaskBudget,
+    grammar::mask::MaskWorkLimits,
+    jobs::runner::extract::Int8ExtractionJobPlanner,
+    tasks::source_planning::SourcePlanningLimits,
+    tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding},
     canonjson, LeakResponsePolicy, ResourceHostConfig, RuntimePreset,
     execution_identity::{NumericsProfile, ThinkingMode, ToolMode},
     hosted::LoadLimits,
@@ -18,7 +23,7 @@ use std::{fs, io::{self, Cursor, Read}, os::unix::fs::DirBuilderExt,
     path::Path, sync::atomic::{AtomicUsize, Ordering}, time::SystemTime};
 
 #[derive(Clone, Copy, Debug)]
-enum Kind { Classify, Sentiment, Judge }
+enum Kind { Classify, Sentiment, Judge, Extract, Keyphrases }
 
 fn native() -> NativeLimits {
     NativeLimits { context_tokens: 8192, allocator_reserve_bytes: 64 << 20,
@@ -76,6 +81,10 @@ fn input(kind: Kind) -> Vec<u8> {
     let mut bytes = Vec::new();
     for index in 0..3 {
         let args = match kind {
+            Kind::Extract => json!({"schema":r#"{"type":"boolean"}"#,
+                "grounding":"structural","budget":budget()}),
+            Kind::Keyphrases => json!({"task":"keyphrases","options":{
+                "max_phrases":1,"max_phrase_scalars":12},"budget":budget()}),
             Kind::Classify => json!({
                 "labels":[{"id":"billing","description":"Invoices"},{"id":"refund","description":"Refunds"}],
                 "mode":if index == 1 { "multi_label" } else { "exclusive" },
@@ -146,11 +155,44 @@ fn run_case(host: &NlpEngine, model: &ResidentInt8, kind: Kind, root: &Path,
     let inner = if matches!(mode, JobOpenMode::ResumeRetained { .. }) { None }
         else { Some(Cursor::new(input.to_vec())) };
     let reader = OwnedReader { inner, dropped: Arc::clone(&dropped) };
-    let request = request(root, mode); let limits = host_limits();
+    let mut request = request(root, mode); let limits = host_limits();
     let cancellation = CancellationToken::default(); let kernel = Int8Kernel::scalar();
     let registry = pinned_controls::pinned().unwrap(); let controls = registry.template_controls();
     let eos = controls.entries().iter().find(|e| e.special && e.surface == crate::template::IM_END).unwrap().id;
     let result = match kind {
+        Kind::Extract | Kind::Keyphrases => {
+            let mask_work = 512 * 1024 * 1024;
+            request.limits.max_work.mask_node_visits = mask_work * request.limits.max_attempts;
+            let native = Int8ExtractionBatchLimits { max_model_work: request.limits.max_work.model,
+                masks: ExtractionMaskBudget { per_mask: MaskWorkLimits { max_trie_node_visits: 2_000_000,
+                    checkpoint_interval_nodes: 128 }, max_visits_per_item: mask_work,
+                    max_visits_per_run: request.limits.max_work.mask_node_visits } };
+            let team = (width > 1).then_some((kernel, width));
+            let vocabulary = Arc::new(ExtractionVocabulary::pinned(controls).unwrap());
+            let encoding = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 8192,
+                max_output_tokens: 4096, max_pair_checks: 1 << 22, max_pair_bytes: 1 << 26 });
+            let total = SafeBpeWorkLimits { max_input_bytes: 65536, max_output_tokens: 32768,
+                max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 };
+            if matches!(kind, Kind::Extract) {
+                // The factory binds the pinned tokenizer and template itself.
+                let empty = Sha256Digest::of_bytes(b"null");
+                let id = identity(model.artifact_identity(), "extract-v1", empty, empty);
+                let planner = Int8ExtractionJobPlanner::pinned(controls, eos, id, budget(),
+                    Default::default(), Default::default(), None, native).unwrap()
+                    .with_document_encoding(encoding, Some(total)).unwrap();
+                host.job_int8_extract_scheduled(model, planner, vocabulary, request, limits,
+                    schedule, team, reader, cancellation)
+            } else {
+                let planner = Arc::new(SourceTaskPlanner::pinned(controls, eos).unwrap()
+                    .with_map_document_encoding(encoding, total).unwrap());
+                let id = identity(model.artifact_identity(), "keyphrases-v1", planner.tokenizer_digest(),
+                    *planner.template_digest());
+                let config = SourceCorpusConfig { identity: id, task_ceiling: budget(),
+                    planning: SourcePlanningLimits::default(), defaults: None, native_work: native };
+                host.job_int8_source_scheduled(model, planner, vocabulary, config, request, limits,
+                    schedule, team, reader, cancellation)
+            }
+        }
         Kind::Classify => {
             let (planner, config) = classification(model);
             match (width, schedule) {
@@ -236,10 +278,22 @@ fn abandon_first_attempt(host: &NlpEngine, model: &ResidentInt8, root: &Path, in
 #[test]
 #[ignore = "controller-only independently pinned INT8 artifact and durable storage; no parity or recovery claim until run"]
 fn stored_scoring_matches_schedules_replays_without_redebit_and_preserves_abandoned_attempts() {
+    check_schedules(concat!(module_path!(),
+        "::stored_scoring_matches_schedules_replays_without_redebit_and_preserves_abandoned_attempts"),
+        &[Kind::Classify, Kind::Sentiment, Kind::Judge]);
+}
+
+#[test]
+#[ignore = "requires independently pinned INT8 model, admitted host memory and protected job storage"]
+fn structured_compact_jobs_preserve_all_stored_bytes_and_debits_across_schedules_and_replay() {
+    check_schedules(concat!(module_path!(),
+        "::structured_compact_jobs_preserve_all_stored_bytes_and_debits_across_schedules_and_replay"),
+        &[Kind::Extract, Kind::Keyphrases]);
+}
+
+fn check_schedules(full_name: &str, kinds: &[Kind]) {
     const CHILD: &str = "FNLP_INT8_SCORE_JOB_TEAM_CHILD";
     const COMPLETE: &str = "FNLP_INT8_SCORE_JOB_TEAM_COMPLETE";
-    let full_name = concat!(module_path!(),
-        "::stored_scoring_matches_schedules_replays_without_redebit_and_preserves_abandoned_attempts");
     let name = full_name.split_once("::").expect("crate-qualified test name").1;
     if std::env::var(CHILD).ok().as_deref() != Some(name) {
         let result = std::process::Command::new(std::env::current_exe().expect("test executable"))
@@ -288,7 +342,7 @@ fn stored_scoring_matches_schedules_replays_without_redebit_and_preserves_abando
     assert_eq!(model.artifact_identity().revision, "f56ec5a9650268aa098496734743c25ea778bd2d");
     let baseline = host.resources().memory_snapshot().committed_bytes;
     let retention = InputRetentionLimits { max_spool_bytes: 1 << 20 };
-    for (task, kind) in [Kind::Classify, Kind::Sentiment, Kind::Judge].into_iter().enumerate() {
+    for (task, kind) in kinds.iter().copied().enumerate() {
         let input = input(kind); let mut expected = Vec::new(); let mut progress = None;
         for (case, (width, schedule)) in [(1, None), (1, Some(prefill(3))), (2, None),
             (2, Some(prefill(3))), (4, None), (4, Some(prefill(3)))].into_iter().enumerate() {
@@ -299,6 +353,9 @@ fn stored_scoring_matches_schedules_replays_without_redebit_and_preserves_abando
             assert_eq!(actual.items, 3); assert_eq!(actual.committed, 3);
             assert_eq!(actual.attempts, 3); assert!(actual.materialized);
             assert!(actual.reserved_work.model.forward_positions > 0);
+            if matches!(kind, Kind::Extract | Kind::Keyphrases) {
+                assert!(actual.reserved_work.mask_node_visits > 0);
+            }
             let output = fs::read(root.join("materialized.ndjson")).unwrap();
             assert_eq!(serde_json::Deserializer::from_slice(&output).into_iter::<serde_json::Value>()
                 .collect::<Result<Vec<_>, _>>().unwrap().len(), 3);

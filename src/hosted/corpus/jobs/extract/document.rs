@@ -16,53 +16,59 @@ impl NlpEngine {
         request: SourceJobRequest, limits: JobHostLimits, reduction_reserve_bytes: u64,
         reader: R, cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
-        self.check_resident_domain(model)?;
-        check_model_identity(model.artifact_identity(), planner.execution_identity())?;
-        planner.check_job_limits(request.limits).map_err(HostedError::BatchSetup)?;
-        let required = requirements(limits.native)?;
-        let mapping = planner.document_limits();
-        check_capacity(planner.document_budget(), mapping.mapping.chunks.context_tokens,
-            limits.native.context_tokens, required.kv_bytes, reduction_reserve_bytes)?;
-        let bytes = sum(&[limits.required_buffer_bytes_for_input(request.limits, request.mode.input_memory())?,
-            crate::hosted::extraction_map::document_workspace_bytes(planner.document_budget(), mapping,
-                mapping.mapping.chunks.max_chunks, reduction_reserve_bytes)?])?;
-        let lease = self.resources().acquire_lease();
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
-            || Ok(StreamInput { planner: Some((planner, vocabulary, request)), reader, writer: () }))?;
-        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-        let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound, limits.native.allocator_reserve_bytes])?)?;
-        let model = model.clone();
-        let completed = dispatch::run(self, limits.native.run, cancellation, move |control| {
-            let mut input = input; // Complete charged owner, including queued cancellation.
-            let (planner, vocabulary, request) = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
-            let population = match read_population(&mut input.value.reader, &request,
-                limits.transport, control) {
-                Ok(population) => population,
-                Err(error) => return Ok(Err(JobRunError::Storage(error))),
-            };
-            let mut engine = allocate_native(kv, workspace, || model.inner.loaded.value
-                .engine(limits.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            // Existing document admission validates ALL child identities and
-            // guards ONE complete document result through spool+journal commit.
-            let admission = CorpusAdmission { lease: &lease, model: model.artifact_identity(),
-                kv_bytes: required.kv_bytes, sampler_bytes: 0,
-                output_bytes: request.limits.max_result_bytes as u64 };
-            let result = (|| {
-                let processor = Int8DocumentExtractionJobProcessor::new(&planner, &mut engine.value,
-                    &vocabulary, admission).map_err(JobRunError::Processor)?;
-                run_population(request, &population, processor, control)
-            })();
-            // Runner/journal/spool/lock and all result guards have drained.
-            // Retain the factory and original population until native cleanup.
-            drop(engine); drop(population); drop(vocabulary); drop(planner);
-            drop(input); drop(lease);
-            Ok(result)
-        })?;
-        completed.map_err(HostedJobError::Job)
+        self.job_int8_extract_document_scheduled(model, planner, vocabulary, request, limits,
+            reduction_reserve_bytes, None, None, reader, cancellation)
+    }
+
+    /// Share the admitted engine, prompt buffers and projection team across all
+    /// chunks of each pending document. Only complete document maps are stored.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int8_extract_document_scheduled<R>(&self, model: &ResidentInt8,
+        planner: Int8DocumentExtractionJobPlanner, vocabulary: Arc<ExtractionVocabulary>,
+        request: SourceJobRequest, limits: JobHostLimits, reduction_reserve_bytes: u64,
+        prefill: Option<Int8PrefillLimits>, team: Option<(Int8Kernel, usize)>,
+        reader: R, cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        let task = DocumentExtractionTask { planner, vocabulary, reduction_reserve_bytes,
+            context_tokens: limits.native.context_tokens };
+        scored::run(self, model, task, request, limits, prefill, team, reader, cancellation)
     }
 }
+
+struct DocumentExtractionTask {
+    planner: Int8DocumentExtractionJobPlanner,
+    vocabulary: Arc<ExtractionVocabulary>,
+    reduction_reserve_bytes: u64,
+    context_tokens: usize,
+}
+impl scored::Int8JobTask for DocumentExtractionTask {
+    fn identity(&self) -> &ExecutionIdentity { self.planner.execution_identity() }
+    fn validate(&self, native: Int8MemoryRequirement, job: JobLimits) -> Result<(), HostedError> {
+        self.planner.check_job_limits(job).map_err(HostedError::BatchSetup)?;
+        check_capacity(self.planner.document_budget(), self.planner.document_limits().mapping.chunks.context_tokens,
+            self.context_tokens, native.kv_bytes, self.reduction_reserve_bytes)
+    }
+    fn preparation_workspace_bytes(&self) -> Result<u64, HostedError> {
+        extraction_document_job_workspace(&self.planner, self.reduction_reserve_bytes)
+    }
+    fn execute(self, engine: &mut StrictInt8Engine<'_>, admission: CorpusAdmission<'_>,
+        request: SourceJobRequest, population: &Population<'_>, prefill: Option<Int8PrefillLimits>,
+        control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
+        let result = Int8DocumentExtractionJobProcessor::scheduled(&self.planner, engine,
+            &self.vocabulary, admission, prefill).map_err(JobRunError::Processor)
+            .and_then(|processor| run_population(request, population, processor, control));
+        Ok(result)
+    }
+}
+
+/// Complete map, result staging and reducer storage carried alongside the job.
+pub(crate) fn extraction_document_job_workspace(planner: &Int8DocumentExtractionJobPlanner, reserve: u64)
+    -> Result<u64, HostedError> {
+    let mapping = planner.document_limits();
+    crate::hosted::extraction_map::document_workspace_bytes(planner.document_budget(), mapping,
+        mapping.mapping.chunks.max_chunks, reserve)
+}
+
 fn check_capacity(budget: TaskBudget, planned_context: usize, resident_context: usize,
     kv: u64, reserve: u64) -> Result<(), HostedError> {
     if planned_context != resident_context || resident_context == 0
