@@ -137,6 +137,52 @@ fn content_limit_can_finish_without_tokens_but_token_limit_requires_all_tokens()
     let n = s.writer.len(); assert!(s.finish(&completion(&s, GenerationFinish::TokenLimit)).is_err());
     assert_eq!(s.writer.len(), n);
 }
+
+#[test]
+fn int8_work_mismatches_never_publish_terminal_bytes_or_allow_a_retry() {
+    for has_token in [false, true] { for zero in [false, true] { for axis in 0..5 {
+        let mut s = sink(false);
+        let finish = if has_token {
+            push(&mut s, event(0, 166101, b"", false)); GenerationFinish::Eos
+        } else { GenerationFinish::ByteLimit };
+        let before = s.writer.clone(); let mut result = completion(&s, finish);
+        let count = match axis {
+            0 => &mut result.model_work.forward_positions,
+            1 => &mut result.model_work.projected_logits,
+            2 => &mut result.model_work.attention_pairs,
+            3 => &mut result.model_work.projections.dot_products,
+            _ => &mut result.model_work.projections.multiply_accumulates,
+        };
+        assert!(*count > 0);
+        *count = if zero { 0 } else { *count + 1 };
+        assert_eq!(s.finish(&result).unwrap_err().code, "stream_completion_backend");
+        assert_eq!(s.writer, before);
+        assert!(s.finish(&completion(&s, finish)).is_err());
+        assert_eq!(s.writer, before);
+    } } }
+}
+
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn int8_compute_metadata_cannot_authorize_inconsistent_model_work() {
+    let receipt = crate::hosted::Int8ComputeReceipt { schedule: "int8-output-row-team-v1",
+        compute_threads: 4, completed_projections: 100, completed_rows: 1000, completed_worker_rows: 750 };
+    for axis in 0..5 {
+        let mut s = sink(false); push(&mut s, event(0, 166101, b"", false));
+        let before = s.writer.clone(); let mut result = completion(&s, GenerationFinish::Eos);
+        match axis {
+            0 => result.model_work.forward_positions = 0,
+            1 => result.model_work.projected_logits = 0,
+            2 => result.model_work.attention_pairs = 0,
+            3 => result.model_work.projections.dot_products = 0,
+            _ => result.model_work.projections.multiply_accumulates = 0,
+        }
+        assert_eq!(s.finish_with_compute(&result, &receipt).unwrap_err().code, "stream_completion_backend");
+        assert_eq!(s.writer, before);
+        assert!(s.finish_with_compute(&completion(&s, GenerationFinish::Eos), &receipt).is_err());
+        assert_eq!(s.writer, before);
+    }
+}
 #[test]
 fn eos_and_token_ceiling_close_admission_even_before_final_publication() {
     let mut s = sink(false); push(&mut s, event(0, 166101, b"", false));

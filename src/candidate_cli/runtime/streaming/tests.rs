@@ -155,6 +155,20 @@ fn all_eleven_cancellation_kinds_keep_their_exit_category_and_attribution() {
     for cause in [FailFast, LinkedExit, RaceLost] { assert_eq!(cancelled(cause).exit, ErrorCode::Generic); }
     assert_eq!(cancelled(RaceLost).code, "stream_root_race_invariant");
 }
+
+#[test]
+fn native_team_cancellation_preserves_every_original_exit_code_and_cause() {
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let expected = cancelled(cause);
+        let failure = host_failure(HostedError::Native(
+            crate::native_engine::strict_int8::StrictInt8Error::Cancelled(cause)));
+        assert_eq!(failure.exit, expected.exit);
+        assert_eq!(failure.code, expected.code);
+        assert_eq!(failure.cancellation, Some(cause));
+    }
+}
 #[test]
 fn invalid_final_task_and_broken_stream_are_errors_not_shortened_successes() {
     let f = host_failure(HostedError::Chat(Int8ChatError::Chat(ChatError::NoResult("incomplete UTF-8"))));

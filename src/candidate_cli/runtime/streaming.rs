@@ -126,6 +126,7 @@ fn host_failure(error: HostedError) -> Failure {
                 _ => Failure::output("stream_native_task_failed"),
             }
         }
+        HostedError::Native(crate::native_engine::strict_int8::StrictInt8Error::Cancelled(cause)) => cancelled(cause),
         HostedError::ResourceDomain | HostedError::ModelIdentity => Failure {
             exit: ErrorCode::ArtifactIntegrityOrFormatOrVersion, code: "stream_model_identity", cancellation: None },
         HostedError::Limits(_) | HostedError::Reservation(_) | HostedError::Reentrant

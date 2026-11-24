@@ -8,7 +8,7 @@ use crate::{execution_identity::Sha256Digest,
         decode::{DecodeEventSink, DecodeTokenEvent, DecodeScoreSpace, DECODE_TOKEN_EVENT_SCHEMA_VERSION},
         generation::{GenerationFinish, quantized::INT8_GENERATION_VERSION,
             grouped_int4::{INT4_GENERATION_VERSION, INT4_SOURCE_FORMAT}},
-        lmhead::NANBEIGE_VOCAB_SIZE, sampler::Seed256, strict_int8::STRICT_INT8_PROFILE,
+        lmhead::NANBEIGE_VOCAB_SIZE, sampler::Seed256, strict_int8::{Int8Work, STRICT_INT8_PROFILE},
         strict_int4::{Int4ModelIdentity, Int4Work, STRICT_INT4_PROFILE}},
     tasks::chat::{ChatResult, quantized::Int8ChatResult, grouped_int4::Int4ChatResult},
     tokenizer::untrusted::UntrustedEncoding};
@@ -218,14 +218,24 @@ impl<W: Write> TokenSink<W> {
     /// Only the runtime's guarded, post-drain completion calls this in product
     /// code. Unit fixtures exercise framing without manufacturing model proof.
     pub(in crate::candidate_cli) fn finish(&mut self, result: &Int8ChatResult) -> Result<(), Failure> {
-        self.finish_result(result, result.schema_version, &result.result, Backend::Int8, true, None::<&()>)
+        self.finish_int8_receipt(result, None::<&()>)
     }
     /// A physical receipt belongs only to the post-join terminal frame. The
     /// same result reconciliation and reserved transport bound still apply.
     #[cfg(feature = "asupersync-runtime")]
     pub(in crate::candidate_cli) fn finish_with_compute(&mut self, result: &Int8ChatResult,
         compute: &crate::hosted::Int8ComputeReceipt) -> Result<(), Failure> {
-        self.finish_result(result, result.schema_version, &result.result, Backend::Int8, true, Some(compute))
+        self.finish_int8_receipt(result, Some(compute))
+    }
+    fn finish_int8_receipt<C: Serialize>(&mut self, result: &Int8ChatResult, compute: Option<&C>)
+        -> Result<(), Failure> {
+        // A complete stream starts from empty KV. Reconcile every model work
+        // axis independently before its terminal frame can claim success.
+        let expected = usize::try_from(result.result.native_work.forward_positions).ok()
+            .zip(usize::try_from(result.result.native_work.projected_logits).ok())
+            .and_then(|(positions, logits)| Int8Work::for_sequence(0, positions, logits).ok());
+        self.finish_result(result, result.schema_version, &result.result, Backend::Int8,
+            expected.is_some_and(|work| work == result.model_work), compute)
     }
     pub(in crate::candidate_cli) fn finish_int4(&mut self, result: &Int4ChatResult) -> Result<(), Failure> {
         self.finish_int4_receipt(result, None::<&()>)
