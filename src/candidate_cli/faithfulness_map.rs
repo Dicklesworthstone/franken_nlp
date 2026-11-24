@@ -6,6 +6,7 @@ use crate::{
         JudgeLimits, JudgeRequest, quantized::faithfulness_map::{
             Int8FaithfulnessMapLimits, MAX_FAITHFULNESS_MAP_HEADS}}, mapreduce::ChunkLimits},
     tokenizer::untrusted::UntrustedEncoding,
+    native_engine::strict_int8::prefill::Int8PrefillLimits,
 };
 
 #[derive(Args)]
@@ -34,6 +35,8 @@ pub(crate) struct FaithfulnessMapCommand {
     pub(super) scoring: scored::ScoredArgs,
     pub(super) mapping: MappingArgs,
     pub(super) encoding: input_encoding::DocumentInputEncodingArgs,
+    pub(super) compute: compute::Args,
+    pub(super) prefill: scored::prefill::ScoringPrefillArgs,
 }
 
 pub(super) struct MapLimits {
@@ -43,14 +46,15 @@ pub(super) struct MapLimits {
     pub(super) planning: JudgeLimits,
     pub(super) mapping: Int8FaithfulnessMapLimits,
     pub(super) encoding: UntrustedEncoding,
+    pub(super) prefill: Option<Int8PrefillLimits>,
     pub(super) envelope_bytes: usize,
 }
 
 pub(super) fn definition() -> clap::Command {
-    input_encoding::document_definition(MappingArgs::augment_args(scored::ScoredArgs::augment_args(
+    compute::definition(input_encoding::document_definition(scored::prefill::ScoringPrefillArgs::augment_args(MappingArgs::augment_args(scored::ScoredArgs::augment_args(
         clap::Command::new("faithfulness-map")
             .about("Judge a claim against every chunk of a complete source with native INT8")
-            .long_about("Read one strict {mode: faithfulness, source, claim, policy} JSON object. Preserve the complete source and unchanged claim, partitioning only the source into nonoverlapping UTF-8 chunks with claim-aware prompt capacity. Plan every chunk and every evidence window before loading weights, then reuse one native INT8 cache. Full-vocabulary candidate scores retain EOS and the existing judgment policy. The shared document reduction preserves original byte/scalar evidence coordinates, including contrary witnesses when it abstains. A document decision requires the declared classified-coverage floor and compatible evidence. Independent chunk judgments do not establish cross-chunk inference, calibrated correctness or a factuality certificate. Any failed chunk, cancellation or exhausted allowance returns no complete document result."))))
+            .long_about("Read one strict {mode: faithfulness, source, claim, policy} JSON object. Preserve the complete source and unchanged claim, partitioning only the source into nonoverlapping UTF-8 chunks with claim-aware prompt capacity. Plan every chunk and every evidence window before loading weights, then reuse one native INT8 cache. Full-vocabulary candidate scores retain EOS and the existing judgment policy. The shared document reduction preserves original byte/scalar evidence coordinates, including contrary witnesses when it abstains. A document decision requires the declared classified-coverage floor and compatible evidence. Independent chunk judgments do not establish cross-chunk inference, calibrated correctness or a factuality certificate. Any failed chunk, cancellation or exhausted allowance returns no complete document result."))))))
         .mut_arg("input", |arg| arg.help("One complete faithfulness JSON object; '-' reads stdin"))
         .mut_arg("max_input_bytes", |arg| arg.default_value("1048576")
             .help("Complete JSON byte cap, including both original source and exact claim"))
@@ -63,17 +67,22 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("max_attention_pairs", |arg| arg.default_value("1000000000000"))
         .mut_arg("max_dot_products", |arg| arg.default_value("10000000000000000"))
         .mut_arg("max_multiply_accumulates", |arg| arg.default_value("10000000000000000"))
-        .after_long_help("Explicit compact input: --input-encoding safe-bpe-v1 preserves exact source and claim bytes without admitting template-control tokens. One bounded tokenizer ledger covers claim capacity, accepted and rejected source probes, and every final evidence-head plan in each complete preparation. CLI preflight and owned hosted preparation use the same fixed policy; work never renews per chunk or head. Native work, source bytes, context, tokenizer work, retained chunks and final result have independent ceilings. The complete process memory envelope is checked before input/model IO. The original cooperative deadline spans reading, preparation, loading, inference, evidence reduction and checked publication. Only faithfulness mode is accepted; no sampling, thinking, tools, cohorts, prompt overrides or retained jobs.")
+        .after_long_help("Explicit compact input: --input-encoding safe-bpe-v1 preserves exact source and claim bytes without admitting template-control tokens. One bounded tokenizer ledger covers claim capacity, accepted and rejected source probes, and every final evidence-head plan in each complete preparation. CLI preflight and owned hosted preparation use the same fixed policy; work never renews per chunk or head. Optional --compute-threads reuses one bounded persistent CPU team across every source chunk and evidence head; --prefill-rows bounds prompt staging on the same execution path. Scheduling preserves the exact claim, complete work allowance and source/result bindings. Native work, source bytes, context, tokenizer work, retained chunks and final result have independent ceilings. The complete process memory envelope is checked before input/model IO. The original cooperative deadline spans reading, preparation, loading, inference, evidence reduction and checked publication. Only faithfulness mode is accepted; no sampling, thinking, tools, cohorts, prompt overrides or retained jobs.")
 }
 
 impl FaithfulnessMapCommand {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         Ok(Self { scoring: scored::ScoredArgs::from_arg_matches(matches)?,
             mapping: MappingArgs::from_arg_matches(matches)?,
-            encoding: input_encoding::DocumentInputEncodingArgs::from_matches(matches)? })
+            encoding: input_encoding::DocumentInputEncodingArgs::from_matches(matches)?,
+            compute: compute::Args::from_matches(matches)?,
+            prefill: scored::prefill::ScoringPrefillArgs::from_arg_matches(matches)? })
     }
     pub(super) fn validate(&self) -> Result<MapLimits, CandidateError> {
-        let (common, limits) = self.scoring.common()?;
+        let (mut common, mut limits) = self.scoring.common()?;
+        let prefill = self.prefill.limits()?;
+        common.compute = self.compute;
+        limits.compute = self.compute.admit_prefill(prefill)?;
         let encoding = self.encoding.policy()?;
         let m = &self.mapping;
         if self.scoring.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
@@ -112,7 +121,7 @@ impl FaithfulnessMapCommand {
             .and_then(|n| n.checked_add(encoder_bytes)).ok_or(CandidateError::Arguments)?;
         if floor > limits.preparation_bytes { return Err(CandidateError::Arguments); }
         let admitted = MapLimits { common, limits, task,
-            planning: judge::planning_limits(&self.scoring, task), mapping, encoding, envelope_bytes };
+            planning: judge::planning_limits(&self.scoring, task), mapping, encoding, prefill, envelope_bytes };
         #[cfg(feature = "asupersync-runtime")]
         runtime::faithfulness_map::admit(&admitted)?;
         Ok(admitted)

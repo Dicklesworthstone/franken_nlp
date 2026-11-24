@@ -373,10 +373,31 @@ impl PreparedInt8FaithfulnessMap<'_> {
     pub fn execute_with_control<C: DecodeStepControl>(&self, admitted: &[ExecutionIdentity],
         engine: &mut StrictInt8Engine<'_>, budget: Int8ScoringBudget, control: &mut C)
         -> Result<Int8FaithfulnessMapRun, Int8FaithfulnessMapError> {
+        self.execute_with_prefill(admitted, engine, budget, None, control)
+    }
+    /// Reuse bounded prompt morsels across every chunk and evidence head.
+    /// Candidate continuations, full-vocabulary denominators and the complete
+    /// document work allowance retain their sequential execution contract.
+    pub fn execute_layer_major_with_control<C: DecodeStepControl>(&self, admitted: &[ExecutionIdentity],
+        engine: &mut StrictInt8Engine<'_>, budget: Int8ScoringBudget,
+        prefill: Int8PrefillLimits, control: &mut C)
+        -> Result<Int8FaithfulnessMapRun, Int8FaithfulnessMapError> {
+        self.execute_with_prefill(admitted, engine, budget, Some(prefill), control)
+    }
+    fn execute_with_prefill<C: DecodeStepControl>(&self, admitted: &[ExecutionIdentity],
+        engine: &mut StrictInt8Engine<'_>, budget: Int8ScoringBudget,
+        prefill: Option<Int8PrefillLimits>, control: &mut C)
+        -> Result<Int8FaithfulnessMapRun, Int8FaithfulnessMapError> {
+        if let Some(limits) = prefill { limits.validate()?; }
         self.preflight_with_control(admitted, engine, budget, control)?;
         self.collect_with_control(control, |index, plan, control| {
-            let run = plan.execute_with_control(&admitted[index], engine, Int8ScoringBudget {
-                native: Int8RunBudget::exact(plan.planned_work()), max_kv_bytes: budget.max_kv_bytes }, control)?;
+            let local = Int8ScoringBudget {
+                native: Int8RunBudget::exact(plan.planned_work()), max_kv_bytes: budget.max_kv_bytes };
+            let run = match prefill {
+                Some(limits) => plan.execute_layer_major_with_control(
+                    &admitted[index], engine, local, limits, control),
+                None => plan.execute_with_control(&admitted[index], engine, local, control),
+            }?;
             if engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) {
                 return Err(Int8FaithfulnessMapError::Admission);
             }

@@ -302,8 +302,76 @@ fn all_original_cancellation_causes_survive_hosted_and_preparation_boundaries() 
 fn owned_inputs_and_complete_guarded_results_cross_the_real_blocking_boundary() {
     fn send<T: Send + 'static>() {}
     send::<MapInput>();
+    send::<MapTeamAdmission>();
+    send::<HostedInt8TeamResult<Int8FaithfulnessMapRun>>();
     send::<Int8FaithfulnessMapRun>();
     send::<HostedOutput<Int8FaithfulnessMapRun>>();
     let _byte = NlpEngine::map_int8_faithfulness;
     let _compact = NlpEngine::map_int8_faithfulness_with_encoding;
+    let _prefill = NlpEngine::map_int8_faithfulness_layer_major_with_encoding;
+    let _team = NlpEngine::map_int8_faithfulness_with_threads;
+    let _composed = NlpEngine::map_int8_faithfulness_layer_major_with_threads;
 }
+
+fn prefill(rows: usize) -> Int8PrefillLimits {
+    Int8PrefillLimits { max_batch_rows: rows,
+        max_extra_scratch_bytes: Int8PrefillLimits::required_extra_scratch_bytes(rows).unwrap() }
+}
+
+#[test]
+fn prompt_and_worker_storage_is_reused_without_multiplying_the_native_cache_by_evidence_heads() {
+    let (request, mut config) = fixture();
+    let batch = prefill(4);
+    let mut previous_input = 0;
+    for chunks in [1, 8, 64] {
+        config.mapping.chunks.max_chunks = chunks;
+        let plain = scheduled_requirements(config, task(&request), &UntrustedEncoding::ByteFallback,
+            None, None).unwrap();
+        let grouped = scheduled_requirements(config, task(&request), &UntrustedEncoding::ByteFallback,
+            Some(batch), None).unwrap();
+        assert_eq!(grouped.workspace_bytes, plain.workspace_bytes + batch.validate().unwrap());
+        assert_eq!(grouped.native, plain.native);
+        assert_eq!(grouped.input_bytes, plain.input_bytes);
+        assert_eq!(grouped.output_reservation_bytes, plain.output_reservation_bytes);
+        assert!(grouped.input_bytes > previous_input);
+        previous_input = grouped.input_bytes;
+        for width in [2, 4, 64] {
+            assert_eq!(scheduled_requirements(config, task(&request), &UntrustedEncoding::ByteFallback,
+                Some(batch), Some(width)).unwrap(), grouped);
+            assert!(dispatch::int8_prefill_team_workspace_bytes(width, batch.max_batch_rows).unwrap() > 0);
+        }
+    }
+    // Compact encoding is a separate owner, not a replacement for either
+    // coordinator prompt storage or fixed child payload.
+    let compact = UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 262144, max_output_tokens: 131072,
+        max_pair_checks: 33554432, max_pair_bytes: 268435456 });
+    let base = config.requirements_with_encoding(task(&request), &compact).unwrap();
+    let scheduled = scheduled_requirements(config, task(&request), &compact, Some(batch), Some(4)).unwrap();
+    assert_eq!(scheduled.input_bytes, base.input_bytes);
+    assert_eq!(scheduled.workspace_bytes, base.workspace_bytes + batch.validate().unwrap());
+}
+
+#[test]
+fn underfunded_prompt_geometry_invalid_team_width_and_combined_overflow_refuse_admission() {
+    let (request, config) = fixture();
+    let quote = config.requirements(task(&request)).unwrap();
+    let batch = prefill(4);
+    let generous = Int8PrefillLimits { max_extra_scratch_bytes: u64::MAX, ..batch };
+    assert_eq!(quote.with_prefill(generous).unwrap(), quote.with_prefill(batch).unwrap());
+    let short = Int8PrefillLimits { max_extra_scratch_bytes: batch.max_extra_scratch_bytes - 1, ..batch };
+    assert!(quote.with_prefill(short).is_err());
+    for rows in [0, 65, usize::MAX] {
+        assert!(quote.with_prefill(Int8PrefillLimits {
+            max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX }).is_err());
+    }
+    for width in [0, 1, 65, usize::MAX] {
+        assert!(scheduled_requirements(config, task(&request), &UntrustedEncoding::ByteFallback,
+            Some(batch), Some(width)).is_err());
+    }
+    let mut overflow = quote; overflow.workspace_bytes = u64::MAX;
+    assert!(overflow.with_prefill(batch).is_err());
+}
+
+#[cfg(feature = "asupersync-runtime")]
+mod model;

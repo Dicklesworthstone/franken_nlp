@@ -24,14 +24,22 @@ fn config(admitted: &MapLimits, elapsed: Duration) -> Int8FaithfulnessMapHostCon
 /// lease spans both alternative load/execution peaks; host plans are separate.
 pub(in crate::candidate_cli) fn admit(admitted: &MapLimits)
     -> Result<Int8FaithfulnessMapMemoryRequirement, CandidateError> {
+    if admitted.limits.compute != admitted.common.compute.admit_prefill(admitted.prefill)? {
+        return Err(CandidateError::Arguments);
+    }
     let quote = config(admitted, Duration::from_secs(admitted.common.timeout_seconds))
         .requirements_with_encoding(admitted.task, &admitted.encoding)
         .map_err(|_| CandidateError::Arguments)?;
+    let quote = match admitted.prefill {
+        Some(prefill) => quote.with_prefill(prefill).map_err(|_| CandidateError::Arguments)?,
+        None => quote,
+    };
     let sum = |values: &[u64]| values.iter().try_fold(0_u64,
         |total, &bytes| total.checked_add(bytes).ok_or(CandidateError::Arguments));
     let loading = sum(&[admitted.limits.weight_bytes, 192 * MIB, 64 * 1024, 65_536])?;
     let execution = sum(&[admitted.limits.weight_bytes, 192 * MIB, quote.input_bytes,
-        quote.native.kv_bytes, quote.workspace_bytes, quote.output_reservation_bytes, 65_536])?;
+        quote.native.kv_bytes, quote.workspace_bytes, admitted.limits.compute.workspace_bytes,
+        quote.output_reservation_bytes, 65_536])?;
     let peak = sum(&[admitted.limits.preparation_bytes, loading.max(execution).max(quote.input_bytes)])?;
     if peak > admitted.limits.memory_bytes { return Err(CandidateError::Arguments); }
     Ok(quote)
@@ -56,6 +64,7 @@ fn host_error(error: HostedError) -> CandidateError {
             | HostedError::Scope { physical_error: Some(error), .. } => host_error(*error),
         HostedError::FaithfulnessMap(error) => completion_error(error),
         HostedError::Judge(error) => error.cancellation().map(stopped).unwrap_or(CandidateError::Execution),
+        HostedError::Native(crate::native_engine::strict_int8::StrictInt8Error::Cancelled(cause)) => stopped(cause),
         HostedError::Reservation(_) => CandidateError::Memory,
         HostedError::ModelIdentity | HostedError::ResourceDomain => CandidateError::Identity,
         _ => CandidateError::Execution,
@@ -95,7 +104,7 @@ fn prepare(request: &JudgeRequest, facts: &ArtifactIdentity, admitted: &MapLimit
 pub(in crate::candidate_cli) fn execute(admitted: MapLimits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
     let quote = admit(&admitted)?;
-    let session = Session::new(&admitted.common, admitted.limits)?;
+    let session = Session::new_with_prefill(&admitted.common, admitted.limits, admitted.prefill)?;
     let text = session.read(&admitted.common.input, input, admitted.common.max_input_bytes)?;
     let request = command::request(&text, &admitted)?;
     drop(text);
@@ -111,15 +120,32 @@ pub(in crate::candidate_cli) fn execute(admitted: MapLimits,
     let cancellation = CancellationToken::default();
     let model = session.load(&admitted.common, admitted.limits, &facts, cancellation.clone())?;
     let config = config(&admitted, session.remaining()?);
-    let result = session.engine.map_int8_faithfulness_with_encoding(&model, request,
-        identity, config, admitted.encoding.clone(), cancellation).map_err(host_error)?;
+    let result = if admitted.limits.compute.threads == 1 {
+        compute::Completion::Serial(match admitted.prefill {
+            None => session.engine.map_int8_faithfulness_with_encoding(&model, request,
+                identity, config, admitted.encoding.clone(), cancellation),
+            Some(prefill) => session.engine.map_int8_faithfulness_layer_major_with_encoding(&model, request,
+                identity, config, admitted.encoding.clone(), prefill, cancellation),
+        }.map_err(host_error)?)
+    } else {
+        let kernel = crate::native_engine::simd::config::process_kernel();
+        compute::Completion::Team(match admitted.prefill {
+            None => session.engine.map_int8_faithfulness_with_threads(&model, request,
+                identity, config, admitted.encoding.clone(), kernel,
+                admitted.limits.compute.threads, cancellation),
+            Some(prefill) => session.engine.map_int8_faithfulness_layer_major_with_threads(&model, request,
+                identity, config, admitted.encoding.clone(), kernel,
+                admitted.limits.compute.threads, prefill, cancellation),
+        }.map_err(host_error)?)
+    };
     expected.verify_completed_with_control(result.result(), &mut session.control())
         .map_err(completion_error)?;
     session.remaining()?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
         evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
         source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
-        quant_recipe: &facts.recipe_id, output: &result };
+        quant_recipe: &facts.recipe_id, output: result.result() };
+    let response = compute::Response { response: &response, compute: result.compute() };
     let response = input_encoding::Response { response: &response,
         input_encoding: input_encoding::reported_policy(&admitted.encoding) };
     // Native output and CLI staging ownership survive both write and flush.

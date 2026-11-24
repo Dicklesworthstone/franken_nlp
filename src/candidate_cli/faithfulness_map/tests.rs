@@ -87,7 +87,7 @@ fn exact_json_byte_cap_and_separate_final_result_allowance_are_enforced() {
 #[test]
 fn only_supported_faithfulness_document_controls_are_exposed() {
     for flag in ["--seed", "--temperature-milli", "--top-k", "--max-new-tokens",
-        "--prefill-rows", "--cohort-heads", "--cohort-chunks", "--compute-threads"] {
+        "--cohort-heads", "--cohort-chunks"] {
         assert!(super::super::definition().try_get_matches_from([
             "candidate", "faithfulness-map", "--model", "m", "--memory-mib", "32768", flag, "1"]).is_err());
     }
@@ -109,7 +109,9 @@ fn invalid_document_limits_fail_before_input_output_or_model_io() {
         ("--max-retained-result-bytes", "1"), ("--max-retained-result-bytes", "67108865"),
         ("--minimum-classified-coverage-ppm", "1000001"), ("--max-forward-positions", "0"),
         ("--context-tokens", "16"), ("--max-input-bytes", "3"),
-        ("--preparation-mib", "511"), ("--timeout-seconds", "0")] {
+        ("--preparation-mib", "511"), ("--timeout-seconds", "0"),
+        ("--compute-threads", "0"), ("--compute-threads", "65"),
+        ("--prefill-rows", "0"), ("--prefill-rows", "65")] {
         let mut output = Vec::new();
         assert!(matches!(command(&[flag, value]).execute(&mut NoRead, &mut output),
             Err(CandidateError::Arguments)), "{flag}");
@@ -144,9 +146,48 @@ fn disabled_runtime_refuses_before_private_input_and_public_output() {
     impl Read for NoRead {
         fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("disabled runtime read"); }
     }
-    for flags in [&[][..], &["--input-encoding", "safe-bpe-v1"][..]] {
+    for flags in [&[][..], &["--input-encoding", "safe-bpe-v1"][..],
+        &["--prefill-rows", "4"][..], &["--compute-threads", "4"][..],
+        &["--compute-threads", "4", "--prefill-rows", "3"][..]] {
         let mut output = Vec::new();
         assert_eq!(command(flags).execute(&mut NoRead, &mut output), Err(CandidateError::Unavailable));
         assert!(output.is_empty());
+    }
+}
+
+#[test]
+fn complete_faithfulness_composes_prefill_and_workers_without_changing_semantic_limits() {
+    let plain = command(&[]).validate().unwrap();
+    assert!(plain.prefill.is_none());
+    assert_eq!(plain.limits.compute.threads, 1);
+    assert_eq!(plain.limits.compute.workspace_bytes, 0);
+    for flags in [&["--prefill-rows", "3"][..], &["--compute-threads", "4"][..],
+        &["--compute-threads", "4", "--prefill-rows", "3"][..]] {
+        let admitted = command(flags).validate().unwrap();
+        assert_eq!(admitted.task, plain.task);
+        assert_eq!(admitted.mapping.max_model_work, plain.mapping.max_model_work);
+        assert_eq!(admitted.mapping.max_result_bytes, plain.mapping.max_result_bytes);
+        assert_eq!(admitted.common.context_tokens, plain.common.context_tokens);
+        assert_eq!(admitted.encoding, plain.encoding);
+        assert_eq!(admitted.limits.compute,
+            admitted.common.compute.admit_prefill(admitted.prefill).unwrap());
+        if admitted.limits.compute.threads > 1 {
+            assert!(admitted.limits.compute.workspace_bytes > 0);
+        }
+        if let Some(prefill) = admitted.prefill {
+            assert_eq!(prefill.max_batch_rows, 3);
+            assert_eq!(prefill.validate().unwrap(), prefill.max_extra_scratch_bytes);
+        }
+    }
+}
+
+#[test]
+fn malformed_worker_and_prompt_widths_never_fall_back_to_serial_defaults() {
+    for flag in ["--compute-threads", "--prefill-rows"] {
+        for value in ["-1", "3.5", "NaN", "99999999999999999999999999999"] {
+            assert!(super::super::definition().try_get_matches_from([
+                "candidate", "faithfulness-map", "--model", "m",
+                "--memory-mib", "32768", flag, value]).is_err());
+        }
     }
 }

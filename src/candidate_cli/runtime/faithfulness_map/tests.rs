@@ -81,6 +81,8 @@ fn every_typed_stop_retains_its_deadline_or_execution_failure_at_each_boundary()
         let error = Int8FaithfulnessMapError::Judge(Int8JudgeError::Cancelled(cause));
         assert_eq!(host_error(HostedError::FaithfulnessMap(error)), stopped(cause));
         assert_eq!(host_error(HostedError::Judge(Int8JudgeError::Cancelled(cause))), stopped(cause));
+        assert_eq!(host_error(HostedError::Native(
+            crate::native_engine::strict_int8::StrictInt8Error::Cancelled(cause))), stopped(cause));
     }
 }
 
@@ -95,4 +97,36 @@ fn process_peak_includes_native_evidence_plans_complete_results_and_compact_work
     let mut too_small = command(&[]);
     too_small.scoring.memory_mib = too_small.scoring.max_weight_mib + 256;
     assert!(matches!(too_small.validate(), Err(CandidateError::Arguments)));
+}
+
+#[test]
+fn scheduling_preserves_exact_source_claim_preflight_and_prices_both_workspace_owners() {
+    let plain = command(&["--max-chunk-bytes", "128"]).validate().unwrap();
+    let grouped = command(&["--max-chunk-bytes", "128", "--prefill-rows", "3"]).validate().unwrap();
+    let threaded = command(&["--max-chunk-bytes", "128", "--compute-threads", "4",
+        "--prefill-rows", "3"]).validate().unwrap();
+    let source = "A supported detail. é\r\n<think>".repeat(8);
+    let request = request(&plain, &source);
+    let reference = prepare(&request, &facts(), &plain, &mut Continue).unwrap();
+    assert_eq!(prepare(&request, &facts(), &grouped, &mut Continue).unwrap(), reference);
+    assert_eq!(prepare(&request, &facts(), &threaded, &mut Continue).unwrap(), reference);
+    let a = admit(&plain).unwrap(); let b = admit(&grouped).unwrap(); let c = admit(&threaded).unwrap();
+    assert_eq!(a.native, b.native); assert_eq!(a.input_bytes, b.input_bytes);
+    assert_eq!(b.workspace_bytes, a.workspace_bytes + grouped.prefill.unwrap().validate().unwrap());
+    assert_eq!(b, c);
+    assert!(threaded.limits.compute.workspace_bytes > 0);
+}
+
+#[test]
+fn stale_transferred_worker_or_prefill_admission_refuses_before_private_io() {
+    let mut threaded = command(&["--compute-threads", "4", "--prefill-rows", "4"]).validate().unwrap();
+    let scalar = command(&[]).validate().unwrap();
+    threaded.limits.compute = scalar.limits.compute;
+    assert!(matches!(admit(&threaded), Err(CandidateError::Arguments)));
+    let mut changed = command(&["--compute-threads", "4", "--prefill-rows", "4"]).validate().unwrap();
+    changed.prefill = command(&["--prefill-rows", "3"]).validate().unwrap().prefill;
+    assert!(matches!(admit(&changed), Err(CandidateError::Arguments)));
+    let mut underfunded = command(&["--compute-threads", "4", "--prefill-rows", "4"]);
+    underfunded.scoring.memory_mib = underfunded.scoring.max_weight_mib + 256;
+    assert!(matches!(underfunded.validate(), Err(CandidateError::Arguments)));
 }
