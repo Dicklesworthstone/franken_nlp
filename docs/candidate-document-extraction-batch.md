@@ -98,6 +98,50 @@ that document's result and closes the execution adapter. Earlier fully delivered
 documents remain valid. A stream with any failed document returns a nonzero exit;
 no extra success frame is appended by the CLI.
 
+## Compact input and persistent workers
+
+Add `--input-encoding safe-bpe-v1` to use the existing bounded compact tokenizer
+for each exact schema and source chunk. One cumulative invocation ledger covers
+schema sizing, accepted and discarded partition probes, actual chunk compilation,
+plan reconstruction and every document in the stream. Flushes and native handoff
+do not reset it, and rejected or cancelled preparation keeps its spent work.
+
+```sh
+fnlp candidate batch documents.ndjson \
+  --task extract --chunked --schema schema.json --source-membership \
+  --input-encoding safe-bpe-v1 \
+  --max-total-tokenizer-input-bytes 67108864 \
+  --max-total-tokenizer-output-tokens 4194304 \
+  --max-total-tokenizer-pair-checks 268435456 \
+  --max-total-tokenizer-pair-bytes 4294967296 \
+  --compute-threads 4 --prefill-rows 8 \
+  --model local.fnlpq --memory-mib 16384 --preparation-mib 1024 \
+  --max-chunks 64 --max-document-result-bytes 16777216
+```
+
+The four `--max-total-tokenizer-*` values above are the default invocation caps.
+They must be positive and are available here only for compact chunked extraction.
+The existing per-call pair-check and pair-byte caps remain additional limits.
+A partition probe may contain more tokens than the native context before the
+partitioner shrinks it; its complete bounded encoding still spends the same
+ledger. Every accepted chunk must satisfy the original native context and output
+reservation. Compact input preserves source bytes and evidence coordinates but
+changes prompt tokens, so it carries no identical-output or quality claim.
+
+One encoder workspace and its cumulative ledger are admitted beside the complete
+retained map frontier, caller preparation, owned IO, native buffers and result.
+The CLI checks this complete memory demand even with serial compact execution,
+then matches the actual planner policy, caps and workspace before loading weights.
+Compact event provenance includes `input_encoding` and the declared
+`invocation_encoding_work_limits`; the latter reports limits, not measured work.
+Byte-fallback remains the default and omits these fields.
+
+`--compute-threads` and `--prefill-rows` can be selected independently and compose
+with either encoding. Both accept 1 through 64; the thread width includes the
+coordinator. One persistent team and prompt workspace span every chunk and
+document. Native work, masks and verification retain their original corpus
+ceilings, and terminal completion follows physical worker join.
+
 ## Library entrypoints and validation status
 
 Embedding hosts can use `NlpEngine::batch_int8_extract_document` with
@@ -105,6 +149,11 @@ Embedding hosts can use `NlpEngine::batch_int8_extract_document` with
 an immutable extraction planner, shared vocabulary, owned reader/writer and an
 explicit cancellation token. The lower-level typed adapter is
 `batch::extract::quantized::long::stream::NativeInt8DocumentExtractionBatch`.
+For compact input, configure the same planner with
+`Int8ExtractionBatchPlanner::with_map_document_encoding(policy, totals)` and
+retain it across preparation and execution. Use
+`ExtractionDocumentCorpusConfig::preparation_workspace_bytes` to quote the
+complete task workspace, including the encoder and shared ledger.
 
 The implementation includes model-free regression definitions for multi-document
 engine reuse, exact child identities, nonrenewable work and verification ledgers,

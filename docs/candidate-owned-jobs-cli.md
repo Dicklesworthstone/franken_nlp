@@ -173,8 +173,10 @@ resume rather than changing the meaning of pending items.
 
 ## Compact input with authenticated resume
 
-Single-context `extract`, `ner`, `keyphrases`, `summarize` and `answer` jobs
-accept `--input-encoding safe-bpe-v1` on both `start` and `resume`. For example:
+Single-context `extract`, `ner`, `keyphrases`, `summarize` and `answer` jobs,
+complete schema-extraction documents selected by `--document-config`, and
+complete NER/keyphrase/summary documents selected by `--source-document-config` accept
+`--input-encoding safe-bpe-v1` on both `start` and `resume`. For example:
 
 ```sh
 fnlp candidate job start corpus.ndjson --task extract \
@@ -240,13 +242,31 @@ the original bytes and excludes template-control token IDs, while changing
 the prompt token sequence. It does not establish identical model output,
 numerical equivalence, quality or measured speed.
 
-Complete-document jobs using `--document-config` or
-`--source-document-config` continue to require byte fallback. They reject
-compact input before configuration, key, model or population access; their
-chunk-level accounting contract is separate.
+For complete schema-extraction documents, combine `--task extract --schema FILE`
+with the existing `--document-config FILE` and the same compact-input flags.
+Each original document remains one durable item containing its complete chunk
+map. Its schema sizing, accepted/discarded partition probes, every chunk plan
+and reconstruction all spend the shared invocation ledger. A probe may exceed
+native token capacity before partitioning; accepted chunks still obey the
+unchanged native context. Source bytes, exact chunk JSON and original-coordinate
+evidence remain intact.
+
+Complete-document admission adds the encoder and ledger beside the full retained
+map frontier and native buffers, including with serial execution. The prepared
+factory's policy, total caps and workspace must match the CLI quote before weights
+load. Use sufficient process headroom, such as `--memory-mib 16384` in an example
+configuration; this is a ledger allowance, not a measured memory requirement.
+Both scheduling options compose with compact documents. Resume skips committed
+documents without tokenizing or inferring them again. Pending documents share
+this resumed invocation's authenticated tokenizer allowance; durable native work,
+masks and attempts retain all previous debits.
 
 Library callers configure `Int8ExtractionJobPlanner::with_document_encoding`
-with the fixed policy and invocation totals. Source jobs use the existing
+for single-context extraction or
+`Int8DocumentExtractionJobPlanner::with_document_encoding` for whole documents,
+with the fixed policy and invocation totals. Reapplying an identical whole-document
+policy preserves already spent tokenizer work; changing its policy or caps is
+refused. Source jobs use the existing
 `SourceTaskPlanner::with_map_document_encoding` cumulative owner. Keep that
 owner across preparation and native execution; the hosted job entry points
 admit its workspace independently.

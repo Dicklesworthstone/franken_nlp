@@ -81,11 +81,8 @@ fn check_encoding_quote(prepared: &PreparedJob, encoding: &UntrustedEncoding,
             planner.encoding_workspace_bytes().map_err(|_| CandidateError::Planning)?),
         PreparedJob::SourceDocument { planner, .. } => (planner.document_encoding(), planner.encoding_work_limits(),
             planner.encoding_workspace_bytes().map_err(|_| CandidateError::Planning)?),
-        PreparedJob::Document { .. } => {
-            return if encoding == &UntrustedEncoding::ByteFallback && total.is_none() && expected == 0 {
-                Ok(())
-            } else { Err(Failure::usage("document_job_input_encoding")) };
-        }
+        PreparedJob::Document { planner, .. } => (planner.document_encoding(), planner.encoding_work_limits(),
+            planner.encoding_workspace_bytes().map_err(|_| CandidateError::Planning)?),
     };
     if actual_policy != encoding || actual_total != total || workspace != expected {
         return Err(Failure::usage("job_encoding_quote_mismatch"));
@@ -151,11 +148,12 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     let session = Session::new_with_prefill(&common, limits, prefill)?;
     let lifetime = command::parse_limits(&read_config(&session, &args.limits_file, command::LIMIT_BYTES)?)?;
     let native = command::native_limits(&args, lifetime)?;
-    let scheduled = prefill.is_some() || limits.compute.threads > 1;
+    let full_native_memory = prefill.is_some() || limits.compute.threads > 1
+        || args.document_config.is_some() && !args.encoding.is_default();
     // One record owns the output guard. Lifetime work can span millions of
     // records and is not a concurrent memory requirement.
     let native_bytes = |result_bytes: u64, output_tokens: u64| -> Result<u64, Failure> {
-        if !scheduled {
+        if !full_native_memory {
             return limits.weight_bytes.checked_add(limits.preparation_bytes)
                 .ok_or_else(|| Failure::usage("job_memory_arithmetic"));
         }
@@ -190,7 +188,7 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
         (Some(_), Some(_)) => return Err(Failure::usage("source_document_job_options")),
     };
     check_encoding_quote(&prepared, &encoding, encoding_work_limits, encoding_workspace_bytes)?;
-    if scheduled {
+    if full_native_memory {
         use crate::hosted::corpus::jobs::{extraction_document_job_workspace, source_document_job_workspace};
         let document = match &prepared {
             PreparedJob::Document { planner, reduction_reserve_bytes } => Some((
@@ -207,7 +205,7 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
         if let Some((workspace, chunks, result_bytes)) = document {
             let tokens = (chunks as u64).checked_mul(args.host.max_new_tokens as u64)
                 .ok_or_else(|| Failure::usage("job_memory_arithmetic"))?;
-            // Source document workspace already includes compact encoding.
+            // Both document workspace quotes already include compact encoding.
             preflight_memory(early_host, lifetime, limits, input_memory,
                 workspace.map_err(|error| host_failure(error.into()))?,
                 native_bytes(result_bytes, tokens)?)?;

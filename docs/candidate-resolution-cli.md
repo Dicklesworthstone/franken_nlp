@@ -90,6 +90,33 @@ singletons. A nonempty comparison plan cannot use this shortcut. Compatible
 model metadata is still required to bind the candidate request. This is not a
 lexical merge or a simulated model result.
 
+## Bounded prompts and persistent workers
+
+Add `--prefill-rows 8` to process bounded groups of prompt tokens, and
+`--compute-threads 4` to use one persistent INT8 numerical team. Both options
+accept 1 through 64 and can be selected independently. The thread width includes
+the coordinator; runtime threads are additional. Omitting them preserves serial
+execution and sequential prompt processing.
+
+```sh
+fnlp candidate resolve snapshot.json --model ./model.fnlpq \
+  --memory-mib 16384 --compute-threads 4 --prefill-rows 8
+```
+
+The same options apply with `--discover-entities`, including its `--chunked`
+whole-document mode. One team spans original-source NER, every NER chunk and
+both presentation orders of every candidate pair. Worker count does not multiply
+the snapshot's native-work allowance or change its partition, source coordinates,
+comparison policy or complete-link clustering rules.
+
+For threaded execution, the CLI admits source, graph and intermediate output,
+both preparation owners, full native context, coordinator prompt scratch and
+fixed worker storage before private input access. Hosted reservations remain owned through physical worker
+join. A completed team result adds the existing top-level `compute` receipt;
+semantic output remains inside the same candidate envelope. The genuine
+no-model CLI shortcut keeps its existing result shape and zero native work.
+These schedules remain candidates pending executed model and performance gates.
+
 ## Resource and delivery contract
 
 The shared scored options default to a 2048-token context, 65536 input bytes

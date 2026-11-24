@@ -88,9 +88,24 @@ impl ExtractCommand {
 /// each corpus record, and the per-attempt bound inside an owned job.
 pub(super) fn encoding_policy(host: &SourceHostArgs, encoding: &input_encoding::InputEncodingArgs,
     limits: Limits) -> Result<crate::tokenizer::untrusted::UntrustedEncoding, CandidateError> {
-    let bytes = host.max_input_bytes.checked_add(SCHEMA_BYTES).ok_or(CandidateError::Arguments)?
-        .min(crate::tokenizer::untrusted::SafeBpeLimits::MAX_INPUT_BYTES);
-    encoding.policy(bytes, limits.max_prompt_tokens)
+    encoding.policy(encoding_input_bytes(host)?, limits.max_prompt_tokens)
+}
+
+/// A partition probe may exceed native context before the lossless partitioner
+/// shrinks it. Admit its bounded schema/source encoding in full; native task
+/// budgets still limit every accepted chunk. A separate invocation ledger pays
+/// for all probes, repeated schema compilation and reconstruction.
+pub(super) fn document_encoding_policy(host: &SourceHostArgs,
+    encoding: &input_encoding::InputEncodingArgs)
+    -> Result<crate::tokenizer::untrusted::UntrustedEncoding, CandidateError> {
+    let bytes = encoding_input_bytes(host)?;
+    encoding.policy(bytes, bytes)
+}
+
+fn encoding_input_bytes(host: &SourceHostArgs) -> Result<usize, CandidateError> {
+    host.max_input_bytes.checked_add(SCHEMA_BYTES).map(|bytes|
+        bytes.min(crate::tokenizer::untrusted::SafeBpeLimits::MAX_INPUT_BYTES))
+        .ok_or(CandidateError::Arguments)
 }
 
 pub(super) fn validate_preparation(host: &SourceHostArgs,

@@ -100,7 +100,7 @@ pub(super) struct EncodingWorkArgs {
     #[arg(long)] max_total_tokenizer_pair_bytes: Option<u64>,
 }
 impl EncodingWorkArgs {
-    fn limits(self, encoding: &input_encoding::InputEncodingArgs)
+    pub(super) fn limits(self, encoding: &input_encoding::InputEncodingArgs)
         -> Result<Option<SafeBpeWorkLimits>, Failure> {
         if encoding.is_default() {
             return if self == Self::default() { Ok(None) }
@@ -209,7 +209,7 @@ pub(super) fn definition() -> clap::Command {
 fn encoding_definition(command: clap::Command) -> clap::Command {
     let command = command.mut_arg("prefill_rows", |arg| arg.help(
         "Process up to 1..=64 prompt tokens per group. With --compute-threads, one team serves every pending record and document chunk. Either width can change on resume."));
-    input_encoding::definition(command).after_long_help("Explicit --input-encoding safe-bpe-v1 supports single-context extract, ner, keyphrases, summarize and answer jobs, plus complete NER/keyphrase/cited-summary documents selected by --source-document-config, including exact reducers. Schema and source share each extraction record's allowance; QA question, passage IDs and all evidence share each answer record's allowance. Complete-source jobs count actual compact tokens and share the same allowance across accepted/discarded partition probes and chunk compilation. One additional --max-total-tokenizer-* invocation ledger spans all records and failed/cancelled preparation without resetting at native handoff or reconstruction. Every per-call and total cap is authenticated: repeat it on resume. A resumed invocation receives that same declared bounded tokenizer allowance while persisted native/mask work and attempts stay spent. Encoder workspace is admitted before private IO and remains charged through physical completion. Compact input changes prompt tokens, preserves original bytes/control containment and makes no tokenizer-parity, identical-output, quality or speed claim. Complete-document schema extraction via --document-config still requires byte-fallback. Byte-fallback remains the default and adds no encoding metadata.")
+    input_encoding::definition(command).after_long_help("Explicit --input-encoding safe-bpe-v1 supports single-context extract, ner, keyphrases, summarize and answer jobs, complete schema-extraction documents selected by --document-config, and complete NER/keyphrase/cited-summary documents selected by --source-document-config, including exact reducers. Schema and source share each extraction record's allowance; QA question, passage IDs and all evidence share each answer record's allowance. Complete-document jobs count actual compact tokens, including accepted/discarded partition probes and chunk compilation. One additional --max-total-tokenizer-* invocation ledger spans all records, repeated schemas and failed/cancelled preparation without resetting at native handoff or reconstruction. Every per-call and total cap is authenticated: repeat it on resume. A resumed invocation receives that same declared bounded tokenizer allowance while persisted native/mask work and attempts stay spent. Encoder workspace is admitted before private IO and remains charged through physical completion. Compact input changes prompt tokens, preserves original bytes/control containment and makes no tokenizer-parity, identical-output, quality or speed claim. Byte-fallback remains the default and adds no encoding metadata.")
 }
 impl JobArgs {
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), Failure> {
@@ -229,9 +229,6 @@ impl JobArgs {
         self.task_kind()?;
         source_document::validate_mode(self)?;
         self.encoding_work_limits()?;
-        if !self.encoding.is_default() && self.document_config.is_some() {
-            return Err(Failure::usage("document_job_input_encoding"));
-        }
         let prefill = self.prefill.limits()?;
         let (mut common, mut limits) = self.host.common_with_encoding(self.input.clone(), &self.encoding)
             .map_err(Failure::from)?;
@@ -258,7 +255,11 @@ impl JobArgs {
     }
     pub(super) fn encoding_policy(&self, limits: Limits) -> Result<UntrustedEncoding, Failure> {
         if self.task == "extract" {
-            super::extract::encoding_policy(&self.host, &self.encoding, limits).map_err(Failure::from)
+            if self.document_config.is_some() {
+                super::extract::document_encoding_policy(&self.host, &self.encoding).map_err(Failure::from)
+            } else {
+                super::extract::encoding_policy(&self.host, &self.encoding, limits).map_err(Failure::from)
+            }
         } else if self.source_document_config.is_some() {
             // A rejected partition candidate can exceed native token capacity.
             // Admit its complete bounded encoding so the lossless partitioner
@@ -277,7 +278,7 @@ impl JobArgs {
             (UntrustedEncoding::ByteFallback, None) => Ok(0),
             (UntrustedEncoding::SafeBpeV1(call), Some(_)) => {
                 let bytes = call.requirements().map_err(|_| Failure::usage("job_input_encoding"))?.workspace_bytes;
-                bytes.checked_add(if self.task == "extract" { 0 } else { 1024 })
+                bytes.checked_add(if self.task == "extract" && self.document_config.is_none() { 0 } else { 1024 })
                     .ok_or_else(|| Failure::usage("job_memory_arithmetic"))
             }
             _ => Err(Failure::usage("job_input_encoding")),

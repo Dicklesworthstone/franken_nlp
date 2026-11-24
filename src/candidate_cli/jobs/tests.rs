@@ -112,17 +112,30 @@ fn cumulative_tokenizer_caps_refuse_byte_mode_zero_and_overflow_before_private_i
     }
 }
 #[test]
-fn compact_extraction_document_jobs_fail_before_key_configuration_model_or_population_reads() {
-    struct NoRead;
-    impl Read for NoRead { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("unsupported document mode read private input") } }
+fn compact_extraction_document_jobs_admit_complete_probes_and_an_invocation_ledger() {
     for mode in ["start", "resume"] {
         let extra = ["--schema", "private/schema.json", "--document-config", "private/document.json"];
-        command(mode, "extract", &extra).into_parts().1.validate().unwrap();
-        let mut compact = extra.to_vec();
-        compact.extend_from_slice(&["--input-encoding", "safe-bpe-v1"]);
-        let mut stdout = Vec::new();
-        let error = command(mode, "extract", &compact).execute_owned(NoRead, &mut stdout).unwrap_err();
-        assert_eq!(error.code, "document_job_input_encoding"); assert!(stdout.is_empty());
+        let (_, byte) = command(mode, "extract", &extra).into_parts();
+        let (_, byte_limits) = byte.validate().unwrap();
+        assert_eq!(byte.encoding_workspace_bytes(byte_limits).unwrap(), 0);
+        for schedule in [&[][..], &["--compute-threads", "4", "--prefill-rows", "7"][..]] {
+            let mut compact = extra.to_vec();
+            compact.extend_from_slice(&["--input-encoding", "safe-bpe-v1"]);
+            compact.extend_from_slice(schedule);
+            let (_, mut compact) = command(mode, "extract", &compact).into_parts();
+            compact.host.memory_mib = 16384;
+            let (_, limits) = compact.validate().unwrap();
+            let UntrustedEncoding::SafeBpeV1(call) = compact.encoding_policy(limits).unwrap()
+                else { panic!("compact document policy lost") };
+            assert_eq!(call.max_input_bytes, compact.host.max_input_bytes + super::super::extract::SCHEMA_BYTES);
+            assert_eq!(call.max_output_tokens, call.max_input_bytes);
+            assert!(call.max_output_tokens > limits.max_prompt_tokens);
+            assert!(compact.encoding_work_limits().unwrap().is_some());
+            assert_eq!(compact.encoding_workspace_bytes(limits).unwrap(), call.requirements().unwrap().workspace_bytes + 1024);
+            assert_eq!(compact.host.task_budget(limits), byte.host.task_budget(byte_limits));
+            assert_eq!(native_limits(&compact, lifetime()).unwrap().max_model_work,
+                native_limits(&byte, lifetime()).unwrap().max_model_work);
+        }
     }
 }
 #[test]

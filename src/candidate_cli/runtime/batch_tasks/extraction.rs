@@ -3,13 +3,49 @@ use super::*;
 use std::sync::Arc;
 use super::super::extraction as planning;
 use crate::{candidate_cli::extract::SCHEMA_BYTES,
-    hosted::corpus::ExtractionDocumentCorpusConfig};
+    batch::extract::quantized::Int8ExtractionBatchPlanner,
+    hosted::corpus::ExtractionDocumentCorpusConfig,
+    tokenizer::untrusted::SafeBpeWorkLimits};
+
+#[derive(Serialize)]
+struct EncodingProvenance<'a, T: Serialize> {
+    #[serde(flatten)]
+    response: input_encoding::Response<'a, T>,
+    /// Declared invocation caps, not an observation of tokenizer work spent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    invocation_encoding_work_limits: Option<SafeBpeWorkLimits>,
+}
+
+fn check_encoding_quote(command: &BatchCommand, limits: Limits,
+    compiler: &Int8ExtractionBatchPlanner, document: Option<&ExtractionDocumentCorpusConfig>,
+    expected_workspace: u64) -> Result<(), CandidateError> {
+    let actual_workspace = if command.document.chunked {
+        compiler.map_document_encoding_workspace_bytes()
+    } else { compiler.encoding_workspace_bytes() }.map_err(|_| CandidateError::Planning)?;
+    if compiler.document_encoding() != &command.encoding_policy(limits)?
+        || compiler.map_document_encoding_limits() != command.document_encoding_work_limits()?
+        || actual_workspace != expected_workspace || document.is_some() != command.document.chunked {
+        return Err(CandidateError::Arguments);
+    }
+    if let Some(document) = document {
+        // Pre-IO admission reserves the schema maximum. Bind the real complete
+        // frontier quote to that bound before transferring this same planner.
+        let expected = command.schedule_document_reserve()?.0.checked_add(expected_workspace)
+            .ok_or(CandidateError::Arguments)?;
+        if document.preparation_workspace_bytes(compiler).map_err(|_| CandidateError::Planning)? > expected {
+            return Err(CandidateError::Arguments);
+        }
+    }
+    Ok(())
+}
 
 pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     command: BatchCommand, args: CandidateArgs, limits: Limits, envelope: CorpusEnvelope,
     mut input: R, output: W,
 ) -> Result<(), CandidateError> {
     let encoding = command.encoding_policy(limits)?;
+    let encoding_work_limits = command.document_encoding_work_limits()?;
+    let encoding_workspace_bytes = command.encoding_workspace_bytes(limits)?;
     let (session, prefill) = scheduled_session(&command, &args, limits, envelope)?;
     let schema = command.schema.as_ref().map(|path| session.read(path, &mut input, SCHEMA_BYTES)).transpose()?;
     let raw_defaults = command.defaults.as_ref()
@@ -26,8 +62,12 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     } else { (defaults, None) };
     session.remaining()?;
     let facts = session.facts(&args)?;
-    let compiler = planning::planner(&facts, &command.host, limits, defaults)?
-        .with_document_encoding(encoding.clone()).map_err(|_| CandidateError::Planning)?;
+    let compiler = planning::planner(&facts, &command.host, limits, defaults)?;
+    let compiler = match encoding_work_limits {
+        Some(total) => compiler.with_map_document_encoding(encoding.clone(), total),
+        None => compiler.with_document_encoding(encoding.clone()),
+    }.map_err(|_| CandidateError::Planning)?;
+    check_encoding_quote(&command, limits, &compiler, document.as_ref(), encoding_workspace_bytes)?;
     session.remaining()?;
     let vocabulary = planning::vocabulary()?;
     session.remaining()?;
@@ -38,8 +78,9 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         quant_recipe: &facts.recipe_id, task: &command.task,
         compute_threads: (limits.compute.threads > 1).then_some(limits.compute.threads),
         prefill_rows: prefill.map(|limits| limits.max_batch_rows) };
-    let provenance = input_encoding::Response { response: &provenance,
-        input_encoding: input_encoding::reported_policy(&encoding) };
+    let provenance = EncodingProvenance { response: input_encoding::Response { response: &provenance,
+        input_encoding: input_encoding::reported_policy(&encoding) },
+        invocation_encoding_work_limits: encoding_work_limits };
     let writer = CandidateWriter::new(output, &provenance, envelope.transport.max_output_line_bytes,
         envelope.output_bytes)?;
     let reader: Box<dyn BufRead + Send> = if command.input.as_os_str() == "-" {

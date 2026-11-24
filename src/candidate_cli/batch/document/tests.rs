@@ -209,3 +209,63 @@ fn chunked_schedule_funds_one_complete_frontier_without_accumulating_the_corpus(
     assert_eq!(larger_frontier - retained,
         4 * selected.host.max_result_bytes as u64 + 8 * selected.host.max_new_tokens as u64);
 }
+
+#[test]
+fn compact_chunked_encoding_has_one_stream_allowance_and_preserves_all_native_budgets() {
+    use crate::tokenizer::untrusted::{SafeBpeWorkLimits, UntrustedEncoding};
+    let baseline = chunked(&["--max-requests", "3"]);
+    let (_, original_limits, original) = baseline.validate().unwrap();
+    for width in ["1", "4"] {
+        for rows in [None, Some("7")] {
+            let mut flags = vec!["--max-requests", "3", "--compute-threads", width,
+                "--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-input-bytes", "3000000",
+                "--max-total-tokenizer-output-tokens", "4000000",
+                "--max-total-tokenizer-pair-checks", "5000000", "--max-total-tokenizer-pair-bytes", "6000000"];
+            if let Some(rows) = rows { flags.extend(["--prefill-rows", rows]); }
+            let mut selected = chunked(&flags); selected.host.memory_mib = 16384;
+            let (_, mut limits, envelope) = selected.validate().unwrap();
+            let UntrustedEncoding::SafeBpeV1(call) = selected.encoding_policy(limits).unwrap()
+                else { panic!("compact document policy lost") };
+            assert_eq!(call.max_input_bytes, selected.host.max_input_bytes + crate::candidate_cli::extract::SCHEMA_BYTES);
+            assert_eq!(call.max_output_tokens, call.max_input_bytes);
+            assert!(call.max_output_tokens > limits.max_prompt_tokens);
+            assert_eq!(selected.document_encoding_work_limits().unwrap(), Some(SafeBpeWorkLimits {
+                max_input_bytes: 3_000_000, max_output_tokens: 4_000_000,
+                max_pair_checks: 5_000_000, max_pair_bytes: 6_000_000 }));
+            assert_eq!(selected.encoding_workspace_bytes(limits).unwrap(), call.requirements().unwrap().workspace_bytes + 1024);
+            assert_eq!(envelope.native.max_model_work, original.native.max_model_work);
+            assert_eq!(envelope.native.masks.max_visits_per_run, original.native.masks.max_visits_per_run);
+            assert_eq!(selected.host.task_budget(limits), baseline.host.task_budget(original_limits));
+            let prefill = selected.prefill.limits().unwrap();
+            limits.memory_bytes = selected.schedule_peak_bytes(limits, envelope, prefill).unwrap();
+            selected.check_scheduling_memory(limits, envelope, prefill).unwrap();
+            limits.memory_bytes -= 1;
+            assert_eq!(selected.check_scheduling_memory(limits, envelope, prefill), Err(CandidateError::Arguments));
+        }
+    }
+    assert_eq!(baseline.document_encoding_work_limits().unwrap(), None);
+    assert_eq!(baseline.encoding_workspace_bytes(original_limits).unwrap(), 0);
+}
+
+#[test]
+fn document_tokenizer_totals_reject_wrong_routes_and_invalid_caps_before_private_io() {
+    struct NoRead;
+    impl Read for NoRead { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("input read") } }
+    struct NoWrite;
+    impl Write for NoWrite {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("output written") }
+        fn flush(&mut self) -> io::Result<()> { panic!("output flushed") }
+    }
+    for flag in ["--max-total-tokenizer-input-bytes", "--max-total-tokenizer-output-tokens",
+        "--max-total-tokenizer-pair-checks", "--max-total-tokenizer-pair-bytes"] {
+        assert_eq!(chunked(&[flag, "1"]).execute_owned(NoRead, NoWrite), Err(CandidateError::Arguments));
+        for task in ["extract", "ner", "answer"] {
+            assert_eq!(command(task, &["--input-encoding", "safe-bpe-v1", flag, "1"])
+                .execute_owned(NoRead, NoWrite), Err(CandidateError::Arguments));
+        }
+        for value in ["0", "18446744073709551615"] {
+            assert_eq!(chunked(&["--input-encoding", "safe-bpe-v1", flag, value])
+                .execute_owned(NoRead, NoWrite), Err(CandidateError::Arguments));
+        }
+    }
+}
