@@ -1,6 +1,9 @@
 //! Complete-document exact-schema extraction on the process-owned INT8 host.
-//! No global object merge, implicit model loading, or per-chunk budget renewal.
+//! Independent objects by default; explicit root-object reconciliation is
+//! separately admitted. No implicit model loading or per-chunk budget renewal.
 use super::*;
+pub(super) mod object;
+pub use object::Int8ObjectExtractionMapConfig;
 use crate::{
     batch::extract::{ExtractionBatchArgs, quantized::{Int8ExtractionBatchPlanner,
         long::{Int8ExtractionMapLimits, Int8ExtractionMapRun, PreparedInt8ExtractionMap}}},

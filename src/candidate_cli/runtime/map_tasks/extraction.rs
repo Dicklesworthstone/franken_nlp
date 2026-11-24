@@ -1,5 +1,6 @@
 //! Exact-schema document extraction; all actual chunks compile before weights.
 use super::*;
+mod object;
 use super::super::extraction as compiler;
 use crate::{
     batch::extract::{ExtractionBatchArgs, quantized::{Int8ExtractionBatchPlanner,
@@ -29,6 +30,7 @@ fn planning_error(error: Int8SourceMapError) -> CandidateError {
 
 pub(super) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+    if command.extraction.reconcile_object { return object::execute(command, args, limits, input, output); }
     let prefill = command.extraction.prefill()?;
     if limits.compute != command.compute.admit_prefill(prefill)? { return Err(CandidateError::Arguments); }
     // Declared before source/schema/compiler allocations: this preparation

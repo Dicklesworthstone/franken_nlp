@@ -90,7 +90,7 @@ pub use source::SourceLimits;
 mod source_map;
 mod extraction_team;
 mod extraction_map;
-pub use extraction_map::ExtractionMapConfig;
+pub use extraction_map::{ExtractionMapConfig, Int8ObjectExtractionMapConfig};
 mod semantic;
 pub use semantic::{Int8SemanticHostLimits, Int8SemanticHostRequirements};
 pub use source_map::SourceMapConfig;
@@ -159,6 +159,7 @@ pub enum HostedError {
     Chat(Int8ChatError),
     Int4(Int4HostError),
     Extraction(Int8ExtractError),
+    Int8ObjectExtractionMap(crate::batch::extract::quantized::long::object::Int8ObjectExtractionMapError),
     SemanticExtraction(crate::tasks::extract::semantic::int8::Int8SemanticError),
     Classification(crate::tasks::classify::quantized::Int8ClassificationError),
     ClassificationMap(crate::tasks::classify::quantized::long::Int8ClassificationMapError),
@@ -195,6 +196,7 @@ impl fmt::Display for HostedError {
             Self::Chat(_) => "hosted native generation or chat failed",
             Self::Int4(_) => "hosted source-candidate INT4 loading or execution failed",
             Self::Extraction(_) => "hosted native extraction failed",
+            Self::Int8ObjectExtractionMap(_) => "hosted native object document extraction failed",
             Self::SemanticExtraction(_) => "hosted native semantic extraction failed",
             Self::Classification(_) => "hosted native classification failed",
             Self::ClassificationMap(_) => "hosted native classification document failed",
@@ -224,6 +226,7 @@ impl Error for HostedError {
             Self::Int4(e) => Some(e),
             Self::Assay(e) => Some(e),
             Self::SemanticExtraction(e) => Some(e),
+            Self::Int8ObjectExtractionMap(e) => Some(e),
             Self::SourceMap(e) => Some(e), Self::Resolution(e) => Some(e),
             Self::ClassificationMap(e) => Some(e), Self::FaithfulnessMap(e) => Some(e),
             Self::Redaction(e) => Some(e), Self::Sentiment(e) => Some(e),

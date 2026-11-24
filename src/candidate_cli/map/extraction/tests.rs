@@ -150,3 +150,126 @@ fn scheduled_document_peak_accounts_for_prompt_workers_and_the_complete_frontier
 fn disabled_runtime_never_opens_schema_source_model_or_output() {
     assert_eq!(extract(&["--source-membership"]).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Unavailable));
 }
+
+#[test]
+fn root_object_reconciliation_is_explicit_and_does_not_change_independent_defaults() {
+    let ordinary = extract(&[]);
+    let (_, baseline) = ordinary.validate().unwrap();
+    assert!(!ordinary.extraction.reconcile_object);
+    assert_eq!(ordinary.extraction.object_limits(&ordinary).unwrap(), None);
+    assert_eq!(ordinary.extraction.object_workspace_bytes(&ordinary).unwrap(), 0);
+    let mut object = extract(&["--reconcile-object"]);
+    object.host.memory_mib = 16384;
+    let (_, selected) = object.validate().unwrap();
+    assert!(object.extraction.reconcile_object);
+    let bounds = object.extraction.object_limits(&object).unwrap().unwrap();
+    assert_eq!(bounds.max_properties, 4096);
+    assert_eq!(bounds.max_origins, 16384);
+    assert_eq!(bounds.max_input_bytes, object.max_total_value_bytes);
+    assert_eq!(bounds.max_json_bytes, object.max_map_result_bytes);
+    assert_eq!(bounds.max_result_bytes, object.max_map_result_bytes);
+    let before = ordinary.extraction_mapping().unwrap();
+    let after = object.extraction_mapping().unwrap();
+    assert_eq!(after.mapping.max_model_work, before.mapping.max_model_work);
+    assert_eq!(after.mapping.max_mask_visits, before.mapping.max_mask_visits);
+    assert_eq!(after.verification, before.verification);
+    assert_eq!(after.mapping.chunks.max_chunks, before.mapping.chunks.max_chunks);
+    assert_eq!(object.host.task_budget(selected), ordinary.host.task_budget(baseline));
+}
+
+#[test]
+fn object_only_bounds_refuse_missing_mode_wrong_tasks_and_out_of_domain_values() {
+    for flag in ["--max-object-properties", "--max-object-origins", "--max-object-input-bytes",
+        "--max-object-json-bytes", "--max-object-nodes", "--max-object-result-bytes"] {
+        assert!(root().try_get_matches_from(["candidate", "map", "--task", "extract", "--schema", "s",
+            "--model", "m", "--memory-mib", "16384", flag, "10"]).is_err());
+        let mut c = extract(&["--reconcile-object", flag, "0"]);
+        c.host.memory_mib = 16384;
+        assert_eq!(c.execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments), "{flag}");
+    }
+    for flags in [
+        vec!["--max-object-properties", "1000001"],
+        vec!["--max-object-origins", "4095"],
+        vec!["--max-object-nodes", "1000001"],
+        vec!["--max-object-input-bytes", "67108865"],
+        vec!["--max-object-json-bytes", "16777217"],
+        vec!["--max-object-result-bytes", "16777217"],
+        vec!["--max-object-json-bytes", "128", "--max-object-result-bytes", "127"],
+    ] {
+        let mut selected = vec!["--reconcile-object"];
+        selected.extend(flags);
+        let mut c = extract(&selected);
+        c.host.memory_mib = 16384;
+        assert_eq!(c.execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+    }
+    for task in ["ner", "keyphrases", "summarize"] {
+        assert_eq!(command(task, &["--schema", "s", "--reconcile-object"])
+            .execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+    }
+    let mut mutated = extract(&["--reconcile-object", "--max-object-nodes", "10"]);
+    mutated.extraction.reconcile_object = false;
+    assert_eq!(mutated.execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+}
+
+#[test]
+fn object_quote_funds_original_partial_schema_and_reconciliation_for_serial_and_team_routes() {
+    for flags in [
+        vec!["--reconcile-object"],
+        vec!["--reconcile-object", "--prefill-rows", "4"],
+        vec!["--reconcile-object", "--compute-threads", "4"],
+        vec!["--reconcile-object", "--compute-threads", "4", "--prefill-rows", "4"],
+    ] {
+        let mut c = extract(&flags);
+        c.host.memory_mib = 16384;
+        let (args, mut limits) = c.validate().unwrap();
+        let bounds = c.extraction.object_limits(&c).unwrap().unwrap();
+        let object = bounds.workspace_bytes().unwrap()
+            + RootObjectSchema::workspace_bytes(schema::compiler(&c.host)).unwrap();
+        assert_eq!(c.extraction.object_workspace_bytes(&c).unwrap(), object);
+        let peak = c.extraction.schedule_peak_bytes(&c, &args, limits).unwrap();
+        limits.memory_bytes = peak;
+        c.extraction.check_schedule_memory(&c, &args, limits).unwrap();
+        limits.memory_bytes -= 1;
+        assert_eq!(c.extraction.check_schedule_memory(&c, &args, limits), Err(CandidateError::Arguments));
+        c.extraction.reconcile_object = false;
+        let independent = c.extraction.schedule_peak_bytes(&c, &args, limits).unwrap();
+        assert_eq!(peak - independent, object * 2);
+    }
+}
+
+#[test]
+fn root_object_limits_do_not_renew_with_chunk_count_prefill_or_workers() {
+    let mut a = extract(&["--reconcile-object", "--max-object-properties", "17",
+        "--max-object-origins", "23", "--max-object-input-bytes", "65536",
+        "--max-object-json-bytes", "1024", "--max-object-nodes", "4096",
+        "--max-object-result-bytes", "4096"]);
+    a.host.memory_mib = 16384;
+    let bounds = a.extraction.object_limits(&a).unwrap();
+    let work = a.work_ceiling();
+    let verification = a.extraction_mapping().unwrap().verification;
+    a.max_chunks = 256;
+    a.host.preparation_mib = 1024;
+    a.extraction.prefill_rows = Some(4);
+    assert_eq!(a.extraction.object_limits(&a).unwrap(), bounds);
+    assert_eq!(a.work_ceiling(), work);
+    assert_eq!(a.extraction_mapping().unwrap().verification, verification);
+    a.validate().unwrap();
+}
+
+#[test]
+fn object_help_explains_conflicts_required_fields_atomic_values_and_explicit_mode() {
+    let help = super::super::definition().render_long_help().to_string();
+    for expected in ["--reconcile-object", "only root required fields", "conflicting values",
+        "missing final required fields", "Nested objects and arrays remain atomic",
+        "remaining original whole-document allowance"] {
+        assert!(help.contains(expected), "{expected}");
+    }
+}
+
+#[cfg(not(feature = "asupersync-runtime"))]
+#[test]
+fn disabled_object_runtime_never_reads_schema_source_model_or_writes_output() {
+    let mut c = extract(&["--reconcile-object"]);
+    c.host.memory_mib = 16384;
+    assert_eq!(c.execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Unavailable));
+}
