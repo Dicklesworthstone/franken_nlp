@@ -46,7 +46,7 @@
   "max_model_work": {
     "forward_positions": 4096,
     "projected_logits": 64000000,
-    "attention_pairs": 16777216,
+    "attention_pairs": 17716740096,
     "projections": {
       "dot_products": 100000000000,
       "multiply_accumulates": 1000000000000000

@@ -9,6 +9,69 @@ use crate::{
 
 pub(super) const OPTIONS_BYTES: usize = 1024 * 1024;
 
+pub(super) mod corpus;
+
+/// The complete-attempt encoding policy also has a separate invocation cap.
+/// Actual work includes failed preparation and every dynamic review; neither
+/// a record boundary nor a flush renews the mutable native processor ledger.
+#[derive(Args, Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::candidate_cli) struct InvocationEncodingArgs {
+    /// Total encoded input bytes across this invocation; safe-bpe-v1 only, default 67108864.
+    #[arg(long)] max_total_tokenizer_input_bytes: Option<u64>,
+    /// Total untrusted output tokens across this invocation; safe-bpe-v1 only, default 4194304.
+    #[arg(long)] max_total_tokenizer_output_tokens: Option<u64>,
+    /// Total BPE pair checks across this invocation; safe-bpe-v1 only, default 268435456.
+    #[arg(long)] max_total_tokenizer_pair_checks: Option<u64>,
+    /// Total examined BPE pair bytes across this invocation; safe-bpe-v1 only, default 4294967296.
+    #[arg(long)] max_total_tokenizer_pair_bytes: Option<u64>,
+}
+impl InvocationEncodingArgs {
+    pub(in crate::candidate_cli) fn limits(self, policy: &UntrustedEncoding)
+        -> Result<Option<crate::tokenizer::untrusted::SafeBpeWorkLimits>, CandidateError> {
+        policy.validate().map_err(|_| CandidateError::Arguments)?;
+        if policy == &UntrustedEncoding::ByteFallback {
+            return if self == Self::default() { Ok(None) } else { Err(CandidateError::Arguments) };
+        }
+        let limits = crate::tokenizer::untrusted::SafeBpeWorkLimits {
+            max_input_bytes: self.max_total_tokenizer_input_bytes.unwrap_or(64 * MIB),
+            max_output_tokens: self.max_total_tokenizer_output_tokens.unwrap_or(4 * MIB),
+            max_pair_checks: self.max_total_tokenizer_pair_checks.unwrap_or(256 * MIB),
+            max_pair_bytes: self.max_total_tokenizer_pair_bytes.unwrap_or(4096 * MIB),
+        };
+        limits.validate().map_err(|_| CandidateError::Arguments)?;
+        Ok(Some(limits))
+    }
+}
+
+/// Population commands validate the exact fixed declaration without inventing
+/// an empty document. Source-dependent membership is checked on each real item.
+pub(in crate::candidate_cli) fn fixed_request(command: &SemanticCommand, schema: String,
+    budget: crate::tasks::ir::TaskBudget, options: &Int8SemanticOptions)
+    -> Result<crate::batch::extract::ExtractionBatchArgs, CandidateError> {
+    let request = extract::arguments(schema, command.source_membership, budget)?;
+    let declaration = crate::grammar::runtime::JsonValidationSchema::compile(
+        &request.schema, extract::compiler(&command.host)).map_err(|_| CandidateError::Planning)?;
+    if declaration.requires_verbatim_source() != command.source_membership {
+        return Err(CandidateError::Planning);
+    }
+    options.validate_schema(declaration.root()).map_err(|_| CandidateError::Planning)?;
+    Ok(request)
+}
+
+pub(in crate::candidate_cli) fn population_failure(error: CandidateError) -> stream::Failure {
+    let (exit, code) = match error {
+        CandidateError::Arguments => (ErrorCode::Usage, "semantic_population_options"),
+        CandidateError::Input => (ErrorCode::InputDecodeOrParse, "semantic_population_input"),
+        CandidateError::Planning => (ErrorCode::StructuredTaskNoResult, "semantic_population_plan"),
+        CandidateError::Memory | CandidateError::Runtime =>
+            (ErrorCode::AdmissionOrResourceLimit, "semantic_population_admission"),
+        CandidateError::Identity => (ErrorCode::ArtifactIntegrityOrFormatOrVersion, "semantic_population_identity"),
+        CandidateError::Timeout => (ErrorCode::BudgetOrTimeout, "semantic_population_deadline"),
+        _ => (ErrorCode::Generic, "semantic_population_setup_or_delivery"),
+    };
+    stream::Failure { exit, code, cancellation: None }
+}
+
 #[derive(Args)]
 pub(crate) struct SemanticCommand {
     /// Exact original UTF-8 source; '-' or no path reads stdin.

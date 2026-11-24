@@ -42,7 +42,7 @@ The example's `quote` field uses `x-fnlp-source: "verbatim"`. Its independent so
 
 The options file is read first under caller preparation admission. The CLI then prices the declared maximum source, retained field plans and source copies, native context, intermediate results, and combined output before reading schema, source, or model metadata. It rechecks the quote against the consumed plan before weights are loaded. The source and every dynamic judge must fit the explicit context and evidence policy; no tail is silently dropped.
 
-The example uses a 2,048-position context. Its judge `max_kv_bytes` is `369098752`, the complete resident bf16 KV allocation for that context (`2048 * 180224`). Change this field with `--context-tokens`; both stages must admit the same reused native context. `--max-result-bytes` bounds the original extraction, while `limits.max_output_bytes` in the options bounds the combined semantic result. The extraction bound must also fit `limits.max_input_json_bytes`.
+The example uses a 2,048-position context. Its judge `max_kv_bytes` is `369098752`, the complete resident bf16 KV allocation for that context (`2048 * 180224`). Change this field with `--context-tokens`; both stages must admit the same reused native context. The example's attention ceiling is `17716740096`, covering its 4,096 declared forward positions at the full 2,048-position context across 44 KV slots and 48 query heads; it is a finite work allowance, not a measured usage claim. `--max-result-bytes` bounds the original extraction, while `limits.max_output_bytes` in the options bounds the combined semantic result. The extraction bound must also fit `limits.max_input_json_bytes`.
 
 The five native ceilings cover forward positions, projected logits, attention pairs, projection dot products, and projection multiply-accumulates. The maximum extraction reservation remains charged even when extraction stops early. Actual values determine the review prompts, so every dynamic judge is compiled and preflighted after extraction and before the first review forward. All judges run within the remaining complete-request allowance.
 
@@ -135,3 +135,85 @@ retention, exact memory boundaries, independent coordinator/child admission,
 schedule mismatch before IO, and unchanged serial publication. They do not
 establish actual-model parity or throughput. These explicit schedules remain
 candidates pending controller-owned DSR validation.
+
+## Resident semantic extraction populations
+
+`fnlp candidate extract-semantic-batch` applies the same fixed schema and
+explicit review policy to an ordered NDJSON stream using one resident INT8
+engine and compiler pair. Each successful record contains the unchanged
+extraction and its complete field review. Non-null `task_args` is refused
+before encoding: a record cannot replace the schema, grounding, review policy
+or budgets. Ordinary batch flush markers retain their transport meaning and
+do not renew work.
+
+For a one-record run, place the original example source in this envelope:
+
+```jsonl
+{"id":"report-1","text":"Acme reported revenue of 1250000 US dollars for 2025."}
+```
+
+Then run:
+
+```sh
+fnlp candidate extract-semantic-batch reports.ndjson \
+  --model /models/candidate-int8.fnlpq --memory-mib 16384 \
+  --context-tokens 2048 --max-new-tokens 128 --max-input-bytes 512 \
+  --max-result-bytes 16384 --schema docs/examples/int8-semantic/schema.json \
+  --source-membership --semantic-options docs/examples/int8-semantic/options.json \
+  --compute-threads 4 --prefill-rows 8
+```
+
+The stream uses the `fnlp-candidate-int8-semantic-extraction-batch-v1`
+protocol. Combined results retain exact extraction JSON strings and the same
+four field states described above. The terminal completion frame follows
+physical worker join; a failed extraction or review never produces a
+successful extraction-only record.
+
+The semantic options' five-axis `max_model_work` limits one complete
+extraction-and-review attempt. Population work has separate ceilings:
+
+| Flag | Invocation allowance |
+| --- | --- |
+| `--max-total-forward-positions` | All native forward positions |
+| `--max-total-projected-logits` | Full-vocabulary projected logits |
+| `--max-total-attention-pairs` | Native attention work |
+| `--max-total-dot-products` | Projection dot products |
+| `--max-total-multiply-accumulates` | Projection multiply-accumulates |
+| `--max-total-mask-node-visits` | Extraction grammar-mask work |
+
+Each native default is the options file's allowance for **one complete
+attempt**. The mask default is the extraction's per-attempt mask allowance.
+Increase the totals explicitly for a larger population; increasing the request
+count does not multiply them. Before either native stage, the processor spends
+the full declared attempt allowance. Early EOS, failed review, cancellation,
+and flushes do not refund that reservation.
+
+Compact populations retain the per-document `--max-tokenizer-*` allowance
+across schema/source encoding and every field review, and additionally use the
+four `--max-total-tokenizer-*` invocation ceilings. Actual consumed tokenizer
+work stays charged across documents, discarded preparation, failed or
+cancelled review planning, and flushes. A prepared item is sealed to its own
+processor invocation, so moving it to another processor cannot evade that
+debit. The encoding receipt reports the document's actual work under the
+original declared policy, not the smaller temporary allowance remaining at
+one planning step.
+
+Serial, bounded-prefill, persistent-worker and combined schedules share the
+same task and work contracts. The complete quote prices all retained field
+plans, source copies, transport, one encoder and ledger, full native context,
+prompt scratch, worker buffers and combined output before private input or
+model IO. Actual compiler and vocabulary objects, readers, writers and output
+authority remain owned through physical join, including failed work.
+
+Library callers use `batch::extract::semantic::int8` for the sealed planner
+and native processor. The pure quote is
+`hosted::corpus::semantic::int8_semantic_corpus_requirements`;
+`NlpEngine::corpus_int8_semantic_extract` and
+`corpus_int8_semantic_extract_scheduled` run owned readers and writers through
+the existing bounded transport. The scheduled entry accepts optional
+`Int8PrefillLimits` and `(Int8Kernel, usize)` team settings.
+
+The population implementation and source regression definitions are present.
+Compilation, executable regressions, independently pinned model equivalence,
+task-quality evaluation and target-host performance remain controller-owned
+validation gates.

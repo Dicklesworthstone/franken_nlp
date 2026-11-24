@@ -3,6 +3,7 @@
 
 use super::*;
 mod scored;
+pub mod semantic;
 mod sentiment;
 pub use sentiment::SentimentCorpusConfig;
 mod classify;

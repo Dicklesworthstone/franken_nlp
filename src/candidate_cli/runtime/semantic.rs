@@ -206,4 +206,6 @@ fn check_result(run: &Int8SemanticExtractionRun, extraction: Int8Work, cap: Int8
     Ok(())
 }
 
+pub(in crate::candidate_cli) mod corpus;
+
 #[cfg(test)] mod tests;

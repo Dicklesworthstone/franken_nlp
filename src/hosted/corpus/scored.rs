@@ -16,6 +16,9 @@ pub(super) enum Completion {
 
 pub(super) trait CorpusTask: Send + Sized + 'static {
     fn identity(&self) -> &ExecutionIdentity;
+    /// Keep the actual shared compiler/vocabulary and any combined-output
+    /// owner outside the consuming callback through physical worker join.
+    fn retain_for_join(&self) -> Option<Box<dyn Send>> { None }
     /// Validate the exact task, complete native allocation and output envelope.
     /// Return additional retained/temporary task storage beyond the common
     /// transport and caller preparation: tokenizer workspaces or complete
@@ -76,8 +79,12 @@ fn quote(limits: CorpusLimits, native: Int8MemoryRequirement, task_bytes: u64,
 /// This aggregate stays OUTSIDE scoped_cpu's callback. A failed record,
 /// cancellation, panic, or early callback return cannot release its reader,
 /// writer, native claims or lease while any numerical child remains live.
+struct RetainedInput<P, R, W> {
+    _retained: Option<Box<dyn Send>>,
+    stream: StreamInput<P, R, W>,
+}
 struct Execution<P, R, W> {
-    input: Charged<StreamInput<P, R, W>>,
+    input: Charged<RetainedInput<P, R, W>>,
     kv: Option<Pending>,
     scratch: Option<Pending>,
     _kv: Option<CommittedMemory>,
@@ -104,7 +111,11 @@ where P: CorpusTask, R: BufRead + Send + 'static, W: Write + Send + 'static {
     let required = quote(limits, native, task_bytes, prefill, team.map(|(_, width)| width))?;
     let lease = host.resources().acquire_lease();
     let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
-        || Ok(StreamInput { planner: Some(task), reader, writer }))?;
+        || {
+            let retained = task.retain_for_join();
+            Ok(RetainedInput { _retained: retained,
+                stream: StreamInput { planner: Some(task), reader, writer } })
+        })?;
     let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
     let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.scratch_bytes)?;
     let execution = Execution { input, kv: Some(kv), scratch: Some(scratch),
@@ -126,7 +137,7 @@ where P: CorpusTask, R: BufRead + Send + 'static, W: Write + Send + 'static {
             },
             |completion, execution, control| match completion {
                 Completion::Deferred(completion) => completion
-                    .publish(&mut execution.input.value.writer, control).map_err(HostedError::Batch),
+                    .publish(&mut execution.input.value.stream.writer, control).map_err(HostedError::Batch),
                 Completion::Published(_) => Err(HostedError::CompletionMissing),
             }),
     }
@@ -144,7 +155,7 @@ impl<P: CorpusTask, R: BufRead, W: Write> Execution<P, R, W> {
     fn run<'weights>(&mut self, model: &'weights CurrentCandidateInt8Model,
         kernel: Option<Int8Kernel>, projection: Option<&'weights mut (dyn Int8ProjectionExecutor + 'weights)>,
         defer: bool, control: &mut RunControl) -> Result<Completion, HostedError> {
-        let task = self.input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
+        let task = self.input.value.stream.planner.take().ok_or(HostedError::CompletionMissing)?;
         let engine = model.engine(self.limits.native.context_tokens, memory_budget(self.required.native))
             .map_err(HostedError::Model)?;
         let engine = match kernel { Some(kernel) => engine.with_kernel(kernel), None => engine };
@@ -157,7 +168,7 @@ impl<P: CorpusTask, R: BufRead, W: Write> Execution<P, R, W> {
             kv_bytes: self.required.native.kv_bytes, sampler_bytes: 0,
             output_bytes: self.limits.transport.max_output_line_bytes as u64 };
         let result = task.execute(&mut engine, admission, self.prefill,
-            &mut self.input.value.reader, &mut self.input.value.writer,
+            &mut self.input.value.stream.reader, &mut self.input.value.stream.writer,
             self.limits.transport, defer, control);
         // Native buffers end before scope exit; their outer claims survive
         // every physical child and, on success, terminal footer publication.

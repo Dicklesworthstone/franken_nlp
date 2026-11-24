@@ -112,3 +112,41 @@ fn shared_scored_transport_preserves_records_and_flush_work_and_defers_only_term
 mod native;
 
 mod structured;
+
+
+#[test]
+fn retained_stream_assets_survive_consuming_callback_error_and_unwind() {
+    use std::{panic::{catch_unwind, AssertUnwindSafe},
+        sync::{Arc, atomic::{AtomicUsize, Ordering}}};
+    struct Asset { bytes: Vec<u8>, drops: Arc<AtomicUsize> }
+    impl Drop for Asset {
+        fn drop(&mut self) { self.drops.fetch_add(1, Ordering::SeqCst); }
+    }
+    // This is the real private input aggregate, without native model execution.
+    // The dispatcher separately tests that its aggregate outlives physical join.
+    for unwind in [false, true] {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let asset = Arc::new(Asset { bytes: b"retained compiler".to_vec(), drops: Arc::clone(&drops) });
+        let observer = Arc::downgrade(&asset);
+        let mut input = RetainedInput {
+            _retained: Some(Box::new(Arc::clone(&asset))),
+            stream: StreamInput { planner: Some(asset),
+                reader: Cursor::new(b"owned source".to_vec()), writer: Vec::<u8>::new() },
+        };
+        let failure = catch_unwind(AssertUnwindSafe(|| {
+            let _consumed_task = input.stream.planner.take().unwrap();
+            if unwind { panic!("injected consuming callback unwind"); }
+            Err::<(), _>(HostedError::CompletionMissing)
+        }));
+        if unwind { assert!(failure.is_err()); }
+        else { assert!(matches!(failure, Ok(Err(HostedError::CompletionMissing)))); }
+        assert!(input.stream.planner.is_none());
+        assert_eq!(observer.strong_count(), 1, "the outer retained owner is the only surviving Arc");
+        assert_eq!(observer.upgrade().unwrap().bytes.as_slice(), b"retained compiler");
+        assert_eq!(input.stream.reader.get_ref().as_slice(), b"owned source");
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(input);
+        assert!(observer.upgrade().is_none());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+}
