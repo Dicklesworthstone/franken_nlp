@@ -277,8 +277,6 @@ fn invalid_or_unimplemented_redaction_schedules_refuse_before_private_io() {
     for extra in [
         vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
         vec!["--prefill-rows", "0"], vec!["--prefill-rows", "65"],
-        vec!["--ndjson", "--compute-threads", "4"],
-        vec!["--ndjson", "--chunked", "--prefill-rows", "4"],
         vec!["--ndjson", "--store-results", "--compute-threads", "4",
             "--job-dir", "private-job", "--job-id", "0123456789abcdef0123456789abcdef",
             "--job-key-file", "private-key", "--job-limits", "limits.json"],

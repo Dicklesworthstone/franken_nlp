@@ -71,7 +71,8 @@ fn admission() -> Admission { Admission { trace: Rc::default(), drift: false } }
 #[test]
 fn records_cannot_change_actions_types_chunks_verification_or_keys() {
     for args in [r#"{"verify":false}"#, r#"{"chunked":false}"#, r#"{"ner":{}}"#,
-        r#"{"key":"secret"}"#, r#"{"namespace":"other"}"#, r#"{"actions":{}}"#] {
+        r#"{"key":"secret"}"#, r#"{"namespace":"other"}"#, r#"{"actions":{}}"#,
+        r#"{"prefill_rows":7}"#, r#"{"compute_threads":4}"#, r#"{"max_extra_scratch_bytes":0}"#] {
         assert!(serde_json::from_str::<BatchDocument<RedactionBatchArgs>>(
             &format!(r#"{{"id":"opaque","text":"private","task_args":{args}}}"#)).is_err());
     }

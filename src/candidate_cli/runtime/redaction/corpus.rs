@@ -89,6 +89,7 @@ fn corpus_execution_error(error: HostedError) -> CandidateError {
         HostedError::BatchSetup(error) => error.cancellation.map(batch_cancelled).unwrap_or(CandidateError::Batch),
         HostedError::SourceMap(error) => error.cancellation().map(batch_cancelled).unwrap_or(CandidateError::Batch),
         HostedError::Redaction(error) => error.cancellation().map(batch_cancelled).unwrap_or(CandidateError::Batch),
+        HostedError::Native(crate::native_engine::strict_int8::StrictInt8Error::Cancelled(cause)) => batch_cancelled(cause),
         HostedError::Reservation(_) => CandidateError::Memory,
         HostedError::ModelIdentity | HostedError::ResourceDomain => CandidateError::Identity,
         _ => CandidateError::Batch,
@@ -137,7 +138,8 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Sen
         #[cfg(not(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
         { return Err(CandidateError::Unavailable); }
     }
-    let session = Session::new(&common, limits)?;
+    let prefill = command.prefill.limits()?;
+    let session = Session::new_with_prefill(&common, limits, prefill)?;
     // A private binary key is read ONCE from the inherited input handle, only
     // with a separate corpus path. Commitment checks precede all corpus IO.
     let request = command.request();
@@ -172,11 +174,39 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Sen
     let corpus = CorpusLimits { native: session.native(&common)?, transport: envelope.transport,
         preparation_reserve_bytes: limits.preparation_bytes, io_reserve_bytes: envelope.io_bytes };
     let edit_reserve_bytes = command.edit_reserve_mib.checked_mul(MIB).ok_or(CandidateError::Arguments)?;
+    let planner = Arc::new(planner); let vocabulary = Arc::new(vocabulary);
+    let width = limits.compute.threads;
+    let kernel = crate::native_engine::simd::config::process_kernel();
     let summary = match prepared {
-        PreparedCorpus::Short(batch) => session.engine.batch_int8_redact(&model, Arc::new(planner), Arc::new(vocabulary),
-            RedactionCorpusConfig { batch, edit_reserve_bytes }, secret, corpus, reader, writer, cancellation),
-        PreparedCorpus::Document(batch) => session.engine.batch_int8_redact_document(&model, Arc::new(planner), Arc::new(vocabulary),
-            RedactionCorpusConfig { batch, edit_reserve_bytes }, secret, corpus, reader, writer, cancellation),
+        PreparedCorpus::Short(batch) => {
+            let config = RedactionCorpusConfig { batch, edit_reserve_bytes };
+            if width == 1 { match prefill {
+                None => session.engine.batch_int8_redact(&model, planner, vocabulary,
+                    config, secret, corpus, reader, writer, cancellation),
+                Some(prefill) => session.engine.batch_int8_redact_layer_major(&model, planner, vocabulary,
+                    config, secret, corpus, prefill, reader, writer, cancellation),
+            } } else { match prefill {
+                None => session.engine.batch_int8_redact_with_threads(&model, planner, vocabulary,
+                    config, secret, corpus, kernel, width, reader, writer, cancellation),
+                Some(prefill) => session.engine.batch_int8_redact_layer_major_with_threads(&model, planner, vocabulary,
+                    config, secret, corpus, kernel, width, prefill, reader, writer, cancellation),
+            } }
+        },
+        PreparedCorpus::Document(batch) => {
+            let config = RedactionCorpusConfig { batch, edit_reserve_bytes };
+            if width == 1 { match prefill {
+                None => session.engine.batch_int8_redact_document(&model, planner, vocabulary,
+                    config, secret, corpus, reader, writer, cancellation),
+                Some(prefill) => session.engine.batch_int8_redact_document_layer_major(&model, planner, vocabulary,
+                    config, secret, corpus, prefill, reader, writer, cancellation),
+            } } else { match prefill {
+                None => session.engine.batch_int8_redact_document_with_threads(&model, planner, vocabulary,
+                    config, secret, corpus, kernel, width, reader, writer, cancellation),
+                Some(prefill) => session.engine.batch_int8_redact_document_layer_major_with_threads(
+                    &model, planner, vocabulary, config, secret, corpus,
+                    kernel, width, prefill, reader, writer, cancellation),
+            } }
+        },
     }.map_err(corpus_execution_error)?;
     // A terminal protocol frame is not proof all documents succeeded. Preserve
     // earlier completed frames on later failure; never append a second terminal.

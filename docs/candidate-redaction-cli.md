@@ -150,8 +150,9 @@ I/O. Failures use closed diagnostics and no candidate result prefix is printed.
 
 ## Persistent INT8 workers and bounded prompt prefill
 
-Both one-shot short redaction and `--chunked` complete-document redaction
-accept `--compute-threads 1..=64` and `--prefill-rows 1..=64`. Omit the
+One-shot short redaction, `--chunked` complete-document redaction and live
+`--ndjson` populations accept `--compute-threads 1..=64` and
+`--prefill-rows 1..=64`. Omit the
 prefill option for sequential prompt processing; width one retains the serial
 projection path. The options can be selected independently or together.
 
@@ -176,16 +177,19 @@ Native, mask, rule and grounding budgets keep their existing scopes. The host
 retains its input, secret and memory ownership until the workers physically
 join on success, cancellation, error or unwinding.
 
-Threaded results add an optional top-level `compute` receipt with physical
-worker counters. Semantic output, detector-policy identity and compact
+Threaded one-shot results add an optional top-level `compute` receipt with
+physical worker counters. Live corpus framing remains unchanged. Semantic output, detector-policy identity and compact
 `input_encoding` metadata retain their existing meanings. Serial responses
 omit `compute`; all output remains guarded through serialization, write and
 flush under the original cooperative deadline. These counters do not measure
 throughput or establish numerical parity or detector quality.
 
-This increment exposes scheduling for one-shot requests. Live and retained
-population commands currently reject these schedule options before private
-IO because their team must span the entire population invocation.
+Live streams reuse one team across every record, original/verification stage
+and flush epoch. Their terminal completion frame is published only after the
+workers join under the original control; previously delivered document events
+remain valid if later work fails. See the [corpus guide](candidate-redaction-corpus.md).
+Retained jobs currently reject multiple workers and explicit prefill before
+private IO; their existing serial schedule remains available.
 
 Embedding applications use `NlpEngine::redact_int8_layer_major`,
 `redact_int8_with_threads` or `redact_int8_layer_major_with_threads`; the

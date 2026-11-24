@@ -8,7 +8,8 @@ use crate::{
         BatchRequestContext, BatchWork, generation::GuardedOutput},
     canonjson, execution_identity::ExecutionIdentity,
     native_engine::{decode::DecodeStepControl, kv::KV_BYTES_PER_TOKEN,
-        lmhead::NANBEIGE_VOCAB_SIZE, strict_int8::{Int8Work, StrictInt8Engine, STRICT_INT8_PROFILE}},
+        lmhead::NANBEIGE_VOCAB_SIZE, strict_int8::{Int8Work, StrictInt8Engine, STRICT_INT8_PROFILE,
+            prefill::Int8PrefillLimits}},
     tasks::{extract::ExtractionVocabulary, source_planning::SourceTaskPlanner},
 };
 use super::{RedactError, RedactionRequest, actions::VerificationStatus,
@@ -43,6 +44,7 @@ pub struct NativeInt8RedactionBatch<'p, 'e, 'w, 'v, 's, 'k, A: Int8RedactionBatc
     redactor: Int8Redactor<'p>, config: Int8RedactionBatchConfig,
     engine: &'e mut StrictInt8Engine<'w>, vocabulary: &'v ExtractionVocabulary,
     pseudonyms: Option<&'s Pseudonyms<'k>>, admission: A, run: RunState,
+    prefill: Option<Int8PrefillLimits>,
 }
 impl<'p, 'e, 'w, 'v, 's, 'k, A: Int8RedactionBatchAdmission>
     NativeInt8RedactionBatch<'p, 'e, 'w, 'v, 's, 'k, A> {
@@ -55,7 +57,20 @@ impl<'p, 'e, 'w, 'v, 's, 'k, A: Int8RedactionBatchAdmission>
         let redactor = Int8Redactor::new(planner, config.ner_identity.clone(), config.detector.clone())
             .map_err(|_| BatchCode::Admission)?;
         capacity_bytes(engine, &config).map_err(|e| e.fault)?;
-        Ok(Self { redactor, config, engine, vocabulary, pseudonyms, admission, run: RunState::default() })
+        Ok(Self { redactor, config, engine, vocabulary, pseudonyms, admission,
+            run: RunState::default(), prefill: None })
+    }
+    /// Fix one bounded prompt schedule for the complete resident stream. Every
+    /// original and edited-source pass uses the same admitted engine; records
+    /// and flushes cannot replace the schedule or renew native/mask allowances.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_layer_major(planner: &'p SourceTaskPlanner, config: Int8RedactionBatchConfig,
+        engine: &'e mut StrictInt8Engine<'w>, vocabulary: &'v ExtractionVocabulary,
+        pseudonyms: Option<&'s Pseudonyms<'k>>, admission: A, prefill: Int8PrefillLimits) -> Result<Self, BatchFault> {
+        prefill.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        let mut processor = Self::new(planner, config, engine, vocabulary, pseudonyms, admission)?;
+        processor.prefill = Some(prefill);
+        Ok(processor)
     }
     pub fn reserved_model_work(&self) -> Int8Work { self.run.reserved }
     pub fn reserved_mask_visits(&self) -> u64 { self.run.masks }
@@ -89,9 +104,13 @@ impl<A: Int8RedactionBatchAdmission> BatchProcessor for NativeInt8RedactionBatch
         let engine = &mut *self.engine;
         let vocabulary = self.vocabulary;
         let pseudonyms = self.pseudonyms;
+        let prefill = self.prefill;
         execute_reserved(&mut self.run, config, context, kv, &mut self.admission, control, |control| {
-            let result = redactor.redact(&prepared.source, &config.request, pseudonyms, engine, vocabulary, control)
-                .and_then(|out| { validate_result(&out, config)?; Ok(out) });
+            let result = match prefill {
+                None => redactor.redact(&prepared.source, &config.request, pseudonyms, engine, vocabulary, control),
+                Some(prefill) => redactor.redact_layer_major(&prepared.source, &config.request,
+                    pseudonyms, engine, vocabulary, prefill, control),
+            }.and_then(|out| { validate_result(&out, config)?; Ok(out) });
             (result, clean(engine))
         })
     }

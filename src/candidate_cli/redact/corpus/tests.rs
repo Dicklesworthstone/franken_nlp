@@ -224,3 +224,122 @@ fn compact_populations_without_runtime_do_not_consume_key_options_or_population(
     assert_eq!(command.execute_owned(NoIo, NoIo), Err(CandidateError::Unavailable));
     assert_eq!(retained(&[]).execute_owned(NoIo, NoIo), Err(CandidateError::Unavailable));
 }
+
+fn scheduled_live(extra: &[&str]) -> RedactCommand {
+    let mut flags = vec!["--ndjson", "--max-requests", "3"];
+    flags.extend_from_slice(extra);
+    let mut command = command(&flags);
+    command.host.memory_mib = 16_384;
+    command
+}
+
+#[test]
+fn live_schedules_preserve_item_policy_and_nonrenewable_corpus_allowances() {
+    for mode in 0..3 {
+        let base = match mode {
+            0 => vec![],
+            1 => vec!["--chunked"],
+            _ => vec!["--chunked", "--input-encoding", "safe-bpe-v1"],
+        };
+        let ordinary = scheduled_live(&base);
+        let (_, ordinary_limits) = ordinary.validate().unwrap();
+        let envelope = ordinary.corpus.envelope(&ordinary, ordinary_limits).unwrap();
+        for schedule in [
+            vec!["--compute-threads", "4"],
+            vec!["--prefill-rows", "7"],
+            vec!["--compute-threads", "4", "--prefill-rows", "7"],
+        ] {
+            let mut flags = base.clone(); flags.extend(schedule);
+            let command = scheduled_live(&flags);
+            let (common, limits) = command.validate().unwrap();
+            let actual = command.corpus.envelope(&command, limits).unwrap();
+            assert_eq!(actual.transport, envelope.transport);
+            assert_eq!(actual.max_model_work, envelope.max_model_work);
+            assert_eq!(actual.max_mask_visits, envelope.max_mask_visits);
+            assert_eq!(actual.output_bytes, envelope.output_bytes);
+            assert_eq!(actual.io_bytes, envelope.io_bytes);
+            assert_eq!(command.encoding_policy(limits).unwrap(), ordinary.encoding_policy(ordinary_limits).unwrap());
+            assert_eq!(serde_json::to_vec(&command.request()).unwrap(),
+                serde_json::to_vec(&ordinary.request()).unwrap());
+            assert_eq!(common.compute, command.compute);
+            assert!(common.policy.prefill().unwrap().is_none());
+        }
+    }
+}
+
+#[test]
+fn live_scheduling_prices_one_team_full_transport_and_both_detector_stages_before_io() {
+    use crate::native_engine::strict_int8::{prefill::Int8PrefillLimits,
+        projection::int8_team_workspace_bytes_with_prefill};
+    for chunked in [false, true] {
+        let mut flags = vec!["--compute-threads", "4", "--prefill-rows", "7"];
+        if chunked { flags.push("--chunked"); }
+        let mut command = scheduled_live(&flags);
+        let (_, limits) = command.validate().unwrap();
+        let envelope = command.corpus.envelope(&command, limits).unwrap();
+        let native = Int8MemoryRequirement::for_context(command.host.context_tokens).unwrap();
+        let edit = command.edit_reserve_mib * MIB;
+        let (output_rows, temporary) = if chunked {
+            let d = command.long.config(&command.host, limits, NerOptions::default()).unwrap();
+            let chunks = d.mapping.chunks.max_chunks as u64;
+            (d.mapping.max_model_work.projected_logits / NANBEIGE_VOCAB_SIZE as u64,
+                4 * (d.per_chunk.max_output_bytes * chunks + d.mapping.reduction.max_live_value_bytes as u64)
+                    + 8 * u64::from(d.per_chunk.max_output_tokens) * chunks + edit)
+        } else {
+            let d = short_detector(&command, limits, NerOptions::default()).unwrap();
+            (d.max_model_work.projected_logits / NANBEIGE_VOCAB_SIZE as u64,
+                4 * d.per_pass.max_output_bytes + 8 * u64::from(d.per_pass.max_output_tokens) + edit)
+        };
+        let t = envelope.transport;
+        let expected = limits.weight_bytes + 192 * MIB + 2 * limits.preparation_bytes
+            + native.kv_bytes + native.rope_bytes + native.scratch_payload_bound + 64 * MIB
+            + int8_team_workspace_bytes_with_prefill(4, 7).unwrap()
+            + Int8PrefillLimits::required_extra_scratch_bytes(7).unwrap()
+            + 4 * command.host.max_result_bytes as u64 + 8 * output_rows + 4096
+            + 65_536 + 64 * 1024 + 8 * t.max_line_bytes as u64 + 4 * t.max_output_line_bytes as u64
+            + 128 * t.max_epoch_ids as u64 + t.max_epoch_id_bytes as u64 + envelope.io_bytes
+            + temporary + 4096;
+        assert_eq!(command.corpus.compact_base_peak_bytes(&command, limits, edit).unwrap(), expected);
+        command.corpus.max_requests = Some(4);
+        let (_, more) = command.validate().unwrap();
+        assert_eq!(command.corpus.compact_base_peak_bytes(&command, more, edit).unwrap(), expected,
+            "a second document or flush does not allocate another native engine or numerical team");
+        command.host.memory_mib = expected.div_ceil(MIB) - 1;
+        assert_eq!(command.execute_owned(NoIo, NoIo), Err(CandidateError::Arguments));
+        let mut exact = scheduled_live(&flags); exact.host.memory_mib = expected.div_ceil(MIB);
+        assert!(exact.validate().is_ok());
+    }
+}
+
+#[test]
+fn invalid_live_and_unsupported_retained_schedules_fail_before_owned_private_io() {
+    for flags in [
+        vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+        vec!["--prefill-rows", "0"], vec!["--prefill-rows", "65"],
+        vec!["--compute-threads", "4", "--max-corpus-mask-node-visits", "1"],
+        vec!["--prefill-rows", "7", "--input-encoding", "safe-bpe-v1"],
+    ] {
+        assert_eq!(scheduled_live(&flags).execute_owned(NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+    for flags in [
+        vec!["--compute-threads", "2"], vec!["--prefill-rows", "1"],
+        vec!["--compute-threads", "4", "--prefill-rows", "7"],
+    ] {
+        let command = retained(&flags);
+        assert!(matches!(command.validate(), Err(CandidateError::Arguments)));
+        assert_eq!(command.execute_owned(NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+    assert!(retained(&["--compute-threads", "1"]).validate().is_ok());
+}
+
+#[cfg(not(feature = "asupersync-runtime"))]
+#[test]
+fn scheduled_live_mode_without_runtime_never_reads_key_options_population_or_model() {
+    for chunked in [false, true] {
+        let mut flags = vec!["private.ndjson", "--compute-threads", "4", "--prefill-rows", "7",
+            "--action", "pseudonymize", "--key-stdin", "--key-id", "k", "--namespace", "scope",
+            "--ner-options", "private-options.json"];
+        if chunked { flags.extend(["--chunked", "--input-encoding", "safe-bpe-v1"]); }
+        assert_eq!(scheduled_live(&flags).execute_owned(NoIo, NoIo), Err(CandidateError::Unavailable));
+    }
+}

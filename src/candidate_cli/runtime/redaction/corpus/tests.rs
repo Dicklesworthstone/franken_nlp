@@ -126,7 +126,50 @@ fn population_source_and_batch_cancellation_preserve_timeout_classification() {
         ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
         let expected = match cause { Deadline | Timeout => CandidateError::Timeout, _ => CandidateError::Batch };
         assert_eq!(corpus_execution_error(HostedError::BatchSetup(crate::batch::BatchFault::cancelled(cause))), expected);
+        assert_eq!(corpus_execution_error(HostedError::Native(
+            crate::native_engine::strict_int8::StrictInt8Error::Cancelled(cause))), expected);
         assert_eq!(corpus_execution_error(HostedError::SourceMap(
             crate::tasks::source_planning::quantized::long::Int8SourceMapError::Source(Int8SourceError::Cancelled(cause)))), expected);
     }
+}
+
+#[test]
+fn scheduled_population_runtime_rejects_stale_width_prompt_or_transport_before_io() {
+    for chunked in [false, true] {
+        for axis in 0..6 {
+            let mut flags = vec!["--ndjson", "--compute-threads", "4", "--prefill-rows", "7"];
+            if chunked { flags.extend(["--chunked", "--input-encoding", "safe-bpe-v1"]); }
+            let mut command = command(&flags); command.host.memory_mib = 16_384;
+            let (common, mut limits) = command.validate().unwrap();
+            let mut envelope = command.corpus.envelope(&command, limits).unwrap();
+            match axis {
+                0 => limits.compute.workspace_bytes -= 1,
+                1 => limits.compute.threads = 3,
+                2 => command.prefill = Default::default(),
+                3 => command.compute = Default::default(),
+                4 => envelope.io_bytes -= 1,
+                _ => envelope.max_model_work.attention_pairs -= 1,
+            }
+            assert_eq!(execute(command, common, limits, envelope, NoIo, NoIo), Err(CandidateError::Arguments));
+        }
+    }
+}
+
+#[test]
+fn complete_document_factory_policy_does_not_change_with_the_physical_schedule() {
+    let ordinary = compact_command();
+    let mut scheduled = command(&["--ndjson", "--chunked", "--input-encoding", "safe-bpe-v1",
+        "--max-ner-chunk-bytes", "128", "--max-new-tokens", "64",
+        "--compute-threads", "4", "--prefill-rows", "7"]);
+    scheduled.host.memory_mib = 16_384;
+    let (_, a) = ordinary.validate().unwrap(); let (_, b) = scheduled.validate().unwrap();
+    let (factory, _) = planner().unwrap();
+    let plain = configure_planner(&ordinary, a, factory).unwrap();
+    let (factory, _) = planner().unwrap();
+    let threaded = configure_planner(&scheduled, b, factory).unwrap();
+    assert_eq!(source_identity(&facts(), &plain, BuiltInTask::Ner).unwrap(),
+        source_identity(&facts(), &threaded, BuiltInTask::Ner).unwrap());
+    assert_eq!(serde_json::to_vec(&provenance(population_encoding(&plain).unwrap())).unwrap(),
+        serde_json::to_vec(&provenance(population_encoding(&threaded).unwrap())).unwrap());
+    assert_eq!(threaded.map_document_encoding_work().unwrap(), Some(SafeBpeWork::default()));
 }

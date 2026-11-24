@@ -246,9 +246,11 @@ completed result is returned. Optional `compute` counters are separate from
 semantic output and do not change detector identity.
 
 See the [redaction CLI guide](candidate-redaction-cli.md#persistent-int8-workers-and-bounded-prompt-prefill)
-for invocation examples and the matching hosted/native APIs. This initial INT8
-scheduling increment covers one-shot short and complete documents; population
-schedules remain refused until their complete-stream ownership is implemented.
+for invocation examples and the matching hosted/native APIs. Live
+`--ndjson` streams also reuse one team across every record and flush, with
+terminal publication after physical join; see the [corpus guide](candidate-redaction-corpus.md).
+Retained jobs keep their serial schedule and refuse explicit prefill or
+multiple workers before private IO.
 Regression definitions have received source review; compilation, executable
 tests, real-model equivalence and performance remain pending the required
 controller-owned DSR checkpoint.

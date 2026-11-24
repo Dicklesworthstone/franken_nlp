@@ -62,17 +62,27 @@ impl CorpusArgs {
     /// added by runtime before either key, population or model is opened.
     pub(in crate::candidate_cli) fn compact_base_peak_bytes(&self, command: &RedactCommand,
         limits: Limits, edit_bytes: u64) -> Result<u64, CandidateError> {
-        if !self.ndjson || !command.long.chunked { return Err(CandidateError::Arguments); }
+        if !self.ndjson { return Err(CandidateError::Arguments); }
         let envelope = self.envelope(command, limits)?;
-        let detector = command.long.config(&command.host, limits, NerOptions::default())?;
         let native = Int8MemoryRequirement::for_context(command.host.context_tokens)
             .map_err(|_| CandidateError::Arguments)?;
         // CorpusAdmission retains an output token claim derived from the
-        // complete item work, independently of the temporary map token owner.
-        let output_tokens = detector.mapping.max_model_work.projected_logits / NANBEIGE_VOCAB_SIZE as u64;
-        let base = compute::request_peak_bytes(limits, native, detector.max_result_bytes,
+        // complete item work, independently of intermediate detector tokens.
+        let (result_bytes, output_tokens, temporary) = if command.long.chunked {
+            let detector = command.long.config(&command.host, limits, NerOptions::default())?;
+            (detector.max_result_bytes,
+                detector.mapping.max_model_work.projected_logits / NANBEIGE_VOCAB_SIZE as u64,
+                command.long.temporary_bytes(&command.host, edit_bytes)?)
+        } else {
+            let detector = short_detector(command, limits, NerOptions::default())?;
+            let temporary = detector.per_pass.max_output_bytes.checked_mul(4)
+                .and_then(|n| n.checked_add(u64::from(detector.per_pass.max_output_tokens).checked_mul(8)?))
+                .and_then(|n| n.checked_add(edit_bytes)).ok_or(CandidateError::Arguments)?;
+            (detector.max_result_bytes, detector.max_model_work.projected_logits / NANBEIGE_VOCAB_SIZE as u64,
+                temporary)
+        };
+        let base = compute::request_peak_bytes(limits, native, result_bytes,
             output_tokens, 0, limits.preparation_bytes)?;
-        let temporary = command.long.temporary_bytes(&command.host, edit_bytes)?;
         let sum = |parts: &[u64]| parts.iter().try_fold(0_u64, |sum, &bytes| sum.checked_add(bytes))
             .ok_or(CandidateError::Arguments);
         let buffers = if command.retention.store_results {
@@ -87,7 +97,9 @@ impl CorpusArgs {
             let ids = (t.max_epoch_ids as u64).checked_mul(128).ok_or(CandidateError::Arguments)?;
             sum(&[lines, output, ids, t.max_epoch_id_bytes as u64, envelope.io_bytes])?
         };
-        sum(&[base, temporary, buffers, 4096])
+        let prompt = command.prefill.limits()?.map(|limits| limits.validate())
+            .transpose().map_err(|_| CandidateError::Arguments)?.unwrap_or(0);
+        sum(&[base, temporary, buffers, 4096, prompt])
     }
     pub(in crate::candidate_cli) fn envelope(&self, command: &RedactCommand, limits: Limits)
         -> Result<CorpusEnvelope, CandidateError> {

@@ -69,7 +69,8 @@ fn admission() -> Admission { Admission { trace: Rc::default(), drift: false, re
 #[test]
 fn input_records_cannot_weaken_verification_or_change_key_scope() {
     for args in [r#"{"verify":false}"#, r#"{"key":"secret"}"#, r#"{"types":[]}"#,
-        r#"{"actions":{}}"#, r#"{"namespace":"other"}"#] {
+        r#"{"actions":{}}"#, r#"{"namespace":"other"}"#, r#"{"prefill_rows":7}"#,
+        r#"{"compute_threads":4}"#, r#"{"max_extra_scratch_bytes":0}"#] {
         let text = format!(r#"{{"id":"i","text":"private","task_args":{args}}}"#);
         assert!(serde_json::from_str::<BatchDocument<RedactionBatchArgs>>(&text).is_err());
     }

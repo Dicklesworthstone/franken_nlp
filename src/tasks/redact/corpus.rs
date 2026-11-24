@@ -8,7 +8,8 @@ use crate::{
         BatchRequestContext, BatchWork, generation::GuardedOutput},
     canonjson, execution_identity::ExecutionIdentity,
     native_engine::{decode::DecodeStepControl, kv::KV_BYTES_PER_TOKEN,
-        lmhead::NANBEIGE_VOCAB_SIZE, strict_int8::{Int8Work, StrictInt8Engine, STRICT_INT8_PROFILE}},
+        lmhead::NANBEIGE_VOCAB_SIZE, strict_int8::{Int8Work, StrictInt8Engine, STRICT_INT8_PROFILE,
+            prefill::Int8PrefillLimits}},
     tasks::{extract::ExtractionVocabulary, source_planning::{SourceTaskPlanner,
         quantized::long::Int8SourceMapError}},
 };
@@ -52,6 +53,7 @@ pub struct NativeInt8DocumentRedactionBatch<'p, 'e, 'w, 'v, 's, 'k, A: Int8Redac
     planner: &'p SourceTaskPlanner, config: LongRedactionBatchConfig,
     engine: &'e mut StrictInt8Engine<'w>, vocabulary: &'v ExtractionVocabulary,
     pseudonyms: Option<&'s Pseudonyms<'k>>, admission: A, ledger: Ledger, owner: Arc<()>,
+    prefill: Option<Int8PrefillLimits>,
 }
 impl<'p, 'e, 'w, 'v, 's, 'k, A: Int8RedactionBatchAdmission>
     NativeInt8DocumentRedactionBatch<'p, 'e, 'w, 'v, 's, 'k, A> {
@@ -63,7 +65,19 @@ impl<'p, 'e, 'w, 'v, 's, 'k, A: Int8RedactionBatchAdmission>
         config.request.actions.check_key(pseudonyms).map_err(|_| BatchCode::Admission)?;
         capacity(engine, &config).map_err(|e| e.fault)?;
         Ok(Self { planner, config, engine, vocabulary, pseudonyms, admission,
-            ledger: Ledger::default(), owner: Arc::new(()) })
+            ledger: Ledger::default(), owner: Arc::new(()), prefill: None })
+    }
+    /// Reuse one pre-admitted prompt schedule through the complete population.
+    /// Preparation retains each original's compact operation and private owner;
+    /// packed execution never creates or resets that tokenizer ledger.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_layer_major(planner: &'p SourceTaskPlanner, config: LongRedactionBatchConfig,
+        engine: &'e mut StrictInt8Engine<'w>, vocabulary: &'v ExtractionVocabulary,
+        pseudonyms: Option<&'s Pseudonyms<'k>>, admission: A, prefill: Int8PrefillLimits) -> Result<Self, BatchFault> {
+        prefill.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        let mut processor = Self::new(planner, config, engine, vocabulary, pseudonyms, admission)?;
+        processor.prefill = Some(prefill);
+        Ok(processor)
     }
     pub fn reserved_model_work(&self) -> Int8Work { self.ledger.reserved }
     pub fn reserved_mask_visits(&self) -> u64 { self.ledger.masks }
@@ -109,9 +123,13 @@ impl<A: Int8RedactionBatchAdmission> BatchProcessor
         let config = &self.config;
         let vocabulary = self.vocabulary;
         let pseudonyms = self.pseudonyms;
+        let prefill = self.prefill;
         execute_reserved(&mut self.ledger, config, context, kv, &mut self.admission, control, |control| {
-            let result = redactor.redact(&prepared.source, &config.request, pseudonyms, engine, vocabulary, control)
-                .and_then(|out| { validate_result(&out, prepared.preflight, config)?; Ok(out) });
+            let result = match prefill {
+                None => redactor.redact(&prepared.source, &config.request, pseudonyms, engine, vocabulary, control),
+                Some(prefill) => redactor.redact_layer_major(&prepared.source, &config.request,
+                    pseudonyms, engine, vocabulary, prefill, control),
+            }.and_then(|out| { validate_result(&out, prepared.preflight, config)?; Ok(out) });
             (result, clean(engine))
         })
     }

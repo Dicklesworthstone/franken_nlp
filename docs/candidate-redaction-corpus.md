@@ -109,6 +109,66 @@ larger allowance, such as the illustrative 24576 MiB example in
 [candidate-redaction-jobs.md](candidate-redaction-jobs.md). An insufficient
 ceiling refuses setup instead of silently reducing the detector or chunk scope.
 
+## Persistent INT8 workers and prompt prefill
+
+Live redaction streams accept `--compute-threads N` and `--prefill-rows M`
+together or separately, for both single-context and `--chunked` documents:
+
+```sh
+fnlp candidate redact records.ndjson --ndjson --chunked \
+  --input-encoding safe-bpe-v1 --compute-threads 4 --prefill-rows 7 \
+  --model ./model.fnlpq --memory-mib 16384 \
+  --max-new-tokens 128 --max-requests 100
+```
+
+Width one keeps serial numerical execution. Widths two through 64 admit one
+coordinator and `N - 1` persistent projection workers for the entire stream.
+The model, native engine and fixed worker team span every original document,
+NER chunk, edited-source verification and explicit flush. Record processing
+remains ordered, with each document delivered before the next is admitted.
+
+An explicit prefill width from one through 64 groups exact prompt rows into
+bounded layer-major morsels. Omitting it keeps tokenwise prompt execution.
+Prompt prefill and numerical workers compose without changing the detector,
+chunk partition, source coordinates or redaction policy. Every native position,
+projection, attention pair and mask visit continues to debit the existing
+per-document and whole-stream ledgers. A flush, worker or prompt morsel never
+renews those allowances. Compact input remains available only with `--chunked`;
+its per-original tokenizer operation also survives both detector stages.
+
+The CLI admits simultaneous native, prompt, worker, map/edit, output and IO
+storage before private input. The memory ceiling in the example is illustrative;
+insufficient capacity refuses setup without shrinking the requested schedule.
+The same original deadline covers input, planning, computation, worker drain,
+serialization, writes and final flush.
+
+Completed document events may be delivered while the stream is running. The
+terminal `run_complete` is held until all numerical workers have physically
+joined, then delivered under the original cancellation and transport budgets.
+Reader/writer, planner, vocabulary and pseudonym ownership remain charged through
+that final delivery. Write failure, cancellation or a worker failure cannot turn
+the completed prefix into a successful whole-stream result.
+
+These are physical scheduling choices. They do not change the inner semantic
+events, invent per-document worker counts, or make a measured speed/parity claim.
+The hosted methods continue to return the existing `BatchSummary`.
+Retained `--store-results` mode currently requires one compute thread and no
+explicit prefill option; requests for retained scheduling refuse before private IO.
+
+Library callers can use `batch_int8_redact_layer_major`,
+`batch_int8_redact_with_threads`, or
+`batch_int8_redact_layer_major_with_threads` with the same short-document policy.
+The complete-document forms insert `_document` after `redact` and accept
+`RedactionCorpusConfig<LongRedactionBatchConfig>`. All reuse the native redaction
+adapters and the common bounded corpus transport.
+
+Focused source regressions cover schedule/memory admission and fixed host policy.
+An ignored, independently pinned real-artifact fixture compares complete NDJSON
+streams across serial, prefill, worker-team and composed schedules, including
+multiple records, a malformed record, explicit flushes and final physical drain.
+Compilation, executable regressions, model parity and performance remain pending
+the repository's controller-owned DSR and model gates.
+
 ## One pseudonym scope
 
 For pseudonymization, provide an existing high-entropy binary key of 32 through
@@ -207,9 +267,11 @@ poisoned native state stops further work. Residual coordinate vectors are droppe
 under the live output reservation; transport errors contain fixed codes rather
 than private model/parser/source diagnostics.
 
-There is no retry, resume journal, token streaming, parallel/GEMM batching or
-per-record model reload. A transport write/flush failure may leave partial external
-bytes and is an error. No Drop-based writer flush publishes an incomplete event.
+This live route retains no resume journal and performs no automatic retry or
+per-record model reload. Token streaming and inter-document cohorts remain
+separate execution surfaces. A transport write/flush failure may leave partial
+external bytes and is an error. No Drop-based writer flush publishes an incomplete
+event.
 
 The CLI transfers owned reader/writer handles before taking stdio locks. A single
 host invocation owns the resident native engine, deadline and run ledger. Memory

@@ -6,13 +6,8 @@ use crate::tasks::redact::{
 };
 
 impl NlpEngine {
-    /// Process bounded NDJSON records whose text need not fit one NER context.
-    /// Every item uses whole-source rules and independently verified native NER
-    /// maps, then optionally repartitions the actual transformed source. The
-    /// complete per-item work ceiling is charged to the corpus before inference.
-    /// Flush and failed documents never renew native or mask authority. Compact
-    /// encoding forks one cumulative operation per original document attempt;
-    /// preflight, reconstruction and fresh verification retain that operation.
+    /// Each original retains one compact operation through preflight, execution
+    /// and fresh transformed-source verification; flushes never renew work.
     #[allow(clippy::too_many_arguments)]
     pub fn batch_int8_redact_document<R, W>(&self, model: &ResidentInt8,
         planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
@@ -20,44 +15,68 @@ impl NlpEngine {
         limits: CorpusLimits, reader: R, writer: W, cancellation: CancellationToken)
         -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
-        self.check_resident_domain(model)?;
-        check_model_identity(model.artifact_identity(), &config.batch.ner_identity)?;
-        crate::hosted::redact::check_encoding_preparation(&planner, limits.preparation_reserve_bytes)?;
-        document_batch::check_configuration(&planner, &config.batch).map_err(HostedError::BatchSetup)?;
-        let required = requirements(limits.native)?;
-        validate(&config, limits, required.kv_bytes)?;
-        let buffers = sum(&[limits.reservation_bytes()?,
-            temporary_bytes(&config.batch.detector, config.edit_reserve_bytes)?, secret_bytes(pseudonyms.as_ref())?])?;
-        let lease = self.resources().acquire_lease();
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, buffers)?,
-            || Ok(StreamInput { planner: Some((planner, vocabulary, config, pseudonyms)), reader, writer }))?;
-        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-        let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound, limits.native.allocator_reserve_bytes])?)?;
-        let model = model.clone();
-        dispatch::run(self, limits.native.run, cancellation, move |control| {
-            let mut input = input;
-            let (planner, vocabulary, config, secret) = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
-            // Check one immutable full256 HMAC scope before native allocation
-            // or the first read/write. Never re-read a secret at a flush boundary.
-            let context = pseudonym_context(secret.as_ref(), &config.batch.request)?;
-            let mut engine = allocate_native(kv, workspace, || model.inner.loaded.value
-                .engine(limits.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            let admission = CorpusAdmission { lease: &lease, model: model.artifact_identity(),
-                kv_bytes: required.kv_bytes, sampler_bytes: 0,
-                output_bytes: limits.transport.max_output_line_bytes as u64 };
-            let result = {
-                let mut processor = NativeInt8DocumentRedactionBatch::new(&planner, config.batch,
-                    &mut engine.value, &vocabulary, context.as_ref(), admission).map_err(HostedError::BatchSetup)?;
-                batch::run_ndjson(&mut input.value.reader, &mut input.value.writer, &mut processor,
-                    limits.transport, control).map_err(HostedError::Batch)
-            };
-            drop(engine); drop(context); drop(secret); drop(vocabulary); drop(planner);
-            drop(input); // Owned IO and compiler storage before the charge/physical handoff.
-            drop(lease);
-            result
-        })
+        team::run(self, model, planner, vocabulary, config, pseudonyms, limits,
+            None, None, reader, writer, cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_redact_document_layer_major<R, W>(&self, model: &ResidentInt8,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: RedactionCorpusConfig<LongRedactionBatchConfig>, pseudonyms: Option<RedactionPseudonyms>,
+        limits: CorpusLimits, prefill: Int8PrefillLimits, reader: R, writer: W,
+        cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        team::run(self, model, planner, vocabulary, config, pseudonyms, limits,
+            Some(prefill), None, reader, writer, cancellation)
+    }
+
+    /// The same team spans every chunk of every original and edited document.
+    /// Native buffers, key, planner and IO ownership survive physical join.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_redact_document_with_threads<R, W>(&self, model: &ResidentInt8,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: RedactionCorpusConfig<LongRedactionBatchConfig>, pseudonyms: Option<RedactionPseudonyms>,
+        limits: CorpusLimits, kernel: Int8Kernel, compute_threads: usize,
+        reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        team::run(self, model, planner, vocabulary, config, pseudonyms, limits,
+            None, Some((kernel, compute_threads)), reader, writer, cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_redact_document_layer_major_with_threads<R, W>(&self, model: &ResidentInt8,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: RedactionCorpusConfig<LongRedactionBatchConfig>, pseudonyms: Option<RedactionPseudonyms>,
+        limits: CorpusLimits, kernel: Int8Kernel, compute_threads: usize, prefill: Int8PrefillLimits,
+        reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        team::run(self, model, planner, vocabulary, config, pseudonyms, limits,
+            Some(prefill), Some((kernel, compute_threads)), reader, writer, cancellation)
+    }
+}
+
+impl team::Policy for RedactionCorpusConfig<LongRedactionBatchConfig> {
+    fn identity(&self) -> &ExecutionIdentity { &self.batch.ner_identity }
+    fn request(&self) -> &RedactionRequest { &self.batch.request }
+    fn validate(&self, planner: &SourceTaskPlanner, limits: CorpusLimits,
+        native: Int8MemoryRequirement) -> Result<u64, HostedError> {
+        crate::hosted::redact::check_encoding_preparation(planner, limits.preparation_reserve_bytes)?;
+        document_batch::check_configuration(planner, &self.batch).map_err(HostedError::BatchSetup)?;
+        validate(self, limits, native.kv_bytes)?;
+        temporary_bytes(&self.batch.detector, self.edit_reserve_bytes)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn execute<R: BufRead, W: Write>(self, planner: &SourceTaskPlanner,
+        vocabulary: &ExtractionVocabulary, pseudonyms: Option<&Pseudonyms<'_>>,
+        engine: &mut StrictInt8Engine<'_>, admission: CorpusAdmission<'_>, prefill: Option<Int8PrefillLimits>,
+        reader: &mut R, writer: &mut W, limits: BatchLimits, defer: bool, control: &mut RunControl)
+        -> Result<super::super::scored::Completion, HostedError> {
+        let mut processor = match prefill {
+            None => NativeInt8DocumentRedactionBatch::new(planner, self.batch, engine, vocabulary, pseudonyms, admission),
+            Some(prefill) => NativeInt8DocumentRedactionBatch::new_layer_major(
+                planner, self.batch, engine, vocabulary, pseudonyms, admission, prefill),
+        }.map_err(HostedError::BatchSetup)?;
+        super::super::scored::execute_stream(reader, writer, &mut processor, limits, defer, control)
     }
 }
 fn validate(config: &RedactionCorpusConfig<LongRedactionBatchConfig>, limits: CorpusLimits, kv: u64)
