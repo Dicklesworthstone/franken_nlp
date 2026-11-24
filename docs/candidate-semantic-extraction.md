@@ -217,3 +217,11 @@ The population implementation and source regression definitions are present.
 Compilation, executable regressions, independently pinned model equivalence,
 task-quality evaluation and target-host performance remain controller-owned
 validation gates.
+
+## Retained semantic extraction jobs
+
+Use `fnlp candidate extract-semantic-job start|resume` for authenticated
+populations with complete extraction-and-review results, durable work debits,
+explicit retained input and optional materialization. See the
+[INT8 semantic job guide](candidate-semantic-jobs.md) for setup, bounded examples,
+resume authentication, compact invocation accounting and physical scheduling.

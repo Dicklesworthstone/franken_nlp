@@ -150,7 +150,7 @@ fn check_factory(command: &BatchCommand, limits: Limits, options: &Int8SemanticO
         .map_err(host_failure)
 }
 
-fn minimum_memory(args: &CandidateArgs, limits: Limits, quote: Int8SemanticCorpusRequirements,
+pub(super) fn minimum_memory(args: &CandidateArgs, limits: Limits, quote: Int8SemanticCorpusRequirements,
     prefill: Option<Int8PrefillLimits>) -> Result<u64, CandidateError> {
     let native = Int8MemoryRequirement::for_context(args.context_tokens).map_err(|_| CandidateError::Arguments)?;
     let extra = prefill.map(Int8PrefillLimits::validate).transpose()

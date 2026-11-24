@@ -10,6 +10,7 @@ use crate::{
 pub(super) const OPTIONS_BYTES: usize = 1024 * 1024;
 
 pub(super) mod corpus;
+pub(super) mod jobs;
 
 /// The complete-attempt encoding policy also has a separate invocation cap.
 /// Actual work includes failed preparation and every dynamic review; neither

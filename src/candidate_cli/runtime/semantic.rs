@@ -207,5 +207,8 @@ fn check_result(run: &Int8SemanticExtractionRun, extraction: Int8Work, cap: Int8
 }
 
 pub(in crate::candidate_cli) mod corpus;
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(in crate::candidate_cli) mod jobs;
 
 #[cfg(test)] mod tests;

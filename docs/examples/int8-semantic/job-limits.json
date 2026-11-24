@@ -1,0 +1,23 @@
+{
+  "max_items": 2,
+  "max_id_bytes": 128,
+  "max_input_bytes_per_item": 512,
+  "max_snapshot_bytes": 1048576,
+  "max_result_bytes": 1048576,
+  "max_spool_bytes": 16777216,
+  "max_materialized_bytes": 16777216,
+  "max_journal_bytes": 16777216,
+  "max_attempts": 4,
+  "max_work": {
+    "model": {
+      "forward_positions": 16384,
+      "projected_logits": 256000000,
+      "attention_pairs": 70866960384,
+      "projections": {
+        "dot_products": 400000000000,
+        "multiply_accumulates": 4000000000000000
+      }
+    },
+    "mask_node_visits": 8000000000
+  }
+}
