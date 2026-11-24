@@ -29,16 +29,36 @@ pub(super) fn execute(command: &RedactCommand, common: &CandidateArgs, limits: L
     session.remaining()?;
     let cancellation = CancellationToken::default();
     let model = session.load(common, limits, &facts, cancellation.clone())?;
-    let result = session.engine.redact_int8_document(&model, source, Arc::clone(&planner), Arc::new(vocabulary), RedactConfig {
+    let config = RedactConfig {
         ner_identity: identity, request: request.clone(), detector: detector.clone(), native: session.native(common)?,
         preparation_reserve_bytes: limits.preparation_bytes, edit_reserve_bytes: command.edit_reserve_mib * MIB,
-    }, secret, cancellation).map_err(execution_error)?;
+    };
+    let vocabulary = Arc::new(vocabulary);
+    let prefill = command.prefill.limits()?;
+    let result = if limits.compute.threads == 1 {
+        compute::Completion::Serial(match prefill {
+            None => session.engine.redact_int8_document(&model, source, Arc::clone(&planner),
+                vocabulary, config, secret, cancellation),
+            Some(prefill) => session.engine.redact_int8_document_layer_major(&model, source, Arc::clone(&planner),
+                vocabulary, config, secret, prefill, cancellation),
+        }.map_err(execution_error)?)
+    } else {
+        let kernel = crate::native_engine::simd::config::process_kernel();
+        compute::Completion::Team(match prefill {
+            None => session.engine.redact_int8_document_with_threads(&model, source, Arc::clone(&planner),
+                vocabulary, config, secret, kernel, limits.compute.threads, cancellation),
+            Some(prefill) => session.engine.redact_int8_document_layer_major_with_threads(
+                &model, source, Arc::clone(&planner), vocabulary, config, secret,
+                kernel, limits.compute.threads, prefill, cancellation),
+        }.map_err(execution_error)?)
+    };
     session.remaining()?;
     check_completed(expected, result.result(), &request, &detector)?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
         evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
         source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
-        quant_recipe: &facts.recipe_id, output: &result };
+        quant_recipe: &facts.recipe_id, output: result.result() };
+    let response = compute::Response { response: &response, compute: result.compute() };
     let response = EncodedResponse { response: &response, input_encoding: encoding_receipt(&planner)? };
     // Only complete edited text and opt-in coordinates escape. The existing
     // result guard and caller Session survive canonical staging, write and flush.

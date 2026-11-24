@@ -34,6 +34,7 @@ fn execution_error(error: HostedError) -> CandidateError {
             | HostedError::Scope { physical_error: Some(error), .. } => execution_error(*error),
         HostedError::Redaction(error) => error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution),
         HostedError::SourceMap(error) => error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution),
+        HostedError::Native(crate::native_engine::strict_int8::StrictInt8Error::Cancelled(cause)) => cancelled(cause),
         HostedError::Reservation(_) => CandidateError::Memory,
         HostedError::ModelIdentity | HostedError::ResourceDomain => CandidateError::Identity,
         _ => CandidateError::Execution,
@@ -81,7 +82,8 @@ pub(in crate::candidate_cli) fn execute(command: RedactCommand, _common: Candida
     let (common, limits) = command.validate()?;
     if limits != admitted { return Err(CandidateError::Arguments); }
     let (encoding, complete_encoding) = command.encoding_policy(limits)?;
-    let session = Session::new(&common, limits)?;
+    let prefill = command.prefill.limits()?;
+    let session = Session::new_with_prefill(&common, limits, prefill)?;
     // Key material never reaches argv, String, serialization or diagnostics.
     // A key read consumes stdin only with an explicitly separate document file.
     let secret = command.key(input)?.map(|(key, namespace)| RedactionPseudonyms { key: Arc::new(key), namespace });
@@ -119,15 +121,33 @@ pub(in crate::candidate_cli) fn execute(command: RedactCommand, _common: Candida
     session.remaining()?;
     let cancellation = CancellationToken::default();
     let model = session.load(&common, limits, &facts, cancellation.clone())?;
-    let result = session.engine.redact_int8(&model, text, Arc::clone(&planner), Arc::new(vocabulary), RedactConfig {
+    let config = RedactConfig {
         ner_identity: identity, request, detector, native: session.native(&common)?,
         preparation_reserve_bytes: limits.preparation_bytes, edit_reserve_bytes: command.edit_reserve_mib * MIB,
-    }, secret, cancellation).map_err(execution_error)?;
+    };
+    let vocabulary = Arc::new(vocabulary);
+    let result = if limits.compute.threads == 1 {
+        compute::Completion::Serial(match prefill {
+            None => session.engine.redact_int8(&model, text, Arc::clone(&planner),
+                vocabulary, config, secret, cancellation),
+            Some(prefill) => session.engine.redact_int8_layer_major(&model, text, Arc::clone(&planner),
+                vocabulary, config, secret, prefill, cancellation),
+        }.map_err(execution_error)?)
+    } else {
+        let kernel = crate::native_engine::simd::config::process_kernel();
+        compute::Completion::Team(match prefill {
+            None => session.engine.redact_int8_with_threads(&model, text, Arc::clone(&planner),
+                vocabulary, config, secret, kernel, limits.compute.threads, cancellation),
+            Some(prefill) => session.engine.redact_int8_layer_major_with_threads(&model, text, Arc::clone(&planner),
+                vocabulary, config, secret, kernel, limits.compute.threads, prefill, cancellation),
+        }.map_err(execution_error)?)
+    };
     session.remaining()?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
         evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
         source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
-        quant_recipe: &facts.recipe_id, output: &result };
+        quant_recipe: &facts.recipe_id, output: result.result() };
+    let response = compute::Response { response: &response, compute: result.compute() };
     let response = EncodedResponse { response: &response, input_encoding: encoding_receipt(&planner)? };
     // Native result contains only final edited text and opted-in coordinates.
     // Keep both guards alive through the complete write AND flush.

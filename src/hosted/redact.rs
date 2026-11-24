@@ -1,8 +1,10 @@
 //! One process-owned redaction invocation, including fresh NER verification.
 use super::*;
 mod long;
+mod team;
 use crate::{
-    native_engine::constrained_int8,
+    native_engine::{constrained_int8, simd::Int8Kernel,
+        strict_int8::{prefill::Int8PrefillLimits, StrictInt8Engine}},
     tasks::{ner::NER_TASK_VERSION, source_planning::SourceTaskPlanner,
         redact::{RedactError, RedactionRequest,
             pseudonym::{PseudonymKey, Pseudonyms},
@@ -53,10 +55,29 @@ impl NlpEngine {
         planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
         config: RedactConfig, pseudonyms: Option<RedactionPseudonyms>, cancellation: CancellationToken)
         -> Result<HostedOutput<Int8RedactionRun>, HostedError> {
+        self.redact_int8_scheduled(model, source, planner, vocabulary, config, pseudonyms, None, cancellation)
+    }
+
+    /// Reuse one bounded layer-major prompt workspace for original and edited
+    /// sources. The encoding and native ledgers retain their original scope.
+    #[allow(clippy::too_many_arguments)]
+    pub fn redact_int8_layer_major(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: RedactConfig, pseudonyms: Option<RedactionPseudonyms>, prefill: Int8PrefillLimits,
+        cancellation: CancellationToken) -> Result<HostedOutput<Int8RedactionRun>, HostedError> {
+        self.redact_int8_scheduled(model, source, planner, vocabulary, config, pseudonyms, Some(prefill), cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn redact_int8_scheduled(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: RedactConfig, pseudonyms: Option<RedactionPseudonyms>, prefill: Option<Int8PrefillLimits>,
+        cancellation: CancellationToken) -> Result<HostedOutput<Int8RedactionRun>, HostedError> {
         dispatch::preflight(self, config.native.run)?;
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), &config.ner_identity)?;
         let required = requirements(config.native)?;
+        let scratch_bytes = team::scratch_bytes(config.native, required, prefill)?;
         validate(&config, source.len(), planner.tokenizer_digest(), *planner.template_digest(), required.kv_bytes)?;
         check_encoding_preparation(&planner, config.preparation_reserve_bytes)?;
         let input_bytes = input_bytes(&source, &config, pseudonyms.as_ref())?;
@@ -77,12 +98,15 @@ impl NlpEngine {
             let pseudonyms = pseudonym_context(input.value.pseudonyms.as_ref(), &config.request)?;
             let output = output_claim(&lease, config.detector.max_result_bytes, 0)?;
             let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-            let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-                sum(&[required.rope_bytes, required.scratch_payload_bound, config.native.allocator_reserve_bytes])?)?;
+            let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch_bytes)?;
             let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value
                 .engine(config.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            let result = allocate(output, || redactor.redact(&input.value.source, &config.request,
-                pseudonyms.as_ref(), &mut engine.value, &input.value.vocabulary, control).map_err(execution_error))?;
+            let result = allocate(output, || match prefill {
+                None => redactor.redact(&input.value.source, &config.request,
+                    pseudonyms.as_ref(), &mut engine.value, &input.value.vocabulary, control),
+                Some(prefill) => redactor.redact_layer_major(&input.value.source, &config.request,
+                    pseudonyms.as_ref(), &mut engine.value, &input.value.vocabulary, prefill, control),
+            }.map_err(execution_error))?;
             drop(engine);
             drop(pseudonyms);
             drop(redactor);
@@ -91,6 +115,53 @@ impl NlpEngine {
             drop(lease);
             Ok(GuardedOutput::new(result.value, result._memory))
         })
+    }
+
+    /// One fixed row team serves both NER passes; source, key and all charges
+    /// remain owned until the scoped workers physically join.
+    #[allow(clippy::too_many_arguments)]
+    pub fn redact_int8_with_threads(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: RedactConfig, pseudonyms: Option<RedactionPseudonyms>, kernel: Int8Kernel,
+        compute_threads: usize, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8RedactionRun>, HostedError> {
+        self.redact_int8_team(model, source, planner, vocabulary, config, pseudonyms,
+            kernel, compute_threads, None, cancellation)
+    }
+
+    /// Layer-major prompt morsels and subsequent decoding share the same team.
+    #[allow(clippy::too_many_arguments)]
+    pub fn redact_int8_layer_major_with_threads(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: RedactConfig, pseudonyms: Option<RedactionPseudonyms>, kernel: Int8Kernel,
+        compute_threads: usize, prefill: Int8PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8RedactionRun>, HostedError> {
+        self.redact_int8_team(model, source, planner, vocabulary, config, pseudonyms,
+            kernel, compute_threads, Some(prefill), cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn redact_int8_team(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: RedactConfig, pseudonyms: Option<RedactionPseudonyms>, kernel: Int8Kernel,
+        compute_threads: usize, prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8RedactionRun>, HostedError> {
+        let max_result_bytes = config.detector.max_result_bytes;
+        let temporary_bytes = temporary_bytes(&config)?;
+        team::run(self, model, source, planner, vocabulary, config, pseudonyms,
+            kernel, compute_threads, prefill, max_result_bytes, temporary_bytes, cancellation, validate,
+            |input, engine, prefill, control| {
+                let config = &input.config;
+                let redactor = Int8Redactor::new(&input.planner, config.ner_identity.clone(), config.detector.clone())
+                    .map_err(HostedError::Redaction)?;
+                let pseudonyms = pseudonym_context(input.pseudonyms.as_ref(), &config.request)?;
+                match prefill {
+                    None => redactor.redact(&input.source, &config.request,
+                        pseudonyms.as_ref(), engine, &input.vocabulary, control),
+                    Some(prefill) => redactor.redact_layer_major(&input.source, &config.request,
+                        pseudonyms.as_ref(), engine, &input.vocabulary, prefill, control),
+                }.map_err(execution_error)
+            })
     }
 }
 pub(super) fn check_encoding_preparation(planner: &SourceTaskPlanner, preparation_bytes: u64) -> Result<(), HostedError> {

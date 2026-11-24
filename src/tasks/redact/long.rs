@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::{
     canonjson, execution_identity::{ExecutionIdentity, Sha256Digest},
     native_engine::{constrained_int8, decode::{DecodeCancellationKind, DecodeStepControl},
-        strict_int8::{Int8Work, StrictInt8Engine, STRICT_INT8_PROFILE}},
+        strict_int8::{Int8Work, StrictInt8Engine, STRICT_INT8_PROFILE, prefill::Int8PrefillLimits}},
     tasks::{extract::ExtractionVocabulary, ir::{PlanContext, TaskBudget}, ner::{NerOptions, NER_TASK_VERSION},
         mapreduce::CHUNK_PROFILE, source_planning::{SourcePlanningLimits, SourceTaskPlanner, SourceTaskResult,
             quantized::{Int8SourceError, long::{Int8SourceMapError, Int8SourceMapLimits, PreparedInt8SourceMap, SourceMapTask}}}},
@@ -137,7 +137,27 @@ impl<'p> Int8DocumentRedactor<'p> {
     pub fn redact<C: DecodeStepControl>(&self, source: &str, request: &RedactionRequest,
         pseudonyms: Option<&Pseudonyms<'_>>, engine: &mut StrictInt8Engine<'_>,
         vocabulary: &ExtractionVocabulary, control: &mut C) -> Result<LongRedactionRun, LongRedactionError> {
+        self.redact_scheduled(source, request, pseudonyms, engine, vocabulary, None, control)
+    }
+    /// Keep the same native engine, projection team and bounded prompt schedule
+    /// for every original chunk and every freshly planned edited-source chunk.
+    /// Grouped prompts do not alter chunk partitioning or renew any work ledger.
+    #[allow(clippy::too_many_arguments)]
+    pub fn redact_layer_major<C: DecodeStepControl>(&self, source: &str, request: &RedactionRequest,
+        pseudonyms: Option<&Pseudonyms<'_>>, engine: &mut StrictInt8Engine<'_>,
+        vocabulary: &ExtractionVocabulary, prefill: Int8PrefillLimits, control: &mut C)
+        -> Result<LongRedactionRun, LongRedactionError> {
+        self.redact_scheduled(source, request, pseudonyms, engine, vocabulary, Some(prefill), control)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn redact_scheduled<C: DecodeStepControl>(&self, source: &str, request: &RedactionRequest,
+        pseudonyms: Option<&Pseudonyms<'_>>, engine: &mut StrictInt8Engine<'_>,
+        vocabulary: &ExtractionVocabulary, prefill: Option<Int8PrefillLimits>, control: &mut C)
+        -> Result<LongRedactionRun, LongRedactionError> {
         poll(control)?;
+        if let Some(prefill) = prefill {
+            prefill.validate().map_err(|error| LongRedactionError::Redaction(error.into()))?;
+        }
         request.actions.check_key(pseudonyms)?;
         request.rules.validate()?;
         if source.is_empty() || source.len() > request.rule_budget.max_input_bytes
@@ -146,7 +166,8 @@ impl<'p> Int8DocumentRedactor<'p> {
         }
         let mut accounting = Accounting::default();
         let mut grounding = request.grounding_budget;
-        let (document, original) = self.detect(source, request, engine, vocabulary, &mut accounting, &mut grounding, control)?;
+        let (document, original) = self.detect(source, request, engine, vocabulary,
+            &mut accounting, &mut grounding, prefill, control)?;
         poll(control)?;
         let mut result = actions::apply(&document, &request.actions, pseudonyms, request.edit_budget)?;
         drop(document);
@@ -155,7 +176,7 @@ impl<'p> Int8DocumentRedactor<'p> {
             // Re-tokenize and re-partition ACTUAL edited bytes. Replacements may
             // expand or shrink source and create new cross-edit rule matches.
             let (residual, receipt) = self.detect(&result.text, request, engine, vocabulary,
-                &mut accounting, &mut grounding, control)?;
+                &mut accounting, &mut grounding, prefill, control)?;
             require_clean(residual, self.config.max_result_bytes)?;
             result.verification = VerificationStatus::CleanDeclaredUnion;
             Some(receipt)
@@ -195,7 +216,7 @@ impl<'p> Int8DocumentRedactor<'p> {
     #[allow(clippy::too_many_arguments)]
     fn detect<'s, C: DecodeStepControl>(&self, source: &'s str, request: &RedactionRequest,
         engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary, accounting: &mut Accounting,
-        grounding: &mut GroundingBudget, control: &mut C)
+        grounding: &mut GroundingBudget, prefill: Option<Int8PrefillLimits>, control: &mut C)
         -> Result<(DetectedDocument<'s>, LongRedactionStage), LongRedactionError> {
         poll(control)?;
         let mut mapping = self.config.mapping;
@@ -217,7 +238,10 @@ impl<'p> Int8DocumentRedactor<'p> {
         }
         // Existing source-map admission checks every identity and full resident
         // KV capacity before its first forward, with one exclusive native engine.
-        let mapped = prepared.execute_with_control(&admitted, engine, vocabulary, control)?;
+        let mapped = match prefill {
+            None => prepared.execute_with_control(&admitted, engine, vocabulary, control),
+            Some(prefill) => prepared.execute_layer_major_with_control(&admitted, engine, vocabulary, prefill, control),
+        }?;
         if mapped.planned_model_work != preflight.planned_model_work
             || mapped.reserved_mask_node_visits != preflight.reserved_mask_node_visits
             || mapped.mapped.root().value().len() != preflight.chunks {

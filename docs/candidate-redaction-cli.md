@@ -147,6 +147,52 @@ execution; blocking I/O and individual tokenizer operations are not preempted.
 Without the runtime feature, refusal precedes key, document, options and model
 I/O. Failures use closed diagnostics and no candidate result prefix is printed.
 
+
+## Persistent INT8 workers and bounded prompt prefill
+
+Both one-shot short redaction and `--chunked` complete-document redaction
+accept `--compute-threads 1..=64` and `--prefill-rows 1..=64`. Omit the
+prefill option for sequential prompt processing; width one retains the serial
+projection path. The options can be selected independently or together.
+
+```sh
+fnlp candidate redact document.txt \
+  --model ./model.fnlpq --memory-mib 16384 \
+  --chunked --input-encoding safe-bpe-v1 \
+  --compute-threads 4 --prefill-rows 8
+```
+
+The memory allowance is illustrative. Admission includes both preparation
+owners, the original source and secret metadata, native KV and scratch,
+intermediate NER/map results, editing storage, final output, coordinator
+prompt scratch and fixed worker buffers before private key, document, options
+or model IO. Prompt scratch is additional to worker storage. Worker width
+does not multiply the number of engines or renew any allowance.
+
+One team spans original detection, every original NER chunk, editing, and
+fresh detection on the actual transformed text. Compact input retains the
+same spent tokenizer operation across preflight, reconstruction and verification.
+Native, mask, rule and grounding budgets keep their existing scopes. The host
+retains its input, secret and memory ownership until the workers physically
+join on success, cancellation, error or unwinding.
+
+Threaded results add an optional top-level `compute` receipt with physical
+worker counters. Semantic output, detector-policy identity and compact
+`input_encoding` metadata retain their existing meanings. Serial responses
+omit `compute`; all output remains guarded through serialization, write and
+flush under the original cooperative deadline. These counters do not measure
+throughput or establish numerical parity or detector quality.
+
+This increment exposes scheduling for one-shot requests. Live and retained
+population commands currently reject these schedule options before private
+IO because their team must span the entire population invocation.
+
+Embedding applications use `NlpEngine::redact_int8_layer_major`,
+`redact_int8_with_threads` or `redact_int8_layer_major_with_threads`; the
+complete-document equivalents start with `redact_int8_document` and use the
+same suffixes. The native redactors also expose `redact_layer_major` for
+callers that already own the engine and its prefill reservation.
+
 ## Validation status
 
 Regression sources cover command routing, detector scope, verification opt-out,

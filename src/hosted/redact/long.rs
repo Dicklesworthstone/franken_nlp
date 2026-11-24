@@ -15,10 +15,30 @@ impl NlpEngine {
         planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
         config: RedactConfig<LongRedactionConfig>, pseudonyms: Option<RedactionPseudonyms>, cancellation: CancellationToken)
         -> Result<HostedOutput<LongRedactionRun>, HostedError> {
+        self.redact_int8_document_scheduled(model, source, planner, vocabulary, config, pseudonyms, None, cancellation)
+    }
+
+    /// One bounded prompt workspace serves every original and edited chunk.
+    #[allow(clippy::too_many_arguments)]
+    pub fn redact_int8_document_layer_major(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: RedactConfig<LongRedactionConfig>, pseudonyms: Option<RedactionPseudonyms>,
+        prefill: Int8PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedOutput<LongRedactionRun>, HostedError> {
+        self.redact_int8_document_scheduled(model, source, planner, vocabulary, config, pseudonyms, Some(prefill), cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn redact_int8_document_scheduled(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: RedactConfig<LongRedactionConfig>, pseudonyms: Option<RedactionPseudonyms>,
+        prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedOutput<LongRedactionRun>, HostedError> {
         dispatch::preflight(self, config.native.run)?;
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), &config.ner_identity)?;
         let required = requirements(config.native)?;
+        let scratch_bytes = team::scratch_bytes(config.native, required, prefill)?;
         validate_document(&config, source.len(), planner.tokenizer_digest(), *planner.template_digest(), required.kv_bytes)?;
         check_encoding_preparation(&planner, config.preparation_reserve_bytes)?;
         let bytes = input_bytes(&source, &config, pseudonyms.as_ref())?;
@@ -39,12 +59,15 @@ impl NlpEngine {
             let pseudonyms = pseudonym_context(input.value.pseudonyms.as_ref(), &config.request)?;
             let output = output_claim(&lease, config.detector.max_result_bytes, 0)?;
             let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-            let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-                sum(&[required.rope_bytes, required.scratch_payload_bound, config.native.allocator_reserve_bytes])?)?;
+            let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch_bytes)?;
             let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value
                 .engine(config.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            let result = allocate(output, || redactor.redact(&input.value.source, &config.request,
-                pseudonyms.as_ref(), &mut engine.value, &input.value.vocabulary, control).map_err(document_error))?;
+            let result = allocate(output, || match prefill {
+                None => redactor.redact(&input.value.source, &config.request,
+                    pseudonyms.as_ref(), &mut engine.value, &input.value.vocabulary, control),
+                Some(prefill) => redactor.redact_layer_major(&input.value.source, &config.request,
+                    pseudonyms.as_ref(), &mut engine.value, &input.value.vocabulary, prefill, control),
+            }.map_err(document_error))?;
             drop(engine);
             drop(pseudonyms);
             drop(redactor);
@@ -53,6 +76,52 @@ impl NlpEngine {
             drop(lease);
             Ok(GuardedOutput::new(result.value, result._memory))
         })
+    }
+
+    /// One fixed team spans the complete original map, edit and fresh
+    /// transformed-source map, including all source-grounding checks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn redact_int8_document_with_threads(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: RedactConfig<LongRedactionConfig>, pseudonyms: Option<RedactionPseudonyms>,
+        kernel: Int8Kernel, compute_threads: usize, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<LongRedactionRun>, HostedError> {
+        self.redact_int8_document_team(model, source, planner, vocabulary, config, pseudonyms,
+            kernel, compute_threads, None, cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn redact_int8_document_layer_major_with_threads(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: RedactConfig<LongRedactionConfig>, pseudonyms: Option<RedactionPseudonyms>,
+        kernel: Int8Kernel, compute_threads: usize, prefill: Int8PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<LongRedactionRun>, HostedError> {
+        self.redact_int8_document_team(model, source, planner, vocabulary, config, pseudonyms,
+            kernel, compute_threads, Some(prefill), cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn redact_int8_document_team(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: RedactConfig<LongRedactionConfig>, pseudonyms: Option<RedactionPseudonyms>,
+        kernel: Int8Kernel, compute_threads: usize, prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<LongRedactionRun>, HostedError> {
+        let max_result_bytes = config.detector.max_result_bytes;
+        let temporary_bytes = document_temporary_bytes(&config)?;
+        team::run(self, model, source, planner, vocabulary, config, pseudonyms,
+            kernel, compute_threads, prefill, max_result_bytes, temporary_bytes, cancellation, validate_document,
+            |input, engine, prefill, control| {
+                let config = &input.config;
+                let redactor = Int8DocumentRedactor::new(&input.planner, config.ner_identity.clone(), config.detector.clone())
+                    .map_err(document_error)?;
+                let pseudonyms = pseudonym_context(input.pseudonyms.as_ref(), &config.request)?;
+                match prefill {
+                    None => redactor.redact(&input.source, &config.request,
+                        pseudonyms.as_ref(), engine, &input.vocabulary, control),
+                    Some(prefill) => redactor.redact_layer_major(&input.source, &config.request,
+                        pseudonyms.as_ref(), engine, &input.vocabulary, prefill, control),
+                }.map_err(document_error)
+            })
     }
 }
 fn document_error(error: LongRedactionError) -> HostedError {

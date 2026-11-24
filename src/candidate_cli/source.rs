@@ -8,7 +8,7 @@ use crate::{
         source_planning::{SourcePlanningLimits, SourceTaskRequest}},
 };
 
-mod prefill;
+pub(super) mod prefill;
 
 pub(super) const OPTIONS_BYTES: usize = 16 * 1024;
 pub(super) const MAX_PASSAGES: usize = 32;

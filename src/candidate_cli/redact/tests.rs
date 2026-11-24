@@ -193,3 +193,117 @@ fn explicit_byte_redaction_preserves_default_admission_and_has_no_encoding_allow
     assert_eq!(explicit.host.preparation_mib, 512);
     assert_eq!(explicit.encoding_policy(explicit_limits).unwrap(), (UntrustedEncoding::ByteFallback, None));
 }
+
+fn scheduled(extra: &[&str]) -> RedactCommand {
+    let mut command = command(extra);
+    command.host.memory_mib = 16_384;
+    command
+}
+
+#[test]
+fn one_shot_redaction_schedules_compose_without_changing_semantic_or_encoding_authority() {
+    for chunked in [false, true] {
+        for compact in [false, true] {
+            let mut base = Vec::new();
+            if chunked { base.push("--chunked"); }
+            if compact { base.extend(["--input-encoding", "safe-bpe-v1"]); }
+            let ordinary = scheduled(&base);
+            let (_, ordinary_limits) = ordinary.validate().unwrap();
+            let policy = ordinary.encoding_policy(ordinary_limits).unwrap();
+            for extra in [
+                vec!["--compute-threads", "4"],
+                vec!["--prefill-rows", "7"],
+                vec!["--compute-threads", "4", "--prefill-rows", "7"],
+            ] {
+                let mut arguments = base.clone(); arguments.extend(extra);
+                let command = scheduled(&arguments);
+                let (common, limits) = command.validate().unwrap();
+                let mut expected = ordinary_limits;
+                expected.compute = command.compute.admit_prefill(command.prefill.limits().unwrap()).unwrap();
+                assert_eq!(limits, expected);
+                assert_eq!(common.compute, command.compute);
+                assert!(common.policy.prefill().unwrap().is_none(), "source scheduling has no sampler policy");
+                assert_eq!(command.encoding_policy(limits).unwrap(), policy);
+                assert_eq!(serde_json::to_vec(&command.request()).unwrap(),
+                    serde_json::to_vec(&ordinary.request()).unwrap());
+                assert_eq!(command.host.task_budget(limits), ordinary.host.task_budget(ordinary_limits));
+            }
+        }
+    }
+}
+
+#[test]
+fn redaction_worker_and_prompt_storage_coexist_with_both_preparation_owners() {
+    use crate::native_engine::strict_int8::{prefill::Int8PrefillLimits,
+        projection::int8_team_workspace_bytes_with_prefill};
+    for chunked in [false, true] {
+        let mut arguments = vec!["--compute-threads", "4", "--prefill-rows", "7"];
+        if chunked { arguments.push("--chunked"); }
+        let mut command = scheduled(&arguments);
+        let (_, limits) = command.validate().unwrap();
+        let native = Int8MemoryRequirement::for_context(command.host.context_tokens).unwrap();
+        let worker_bytes = int8_team_workspace_bytes_with_prefill(4, 7).unwrap();
+        let prompt_bytes = Int8PrefillLimits::required_extra_scratch_bytes(7).unwrap();
+        let result = command.host.max_result_bytes as u64;
+        let edit = command.edit_reserve_mib * MIB;
+        let temporary = if chunked {
+            let config = command.long.config(&command.host, limits, NerOptions::default()).unwrap();
+            let count = config.mapping.chunks.max_chunks as u64;
+            4 * (config.per_chunk.max_output_bytes * count
+                + config.mapping.reduction.max_live_value_bytes as u64)
+                + 8 * u64::from(config.per_chunk.max_output_tokens) * count + edit
+        } else { 4 * result + 8 * command.host.max_new_tokens as u64 + edit };
+        let expected = limits.weight_bytes + 192 * MIB + 2 * limits.preparation_bytes
+            + native.kv_bytes + native.rope_bytes + native.scratch_payload_bound + 64 * MIB
+            + worker_bytes + prompt_bytes + 4 * result + 4096 + 65_536 + 64 * 1024
+            + command.host.max_input_bytes as u64 + 1 + 4096 + temporary;
+        assert_eq!(limits.compute.workspace_bytes, worker_bytes);
+        assert_eq!(command.compact_peak_bytes(limits, edit).unwrap(), expected);
+        command.host.memory_mib = expected.div_ceil(MIB) - 1;
+        assert!(matches!(command.validate(), Err(CandidateError::Arguments)));
+        command.host.memory_mib += 1;
+        assert!(command.validate().is_ok());
+    }
+}
+
+#[test]
+fn invalid_or_unimplemented_redaction_schedules_refuse_before_private_io() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private input"); } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("output"); }
+        fn flush(&mut self) -> io::Result<()> { panic!("flush"); }
+    }
+    for extra in [
+        vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+        vec!["--prefill-rows", "0"], vec!["--prefill-rows", "65"],
+        vec!["--ndjson", "--compute-threads", "4"],
+        vec!["--ndjson", "--chunked", "--prefill-rows", "4"],
+        vec!["--ndjson", "--store-results", "--compute-threads", "4",
+            "--job-dir", "private-job", "--job-id", "0123456789abcdef0123456789abcdef",
+            "--job-key-file", "private-key", "--job-limits", "limits.json"],
+    ] {
+        let command = scheduled(&extra);
+        assert!(matches!(command.validate(), Err(CandidateError::Arguments)));
+        assert_eq!(command.execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+    }
+    let mut command = scheduled(&["private.txt", "--compute-threads", "64", "--prefill-rows", "64",
+        "--action", "pseudonymize", "--key-stdin", "--key-id", "k", "--namespace", "scope"]);
+    command.host.memory_mib = 1024;
+    assert_eq!(command.execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+}
+
+#[test]
+fn explicit_serial_redaction_preserves_existing_defaults() {
+    let default = command(&[]);
+    let explicit = command(&["--compute-threads", "1"]);
+    assert!(default.prefill.limits().unwrap().is_none());
+    assert_eq!(default.validate().unwrap().1, explicit.validate().unwrap().1);
+    for value in ["-1", "4.0", "NaN", "9999999999999999999999999999999"] {
+        for flag in ["--compute-threads", "--prefill-rows"] {
+            assert!(super::super::definition().try_get_matches_from([
+                "candidate", "redact", "--model", "local.fnlpq", "--memory-mib", "16384", flag, value,
+            ]).is_err());
+        }
+    }
+}

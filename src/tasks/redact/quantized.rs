@@ -9,7 +9,8 @@ use crate::{
     grammar::mask::MaskWorkLimits,
     native_engine::{constrained::JsonWorkBudget, constrained_int8::{self, Int8JsonBudget},
         decode::{DecodeCancellationKind, DecodeStepControl}, kv::KV_BYTES_PER_TOKEN,
-        strict_int8::{Int8RunBudget, Int8Work, StrictInt8Engine, StrictInt8Error, STRICT_INT8_PROFILE}},
+        strict_int8::{Int8RunBudget, Int8Work, StrictInt8Engine, StrictInt8Error, STRICT_INT8_PROFILE,
+            prefill::Int8PrefillLimits}},
     tasks::{extract::{ExtractionVocabulary, quantized::check_size}, ir::{PlanContext, TaskBudget},
         ner::{EntityType, NerOptions, NerResult, NER_TASK_VERSION},
         source_planning::{SourcePlanningLimits, SourceTaskPlanner, SourceTaskRequest, SourceTaskResult,
@@ -143,9 +144,30 @@ impl<'p> Int8Redactor<'p> {
     pub fn redact<C: DecodeStepControl>(&self, source: &str, request: &RedactionRequest,
         pseudonyms: Option<&Pseudonyms<'_>>, engine: &mut StrictInt8Engine<'_>,
         vocabulary: &ExtractionVocabulary, control: &mut C) -> Result<Int8RedactionRun, Int8RedactionError> {
+        self.redact_scheduled(source, request, pseudonyms, engine, vocabulary, None, control)
+    }
+
+    /// Apply the same bounded prompt schedule to the original and fresh edited
+    /// source. The caller retains the additional prefill workspace and any
+    /// installed projection team across both passes and final verification.
+    #[allow(clippy::too_many_arguments)]
+    pub fn redact_layer_major<C: DecodeStepControl>(&self, source: &str, request: &RedactionRequest,
+        pseudonyms: Option<&Pseudonyms<'_>>, engine: &mut StrictInt8Engine<'_>,
+        vocabulary: &ExtractionVocabulary, prefill: Int8PrefillLimits, control: &mut C)
+        -> Result<Int8RedactionRun, Int8RedactionError> {
+        self.redact_scheduled(source, request, pseudonyms, engine, vocabulary, Some(prefill), control)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn redact_scheduled<C: DecodeStepControl>(&self, source: &str, request: &RedactionRequest,
+        pseudonyms: Option<&Pseudonyms<'_>>, engine: &mut StrictInt8Engine<'_>,
+        vocabulary: &ExtractionVocabulary, prefill: Option<Int8PrefillLimits>, control: &mut C)
+        -> Result<Int8RedactionRun, Int8RedactionError> {
         checkpoint(control)?;
+        if let Some(prefill) = prefill { prefill.validate()?; }
         check_engine(&self.identity, engine, self.config.per_pass.max_kv_bytes)?;
-        let mut pass = Pass { recipe: self, engine, vocabulary, control, ledger: Ledger::new(&self.config, request.verify)? };
+        let mut pass = Pass { recipe: self, engine, vocabulary, prefill, control,
+            ledger: Ledger::new(&self.config, request.verify)? };
         self.run_pipeline(source, request, pseudonyms, &mut pass)
     }
 
@@ -202,7 +224,8 @@ impl<'p> Int8Redactor<'p> {
 
 struct Pass<'a, 'p, 'w, C> {
     recipe: &'a Int8Redactor<'p>, engine: &'a mut StrictInt8Engine<'w>,
-    vocabulary: &'a ExtractionVocabulary, control: &'a mut C, ledger: Ledger,
+    vocabulary: &'a ExtractionVocabulary, prefill: Option<Int8PrefillLimits>,
+    control: &'a mut C, ledger: Ledger,
 }
 impl<C: DecodeStepControl> NerPass for Pass<'_, '_, '_, C> {
     type Error = Int8RedactionError;
@@ -215,12 +238,16 @@ impl<C: DecodeStepControl> NerPass for Pass<'_, '_, '_, C> {
         let work = plan.planned_work();
         self.ledger.reserve(work)?;
         let config = &self.recipe.config;
-        let run = plan.execute_with_control(plan.execution_identity(), self.engine, self.vocabulary,
-            Int8JsonBudget { native: Int8RunBudget::exact(work), json: JsonWorkBudget {
-                max_forward_positions: work.forward_positions, max_projected_logits: work.projected_logits,
-                max_kv_bytes: config.per_pass.max_kv_bytes, max_total_mask_node_visits: config.mask_visits_per_pass,
-                mask_limits: config.mask_limits,
-            } }, self.control)?;
+        let budget = Int8JsonBudget { native: Int8RunBudget::exact(work), json: JsonWorkBudget {
+            max_forward_positions: work.forward_positions, max_projected_logits: work.projected_logits,
+            max_kv_bytes: config.per_pass.max_kv_bytes, max_total_mask_node_visits: config.mask_visits_per_pass,
+            mask_limits: config.mask_limits,
+        } };
+        let run = match self.prefill {
+            None => plan.execute_with_control(plan.execution_identity(), self.engine, self.vocabulary, budget, self.control),
+            Some(prefill) => plan.execute_layer_major_with_control(plan.execution_identity(), self.engine,
+                self.vocabulary, budget, prefill, self.control),
+        }?;
         if self.engine.is_poisoned() || !self.engine.kv_cache().all_slots_have_len(0) {
             return Err(Int8RedactionError::InvalidResult);
         }

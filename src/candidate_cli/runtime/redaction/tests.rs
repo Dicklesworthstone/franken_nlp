@@ -176,6 +176,8 @@ fn compact_cancellation_remains_typed_through_planning_and_host_errors() {
         assert_eq!(planning_error(Int8RedactionError::Source(nested())), expected);
         assert_eq!(execution_error(HostedError::Redaction(Int8RedactionError::Source(nested()))), expected);
         assert_eq!(execution_error(HostedError::Redaction(Int8RedactionError::Cancelled(cause))), expected);
+        assert_eq!(execution_error(HostedError::Native(
+            crate::native_engine::strict_int8::StrictInt8Error::Cancelled(cause))), expected);
     }
     assert_eq!(encoding_receipt(&planner).unwrap().unwrap().work, SafeBpeWork::default());
     assert_eq!(planning_error(Int8RedactionError::Identity), CandidateError::Identity);
@@ -239,4 +241,47 @@ fn runtime_rejects_stale_or_invalid_admission_before_private_io() {
         }
         assert_eq!(execute(command, common, limits, &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
     }
+}
+
+#[test]
+fn scheduled_redaction_rejects_stale_worker_or_prompt_admission_before_private_io() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> { panic!("private read"); } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> { panic!("publication"); }
+        fn flush(&mut self) -> std::io::Result<()> { panic!("flush"); }
+    }
+    for chunked in [false, true] {
+        for axis in 0..4 {
+            let mut args = vec!["--compute-threads", "4", "--prefill-rows", "7"];
+            if chunked { args.push("--chunked"); }
+            let mut command = compact(&args);
+            let (common, mut limits) = command.validate().unwrap();
+            match axis {
+                0 => limits.compute.threads = 3,
+                1 => limits.compute.workspace_bytes -= 1,
+                2 => command.prefill = Default::default(),
+                _ => command.compute = Default::default(),
+            }
+            assert_eq!(execute(command, common, limits, &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+        }
+    }
+}
+
+#[test]
+fn compute_metadata_remains_optional_and_separate_from_compact_policy() {
+    let value = serde_json::json!({"fixture_kind":"publication-shape-only","output":{"edited_text":"[EMAIL]"}});
+    let (byte, _) = planner().unwrap();
+    let scheduled = compute::Response { response: &value, compute: None };
+    let response = EncodedResponse { response: &scheduled, input_encoding: encoding_receipt(&byte).unwrap() };
+    assert_eq!(serde_json::to_vec(&response).unwrap(), serde_json::to_vec(&value).unwrap());
+    let command = compact(&["--compute-threads", "4", "--prefill-rows", "7"]);
+    let (_, limits) = command.validate().unwrap();
+    let compact = compact_planner(&command, limits);
+    let encoded = EncodedResponse { response: &scheduled, input_encoding: encoding_receipt(&compact).unwrap() };
+    let encoded: serde_json::Value = serde_json::to_value(&encoded).unwrap();
+    assert!(encoded.get("compute").is_none());
+    assert_eq!(encoded["output"], value["output"]);
+    assert_eq!(encoded["input_encoding"]["complete_limits"],
+        serde_json::to_value(compact.map_document_encoding_limits().unwrap()).unwrap());
 }

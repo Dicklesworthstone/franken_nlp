@@ -227,6 +227,32 @@ requires the embedding application to retain its resource/error-output guards.
 It is not a model activation receipt. Private prompt/source digests and generated
 NER token transcripts are not exported by the long-redaction envelope.
 
+
+## Persistent INT8 workers and bounded prompt prefill
+
+The INT8 `candidate redact --chunked` route now accepts
+`--compute-threads 1..=64` and optional `--prefill-rows 1..=64`.
+One fixed team and one native engine serve the complete original map and the
+fresh map of the edited source. Prompt morsels use the same team as subsequent
+constrained decoding; they do not change partitioning or create document
+cohorts. The existing byte and compact input policies both compose with these
+physical schedules.
+
+Worker buffers and coordinator prompt scratch are admitted together with the
+full map frontier, editing storage, output and both preparation owners. A
+single cumulative compact operation still covers every accepted/rejected
+sizing probe and both detection stages. Every worker joins before the guarded
+completed result is returned. Optional `compute` counters are separate from
+semantic output and do not change detector identity.
+
+See the [redaction CLI guide](candidate-redaction-cli.md#persistent-int8-workers-and-bounded-prompt-prefill)
+for invocation examples and the matching hosted/native APIs. This initial INT8
+scheduling increment covers one-shot short and complete documents; population
+schedules remain refused until their complete-stream ownership is implemented.
+Regression definitions have received source review; compilation, executable
+tests, real-model equivalence and performance remain pending the required
+controller-owned DSR checkpoint.
+
 ## Grouped INT4 documents and explicit native chunk cohorts
 
 `fnlp candidate source-int4 redact-document` provides the same complete-document

@@ -7,7 +7,7 @@ use clap::ValueEnum;
 use crate::tasks::{ner::NerOptions, redact::{PiiKind, RedactionRequest,
     actions::RedactionAction, pseudonym::PseudonymKey}};
 use crate::tokenizer::untrusted::{SafeBpeWorkLimits, UntrustedEncoding};
-use source::SourceHostArgs;
+use source::{SourceHostArgs, prefill::SourcePrefillArgs};
 
 #[derive(Clone, Copy, Eq, PartialEq, ValueEnum)]
 pub(super) enum Action { Mask, Placeholder, Pseudonymize }
@@ -29,6 +29,11 @@ pub(crate) struct RedactCommand {
     pub(super) input: PathBuf,
     #[command(flatten)]
     pub(super) host: SourceHostArgs,
+    /// Source scheduling stays separate from free-text generation policy.
+    #[command(flatten)]
+    pub(super) prefill: SourcePrefillArgs,
+    #[arg(skip)]
+    pub(super) compute: compute::Args,
     /// Compact input is admitted only for one complete redaction operation.
     #[arg(skip)]
     pub(super) encoding: input_encoding::InputEncodingArgs,
@@ -73,10 +78,11 @@ pub(crate) struct RedactCommand {
 }
 
 pub(super) fn definition() -> clap::Command {
-    input_encoding::definition(RedactCommand::augment_args(clap::Command::new("redact")
+    compute::definition(input_encoding::definition(RedactCommand::augment_args(clap::Command::new("redact")
         .about("Redact with native source-bound NER plus rules; verify the edited text afresh")
         .after_help("Verification covers only the selected detector union, not all PII. Model omissions and Unicode obfuscations remain possible. Pseudonyms are not anonymization. By default this candidate command emits one completed JSON object, never intermediate NER text. Pseudonymization always uses full 256-bit HMAC; raw key bytes have no argv option. Add --chunked for long documents: rules scan whole text while NER uses source-aligned chunks, then verification re-chunks the actual edited text. NER chunk boundaries may split entities; per-document work ceilings never renew per chunk. Add --ndjson for an owned corpus stream with one resident engine, fixed policy/key scope and independent whole-corpus ceilings. Completed document events remain valid if later records fail; any failed record yields a nonzero exit. Records cannot override actions, keys, types, chunking or verification. Add --store-results with --job-dir, --job-id, --job-key-file and --job-limits for explicit private retention. Save original envelopes only with --spool-input --max-retained-input-mib N; --resume --use-retained-input --max-retained-input-mib N restores them without a population positional argument or population stdin read. Otherwise resume requires the complete original population. Policy and both key scopes remain unchanged. Retained mode emits metadata only, and an error may follow durable progress. It requires metadata-store on supported Linux targets. The independent fnlp redact --rules-only command remains model-free."))
-    )
+    ))
+        .mut_arg("compute_threads", |arg| arg.help("Coordinator plus persistent INT8 row workers, 1..=64; one team spans original detection and fresh edited-text verification, including every chunk. Runtime threads are additional. Composes with --prefill-rows. One-shot redaction only; population scheduling is refused"))
         .mut_arg("preparation_mib", |arg| arg
             .default_value_if("input_encoding", clap::builder::ArgPredicate::Equals("safe-bpe-v1".into()), "1024")
             .help("Preparation memory in MiB; defaults to 512 for byte input or 1024 for compact redaction, including edited-text tokenizer workspace"))
@@ -88,19 +94,30 @@ impl RedactCommand {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let mut command = Self::from_arg_matches(matches)?;
         command.encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+        command.compute = compute::Args::from_matches(matches)?;
         Ok(command)
     }
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), CandidateError> {
+        let prefill = self.prefill.limits()?;
+        let compute = self.compute.admit_prefill(prefill)?;
+        // Population scheduling needs one team across the complete stream or
+        // retained invocation, including physical drain and terminal delivery.
+        if (compute.threads > 1 || prefill.is_some())
+            && (self.corpus.ndjson || self.retention.store_results) {
+            return Err(CandidateError::Arguments);
+        }
         if !self.encoding.is_default() && !self.long.chunked
             && (self.corpus.ndjson || self.retention.store_results) {
             return Err(CandidateError::Arguments);
         }
         // Long documents encode bounded probes and chunks, never the entire
         // original as one call. Price that workspace beside all retained plans.
-        let (mut common, limits) = if self.long.chunked {
+        let (mut common, mut limits) = if self.long.chunked {
             self.host.common(self.input.clone())?
         } else { self.host.common_with_encoding(self.input.clone(), &self.encoding)? };
         common.input_encoding = self.encoding.clone();
+        common.compute = self.compute;
+        limits.compute = compute;
         self.long.validate(&self.host, limits)?;
         if self.rules.is_empty() || !(1..=16_384).contains(&self.max_detections)
             || self.max_rule_work == 0 || self.max_rule_work > 1_000_000_000_000
@@ -120,7 +137,8 @@ impl RedactCommand {
             self.namespace.as_deref(), self.expected_key_commitment.as_deref())?;
         self.corpus.validate(self, limits)?;
         let (_, complete) = self.encoding_policy(limits)?;
-        if complete.is_some() && self.compact_peak_bytes(limits, edit)? > limits.memory_bytes {
+        if (complete.is_some() || compute.threads > 1 || prefill.is_some())
+            && self.compact_peak_bytes(limits, edit)? > limits.memory_bytes {
             return Err(CandidateError::Arguments);
         }
         Ok((common, limits))
@@ -170,7 +188,9 @@ impl RedactCommand {
                 .and_then(|n| n.checked_add(self.host.max_new_tokens as u64 * 8))
                 .and_then(|n| n.checked_add(edit_bytes)).ok_or(CandidateError::Arguments)?
         };
-        [peak, self.host.max_input_bytes as u64 + 1, 4096, temporary]
+        let prefill_bytes = self.prefill.limits()?.map(|limits| limits.validate())
+            .transpose().map_err(|_| CandidateError::Arguments)?.unwrap_or(0);
+        [peak, self.host.max_input_bytes as u64 + 1, 4096, temporary, prefill_bytes]
             .into_iter().try_fold(0_u64, |sum, bytes| sum.checked_add(bytes))
             .ok_or(CandidateError::Arguments)
     }
