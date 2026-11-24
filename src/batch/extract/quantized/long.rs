@@ -16,6 +16,8 @@ use crate::{
         SourceOccurrence, FieldGroundingError, GroundingScanError, scan_occurrences_with_checkpoints},
 };
 mod execution;
+/// Explicit partial-root-object extraction and exact complete-document reconciliation.
+pub mod object;
 /// Bounded corpus transport over complete documents and one native driver.
 pub mod stream;
 

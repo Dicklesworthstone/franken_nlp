@@ -10,7 +10,7 @@ use crate::{canonjson, execution_identity::Sha256Digest,
     grammar::{CompileLimits, SchemaNode, SourceAnnotation, runtime::JsonValidationSchema},
     native_engine::decode::{DecodeCancellationKind, DecodeStepControl},
     validation::{JsonValue, grounded_fields::{GroundingBudget, SourceFieldEvidence,
-        SourceOccurrence, VerifiedSourceSpan, scan_occurrences}},
+        SourceOccurrence, VerifiedSourceSpan, GroundingScanError, scan_occurrences_with_checkpoints}},
 };
 use super::array_union::{self, RootArrayUnionError, RootArrayUnionLimits, Writer};
 
@@ -182,6 +182,9 @@ impl RootObjectResult {
     pub fn original_source_fields(&self) -> &[SourceFieldEvidence] { &self.original_source_fields }
     pub fn verification_used(&self) -> RootObjectVerification { self.verification_used }
     pub(crate) fn binding(&self) -> Sha256Digest { self.binding }
+    /// Process-private authority for a containing task's completion seal.
+    /// Never serialize or format a fingerprint of source-derived chunk content.
+    pub(crate) fn map_binding(&self) -> &[u8; 32] { &self.mapped_digest }
     pub(crate) fn matches_chunks<'a>(&self, chunks: impl Iterator<Item = ObjectChunk<'a>>) -> bool {
         let mut hash = map_hasher();
         for chunk in chunks { hash_chunk(&mut hash, &chunk); }
@@ -308,7 +311,11 @@ fn verify_fields<C: DecodeStepControl>(schema: &SchemaNode, value: &JsonValue, s
     match (schema, value) {
         (SchemaNode::String { source: SourceAnnotation::Verbatim, .. }, JsonValue::String(text)) => {
             budget.max_fields = budget.max_fields.checked_sub(1).ok_or(RootObjectError::Limit)?;
-            let spans = scan_occurrences(source, text, budget).map_err(|_| RootObjectError::Source)?;
+            let spans = scan_occurrences_with_checkpoints(source, text, budget, || poll(control))
+                .map_err(|error| match error {
+                    GroundingScanError::Checkpoint(error) => error,
+                    GroundingScanError::Verification(_) => RootObjectError::Source,
+                })?;
             poll(control)?;
             let occurrence = if spans.len() == 1 { SourceOccurrence::Anchored } else { SourceOccurrence::Ambiguous };
             fields.try_reserve(1).map_err(|_| RootObjectError::Allocation)?;

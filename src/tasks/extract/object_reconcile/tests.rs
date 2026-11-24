@@ -284,3 +284,30 @@ fn derivation_and_final_reconciliation_preserve_every_original_cancellation_caus
         }
     }
 }
+
+
+#[test]
+fn final_object_source_scan_interrupts_inside_large_unicode_census_without_refunding_work() {
+    let derived = schema(r#"{"type":"object","additionalProperties":false,"required":["quote"],"properties":{"quote":{"type":"string","maxLength":16,"x-fnlp-source":"verbatim"}}}"#);
+    let source = "é".repeat(12_288);
+    use DecodeCancellationKind::*;
+    for text in ["", "é", "absent"] {
+        let parsed = value(&format!("{{\"quote\":{}}}", serde_json::to_string(text).unwrap()));
+        for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+            ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+            let mut control = Control { polls: 0, stop: 4, cause };
+            let mut budget = GroundingBudget::default(); let before = budget;
+            let mut fields = Vec::new();
+            // Root/field entry and scan admission are the first three polls.
+            // The fourth is INSIDE the bounded scan, before completion/absence.
+            let error = verify_fields(derived.original.root(), &parsed, &source, "$",
+                &mut budget, &mut fields, &mut control).err().unwrap();
+            assert_eq!(error, RootObjectError::Cancelled(cause)); assert_eq!(control.polls, 4);
+            assert!(fields.is_empty());
+            assert_eq!(budget.max_fields, before.max_fields - 1);
+            assert_eq!(budget.max_matches, before.max_matches);
+            assert_eq!(budget.max_scan_steps,
+                before.max_scan_steps - ((source.len() + text.len() + 1) * 8) as u64);
+        }
+    }
+}
