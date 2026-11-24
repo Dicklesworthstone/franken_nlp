@@ -113,15 +113,4 @@ fn check_population_memory(args: &ScoreJobArgs, host: JobHostLimits, job: JobLim
     Ok(())
 }
 
-/// Selected physical schedule, reported only after hosted worker drain.
-/// Omitted default fields preserve the existing serial metadata bytes.
-#[derive(Serialize)]
-struct ScheduledResponse<'a, T: Serialize> {
-    #[serde(flatten)] response: &'a T,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    compute_threads: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prefill_rows: Option<usize>,
-}
-
 #[cfg(test)] mod tests;

@@ -112,12 +112,9 @@ fn host_limits(args: &JobArgs, common: &CandidateArgs, limits: Limits, session: 
         serialization_reserve_bytes: args.serialization_memory_mib.checked_mul(MIB).ok_or_else(|| Failure::usage("job_memory"))? })
 }
 fn preflight_memory(host: JobHostLimits, job: JobLimits, limits: Limits, input: JobInputMemory,
-    encoding_workspace_bytes: u64) -> Result<(), Failure> {
-    let buffers = host.required_buffer_bytes_for_input(job, input).map_err(host_failure)?
-        .checked_add(encoding_workspace_bytes).ok_or_else(|| Failure::usage("job_memory_arithmetic"))?;
-    // Necessary bound only; the real host additionally admits KV/workspace,
-    // resident metadata and guarded output. Do not call this a memory permit.
-    let minimum = buffers.checked_add(limits.preparation_bytes).and_then(|n| n.checked_add(limits.weight_bytes))
+    task_workspace_bytes: u64, native_bytes: u64) -> Result<(), Failure> {
+    let buffers = host.required_buffer_bytes_for_input(job, input).map_err(host_failure)?;
+    let minimum = buffers.checked_add(task_workspace_bytes).and_then(|bytes| bytes.checked_add(native_bytes))
         .ok_or_else(|| Failure::usage("job_memory_arithmetic"))?;
     if minimum > limits.memory_bytes {
         return Err(Failure { exit: ErrorCode::AdmissionOrResourceLimit, code: "job_population_memory" });
@@ -147,11 +144,34 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     let encoding_workspace_bytes = args.encoding_workspace_bytes(limits)?;
     // Declared first: preparation/input/factory/result storage drops BEFORE its
     // charge. No key/config/model IO occurs before this preparation admission.
-    let session = Session::new(&common, limits)?;
+    let prefill = args.prefill.limits()?;
+    if common.compute != args.compute || limits.compute != args.compute.admit_prefill(prefill)? {
+        return Err(Failure::usage("job_schedule_admission"));
+    }
+    let session = Session::new_with_prefill(&common, limits, prefill)?;
     let lifetime = command::parse_limits(&read_config(&session, &args.limits_file, command::LIMIT_BYTES)?)?;
     let native = command::native_limits(&args, lifetime)?;
-    preflight_memory(host_limits(&args, &common, limits, &session)?, lifetime, limits,
-        args.input_retention.input_memory()?, encoding_workspace_bytes)?;
+    let scheduled = prefill.is_some() || limits.compute.threads > 1;
+    // One record owns the output guard. Lifetime work can span millions of
+    // records and is not a concurrent memory requirement.
+    let native_bytes = |result_bytes: u64, output_tokens: u64| -> Result<u64, Failure> {
+        if !scheduled {
+            return limits.weight_bytes.checked_add(limits.preparation_bytes)
+                .ok_or_else(|| Failure::usage("job_memory_arithmetic"));
+        }
+        let requirement = Int8MemoryRequirement::for_context(common.context_tokens)
+            .map_err(|_| Failure::usage("job_native_memory"))?;
+        // Host buffers already include the transferred preparation owner.
+        // request_peak_bytes includes the separate caller preparation charge.
+        let peak = compute::request_peak_bytes(limits, requirement, result_bytes,
+            output_tokens, 0, 0)?;
+        peak.checked_add(prefill.map_or(0, |p| p.max_extra_scratch_bytes))
+            .ok_or_else(|| Failure::usage("job_memory_arithmetic"))
+    };
+    let early_host = host_limits(&args, &common, limits, &session)?;
+    let input_memory = args.input_retention.input_memory()?;
+    preflight_memory(early_host, lifetime, limits, input_memory, encoding_workspace_bytes,
+        native_bytes(args.host.max_result_bytes as u64, args.host.max_new_tokens as u64)?)?;
     let key = JobSecret::read(&args.key_file).map_err(job_failure)?;
     session.remaining()?;
     let defaults = args.defaults.as_ref().map(|path| read_config(&session, path, command::DEFAULT_BYTES)).transpose()?;
@@ -170,6 +190,29 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
         (Some(_), Some(_)) => return Err(Failure::usage("source_document_job_options")),
     };
     check_encoding_quote(&prepared, &encoding, encoding_work_limits, encoding_workspace_bytes)?;
+    if scheduled {
+        use crate::hosted::corpus::jobs::{extraction_document_job_workspace, source_document_job_workspace};
+        let document = match &prepared {
+            PreparedJob::Document { planner, reduction_reserve_bytes } => Some((
+                extraction_document_job_workspace(planner, *reduction_reserve_bytes),
+                planner.document_limits().mapping.chunks.max_chunks,
+                planner.document_limits().mapping.reduction.max_result_bytes as u64)),
+            PreparedJob::SourceDocument { planner, reduction_reserve_bytes } => Some((
+                source_document_job_workspace(planner, *reduction_reserve_bytes),
+                planner.document_limits().chunks.max_chunks,
+                planner.reduction_policy().map_or(planner.document_limits().reduction.max_result_bytes as u64,
+                    |policy| policy.max_result_bytes()))),
+            _ => None,
+        };
+        if let Some((workspace, chunks, result_bytes)) = document {
+            let tokens = (chunks as u64).checked_mul(args.host.max_new_tokens as u64)
+                .ok_or_else(|| Failure::usage("job_memory_arithmetic"))?;
+            // Source document workspace already includes compact encoding.
+            preflight_memory(early_host, lifetime, limits, input_memory,
+                workspace.map_err(|error| host_failure(error.into()))?,
+                native_bytes(result_bytes, tokens)?)?;
+        }
+    }
     // Only owned IO crosses the worker boundary; retained replay supplies no
     // external population reader and is restored by the locked job owner.
     let reader = command::population_reader(mode, args.input_retention, &args.input, input, IO_BYTES)?;
@@ -182,15 +225,17 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     // The host either ingests the supplied population or authenticates retained
     // inputs under one job lock. Exact typed-population/recipe binding precedes
     // repair and native forwards. Committed results are skipped by JobRunner.
+    let team = (limits.compute.threads > 1).then(||
+        (crate::native_engine::simd::config::process_kernel(), limits.compute.threads));
     let progress = match prepared {
-        PreparedJob::Source { planner, config } => session.engine.job_int8_source(&model, planner,
-            vocabulary, config, request, host, reader, cancellation.clone()),
-        PreparedJob::Extract(planner) => session.engine.job_int8_extract(&model, planner,
-            vocabulary, request, host, reader, cancellation.clone()),
-        PreparedJob::Document { planner, reduction_reserve_bytes } => session.engine.job_int8_extract_document(&model,
-            planner, vocabulary, request, host, reduction_reserve_bytes, reader, cancellation.clone()),
-        PreparedJob::SourceDocument { planner, reduction_reserve_bytes } => session.engine.job_int8_source_document(&model,
-            planner, vocabulary, request, host, reduction_reserve_bytes, reader, cancellation.clone()),
+        PreparedJob::Source { planner, config } => session.engine.job_int8_source_scheduled(&model, planner,
+            vocabulary, config, request, host, prefill, team, reader, cancellation.clone()),
+        PreparedJob::Extract(planner) => session.engine.job_int8_extract_scheduled(&model, planner,
+            vocabulary, request, host, prefill, team, reader, cancellation.clone()),
+        PreparedJob::Document { planner, reduction_reserve_bytes } => session.engine.job_int8_extract_document_scheduled(
+            &model, planner, vocabulary, request, host, reduction_reserve_bytes, prefill, team, reader, cancellation.clone()),
+        PreparedJob::SourceDocument { planner, reduction_reserve_bytes } => session.engine.job_int8_source_document_scheduled(
+            &model, planner, vocabulary, request, host, reduction_reserve_bytes, prefill, team, reader, cancellation.clone()),
     }.map_err(host_failure)?;
     if let Some(cause) = cancellation.cause() { return Err(job_failure(JobError::Cancelled(cause))); }
     session.remaining()?;
@@ -204,6 +249,9 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     let response = EncodingReport { response: &response,
         input_encoding: input_encoding::reported_policy(&encoding),
         invocation_encoding_work_limits: encoding_work_limits };
+    let response = ScheduledResponse { response: &response,
+        compute_threads: team.map(|(_, width)| width),
+        prefill_rows: prefill.map(|limits| limits.max_batch_rows) };
     publish_report(&response, output, &|| session.remaining(), &cancellation)
 }
 
@@ -219,6 +267,17 @@ fn publish_report<T: Serialize>(response: &T, output: &mut impl Write,
         (CandidateError::Execution, Some(cause)) => job_failure(JobError::Cancelled(cause)),
         (error, _) => Failure::from(error),
     })
+}
+
+/// Selected physical schedule, reported only after hosted worker drain.
+/// Omitted default fields preserve the existing serial metadata bytes.
+#[derive(Serialize)]
+struct ScheduledResponse<'a, T: Serialize> {
+    #[serde(flatten)] response: &'a T,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compute_threads: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefill_rows: Option<usize>,
 }
 
 #[derive(Serialize)]

@@ -170,24 +170,25 @@ fn impossible_population_memory_fails_before_resident_loading() {
         transport: PopulationReadLimits { max_stream_bytes: 64 * MIB, max_lines: 1000 },
         preparation_reserve_bytes: limits.preparation_bytes, io_reserve_bytes: 131072,
         journal_reserve_bytes: 64 * MIB, serialization_reserve_bytes: 16 * MIB };
-    preflight_memory(h, lifetime(), limits, JobInputMemory::CompletePopulation, 0).unwrap();
+    let native = limits.weight_bytes + limits.preparation_bytes;
+    preflight_memory(h, lifetime(), limits, JobInputMemory::CompletePopulation, 0, native).unwrap();
     let mut huge = lifetime(); huge.max_snapshot_bytes = i64::MAX as u64;
-    assert!(preflight_memory(h, huge, limits, JobInputMemory::CompletePopulation, 0).is_err());
-    preflight_memory(h, huge, limits, JobInputMemory::RetainedRecord, 0).unwrap();
+    assert!(preflight_memory(h, huge, limits, JobInputMemory::CompletePopulation, 0, native).is_err());
+    preflight_memory(h, huge, limits, JobInputMemory::RetainedRecord, 0, native).unwrap();
     let mut zero = h; zero.journal_reserve_bytes = 0;
-    assert!(preflight_memory(zero, lifetime(), limits, JobInputMemory::CompletePopulation, 0).is_err());
-    assert!(preflight_memory(zero, lifetime(), limits, JobInputMemory::RetainedRecord, 0).is_err());
+    assert!(preflight_memory(zero, lifetime(), limits, JobInputMemory::CompletePopulation, 0, native).is_err());
+    assert!(preflight_memory(zero, lifetime(), limits, JobInputMemory::RetainedRecord, 0, native).is_err());
     let compact = args("ner", &["--input-encoding", "safe-bpe-v1"]);
     let encoder = compact.encoding_workspace_bytes(limits).unwrap();
     for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
         let minimum = h.required_buffer_bytes_for_input(lifetime(), input).unwrap()
             + limits.preparation_bytes + limits.weight_bytes;
         let mut boundary = limits; boundary.memory_bytes = minimum;
-        preflight_memory(h, lifetime(), boundary, input, 0).unwrap();
-        assert_eq!(preflight_memory(h, lifetime(), boundary, input, encoder).unwrap_err().code, "job_population_memory");
+        preflight_memory(h, lifetime(), boundary, input, 0, native).unwrap();
+        assert_eq!(preflight_memory(h, lifetime(), boundary, input, encoder, native).unwrap_err().code, "job_population_memory");
         boundary.memory_bytes += encoder;
-        preflight_memory(h, lifetime(), boundary, input, encoder).unwrap();
-        assert_eq!(preflight_memory(h, lifetime(), boundary, input, u64::MAX).unwrap_err().code, "job_memory_arithmetic");
+        preflight_memory(h, lifetime(), boundary, input, encoder, native).unwrap();
+        assert_eq!(preflight_memory(h, lifetime(), boundary, input, u64::MAX, native).unwrap_err().code, "job_memory_arithmetic");
     }
 }
 

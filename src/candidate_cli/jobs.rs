@@ -47,6 +47,8 @@ pub(super) struct JobArgs {
     #[arg(long, value_parser = ["ner", "keyphrases", "summarize", "answer", "extract"])]
     pub task: String,
     #[command(flatten)] pub host: SourceHostArgs,
+    #[command(flatten)] pub prefill: source::prefill::SourcePrefillArgs,
+    #[arg(skip)] pub compute: compute::Args,
     #[arg(skip)] pub encoding: input_encoding::InputEncodingArgs,
     #[command(flatten)] pub encoding_work: EncodingWorkArgs,
     /// Required consent: retain private native results in the owner-only spool.
@@ -201,10 +203,12 @@ pub(super) fn definition() -> clap::Command {
         .about("Start or resume explicitly retained, non-certified native corpus jobs")
         .long_about("Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. Store private results only with --store-results, a protected existing directory, original key, random job ID and immutable limits. Resume authenticates the complete original input and unchanged task/model recipe, with an explicit retained-input source available. Stdout contains metadata only; errors may follow durable progress. No automatic retry, directory/key creation or release activation. Add --task extract --schema FILE --document-config FILE to retain and resume complete documents larger than one context. One journal result contains independent exact-schema chunk values, never a repaired global object or a partial document. Document settings and the shared schema must remain unchanged on resume. For --task ner, keyphrases or summarize, use --source-document-config FILE instead: fixed task options, complete source-aligned chunk maps and one durable result per original document, without global reranking or summary synthesis.")
         .after_help(INPUT_RETENTION_HELP))
-        .mut_subcommand("start", encoding_definition)
-        .mut_subcommand("resume", encoding_definition)
+        .mut_subcommand("start", |command| compute::definition(encoding_definition(command)))
+        .mut_subcommand("resume", |command| compute::definition(encoding_definition(command)))
 }
 fn encoding_definition(command: clap::Command) -> clap::Command {
+    let command = command.mut_arg("prefill_rows", |arg| arg.help(
+        "Process up to 1..=64 prompt tokens per group. With --compute-threads, one team serves every pending record and document chunk. Either width can change on resume."));
     input_encoding::definition(command).after_long_help("Explicit --input-encoding safe-bpe-v1 supports single-context extract, ner, keyphrases, summarize and answer jobs, plus complete NER/keyphrase/cited-summary documents selected by --source-document-config, including exact reducers. Schema and source share each extraction record's allowance; QA question, passage IDs and all evidence share each answer record's allowance. Complete-source jobs count actual compact tokens and share the same allowance across accepted/discarded partition probes and chunk compilation. One additional --max-total-tokenizer-* invocation ledger spans all records and failed/cancelled preparation without resetting at native handoff or reconstruction. Every per-call and total cap is authenticated: repeat it on resume. A resumed invocation receives that same declared bounded tokenizer allowance while persisted native/mask work and attempts stay spent. Encoder workspace is admitted before private IO and remains charged through physical completion. Compact input changes prompt tokens, preserves original bytes/control containment and makes no tokenizer-parity, identical-output, quality or speed claim. Complete-document schema extraction via --document-config still requires byte-fallback. Byte-fallback remains the default and adds no encoding metadata.")
 }
 impl JobArgs {
@@ -228,8 +232,12 @@ impl JobArgs {
         if !self.encoding.is_default() && self.document_config.is_some() {
             return Err(Failure::usage("document_job_input_encoding"));
         }
-        let (common, limits) = self.host.common_with_encoding(self.input.clone(), &self.encoding)
+        let prefill = self.prefill.limits()?;
+        let (mut common, mut limits) = self.host.common_with_encoding(self.input.clone(), &self.encoding)
             .map_err(Failure::from)?;
+        limits.compute = self.compute.admit_prefill(prefill)?;
+        common.compute = self.compute;
+        compute::check_source_memory(&common, limits, self.host.max_result_bytes, prefill)?;
         let policy = self.encoding_policy(limits)?;
         if self.task == "extract" && !self.encoding.is_default() {
             super::extract::validate_preparation(&self.host, &policy, limits)?;
@@ -289,11 +297,12 @@ impl JobCommand {
         let mut command = Self::from_arg_matches(matches)?;
         let (_, operation) = matches.subcommand().ok_or_else(||
             clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "job operation required"))?;
-        let encoding = input_encoding::InputEncodingArgs::from_matches(operation)?;
-        match &mut command.operation {
-            Operation::Start(args) => args.encoding = encoding,
-            Operation::Resume(args) => args.common.encoding = encoding,
-        }
+        let args = match &mut command.operation {
+            Operation::Start(args) => args,
+            Operation::Resume(args) => &mut args.common,
+        };
+        args.encoding = input_encoding::InputEncodingArgs::from_matches(operation)?;
+        args.compute = compute::Args::from_matches(operation)?;
         Ok(command)
     }
     fn mode(&self) -> RunMode {

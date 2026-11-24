@@ -66,4 +66,4 @@ pub(super) fn checkpoint<C: crate::native_engine::decode::DecodeStepControl>(con
     match control.prefill_checkpoint(0) { Some(cause) => Err(JobError::Cancelled(cause)), None => Ok(()) }
 }
 
-#[cfg(test)] mod tests;
+#[cfg(test)] pub(crate) mod tests;

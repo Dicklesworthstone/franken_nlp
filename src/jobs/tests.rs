@@ -8,24 +8,24 @@ pub(super) fn error<T>(value: Result<T, JobError>) -> JobError {
     match value { Err(error) => error, Ok(_) => panic!("expected job refusal") }
 }
 #[derive(Default)]
-pub(super) struct Control { pub calls: u64, pub stop_at: Option<u64> }
+pub(crate) struct Control { pub calls: u64, pub stop_at: Option<u64> }
 impl DecodeStepControl for Control {
     fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
         self.calls += 1;
         self.stop_at.filter(|&n| self.calls >= n).map(|_| DecodeCancellationKind::Deadline)
     }
 }
-pub(super) fn key() -> JobSecret { JobSecret::from_bytes([17; 32]) }
-pub(super) fn work() -> JobWork {
+pub(crate) fn key() -> JobSecret { JobSecret::from_bytes([17; 32]) }
+pub(crate) fn work() -> JobWork {
     JobWork { model: constrained_int8::planned_work(128, 16).unwrap(), mask_node_visits: 1000 }
 }
-pub(super) fn limits() -> JobLimits {
+pub(crate) fn limits() -> JobLimits {
     let mut cap = JobWork::default(); for _ in 0..16 { cap = cap.checked_add(work()).unwrap(); }
     JobLimits { max_items: 16, max_id_bytes: 128, max_input_bytes_per_item: 1 << 20,
         max_snapshot_bytes: 16 << 20, max_result_bytes: 16384, max_spool_bytes: 1 << 20,
         max_materialized_bytes: 1 << 20, max_journal_bytes: 32 << 20, max_attempts: 16, max_work: cap }
 }
-pub(super) fn identity() -> ExecutionIdentity {
+pub(crate) fn identity() -> ExecutionIdentity {
     let d = Sha256Digest::of_bytes(b"owned-job-storage-fixture");
     ExecutionIdentity { schema_version: 1, source_revision: "fixture".to_owned(), logical_model_digest: d,
         artifact_format: "fixture".to_owned(), quant_recipe: "fixture".to_owned(), packing_set_digest: d,

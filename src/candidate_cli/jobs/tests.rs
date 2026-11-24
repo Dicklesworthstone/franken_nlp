@@ -38,6 +38,33 @@ fn all_five_native_job_tasks_have_distinct_start_and_resume_routes() {
     }
 }
 #[test]
+fn start_and_resume_admit_the_same_schedule_for_single_context_and_document_jobs() {
+    for mode in ["start", "resume"] {
+        for (task, document) in [
+            ("extract", &[][..]), ("answer", &[][..]), ("ner", &[][..]),
+            ("keyphrases", &[][..]), ("summarize", &[][..]),
+            ("extract", &["--schema", "schema.json", "--document-config", "map.json"][..]),
+            ("ner", &["--source-document-config", "map.json"][..]),
+        ] {
+            let mut flags = vec!["--compute-threads", "4", "--prefill-rows", "8"];
+            flags.extend_from_slice(document);
+            let (_, mut job) = command(mode, task, &flags).into_parts();
+            job.host.memory_mib = 16384;
+            let (common, limits) = job.validate().unwrap();
+            let prefill = job.prefill.limits().unwrap().unwrap();
+            assert_eq!(prefill.max_batch_rows, 8);
+            assert_eq!(common.compute.threads(), 4);
+            assert_eq!(limits.compute, common.compute.admit_prefill(Some(prefill)).unwrap());
+            assert!(limits.compute.workspace_bytes > 0);
+        }
+        for invalid in [["--compute-threads", "0"], ["--compute-threads", "65"],
+            ["--prefill-rows", "0"], ["--prefill-rows", "65"]] {
+            assert!(command(mode, "extract", &invalid).into_parts().1.validate().is_err());
+        }
+    }
+}
+
+#[test]
 fn compact_job_input_is_explicit_on_all_five_start_and_resume_routes() {
     for task in ["ner", "keyphrases", "summarize", "answer", "extract"] {
         for mode in ["start", "resume"] {

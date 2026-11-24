@@ -12,6 +12,22 @@ model-quality or durability qualification. One model and one native engine serve
 the pending population. Existing `fnlp job status`, `verify`, `materialize` and
 `schema` remain separate model-free management commands, unchanged by this route.
 
+## CPU scheduling for start and resume
+
+Add `--compute-threads 4 --prefill-rows 8` to either command to use one four-thread
+CPU team across pending records and process up to eight prompt tokens per group.
+Either option can be used independently. The thread count includes the coordinator.
+Both counts accept 1 through 64. Omitting both uses sequential execution.
+
+The schedule applies to single-context extraction, NER, keyphrases, summaries and
+passage QA. For complete-document extraction and source maps it also applies to
+each chunk. The worker buffers and prompt scratch share the process memory ceiling
+with the model, document and journal. On resume you may change either count and
+supply the original authenticated task settings. Committed records are skipped,
+and previous attempts and work keep their lifetime charges. An explicitly selected
+schedule appears in the completion report as `compute_threads` (for widths above
+one) and/or `prefill_rows`.
+
 ## Explicit retention and setup
 
 `--store-results` is required on both start and resume. Results are retained in
