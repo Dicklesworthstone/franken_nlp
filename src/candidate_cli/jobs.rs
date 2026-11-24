@@ -70,6 +70,9 @@ pub(super) struct JobArgs {
     /// Requires one shared schema; each journal result contains all chunk values.
     #[arg(long, requires = "schema", conflicts_with = "defaults")]
     pub document_config: Option<PathBuf>,
+    /// Explicit whole-document object semantics and immutable reducer bounds.
+    #[command(flatten)]
+    pub reconciliation: super::batch::document::ReconciliationArgs,
     /// NER/keyphrases/summarize only: immutable whole-document map settings.
     /// Uses fixed task defaults; records cannot replace options or budgets.
     #[arg(long, conflicts_with_all = ["document_config", "schema", "source_membership"])]
@@ -201,7 +204,7 @@ pub(in crate::candidate_cli) fn population_reader<R: Read + Send + 'static>(mode
 pub(super) fn definition() -> clap::Command {
     JobCommand::augment_args(clap::Command::new("job")
         .about("Start or resume explicitly retained, non-certified native corpus jobs")
-        .long_about("Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. Store private results only with --store-results, a protected existing directory, original key, random job ID and immutable limits. Resume authenticates the complete original input and unchanged task/model recipe, with an explicit retained-input source available. Stdout contains metadata only; errors may follow durable progress. No automatic retry, directory/key creation or release activation. Add --task extract --schema FILE --document-config FILE to retain and resume complete documents larger than one context. One journal result contains independent exact-schema chunk values, never a repaired global object or a partial document. Document settings and the shared schema must remain unchanged on resume. For --task ner, keyphrases or summarize, use --source-document-config FILE instead: fixed task options, complete source-aligned chunk maps and one durable result per original document, without global reranking or summary synthesis.")
+        .long_about("Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. Store private results only with --store-results, a protected existing directory, original key, random job ID and immutable limits. Resume authenticates the complete original input and unchanged task/model recipe, with an explicit retained-input source available. Stdout contains metadata only; errors may follow durable progress. No automatic retry, directory/key creation or release activation. Add --task extract --schema FILE --document-config FILE to retain and resume complete documents larger than one context. The default journal result contains independent exact-schema chunk values. Add --reconcile-object to extract partial root objects, combine complementary properties and independently validate one final object against the ORIGINAL schema. Equal values retain every origin; conflicts or missing required fields fail the complete attempt without a partial committed result. Nested values remain atomic. Document settings, exact schema, reconciliation mode and every --max-object-* bound are authenticated and must remain unchanged on resume. Compact input, prompt prefill and persistent workers compose with either document mode. For --task ner, keyphrases or summarize, use --source-document-config FILE instead: fixed task options, complete source-aligned chunk maps and one durable result per original document, without global reranking or summary synthesis.")
         .after_help(INPUT_RETENTION_HELP))
         .mut_subcommand("start", |command| compute::definition(encoding_definition(command)))
         .mut_subcommand("resume", |command| compute::definition(encoding_definition(command)))
@@ -226,6 +229,7 @@ impl JobArgs {
             || self.journal_memory_mib == 0 || self.serialization_memory_mib == 0 {
             return Err(Failure::usage("explicit_storage_or_job_options"));
         }
+        document::validate_mode(self)?;
         self.task_kind()?;
         source_document::validate_mode(self)?;
         self.encoding_work_limits()?;

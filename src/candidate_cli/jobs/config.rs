@@ -46,6 +46,15 @@ fn budget_fits(b: TaskBudget, ceiling: TaskBudget) -> Result<(), CandidateError>
 }
 pub(in crate::candidate_cli) fn load_defaults(args: &JobArgs, ceiling: TaskBudget, text: Option<&str>, schema: Option<String>)
     -> Result<Defaults, CandidateError> {
+    // An object document compiles the original declaration at its FINAL JSON
+    // cap and only the derived partial declaration at each chunk's cap. The
+    // immutable document factory performs both checks before model/population
+    // IO; compiling the original required set here would reject valid maps.
+    let object_document = args.reconciliation.requested();
+    if object_document && (args.task != "extract" || args.document_config.is_none()
+        || args.schema.is_none() || args.defaults.is_some() || args.source_document_config.is_some()) {
+        return Err(CandidateError::Arguments);
+    }
     if text.is_some() != args.defaults.is_some() || schema.is_some() != args.schema.is_some() {
         return Err(CandidateError::Arguments);
     }
@@ -64,7 +73,7 @@ pub(in crate::candidate_cli) fn load_defaults(args: &JobArgs, ceiling: TaskBudge
                 ..JsonLimits::default()
             }).map_err(|_| CandidateError::Planning)?;
             if !matches!(declaration, JsonValue::Object(_)) { return Err(CandidateError::Planning); }
-            if defaults.grounding == ExtractionBatchGrounding::Structural {
+            if defaults.grounding == ExtractionBatchGrounding::Structural && !object_document {
                 JsonProgram::compile(&defaults.schema, schema_cli::compiler(&args.host)).map_err(|_| CandidateError::Planning)?;
             }
             // Verbatim defaults compile with EACH original source, never a

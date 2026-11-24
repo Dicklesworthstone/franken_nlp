@@ -148,7 +148,9 @@ fn preparation_and_every_scaled_native_axis_refuse_underfunding_or_overflow_befo
 fn help_and_completion_keep_independent_values_and_nonzero_document_failure_exit() {
     let help = super::super::definition().render_long_help().to_string();
     assert!(help.contains("--task extract --chunked --schema FILE"));
-    assert!(help.contains("Required fields must be satisfiable per chunk"));
+    assert!(help.contains("By default, required fields must be satisfiable per chunk"));
+    assert!(help.contains("--reconcile-object"));
+    assert!(help.contains("conflicts or missing required fields refuse the whole document"));
     assert!(help.contains("No partial document success"));
     assert_eq!(completed(BatchSummary { failed: 1, ..BatchSummary::default() }), Err(CandidateError::Batch));
 }
@@ -266,6 +268,143 @@ fn document_tokenizer_totals_reject_wrong_routes_and_invalid_caps_before_private
         for value in ["0", "18446744073709551615"] {
             assert_eq!(chunked(&["--input-encoding", "safe-bpe-v1", flag, value])
                 .execute_owned(NoRead, NoWrite), Err(CandidateError::Arguments));
+        }
+    }
+}
+
+
+fn reconciled(flags: &[&str]) -> BatchCommand {
+    let mut options = vec!["--reconcile-object"];
+    options.extend_from_slice(flags);
+    let mut c = chunked(&options); c.host.memory_mib = 32768; c
+}
+struct Continue;
+impl DecodeStepControl for Continue {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
+}
+
+#[test]
+fn object_reconciliation_requires_complete_document_extraction_before_private_io() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("input read") } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("output written") }
+        fn flush(&mut self) -> io::Result<()> { panic!("output flushed") }
+    }
+    for task in ["extract", "ner", "keyphrases", "summarize", "answer"] {
+        assert_eq!(command(task, &["--reconcile-object"]).execute_owned(NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+    for task in ["ner", "keyphrases", "summarize", "answer"] {
+        assert_eq!(command(task, &["--chunked", "--schema", "s", "--reconcile-object"])
+            .execute_owned(NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+    let mut missing = reconciled(&[]); missing.schema = None;
+    assert_eq!(missing.execute_owned(NoIo, NoIo), Err(CandidateError::Arguments));
+    let mut defaults = reconciled(&[]); defaults.defaults = Some(PathBuf::from("private-defaults"));
+    assert_eq!(defaults.execute_owned(NoIo, NoIo), Err(CandidateError::Arguments));
+    for flag in ["--max-object-properties", "--max-object-origins", "--max-object-input-bytes",
+        "--max-object-json-bytes", "--max-object-nodes", "--max-object-result-bytes"] {
+        assert!(root().try_get_matches_from(["candidate", "batch", "--task", "extract",
+            "--model", "m", "--chunked", "--schema", "s", flag, "32"]).is_err());
+        assert_eq!(reconciled(&[flag, "0"]).execute_owned(NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+    let mut orphan = reconciled(&["--max-object-properties", "8"]);
+    orphan.document.reconciliation.reconcile_object = false;
+    assert!(orphan.document.reconciliation.requested());
+    assert_eq!(orphan.execute_owned(NoIo, NoIo), Err(CandidateError::Arguments));
+}
+
+#[test]
+fn object_bounds_share_the_existing_single_document_contract_and_leave_defaults_unchanged() {
+    let ordinary = chunked(&[]);
+    assert_eq!(ordinary.document_object_limits().unwrap(), None);
+    assert_eq!(ordinary.document_object_workspace_bytes().unwrap(), 0);
+    assert_eq!(ReconciliationArgs::default().limits(4096, 1024).unwrap(), None);
+    let selected = reconciled(&[]);
+    assert_eq!(selected.document_object_limits().unwrap(), Some(RootObjectLimits {
+        max_properties: 4096, max_origins: 16384, max_input_bytes: MAX_DOCUMENT_RESULT,
+        max_json_bytes: 16 * 1024 * 1024, max_nodes: 262144, max_result_bytes: 16 * 1024 * 1024 }));
+    for (flag, value) in [("--max-object-properties", "1000001"), ("--max-object-origins", "1"),
+        ("--max-object-input-bytes", "67108865"), ("--max-object-json-bytes", "16777217"),
+        ("--max-object-nodes", "1000001"), ("--max-object-result-bytes", "16777217")] {
+        assert!(reconciled(&[flag, value]).validate().is_err(), "{flag}={value}");
+    }
+    let selected = reconciled(&["--max-object-properties", "8", "--max-object-origins", "16",
+        "--max-object-input-bytes", "4096", "--max-object-json-bytes", "1024",
+        "--max-object-nodes", "512", "--max-object-result-bytes", "4096"]);
+    selected.validate().unwrap();
+    let object = selected.document_object_limits().unwrap().unwrap();
+    assert_eq!(object.max_properties, 8); assert_eq!(object.max_origins, 16);
+    assert_eq!(object.max_input_bytes, 4096); assert_eq!(object.max_json_bytes, 1024);
+    assert_eq!(object.max_nodes, 512); assert_eq!(object.max_result_bytes, 4096);
+    assert_eq!(selected.schedule_document_reserve().unwrap().0 - ordinary.schedule_document_reserve().unwrap().0,
+        selected.document_object_workspace_bytes().unwrap());
+}
+
+#[test]
+fn final_required_object_may_exceed_each_native_chunk_output_cap() {
+    let c = reconciled(&["--max-result-bytes", "2048"]);
+    let (_, limits, _) = c.validate().unwrap();
+    let budget = c.host.task_budget(limits);
+    let compiler = crate::candidate_cli::extract::compiler(&c.host);
+    let object = c.document_object_limits().unwrap().unwrap();
+    let value = "x".repeat(896);
+    let schema = format!(r#"{{"type":"object","additionalProperties":false,"properties":{{"a":{{"type":"string","const":"{value}"}},"b":{{"type":"string","const":"{value}"}},"c":{{"type":"string","const":"{value}"}}}},"required":["a","b","c"]}}"#);
+    assert!(crate::grammar::runtime::JsonValidationSchema::compile(&schema, compiler).is_err());
+    assert!(c.load_extract_defaults(Some(schema.clone()), None, budget).is_err());
+    let request = reconciled_request(schema.clone(), false, budget, compiler, object, &mut Continue).unwrap();
+    assert_eq!(request.schema, schema); assert_eq!(request.budget, budget);
+    assert_eq!(request.budget.max_output_bytes, 2048);
+    assert_eq!(request.grounding, ExtractionBatchGrounding::Structural);
+}
+
+#[test]
+fn reconciled_request_retains_original_exact_numbers_and_rejects_wrong_shape_or_grounding() {
+    let c = reconciled(&[]); let (_, limits, _) = c.validate().unwrap();
+    let budget = c.host.task_budget(limits);
+    let compiler = crate::candidate_cli::extract::compiler(&c.host);
+    let object = c.document_object_limits().unwrap().unwrap();
+    let schema = " {\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"number\",\"const\":9007199254740993}},\"required\":[\"n\"],\"additionalProperties\":false}\n";
+    let request = reconciled_request(schema.to_owned(), false, budget, compiler, object, &mut Continue).unwrap();
+    assert_eq!(request.schema.as_bytes(), schema.as_bytes());
+    let annotated = r#"{"type":"object","properties":{"name":{"type":"string","maxLength":32,"x-fnlp-source":"verbatim"}},"required":["name"],"additionalProperties":false}"#;
+    assert!(reconciled_request(annotated.to_owned(), false, budget, compiler, object, &mut Continue).is_err());
+    assert!(reconciled_request(schema.to_owned(), true, budget, compiler, object, &mut Continue).is_err());
+    let grounded = reconciled_request(annotated.to_owned(), true, budget, compiler, object, &mut Continue).unwrap();
+    assert_eq!(grounded.schema, annotated);
+    assert_eq!(grounded.grounding, ExtractionBatchGrounding::SourceMembership);
+    for invalid in [r#"{"type":"boolean"}"#, r#"{"type":"array","items":{"type":"boolean"},"maxItems":2}"#,
+        r#"{"type":"object","type":"object","properties":{},"additionalProperties":false}"#] {
+        assert!(reconciled_request(invalid.to_owned(), false, budget, compiler, object, &mut Continue).is_err());
+    }
+    struct Stop;
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { Some(DecodeCancellationKind::Deadline) }
+    }
+    assert!(matches!(reconciled_request(schema.to_owned(), false, budget, compiler, object, &mut Stop),
+        Err(CandidateError::Timeout)));
+}
+
+#[test]
+fn object_corpus_admits_the_whole_peak_for_serial_prefill_team_and_compact_routes() {
+    let baseline = chunked(&["--max-requests", "3"]);
+    let (_, original_limits, original) = baseline.validate().unwrap();
+    for encoding in ["byte-fallback", "safe-bpe-v1"] {
+        for schedule in [&[][..], &["--prefill-rows", "7"][..],
+            &["--compute-threads", "4"][..], &["--compute-threads", "4", "--prefill-rows", "7"][..]] {
+            let mut flags = vec!["--max-requests", "3", "--input-encoding", encoding];
+            flags.extend_from_slice(schedule);
+            let selected = reconciled(&flags);
+            let (_, mut limits, envelope) = selected.validate().unwrap();
+            assert_eq!(envelope.native.max_model_work, original.native.max_model_work);
+            assert_eq!(envelope.native.masks.max_visits_per_run, original.native.masks.max_visits_per_run);
+            assert_eq!(selected.host.task_budget(limits), baseline.host.task_budget(original_limits));
+            assert_eq!(envelope.transport.max_output_line_bytes, original.transport.max_output_line_bytes);
+            let prefill = selected.prefill.limits().unwrap();
+            limits.memory_bytes = selected.schedule_peak_bytes(limits, envelope, prefill).unwrap();
+            selected.check_scheduling_memory(limits, envelope, prefill).unwrap();
+            limits.memory_bytes -= 1;
+            assert_eq!(selected.check_scheduling_memory(limits, envelope, prefill), Err(CandidateError::Arguments));
         }
     }
 }

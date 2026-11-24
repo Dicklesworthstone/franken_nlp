@@ -618,7 +618,8 @@ resume recipe. A resumed invocation gets the same declared tokenizer
 allowance, while native/mask work and attempts retain their original durable
 lifetime debits. Compact reports expose `input_encoding` and
 `invocation_encoding_work_limits`; byte-mode recipes and reports remain
-unchanged. Document-map job configurations still require byte fallback.
+unchanged. Complete-document extraction jobs also accept the bounded compact
+policy, including explicit root-object reconciliation.
 See [compact input with authenticated resume](docs/candidate-owned-jobs-cli.md#compact-input-with-authenticated-resume)
 for the flags, limits and memory contract.
 
@@ -723,8 +724,8 @@ retains its independently validated JSON string. Explicit
 combines complementary root properties under a separately derived partial
 schema; the default keeps the independent chunk objects. The host admits the
 encoder workspace beside the retained schema and source plans.
-Complete-document extraction corpora and retained extraction jobs keep their
-separate byte-mode contracts.
+Complete-document extraction corpora and retained extraction jobs also accept
+the bounded compact policy, with one invocation-wide tokenizer ledger.
 
 For passage QA, use `--task answer --question question.txt` with the same compact
 flag. The repeated question, passage manifests, discarded source probes and
@@ -867,6 +868,76 @@ storage before private IO. Library callers use `Int8ObjectExtractionPlanner`,
 `NlpEngine::extract_int8_object_document` with the corresponding layer-major and
 threaded variants. Omitting `--reconcile-object` preserves independent chunk
 extraction.
+
+### Resident populations and authenticated jobs
+
+The same root-object reconciliation is available for a resident population of
+complete documents:
+
+```sh
+fnlp candidate batch documents.ndjson --task extract --chunked \
+  --schema record.schema.json --reconcile-object --source-membership \
+  --model ./model.fnlpq --memory-mib 16384 --preparation-mib 2048 \
+  --max-chunks 64 --max-document-result-bytes 16777216 \
+  --max-object-properties 16 --max-object-origins 1024 \
+  --max-object-input-bytes 1048576 --max-object-json-bytes 65536 \
+  --max-object-nodes 4096 --max-object-result-bytes 1048576 \
+  --compute-threads 4 --prefill-rows 4
+```
+
+Each NDJSON record supplies an `id` and the original complete `text`.
+The shared schema, task budget and object policy are fixed for the population;
+`task_args` must be absent, null or an empty object. A document produces
+one complete result containing the partial map and the independently validated
+final object. Conflicts, missing required properties or exhausted verification
+budgets fail the document without publishing a partial success. The complete
+result, including the partial map, must fit `--max-document-result-bytes`.
+
+For durable work, use the same mode on the existing explicitly retained
+`candidate job start` and `candidate job resume` routes:
+
+```sh
+fnlp candidate job start documents.ndjson --task extract \
+  --schema record.schema.json --document-config document-limits.json \
+  --reconcile-object --source-membership \
+  --model ./model.fnlpq --memory-mib 16384 --preparation-mib 2048 \
+  --max-object-properties 16 --max-object-origins 1024 \
+  --max-object-input-bytes 1048576 --max-object-json-bytes 65536 \
+  --max-object-nodes 4096 --max-object-result-bytes 1048576 \
+  --store-results --job-dir ./private-job --job-id "$JOB_ID" \
+  --key-file ./private-job.key --limits job-limits.json
+```
+
+Prepare the protected job directory, raw key, fresh random job ID and immutable
+settings using the [owned-job contract](docs/candidate-owned-jobs-cli.md).
+`document-limits.json` remains the existing closed document-settings format.
+Its result cap bounds the complete partial-map-plus-object envelope; its
+native and verification allowances remain whole-document limits. The six
+object bounds add independent reducer limits. Final object validation uses
+`--max-object-json-bytes`, while native partial chunk generation keeps the
+per-chunk output cap, allowing required fields to be collected across chunks.
+
+Resume with the original schema bytes, object mode, every object bound,
+document settings, input-encoding policy and lifetime job limits unchanged.
+They enter the authenticated recipe, so changing the reducer policy or any
+bound cannot silently reuse an existing journal. Native and mask work retain
+their durable lifetime accounting, including failed attempts. Each invocation
+keeps its separately declared compact-tokenizer allowance.
+
+Both population routes support byte fallback and `--input-encoding safe-bpe-v1`,
+serial execution, prompt prefill, a persistent projection team, or their
+combination. Physical worker and prefill widths do not alter the semantic job
+recipe. Memory accounting includes both schema declarations, reconciliation,
+retained partial results and any encoding/worker storage. Object provenance
+reports the public `root_object_reconciliation` policy and limits; ordinary
+mode omits that field.
+
+Library callers use `ExtractionDocumentCorpusConfig::with_root_object_reconciliation`
+and the four `NlpEngine::batch_int8_extract_object_document` schedule variants.
+Retained-job callers configure
+`Int8DocumentExtractionJobPlanner::with_root_object_reconciliation`.
+These implementations remain candidate and non-authoritative; executable Rust
+and model qualification are pending.
 
 ## Implemented candidate INT8 semantic extraction
 

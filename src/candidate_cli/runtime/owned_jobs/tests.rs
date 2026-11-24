@@ -126,17 +126,68 @@ fn byte_receipts_are_unchanged_and_compact_totals_are_explicitly_invocation_scop
     let p = progress();
     let report = progress_report(p, p.job_id, lifetime(), true, RunMode::Start, "extract").unwrap();
     let before = serde_json::to_value(&report).unwrap();
-    let byte = EncodingReport { response: &report, input_encoding: None, invocation_encoding_work_limits: None };
+    let byte = EncodingReport { response: &report, input_encoding: None, invocation_encoding_work_limits: None,
+        root_object_reconciliation: None };
+    assert_eq!(serde_json::to_vec(&byte).unwrap(), serde_json::to_vec(&report).unwrap());
     assert_eq!(serde_json::to_value(byte).unwrap(), before);
     let a = args("extract", &["--input-encoding", "safe-bpe-v1"]);
     let (_, limits) = a.validate().unwrap(); let policy = a.encoding_policy(limits).unwrap();
     let totals = a.encoding_work_limits().unwrap();
-    let compact = EncodingReport { response: &report, input_encoding: Some(&policy), invocation_encoding_work_limits: totals };
+    let compact = EncodingReport { response: &report, input_encoding: Some(&policy), invocation_encoding_work_limits: totals,
+        root_object_reconciliation: None };
     let mut encoded = serde_json::to_value(compact).unwrap();
     let object = encoded.as_object_mut().unwrap();
     assert_eq!(object.remove("input_encoding"), Some(serde_json::to_value(policy).unwrap()));
     assert_eq!(object.remove("invocation_encoding_work_limits"), Some(serde_json::to_value(totals.unwrap()).unwrap()));
     assert_eq!(encoded, before);
+}
+#[test]
+fn object_job_metadata_reports_only_public_policy_and_limits_across_physical_schedules() {
+    use crate::tasks::extract::object_reconcile::{RootObjectLimits, ROOT_OBJECT_DERIVATION, ROOT_OBJECT_RECONCILIATION};
+    use crate::batch::extract::quantized::long::object::ROOT_OBJECT_MAP_PROMPT;
+    let p = progress();
+    let report = progress_report(p, p.job_id, lifetime(), true,
+        RunMode::Resume { discard_uncommitted: false }, "extract").unwrap();
+    let baseline = serde_json::to_value(&report).unwrap();
+    let a = args("extract", &["--input-encoding", "safe-bpe-v1"]);
+    let (_, limits) = a.validate().unwrap();
+    let policy = a.encoding_policy(limits).unwrap();
+    let totals = a.encoding_work_limits().unwrap();
+    let object = RootObjectLimits { max_properties: 7, max_origins: 11, max_input_bytes: 2048,
+        max_json_bytes: 512, max_nodes: 99, max_result_bytes: 4096 };
+    let expected = serde_json::json!({
+        "policy": ROOT_OBJECT_RECONCILIATION,
+        "schema_derivation": ROOT_OBJECT_DERIVATION,
+        "map_prompt": ROOT_OBJECT_MAP_PROMPT,
+        "limits": object,
+    });
+    for compact in [false, true] {
+        for compute_threads in [None, Some(4)] {
+            for prefill_rows in [None, Some(7)] {
+                let response = EncodingReport { response: &report,
+                    input_encoding: compact.then_some(&policy),
+                    invocation_encoding_work_limits: if compact { totals } else { None },
+                    root_object_reconciliation: Some(RootObjectSelection::new(object)) };
+                let response = ScheduledResponse { response: &response, compute_threads, prefill_rows };
+                let mut value = serde_json::to_value(response).unwrap();
+                let fields = value.as_object_mut().unwrap();
+                assert_eq!(fields.remove("root_object_reconciliation"), Some(expected.clone()));
+                assert_eq!(fields.remove("input_encoding"),
+                    compact.then(|| serde_json::to_value(&policy).unwrap()));
+                assert_eq!(fields.remove("invocation_encoding_work_limits"),
+                    compact.then(|| serde_json::to_value(totals.unwrap()).unwrap()));
+                assert_eq!(fields.remove("compute_threads"), compute_threads.map(serde_json::Value::from));
+                assert_eq!(fields.remove("prefill_rows"), prefill_rows.map(serde_json::Value::from));
+                assert_eq!(value, baseline);
+            }
+        }
+    }
+    let selection = expected.as_object().unwrap();
+    assert_eq!(selection.len(), 4);
+    assert_eq!(selection["limits"].as_object().unwrap().len(), 6);
+    for absent in ["schema", "schema_digest", "source", "prompt_digest", "result", "recipe", "request_binding"] {
+        assert!(!selection.contains_key(absent));
+    }
 }
 #[test]
 fn invalid_progress_or_lost_materialization_cannot_be_reported_as_complete() {

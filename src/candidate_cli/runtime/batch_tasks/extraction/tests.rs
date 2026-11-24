@@ -243,10 +243,11 @@ fn document_stream_frames_report_declared_totals_without_fabricating_spent_work(
     let total = cmd.document_encoding_work_limits().unwrap();
     let base = serde_json::json!({"scope":"real-artifact-current-candidate"});
     let byte = EncodingProvenance { response: input_encoding::Response { response: &base, input_encoding: None },
-        invocation_encoding_work_limits: None };
+        invocation_encoding_work_limits: None, root_object_reconciliation: None };
     assert_eq!(serde_json::to_value(byte).unwrap(), base);
     let provenance = EncodingProvenance { response: input_encoding::Response {
-        response: &base, input_encoding: Some(&policy) }, invocation_encoding_work_limits: total };
+        response: &base, input_encoding: Some(&policy) }, invocation_encoding_work_limits: total,
+        root_object_reconciliation: None };
     let mut output = Vec::new();
     {
         let mut writer = CandidateWriter::new(&mut output, &provenance,
@@ -261,6 +262,135 @@ fn document_stream_frames_report_declared_totals_without_fabricating_spent_work(
         let value: serde_json::Value = serde_json::from_slice(line).unwrap();
         assert_eq!(value["input_encoding"], serde_json::to_value(&policy).unwrap());
         assert_eq!(value["invocation_encoding_work_limits"], serde_json::to_value(total).unwrap());
+        assert!(value.get("encoding_work").is_none());
+    }
+}
+
+
+fn object_document(extra: &[&str]) -> BatchCommand {
+    let mut flags = vec!["--reconcile-object"];
+    flags.extend_from_slice(extra);
+    let mut command = compact_document(&flags); command.host.memory_mib = 32768; command
+}
+fn object_document_planner(cmd: &BatchCommand, schema: &str)
+    -> (Int8ObjectExtractionPlanner, Int8ObjectExtractionDocumentCorpusConfig, Limits) {
+    let (_, limits, envelope) = cmd.validate().unwrap();
+    let reconciliation = cmd.document_object_limits().unwrap().unwrap();
+    let request = reconciled_request(schema.to_owned(), cmd.source_membership,
+        cmd.host.task_budget(limits), schema_cli::compiler(&cmd.host), reconciliation, &mut Continue).unwrap();
+    let config = ExtractionDocumentCorpusConfig { batch: cmd.document_configuration(request, envelope).unwrap(),
+        reduction_reserve_bytes: cmd.document_reduction_bytes().unwrap() }
+        .with_root_object_reconciliation(reconciliation);
+    let compiler = planning::planner(&facts(), &cmd.host, limits, None).unwrap()
+        .with_map_document_encoding(cmd.encoding_policy(limits).unwrap(),
+            cmd.document_encoding_work_limits().unwrap().unwrap()).unwrap();
+    let compiler = Int8ObjectExtractionPlanner::new(compiler).unwrap();
+    check_object_quote(cmd, limits, &compiler, &config, cmd.encoding_workspace_bytes(limits).unwrap()).unwrap();
+    (compiler, config, limits)
+}
+
+#[test]
+fn object_document_corpus_binds_original_schema_and_keeps_one_compact_ledger_across_documents() {
+    let schema = r#"{"type":"object","properties":{"n":{"type":"number","const":0.12345678901234567890123456789012345678},"b":{"type":"boolean"}},"required":["n","b"],"additionalProperties":false}"#;
+    let source = "é Alice\r\nBob 上海 <think>";
+    let cmd = object_document(&[]);
+    let (compiler, config, limits) = object_document_planner(&cmd, schema);
+    assert_eq!(config.mapping.batch.request.schema, schema);
+    let prepare = || compiler.plan_document_with_control(source, &config.mapping.batch.request,
+        config.limits(), &mut Continue);
+    let first = prepare().unwrap();
+    let metadata = first.preflight_metadata();
+    let identities: Vec<_> = first.execution_identities().cloned().collect();
+    assert!(identities.len() > 1);
+    assert!(identities.iter().all(|id| id.schema_digest != Sha256Digest::of_bytes(schema.as_bytes())));
+    assert_eq!(metadata.source_span().byte_end, source.len());
+    assert_eq!(metadata.source_span().scalar_end, source.chars().count());
+    assert_eq!(metadata.execution_version(),
+        crate::batch::extract::quantized::long::object::INT8_OBJECT_MAP_EXECUTION);
+    let spent = compiler.map_document_encoding_work().unwrap().unwrap();
+    drop(first);
+    let second = prepare().unwrap();
+    assert_eq!(second.preflight_metadata(), metadata);
+    assert_eq!(second.execution_identities().cloned().collect::<Vec<_>>(), identities);
+    assert_eq!(compiler.map_document_encoding_work().unwrap().unwrap(), spent.checked_add(spent).unwrap());
+    drop(second);
+
+    // A different original required set derives the same chunk schema, but
+    // cannot reuse the sealed whole-document completion authority.
+    let changed = ExtractionBatchArgs { schema: schema.replace(r#""required":["n","b"]"#, r#""required":["n"]"#),
+        grounding: config.mapping.batch.request.grounding, budget: config.mapping.batch.request.budget };
+    let changed = compiler.plan_document_with_control(source, &changed, config.limits(), &mut Continue).unwrap();
+    assert_eq!(changed.execution_identities().cloned().collect::<Vec<_>>(), identities);
+    assert_ne!(changed.preflight_metadata(), metadata);
+    drop(changed);
+    assert_eq!(check_object_quote(&cmd, limits, &compiler, &config,
+        cmd.encoding_workspace_bytes(limits).unwrap() - 1), Err(CandidateError::Arguments));
+    let mut stale = config; stale.reconciliation.max_properties -= 1;
+    assert_eq!(check_object_quote(&cmd, limits, &compiler, &stale,
+        cmd.encoding_workspace_bytes(limits).unwrap()), Err(CandidateError::Arguments));
+
+    let cap = spent.input_bytes().to_string();
+    let bounded = object_document(&["--max-total-tokenizer-input-bytes", &cap]);
+    let (compiler, config, _) = object_document_planner(&bounded, schema);
+    let first = compiler.plan_document_with_control(source, &config.mapping.batch.request,
+        config.limits(), &mut Continue).unwrap();
+    assert_eq!(first.preflight_metadata().planned_work(), metadata.planned_work());
+    drop(first);
+    assert!(compiler.plan_document_with_control(source, &config.mapping.batch.request,
+        config.limits(), &mut Continue).is_err());
+    assert_eq!(compiler.map_document_encoding_work().unwrap().unwrap(), spent);
+}
+
+#[test]
+fn object_document_corpus_schedules_preserve_the_same_identity_work_and_cancellation() {
+    let schema = r#"{"type":"object","properties":{"flag":{"type":"boolean"}},"required":["flag"],"additionalProperties":false}"#;
+    let source = "é Alice\r\nBob 上海";
+    let mut baseline = None;
+    for schedule in [&[][..], &["--compute-threads", "4"][..],
+        &["--prefill-rows", "7"][..], &["--compute-threads", "4", "--prefill-rows", "7"][..]] {
+        let cmd = object_document(schedule);
+        let (compiler, config, _) = object_document_planner(&cmd, schema);
+        let plan = compiler.plan_document_with_control(source, &config.mapping.batch.request,
+            config.limits(), &mut Continue).unwrap();
+        let actual = (plan.preflight_metadata(), plan.execution_identities().cloned().collect::<Vec<_>>(),
+            compiler.map_document_encoding_work().unwrap());
+        if let Some(baseline) = &baseline { assert_eq!(&actual, baseline); }
+        else { baseline = Some(actual); }
+        drop(plan);
+        struct Stop;
+        impl DecodeStepControl for Stop {
+            fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { Some(DecodeCancellationKind::Deadline) }
+        }
+        let before = compiler.map_document_encoding_work().unwrap();
+        assert!(compiler.plan_document_with_control(source, &config.mapping.batch.request,
+            config.limits(), &mut Stop).is_err());
+        assert_eq!(compiler.map_document_encoding_work().unwrap(), before);
+    }
+}
+
+#[test]
+fn selected_object_policy_and_bounds_are_reported_on_every_corpus_frame() {
+    let cmd = object_document(&[]); let (_, limits, envelope) = cmd.validate().unwrap();
+    let policy = cmd.encoding_policy(limits).unwrap();
+    let object = cmd.document_object_limits().unwrap().unwrap();
+    let base = serde_json::json!({"scope":"real-artifact-current-candidate"});
+    let provenance = EncodingProvenance { response: input_encoding::Response {
+        response: &base, input_encoding: Some(&policy) },
+        invocation_encoding_work_limits: cmd.document_encoding_work_limits().unwrap(),
+        root_object_reconciliation: Some(RootObjectSelection::new(object)) };
+    let mut output = Vec::new();
+    {
+        let mut writer = CandidateWriter::new(&mut output, &provenance,
+            envelope.transport.max_output_line_bytes, envelope.output_bytes).unwrap();
+        for event in ["run_start", "doc", "doc_error", "flush", "run_complete"] {
+            writeln!(writer, "{{\"event\":\"{event}\"}}").unwrap(); writer.flush().unwrap();
+        }
+    }
+    for line in output.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
+        let value: serde_json::Value = serde_json::from_slice(line).unwrap();
+        assert_eq!(value["root_object_reconciliation"], serde_json::to_value(RootObjectSelection::new(object)).unwrap());
+        assert!(value.get("schema").is_none());
+        assert!(value.get("source").is_none());
         assert!(value.get("encoding_work").is_none());
     }
 }

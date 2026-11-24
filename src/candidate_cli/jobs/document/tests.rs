@@ -131,6 +131,87 @@ fn every_native_scaling_axis_uses_checked_arithmetic() {
     }
     assert!(scale(one, 0).is_err());
 }
+#[test]
+fn object_reconciliation_requires_the_fixed_document_route_before_private_io() {
+    struct NoRead;
+    impl Read for NoRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("invalid object mode read private input") }
+    }
+    for operation in ["start", "resume"] {
+        let (_, valid) = command(operation, "extract", &["--schema", "s", "--document-config", "d",
+            "--reconcile-object", "--preparation-mib", "2048"]).into_parts();
+        valid.validate().unwrap();
+        for (task, extra) in [
+            ("extract", &["--reconcile-object"][..]),
+            ("extract", &["--schema", "s", "--reconcile-object"][..]),
+            ("extract", &["--defaults", "defaults.json", "--reconcile-object"][..]),
+            ("ner", &["--reconcile-object"][..]),
+            ("summarize", &["--source-document-config", "d", "--reconcile-object"][..]),
+        ] {
+            let mut output = Vec::new();
+            let error = command(operation, task, extra).execute_owned(NoRead, &mut output).err().unwrap();
+            assert_eq!(error.code, "document_job_object_options");
+            assert!(output.is_empty());
+        }
+    }
+}
+#[test]
+fn object_bounds_use_the_same_document_settings_on_start_and_resume() {
+    for operation in ["start", "resume"] {
+        let (_, a) = command(operation, "extract", &["--schema", "s", "--document-config", "d",
+            "--reconcile-object", "--preparation-mib", "2048",
+            "--max-object-properties", "7", "--max-object-origins", "11",
+            "--max-object-input-bytes", "2048", "--max-object-json-bytes", "512",
+            "--max-object-nodes", "99", "--max-object-result-bytes", "4096"]).into_parts();
+        let lifetime = job();
+        let (config, _) = load_settings(&settings(), &a, lifetime).unwrap();
+        assert_eq!(a.reconciliation.limits(config.limits.mapping.reduction.max_total_value_bytes,
+            config.limits.mapping.reduction.max_result_bytes).unwrap(),
+            Some(crate::tasks::extract::object_reconcile::RootObjectLimits {
+                max_properties: 7, max_origins: 11, max_input_bytes: 2048,
+                max_json_bytes: 512, max_nodes: 99, max_result_bytes: 4096,
+            }));
+        assert_eq!(config.max_model_work, lifetime.max_work.model);
+        assert_eq!(config.max_mask_visits, lifetime.max_work.mask_node_visits);
+        let (_, too_large) = command(operation, "extract", &["--schema", "s", "--document-config", "d",
+            "--reconcile-object", "--preparation-mib", "2048", "--max-object-json-bytes", "4194305"]).into_parts();
+        assert!(load_settings(&settings(), &too_large, lifetime).is_err());
+        for flag in ["--max-object-properties", "--max-object-origins", "--max-object-input-bytes",
+            "--max-object-json-bytes", "--max-object-nodes", "--max-object-result-bytes"] {
+            let (_, zero) = command(operation, "extract", &["--schema", "s", "--document-config", "d",
+                "--reconcile-object", flag, "0"]).into_parts();
+            assert!(zero.validate().is_err(), "{operation}: {flag}");
+        }
+    }
+}
+#[test]
+fn object_schema_and_reducer_storage_are_additive_even_in_serial_byte_mode() {
+    let plain = options();
+    let object = args("extract", &["--schema", "s", "--document-config", "d",
+        "--reconcile-object", "--preparation-mib", "2048"]);
+    let d = settings();
+    let text = serde_json::to_string(&d).unwrap();
+    let host = &plain.host;
+    let per_chunk = host.context_tokens as u64 * 32 + u64::from(host.max_grammar_states) * 512
+        + 2 * crate::candidate_cli::extract::SCHEMA_BYTES as u64;
+    let floor = per_chunk * d.max_chunks as u64 + 256 * MIB
+        + host.max_input_bytes as u64 * 64 + d.max_result_bytes as u64 * 2;
+    let reconciliation = object.reconciliation.limits(d.max_total_value_bytes, d.max_result_bytes).unwrap().unwrap();
+    let extra = RootObjectSchema::workspace_bytes(crate::candidate_cli::extract::compiler(host)).unwrap()
+        + reconciliation.workspace_bytes().unwrap();
+    assert!(extra > 0);
+    let (_, mut limits) = plain.validate().unwrap();
+    limits.preparation_bytes = floor;
+    load(&text, &plain, request(&plain, limits), job(), limits).unwrap();
+    let error = load(&text, &object, request(&object, limits), job(), limits).err().unwrap();
+    assert_eq!(error.code, "document_job_preparation");
+    limits.preparation_bytes = floor + extra - 1;
+    assert_eq!(load(&text, &object, request(&object, limits), job(), limits).err().unwrap().code,
+        "document_job_preparation");
+    limits.preparation_bytes += 1;
+    load(&text, &object, request(&object, limits), job(), limits).unwrap();
+}
+
 #[cfg(not(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64"))))]
 #[test]
@@ -143,7 +224,11 @@ fn unavailable_profiles_refuse_both_modes_before_any_key_settings_or_population_
         fn flush(&mut self) -> io::Result<()> { panic!("flush") }
     }
     for operation in ["start", "resume"] {
-        let c = command(operation, "extract", &["--schema", "s", "--document-config", "d"]);
-        assert_eq!(c.execute_owned(NoRead, &mut NoWrite).err().unwrap().code, "owned_job_profile_unavailable");
+        for object in [false, true] {
+            let mut flags = vec!["--schema", "s", "--document-config", "d"];
+            if object { flags.push("--reconcile-object"); }
+            let c = command(operation, "extract", &flags);
+            assert_eq!(c.execute_owned(NoRead, &mut NoWrite).err().unwrap().code, "owned_job_profile_unavailable");
+        }
     }
 }

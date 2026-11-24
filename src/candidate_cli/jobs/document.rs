@@ -6,11 +6,25 @@ use crate::{
     jobs::JobWork,
     native_engine::{constrained_int8, strict_int8::Int8Work},
     tasks::{mapreduce::{ChunkLimits, ExecutionLimits}, source_planning::quantized::long::Int8SourceMapLimits},
+    tasks::extract::object_reconcile::RootObjectSchema,
     validation::grounded_fields::GroundingBudget,
 };
 
 pub(in crate::candidate_cli) const DOCUMENT_BYTES: usize = 16 * 1024;
 const MAX_RESULT: usize = 64 * 1024 * 1024;
+
+/// Reject mode confusion and malformed explicit bounds before private IO.
+/// Actual result/input defaults come from the authenticated document settings.
+pub(super) fn validate_mode(args: &JobArgs) -> Result<(), Failure> {
+    if args.reconciliation.requested() {
+        if args.task != "extract" || args.document_config.is_none() || args.schema.is_none()
+            || args.defaults.is_some() || args.source_document_config.is_some() {
+            return Err(Failure::usage("document_job_object_options"));
+        }
+        args.reconciliation.limits(MAX_RESULT, MAX_RESULT)?;
+    }
+    Ok(())
+}
 
 /// Every field is required and unknown fields are refused. A resume freezes
 /// semantic settings alongside the exact shared schema and JobLimits; modeled
@@ -36,6 +50,7 @@ fn parse(text: &str) -> Result<DocumentSettings, Failure> {
 }
 pub(in crate::candidate_cli) fn load(text: &str, args: &JobArgs, request: ExtractionBatchArgs,
     lifetime: JobLimits, limits: Limits) -> Result<(ExtractionDocumentBatchConfig, u64), Failure> {
+    validate_mode(args)?;
     if args.task != "extract" || args.schema.is_none() || args.defaults.is_some() || args.document_config.is_none() {
         return Err(Failure::usage("document_job_requires_fixed_schema"));
     }
@@ -53,6 +68,13 @@ pub(in crate::candidate_cli) fn load(text: &str, args: &JobArgs, request: Extrac
     }
     let reserve = d.reduction_reserve_mib.checked_mul(MIB)
         .filter(|&n| n != 0 && n <= limits.memory_bytes).ok_or_else(|| Failure::usage("document_job_memory"))?;
+    let object_workspace = match args.reconciliation.limits(d.max_total_value_bytes, d.max_result_bytes)? {
+        None => 0,
+        Some(reconciliation) => RootObjectSchema::workspace_bytes(super::super::extract::compiler(host))
+            .and_then(|schema| reconciliation.workspace_bytes().and_then(|reducer|
+                schema.checked_add(reducer).ok_or(crate::tasks::extract::object_reconcile::RootObjectError::InvalidLimits)))
+            .map_err(|_| Failure::usage("document_job_object_memory"))?,
+    };
     // Retained schema/prompt/grammar plans, plus two complete result stages.
     // The actual host additionally reserves native map values, coordinate scan
     // vectors, journal/IO, model/KV/scratch and output guards. This is a necessary
@@ -64,6 +86,7 @@ pub(in crate::candidate_cli) fn load(text: &str, args: &JobArgs, request: Extrac
     let floor = per.checked_mul(d.max_chunks as u64).and_then(|n| n.checked_add(256 * MIB))
         .and_then(|n| n.checked_add((host.max_input_bytes as u64).checked_mul(64)?))
         .and_then(|n| n.checked_add((d.max_result_bytes as u64).checked_mul(2)?))
+        .and_then(|n| n.checked_add(object_workspace))
         .ok_or_else(|| Failure::usage("document_job_memory"))?;
     if floor > limits.preparation_bytes { return Err(Failure::usage("document_job_preparation")); }
     let prompt = host.context_tokens.checked_sub(host.max_new_tokens).filter(|&n| n != 0)

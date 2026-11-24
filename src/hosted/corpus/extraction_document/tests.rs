@@ -137,3 +137,55 @@ fn compact_document_corpus_adds_one_encoder_and_ledger_beside_the_existing_front
     assert!(c.preparation_workspace_bytes(&record_only).is_err());
     assert_eq!(compact.map_document_encoding_work().unwrap(), Some(Default::default()));
 }
+
+fn object_limits() -> RootObjectLimits {
+    RootObjectLimits { max_properties: 8, max_origins: 16, max_input_bytes: 8192,
+        max_json_bytes: 1024, max_nodes: 256, max_result_bytes: 4096 }
+}
+
+#[test]
+fn object_corpus_reserves_both_schemas_and_reducer_beside_one_complete_frontier() {
+    use crate::{grammar::{CompileLimits, runtime::SourceRuntimeLimits},
+        tokenizer::{pinned_controls, untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding}}};
+    let registry = pinned_controls::pinned().unwrap();
+    for compact in [false, true] {
+        let (mut c, _) = config();
+        c.batch.request.schema = r#"{"type":"object","properties":{"a":{"type":"boolean"}},"required":["a"],"additionalProperties":false}"#.to_owned();
+        let original_schema = c.batch.request.schema.clone();
+        let compiler = CompileLimits::default();
+        let mut base = Int8ExtractionBatchPlanner::pinned(registry.template_controls(), 166101, identity(),
+            c.batch.request.budget, compiler, SourceRuntimeLimits::default(), None).unwrap();
+        if compact {
+            let policy = SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 4096,
+                max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
+            let total = SafeBpeWorkLimits { max_input_bytes: 1 << 20, max_output_tokens: 1 << 20,
+                max_pair_checks: 1 << 28, max_pair_bytes: 1 << 32 };
+            base = base.with_map_document_encoding(UntrustedEncoding::SafeBpeV1(policy), total).unwrap();
+        }
+        let mapping = c.preparation_workspace_bytes(&base).unwrap();
+        let planner = Int8ObjectExtractionPlanner::new(base).unwrap();
+        let config = c.with_root_object_reconciliation(object_limits());
+        assert_eq!(config.mapping.batch.request.schema, original_schema);
+        assert_eq!(config.preparation_workspace_bytes(&planner).unwrap(),
+            mapping + object_limits().workspace_bytes().unwrap() + RootObjectSchema::workspace_bytes(compiler).unwrap());
+        assert_eq!(planner.map_document_encoding_work().unwrap().is_some(), compact);
+    }
+}
+
+#[test]
+fn object_corpus_bounds_cannot_hide_schema_storage_or_exceed_the_whole_document_cap() {
+    let (c, _) = config();
+    let compiler = crate::grammar::CompileLimits::default();
+    let object = object_limits();
+    let original = object_workspace(&c, object, compiler).unwrap();
+    let wider = crate::grammar::CompileLimits { max_schema_bytes: compiler.max_schema_bytes * 2, ..compiler };
+    assert!(object_workspace(&c, object, wider).unwrap() > original);
+    let tiny = RootObjectLimits { max_json_bytes: 2, max_result_bytes: 2, ..object };
+    assert!(object_workspace(&c, tiny, compiler).unwrap() > RootObjectSchema::workspace_bytes(compiler).unwrap());
+    for axis in 0..4 {
+        let mut invalid = object;
+        match axis { 0 => invalid.max_json_bytes = 4097, 1 => invalid.max_result_bytes = 4097,
+            2 => invalid.max_properties = 0, _ => invalid.max_origins = 1 }
+        assert!(object_workspace(&c, invalid, compiler).is_err());
+    }
+}

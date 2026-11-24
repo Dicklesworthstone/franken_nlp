@@ -9,7 +9,8 @@ use super::source_tasks::{Session, source_identity};
 use crate::jobs::runner::extract::document::Int8DocumentExtractionJobPlanner;
 use crate::jobs::runner::source::document::Int8SourceDocumentJobPlanner;
 use crate::{
-    candidate_cli::{jobs::{self as command, Defaults, Failure, JobArgs, RunMode}, extract as schema_cli},
+    candidate_cli::{jobs::{self as command, Defaults, Failure, JobArgs, RunMode}, extract as schema_cli,
+        batch::document::RootObjectSelection},
     batch::{BatchCode, extract::quantized::Int8ExtractionBatchLimits, source::quantized as source_batch},
     hosted::{HostedError, corpus::{SourceCorpusConfig, jobs::{HostedJobError, JobHostLimits,
         JobOpenMode, SourceJobRequest}}},
@@ -27,6 +28,14 @@ enum PreparedJob {
     Extract(Int8ExtractionJobPlanner),
     Document { planner: Int8DocumentExtractionJobPlanner, reduction_reserve_bytes: u64 },
     SourceDocument { planner: Int8SourceDocumentJobPlanner, reduction_reserve_bytes: u64 },
+}
+/// Report the authenticated factory's actual semantics after execution, never
+/// infer object mode from a requested flag or inspect private stored results.
+fn root_object_selection(prepared: &PreparedJob) -> Option<RootObjectSelection> {
+    match prepared {
+        PreparedJob::Document { planner, .. } => planner.root_object_reconciliation().map(RootObjectSelection::new),
+        _ => None,
+    }
 }
 fn prepare(args: &JobArgs, facts: &ArtifactIdentity, ceiling: TaskBudget, defaults: Defaults,
     native: Int8ExtractionBatchLimits, control: &mut impl DecodeStepControl)
@@ -149,7 +158,7 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     let lifetime = command::parse_limits(&read_config(&session, &args.limits_file, command::LIMIT_BYTES)?)?;
     let native = command::native_limits(&args, lifetime)?;
     let full_native_memory = prefill.is_some() || limits.compute.threads > 1
-        || args.document_config.is_some() && !args.encoding.is_default();
+        || args.document_config.is_some() && (!args.encoding.is_default() || args.reconciliation.requested());
     // One record owns the output guard. Lifetime work can span millions of
     // records and is not a concurrent memory requirement.
     let native_bytes = |result_bytes: u64, output_tokens: u64| -> Result<u64, Failure> {
@@ -188,6 +197,7 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
         (Some(_), Some(_)) => return Err(Failure::usage("source_document_job_options")),
     };
     check_encoding_quote(&prepared, &encoding, encoding_work_limits, encoding_workspace_bytes)?;
+    let root_object_reconciliation = root_object_selection(&prepared);
     if full_native_memory {
         use crate::hosted::corpus::jobs::{extraction_document_job_workspace, source_document_job_workspace};
         let document = match &prepared {
@@ -246,7 +256,7 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     // protected spool/materialization. Failed delivery never implies rollback.
     let response = EncodingReport { response: &response,
         input_encoding: input_encoding::reported_policy(&encoding),
-        invocation_encoding_work_limits: encoding_work_limits };
+        invocation_encoding_work_limits: encoding_work_limits, root_object_reconciliation };
     let response = ScheduledResponse { response: &response,
         compute_threads: team.map(|(_, width)| width),
         prefill_rows: prefill.map(|limits| limits.max_batch_rows) };
@@ -285,6 +295,8 @@ struct EncodingReport<'a, T: Serialize> {
     input_encoding: Option<&'a UntrustedEncoding>,
     #[serde(skip_serializing_if = "Option::is_none")]
     invocation_encoding_work_limits: Option<SafeBpeWorkLimits>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_object_reconciliation: Option<RootObjectSelection>,
 }
 
 #[derive(Serialize)]

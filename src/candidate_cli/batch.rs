@@ -10,7 +10,7 @@ use crate::{
 use source::{Kind, SourceHostArgs};
 mod writer;
 mod extraction;
-mod document;
+pub(in crate::candidate_cli) mod document;
 pub(super) use writer::CandidateWriter;
 #[cfg(test)] mod tests;
 
@@ -74,7 +74,7 @@ pub(super) struct CorpusEnvelope {
 pub(super) fn definition() -> clap::Command {
     compute::definition(input_encoding::definition(BatchCommand::augment_args(clap::Command::new("batch")
         .about("Process bounded schema/source-task NDJSON using one resident candidate model")
-        .long_about("Run one fixed task over bounded ordered NDJSON. Each event carries non-authoritative candidate provenance. Weights and the native engine are reused. --compute-threads reuses one persistent INT8 row team across every record and chunk, and --prefill-rows selects bounded prompt morsels on that same team. Documents remain ordered; work, mask and tokenizer limits retain their original scope. Terminal run_complete follows physical worker join under the original invocation control. Earlier completed records remain valid if later records fail. Any document failure produces a nonzero process exit. Add --task extract --chunked --schema FILE for complete documents larger than one context. Each successful record retains independent exact-schema JSON strings for every chunk and original-coordinate verbatim evidence when --source-membership is selected. Required fields must be satisfiable per chunk; objects are never merged or repaired. Chunked records cannot override the shared schema or budgets in task_args. No partial document success is emitted."))))
+        .long_about("Run one fixed task over bounded ordered NDJSON. Each event carries non-authoritative candidate provenance. Weights and the native engine are reused. --compute-threads reuses one persistent INT8 row team across every record and chunk, and --prefill-rows selects bounded prompt morsels on that same team. Documents remain ordered; work, mask and tokenizer limits retain their original scope. Terminal run_complete follows physical worker join under the original invocation control. Earlier completed records remain valid if later records fail. Any document failure produces a nonzero process exit. Add --task extract --chunked --schema FILE for complete documents larger than one context. Each successful record retains independent exact-schema JSON strings for every chunk and original-coordinate verbatim evidence when --source-membership is selected. By default, required fields must be satisfiable per chunk. Add --reconcile-object to derive partial root schemas and combine complementary root properties into one independently validated original-schema object. Exact equal values keep every origin; conflicts or missing required fields refuse the whole document. Nested objects and arrays remain atomic. Chunked records cannot override the shared schema or budgets in task_args. No partial document success is emitted."))))
         .mut_arg("prefill_rows", |arg| arg.help("Bounded layer-major INT8 prompt morsels, 1..=64 rows, for all source/extraction records and every chunk of complete-document extraction. Composes with --compute-threads; both coordinator and worker buffers are admitted before private IO"))
         .after_long_help("--input-encoding safe-bpe-v1 uses one bounded tokenizer allowance per complete record: schema plus source for extract, or all untrusted source segments including QA passages and IDs. Extraction's aggregate byte ceiling is max-input-bytes plus the 64-KiB schema allowance, capped at 1 MiB; separate schema and document limits remain enforced. The allowance is not renewed between a record's segments. With --task extract --chunked, --max-total-tokenizer-* adds one cumulative invocation ledger across every document, schema encoding, accepted/discarded partition probe, chunk compilation and reconstruction; it never resets at flush or native handoff. Total-tokenizer flags require chunked safe-bpe-v1 extraction. The maximum record count bounds other preparation; native work and mask quotas remain shared across the whole invocation and flushes. One transient encoder workspace and the complete document frontier are admitted before private IO. Exact schema numbers, source bytes and citation coordinates are preserved; the policy binds prompt identity and is reported in every compact frame, with declared invocation tokenizer caps for chunked streams. This option changes prompt tokens and makes no parity, quality or speed claim.")
 }
@@ -178,7 +178,8 @@ impl BatchCommand {
             return Err(CandidateError::Arguments);
         }
         if (limits.compute.threads > 1 || prefill.is_some()
-            || self.document.chunked && !self.encoding.is_default())
+            || self.document.chunked && !self.encoding.is_default()
+            || self.document.reconciliation.requested())
             && self.schedule_peak_bytes(limits, envelope, prefill)? > limits.memory_bytes {
             return Err(CandidateError::Arguments);
         }

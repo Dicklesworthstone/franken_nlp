@@ -2,9 +2,10 @@
 use super::*;
 use std::sync::Arc;
 use super::super::extraction as planning;
-use crate::{candidate_cli::extract::SCHEMA_BYTES,
-    batch::extract::quantized::Int8ExtractionBatchPlanner,
-    hosted::corpus::ExtractionDocumentCorpusConfig,
+use crate::{candidate_cli::{extract::SCHEMA_BYTES,
+        batch::document::{RootObjectSelection, reconciled_request}},
+    batch::extract::quantized::{Int8ExtractionBatchPlanner, long::object::Int8ObjectExtractionPlanner},
+    hosted::corpus::{ExtractionDocumentCorpusConfig, Int8ObjectExtractionDocumentCorpusConfig},
     tokenizer::untrusted::SafeBpeWorkLimits};
 
 #[derive(Serialize)]
@@ -14,6 +15,8 @@ struct EncodingProvenance<'a, T: Serialize> {
     /// Declared invocation caps, not an observation of tokenizer work spent.
     #[serde(skip_serializing_if = "Option::is_none")]
     invocation_encoding_work_limits: Option<SafeBpeWorkLimits>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_object_reconciliation: Option<RootObjectSelection>,
 }
 
 fn check_encoding_quote(command: &BatchCommand, limits: Limits,
@@ -39,10 +42,29 @@ fn check_encoding_quote(command: &BatchCommand, limits: Limits,
     Ok(())
 }
 
+fn check_object_quote(command: &BatchCommand, limits: Limits,
+    compiler: &Int8ObjectExtractionPlanner, document: &Int8ObjectExtractionDocumentCorpusConfig,
+    expected_workspace: u64) -> Result<(), CandidateError> {
+    check_encoding_quote(command, limits, compiler.base_planner(), Some(&document.mapping), expected_workspace)?;
+    let expected = command.schedule_document_reserve()?.0.checked_add(expected_workspace)
+        .ok_or(CandidateError::Arguments)?;
+    if command.document_object_limits()? != Some(document.reconciliation)
+        || document.preparation_workspace_bytes(compiler).map_err(|_| CandidateError::Planning)? > expected {
+        return Err(CandidateError::Arguments);
+    }
+    Ok(())
+}
+
+enum PreparedCompiler {
+    Map { compiler: Int8ExtractionBatchPlanner, document: Option<ExtractionDocumentCorpusConfig> },
+    Object { compiler: Int8ObjectExtractionPlanner, document: Int8ObjectExtractionDocumentCorpusConfig },
+}
+
 pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     command: BatchCommand, args: CandidateArgs, limits: Limits, envelope: CorpusEnvelope,
     mut input: R, output: W,
 ) -> Result<(), CandidateError> {
+    let reconciliation = command.document_object_limits()?;
     let encoding = command.encoding_policy(limits)?;
     let encoding_work_limits = command.document_encoding_work_limits()?;
     let encoding_workspace_bytes = command.encoding_workspace_bytes(limits)?;
@@ -50,7 +72,12 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let schema = command.schema.as_ref().map(|path| session.read(path, &mut input, SCHEMA_BYTES)).transpose()?;
     let raw_defaults = command.defaults.as_ref()
         .map(|path| session.read(path, &mut input, MAX_SOURCE_ARGUMENT_BYTES)).transpose()?;
-    let defaults = command.load_extract_defaults(schema, raw_defaults.as_deref(), command.host.task_budget(limits))?;
+    let defaults = match reconciliation {
+        Some(reconciliation) => Some(reconciled_request(schema.ok_or(CandidateError::Arguments)?,
+            command.source_membership, command.host.task_budget(limits),
+            crate::candidate_cli::extract::compiler(&command.host), reconciliation, &mut session.control())?),
+        None => command.load_extract_defaults(schema, raw_defaults.as_deref(), command.host.task_budget(limits))?,
+    };
     // Move the exact shared schema into the fixed document policy rather than
     // retaining an unused second default-schema copy inside the compiler.
     let (defaults, document) = if command.document.chunked {
@@ -68,6 +95,16 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         None => compiler.with_document_encoding(encoding.clone()),
     }.map_err(|_| CandidateError::Planning)?;
     check_encoding_quote(&command, limits, &compiler, document.as_ref(), encoding_workspace_bytes)?;
+    let prepared = match reconciliation {
+        Some(reconciliation) => {
+            let compiler = Int8ObjectExtractionPlanner::new(compiler).map_err(|_| CandidateError::Planning)?;
+            let document = document.ok_or(CandidateError::Arguments)?
+                .with_root_object_reconciliation(reconciliation);
+            check_object_quote(&command, limits, &compiler, &document, encoding_workspace_bytes)?;
+            PreparedCompiler::Object { compiler, document }
+        }
+        None => PreparedCompiler::Map { compiler, document },
+    };
     session.remaining()?;
     let vocabulary = planning::vocabulary()?;
     session.remaining()?;
@@ -80,7 +117,8 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         prefill_rows: prefill.map(|limits| limits.max_batch_rows) };
     let provenance = EncodingProvenance { response: input_encoding::Response { response: &provenance,
         input_encoding: input_encoding::reported_policy(&encoding) },
-        invocation_encoding_work_limits: encoding_work_limits };
+        invocation_encoding_work_limits: encoding_work_limits,
+        root_object_reconciliation: reconciliation.map(RootObjectSelection::new) };
     let writer = CandidateWriter::new(output, &provenance, envelope.transport.max_output_line_bytes,
         envelope.output_bytes)?;
     let reader: Box<dyn BufRead + Send> = if command.input.as_os_str() == "-" {
@@ -97,37 +135,55 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     // physical completion. Chunked documents do not loop over host invocations
     // or replenish native/mask/verification allowances at document/flush boundaries.
     let width = limits.compute.threads;
-    let summary = if width == 1 {
-        match document {
-            Some(config) => match prefill {
-                None => session.engine.batch_int8_extract_document(&model, Arc::new(compiler),
-                    vocabulary, config, corpus, reader, writer, cancellation),
-                Some(prefill) => session.engine.batch_int8_extract_document_layer_major(&model,
-                    Arc::new(compiler), vocabulary, config, corpus, prefill, reader, writer, cancellation),
-            },
-            None => match prefill {
-                None => session.engine.batch_int8_extract(&model, compiler, vocabulary, envelope.native,
-                    corpus, reader, writer, cancellation),
-                Some(prefill) => session.engine.batch_int8_extract_layer_major(&model, compiler,
-                    vocabulary, envelope.native, corpus, prefill, reader, writer, cancellation),
-            },
-        }
-    } else {
-        let kernel = crate::native_engine::simd::config::process_kernel();
-        match document {
-            Some(config) => match prefill {
-                None => session.engine.batch_int8_extract_document_with_threads(&model, Arc::new(compiler),
-                    vocabulary, config, corpus, kernel, width, reader, writer, cancellation),
-                Some(prefill) => session.engine.batch_int8_extract_document_layer_major_with_threads(&model,
-                    Arc::new(compiler), vocabulary, config, corpus, kernel, width, prefill, reader, writer, cancellation),
-            },
-            None => match prefill {
-                None => session.engine.batch_int8_extract_with_threads(&model, compiler, vocabulary,
-                    envelope.native, corpus, kernel, width, reader, writer, cancellation),
-                Some(prefill) => session.engine.batch_int8_extract_layer_major_with_threads(&model,
-                    compiler, vocabulary, envelope.native, corpus, kernel, width, prefill, reader, writer, cancellation),
-            },
-        }
+    let summary = match prepared {
+        PreparedCompiler::Object { compiler, document } => if width == 1 {
+            match prefill {
+                None => session.engine.batch_int8_extract_object_document(&model, Arc::new(compiler), vocabulary,
+                    document, corpus, reader, writer, cancellation),
+                Some(prefill) => session.engine.batch_int8_extract_object_document_layer_major(&model,
+                    Arc::new(compiler), vocabulary, document, corpus, prefill, reader, writer, cancellation),
+            }
+        } else {
+            let kernel = crate::native_engine::simd::config::process_kernel();
+            match prefill {
+                None => session.engine.batch_int8_extract_object_document_with_threads(&model,
+                    Arc::new(compiler), vocabulary, document, corpus, kernel, width, reader, writer, cancellation),
+                Some(prefill) => session.engine.batch_int8_extract_object_document_layer_major_with_threads(&model,
+                    Arc::new(compiler), vocabulary, document, corpus, kernel, width, prefill, reader, writer, cancellation),
+            }
+        },
+        PreparedCompiler::Map { compiler, document } => if width == 1 {
+            match document {
+                Some(config) => match prefill {
+                    None => session.engine.batch_int8_extract_document(&model, Arc::new(compiler),
+                        vocabulary, config, corpus, reader, writer, cancellation),
+                    Some(prefill) => session.engine.batch_int8_extract_document_layer_major(&model,
+                        Arc::new(compiler), vocabulary, config, corpus, prefill, reader, writer, cancellation),
+                },
+                None => match prefill {
+                    None => session.engine.batch_int8_extract(&model, compiler, vocabulary, envelope.native,
+                        corpus, reader, writer, cancellation),
+                    Some(prefill) => session.engine.batch_int8_extract_layer_major(&model, compiler,
+                        vocabulary, envelope.native, corpus, prefill, reader, writer, cancellation),
+                },
+            }
+        } else {
+            let kernel = crate::native_engine::simd::config::process_kernel();
+            match document {
+                Some(config) => match prefill {
+                    None => session.engine.batch_int8_extract_document_with_threads(&model, Arc::new(compiler),
+                        vocabulary, config, corpus, kernel, width, reader, writer, cancellation),
+                    Some(prefill) => session.engine.batch_int8_extract_document_layer_major_with_threads(&model,
+                        Arc::new(compiler), vocabulary, config, corpus, kernel, width, prefill, reader, writer, cancellation),
+                },
+                None => match prefill {
+                    None => session.engine.batch_int8_extract_with_threads(&model, compiler, vocabulary,
+                        envelope.native, corpus, kernel, width, reader, writer, cancellation),
+                    Some(prefill) => session.engine.batch_int8_extract_layer_major_with_threads(&model,
+                        compiler, vocabulary, envelope.native, corpus, kernel, width, prefill, reader, writer, cancellation),
+                },
+            }
+        },
     }.map_err(|_| CandidateError::Batch)?;
     // A successfully drained stream can still contain failed documents. Keep
     // its nonzero exit and never append a second stdout completion/error frame.
