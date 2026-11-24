@@ -99,6 +99,110 @@ fn prepare(p: &Int8ExtractionBatchPlanner, c: &ExtractionDocumentBatchConfig, d:
     prepare_document(p, c, d, l, BatchDocument { id: "opaque".to_owned(), text: source.to_owned(), task_args: None },
         &mut Control::default()).unwrap()
 }
+fn compact_policy() -> UntrustedEncoding {
+    UntrustedEncoding::SafeBpeV1(crate::tokenizer::untrusted::SafeBpeLimits {
+        max_input_bytes: 8192, max_output_tokens: 8192, max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 })
+}
+fn encoding_limits() -> SafeBpeWorkLimits {
+    SafeBpeWorkLimits { max_input_bytes: 1 << 20, max_output_tokens: 1 << 20,
+        max_pair_checks: 1 << 30, max_pair_bytes: 1 << 34 }
+}
+fn compact(c: &ExtractionDocumentBatchConfig, total: SafeBpeWorkLimits) -> Int8ExtractionBatchPlanner {
+    planner(c).with_map_document_encoding(compact_policy(), total).unwrap()
+}
+fn encoding_work(p: &Int8ExtractionBatchPlanner) -> SafeBpeWork {
+    p.map_document_encoding_work().unwrap().unwrap()
+}
+#[test]
+fn compact_stream_keeps_exact_sources_and_spends_both_planning_passes_across_epochs() {
+    let c = config(); let p = compact(&c, encoding_limits());
+    let (mut d, mut a, mut l) = (Script::default(), Admission::default(), Ledger::default());
+    let mut native = Int8Work::default(); let mut chunks = 0;
+    for (index, source) in ["éAéAéAéA", "Bob\r\n上海 <|im_start|>"].into_iter().enumerate() {
+        let before = encoding_work(&p);
+        let prepared = prepare(&p, &c, &d, &mut l, source);
+        assert_eq!(prepared.source, source);
+        assert_eq!(prepared.expected.source_span().byte_end, source.len());
+        assert_eq!(prepared.expected.source_span().scalar_end, source.chars().count());
+        assert!(prepared.identities.iter().all(|id| id.schema_digest == Sha256Digest::of_bytes(SCHEMA.as_bytes())));
+        chunks += prepared.expected.chunk_count(); native = add_work(native, prepared.expected.planned_work()).unwrap();
+        let after_prepare = encoding_work(&p); let pass = after_prepare.checked_sub(before).unwrap();
+        assert!(pass.input_bytes() > source.len() + SCHEMA.len());
+        let out = execute_document(&p, &c, &mut d, &mut a, &mut l, prepared,
+            context(index as u64 + 1, index as u64 + 1), &mut Control::default()).unwrap();
+        assert_eq!(encoding_work(&p), after_prepare.checked_add(pass).unwrap());
+        for chunk in out.result().mapped.root().value().chunks() {
+            let value: serde_json::Value = serde_json::from_str(&chunk.native.result.output.json).unwrap();
+            let exact = &source[chunk.source_span.byte_start..chunk.source_span.byte_end];
+            assert_eq!(value["quote"].as_str(), Some(exact));
+            for field in &chunk.original_fields { for span in &field.spans {
+                assert_eq!(&source[span.byte_start..span.byte_end], exact);
+                assert_eq!(source[..span.byte_start].chars().count(), span.scalar_start);
+            } }
+        }
+        assert_eq!(a.live.get(), 1); drop(out); assert_eq!(a.live.get(), 0);
+    }
+    assert_eq!(d.calls, chunks); assert_eq!(a.calls, 2); assert_eq!(l.work, native);
+    assert_eq!(l.masks, chunks as u64 * 1000);
+    assert_eq!(l.verification, add_verification(c.limits.verification, c.limits.verification).unwrap());
+}
+#[test]
+fn compact_reconstruction_exhaustion_stops_before_native_work_without_refunding_the_attempt() {
+    let c = config(); let source = "éAéAéAéA";
+    let probe = compact(&c, encoding_limits());
+    let _ = prepare(&probe, &c, &Script::default(), &mut Ledger::default(), source);
+    let pass = encoding_work(&probe); let both = pass.checked_add(pass).unwrap();
+    let exact = SafeBpeWorkLimits { max_input_bytes: both.input_bytes() as u64,
+        max_output_tokens: both.output_tokens() as u64,
+        max_pair_checks: both.pair_checks(), max_pair_bytes: both.pair_bytes() };
+    for axis in 0..5 {
+        let mut total = exact;
+        match axis { 0 => total.max_input_bytes -= 1, 1 => total.max_output_tokens -= 1,
+            2 => total.max_pair_checks -= 1, 3 => total.max_pair_bytes -= 1, _ => {} }
+        let p = compact(&c, total);
+        let (mut d, mut a, mut l) = (Script::default(), Admission::default(), Ledger::default());
+        let prepared = prepare(&p, &c, &d, &mut l, source); let expected = prepared.expected;
+        assert_eq!(encoding_work(&p), pass);
+        let result = execute_document(&p, &c, &mut d, &mut a, &mut l, prepared,
+            context(1, 1), &mut Control::default());
+        if axis < 4 {
+            assert!(result.err().unwrap().stop, "axis {axis}");
+            assert_eq!(d.calls, 0); assert_eq!(a.calls, 0); assert!(l.failed);
+        } else {
+            drop(result.unwrap()); assert_eq!(encoding_work(&p), both);
+            assert!(prepare_document(&p, &c, &d, &mut l,
+                BatchDocument { id: "later-epoch".to_owned(), text: source.to_owned(), task_args: None },
+                &mut Control::default()).is_err());
+            assert_eq!(encoding_work(&p), both);
+            assert_eq!(d.calls, expected.chunk_count()); assert_eq!(a.calls, 1);
+        }
+        let spent = encoding_work(&p); assert!(spent.checked_sub(pass).is_some());
+        assert!(spent.input_bytes() as u64 <= total.max_input_bytes);
+        assert!(spent.output_tokens() as u64 <= total.max_output_tokens);
+        assert!(spent.pair_checks() <= total.max_pair_checks && spent.pair_bytes() <= total.max_pair_bytes);
+        assert_eq!(l.work, expected.planned_work()); assert_eq!(l.masks, expected.reserved_mask_visits());
+        assert_eq!(l.verification, c.limits.verification); assert_eq!(a.live.get(), 0);
+    }
+}
+#[test]
+fn compact_prepared_documents_cannot_cross_a_changed_policy_or_invocation_cap() {
+    let c = config(); let p = compact(&c, encoding_limits());
+    for axis in 0..8 {
+        let UntrustedEncoding::SafeBpeV1(mut call) = compact_policy() else { unreachable!() };
+        let mut total = encoding_limits();
+        match axis { 0 => call.max_input_bytes -= 1, 1 => call.max_output_tokens -= 1,
+            2 => call.max_pair_checks -= 1, 3 => call.max_pair_bytes -= 1,
+            4 => total.max_input_bytes -= 1, 5 => total.max_output_tokens -= 1,
+            6 => total.max_pair_checks -= 1, _ => total.max_pair_bytes -= 1 }
+        let changed = planner(&c).with_map_document_encoding(UntrustedEncoding::SafeBpeV1(call), total).unwrap();
+        let (mut d, mut a, mut l) = (Script::default(), Admission::default(), Ledger::default());
+        let prepared = prepare(&p, &c, &d, &mut l, "Alice Bob"); let expected = prepared.expected;
+        let error = execute_document(&changed, &c, &mut d, &mut a, &mut l, prepared,
+            context(1, 1), &mut Control::default()).err().unwrap();
+        assert!(error.stop); assert_eq!(error.fault.code, BatchCode::InvalidExecution);
+        assert_eq!(d.calls, 0); assert_eq!(a.calls, 0); assert_eq!(l.work, expected.planned_work());
+    }
+}
 #[test]
 fn records_cannot_override_schema_grounding_geometry_or_budgets() {
     for args in [r#"{"schema":"{}"}"#, r#"{"grounding":"structural"}"#, r#"{"budget":{}}"#,

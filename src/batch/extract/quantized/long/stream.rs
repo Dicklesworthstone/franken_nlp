@@ -57,7 +57,10 @@ impl<'p, 'e, 'w, 'v, A: ExtractionDocumentBatchAdmission>
     pub fn new(planner: &'p Int8ExtractionBatchPlanner, config: ExtractionDocumentBatchConfig,
         engine: &'e mut StrictInt8Engine<'w>, vocabulary: &'v ExtractionVocabulary, admission: A)
         -> Result<Self, BatchFault> {
-        planner.require_byte_encoding()?;
+        // A compact stream requires the complete-map ledger, not merely a
+        // record-local encoding policy. The same borrowed planner retains
+        // every probe, chunk and reconstruction debit across all records.
+        planner.map_document_encoding_workspace_bytes()?;
         config.validate()?;
         let driver = NativeDriver { engine, vocabulary, prefill: None };
         capacity(&driver, &config).map_err(|e| e.fault)?;

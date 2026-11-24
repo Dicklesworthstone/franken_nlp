@@ -59,6 +59,113 @@ fn freeze(p: &Int8DocumentExtractionJobPlanner, input: &[u8]) -> FrozenManifest 
         execution: p.execution_identity(), recipe: p.job_recipe(), limits: limits() },
         [JobInput { id: "item", original: input, normalized: input }], &mut Continue).unwrap()
 }
+fn compact_policy() -> UntrustedEncoding {
+    UntrustedEncoding::SafeBpeV1(crate::tokenizer::untrusted::SafeBpeLimits {
+        max_input_bytes: 4096, max_output_tokens: 4096, max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 })
+}
+fn encoding_limits() -> SafeBpeWorkLimits {
+    SafeBpeWorkLimits { max_input_bytes: 1 << 20, max_output_tokens: 1 << 20,
+        max_pair_checks: 1 << 28, max_pair_bytes: 1 << 32 }
+}
+fn compact() -> Int8DocumentExtractionJobPlanner {
+    factory(config()).with_document_encoding(compact_policy(), Some(encoding_limits())).unwrap()
+}
+#[test]
+fn compact_resume_authenticates_every_encoding_axis_and_keeps_spent_work_out_of_the_recipe() {
+    let p = compact(); let input = r#"{"id":"item","text":"éAéAéAéA"}"#.as_bytes();
+    let frozen = freeze(&p, input);
+    let plan = p.compiler.plan_document_with_control("éAéAéAéA", &p.config.request, p.config.limits, &mut Continue).unwrap();
+    assert!(plan.preflight_metadata().chunk_count() > 1);
+    for child in plan.execution_identities() {
+        assert_eq!(child.template_digest, p.execution_identity().template_digest);
+        assert_eq!(child.schema_digest, Sha256Digest::of_bytes(p.config.request.schema.as_bytes()));
+    }
+    assert!(p.encoding_work().unwrap().unwrap().input_bytes() > 0);
+    frozen.binding.compare(&freeze(&p, input).binding).unwrap();
+    let resumed = compact(); resumed.check_job_limits(limits()).unwrap();
+    frozen.binding.compare(&freeze(&resumed, input).binding).unwrap();
+    assert_eq!(resumed.encoding_work().unwrap(), Some(SafeBpeWork::default()));
+    let recipe = serde_json::to_value(p.job_recipe()).unwrap();
+    assert_eq!(recipe["extraction"]["input_encoding"], serde_json::to_value(compact_policy()).unwrap());
+    assert_eq!(recipe["extraction"]["encoding_work_limits"], serde_json::to_value(encoding_limits()).unwrap());
+    for axis in 0..8 {
+        let UntrustedEncoding::SafeBpeV1(mut call) = compact_policy() else { unreachable!() };
+        let mut total = encoding_limits();
+        match axis { 0 => call.max_input_bytes -= 1, 1 => call.max_output_tokens -= 1,
+            2 => call.max_pair_checks -= 1, 3 => call.max_pair_bytes -= 1,
+            4 => total.max_input_bytes -= 1, 5 => total.max_output_tokens -= 1,
+            6 => total.max_pair_checks -= 1, _ => total.max_pair_bytes -= 1 }
+        let changed = factory(config()).with_document_encoding(UntrustedEncoding::SafeBpeV1(call), Some(total)).unwrap();
+        assert!(frozen.binding.compare(&freeze(&changed, input).binding).is_err(), "axis {axis}");
+    }
+}
+#[test]
+fn compact_job_reconfiguration_preserves_spent_work_and_refuses_incomplete_or_changed_policy() {
+    assert!(factory(config()).with_document_encoding(compact_policy(), None).is_err());
+    assert!(factory(config()).with_document_encoding(UntrustedEncoding::ByteFallback, Some(encoding_limits())).is_err());
+    for axis in 0..4 {
+        let mut total = encoding_limits();
+        match axis { 0 => total.max_input_bytes = 0, 1 => total.max_output_tokens = 0,
+            2 => total.max_pair_checks = 0, _ => total.max_pair_bytes = 0 }
+        assert!(factory(config()).with_document_encoding(compact_policy(), Some(total)).is_err());
+    }
+    let p = compact();
+    let first = p.compiler.plan_document_with_control("éAéAéAéA", &p.config.request, p.config.limits, &mut Continue).unwrap();
+    let expected = first.preflight_metadata(); let ids: Vec<_> = first.execution_identities().cloned().collect();
+    drop(first); let spent = p.encoding_work().unwrap().unwrap();
+    let p = p.with_document_encoding(compact_policy(), Some(encoding_limits())).unwrap();
+    assert_eq!(p.encoding_work().unwrap(), Some(spent));
+    let rebuilt = p.compiler.plan_document_with_control("éAéAéAéA", &p.config.request, p.config.limits, &mut Continue).unwrap();
+    assert_eq!(rebuilt.preflight_metadata(), expected);
+    assert_eq!(rebuilt.execution_identities().cloned().collect::<Vec<_>>(), ids);
+    assert_eq!(p.encoding_work().unwrap(), Some(spent.checked_add(spent).unwrap()));
+    drop(rebuilt);
+    let mut changed = encoding_limits(); changed.max_input_bytes += 1;
+    assert_eq!(p.with_document_encoding(compact_policy(), Some(changed)).err().unwrap().code, BatchCode::InvalidExecution);
+    assert_eq!(compact().with_document_encoding(UntrustedEncoding::ByteFallback, None).err().unwrap().code,
+        BatchCode::InvalidExecution);
+}
+#[test]
+fn byte_job_defaults_preserve_the_original_recipe_identity_and_workspace() {
+    let p = factory(config()); let recipe = canonjson::canonical_bytes(p.job_recipe()).unwrap();
+    let identity = p.execution_identity().clone();
+    assert_eq!(p.encoding_work_limits(), None); assert_eq!(p.encoding_work().unwrap(), None);
+    let p = p.with_document_encoding(UntrustedEncoding::ByteFallback, None).unwrap();
+    assert_eq!(p.document_encoding(), &UntrustedEncoding::ByteFallback);
+    assert_eq!(p.execution_identity(), &identity); assert_eq!(p.encoding_workspace_bytes().unwrap(), 0);
+    assert_eq!(canonjson::canonical_bytes(p.job_recipe()).unwrap(), recipe);
+    let value = serde_json::to_value(p.job_recipe()).unwrap();
+    assert!(value["extraction"].get("input_encoding").is_none());
+    assert!(value["extraction"].get("encoding_work_limits").is_none());
+}
+#[test]
+fn compact_job_workspace_is_additive_to_the_complete_document_frontier() {
+    let byte = factory(config()); let compact = compact();
+    let UntrustedEncoding::SafeBpeV1(call) = compact_policy() else { unreachable!() };
+    let extra = call.requirements().unwrap().workspace_bytes + 1024;
+    assert_eq!(byte.document_work(), compact.document_work());
+    assert_eq!(compact.encoding_workspace_bytes().unwrap(), extra);
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        use crate::hosted::corpus::jobs::extraction_document_job_workspace;
+        let original = extraction_document_job_workspace(&byte, 4096).unwrap();
+        assert_eq!(extraction_document_job_workspace(&compact, 4096).unwrap(), original + extra);
+        assert!(extraction_document_job_workspace(&compact, u64::MAX).is_err());
+    }
+}
+#[test]
+fn a_changed_encoding_recipe_or_identity_refuses_before_storage() {
+    for axis in 0..4 {
+        let mut p = compact();
+        match axis { 0 => p.recipe.extraction.input_encoding = None,
+            1 => p.recipe.extraction.encoding_work_limits = None,
+            2 => p.recipe.extraction.input_encoding = Some(UntrustedEncoding::ByteFallback),
+            _ => p.identity.template_digest = Sha256Digest::of_bytes(b"foreign-compiler") }
+        let error = super::super::super::freeze(&JobSecret::from_bytes([7; 32]), JobId([9; 16]), limits(),
+            &[], &NoNative(&p), &mut Continue).err().unwrap();
+        assert_eq!(error, JobRunError::Processor(BatchCode::Admission.into()), "axis {axis}");
+    }
+}
 #[test]
 fn original_document_planning_uses_every_exact_child_and_one_whole_document_debit() {
     let p = factory(config()); p.check_job_limits(limits()).unwrap();

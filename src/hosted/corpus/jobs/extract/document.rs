@@ -65,8 +65,9 @@ impl scored::Int8JobTask for DocumentExtractionTask {
 pub(crate) fn extraction_document_job_workspace(planner: &Int8DocumentExtractionJobPlanner, reserve: u64)
     -> Result<u64, HostedError> {
     let mapping = planner.document_limits();
-    crate::hosted::extraction_map::document_workspace_bytes(planner.document_budget(), mapping,
-        mapping.mapping.chunks.max_chunks, reserve)
+    sum(&[crate::hosted::extraction_map::document_workspace_bytes(planner.document_budget(), mapping,
+        mapping.mapping.chunks.max_chunks, reserve)?,
+        planner.encoding_workspace_bytes().map_err(HostedError::BatchSetup)?])
 }
 
 fn check_capacity(budget: TaskBudget, planned_context: usize, resident_context: usize,

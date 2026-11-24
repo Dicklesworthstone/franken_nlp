@@ -77,6 +77,54 @@ impl Int8DocumentExtractionJobPlanner {
     pub fn document_limits(&self) -> Int8ExtractionMapLimits { self.config.limits }
     pub fn document_budget(&self) -> TaskBudget { self.config.request.budget }
     pub fn job_recipe(&self) -> &Int8DocumentExtractionJobRecipe { &self.recipe }
+    /// Configure one bounded tokenizer allowance for this invocation before
+    /// authenticating storage. All document probes, chunk compilation and
+    /// reconstruction share the same compiler-owned ledger. Resume recreates
+    /// the same authenticated policy/caps; committed rows are skipped without
+    /// tokenization, while durable native work and attempts remain spent.
+    /// Reapplying identical settings preserves work already consumed. Once
+    /// compact input is selected, changing or removing its policy is refused.
+    pub fn with_document_encoding(mut self, policy: UntrustedEncoding,
+        total: Option<SafeBpeWorkLimits>) -> Result<Self, BatchFault> {
+        self.check_document_encoding()?;
+        encoding_workspace(&policy, total)?;
+        if self.document_encoding() == &policy && self.encoding_work_limits() == total {
+            return Ok(self);
+        }
+        if self.document_encoding() != &UntrustedEncoding::ByteFallback {
+            return Err(BatchCode::InvalidExecution.into());
+        }
+        let total = total.ok_or(BatchCode::InvalidLimits)?;
+        self.compiler = self.compiler.with_map_document_encoding(policy.clone(), total)?;
+        self.identity = self.compiler.base_execution_identity().clone();
+        self.recipe.extraction.input_encoding = Some(policy);
+        self.recipe.extraction.encoding_work_limits = Some(total);
+        self.check_document_encoding()?;
+        bounded_json(&self.recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
+        Ok(self)
+    }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.compiler.document_encoding() }
+    pub fn encoding_work_limits(&self) -> Option<SafeBpeWorkLimits> {
+        self.compiler.map_document_encoding_limits()
+    }
+    pub fn encoding_work(&self) -> Result<Option<SafeBpeWork>, BatchFault> {
+        self.compiler.map_document_encoding_work()
+    }
+    pub fn encoding_workspace_bytes(&self) -> Result<u64, BatchFault> {
+        self.check_document_encoding()?;
+        self.compiler.map_document_encoding_workspace_bytes()
+    }
+    fn check_document_encoding(&self) -> Result<(), BatchFault> {
+        let recipe = &self.recipe.extraction;
+        let expected = recipe.input_encoding.as_ref().unwrap_or(&UntrustedEncoding::ByteFallback);
+        if matches!(recipe.input_encoding.as_ref(), Some(UntrustedEncoding::ByteFallback))
+            || self.document_encoding() != expected || self.encoding_work_limits() != recipe.encoding_work_limits
+            || &self.identity != self.compiler.base_execution_identity() {
+            return Err(BatchCode::Admission.into());
+        }
+        self.compiler.map_document_encoding_workspace_bytes()?;
+        Ok(())
+    }
     pub fn document_work(&self) -> JobWork {
         JobWork { model: self.recipe.per_document_work,
             mask_node_visits: self.recipe.max_mask_visits_per_document }
@@ -87,6 +135,7 @@ impl Int8DocumentExtractionJobPlanner {
     /// axis. This conservative proof needs no journal-format migration and
     /// includes failed, cancelled and acknowledgement-uncertain attempts.
     pub fn check_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> {
+        self.check_document_encoding()?;
         limits.validate().map_err(|_| BatchCode::InvalidLimits)?;
         let maximum = JobWork { model: self.config.max_model_work, mask_node_visits: self.config.max_mask_visits };
         if !self.document_work().fits(limits.max_work) || !limits.max_work.fits(maximum)
@@ -119,6 +168,7 @@ impl<'p, 'e, 'w, 'v, A: ExtractionDocumentBatchAdmission>
     }
     pub(crate) fn scheduled(planner: &'p Int8DocumentExtractionJobPlanner, engine: &'e mut StrictInt8Engine<'w>,
         vocabulary: &'v ExtractionVocabulary, admission: A, prefill: Option<Int8PrefillLimits>) -> Result<Self, BatchFault> {
+        planner.check_document_encoding()?;
         let config = planner.config.clone();
         let native = match prefill {
             None => NativeInt8DocumentExtractionBatch::new(&planner.compiler, config, engine, vocabulary, admission),

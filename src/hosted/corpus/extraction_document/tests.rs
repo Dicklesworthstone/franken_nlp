@@ -116,3 +116,24 @@ fn transferred_document_task_prices_schema_capacity_and_complete_map_frontier() 
     c.reduction_reserve_bytes = u64::MAX;
     assert!(task_workspace(&c).is_err());
 }
+
+#[test]
+fn compact_document_corpus_adds_one_encoder_and_ledger_beside_the_existing_frontier() {
+    use crate::{grammar::{CompileLimits, runtime::SourceRuntimeLimits},
+        tokenizer::{pinned_controls, untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding}}};
+    let (c, _) = config(); let registry = pinned_controls::pinned().unwrap();
+    let planner = || Int8ExtractionBatchPlanner::pinned(registry.template_controls(), 166101, identity(),
+        c.batch.request.budget, CompileLimits::default(), SourceRuntimeLimits::default(), None).unwrap();
+    let call = SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 4096,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
+    let total = SafeBpeWorkLimits { max_input_bytes: 1 << 20, max_output_tokens: 1 << 20,
+        max_pair_checks: 1 << 28, max_pair_bytes: 1 << 32 };
+    let original = c.preparation_workspace_bytes(&planner()).unwrap();
+    assert_eq!(original, task_workspace(&c).unwrap());
+    let compact = planner().with_map_document_encoding(UntrustedEncoding::SafeBpeV1(call), total).unwrap();
+    assert_eq!(c.preparation_workspace_bytes(&compact).unwrap(),
+        original + call.requirements().unwrap().workspace_bytes + 1024);
+    let record_only = planner().with_document_encoding(UntrustedEncoding::SafeBpeV1(call)).unwrap();
+    assert!(c.preparation_workspace_bytes(&record_only).is_err());
+    assert_eq!(compact.map_document_encoding_work().unwrap(), Some(Default::default()));
+}

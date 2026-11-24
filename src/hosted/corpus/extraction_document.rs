@@ -12,6 +12,17 @@ pub struct ExtractionDocumentCorpusConfig {
     pub batch: ExtractionDocumentBatchConfig,
     pub reduction_reserve_bytes: u64,
 }
+impl ExtractionDocumentCorpusConfig {
+    /// Exact task workspace in addition to the corpus's owned IO, caller
+    /// preparation, native buffers and output guard. Compact input adds one
+    /// transient encoder and its cumulative ledger beside the complete map
+    /// frontier; it never discounts original source or schema storage.
+    pub fn preparation_workspace_bytes(&self, planner: &Int8ExtractionBatchPlanner)
+        -> Result<u64, HostedError> {
+        sum(&[task_workspace(self)?, planner.map_document_encoding_workspace_bytes()
+            .map_err(HostedError::BatchSetup)?])
+    }
+}
 impl NlpEngine {
     /// Stream original documents larger than one context using one native
     /// engine and one invocation. Successful rows contain every chunk value
@@ -75,10 +86,9 @@ impl scored::CorpusTask for ExtractionDocumentStream {
     fn identity(&self) -> &ExecutionIdentity { self.planner.base_execution_identity() }
     fn validate(&self, _model: &ArtifactIdentity, limits: CorpusLimits,
         native: Int8MemoryRequirement) -> Result<u64, HostedError> {
-        self.planner.require_byte_encoding().map_err(HostedError::BatchSetup)?;
         self.config.batch.validate().map_err(HostedError::BatchSetup)?;
         validate(&self.config, limits, native.kv_bytes)?;
-        task_workspace(&self.config)
+        self.config.preparation_workspace_bytes(&self.planner)
     }
     #[allow(clippy::too_many_arguments)]
     fn execute<R: BufRead, W: Write>(self, engine: &mut crate::native_engine::strict_int8::StrictInt8Engine<'_>,
