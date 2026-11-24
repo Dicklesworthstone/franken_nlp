@@ -7,6 +7,7 @@ mod manage;
 mod extract;
 pub(super) mod scored;
 mod generation;
+pub mod semantic;
 mod source_document;
 pub(crate) use extract::document::extraction_document_job_workspace;
 pub(crate) use source_document::source_document_job_workspace;

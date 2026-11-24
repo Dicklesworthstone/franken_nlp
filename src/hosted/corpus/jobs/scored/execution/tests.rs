@@ -92,3 +92,64 @@ fn compact_job_preparation_coexists_with_the_complete_physical_schedule() {
 }
 
 mod native;
+
+
+#[test]
+fn retained_job_assets_and_exact_population_survive_callback_error_and_unwind() {
+    use std::{io::Cursor, panic::{catch_unwind, AssertUnwindSafe},
+        sync::{Arc, atomic::{AtomicUsize, Ordering}}};
+    struct Asset(Arc<AtomicUsize>);
+    impl Drop for Asset {
+        fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+    }
+    let wire = b"{\"id\":\"a\",\"text\":\" first \"}\r\n{\"id\":\"b\",\"text\":\"second\"}\n";
+    let first = b"{\"id\":\"a\",\"text\":\" first \"}\r";
+    // Parsing is genuine; no filesystem, journal, model or worker is simulated.
+    for unwind in [false, true] {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let asset = Arc::new(Asset(Arc::clone(&drops)));
+        let observer = Arc::downgrade(&asset);
+        let request = SourceJobRequest { root: PathBuf::new(), key: crate::jobs::tests::key(),
+            job_id: JobId([7; 16]), limits: job(), mode: JobOpenMode::Create, materialize: false };
+        let mut input = RetainedInput {
+            _retained: Some(Box::new(Arc::clone(&asset))), population: None,
+            stream: StreamInput { planner: Some((asset, request)), reader: Cursor::new(wire.to_vec()), writer: () },
+        };
+        let mut original_pointer = None;
+        let failure = catch_unwind(AssertUnwindSafe(|| {
+            let (_consumed_task, request) = input.stream.planner.take().unwrap();
+            let population = match read_population(&mut input.stream.reader, &request,
+                limits().transport, &mut crate::jobs::tests::Control::default()).unwrap() {
+                Population::Original(original) =>
+                    Population::BorrowedOriginal(input.population.insert(original)),
+                _ => panic!("original population fixture"),
+            };
+            let Population::BorrowedOriginal(original) = &population else {
+                panic!("runner must borrow the retained population");
+            };
+            let borrowed = original.borrowed_inputs().unwrap();
+            assert_eq!(borrowed.len(), 2);
+            assert_eq!(borrowed[0].original, first);
+            assert_eq!(borrowed[0].original.as_ptr(), borrowed[0].normalized.as_ptr());
+            original_pointer = Some(borrowed[0].original.as_ptr());
+            if unwind { panic!("injected job callback unwind"); }
+            Err::<(), _>(HostedError::CompletionMissing)
+        }));
+        if unwind { assert!(failure.is_err()); }
+        else { assert!(matches!(failure, Ok(Err(HostedError::CompletionMissing)))); }
+        assert!(input.stream.planner.is_none());
+        assert_eq!(observer.strong_count(), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        let population = input.population.as_ref().expect("outer owner retains every original record");
+        assert_eq!(population.stats().items, 2);
+        let borrowed = population.borrowed_inputs().unwrap();
+        assert_eq!(borrowed[0].id, "a");
+        assert_eq!(borrowed[0].original, first);
+        assert_eq!(borrowed[0].original.as_ptr(), original_pointer.unwrap(), "no replacement or reparse");
+        assert_eq!(borrowed[1].original, b"{\"id\":\"b\",\"text\":\"second\"}");
+        drop(borrowed);
+        drop(input);
+        assert!(observer.upgrade().is_none());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+}

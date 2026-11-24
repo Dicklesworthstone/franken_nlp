@@ -5,6 +5,9 @@ use crate::native_engine::strict_int8::projection::Int8ProjectionExecutor;
 
 pub(in crate::hosted::corpus) trait Int8JobTask: Send + Sized + 'static {
     fn identity(&self) -> &ExecutionIdentity;
+    /// Actual immutable task assets survive runner errors and native unwind
+    /// until the dispatcher has joined every physical child.
+    fn retain_for_join(&self) -> Option<Box<dyn Send>> { None }
     fn validate(&self, native: Int8MemoryRequirement, job: JobLimits) -> Result<(), HostedError>;
     fn preparation_workspace_bytes(&self) -> Result<u64, HostedError> { Ok(0) }
     fn execute(self, engine: &mut StrictInt8Engine<'_>, admission: CorpusAdmission<'_>,
@@ -42,8 +45,13 @@ fn quote(limits: JobHostLimits, job: JobLimits, input: JobInputMemory,
 /// The dispatcher owns this aggregate OUTSIDE its scoped callback. Cancellation,
 /// failed durable work, or unwind cannot release a reader, reservation or lease
 /// while a child remains live. Progress becomes observable only after join.
+struct RetainedInput<P, R> {
+    _retained: Option<Box<dyn Send>>,
+    population: Option<JobPopulation>,
+    stream: StreamInput<(P, SourceJobRequest), R, ()>,
+}
 struct Execution<P, R> {
-    input: Charged<StreamInput<(P, SourceJobRequest), R, ()>>,
+    input: Charged<RetainedInput<P, R>>,
     kv: Option<Pending>,
     scratch: Option<Pending>,
     _kv: Option<CommittedMemory>,
@@ -72,7 +80,11 @@ where P: Int8JobTask, R: BufRead + Send + 'static {
         native, task.preparation_workspace_bytes()?, prefill, team.map(|(_, width)| width))?;
     let lease = host.resources().acquire_lease();
     let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
-        || Ok(StreamInput { planner: Some((task, request)), reader, writer: () }))?;
+        || {
+            let retained = task.retain_for_join();
+            Ok(RetainedInput { _retained: retained, population: None,
+                stream: StreamInput { planner: Some((task, request)), reader, writer: () } })
+        })?;
     let kv = Pending::reserve(&lease, MemoryClass::KvPages, native.kv_bytes)?;
     let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.scratch_bytes)?;
     let execution = Execution { input, kv: Some(kv), scratch: Some(scratch), _kv: None, _scratch: None,
@@ -101,8 +113,14 @@ impl<P: Int8JobTask, R: BufRead> Execution<P, R> {
                 return Err(HostedError::Native(StrictInt8Error::Cancelled(cause)));
             }
         }
-        let (task, request) = self.input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
-        let population = match read_population(&mut self.input.value.reader, &request, self.limits.transport, control) {
+        let (task, request) = self.input.value.stream.planner.take().ok_or(HostedError::CompletionMissing)?;
+        let population = match read_population(&mut self.input.value.stream.reader,
+            &request, self.limits.transport, control) {
+            Ok(Population::Original(original)) => {
+                // The runner borrows these same authenticated original bytes;
+                // its local teardown never releases them ahead of worker join.
+                Population::BorrowedOriginal(self.input.value.population.insert(original))
+            }
             Ok(population) => population,
             Err(error) => return Ok(Err(JobRunError::Storage(error))),
         };
