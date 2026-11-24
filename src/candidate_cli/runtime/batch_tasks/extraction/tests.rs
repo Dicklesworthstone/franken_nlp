@@ -54,7 +54,7 @@ fn compact_extraction_policy_is_reported_on_every_frame_with_bounded_writer_stor
         scope: "real-artifact-current-candidate", evidence: "non_authoritative",
         model_id: &facts.model_id, source_revision: &facts.revision,
         source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
-        quant_recipe: &facts.recipe_id, task: "extract" };
+        quant_recipe: &facts.recipe_id, task: "extract", compute_threads: None, prefill_rows: None };
     let mut output = Vec::new();
     {
         let provenance = input_encoding::Response { response: &provenance,

@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     batch::{BatchLimits, BatchSummary, BatchWork, source::{SourceBatchArgs, SourceMaskBudget,
         quantized::{Int8SourceBatchLimits, MAX_SOURCE_ARGUMENT_BYTES}}},
-    native_engine::{constrained_int8, strict_int8::Int8Work},
+    native_engine::{constrained_int8, strict_int8::{Int8Work, prefill::Int8PrefillLimits}},
     tasks::{BuiltInTask, keyphrases::KeyphraseOptions, ner::NerOptions,
         summarize::SummaryOptions, ir::TaskBudget},
 };
@@ -55,6 +55,10 @@ pub(crate) struct BatchCommand {
     pub(super) max_line_bytes: usize,
     #[arg(skip)]
     pub(super) encoding: input_encoding::InputEncodingArgs,
+    #[arg(skip)]
+    pub(super) compute: compute::Args,
+    #[command(flatten)]
+    pub(super) prefill: source::prefill::SourcePrefillArgs,
 }
 
 #[derive(Clone, Copy)]
@@ -66,15 +70,17 @@ pub(super) struct CorpusEnvelope {
 }
 
 pub(super) fn definition() -> clap::Command {
-    input_encoding::definition(BatchCommand::augment_args(clap::Command::new("batch")
+    compute::definition(input_encoding::definition(BatchCommand::augment_args(clap::Command::new("batch")
         .about("Process bounded schema/source-task NDJSON using one resident candidate model")
-        .long_about("Run one fixed task over bounded ordered NDJSON. Each event carries non-authoritative candidate provenance. Weights and the native engine are reused; this is serial item-local execution, not parallel/GEMM batching or a durable job. Earlier completed records remain valid if later records fail. Any document failure produces a nonzero process exit. Add --task extract --chunked --schema FILE for complete documents larger than one context. Each successful record retains independent exact-schema JSON strings for every chunk and original-coordinate verbatim evidence when --source-membership is selected. Required fields must be satisfiable per chunk; objects are never merged or repaired. Chunked records cannot override the shared schema or budgets in task_args. No partial document success is emitted.")))
+        .long_about("Run one fixed task over bounded ordered NDJSON. Each event carries non-authoritative candidate provenance. Weights and the native engine are reused. --compute-threads reuses one persistent INT8 row team across every record and chunk, and --prefill-rows selects bounded prompt morsels on that same team. Documents remain ordered; work, mask and tokenizer limits retain their original scope. Terminal run_complete follows physical worker join under the original invocation control. Earlier completed records remain valid if later records fail. Any document failure produces a nonzero process exit. Add --task extract --chunked --schema FILE for complete documents larger than one context. Each successful record retains independent exact-schema JSON strings for every chunk and original-coordinate verbatim evidence when --source-membership is selected. Required fields must be satisfiable per chunk; objects are never merged or repaired. Chunked records cannot override the shared schema or budgets in task_args. No partial document success is emitted."))))
+        .mut_arg("prefill_rows", |arg| arg.help("Bounded layer-major INT8 prompt morsels, 1..=64 rows, for all source/extraction records and every chunk of complete-document extraction. Composes with --compute-threads; both coordinator and worker buffers are admitted before private IO"))
         .after_long_help("--input-encoding safe-bpe-v1 uses one bounded tokenizer allowance per complete record: schema plus source for extract, or all untrusted source segments including QA passages and IDs. Extraction's aggregate byte ceiling is max-input-bytes plus the 64-KiB schema allowance, capped at 1 MiB; separate schema and document limits remain enforced. The allowance is not renewed between a record's segments. The maximum record count bounds total preparation; native work and mask quotas remain shared across the whole invocation and flushes. One transient encoder workspace is admitted before private IO. Exact schema numbers, source bytes and citation coordinates are preserved; the policy binds prompt identity and is reported in every compact frame. This option changes prompt tokens and makes no parity, quality or speed claim. Chunked extraction currently requires byte-fallback.")
 }
 impl BatchCommand {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let mut command = Self::from_arg_matches(matches)?;
         command.encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+        command.compute = compute::Args::from_matches(matches)?;
         Ok(command)
     }
     pub(super) fn kind(&self) -> Result<Kind, CandidateError> {
@@ -91,7 +97,11 @@ impl BatchCommand {
         if self.document.chunked && !self.encoding.is_default() {
             return Err(CandidateError::Arguments);
         }
-        let (args, limits) = self.host.common_with_encoding(self.input.clone(), &self.encoding)?;
+        let prefill = self.prefill.limits()?;
+        let compute = self.compute.admit_prefill(prefill)?;
+        let (mut args, mut limits) = self.host.common_with_encoding(self.input.clone(), &self.encoding)?;
+        args.compute = self.compute;
+        limits.compute = compute;
         if self.task == "extract" {
             extract::validate_preparation(&self.host, &self.encoding_policy(limits)?, limits)?;
         }
@@ -136,7 +146,47 @@ impl BatchCommand {
         let io_bytes = (transport.max_output_line_bytes as u64).checked_add(FRAME_ALLOWANCE)
             .and_then(|n| n.checked_add(IO_BUFFER_BYTES as u64 * 2)).ok_or(CandidateError::Arguments)?;
         let envelope = self.document_envelope(limits, CorpusEnvelope { transport, native, output_bytes, io_bytes })?;
+        self.check_scheduling_memory(limits, envelope, prefill)?;
         Ok((args, limits, envelope))
+    }
+    /// Price the simultaneous resident model, caller preparation, transferred
+    /// compiler/transport, encoder, native, prompt, worker and one item output.
+    /// A longer stream spends more work without accumulating result memory.
+    pub(super) fn schedule_peak_bytes(&self, limits: Limits, envelope: CorpusEnvelope,
+        prefill: Option<Int8PrefillLimits>) -> Result<u64, CandidateError> {
+        use crate::tokenizer::untrusted::UntrustedEncoding;
+        let native = Int8MemoryRequirement::for_context(self.host.context_tokens)
+            .map_err(|_| CandidateError::Arguments)?;
+        let encoding = match self.encoding_policy(limits)? {
+            UntrustedEncoding::ByteFallback => 0,
+            UntrustedEncoding::SafeBpeV1(policy) => policy.requirements()
+                .map_err(|_| CandidateError::Arguments)?.workspace_bytes,
+        };
+        let (document, output_tokens) = self.schedule_document_reserve()?;
+        let t = envelope.transport;
+        let transferred = (t.max_line_bytes as u64).checked_mul(8)
+            .and_then(|n| n.checked_add((t.max_output_line_bytes as u64).checked_mul(4)?))
+            .and_then(|n| n.checked_add((t.max_epoch_ids as u64).checked_mul(128)?))
+            .and_then(|n| n.checked_add(t.max_epoch_id_bytes as u64))
+            .and_then(|n| n.checked_add(limits.preparation_bytes))
+            .and_then(|n| n.checked_add(envelope.io_bytes))
+            .and_then(|n| n.checked_add(encoding))
+            .and_then(|n| n.checked_add(document)).ok_or(CandidateError::Arguments)?;
+        let extra = prefill.map(Int8PrefillLimits::validate).transpose()
+            .map_err(|_| CandidateError::Arguments)?.unwrap_or(0);
+        compute::request_peak_bytes(limits, native, t.max_output_line_bytes as u64,
+            output_tokens, 0, transferred)?.checked_add(extra).ok_or(CandidateError::Arguments)
+    }
+    pub(super) fn check_scheduling_memory(&self, limits: Limits, envelope: CorpusEnvelope,
+        prefill: Option<Int8PrefillLimits>) -> Result<(), CandidateError> {
+        if limits.compute != self.compute.admit_prefill(prefill)? {
+            return Err(CandidateError::Arguments);
+        }
+        if (limits.compute.threads > 1 || prefill.is_some())
+            && self.schedule_peak_bytes(limits, envelope, prefill)? > limits.memory_bytes {
+            return Err(CandidateError::Arguments);
+        }
+        Ok(())
     }
     pub(super) fn encoding_policy(&self, limits: Limits)
         -> Result<crate::tokenizer::untrusted::UntrustedEncoding, CandidateError> {

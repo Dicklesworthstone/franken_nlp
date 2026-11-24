@@ -9,7 +9,8 @@ use super::*;
 use crate::{
     native_engine::{
         constrained_int8::{self, Int8JsonBudget, Int8JsonError},
-        strict_int8::{Int8RunBudget, Int8Work, StrictInt8Engine, StrictInt8Error, STRICT_INT8_PROFILE},
+        strict_int8::{Int8RunBudget, Int8Work, StrictInt8Engine, StrictInt8Error, STRICT_INT8_PROFILE,
+            prefill::Int8PrefillLimits},
     },
     tasks::extract::quantized::{Int8ExtractError, Int8ExtractPlan, Int8ExtractRun, INT8_EXTRACT_VERSION},
     tokenizer::untrusted::SafeBpeWorkLimits,
@@ -205,7 +206,17 @@ impl<'e, 'weights, 'v, A: Int8ExtractionBatchAdmission> NativeInt8ExtractionBatc
         if engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) {
             return Err(BatchCode::InvalidExecution.into());
         }
-        Ok(Self { compiler, driver: NativeDriver { engine, vocabulary }, admission, run: RunState::new(limits) })
+        Ok(Self { compiler, driver: NativeDriver { engine, vocabulary, prefill: None }, admission, run: RunState::new(limits) })
+    }
+    /// Bound prompt morsels without changing exact schema/source finalization
+    /// or renewing any native and grammar-mask work at record boundaries.
+    pub fn new_layer_major(compiler: Int8ExtractionBatchPlanner, engine: &'e mut StrictInt8Engine<'weights>,
+        vocabulary: &'v ExtractionVocabulary, admission: A, limits: Int8ExtractionBatchLimits,
+        prefill: Int8PrefillLimits) -> Result<Self, BatchFault> {
+        prefill.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        let mut processor = Self::new(compiler, engine, vocabulary, admission, limits)?;
+        processor.driver.prefill = Some(prefill);
+        Ok(processor)
     }
     pub fn reserved_model_work(&self) -> Int8Work { self.run.reserved }
     pub fn reserved_mask_visits(&self) -> u64 { self.run.mask_visits }
@@ -314,6 +325,7 @@ trait Driver {
 }
 struct NativeDriver<'e, 'weights, 'v> {
     engine: &'e mut StrictInt8Engine<'weights>, vocabulary: &'v ExtractionVocabulary,
+    prefill: Option<Int8PrefillLimits>,
 }
 impl Driver for NativeDriver<'_, '_, '_> {
     fn capacity(&self) -> usize { self.engine.kv_cache().capacity_positions() }
@@ -323,7 +335,11 @@ impl Driver for NativeDriver<'_, '_, '_> {
         // This rechecks the actual materialized model and vocabulary BEFORE
         // opening the native session. Finalization and its last cancellation
         // checkpoint happen inside that same session's lifetime.
-        prepared.plan.execute(self.engine, identity, self.vocabulary, budget, control)
+        match self.prefill {
+            Some(prefill) => prepared.plan.execute_layer_major(
+                self.engine, identity, self.vocabulary, budget, prefill, control),
+            None => prepared.plan.execute(self.engine, identity, self.vocabulary, budget, control),
+        }
     }
 }
 fn preflight(prepared: &PreparedInt8BatchExtraction, driver: &impl Driver) -> Result<u64, BatchItemFailure> {

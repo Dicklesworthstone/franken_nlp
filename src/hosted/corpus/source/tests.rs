@@ -117,3 +117,28 @@ fn actual_request_arguments_stay_data_and_never_deserialize_execution_identity()
     args["identity"] = serde_json::to_value(c.identity).unwrap();
     assert!(serde_json::from_value::<SourceBatchArgs>(args).is_err());
 }
+
+#[test]
+fn compact_source_workspace_is_additive_to_the_transferred_stream_owner() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    use super::super::scored::CorpusTask;
+    let policy = SafeBpeLimits { max_input_bytes: 8192, max_output_tokens: 8192,
+        max_pair_checks: 1 << 22, max_pair_bytes: 1 << 26 };
+    let p = Arc::new(planner().with_document_encoding(UntrustedEncoding::SafeBpeV1(policy)).unwrap());
+    let registry = crate::tokenizer::pinned_controls::pinned().unwrap();
+    let vocabulary = Arc::new(ExtractionVocabulary::pinned(registry.template_controls()).unwrap());
+    let native = NativeLimits { context_tokens: 4096, allocator_reserve_bytes: 4096,
+        run: RunLimits { max_elapsed: Duration::from_secs(1), max_checkpoints: 1000,
+            cleanup_reserve_bytes: 4096 } };
+    let limits = CorpusLimits { native, transport: BatchLimits::default(),
+        preparation_reserve_bytes: 4096, io_reserve_bytes: 4096 };
+    let required = requirements(native).unwrap();
+    for kind in [BuiltInTask::Ner, BuiltInTask::Keyphrases, BuiltInTask::Summarize, BuiltInTask::Answer] {
+        let task = SourceStream { config: config(&p, kind), planner: Arc::clone(&p),
+            vocabulary: Arc::clone(&vocabulary) };
+        assert_eq!(task.validate(&model(), limits, required).unwrap(), policy.requirements().unwrap().workspace_bytes);
+        assert!(limits.reservation_bytes().unwrap() > limits.preparation_reserve_bytes);
+        let mut foreign = model(); foreign.logical_model_sha256 = "2".repeat(64);
+        assert!(task.validate(&foreign, limits, required).is_err());
+    }
+}

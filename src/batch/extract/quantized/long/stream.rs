@@ -59,9 +59,20 @@ impl<'p, 'e, 'w, 'v, A: ExtractionDocumentBatchAdmission>
         -> Result<Self, BatchFault> {
         planner.require_byte_encoding()?;
         config.validate()?;
-        let driver = NativeDriver { engine, vocabulary };
+        let driver = NativeDriver { engine, vocabulary, prefill: None };
         capacity(&driver, &config).map_err(|e| e.fault)?;
         Ok(Self { planner, config, driver, admission, ledger: Ledger::default() })
+    }
+    /// The same engine and fixed prompt workspace span every immutable chunk
+    /// in every original document. Whole-corpus work and exact reconstruction
+    /// checks remain unchanged; flush never replenishes their allowances.
+    pub fn new_layer_major(planner: &'p Int8ExtractionBatchPlanner, config: ExtractionDocumentBatchConfig,
+        engine: &'e mut StrictInt8Engine<'w>, vocabulary: &'v ExtractionVocabulary, admission: A,
+        prefill: Int8PrefillLimits) -> Result<Self, BatchFault> {
+        prefill.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        let mut processor = Self::new(planner, config, engine, vocabulary, admission)?;
+        processor.driver.prefill = Some(prefill);
+        Ok(processor)
     }
     pub fn reserved_model_work(&self) -> Int8Work { self.ledger.work }
     pub fn reserved_mask_visits(&self) -> u64 { self.ledger.masks }

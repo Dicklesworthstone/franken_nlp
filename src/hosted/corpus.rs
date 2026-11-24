@@ -123,44 +123,78 @@ impl NlpEngine {
         native_work: Int8ExtractionBatchLimits, limits: CorpusLimits, reader: R, writer: W,
         cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
-        self.check_resident_domain(model)?;
-        validate_work(native_work.max_model_work)?;
-        let masks = native_work.masks;
+        scored::run(self, model, ExtractionStream { planner, vocabulary, native_work }, limits,
+            None, None, reader, writer, cancellation)
+    }
+
+    /// Bounded prompt prefill for each exact schema/source plan in the stream.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_extract_layer_major<R, W>(&self, model: &ResidentInt8,
+        planner: Int8ExtractionBatchPlanner, vocabulary: Arc<ExtractionVocabulary>,
+        native_work: Int8ExtractionBatchLimits, limits: CorpusLimits,
+        prefill: crate::native_engine::strict_int8::prefill::Int8PrefillLimits,
+        reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        scored::run(self, model, ExtractionStream { planner, vocabulary, native_work }, limits,
+            Some(prefill), None, reader, writer, cancellation)
+    }
+
+    /// Keep one admitted projection team across every record and flush. The
+    /// final completion frame follows physical worker join under the original
+    /// invocation's deadline, cancellation and remaining checkpoint budget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_extract_with_threads<R, W>(&self, model: &ResidentInt8,
+        planner: Int8ExtractionBatchPlanner, vocabulary: Arc<ExtractionVocabulary>,
+        native_work: Int8ExtractionBatchLimits, limits: CorpusLimits,
+        kernel: crate::native_engine::simd::Int8Kernel, compute_threads: usize,
+        reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        scored::run(self, model, ExtractionStream { planner, vocabulary, native_work }, limits,
+            None, Some((kernel, compute_threads)), reader, writer, cancellation)
+    }
+
+    /// Compose coordinator prompt morsels and fixed worker buffers while
+    /// preserving exact output, source occurrence checks and whole-run work.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_extract_layer_major_with_threads<R, W>(&self, model: &ResidentInt8,
+        planner: Int8ExtractionBatchPlanner, vocabulary: Arc<ExtractionVocabulary>,
+        native_work: Int8ExtractionBatchLimits, limits: CorpusLimits,
+        kernel: crate::native_engine::simd::Int8Kernel, compute_threads: usize,
+        prefill: crate::native_engine::strict_int8::prefill::Int8PrefillLimits,
+        reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        scored::run(self, model, ExtractionStream { planner, vocabulary, native_work }, limits,
+            Some(prefill), Some((kernel, compute_threads)), reader, writer, cancellation)
+    }
+}
+
+struct ExtractionStream {
+    planner: Int8ExtractionBatchPlanner, vocabulary: Arc<ExtractionVocabulary>, native_work: Int8ExtractionBatchLimits,
+}
+impl scored::CorpusTask for ExtractionStream {
+    fn identity(&self) -> &ExecutionIdentity { self.planner.base_execution_identity() }
+    fn validate(&self, _model: &ArtifactIdentity, _limits: CorpusLimits,
+        _native: Int8MemoryRequirement) -> Result<u64, HostedError> {
+        validate_work(self.native_work.max_model_work)?;
+        let masks = self.native_work.masks;
         if masks.per_mask.max_trie_node_visits == 0 || masks.per_mask.checkpoint_interval_nodes == 0
             || masks.max_visits_per_item == 0 || masks.max_visits_per_run < masks.max_visits_per_item {
             return Err(HostedError::Limits("mask reservation"));
         }
-        let required = requirements(limits.native)?;
-        let lease = self.resources().acquire_lease();
-        let buffers = sum(&[limits.reservation_bytes()?,
-            planner.encoding_workspace_bytes().map_err(HostedError::BatchSetup)?])?;
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, buffers)?,
-            || Ok(StreamInput { planner: Some((planner, vocabulary)), reader, writer }))?;
-        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-        let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound, limits.native.allocator_reserve_bytes])?)?;
-        let model = model.clone();
-        dispatch::run(self, limits.native.run, cancellation, move |control| {
-            let mut input = input;
-            let (planner, vocabulary) = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
-            let mut engine = allocate_native(kv, workspace, || model.inner.loaded.value
-                .engine(limits.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            let admission = CorpusAdmission { lease: &lease, model: model.artifact_identity(),
-                kv_bytes: required.kv_bytes, sampler_bytes: 0,
-                output_bytes: limits.transport.max_output_line_bytes as u64 };
-            let result = {
-                let mut processor = NativeInt8ExtractionBatch::new(planner, &mut engine.value, &vocabulary, admission, native_work)
-                    .map_err(HostedError::BatchSetup)?;
-                batch::run_ndjson(&mut input.value.reader, &mut input.value.writer,
-                    &mut processor, limits.transport, control).map_err(HostedError::Batch)
-            };
-            drop(engine);
-            drop(vocabulary);
-            drop(input);
-            drop(lease);
-            result
-        })
+        self.planner.encoding_workspace_bytes().map_err(HostedError::BatchSetup)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn execute<R: BufRead, W: Write>(self, engine: &mut crate::native_engine::strict_int8::StrictInt8Engine<'_>,
+        admission: CorpusAdmission<'_>, prefill: Option<crate::native_engine::strict_int8::prefill::Int8PrefillLimits>,
+        reader: &mut R, writer: &mut W, limits: BatchLimits, defer: bool,
+        control: &mut RunControl) -> Result<scored::Completion, HostedError> {
+        let Self { planner, vocabulary, native_work } = self;
+        let mut processor = match prefill {
+            Some(prefill) => NativeInt8ExtractionBatch::new_layer_major(planner, engine,
+                &vocabulary, admission, native_work, prefill),
+            None => NativeInt8ExtractionBatch::new(planner, engine, &vocabulary, admission, native_work),
+        }.map_err(HostedError::BatchSetup)?;
+        scored::execute_stream(reader, writer, &mut processor, limits, defer, control)
     }
 }
 

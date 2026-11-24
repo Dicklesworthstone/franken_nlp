@@ -79,9 +79,9 @@ struct ClassificationStream {
     planner: Arc<ClassificationPlanner>,
     config: ClassificationCorpusConfig,
 }
-impl scored::ScoredTask for ClassificationStream {
+impl scored::CorpusTask for ClassificationStream {
     fn identity(&self) -> &ExecutionIdentity { &self.config.identity }
-    fn validate(&self, limits: CorpusLimits, native: Int8MemoryRequirement) -> Result<u64, HostedError> {
+    fn validate(&self, _model: &ArtifactIdentity, limits: CorpusLimits, native: Int8MemoryRequirement) -> Result<u64, HostedError> {
         validate_work(self.config.max_model_work)?;
         output_ceiling(self.config.task_ceiling, limits.transport.max_output_line_bytes)?;
         if native.kv_bytes > self.config.task_ceiling.max_kv_bytes {

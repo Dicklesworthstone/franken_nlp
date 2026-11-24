@@ -102,3 +102,17 @@ fn corpus_workspace_prices_the_maximum_document_frontier_and_full_coordinates() 
     assert!(bytes > b.limits.mapping.reduction.max_result_bytes as u64);
     assert!(super::super::super::extraction_map::document_workspace_bytes(b.request.budget, b.limits, 9, 4096).is_err());
 }
+
+#[test]
+fn transferred_document_task_prices_schema_capacity_and_complete_map_frontier() {
+    let (mut c, _) = config();
+    let original = task_workspace(&c).unwrap();
+    let map = super::super::super::extraction_map::document_workspace_bytes(c.batch.request.budget,
+        c.batch.limits, c.batch.limits.mapping.chunks.max_chunks, c.reduction_reserve_bytes).unwrap();
+    assert_eq!(original, c.batch.request.schema.capacity() as u64 + map);
+    let old_capacity = c.batch.request.schema.capacity();
+    c.batch.request.schema.reserve_exact(1024);
+    assert_eq!(task_workspace(&c).unwrap(), original + (c.batch.request.schema.capacity() - old_capacity) as u64);
+    c.reduction_reserve_bytes = u64::MAX;
+    assert!(task_workspace(&c).is_err());
+}

@@ -1,5 +1,5 @@
-//! Shared physical lifetime for the three sealed native INT8 scoring streams.
-//! Task compilers retain their own score spaces, validation and work ledgers.
+//! Shared physical lifetime for sealed native INT8 structured and scored streams.
+//! Task compilers retain their own semantics, validation and work ledgers.
 //! No callback or user-provided processor can enter this private host path.
 use super::*;
 use crate::{
@@ -14,11 +14,14 @@ pub(super) enum Completion {
     Deferred(DeferredCompletion),
 }
 
-pub(super) trait ScoredTask: Send + Sized + 'static {
+pub(super) trait CorpusTask: Send + Sized + 'static {
     fn identity(&self) -> &ExecutionIdentity;
-    /// Return separately charged transient tokenizer storage after validating
-    /// the exact task, complete KV allocation and maximum output envelope.
-    fn validate(&self, limits: CorpusLimits, native: Int8MemoryRequirement) -> Result<u64, HostedError>;
+    /// Validate the exact task, complete native allocation and output envelope.
+    /// Return additional retained/temporary task storage beyond the common
+    /// transport and caller preparation: tokenizer workspaces or complete
+    /// document schema/chunk/reduction owners are simultaneously live.
+    fn validate(&self, model: &ArtifactIdentity, limits: CorpusLimits,
+        native: Int8MemoryRequirement) -> Result<u64, HostedError>;
     #[allow(clippy::too_many_arguments)]
     fn execute<R: BufRead, W: Write>(self, engine: &mut StrictInt8Engine<'_>,
         admission: CorpusAdmission<'_>, prefill: Option<Int8PrefillLimits>,
@@ -53,9 +56,9 @@ impl Requirements {
         sum(&[self.input_bytes, self.native.kv_bytes, self.scratch_bytes, self.worker_bytes])
     }
 }
-fn quote(limits: CorpusLimits, native: Int8MemoryRequirement, encoding_bytes: u64,
+fn quote(limits: CorpusLimits, native: Int8MemoryRequirement, task_bytes: u64,
     prefill: Option<Int8PrefillLimits>, width: Option<usize>) -> Result<Requirements, HostedError> {
-    let input_bytes = sum(&[limits.reservation_bytes()?, encoding_bytes])?;
+    let input_bytes = sum(&[limits.reservation_bytes()?, task_bytes])?;
     let scratch_bytes = crate::hosted::scored::scoring_scratch(
         sum(&[native.rope_bytes, native.scratch_payload_bound,
             limits.native.allocator_reserve_bytes])?, prefill)?;
@@ -89,7 +92,7 @@ struct Execution<P, R, W> {
 pub(super) fn run<P, R, W>(host: &NlpEngine, model: &ResidentInt8, task: P,
     limits: CorpusLimits, prefill: Option<Int8PrefillLimits>, team: Option<(Int8Kernel, usize)>,
     reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
-where P: ScoredTask, R: BufRead + Send + 'static, W: Write + Send + 'static {
+where P: CorpusTask, R: BufRead + Send + 'static, W: Write + Send + 'static {
     match team {
         Some((_, width)) => dispatch::preflight_int8_team(host, limits.native.run, width)?,
         None => dispatch::preflight(host, limits.native.run)?,
@@ -97,8 +100,8 @@ where P: ScoredTask, R: BufRead + Send + 'static, W: Write + Send + 'static {
     host.check_resident_domain(model)?;
     check_model_identity(model.artifact_identity(), task.identity())?;
     let native = requirements(limits.native)?;
-    let encoding_bytes = task.validate(limits, native)?;
-    let required = quote(limits, native, encoding_bytes, prefill, team.map(|(_, width)| width))?;
+    let task_bytes = task.validate(model.artifact_identity(), limits, native)?;
+    let required = quote(limits, native, task_bytes, prefill, team.map(|(_, width)| width))?;
     let lease = host.resources().acquire_lease();
     let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
         || Ok(StreamInput { planner: Some(task), reader, writer }))?;
@@ -129,12 +132,12 @@ where P: ScoredTask, R: BufRead + Send + 'static, W: Write + Send + 'static {
     }
 }
 
-impl<P: ScoredTask, R: BufRead, W: Write> Execution<P, R, W> {
+impl<P: CorpusTask, R: BufRead, W: Write> Execution<P, R, W> {
     fn commit_native(&mut self) -> Result<(), HostedError> {
         self._kv = Some(self.kv.take()
-            .ok_or(HostedError::Limits("scoring stream KV admission consumed"))?.commit()?);
+            .ok_or(HostedError::Limits("corpus KV admission consumed"))?.commit()?);
         self._scratch = Some(self.scratch.take()
-            .ok_or(HostedError::Limits("scoring stream scratch admission consumed"))?.commit()?);
+            .ok_or(HostedError::Limits("corpus scratch admission consumed"))?.commit()?);
         Ok(())
     }
 

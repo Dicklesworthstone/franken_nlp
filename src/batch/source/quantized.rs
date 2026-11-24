@@ -5,7 +5,7 @@
 use super::*;
 use crate::{
     native_engine::{constrained_int8::{self, Int8JsonBudget, Int8JsonError},
-        strict_int8::{Int8RunBudget, Int8Work, StrictInt8Engine, StrictInt8Error}},
+        strict_int8::{Int8RunBudget, Int8Work, StrictInt8Engine, StrictInt8Error, prefill::Int8PrefillLimits}},
     tasks::{extract::quantized::Int8ExtractError,
         source_planning::quantized::{Int8SourceError, Int8SourceTaskRun, PreparedInt8SourceTask, INT8_SOURCE_EXECUTION}},
 };
@@ -80,9 +80,20 @@ impl<'p, 'e, 'weights, 'v, A: Int8SourceBatchAdmission> NativeInt8SourceBatch<'p
     pub fn new(compiler: Int8SourceBatchPlanner<'p>, engine: &'e mut StrictInt8Engine<'weights>,
         vocabulary: &'v ExtractionVocabulary, admission: A, limits: Int8SourceBatchLimits) -> Result<Self, BatchFault> {
         validate_limits(limits)?;
-        let driver = NativeDriver { engine, vocabulary };
+        let driver = NativeDriver { engine, vocabulary, prefill: None };
         if !driver.clean() { return Err(BatchCode::InvalidExecution.into()); }
         Ok(Self { compiler, driver, admission, run: RunState::new(limits) })
+    }
+    /// Reuse one admitted prompt workspace for the complete ordered stream.
+    /// The existing source finalizers and nonrenewable native/mask ledgers
+    /// remain authoritative for every record and flush.
+    pub fn new_layer_major(compiler: Int8SourceBatchPlanner<'p>, engine: &'e mut StrictInt8Engine<'weights>,
+        vocabulary: &'v ExtractionVocabulary, admission: A, limits: Int8SourceBatchLimits,
+        prefill: Int8PrefillLimits) -> Result<Self, BatchFault> {
+        prefill.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        let mut processor = Self::new(compiler, engine, vocabulary, admission, limits)?;
+        processor.driver.prefill = Some(prefill);
+        Ok(processor)
     }
     pub fn reserved_model_work(&self) -> Int8Work { self.run.reserved }
     pub fn reserved_mask_visits(&self) -> u64 { self.run.mask_visits }
@@ -168,13 +179,20 @@ trait Driver {
     fn execute<C: DecodeStepControl>(&mut self, prepared: &PreparedInt8SourceTask, identity: &ExecutionIdentity,
         budget: Int8JsonBudget, control: &mut C) -> Result<Int8SourceTaskRun, Int8SourceError>;
 }
-struct NativeDriver<'e, 'weights, 'v> { engine: &'e mut StrictInt8Engine<'weights>, vocabulary: &'v ExtractionVocabulary }
+struct NativeDriver<'e, 'weights, 'v> {
+    engine: &'e mut StrictInt8Engine<'weights>, vocabulary: &'v ExtractionVocabulary,
+    prefill: Option<Int8PrefillLimits>,
+}
 impl Driver for NativeDriver<'_, '_, '_> {
     fn capacity(&self) -> usize { self.engine.kv_cache().capacity_positions() }
     fn clean(&self) -> bool { !self.engine.is_poisoned() && self.engine.kv_cache().all_slots_have_len(0) }
     fn execute<C: DecodeStepControl>(&mut self, prepared: &PreparedInt8SourceTask, identity: &ExecutionIdentity,
         budget: Int8JsonBudget, control: &mut C) -> Result<Int8SourceTaskRun, Int8SourceError> {
-        prepared.execute_with_control(identity, self.engine, self.vocabulary, budget, control)
+        match self.prefill {
+            Some(prefill) => prepared.execute_layer_major_with_control(
+                identity, self.engine, self.vocabulary, budget, prefill, control),
+            None => prepared.execute_with_control(identity, self.engine, self.vocabulary, budget, control),
+        }
     }
 }
 fn preflight(prepared: &PreparedInt8SourceTask, driver: &impl Driver) -> Result<u64, BatchItemFailure> {

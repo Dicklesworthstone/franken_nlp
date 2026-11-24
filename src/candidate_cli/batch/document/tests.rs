@@ -164,3 +164,48 @@ fn a_disabled_runtime_rejects_chunked_extraction_before_schema_model_or_corpus_i
     }
     assert_eq!(chunked(&[]).execute_owned(NoRead, NoWrite), Err(CandidateError::Unavailable));
 }
+
+#[test]
+fn chunked_extraction_composes_all_schedules_without_expanding_semantic_authority() {
+    let baseline = chunked(&["--max-requests", "3"]);
+    let (_, original_limits, original) = baseline.validate().unwrap();
+    for width in ["1", "4"] {
+        for rows in [None, Some("1"), Some("7")] {
+            let mut flags = vec!["--max-requests", "3", "--compute-threads", width];
+            if let Some(rows) = rows { flags.extend(["--prefill-rows", rows]); }
+            let mut selected = chunked(&flags); selected.host.memory_mib = 16384;
+            let (args, limits, envelope) = selected.validate().unwrap();
+            assert_eq!(limits.compute, args.compute.admit_prefill(selected.prefill.limits().unwrap()).unwrap());
+            assert_eq!(envelope.native.max_model_work, original.native.max_model_work);
+            assert_eq!(envelope.native.masks.max_visits_per_run, original.native.masks.max_visits_per_run);
+            assert_eq!(selected.host.task_budget(limits), baseline.host.task_budget(original_limits));
+            assert_eq!(envelope.transport.max_output_line_bytes, original.transport.max_output_line_bytes);
+        }
+    }
+}
+
+#[test]
+fn chunked_schedule_funds_one_complete_frontier_without_accumulating_the_corpus() {
+    let mut selected = chunked(&["--compute-threads", "4", "--prefill-rows", "7", "--max-requests", "3"]);
+    selected.host.memory_mib = 16384;
+    let (_, mut limits, envelope) = selected.validate().unwrap();
+    let prefill = selected.prefill.limits().unwrap();
+    let peak = selected.schedule_peak_bytes(limits, envelope, prefill).unwrap();
+    limits.memory_bytes = peak;
+    selected.check_scheduling_memory(limits, envelope, prefill).unwrap();
+    limits.memory_bytes -= 1;
+    assert_eq!(selected.check_scheduling_memory(limits, envelope, prefill), Err(CandidateError::Arguments));
+    let (retained, tokens) = selected.schedule_document_reserve().unwrap();
+    assert!(retained > 4 * MAX_DOCUMENT_RESULT as u64);
+    assert_eq!(tokens, 64 * selected.host.max_new_tokens as u64);
+    selected.max_requests = 6;
+    let (_, larger_limits, larger) = selected.validate().unwrap();
+    assert_eq!(larger.native.max_model_work, scale_work(envelope.native.max_model_work, 2).unwrap());
+    assert_eq!(selected.schedule_peak_bytes(larger_limits, larger, prefill).unwrap(), peak,
+        "another record may spend work, but cannot retain another complete result");
+    selected.document.max_chunks = Some(65);
+    let (larger_frontier, larger_tokens) = selected.schedule_document_reserve().unwrap();
+    assert_eq!(larger_tokens - tokens, selected.host.max_new_tokens as u64);
+    assert_eq!(larger_frontier - retained,
+        4 * selected.host.max_result_bytes as u64 + 8 * selected.host.max_new_tokens as u64);
+}

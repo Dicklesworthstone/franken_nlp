@@ -58,9 +58,9 @@ impl NlpEngine {
 }
 
 struct SentimentStream { planner: Arc<SentimentPlanner>, config: SentimentCorpusConfig }
-impl scored::ScoredTask for SentimentStream {
+impl scored::CorpusTask for SentimentStream {
     fn identity(&self) -> &ExecutionIdentity { &self.config.identity }
-    fn validate(&self, limits: CorpusLimits, native: Int8MemoryRequirement) -> Result<u64, HostedError> {
+    fn validate(&self, _model: &ArtifactIdentity, limits: CorpusLimits, native: Int8MemoryRequirement) -> Result<u64, HostedError> {
         self.config.validate_with_document_encoding(&self.planner).map_err(HostedError::BatchSetup)?;
         validate_capacity(self.config.task_ceiling, native.kv_bytes, limits.transport.max_output_line_bytes)?;
         super::classify::encoding_workspace_bytes(self.planner.document_encoding())

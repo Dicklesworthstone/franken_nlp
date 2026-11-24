@@ -34,58 +34,85 @@ impl SourceCorpusConfig {
 
 impl NlpEngine {
     /// Execute NER/keyphrases/cited summaries/passage QA over bounded NDJSON.
-    /// `text` is source text except for QA, where it is the question; the
-    /// separately typed passages remain the only source of citation evidence.
-    /// The host supplies concrete admission and retains all captures until
-    /// actual physical completion, including cancellation and queued disposal.
-    /// No model reload, per-document runtime, fallback or inference network.
+    /// `text` is source text except for QA, where it is the question; separately
+    /// typed passages remain the only source of citation evidence.
     #[allow(clippy::too_many_arguments)]
     pub fn batch_int8_source<R, W>(&self, model: &ResidentInt8,
         planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
         config: SourceCorpusConfig, limits: CorpusLimits, reader: R, writer: W,
         cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
-        self.check_resident_domain(model)?;
-        let required = requirements(limits.native)?;
-        config.validate(&planner, model.artifact_identity(), required.kv_bytes)?;
-        let lease = self.resources().acquire_lease();
-        // Preparation prices the pinned planner/vocabulary, defaults, source
-        // graphs and transient task copies. IO prices the actual supplied
-        // reader/writer buffers. These modeled charges are not an RSS bound.
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, limits.reservation_bytes()?)?,
-            || Ok(StreamInput { planner: Some((planner, vocabulary, config)), reader, writer }))?;
-        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-        let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound, limits.native.allocator_reserve_bytes])?)?;
-        let model = model.clone();
-        dispatch::run(self, limits.native.run, cancellation, move |control| {
-            // Capture the entire storage-before-charge aggregate. Partial
-            // field captures would lose that ownership order on queued drop.
-            let mut input = input;
-            let (planner, vocabulary, config) = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
-            let compiler = Int8SourceBatchPlanner::new(&planner, config.identity, config.task_ceiling,
-                config.planning, config.defaults).map_err(HostedError::BatchSetup)?;
-            let mut engine = allocate_native(kv, workspace, || model.inner.loaded.value
-                .engine(limits.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            // Source admission is the same contract as extraction: reuse the
-            // real process-ledger provider and never fabricate a no-op guard.
-            let admission = CorpusAdmission { lease: &lease, model: model.artifact_identity(),
-                kv_bytes: required.kv_bytes, sampler_bytes: 0,
-                output_bytes: limits.transport.max_output_line_bytes as u64 };
-            let result = {
-                let mut processor = NativeInt8SourceBatch::new(compiler, &mut engine.value,
-                    &vocabulary, admission, config.native_work).map_err(HostedError::BatchSetup)?;
-                batch::run_ndjson(&mut input.value.reader, &mut input.value.writer,
-                    &mut processor, limits.transport, control).map_err(HostedError::Batch)
-            };
-            drop(engine);
-            drop(vocabulary);
-            drop(planner);
-            drop(input); // owned IO storage before its charge and physical handoff
-            drop(lease);
-            result
-        })
+        scored::run(self, model, SourceStream { planner, vocabulary, config }, limits,
+            None, None, reader, writer, cancellation)
+    }
+
+    /// Bound each prompt's layer-major morsels while retaining exact schema,
+    /// source finalizers and all native/mask allowances across the stream.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_source_layer_major<R, W>(&self, model: &ResidentInt8,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: SourceCorpusConfig, limits: CorpusLimits,
+        prefill: crate::native_engine::strict_int8::prefill::Int8PrefillLimits,
+        reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        scored::run(self, model, SourceStream { planner, vocabulary, config }, limits,
+            Some(prefill), None, reader, writer, cancellation)
+    }
+
+    /// One fixed projection team serves every ordered record. Terminal success
+    /// follows physical join under the original control and retained IO claims.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_source_with_threads<R, W>(&self, model: &ResidentInt8,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: SourceCorpusConfig, limits: CorpusLimits,
+        kernel: crate::native_engine::simd::Int8Kernel, compute_threads: usize,
+        reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        scored::run(self, model, SourceStream { planner, vocabulary, config }, limits,
+            None, Some((kernel, compute_threads)), reader, writer, cancellation)
+    }
+
+    /// Compose bounded prompt storage and a persistent numerical team. Source
+    /// coordinates, full-document results and whole-run work remain unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_source_layer_major_with_threads<R, W>(&self, model: &ResidentInt8,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: SourceCorpusConfig, limits: CorpusLimits,
+        kernel: crate::native_engine::simd::Int8Kernel, compute_threads: usize,
+        prefill: crate::native_engine::strict_int8::prefill::Int8PrefillLimits,
+        reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        scored::run(self, model, SourceStream { planner, vocabulary, config }, limits,
+            Some(prefill), Some((kernel, compute_threads)), reader, writer, cancellation)
+    }
+}
+
+struct SourceStream {
+    planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>, config: SourceCorpusConfig,
+}
+impl scored::CorpusTask for SourceStream {
+    fn identity(&self) -> &ExecutionIdentity { &self.config.identity }
+    fn validate(&self, model: &ArtifactIdentity, _limits: CorpusLimits,
+        native: Int8MemoryRequirement) -> Result<u64, HostedError> {
+        self.config.validate(&self.planner, model, native.kv_bytes)?;
+        // A compact tokenizer workspace coexists with both caller preparation
+        // and transferred planner/vocabulary/transport state.
+        super::classify::encoding_workspace_bytes(self.planner.document_encoding())
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn execute<R: BufRead, W: Write>(self, engine: &mut crate::native_engine::strict_int8::StrictInt8Engine<'_>,
+        admission: CorpusAdmission<'_>, prefill: Option<crate::native_engine::strict_int8::prefill::Int8PrefillLimits>,
+        reader: &mut R, writer: &mut W, limits: BatchLimits, defer: bool,
+        control: &mut RunControl) -> Result<scored::Completion, HostedError> {
+        let Self { planner, vocabulary, config } = self;
+        let compiler = Int8SourceBatchPlanner::new(&planner, config.identity, config.task_ceiling,
+            config.planning, config.defaults).map_err(HostedError::BatchSetup)?;
+        let mut processor = match prefill {
+            Some(prefill) => NativeInt8SourceBatch::new_layer_major(compiler, engine,
+                &vocabulary, admission, config.native_work, prefill),
+            None => NativeInt8SourceBatch::new(compiler, engine, &vocabulary, admission, config.native_work),
+        }.map_err(HostedError::BatchSetup)?;
+        scored::execute_stream(reader, writer, &mut processor, limits, defer, control)
     }
 }
 

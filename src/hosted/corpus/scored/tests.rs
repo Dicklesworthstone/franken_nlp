@@ -110,3 +110,5 @@ fn shared_scored_transport_preserves_records_and_flush_work_and_defers_only_term
 }
 
 mod native;
+
+mod structured;

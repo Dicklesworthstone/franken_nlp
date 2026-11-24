@@ -14,54 +14,92 @@ pub struct ExtractionDocumentCorpusConfig {
 }
 impl NlpEngine {
     /// Stream original documents larger than one context using one native
-    /// engine and one process invocation. Every successful row contains ALL
-    /// chunk JSON values and their original-coordinate source evidence.
-    /// Schema/grounding are fixed; flush never renews corpus work allowances.
+    /// engine and one invocation. Successful rows contain every chunk value
+    /// and its exact original-coordinate source evidence.
     #[allow(clippy::too_many_arguments)]
     pub fn batch_int8_extract_document<R, W>(&self, model: &ResidentInt8,
         planner: Arc<Int8ExtractionBatchPlanner>, vocabulary: Arc<ExtractionVocabulary>,
         config: ExtractionDocumentCorpusConfig, limits: CorpusLimits, reader: R, writer: W,
         cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
-        self.check_resident_domain(model)?;
-        planner.require_byte_encoding().map_err(HostedError::BatchSetup)?;
-        check_model_identity(model.artifact_identity(), planner.base_execution_identity())?;
-        config.batch.validate().map_err(HostedError::BatchSetup)?;
-        let required = requirements(limits.native)?;
-        validate(&config, limits, required.kv_bytes)?;
-        let buffers = sum(&[limits.reservation_bytes()?, config.batch.request.schema.capacity() as u64,
-            super::super::extraction_map::document_workspace_bytes(config.batch.request.budget,
-                config.batch.limits, config.batch.limits.mapping.chunks.max_chunks,
-                config.reduction_reserve_bytes)?])?;
-        let lease = self.resources().acquire_lease();
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, buffers)?,
-            || Ok(StreamInput { planner: Some((planner, vocabulary, config)), reader, writer }))?;
-        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-        let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound, limits.native.allocator_reserve_bytes])?)?;
-        let model = model.clone();
-        dispatch::run(self, limits.native.run, cancellation, move |control| {
-            let mut input = input; // Retain the whole charged owner while queued and running.
-            let (planner, vocabulary, config) = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
-            let mut engine = allocate_native(kv, workspace, || model.inner.loaded.value
-                .engine(limits.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            let admission = CorpusAdmission { lease: &lease, model: model.artifact_identity(),
-                kv_bytes: required.kv_bytes, sampler_bytes: 0,
-                output_bytes: limits.transport.max_output_line_bytes as u64 };
-            let result = {
-                let mut processor = NativeInt8DocumentExtractionBatch::new(&planner, config.batch,
-                    &mut engine.value, &vocabulary, admission).map_err(HostedError::BatchSetup)?;
-                batch::run_ndjson(&mut input.value.reader, &mut input.value.writer, &mut processor,
-                    limits.transport, control).map_err(HostedError::Batch)
-            };
-            drop(engine); drop(vocabulary); drop(planner);
-            drop(input); // Reader/writer, schema and compiler storage before their charge.
-            drop(lease);
-            result
-        })
+        scored::run(self, model, ExtractionDocumentStream { planner, vocabulary, config }, limits,
+            None, None, reader, writer, cancellation)
+    }
+
+    /// Reuse bounded prompt storage across all chunks of every document,
+    /// preserving source reconstruction, identity binding and exact finalizers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_extract_document_layer_major<R, W>(&self, model: &ResidentInt8,
+        planner: Arc<Int8ExtractionBatchPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: ExtractionDocumentCorpusConfig, limits: CorpusLimits,
+        prefill: crate::native_engine::strict_int8::prefill::Int8PrefillLimits,
+        reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        scored::run(self, model, ExtractionDocumentStream { planner, vocabulary, config }, limits,
+            Some(prefill), None, reader, writer, cancellation)
+    }
+
+    /// One persistent team spans every immutable chunk and complete result.
+    /// The terminal frame follows physical join with native/IO claims retained.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_extract_document_with_threads<R, W>(&self, model: &ResidentInt8,
+        planner: Arc<Int8ExtractionBatchPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: ExtractionDocumentCorpusConfig, limits: CorpusLimits,
+        kernel: crate::native_engine::simd::Int8Kernel, compute_threads: usize,
+        reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        scored::run(self, model, ExtractionDocumentStream { planner, vocabulary, config }, limits,
+            None, Some((kernel, compute_threads)), reader, writer, cancellation)
+    }
+
+    /// Compose prefill and workers without renewing model, mask or source
+    /// verification allowances at any chunk, document or flush boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_extract_document_layer_major_with_threads<R, W>(&self, model: &ResidentInt8,
+        planner: Arc<Int8ExtractionBatchPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: ExtractionDocumentCorpusConfig, limits: CorpusLimits,
+        kernel: crate::native_engine::simd::Int8Kernel, compute_threads: usize,
+        prefill: crate::native_engine::strict_int8::prefill::Int8PrefillLimits,
+        reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        scored::run(self, model, ExtractionDocumentStream { planner, vocabulary, config }, limits,
+            Some(prefill), Some((kernel, compute_threads)), reader, writer, cancellation)
     }
 }
+
+struct ExtractionDocumentStream {
+    planner: Arc<Int8ExtractionBatchPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+    config: ExtractionDocumentCorpusConfig,
+}
+impl scored::CorpusTask for ExtractionDocumentStream {
+    fn identity(&self) -> &ExecutionIdentity { self.planner.base_execution_identity() }
+    fn validate(&self, _model: &ArtifactIdentity, limits: CorpusLimits,
+        native: Int8MemoryRequirement) -> Result<u64, HostedError> {
+        self.planner.require_byte_encoding().map_err(HostedError::BatchSetup)?;
+        self.config.batch.validate().map_err(HostedError::BatchSetup)?;
+        validate(&self.config, limits, native.kv_bytes)?;
+        task_workspace(&self.config)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn execute<R: BufRead, W: Write>(self, engine: &mut crate::native_engine::strict_int8::StrictInt8Engine<'_>,
+        admission: CorpusAdmission<'_>, prefill: Option<crate::native_engine::strict_int8::prefill::Int8PrefillLimits>,
+        reader: &mut R, writer: &mut W, limits: BatchLimits, defer: bool,
+        control: &mut RunControl) -> Result<scored::Completion, HostedError> {
+        let Self { planner, vocabulary, config } = self;
+        let mut processor = match prefill {
+            Some(prefill) => NativeInt8DocumentExtractionBatch::new_layer_major(&planner, config.batch,
+                engine, &vocabulary, admission, prefill),
+            None => NativeInt8DocumentExtractionBatch::new(&planner, config.batch, engine, &vocabulary, admission),
+        }.map_err(HostedError::BatchSetup)?;
+        scored::execute_stream(reader, writer, &mut processor, limits, defer, control)
+    }
+}
+fn task_workspace(config: &ExtractionDocumentCorpusConfig) -> Result<u64, HostedError> {
+    sum(&[config.batch.request.schema.capacity() as u64,
+        super::super::extraction_map::document_workspace_bytes(config.batch.request.budget,
+            config.batch.limits, config.batch.limits.mapping.chunks.max_chunks, config.reduction_reserve_bytes)?])
+}
+
 fn validate(config: &ExtractionDocumentCorpusConfig, limits: CorpusLimits, kv: u64) -> Result<(), HostedError> {
     let b = &config.batch;
     if config.reduction_reserve_bytes == 0 || kv == 0 || kv > b.request.budget.max_kv_bytes

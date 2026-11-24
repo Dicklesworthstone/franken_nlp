@@ -207,3 +207,82 @@ fn feature_disabled_batch_never_reads_or_writes_owned_streams() {
         assert_eq!(cmd.execute_owned(NoRead, NoWrite), Err(CandidateError::Unavailable));
     }
 }
+
+#[test]
+fn structured_corpora_compose_prefill_and_workers_without_renewing_record_or_run_budgets() {
+    for task in ["ner", "keyphrases", "summarize", "answer", "extract"] {
+        for compact in [false, true] {
+            let mut base_flags = vec!["--max-requests", "3"];
+            if compact { base_flags.extend(["--input-encoding", "safe-bpe-v1"]); }
+            let baseline = command(task, &base_flags);
+            let (_, original_limits, original) = baseline.validate().unwrap();
+            for width in ["1", "4"] {
+                for rows in [None, Some("1"), Some("7")] {
+                    let mut flags = base_flags.clone();
+                    flags.extend(["--compute-threads", width]);
+                    if let Some(rows) = rows { flags.extend(["--prefill-rows", rows]); }
+                    let mut selected = command(task, &flags);
+                    selected.host.memory_mib = 16384;
+                    let (args, limits, envelope) = selected.validate().unwrap();
+                    let prefill = selected.prefill.limits().unwrap();
+                    assert_eq!(limits.compute, args.compute.admit_prefill(prefill).unwrap());
+                    assert_eq!(limits.compute.threads, width.parse::<usize>().unwrap());
+                    assert_eq!(envelope.native.max_model_work, original.native.max_model_work);
+                    assert_eq!(envelope.native.masks.max_visits_per_item, original.native.masks.max_visits_per_item);
+                    assert_eq!(envelope.native.masks.max_visits_per_run, original.native.masks.max_visits_per_run);
+                    assert_eq!(envelope.transport.max_work, original.transport.max_work);
+                    assert_eq!(envelope.output_bytes, original.output_bytes);
+                    assert_eq!(selected.host.task_budget(limits), baseline.host.task_budget(original_limits));
+                    assert_eq!(selected.encoding_policy(limits).unwrap(), baseline.encoding_policy(original_limits).unwrap());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn structured_scheduling_prices_every_simultaneous_owner_and_exact_memory_boundary() {
+    for task in ["ner", "keyphrases", "summarize", "answer", "extract"] {
+        let mut selected = command(task, &["--compute-threads", "4", "--prefill-rows", "7",
+            "--input-encoding", "safe-bpe-v1"]);
+        selected.host.memory_mib = 16384;
+        let (_, mut limits, envelope) = selected.validate().unwrap();
+        let prefill = selected.prefill.limits().unwrap();
+        let peak = selected.schedule_peak_bytes(limits, envelope, prefill).unwrap();
+        limits.memory_bytes = peak;
+        selected.check_scheduling_memory(limits, envelope, prefill).unwrap();
+        limits.memory_bytes -= 1;
+        assert_eq!(selected.check_scheduling_memory(limits, envelope, prefill), Err(CandidateError::Arguments));
+        let mut without_workers = limits;
+        without_workers.compute.workspace_bytes = 0;
+        assert_eq!(peak - selected.schedule_peak_bytes(without_workers, envelope, prefill).unwrap(),
+            limits.compute.workspace_bytes);
+        assert_eq!(peak - selected.schedule_peak_bytes(limits, envelope, None).unwrap(),
+            prefill.unwrap().validate().unwrap());
+        let mut retained = envelope;
+        retained.io_bytes += 19;
+        assert_eq!(selected.schedule_peak_bytes(limits, retained, prefill).unwrap(), peak + 19);
+        let mut caller = limits;
+        caller.preparation_bytes += 23;
+        assert_eq!(selected.schedule_peak_bytes(caller, envelope, prefill).unwrap(), peak + 46);
+        retained.io_bytes = u64::MAX;
+        assert!(selected.schedule_peak_bytes(limits, retained, prefill).is_err());
+    }
+}
+
+#[test]
+fn invalid_or_underfunded_structured_schedules_refuse_before_private_io() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private corpus input read") } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("partial corpus output written") }
+        fn flush(&mut self) -> io::Result<()> { panic!("corpus output flushed") }
+    }
+    for task in ["ner", "keyphrases", "summarize", "answer", "extract"] {
+        for flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+            vec!["--prefill-rows", "0"], vec!["--prefill-rows", "65"],
+            vec!["--compute-threads", "4", "--prefill-rows", "7", "--max-weight-mib", "8192"]] {
+            assert_eq!(command(task, &flags).execute_owned(NoIo, NoIo), Err(CandidateError::Arguments));
+        }
+    }
+}

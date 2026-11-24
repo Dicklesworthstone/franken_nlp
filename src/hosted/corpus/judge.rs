@@ -78,9 +78,9 @@ impl NlpEngine {
 }
 
 struct JudgeStream { planner: Arc<JudgePlanner>, config: JudgeCorpusConfig }
-impl scored::ScoredTask for JudgeStream {
+impl scored::CorpusTask for JudgeStream {
     fn identity(&self) -> &ExecutionIdentity { &self.config.identity }
-    fn validate(&self, _limits: CorpusLimits, native: Int8MemoryRequirement) -> Result<u64, HostedError> {
+    fn validate(&self, _model: &ArtifactIdentity, _limits: CorpusLimits, native: Int8MemoryRequirement) -> Result<u64, HostedError> {
         self.config.validate(&self.planner)?;
         if native.kv_bytes > self.config.task_ceiling.max_kv_bytes {
             return Err(HostedError::Limits("judge corpus whole KV allocation"));

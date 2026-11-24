@@ -133,6 +133,28 @@ impl BatchCommand {
         config.validate().map_err(|_| CandidateError::Arguments)?;
         Ok(config)
     }
+    /// The complete map frontier coexists with the stream compiler/transport
+    /// owner. Bound one active document, never multiply retained bytes by the
+    /// number of input records. The shared schema is independently retained.
+    pub(super) fn schedule_document_reserve(&self) -> Result<(u64, u64), CandidateError> {
+        let Some(d) = self.document_settings()? else {
+            return Ok((0, self.host.max_new_tokens as u64));
+        };
+        let mul = |a: u64, b: u64| a.checked_mul(b).ok_or(CandidateError::Arguments);
+        let output_tokens = mul(d.chunks as u64, self.host.max_new_tokens as u64)?;
+        let staged = mul((self.host.max_result_bytes as u64).checked_mul(d.chunks as u64)
+            .and_then(|n| n.checked_add(MAX_DOCUMENT_RESULT as u64)).ok_or(CandidateError::Arguments)?, 4)?;
+        let fields = mul(d.verification.max_fields as u64,
+            std::mem::size_of::<crate::validation::grounded_fields::SourceFieldEvidence>() as u64)?;
+        let spans = mul(mul(d.verification.max_matches as u64,
+            std::mem::size_of::<crate::validation::grounded_fields::VerifiedSourceSpan>() as u64)?, 2)?;
+        let bytes = [staged, mul(output_tokens, 8)?, fields, spans, d.reduction_bytes,
+            4 * crate::candidate_cli::extract::SCHEMA_BYTES as u64]
+            .into_iter().try_fold(0_u64, |total, value| total.checked_add(value))
+            .ok_or(CandidateError::Arguments)?;
+        Ok((bytes, output_tokens))
+    }
+
     pub(in crate::candidate_cli) fn document_reduction_bytes(&self) -> Result<u64, CandidateError> {
         Ok(self.document_settings()?.ok_or(CandidateError::Arguments)?.reduction_bytes)
     }
