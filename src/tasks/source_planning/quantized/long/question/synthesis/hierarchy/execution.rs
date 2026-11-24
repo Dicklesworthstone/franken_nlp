@@ -6,7 +6,7 @@ pub(super) struct Native<'a, 'w> {
     pub planner: &'a SourceTaskPlanner, pub identity: &'a ExecutionIdentity, pub question: &'a str,
     pub budget: TaskBudget, pub planning: SourcePlanningLimits, pub options: AnswerOptions,
     pub mapping: Int8SourceMapLimits, pub engine: &'a mut StrictInt8Engine<'w>, pub vocabulary: &'a ExtractionVocabulary,
-    pub expected: Int8QuestionHierarchyPreflight,
+    pub expected: Int8QuestionHierarchyPreflight, pub prefill: Option<Int8PrefillLimits>,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) struct Witness { identity: Sha256Digest, prompt: usize, work: Int8Work }
@@ -89,7 +89,7 @@ impl Driver for Native<'_, '_> {
         -> Result<(Int8SourceTaskRun, Int8Work), Int8SourceMapError> {
         let plan = self.plan(passages, control)?;
         if Witness::of(&plan)? != *witness { return Err(Int8SourceMapError::Admission); }
-        let mut driver = NativeDriver { engine: self.engine, vocabulary: self.vocabulary, control, limits: self.mapping, prefill: None };
+        let mut driver = NativeDriver { engine: self.engine, vocabulary: self.vocabulary, control, limits: self.mapping, prefill: self.prefill };
         let run = driver.run(&plan, plan.execution_identity())?;
         check_run(&plan, &run, self.mapping.mask_visits_per_chunk)?;
         extract_int8::check_size(&run, plan.max_result_bytes()).map_err(Int8SourceError::from)?;

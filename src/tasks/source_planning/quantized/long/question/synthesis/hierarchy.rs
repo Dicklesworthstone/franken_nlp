@@ -185,16 +185,32 @@ impl<'s> PreparedInt8QuestionHierarchy<'s> {
     pub fn execute_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
         planner: &SourceTaskPlanner, engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
         -> Result<Int8QuestionHierarchyRun, Int8SourceMapError> {
+        self.execute_scheduled(admitted, planner, engine, vocabulary, None, control)
+    }
+    /// Apply bounded prompt morsels to every discovery and hierarchy pass on
+    /// the same engine, without renewing evidence, tokenizer or native budgets.
+    pub fn execute_layer_major_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        planner: &SourceTaskPlanner, engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary,
+        prefill: Int8PrefillLimits, control: &mut C) -> Result<Int8QuestionHierarchyRun, Int8SourceMapError> {
+        self.execute_scheduled(admitted, planner, engine, vocabulary, Some(prefill), control)
+    }
+    fn execute_scheduled<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        planner: &SourceTaskPlanner, engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary,
+        prefill: Option<Int8PrefillLimits>, control: &mut C) -> Result<Int8QuestionHierarchyRun, Int8SourceMapError> {
         checkpoint(control)?;
+        if let Some(prefill) = prefill { check_prefill(prefill)?; }
         self.base.check_planner(planner)?;
         self.base.map.preflight(admitted, engine)?;
         let (map, continuation) = self.into_phases();
-        let discovery = map.execute_with_control(admitted, engine, vocabulary, control)?;
+        let discovery = match prefill {
+            Some(prefill) => map.execute_layer_major_with_control(admitted, engine, vocabulary, prefill, control),
+            None => map.execute_with_control(admitted, engine, vocabulary, control),
+        }?;
         continuation.execute(discovery, control, |continuation, collection, remaining, control| {
             let base = &continuation.base;
             let mut driver = execution::Native { planner: &base.operation, identity: &base.identity, question: &base.question,
                 budget: base.budget, planning: base.planning, options: base.options, mapping: continuation.mapping,
-                engine, vocabulary, expected: continuation.expected };
+                engine, vocabulary, prefill, expected: continuation.expected };
             execution::reduce(base.source, collection, continuation.expected, continuation.mapping.reduction.max_result_bytes as u64,
                 remaining, &mut driver, control)
         })

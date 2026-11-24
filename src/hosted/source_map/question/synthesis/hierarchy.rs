@@ -4,74 +4,90 @@ use crate::tasks::source_planning::quantized::long::question::synthesis::hierarc
     Int8QuestionHierarchyRun, QuestionHierarchyLimits, memory::workspace_bytes};
 
 impl NlpEngine {
-    /// Explicit lossy reduction when complete collected evidence exceeds one
-    /// answer context. Every pass receives the original question and verified
-    /// original-source quotes; generated answer prose never becomes evidence.
-    /// Retain all native/lifted passes and all guards until physical completion.
+    /// Explicit lossy reduction when collected evidence exceeds one answer
+    /// context. Every pass retains the original question and verified source
+    /// quotes, with all native/lifted results owned through physical completion.
     #[allow(clippy::too_many_arguments)]
     pub fn synthesize_int8_document_answer_hierarchical(&self, model: &ResidentInt8, source: String,
         planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
         config: SourceMapConfig<SourceQuestionSynthesis>, hierarchy: QuestionHierarchyLimits,
         cancellation: CancellationToken) -> Result<HostedOutput<Int8QuestionHierarchyRun>, HostedError> {
-        dispatch::preflight(self, config.native.run)?;
-        self.check_resident_domain(model)?;
-        check_model_identity(model.artifact_identity(), &config.identity)?;
+        self.synthesize_int8_document_answer_hierarchical_scheduled(model, source, planner, vocabulary,
+            config, hierarchy, None, None, cancellation)?.serial()
+    }
+
+    /// Retain one bounded prompt workspace across every quotation-selection level.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_int8_document_answer_hierarchical_layer_major(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: SourceMapConfig<SourceQuestionSynthesis>, hierarchy: QuestionHierarchyLimits,
+        prefill: Int8PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int8QuestionHierarchyRun>, HostedError> {
+        self.synthesize_int8_document_answer_hierarchical_scheduled(model, source, planner, vocabulary,
+            config, hierarchy, Some(prefill), None, cancellation)?.serial()
+    }
+
+    /// Reuse one persistent team through discovery and all admitted hierarchy nodes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_int8_document_answer_hierarchical_with_threads(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: SourceMapConfig<SourceQuestionSynthesis>, hierarchy: QuestionHierarchyLimits,
+        kernel: Int8Kernel, compute_threads: usize, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8QuestionHierarchyRun>, HostedError> {
+        self.synthesize_int8_document_answer_hierarchical_scheduled(model, source, planner, vocabulary,
+            config, hierarchy, None, Some((kernel, compute_threads)), cancellation)?.team()
+    }
+
+    /// Compose workers and prompt morsels under the original complete-document
+    /// allowance; dynamic evidence and tokenizer work do not reset between levels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_int8_document_answer_hierarchical_layer_major_with_threads(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: SourceMapConfig<SourceQuestionSynthesis>, hierarchy: QuestionHierarchyLimits,
+        kernel: Int8Kernel, compute_threads: usize, prefill: Int8PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8QuestionHierarchyRun>, HostedError> {
+        self.synthesize_int8_document_answer_hierarchical_scheduled(model, source, planner, vocabulary,
+            config, hierarchy, Some(prefill), Some((kernel, compute_threads)), cancellation)?.team()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn synthesize_int8_document_answer_hierarchical_scheduled(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: SourceMapConfig<SourceQuestionSynthesis>, hierarchy: QuestionHierarchyLimits,
+        prefill: Option<Int8PrefillLimits>, team: Option<(Int8Kernel, usize)>, cancellation: CancellationToken)
+        -> Result<scheduled::Completion<Int8QuestionHierarchyRun>, HostedError> {
         let required = requirements(config.native)?;
         validate_synthesis(&config, source.len(), required.kv_bytes, planner.document_encoding())?;
         hierarchy.validate().map_err(HostedError::SourceMap)?;
-        check_assets(&config.identity, planner.tokenizer_digest(), *planner.template_digest())?;
-        // Check complete configured arithmetic before transferring input. The
-        // actual source partition determines the subsequent committed reserve.
         hierarchy_bytes(&config, config.mapping.chunks.max_chunks, hierarchy)?;
         let bytes = input_bytes(&config, source.capacity(), &planner)?;
-        let run = config.native.run;
-        let lease = self.resources().acquire_lease();
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
-            || Ok(SourceMapInput { source, planner, vocabulary, config }))?;
-        let model = model.clone();
-        dispatch::run(self, run, cancellation, move |control| {
-            let input = input;
-            let config = &input.value.config;
-            let context = PlanContext::new(&config.identity, config.budget)
-                .map_err(|_| HostedError::Limits("question hierarchy task context"))?;
-            let prepared = input.value.planner.plan_int8_question_hierarchy_with_control(&input.value.source,
-                &config.task, hierarchy, config.budget, &context, config.planning, config.mapping, control)
-                .map_err(HostedError::SourceMap)?;
-            let expected = prepared.preflight_metadata();
-            let discovery = expected.discovery();
-            let reduction = Pending::reserve(&lease, MemoryClass::JobBuffers,
-                hierarchy_bytes(config, discovery.chunk_count(), hierarchy)?)?;
-            let tokens = transcript_tokens(config.budget.max_output_tokens, discovery.native_chunks(), hierarchy)?;
-            let output = output_claim(&lease, prepared.max_result_bytes(), tokens)?;
-            let mut admitted = Vec::new();
-            admitted.try_reserve_exact(discovery.native_chunks())
-                .map_err(|_| HostedError::SourceMap(Int8SourceMapError::Allocation))?;
-            for identity in prepared.execution_identities() {
-                if let Some(cause) = control.prefill_checkpoint(0) {
-                    return Err(HostedError::SourceMap(Int8SourceError::Cancelled(cause).into()));
-                }
-                check_model_identity(model.artifact_identity(), identity)?;
-                constrained_int8::check_profile(identity).map_err(|_| HostedError::ModelIdentity)?;
-                admitted.push(identity.clone());
-            }
-            let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-            let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-                sum(&[required.rope_bytes, required.scratch_payload_bound, config.native.allocator_reserve_bytes])?)?;
-            let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value
-                .engine(config.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            let result = allocate(output, || {
-                let result = prepared.execute_with_control(&admitted, &input.value.planner,
-                    &mut engine.value, &input.value.vocabulary, control).map_err(HostedError::SourceMap)?;
-                expected.verify_completed_with_control(&result, control).map_err(HostedError::SourceMap)?;
-                Ok(result)
-            })?;
-            drop(engine);
-            drop(admitted);
-            drop(input);
-            drop(reduction);
-            drop(lease);
-            Ok(GuardedOutput::new(result.value, result._memory))
-        })
+        scheduled::run(self, model, SourceMapInput { source, planner, vocabulary, config },
+            bytes, prefill, team, cancellation, move |input, invocation, control| {
+                let config = &input.config;
+                let context = PlanContext::new(&config.identity, config.budget)
+                    .map_err(|_| HostedError::Limits("question hierarchy task context"))?;
+                let prepared = input.planner.plan_int8_question_hierarchy_with_control(&input.source,
+                    &config.task, hierarchy, config.budget, &context, config.planning, config.mapping, control)
+                    .map_err(HostedError::SourceMap)?;
+                let expected = prepared.preflight_metadata();
+                let discovery = expected.discovery();
+                let temporary = hierarchy_bytes(config, discovery.chunk_count(), hierarchy)?;
+                let tokens = transcript_tokens(config.budget.max_output_tokens, discovery.native_chunks(), hierarchy)?;
+                let output_bytes = prepared.max_result_bytes();
+                let admitted = scheduled::admit(prepared.execution_identities(),
+                    invocation.artifact(), &input.planner, control)?;
+                let prefill = invocation.prefill();
+                invocation.execute(temporary, output_bytes, tokens, control, |engine, control| {
+                    let result = match prefill {
+                        Some(prefill) => prepared.execute_layer_major_with_control(&admitted, &input.planner,
+                            engine, &input.vocabulary, prefill, control),
+                        None => prepared.execute_with_control(&admitted, &input.planner,
+                            engine, &input.vocabulary, control),
+                    }.map_err(HostedError::SourceMap)?;
+                    expected.verify_completed_with_control(&result, control).map_err(HostedError::SourceMap)?;
+                    Ok(result)
+                })
+            })
     }
 }
 

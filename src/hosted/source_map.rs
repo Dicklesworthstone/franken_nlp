@@ -4,6 +4,7 @@ mod summary;
 mod question;
 mod keyphrase_reduction;
 mod team;
+mod scheduled;
 use crate::{
     native_engine::{constrained_int8, lmhead::NANBEIGE_VOCAB_SIZE,
         simd::Int8Kernel, strict_int8::prefill::Int8PrefillLimits},

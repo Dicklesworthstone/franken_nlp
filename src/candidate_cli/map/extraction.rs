@@ -46,9 +46,9 @@ pub(in crate::candidate_cli) struct ExtractionArgs {
     /// Nonrenewable independent source verification work (default 67108864).
     #[arg(long, requires = "schema")]
     max_extraction_scan_steps: Option<u64>,
-    /// Bounded layer-major prompt morsels for extraction, NER, keyphrases or
-    /// cited-summary maps and their exact reducers, 1..=64 rows. Composes with
-    /// the same persistent team. QA and neural synthesis are not supported.
+    /// Bounded layer-major prompt morsels for all complete-document maps,
+    /// exact reducers and neural summary/answer synthesis, 1..=64 rows.
+    /// One persistent team covers discovery and every hierarchy level.
     /// Extra coordinator and worker storage is admitted before private IO.
     #[arg(long, value_name = "ROWS")]
     prefill_rows: Option<usize>,
@@ -140,21 +140,17 @@ impl ExtractionArgs {
         }
         Ok(())
     }
-    pub(super) fn schedule_peak_bytes(&self, command: &MapCommand, args: &CandidateArgs, limits: Limits)
+    pub(in crate::candidate_cli) fn schedule_peak_bytes(&self, command: &MapCommand, args: &CandidateArgs, limits: Limits)
         -> Result<u64, CandidateError> {
         let native = Int8MemoryRequirement::for_context(args.context_tokens).map_err(|_| CandidateError::Arguments)?;
-        let tokens = (command.max_chunks as u64).checked_mul(args.max_new_tokens as u64)
-            .ok_or(CandidateError::Arguments)?;
+        let storage = command.schedule_storage(limits)?;
         let base = compute::request_peak_bytes(limits, native, command.max_map_result_bytes as u64,
-            tokens, 0, limits.preparation_bytes)?;
+            storage.output_tokens, 0, limits.preparation_bytes)?;
         let extra = self.prefill()?.map(Int8PrefillLimits::validate).transpose()
             .map_err(|_| CandidateError::Arguments)?.unwrap_or(0);
         // Price the complete retained frontier, original-coordinate scans and
         // a separately transferred input owner, not one chunk multiplied only
         // after allocation. The host independently reserves its actual counts.
-        let retained = (command.host.max_result_bytes as u64).checked_mul(command.max_chunks as u64)
-            .and_then(|n| n.checked_add(command.max_live_value_bytes as u64))
-            .and_then(|n| n.checked_mul(4)).ok_or(CandidateError::Arguments)?;
         let verification = self.verification()?;
         let fields = (verification.max_fields as u64).checked_mul(std::mem::size_of::<SourceFieldEvidence>() as u64)
             .ok_or(CandidateError::Arguments)?;
@@ -166,15 +162,70 @@ impl ExtractionArgs {
         // the host independently reserves its own schema/reducer peak through
         // physical drain. Admit both before either source or schema is read.
         let object = self.object_workspace_bytes(command)?.checked_mul(2).ok_or(CandidateError::Arguments)?;
-        [base, extra, object, retained, fields, spans, tokens.checked_mul(8).ok_or(CandidateError::Arguments)?,
-            command.reduction_reserve_mib.checked_mul(MIB).ok_or(CandidateError::Arguments)?,
+        [base, extra, object, storage.reduction_bytes, storage.question_bytes, fields, spans,
             (args.max_input_bytes as u64).checked_mul(4).ok_or(CandidateError::Arguments)?,
             2 * schema::SCHEMA_BYTES as u64, encoding]
             .into_iter().try_fold(0_u64, |sum, bytes| sum.checked_add(bytes))
             .ok_or(CandidateError::Arguments)
     }
 }
+/// Simultaneously retained discovery/reduction and returned transcript bounds.
+struct ScheduleStorage { output_tokens: u64, reduction_bytes: u64, question_bytes: u64 }
 impl MapCommand {
+    fn schedule_storage(&self, limits: Limits) -> Result<ScheduleStorage, CandidateError> {
+        let mul = |a: u64, b: u64| a.checked_mul(b).ok_or(CandidateError::Arguments);
+        let sum = |values: &[u64]| values.iter().try_fold(0_u64,
+            |total, value| total.checked_add(*value).ok_or(CandidateError::Arguments));
+        let budget = self.host.task_budget(limits);
+        let chunks = self.max_chunks as u64;
+        let tokens = mul(chunks, u64::from(budget.max_output_tokens))?;
+        let retained = mul(sum(&[mul(budget.max_output_bytes, chunks)?,
+            self.max_live_value_bytes as u64])?, 4)?;
+        let reserve = mul(self.reduction_reserve_mib, MIB)?;
+        let mut storage = ScheduleStorage { output_tokens: tokens,
+            reduction_bytes: sum(&[retained, mul(tokens, 8)?, reserve])?, question_bytes: 0 };
+        if self.task == "answer" {
+            storage.question_bytes = mul(question::QUESTION_BYTES as u64, 4)?;
+            // Independent QA and single-pass synthesis retain their complete
+            // structured envelope; the host gives them no extra token claim.
+            storage.output_tokens = 0;
+            if self.question.synthesis.synthesize_answer {
+                let synthesis = self.question.synthesis.limits(&self.host)?;
+                let verification = self.question.verification()?;
+                if let Some(hierarchy) = self.question.synthesis.hierarchy.limits(true)? {
+                    storage.reduction_bytes = crate::tasks::source_planning::quantized::long::question::synthesis::hierarchy::memory::workspace_bytes(
+                        budget, self.question_mapping()?, self.max_chunks, reserve,
+                        synthesis, verification, hierarchy).map_err(|_| CandidateError::Arguments)?;
+                    storage.output_tokens = mul(sum(&[chunks, hierarchy.max_passes as u64])?,
+                        u64::from(budget.max_output_tokens))?;
+                } else {
+                    storage.reduction_bytes = sum(&[storage.reduction_bytes,
+                        mul(synthesis.max_evidence_bytes as u64, 4)?,
+                        mul(synthesis.max_evidence_passages as u64, 1024)?,
+                        mul(verification.max_matches as u64, 64)?,
+                        mul(budget.max_output_bytes, 4)?, mul(u64::from(budget.max_output_tokens), 8)?])?;
+                }
+            }
+        } else if self.summary.synthesis.synthesize_summary {
+            let synthesis = self.summary.synthesis.limits(self.host.planning())?;
+            let hierarchy = self.summary.synthesis.hierarchy.limits(true)?;
+            let passes = hierarchy.as_ref().map_or(1, |limits| limits.max_passes) as u64;
+            let per_pass = sum(&[mul(budget.max_output_bytes, 4)?,
+                mul(u64::from(budget.max_output_tokens), 8)?])?;
+            storage.reduction_bytes = sum(&[storage.reduction_bytes, mul(per_pass, passes)?,
+                mul(synthesis.max_evidence_bytes as u64, 64)?,
+                mul(synthesis.max_evidence_segments as u64, 128)?,
+                mul(synthesis.verification.max_matches as u64, 128)?,
+                mul(synthesis.verification.max_fields as u64, 128)?])?;
+            if let Some(hierarchy) = hierarchy {
+                storage.reduction_bytes = sum(&[storage.reduction_bytes,
+                    mul(passes, 256)?, mul(hierarchy.max_levels as u64, 128)?])?;
+            }
+            storage.output_tokens = mul(sum(&[chunks, passes])?, u64::from(budget.max_output_tokens))?;
+        }
+        Ok(storage)
+    }
+
     /// Requested ceilings only. The actual extraction compiler tightens context
     /// using the exact schema, pinned scaffold and real source token counts.
     pub(in crate::candidate_cli) fn extraction_mapping(&self) -> Result<Int8ExtractionMapLimits, CandidateError> {

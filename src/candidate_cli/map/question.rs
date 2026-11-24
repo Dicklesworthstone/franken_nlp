@@ -43,7 +43,7 @@ impl QuestionArgs {
     pub(in crate::candidate_cli) fn path(&self) -> Result<&std::path::Path, CandidateError> {
         self.question.as_deref().ok_or(CandidateError::Arguments)
     }
-    fn verification(&self) -> Result<GroundingBudget, CandidateError> {
+    pub(super) fn verification(&self) -> Result<GroundingBudget, CandidateError> {
         let defaults = GroundingBudget::default();
         let budget = GroundingBudget { max_fields: self.max_qa_citations.unwrap_or(defaults.max_fields),
             max_matches: self.max_qa_evidence_spans.unwrap_or(defaults.max_matches),

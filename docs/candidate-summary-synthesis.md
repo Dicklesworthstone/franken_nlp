@@ -23,7 +23,7 @@ fnlp candidate map report.txt \
   --memory-mib 16384 --preparation-mib 1024 \
   --context-tokens 8192 --max-new-tokens 512 \
   --max-input-bytes 1048576 --max-chunks 32 \
-  --max-synthesis-evidence-bytes 8192
+  --max-summary-evidence-bytes 8192
 ```
 
 The numbers are example admission ceilings, not benchmark results or a promise
@@ -65,7 +65,7 @@ evidence sizes and independent verification usage remain visible.
 ## Limits and interpretation
 
 `--max-synthesis-evidence-segments` bounds distinct chunk/quote segments.
-`--max-synthesis-evidence-bytes` includes the two-newline separators.
+`--max-summary-evidence-bytes` includes the two-newline separators.
 `--max-synthesis-fields`, `--max-synthesis-matches`, and
 `--max-synthesis-scan-steps` bound one shared additional independent verification
 ledger across quote collection and final citation lifting. Scan matches and
@@ -81,6 +81,32 @@ original contains no useful information. Citation existence establishes structur
 source membership, not semantic entailment; output remains `non_authoritative`
 with semantic support unassessed. Full-document recall and single-context
  equivalence are not established.
+
+## Bounded prompts and persistent workers
+
+Add `--prefill-rows N` (1 through 64) for bounded prompt processing and
+`--compute-threads N` (2 through 64) for one persistent INT8 projection team.
+The options compose, for example `--compute-threads 4 --prefill-rows 7`, with
+either byte fallback or explicit `--input-encoding safe-bpe-v1`. Compute width
+one is the serial default. The same admitted team serves every discovery chunk
+and the final evidence-only summary pass.
+
+The CLI prices coordinator prompt scratch, workers, the complete evidence
+frontier, retained native results and guarded output before private IO. The host
+admits actual prepared counts and retains source/native owners until all workers
+physically finish. The output guard keeps all discovery and final tokens charged
+through delivery. All work, masks, tokenizer counters and independent source
+verification remain shared; scheduling does not change the collected evidence,
+private completion binding or final source coordinates. Team provenance adds a
+`compute` receipt beside the existing semantic output.
+
+Library callers use `NlpEngine::synthesize_int8_summary_layer_major`,
+`NlpEngine::synthesize_int8_summary_with_threads`, or
+`NlpEngine::synthesize_int8_summary_layer_major_with_threads`. Team variants take
+the kernel and width after the existing task config, then optional prefill
+limits and cancellation. Prepared native tasks also expose
+`execute_layer_major_with_control`. Model parity and target-host performance
+remain subject to the explicit controller gates.
 
 ## Explicit multi-context alternative
 

@@ -120,7 +120,7 @@ fn invalid_or_unfunded_document_schedules_refuse_before_private_io() {
         vec!["--compute-threads", "4", "--prefill-rows", "4", "--max-weight-mib", "8192"]] {
         assert_eq!(extract(&flags).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
     }
-    for flags in [vec!["--compute-threads", "2"], vec!["--prefill-rows", "4"]] {
+    for flags in [vec!["--compute-threads", "0"], vec!["--prefill-rows", "65"]] {
         let mut synthesis = flags.clone(); synthesis.push("--synthesize-summary");
         assert_eq!(command("summarize", &synthesis).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
         let mut question = flags; question.extend(["--question", "never-open.txt"]);

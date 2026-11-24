@@ -52,6 +52,18 @@ fn host_error(error: HostedError) -> CandidateError {
     }
 }
 
+/// Revalidate the complete physical schedule before source, question, options
+/// or model IO. The returned session owns preparation through final delivery.
+fn scheduled_session(command: &MapCommand, args: &CandidateArgs, limits: Limits)
+    -> Result<(Session, Option<crate::native_engine::strict_int8::prefill::Int8PrefillLimits>), CandidateError> {
+    let prefill = command.extraction.prefill()?;
+    if args.compute != command.compute || limits.compute != command.compute.admit_prefill(prefill)? {
+        return Err(CandidateError::Arguments);
+    }
+    command.extraction.check_schedule_memory(command, args, limits)?;
+    Ok((Session::new_with_prefill(args, limits, prefill)?, prefill))
+}
+
 pub(in crate::candidate_cli) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
     if command.kind()? == crate::tasks::BuiltInTask::Answer {
@@ -63,10 +75,7 @@ pub(in crate::candidate_cli) fn execute(command: MapCommand, args: CandidateArgs
     if command.summary.synthesis.synthesize_summary {
         return synthesis::execute(command, args, limits, input, output);
     }
-    let prefill = command.extraction.prefill()?;
-    if limits.compute != command.compute.admit_prefill(prefill)? { return Err(CandidateError::Arguments); }
-    // Check the exact prompt/worker quote before private source/options IO.
-    let session = Session::new_with_prefill(&args, limits, prefill)?;
+    let (session, prefill) = scheduled_session(&command, &args, limits)?;
     let text = session.read(&command.input, input, args.max_input_bytes)?;
     let option_text = command.options.as_ref()
         .map(|path| session.read(path, input, crate::candidate_cli::source::OPTIONS_BYTES)).transpose()?;

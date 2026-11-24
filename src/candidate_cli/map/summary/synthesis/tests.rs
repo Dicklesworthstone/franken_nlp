@@ -27,7 +27,7 @@ fn unrelated_tasks_and_conflicting_reducers_cannot_acquire_synthesis() {
 fn zero_unbounded_and_overlarge_synthesis_limits_fail_closed() {
     for (flag, value) in [("--synthesis-bullets", "0"), ("--synthesis-bullets", "1025"),
         ("--max-synthesis-evidence-segments", "0"), ("--max-synthesis-evidence-segments", "1025"),
-        ("--max-synthesis-evidence-bytes", "0"), ("--max-synthesis-evidence-bytes", "1048577"),
+        ("--max-summary-evidence-bytes", "0"), ("--max-summary-evidence-bytes", "1048577"),
         ("--max-synthesis-fields", "0"), ("--max-synthesis-fields", "1000001"),
         ("--max-synthesis-matches", "0"), ("--max-synthesis-matches", "1000001"),
         ("--max-synthesis-scan-steps", "0"), ("--max-synthesis-scan-steps", "1000000000001")] {
@@ -36,7 +36,7 @@ fn zero_unbounded_and_overlarge_synthesis_limits_fail_closed() {
 }
 #[test]
 fn actual_preparation_limits_are_checked_before_io_and_do_not_expand_with_more_chunks() {
-    let c = command("summarize", &["--synthesize-summary", "--max-synthesis-evidence-bytes", "1024"]);
+    let c = command("summarize", &["--synthesize-summary", "--max-summary-evidence-bytes", "1024"]);
     let mut planning = c.host.planning(); planning.max_input_bytes = 1023;
     assert!(c.summary.synthesis.check_planning(planning).is_err());
     let a = command("summarize", &["--synthesize-summary"]);

@@ -5,6 +5,7 @@ pub(super) struct Native<'a, 'w> {
     pub planner: &'a SourceTaskPlanner, pub identity: &'a ExecutionIdentity,
     pub budget: TaskBudget, pub planning: SourcePlanningLimits, pub options: SummaryOptions,
     pub mapping: Int8SourceMapLimits, pub engine: &'a mut StrictInt8Engine<'w>, pub vocabulary: &'a ExtractionVocabulary,
+    pub prefill: Option<Int8PrefillLimits>,
 }
 // Private seam only. No public caller can inject native receipts or summaries.
 pub(super) trait Driver {
@@ -27,7 +28,7 @@ impl Driver for Native<'_, '_> {
         let (_, ceiling) = reserve(self.budget, self.planning, self.mapping)?;
         if !within(plan.planned_work(), ceiling) { return Err(Int8SourceMapError::WorkLimit); }
         preflight_plans(std::slice::from_ref(&plan), std::slice::from_ref(plan.execution_identity()), self.engine)?;
-        let mut native = NativeDriver { engine: self.engine, vocabulary: self.vocabulary, control, limits: self.mapping, prefill: None };
+        let mut native = NativeDriver { engine: self.engine, vocabulary: self.vocabulary, control, limits: self.mapping, prefill: self.prefill };
         let run = native.run(&plan, plan.execution_identity())?;
         check_run(&plan, &run, self.mapping.mask_visits_per_chunk)?;
         extract_int8::check_size(&run, plan.max_result_bytes()).map_err(Int8SourceError::from)?;

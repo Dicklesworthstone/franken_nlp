@@ -12,7 +12,7 @@ fnlp candidate map document.txt \
   --task answer --question question.txt --synthesize-answer \
   --model ./model.fnlpq --memory-mib 12288 \
   --context-tokens 4096 --max-new-tokens 128 --max-chunks 32 \
-  --max-synthesis-passages 32 --max-synthesis-evidence-bytes 16384
+  --max-synthesis-passages 32 --max-answer-evidence-bytes 16384
 ```
 
 These are illustrative finite allowances, not measured requirements or assurance
@@ -38,7 +38,7 @@ controls require the synthesis switch and cannot silently affect another mode:
 | --- | --- |
 | `--synthesize-answer` | Explicit additional native answer pass over collected quotes |
 | `--max-synthesis-passages` | Complete distinct `(chunk, quote)` passage set; default 32, maximum 1024 |
-| `--max-synthesis-evidence-bytes` | Total verbatim quote bytes; default 16384, intersected with `--max-input-bytes` |
+| `--max-answer-evidence-bytes` | Total verbatim quote bytes; default 16384, intersected with `--max-input-bytes` |
 
 These are refusal thresholds, not top-k selectors. Single-pass synthesis fails
 when all collected evidence cannot fit its final context. Explicit hierarchy
@@ -58,7 +58,7 @@ fnlp candidate map document.txt \
   --synthesize-answer --hierarchical-answer \
   --model ./model.fnlpq --memory-mib 12288 \
   --context-tokens 4096 --max-new-tokens 128 --max-chunks 32 \
-  --max-synthesis-passages 128 --max-synthesis-evidence-bytes 32768 \
+  --max-synthesis-passages 128 --max-answer-evidence-bytes 32768 \
   --answer-max-levels 4 --answer-max-passes 16
 ```
 
@@ -117,6 +117,30 @@ actual work, masks, verification usage and grouping work remain visible. Exact
 request and nested-result commitments remain private and are checked before
 publication. The complete result, including every intermediate receipt, must
 fit `--max-map-result-bytes`.
+
+## Bounded prompts and persistent workers
+
+Independent passage QA, single-pass synthesis and hierarchical answers all
+accept `--prefill-rows N` (1 through 64) and `--compute-threads N` (2 through 64).
+Either option works alone; together they use one admitted projection team for
+every prompt morsel, discovery chunk and subsequent evidence pass. Compute
+width one remains the serial default. Both byte fallback and explicit
+`--input-encoding safe-bpe-v1` retain their existing source contracts.
+
+Add `--compute-threads 4 --prefill-rows 7` to an invocation above after sizing
+`--memory-mib` for its full simultaneous quote. Admission includes coordinator
+prompt scratch, worker buffers, the original source and question, complete
+evidence/reduction state and all retained native transcripts. The CLI checks
+this quote before private input or model IO; the host rechecks actual prepared
+counts. One owner retains the input and every native reservation through the
+physical worker join, including cancellation and failure. The output guard then
+keeps the complete result charged through write and flush.
+
+Scheduling leaves every question, source citation, reducer, private completion
+binding and nonrenewable work allowance intact. Team responses add a `compute`
+receipt beside the existing `output`; the complete semantic QA envelope and its
+result-byte cap are unchanged. No measured parity or performance follows from
+the presence of these execution routes.
 
 ## Native work and completion
 
@@ -220,6 +244,14 @@ For hierarchical execution, use `hierarchy::QuestionHierarchyLimits`,
 `NlpEngine::synthesize_int8_document_answer_hierarchical`. The shared pure
 `hierarchy::memory::workspace_bytes` quote covers complete retained reduction
 state; input/grammar, native workspace and output have separate ownership.
+
+All three hosted base methods (`answer_int8_document`,
+`synthesize_int8_document_answer`, and
+`synthesize_int8_document_answer_hierarchical`) also expose `_layer_major`,
+`_with_threads`, and `_layer_major_with_threads` variants. Hierarchy limits
+precede schedule arguments; team calls take the kernel and compute width, then
+optional prefill limits, followed by cancellation. Prepared native values expose
+`execute_layer_major_with_control` for the same source-bound operation.
 
 Model-free regression definitions cover quote-only inputs, full-stage
 reservations, Unicode lifting, overlap/duplicate handling, passage-join refusal,

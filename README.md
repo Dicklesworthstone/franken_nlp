@@ -745,11 +745,13 @@ fnlp candidate map report.txt --task summarize \
   --input-encoding safe-bpe-v1 --max-chunk-bytes 4096
 ```
 
-Evidence bytes use the whole per-prompt `--max-input-bytes` allowance; their
-actual encoded token count still determines context fit. Final answers and
-summaries cite the original source, and generated discovery text never becomes
-source evidence. These modes synthesize from collected quotes and do not claim
-equivalence to native inference over the complete original document.
+Collected evidence uses `--max-answer-evidence-bytes` for answers and
+`--max-summary-evidence-bytes` for summaries, within the per-prompt
+`--max-input-bytes` allowance. Its actual encoded token count still determines
+context fit. Final answers and summaries cite the original source, and generated
+discovery text never becomes source evidence. These modes synthesize from
+collected quotes and do not claim equivalence to native inference over the
+complete original document.
 
 Question hierarchies retain the original question and complete passage manifest
 in every fit calculation. They admit all groups in a level before the first
@@ -760,6 +762,30 @@ every permitted pass is reserved before discovery. Explicit synthesis accepts
 up to 1024 evidence passages, with the default unchanged at 32. See the
 [hierarchical answer contract](docs/candidate-question-synthesis.md#hierarchical-answers-for-evidence-exceeding-one-context)
 for complete work, memory, result and compact-tokenizer limits.
+
+All these complete-document modes also accept `--prefill-rows 1..=64` for
+bounded prompt processing and `--compute-threads 2..=64` for one persistent INT8
+projection team. They compose for independent QA, single-pass answer/summary
+synthesis and both hierarchies. The same team serves discovery, every dynamic
+evidence pass and the final answer or summary; it is not recreated per chunk.
+The default compute width is one. For example:
+
+```sh
+fnlp candidate map report.txt --task answer --question question.txt \
+  --synthesize-answer --hierarchical-answer --answer-max-passes 8 \
+  --max-answer-evidence-bytes 65536 \
+  --model ./model.fnlpq --memory-mib 32768 \
+  --compute-threads 4 --prefill-rows 7 --input-encoding safe-bpe-v1
+```
+
+The CLI admits coordinator prompt scratch, worker capacity, complete evidence
+frontiers and retained transcripts before opening private inputs. The host
+rechecks the actual prepared request and keeps all owners through physical
+worker completion. No schedule renews model, mask, tokenizer or verification
+allowances, changes source coordinates, or relaxes the complete result-byte cap.
+Team responses add a `compute` receipt alongside the existing semantic output.
+These flags use the same source encoding policies and do not enable lossy
+hierarchy selection unless the corresponding hierarchy flag is supplied.
 
 Encoder workspace is charged alongside retained source, prompts and grammars.
 All output remains candidate

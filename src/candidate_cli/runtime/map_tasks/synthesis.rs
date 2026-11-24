@@ -38,7 +38,7 @@ fn planning_error(error: crate::tasks::source_planning::quantized::long::Int8Sou
 pub(super) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
     command.summary.synthesis.check_planning(command.host.planning())?;
-    let session = Session::new(&args, limits)?;
+    let (session, prefill) = scheduled_session(&command, &args, limits)?;
     let text = session.read(&command.input, input, args.max_input_bytes)?;
     let option_text = command.options.as_ref()
         .map(|path| session.read(path, input, crate::candidate_cli::source::OPTIONS_BYTES)).transpose()?;
@@ -69,22 +69,51 @@ pub(super) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
     // Preflight, hosted reconstruction and every dynamic evidence program
     // retain the same cumulative encoder. Keep it alive for final reporting.
     let planner = Arc::new(planner);
+    let vocabulary = Arc::new(vocabulary);
+    let width = limits.compute.threads;
+    let kernel = crate::native_engine::simd::config::process_kernel();
     match expected {
         Expected::Single(expected) => {
-            let result = session.engine.synthesize_int8_summary(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
-                config, cancellation).map_err(host_error)?;
+            let result = if width == 1 {
+                compute::Completion::Serial(match prefill {
+                    None => session.engine.synthesize_int8_summary(&model, text, Arc::clone(&planner),
+                        vocabulary, config, cancellation),
+                    Some(prefill) => session.engine.synthesize_int8_summary_layer_major(&model, text,
+                        Arc::clone(&planner), vocabulary, config, prefill, cancellation),
+                }.map_err(host_error)?)
+            } else {
+                compute::Completion::Team(match prefill {
+                    None => session.engine.synthesize_int8_summary_with_threads(&model, text, Arc::clone(&planner),
+                        vocabulary, config, kernel, width, cancellation),
+                    Some(prefill) => session.engine.synthesize_int8_summary_layer_major_with_threads(&model, text,
+                        Arc::clone(&planner), vocabulary, config, kernel, width, prefill, cancellation),
+                }.map_err(host_error)?)
+            };
             expected.verify_completed_with_control(result.result(), &mut session.control())
                 .map_err(|error| error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution))?;
-            deliver_encoded(&session, &facts, &result, encoding::report(&planner)?.as_ref(),
-                command.max_map_result_bytes + 4096, output)
+            deliver_scheduled(&session, &facts, result.result(), encoding::report(&planner)?.as_ref(),
+                result.compute(), command.max_map_result_bytes + 4096, output)
         }
         Expected::Hierarchical(expected) => {
-            let result = session.engine.synthesize_int8_summary_hierarchical(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
-                config, expected.limits(), cancellation).map_err(host_error)?;
+            let result = if width == 1 {
+                compute::Completion::Serial(match prefill {
+                    None => session.engine.synthesize_int8_summary_hierarchical(&model, text, Arc::clone(&planner),
+                        vocabulary, config, expected.limits(), cancellation),
+                    Some(prefill) => session.engine.synthesize_int8_summary_hierarchical_layer_major(&model, text,
+                        Arc::clone(&planner), vocabulary, config, expected.limits(), prefill, cancellation),
+                }.map_err(host_error)?)
+            } else {
+                compute::Completion::Team(match prefill {
+                    None => session.engine.synthesize_int8_summary_hierarchical_with_threads(&model, text,
+                        Arc::clone(&planner), vocabulary, config, expected.limits(), kernel, width, cancellation),
+                    Some(prefill) => session.engine.synthesize_int8_summary_hierarchical_layer_major_with_threads(&model, text,
+                        Arc::clone(&planner), vocabulary, config, expected.limits(), kernel, width, prefill, cancellation),
+                }.map_err(host_error)?)
+            };
             expected.verify_completed_with_control(result.result(), &mut session.control())
                 .map_err(|error| error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution))?;
-            deliver_encoded(&session, &facts, &result, encoding::report(&planner)?.as_ref(),
-                command.max_map_result_bytes + 4096, output)
+            deliver_scheduled(&session, &facts, result.result(), encoding::report(&planner)?.as_ref(),
+                result.compute(), command.max_map_result_bytes + 4096, output)
         }
     }
 }

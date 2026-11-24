@@ -28,9 +28,22 @@ impl PreparedInt8Question<'_> {
     pub fn execute_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
         engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
         -> Result<Int8QuestionRun, Int8SourceMapError> {
+        self.execute_scheduled(admitted, engine, vocabulary, None, control)
+    }
+    /// Bound every passage prompt on the same native engine and optional
+    /// persistent projection team. Source coverage and all work stay unchanged.
+    pub fn execute_layer_major_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary,
+        prefill: Int8PrefillLimits, control: &mut C) -> Result<Int8QuestionRun, Int8SourceMapError> {
+        self.execute_scheduled(admitted, engine, vocabulary, Some(prefill), control)
+    }
+    fn execute_scheduled<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary,
+        prefill: Option<Int8PrefillLimits>, control: &mut C) -> Result<Int8QuestionRun, Int8SourceMapError> {
         checkpoint(control)?;
+        if let Some(prefill) = prefill { check_prefill(prefill)?; }
         self.preflight(admitted, engine)?;
-        let driver = NativeDriver { engine, vocabulary, control, limits: self.mapping, prefill: None };
+        let driver = NativeDriver { engine, vocabulary, control, limits: self.mapping, prefill };
         self.execute_with_driver(admitted, driver)
     }
     // Private corruption-test seam only. Public entrypoints always use the SAME

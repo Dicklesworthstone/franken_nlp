@@ -4,6 +4,7 @@ use crate::tasks::source_planning::quantized::long::question::synthesis::hierarc
     QuestionHierarchyLimits, memory::workspace_bytes};
 
 #[derive(Args)]
+#[group(id = "QuestionHierarchyArgs")]
 pub(in crate::candidate_cli) struct HierarchyArgs {
     /// Reduce collected quotes through bounded context-sized levels before
     /// the final answer. Unselected evidence can be lost; all passes remain visible.

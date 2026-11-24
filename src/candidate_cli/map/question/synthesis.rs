@@ -5,6 +5,7 @@ use crate::tasks::source_planning::SourcePlanningLimits;
 pub(in crate::candidate_cli) mod hierarchy;
 
 #[derive(Args)]
+#[group(id = "QuestionSynthesisArgs")]
 pub(in crate::candidate_cli) struct SynthesisArgs {
     #[command(flatten)]
     pub hierarchy: hierarchy::HierarchyArgs,
@@ -18,7 +19,7 @@ pub(in crate::candidate_cli) struct SynthesisArgs {
     max_synthesis_passages: Option<usize>,
     /// Logical quote bytes for synthesis (default 16384), intersected with the
     /// input-byte ceiling. Actual question/manifest/token/context fit also applies.
-    #[arg(long, requires = "synthesize_answer")]
+    #[arg(long = "max-answer-evidence-bytes", id = "max_answer_evidence_bytes", requires = "synthesize_answer")]
     max_synthesis_evidence_bytes: Option<usize>,
 }
 impl SynthesisArgs {
@@ -44,12 +45,16 @@ impl SynthesisArgs {
     }
     pub(in crate::candidate_cli) fn request(&self, question: SourceQuestion, host: &source::SourceHostArgs)
         -> Result<SourceQuestionSynthesis, CandidateError> {
+        Ok(SourceQuestionSynthesis { question, limits: self.limits(host)? })
+    }
+    pub(in crate::candidate_cli) fn limits(&self, host: &source::SourceHostArgs)
+        -> Result<QuestionSynthesisLimits, CandidateError> {
         self.validate("answer")?;
         if !self.synthesize_answer { return Err(CandidateError::Arguments); }
-        Ok(SourceQuestionSynthesis { question, limits: QuestionSynthesisLimits {
+        Ok(QuestionSynthesisLimits {
             max_evidence_passages: self.max_synthesis_passages.unwrap_or(source::MAX_PASSAGES),
             max_evidence_bytes: self.max_synthesis_evidence_bytes.unwrap_or(16384).min(host.max_input_bytes),
-        } })
+        })
     }
 }
 
@@ -69,12 +74,12 @@ mod tests {
     }
     #[test]
     fn evidence_knobs_require_synthesis_and_are_bounded() {
-        for flag in ["--max-synthesis-passages", "--max-synthesis-evidence-bytes"] {
+        for flag in ["--max-synthesis-passages", "--max-answer-evidence-bytes"] {
             assert!(crate::candidate_cli::definition().try_get_matches_from([
                 "candidate", "map", "--task", "answer", "--model", "local", "--memory-mib", "8192", "--question", "q", flag, "1"]).is_err());
         }
         for (flag, value) in [("--max-synthesis-passages", "0"), ("--max-synthesis-passages", "1025"),
-            ("--max-synthesis-evidence-bytes", "0"), ("--max-synthesis-evidence-bytes", "1048577")] {
+            ("--max-answer-evidence-bytes", "0"), ("--max-answer-evidence-bytes", "1048577")] {
             assert!(command("answer", &["--question", "q", "--synthesize-answer", flag, value]).validate().is_err());
         }
         let mut cmd = command("answer", &["--question", "q"]);
@@ -83,7 +88,7 @@ mod tests {
     #[test]
     fn original_question_options_and_one_whole_work_ceiling_are_preserved() {
         let cmd = command("answer", &["--question", "q", "--synthesize-answer", "--max-synthesis-passages", "4",
-            "--max-synthesis-evidence-bytes", "1024"]);
+            "--max-answer-evidence-bytes", "1024"]);
         let question = "  Who? <tool_call> é\r\n".to_owned();
         let task = cmd.question.task(question.clone(), Some(r#"{"max_answer_scalars":64,"max_citations":2,"max_quote_scalars":32}"#)).unwrap();
         let request = cmd.question.synthesis.request(task, &cmd.host).unwrap();

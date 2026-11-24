@@ -6,6 +6,7 @@ use crate::{tasks::{summarize::SummaryOptions, source_planning::SourcePlanningLi
     validation::grounded_fields::GroundingBudget};
 
 #[derive(Args)]
+#[group(id = "SummarySynthesisArgs")]
 pub(in crate::candidate_cli) struct SynthesisArgs {
     /// Run neural summary synthesis over verified source quotes from ALL chunk
     /// summaries. No generated map bullet is used as a source fact. By default
@@ -23,7 +24,7 @@ pub(in crate::candidate_cli) struct SynthesisArgs {
     max_synthesis_evidence_segments: Option<usize>,
     /// Complete evidence bytes INCLUDING separators, default min(input cap, 65536).
     /// Actual prompt/token/context fit is checked independently before synthesis.
-    #[arg(long, requires = "synthesize_summary")]
+    #[arg(long = "max-summary-evidence-bytes", id = "max_summary_evidence_bytes", requires = "synthesize_summary")]
     max_synthesis_evidence_bytes: Option<usize>,
     /// Independent collection + citation-lift field checks, default 4096.
     #[arg(long, requires = "synthesize_summary")]
@@ -54,7 +55,7 @@ impl SynthesisArgs {
         self.hierarchy.limits(self.synthesize_summary)?;
         self.limits(planning).map(|_| ())
     }
-    fn limits(&self, planning: SourcePlanningLimits) -> Result<SummarySynthesisLimits, CandidateError> {
+    pub(in crate::candidate_cli) fn limits(&self, planning: SourcePlanningLimits) -> Result<SummarySynthesisLimits, CandidateError> {
         let defaults = GroundingBudget::default();
         let limits = SummarySynthesisLimits {
             max_evidence_segments: self.max_synthesis_evidence_segments.unwrap_or(256),

@@ -136,19 +136,35 @@ impl PreparedInt8SummaryHierarchy<'_> {
     pub fn execute_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
         planner: &SourceTaskPlanner, engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
         -> Result<Int8SummaryHierarchyRun, Int8SourceMapError> {
+        self.execute_scheduled(admitted, planner, engine, vocabulary, None, control)
+    }
+    /// Bound prompts at every hierarchy node while retaining one engine and
+    /// the complete original source, evidence lineage and operation budgets.
+    pub fn execute_layer_major_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        planner: &SourceTaskPlanner, engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary,
+        prefill: Int8PrefillLimits, control: &mut C) -> Result<Int8SummaryHierarchyRun, Int8SourceMapError> {
+        self.execute_scheduled(admitted, planner, engine, vocabulary, Some(prefill), control)
+    }
+    fn execute_scheduled<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        planner: &SourceTaskPlanner, engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary,
+        prefill: Option<Int8PrefillLimits>, control: &mut C) -> Result<Int8SummaryHierarchyRun, Int8SourceMapError> {
         checkpoint(control)?;
+        if let Some(prefill) = prefill { check_prefill(prefill)?; }
         let Self { base, expected, mapping } = self;
         base.check_planner(planner)?;
         base.map.preflight(admitted, engine)?;
         let PreparedInt8SummarySynthesis { source, map, operation, identity, budget, planning, request, .. } = base;
-        let discovery = map.execute_with_control(admitted, engine, vocabulary, control)?;
+        let discovery = match prefill {
+            Some(prefill) => map.execute_layer_major_with_control(admitted, engine, vocabulary, prefill, control),
+            None => map.execute_with_control(admitted, engine, vocabulary, control),
+        }?;
         expected.discovery.discovery.verify_completed_with_control(&discovery, control)?;
         let mut remaining = request.limits.verification;
         let collection = evidence::collect(source, discovery.mapped.root().value(), request.map_options,
             request.limits, &mut remaining, control)?;
         let initial = EvidenceSize::of(&collection);
         let mut driver = execution::Native { planner: &operation, identity: &identity, budget, planning,
-            options: request.synthesis_options, mapping, engine, vocabulary };
+            options: request.synthesis_options, mapping, engine, vocabulary, prefill };
         let reduced = execution::reduce(source, collection, request, expected, mapping.reduction.max_result_bytes as u64,
             &mut remaining, &mut driver, control)?;
         finish(discovery, initial, reduced, remaining, expected, control)

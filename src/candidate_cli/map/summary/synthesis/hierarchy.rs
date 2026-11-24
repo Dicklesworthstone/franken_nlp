@@ -3,6 +3,7 @@ use super::*;
 use crate::tasks::source_planning::quantized::long::summary::synthesis::hierarchy::SummaryHierarchyLimits;
 
 #[derive(Args)]
+#[group(id = "SummaryHierarchyArgs")]
 pub(in crate::candidate_cli) struct HierarchyArgs {
     /// Allow bounded context-sized quote-compression levels before the final
     /// summary. Quotes not selected by intermediate summaries may be lost.

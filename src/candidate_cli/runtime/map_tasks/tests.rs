@@ -230,3 +230,28 @@ fn serial_map_encoding_and_scheduling_wrappers_keep_canonical_bytes() {
     let scheduled = compute::Response { response: &encoded, compute: None };
     assert_eq!(canonjson::canonical_bytes(&scheduled).unwrap(), canonjson::canonical_bytes(&response).unwrap());
 }
+
+#[test]
+fn question_and_synthesis_runtime_rechecks_schedule_and_peak_before_any_private_io() {
+    struct NoIo;
+    impl Read for NoIo {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private source/question read") }
+    }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("result written") }
+        fn flush(&mut self) -> io::Result<()> { panic!("result flushed") }
+    }
+    for (task, mode) in crate::candidate_cli::map::tests::question_and_synthesis_modes() {
+        for corrupt in 0..3 {
+            let mut flags = mode.to_vec(); flags.extend(["--compute-threads", "4", "--prefill-rows", "7"]);
+            let mut selected = command(task, &flags); selected.host.memory_mib = 32768;
+            let (mut args, mut limits) = selected.validate().unwrap();
+            match corrupt {
+                0 => limits.compute.workspace_bytes -= 1,
+                1 => limits.memory_bytes = selected.extraction.schedule_peak_bytes(&selected, &args, limits).unwrap() - 1,
+                _ => args.compute = compute::Args::default(),
+            }
+            assert_eq!(execute(selected, args, limits, &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+        }
+    }
+}

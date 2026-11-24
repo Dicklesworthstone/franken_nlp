@@ -220,14 +220,30 @@ impl<'s> PreparedInt8QuestionSynthesis<'s> {
     pub fn execute_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
         planner: &SourceTaskPlanner, engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
         -> Result<Int8QuestionSynthesisRun, Int8SourceMapError> {
+        self.execute_scheduled(admitted, planner, engine, vocabulary, None, control)
+    }
+    /// One bounded prompt schedule spans discovery and the final evidence pass;
+    /// the retained tokenizer operation and whole-document allowances never renew.
+    pub fn execute_layer_major_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        planner: &SourceTaskPlanner, engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary,
+        prefill: Int8PrefillLimits, control: &mut C) -> Result<Int8QuestionSynthesisRun, Int8SourceMapError> {
+        self.execute_scheduled(admitted, planner, engine, vocabulary, Some(prefill), control)
+    }
+    fn execute_scheduled<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        planner: &SourceTaskPlanner, engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary,
+        prefill: Option<Int8PrefillLimits>, control: &mut C) -> Result<Int8QuestionSynthesisRun, Int8SourceMapError> {
         checkpoint(control)?;
+        if let Some(prefill) = prefill { check_prefill(prefill)?; }
         self.check_planner(planner)?;
         self.map.preflight(admitted, engine)?;
         let mapping = self.mapping;
         let (map, continuation) = self.into_phases();
-        let discovery = map.execute_with_control(admitted, engine, vocabulary, control)?;
+        let discovery = match prefill {
+            Some(prefill) => map.execute_layer_major_with_control(admitted, engine, vocabulary, prefill, control),
+            None => map.execute_with_control(admitted, engine, vocabulary, control),
+        }?;
         continuation.execute(discovery, control, |plan, control| {
-            synthesis_pass(plan, engine, vocabulary, mapping, control)
+            synthesis_pass(plan, engine, vocabulary, mapping, prefill, control)
         })
     }
 }
@@ -264,12 +280,12 @@ impl Continuation<'_> {
     }
 }
 fn synthesis_pass<C: DecodeStepControl>(plan: &PreparedInt8SourceTask, engine: &mut StrictInt8Engine<'_>,
-    vocabulary: &ExtractionVocabulary, mapping: Int8SourceMapLimits, control: &mut C)
-    -> Result<Int8SourceTaskRun, Int8SourceMapError> {
+    vocabulary: &ExtractionVocabulary, mapping: Int8SourceMapLimits,
+    prefill: Option<Int8PrefillLimits>, control: &mut C) -> Result<Int8SourceTaskRun, Int8SourceMapError> {
     // Admit the actual evidence identity and full resident KV before the
     // final forward; a completed discovery cannot waive either requirement.
     preflight_plans(std::slice::from_ref(plan), std::slice::from_ref(plan.execution_identity()), engine)?;
-    let mut driver = NativeDriver { engine, vocabulary, control, limits: mapping, prefill: None };
+    let mut driver = NativeDriver { engine, vocabulary, control, limits: mapping, prefill };
     Ok(driver.run(plan, plan.execution_identity())?)
 }
 

@@ -22,7 +22,7 @@ fnlp candidate map report.txt \
   --task summarize --synthesize-summary --hierarchical-summary \
   --options summary-options.json --synthesis-bullets 4 \
   --summary-max-levels 8 --summary-max-passes 16 \
-  --max-synthesis-evidence-bytes 131072 \
+  --max-summary-evidence-bytes 131072 \
   --model /path/to/local.fnlpq \
   --memory-mib 16384 --preparation-mib 1024 \
   --context-tokens 8192 --max-new-tokens 512 \
@@ -40,6 +40,33 @@ These are admission ceilings, not benchmarks or a guarantee this configuration
 fits a particular input. All five model-work axes, masks, memory, tokenization,
 verification and result-size ceilings still apply. `--synthesis-bullets` applies
 to every intermediate and final synthesis call; other options are inherited.
+
+## Bounded prompts and persistent workers
+
+This complete hierarchy accepts `--prefill-rows N` (1 through 64) and
+`--compute-threads N` (2 through 64), separately or together. For example, add
+`--compute-threads 4 --prefill-rows 7` after admitting their additional memory.
+The default width is one. Byte fallback and explicit
+`--input-encoding safe-bpe-v1` both retain their existing operation budgets.
+One persistent team spans discovery, every quote-selection level and the final
+pass; prompt rows use the same fixed worker capacity throughout the invocation.
+
+Before private input/model IO, the CLI quotes coordinator prompt scratch and
+workers alongside all retained discovery and hierarchy transcripts, evidence
+frontiers and final result storage. The host repeats admission with the actual
+prepared document. Complete source and native reservations outlive the physical
+worker join; returned output remains charged through serialization and delivery.
+The schedule preserves source coordinates, level ordering, private result
+bindings and all original model/mask/tokenizer/verification ceilings. It does
+not grant another hierarchy pass or increase the complete result-byte cap.
+Team responses add a `compute` receipt beside the existing semantic envelope.
+
+Library variants append `_layer_major`, `_with_threads`, or
+`_layer_major_with_threads` to `synthesize_int8_summary_hierarchical`. Existing
+hierarchy limits precede the optional kernel/width and prefill arguments;
+cancellation is last. The prepared native task also supports
+`execute_layer_major_with_control`. These interfaces await the same compiled,
+real-model and performance gates as the underlying hierarchy.
 
 ## Reduction policy
 

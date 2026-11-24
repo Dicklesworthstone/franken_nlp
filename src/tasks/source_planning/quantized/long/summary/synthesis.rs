@@ -265,17 +265,33 @@ impl<'s> PreparedInt8SummarySynthesis<'s> {
     pub fn execute_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
         planner: &SourceTaskPlanner, engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
         -> Result<Int8SummarySynthesisRun, Int8SourceMapError> {
+        self.execute_scheduled(admitted, planner, engine, vocabulary, None, control)
+    }
+    /// Share one prompt workspace across map discovery and final synthesis.
+    /// Dynamic evidence retains its exact identity and original work allowance.
+    pub fn execute_layer_major_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        planner: &SourceTaskPlanner, engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary,
+        prefill: Int8PrefillLimits, control: &mut C) -> Result<Int8SummarySynthesisRun, Int8SourceMapError> {
+        self.execute_scheduled(admitted, planner, engine, vocabulary, Some(prefill), control)
+    }
+    fn execute_scheduled<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        planner: &SourceTaskPlanner, engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary,
+        prefill: Option<Int8PrefillLimits>, control: &mut C) -> Result<Int8SummarySynthesisRun, Int8SourceMapError> {
         checkpoint(control)?;
+        if let Some(prefill) = prefill { check_prefill(prefill)?; }
         self.check_planner(planner)?;
         self.map.preflight(admitted, engine)?;
         let (map, tail) = self.into_parts();
-        let discovery = map.execute_with_control(admitted, engine, vocabulary, control)?;
+        let discovery = match prefill {
+            Some(prefill) => map.execute_layer_major_with_control(admitted, engine, vocabulary, prefill, control),
+            None => map.execute_with_control(admitted, engine, vocabulary, control),
+        }?;
         let mapping = tail.mapping;
         tail.execute(discovery, |plan, control| {
             // Dynamic source/prompt/schema identity is admitted against the
             // same model and full resident KV before any synthesis forward.
             preflight_plans(std::slice::from_ref(plan), std::slice::from_ref(plan.execution_identity()), engine)?;
-            let mut driver = NativeDriver { engine, vocabulary, control, limits: mapping, prefill: None };
+            let mut driver = NativeDriver { engine, vocabulary, control, limits: mapping, prefill };
             driver.run(plan, plan.execution_identity()).map_err(Into::into)
         }, control)
     }

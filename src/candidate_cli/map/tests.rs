@@ -276,11 +276,12 @@ fn unsupported_or_unfunded_source_schedules_refuse_before_private_io() {
             assert_eq!(command(task, &flags).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
         }
     }
-    for flags in [vec!["--compute-threads", "2"], vec!["--prefill-rows", "3"]] {
-        let mut synthesis = flags.clone(); synthesis.push("--synthesize-summary");
-        assert_eq!(command("summarize", &synthesis).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
-        let mut question = flags; question.extend(["--question", "never-open.txt"]);
-        assert_eq!(command("answer", &question).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+    for (task, mode) in question_and_synthesis_modes() {
+        for schedule in [vec!["--compute-threads", "0"], vec!["--prefill-rows", "65"],
+            vec!["--compute-threads", "4", "--prefill-rows", "7", "--max-weight-mib", "8192"]] {
+            let mut flags = mode.to_vec(); flags.extend(schedule);
+            assert_eq!(command(task, &flags).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+        }
     }
 }
 
@@ -298,5 +299,126 @@ fn disabled_source_team_runtime_never_reads_or_publishes() {
         let mut cmd = command(task, &["--compute-threads", "4", "--prefill-rows", "7"]);
         cmd.host.memory_mib = 16384;
         assert_eq!(cmd.execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Unavailable));
+    }
+}
+
+pub(in crate::candidate_cli) fn question_and_synthesis_modes()
+    -> [(&'static str, &'static [&'static str]); 5] {
+    [
+        ("answer", &["--question", "never-open.txt"]),
+        ("answer", &["--question", "never-open.txt", "--synthesize-answer"]),
+        ("answer", &["--question", "never-open.txt", "--synthesize-answer", "--hierarchical-answer"]),
+        ("summarize", &["--synthesize-summary"]),
+        ("summarize", &["--synthesize-summary", "--hierarchical-summary"]),
+    ]
+}
+
+#[test]
+fn synthesis_modes_register_distinct_groups_and_evidence_controls() {
+    super::definition().debug_assert();
+    for (task, mode, flag) in [
+        ("summarize", vec!["--synthesize-summary"], "--max-summary-evidence-bytes"),
+        ("answer", vec!["--question", "q", "--synthesize-answer"], "--max-answer-evidence-bytes"),
+    ] {
+        let mut selected = mode.clone(); selected.extend([flag, "1024"]);
+        command(task, &selected).validate().unwrap();
+        let mut wrong = vec!["candidate", "map", "--task", task, "--model", "m", "--memory-mib", "8192"];
+        wrong.extend(mode);
+        let other = if task == "answer" { "--max-summary-evidence-bytes" } else { "--max-answer-evidence-bytes" };
+        wrong.extend([other, "1024"]);
+        assert!(crate::candidate_cli::definition().try_get_matches_from(wrong).is_err());
+    }
+}
+
+#[test]
+fn document_questions_and_every_synthesis_mode_compose_schedules_without_renewing_authority() {
+    for (task, mode) in question_and_synthesis_modes() {
+        let baseline = command(task, mode);
+        let (_, original) = baseline.validate().unwrap();
+        for compact in [false, true] {
+            for (width, rows) in [("1", Some("3")), ("2", None), ("4", Some("7"))] {
+                let mut flags = mode.to_vec(); flags.extend(["--compute-threads", width]);
+                if let Some(rows) = rows { flags.extend(["--prefill-rows", rows]); }
+                if compact { flags.extend(["--input-encoding", "safe-bpe-v1"]); }
+                let mut selected = command(task, &flags); selected.host.memory_mib = 32768;
+                let (args, admitted) = selected.validate().unwrap();
+                let prefill = selected.extraction.prefill().unwrap();
+                assert_eq!(admitted.compute, args.compute.admit_prefill(prefill).unwrap());
+                assert_eq!(selected.host.task_budget(admitted), baseline.host.task_budget(original));
+                assert_eq!(selected.work_ceiling(), baseline.work_ceiling());
+                assert_eq!(selected.max_total_mask_node_visits, baseline.max_total_mask_node_visits);
+                assert_eq!(selected.max_chunks, baseline.max_chunks);
+                assert_eq!(selected.max_map_result_bytes, baseline.max_map_result_bytes);
+                assert_eq!(selected.question.synthesis.hierarchy.limits(selected.question.synthesis.synthesize_answer).unwrap(),
+                    baseline.question.synthesis.hierarchy.limits(baseline.question.synthesis.synthesize_answer).unwrap());
+                assert_eq!(selected.summary.synthesis.hierarchy.limits(selected.summary.synthesis.synthesize_summary).unwrap(),
+                    baseline.summary.synthesis.hierarchy.limits(baseline.summary.synthesis.synthesize_summary).unwrap());
+            }
+        }
+    }
+}
+
+#[test]
+fn every_synthesized_schedule_prices_complete_results_beside_native_workers_and_prompt_storage() {
+    for (task, mode) in question_and_synthesis_modes() {
+        let mut flags = mode.to_vec();
+        flags.extend(["--compute-threads", "4", "--prefill-rows", "7", "--input-encoding", "safe-bpe-v1"]);
+        let mut selected = command(task, &flags); selected.host.memory_mib = 32768;
+        let (args, mut limits) = selected.validate().unwrap();
+        let peak = selected.extraction.schedule_peak_bytes(&selected, &args, limits).unwrap();
+        limits.memory_bytes = peak;
+        selected.extraction.check_schedule_memory(&selected, &args, limits).unwrap();
+        limits.memory_bytes -= 1;
+        assert_eq!(selected.extraction.check_schedule_memory(&selected, &args, limits), Err(CandidateError::Arguments));
+        let mut coordinator = limits; coordinator.compute.workspace_bytes = 0;
+        assert_eq!(peak - selected.extraction.schedule_peak_bytes(&selected, &args, coordinator).unwrap(),
+            limits.compute.workspace_bytes);
+        let original_work = selected.work_ceiling();
+        selected.max_chunks += 1;
+        assert!(selected.extraction.schedule_peak_bytes(&selected, &args, limits).unwrap() > peak);
+        assert_eq!(selected.work_ceiling(), original_work);
+        selected.reduction_reserve_mib = u64::MAX;
+        assert_eq!(selected.extraction.schedule_peak_bytes(&selected, &args, limits), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
+fn hierarchy_memory_grows_with_permitted_passes_and_collected_evidence() {
+    for (task, mode, pass_flag, evidence_flag) in [
+        ("answer", vec!["--question", "q", "--synthesize-answer", "--hierarchical-answer"],
+            "--answer-max-passes", "--max-answer-evidence-bytes"),
+        ("summarize", vec!["--synthesize-summary", "--hierarchical-summary"],
+            "--summary-max-passes", "--max-summary-evidence-bytes"),
+    ] {
+        let quote = |passes, evidence| {
+            let mut flags = mode.clone();
+            flags.extend(["--compute-threads", "2", "--prefill-rows", "3", pass_flag, passes, evidence_flag, evidence]);
+            let mut selected = command(task, &flags); selected.host.memory_mib = 32768;
+            let (args, limits) = selected.validate().unwrap();
+            (selected.extraction.schedule_peak_bytes(&selected, &args, limits).unwrap(), selected.work_ceiling())
+        };
+        let (small, work) = quote("16", "1024");
+        let (more_passes, pass_work) = quote("32", "1024");
+        let (more_evidence, evidence_work) = quote("16", "8192");
+        assert!(more_passes > small); assert!(more_evidence > small);
+        assert_eq!(pass_work, work); assert_eq!(evidence_work, work);
+    }
+}
+
+#[cfg(not(feature = "asupersync-runtime"))]
+#[test]
+fn disabled_question_and_synthesis_schedules_never_open_private_inputs() {
+    struct NoIo;
+    impl Read for NoIo {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private source/question read") }
+    }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("result written") }
+        fn flush(&mut self) -> io::Result<()> { panic!("result flushed") }
+    }
+    for (task, mode) in question_and_synthesis_modes() {
+        let mut flags = mode.to_vec(); flags.extend(["--compute-threads", "4", "--prefill-rows", "7"]);
+        let mut selected = command(task, &flags); selected.host.memory_mib = 32768;
+        assert_eq!(selected.execute(&mut NoIo, &mut NoIo), Err(CandidateError::Unavailable));
     }
 }
