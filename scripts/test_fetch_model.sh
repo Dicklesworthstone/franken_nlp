@@ -263,6 +263,21 @@ disk_journal alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA"
 disk_check test "$(remaining_download_bytes)" -eq "$CATALOG_TOTAL"
 disk_pass oversized-prefix-earns-no-storage-credit
 
+disk_setup changed-catalog
+cp "$DISK_FIXTURE/beta.bin" "$DEST/beta.bin"
+# A publisher can atomically update the catalog while a multi-GB transfer
+# holds this invocation's lock. Credit and admission still use both initially
+# validated rows, with beta verified and alpha outstanding.
+printf 'new.bin|1|%s\n' "$DISK_ALPHA_SHA" > "$CATALOG.next"
+mv "$CATALOG.next" "$CATALOG"
+DISK_FREE=$((DISK_ALPHA + MARGIN_BYTES))
+verify_existing_closure
+disk_check test "$(remaining_download_bytes)" -eq "$DISK_ALPHA"
+download_one alpha.bin "$DISK_ALPHA" "$DISK_ALPHA_SHA"
+disk_check test "$(remaining_download_bytes)" -eq 0
+disk_check cmp "$DISK_FIXTURE/alpha.bin" "$DEST/alpha.bin"
+disk_pass changed-catalog-cannot-redirect-inflight-admission
+
 for invalid in 01 08 -1 9223372036854775808 999999999999999999999999999; do
     if valid_byte_count "$invalid"; then exit 1; fi
 done

@@ -198,6 +198,9 @@ ensure_destination() {
 }
 
 catalog_stats() {
+    # Pin the input once. Cache admission, journals, transfer and check-only
+    # must use the same rows even if the catalog is updated during a download.
+    CATALOG_ROWS=$(catalog_lines) || fail 2 "cannot read source catalog=$CATALOG"
     CATALOG_TOTAL=0
     CATALOG_LARGEST=0
     CATALOG_COUNT=0
@@ -217,7 +220,7 @@ catalog_stats() {
         [ "$length" -le "$CATALOG_LARGEST" ] || CATALOG_LARGEST=$length
         CATALOG_COUNT=$((CATALOG_COUNT + 1))
     done <<EOF
-$(catalog_lines)
+$CATALOG_ROWS
 EOF
     [ "$CATALOG_COUNT" -gt 0 ] || fail 2 "catalog has no entries"
     if [ -z "$CATALOG" ]; then
@@ -240,7 +243,7 @@ verify_existing_closure() {
             VERIFIED_NAMES="$VERIFIED_NAMES$inventory_name "
         fi
     done <<EOF
-$(catalog_lines)
+$CATALOG_ROWS
 EOF
 }
 
@@ -267,7 +270,7 @@ remaining_download_bytes() {
         [ "$remaining" -le "$((MAX_BYTES - MARGIN_BYTES - additional))" ] || return 1
         remaining=$((remaining + additional))
     done <<EOF
-$(catalog_lines)
+$CATALOG_ROWS
 EOF
     printf '%s\n' "$remaining"
 }
@@ -627,9 +630,9 @@ trap 'request_interrupt 129 HUP' HUP
 trap 'request_interrupt 130 INT' INT
 trap 'request_interrupt 143 TERM' TERM
 trap cleanup_fetch 0
-ensure_destination
 catalog_stats
 check_interrupted
+ensure_destination
 acquire_lock
 check_interrupted
 if [ "$CHECK_ONLY" -eq 0 ]; then verify_existing_closure; fi
@@ -647,7 +650,7 @@ while IFS='|' read -r file length digest; do
         download_one "$file" "$length" "$digest"
     fi
 done <<EOF
-$(catalog_lines)
+$CATALOG_ROWS
 EOF
 
 check_interrupted
