@@ -113,18 +113,6 @@ fn check_population_memory(args: &ScoreJobArgs, host: JobHostLimits, job: JobLim
     Ok(())
 }
 
-fn publish_report<T: Serialize>(response: &T, output: &mut impl Write,
-    remaining: &impl Fn() -> Result<Duration, CandidateError>, cancellation: &CancellationToken)
-    -> Result<(), Failure> {
-    publish_checked(response, command::REPORT_BYTES, output, &|| {
-        if cancellation.cause().is_some() { return Err(CandidateError::Execution); }
-        remaining().map(|_| ())
-    }).map_err(|error| match (error, cancellation.cause()) {
-        (CandidateError::Execution, Some(cause)) => job_failure(JobError::Cancelled(cause)),
-        (error, _) => Failure::from(error),
-    })
-}
-
 /// Selected physical schedule, reported only after hosted worker drain.
 /// Omitted default fields preserve the existing serial metadata bytes.
 #[derive(Serialize)]

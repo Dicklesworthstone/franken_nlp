@@ -91,18 +91,6 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     publish_report(&response, output, &|| session.remaining(), &cancellation)
 }
 
-fn publish_report<T: Serialize>(response: &T, output: &mut impl Write,
-    remaining: &impl Fn() -> Result<Duration, CandidateError>, cancellation: &CancellationToken)
-    -> Result<(), Failure> {
-    publish_checked(response, command::REPORT_BYTES, output, &|| {
-        if cancellation.cause().is_some() { return Err(CandidateError::Execution); }
-        remaining().map(|_| ())
-    }).map_err(|error| match (error, cancellation.cause()) {
-        (CandidateError::Execution, Some(cause)) => job_failure(JobError::Cancelled(cause)),
-        (error, _) => Failure::from(error),
-    })
-}
-
 #[derive(Serialize)]
 struct PrefillSchedule { execution: &'static str, max_batch_rows: usize, admitted_workspace_bytes: u64 }
 impl PrefillSchedule {

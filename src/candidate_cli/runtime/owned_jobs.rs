@@ -184,14 +184,15 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     // repair and native forwards. Committed results are skipped by JobRunner.
     let progress = match prepared {
         PreparedJob::Source { planner, config } => session.engine.job_int8_source(&model, planner,
-            vocabulary, config, request, host, reader, cancellation),
+            vocabulary, config, request, host, reader, cancellation.clone()),
         PreparedJob::Extract(planner) => session.engine.job_int8_extract(&model, planner,
-            vocabulary, request, host, reader, cancellation),
+            vocabulary, request, host, reader, cancellation.clone()),
         PreparedJob::Document { planner, reduction_reserve_bytes } => session.engine.job_int8_extract_document(&model,
-            planner, vocabulary, request, host, reduction_reserve_bytes, reader, cancellation),
+            planner, vocabulary, request, host, reduction_reserve_bytes, reader, cancellation.clone()),
         PreparedJob::SourceDocument { planner, reduction_reserve_bytes } => session.engine.job_int8_source_document(&model,
-            planner, vocabulary, request, host, reduction_reserve_bytes, reader, cancellation),
+            planner, vocabulary, request, host, reduction_reserve_bytes, reader, cancellation.clone()),
     }.map_err(host_failure)?;
+    if let Some(cause) = cancellation.cause() { return Err(job_failure(JobError::Cancelled(cause))); }
     session.remaining()?;
     let report = progress_report(progress, job_id, lifetime, materialize, mode, &args.task)?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
@@ -203,8 +204,21 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     let response = EncodingReport { response: &response,
         input_encoding: input_encoding::reported_policy(&encoding),
         invocation_encoding_work_limits: encoding_work_limits };
-    publish_checked(&response, command::REPORT_BYTES, output,
-        &|| session.remaining().map(|_| ())).map_err(Failure::from)
+    publish_report(&response, output, &|| session.remaining(), &cancellation)
+}
+
+// A durable commit can precede a cancelled acknowledgement. Preserve the
+// original stop cause through serialization, writes and the final flush.
+fn publish_report<T: Serialize>(response: &T, output: &mut impl Write,
+    remaining: &impl Fn() -> Result<Duration, CandidateError>, cancellation: &CancellationToken)
+    -> Result<(), Failure> {
+    publish_checked(response, command::REPORT_BYTES, output, &|| {
+        if cancellation.cause().is_some() { return Err(CandidateError::Execution); }
+        remaining().map(|_| ())
+    }).map_err(|error| match (error, cancellation.cause()) {
+        (CandidateError::Execution, Some(cause)) => job_failure(JobError::Cancelled(cause)),
+        (error, _) => Failure::from(error),
+    })
 }
 
 #[derive(Serialize)]
