@@ -125,3 +125,159 @@ fn owned_source_graph_inputs_and_guarded_results_cross_the_runtime_boundary() {
     fn send<T: Send + 'static>() {}
     send::<ResolveInput>(); send::<Int8ResolutionRun>(); send::<HostedOutput<Int8ResolutionRun>>();
 }
+
+
+fn team_prefill(rows: usize) -> Int8PrefillLimits {
+    Int8PrefillLimits { max_batch_rows: rows,
+        max_extra_scratch_bytes: Int8PrefillLimits::required_extra_scratch_bytes(rows).unwrap() }
+}
+
+#[test]
+fn pair_prompt_and_worker_capacity_preserve_the_complete_native_geometry() {
+    let c = config(); let required = requirements(c.native).unwrap();
+    let base = required.rope_bytes + required.scratch_payload_bound + c.native.allocator_reserve_bytes;
+    for width in [2, 4, 64] { for prefill in [None, Some(team_prefill(1)), Some(team_prefill(3))] {
+        let (scratch, rows) = team_scratch(c.native, required, width, prefill).unwrap();
+        assert_eq!(rows, prefill.map_or(1, |p| p.max_batch_rows));
+        assert_eq!(scratch, base + prefill.map_or(0, |p| p.validate().unwrap()));
+        let children = dispatch::int8_prefill_team_workspace_bytes(width, rows).unwrap();
+        assert!(children >= dispatch::int8_team_workspace_bytes(width).unwrap());
+        assert_eq!(required, requirements(c.native).unwrap());
+    } }
+}
+
+#[test]
+fn invalid_resolution_team_width_or_prompt_capacity_refuses_before_native_work() {
+    let c = config(); let required = requirements(c.native).unwrap();
+    for width in [0, 1, 65, usize::MAX] {
+        assert!(team_scratch(c.native, required, width, None).is_err());
+    }
+    for prefill in [
+        Int8PrefillLimits { max_batch_rows: 0, max_extra_scratch_bytes: u64::MAX },
+        Int8PrefillLimits { max_batch_rows: 65, max_extra_scratch_bytes: u64::MAX },
+        Int8PrefillLimits { max_extra_scratch_bytes: team_prefill(3).max_extra_scratch_bytes - 1, ..team_prefill(3) },
+    ] {
+        assert!(team_scratch(c.native, required, 2, Some(prefill)).is_err());
+    }
+    let mut native = c.native;
+    native.allocator_reserve_bytes = u64::MAX;
+    assert!(team_scratch(native, required, 2, Some(team_prefill(3))).is_err());
+}
+
+#[test]
+fn empty_pair_native_claims_own_no_kv_and_all_team_owners_are_send() {
+    let empty = TeamNativeClaims::default();
+    assert!(empty.kv.is_none() && empty.scratch.is_none() && empty._kv.is_none() && empty._scratch.is_none());
+    fn send<T: Send + 'static>() {}
+    send::<TeamAdmission<ResolveInput>>();
+    send::<HostedInt8TeamResult<Int8ResolutionRun>>();
+    let _sequential = NlpEngine::resolve_int8_with_threads;
+    let _prefill = NlpEngine::resolve_int8_layer_major_with_threads;
+}
+
+#[test]
+#[ignore = "controller-only independently pinned INT8 artifact and fresh resource-host process; no parity claim until executed"]
+fn complete_resolution_matches_serial_across_persistent_team_and_prompt_schedules() {
+    use crate::{LeakResponsePolicy, ResourceHostConfig, RuntimePreset, canonjson,
+        native_engine::simd::config::process_kernel, tokenizer::pinned_controls};
+    fn documents(paired: bool) -> Vec<ResolutionDocument> {
+        let mut documents = docs();
+        let mut other = docs().pop().unwrap();
+        other.id = "b".to_owned();
+        if !paired {
+            other.text = "Jones".to_owned(); other.mentions[0].surface = "Jones".to_owned();
+        }
+        documents.push(other); documents
+    }
+    fn bound_config(model: &ResidentInt8, planner: &ResolutionPlanner) -> ResolveConfig {
+        let mut c = config(); let facts = model.artifact_identity();
+        c.identity.source_revision = facts.revision.clone();
+        c.identity.logical_model_digest = Sha256Digest::from_hex(&facts.logical_model_sha256).unwrap();
+        c.identity.artifact_format = "fnlpq-current-candidate-v1".to_owned();
+        c.identity.quant_recipe = facts.recipe_id.clone();
+        c.identity.packing_set_digest = Sha256Digest::of_bytes(
+            &crate::canonjson::canonical_bytes(&("current-candidate-portable-int8-v1", Vec::<String>::new())).unwrap());
+        c.identity.template_digest = planner.template_digest();
+        c.identity.tokenizer_digest = planner.tokenizer_digest();
+        c.scoring.max_model_work = Int8Work::for_sequence(0, 16_384, 100_000_000).unwrap();
+        c.preparation_reserve_bytes = 512 << 20;
+        c.graph_reserve_bytes = 256 << 20;
+        c.native.allocator_reserve_bytes = 64 << 20;
+        c.native.run.max_elapsed = Duration::from_secs(3600);
+        c.native.run.max_checkpoints = 1_000_000_000;
+        c
+    }
+    fn drained(host: &NlpEngine, baseline: u64) {
+        let memory = host.resources().memory_snapshot();
+        assert_eq!(memory.committed_bytes, baseline); assert_eq!(memory.reserved_bytes, 0);
+        assert_eq!(memory.recorded_leaks, 0);
+        assert_eq!(host.resources().outstanding_closure_snapshot().active_closures, 0);
+    }
+    let path = PathBuf::from(std::env::var_os("FNLP_INT8_RESOLVE_TEAM_MODEL").expect("admitted INT8 artifact required"));
+    let logical = std::env::var("FNLP_INT8_RESOLVE_TEAM_LOGICAL_SHA256").expect("independent logical model pin required");
+    let source_root = std::env::var("FNLP_INT8_RESOLVE_TEAM_SOURCE_ROOT_SHA256").expect("independent source root pin required");
+    Sha256Digest::from_hex(&logical).unwrap(); Sha256Digest::from_hex(&source_root).unwrap();
+    let host = NlpEngine::builder().resource_config(ResourceHostConfig {
+        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
+        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 3,
+        helper_threads: 0, thread_ceiling: 5, memory_ceiling_bytes: 16_u64 << 30,
+        leak_response_policy: LeakResponsePolicy::PanicInLabOrCi,
+    }).build().unwrap();
+    let lease = host.resources().acquire_lease();
+    let caller = Pending::reserve(&lease, MemoryClass::JobBuffers, 512 << 20).unwrap().commit().unwrap();
+    let model = host.load_current_candidate_int8(path, LoadLimits {
+        artifact: ArtifactLoadBudget::streaming_only(6_u64 << 30, 64 << 10),
+        tokenizer_and_metadata_bytes: 128 << 20, allocator_reserve_bytes: 64 << 20,
+        run: RunLimits { max_elapsed: Duration::from_secs(3600), max_checkpoints: 1_000_000_000,
+            cleanup_reserve_bytes: 65_536 },
+    }, CancellationToken::default()).unwrap();
+    assert_eq!(model.artifact_identity().logical_model_sha256, logical);
+    assert_eq!(model.artifact_identity().source_root_sha256, source_root);
+    assert_eq!(model.artifact_identity().revision, "f56ec5a9650268aa098496734743c25ea778bd2d");
+    let registry = pinned_controls::pinned().unwrap(); let controls = registry.template_controls();
+    let eos = controls.entries().iter().find(|entry| entry.special && entry.surface == crate::template::IM_END).unwrap().id;
+    let planner = Arc::new(ResolutionPlanner::pinned(controls, eos).unwrap());
+    let baseline = host.resources().memory_snapshot().committed_bytes;
+    for paired in [false, true] {
+        let serial = host.resolve_int8(&model, documents(paired), Arc::clone(&planner),
+            bound_config(&model, &planner), CancellationToken::default()).unwrap();
+        assert_eq!(serial.result().model_evaluated, paired);
+        let expected = canonjson::canonical_bytes(serial.result()).unwrap();
+        let work = serial.result().model_work;
+        drop(serial); drained(&host, baseline);
+        for width in [2, 4] { for schedule in [None, Some(team_prefill(1)), Some(team_prefill(3))] {
+            let config = bound_config(&model, &planner);
+            let result = match schedule {
+                None => host.resolve_int8_with_threads(&model, documents(paired), Arc::clone(&planner),
+                    config, process_kernel(), width, CancellationToken::default()),
+                Some(prefill) => host.resolve_int8_layer_major_with_threads(&model, documents(paired),
+                    Arc::clone(&planner), config, process_kernel(), width, prefill, CancellationToken::default()),
+            }.unwrap();
+            assert_eq!(canonjson::canonical_bytes(result.result()).unwrap(), expected);
+            assert_eq!(result.result().model_work, work);
+            assert_eq!(result.result().planned_model_work, work);
+            assert_eq!(result.compute().compute_threads, width);
+            assert_eq!(result.compute().completed_rows, work.projections.dot_products);
+            assert_eq!(result.compute().completed_projections > 0, paired);
+            assert_eq!(result.compute().completed_worker_rows > 0, paired);
+            assert_eq!(Arc::strong_count(&planner), 1);
+            drop(result); drained(&host, baseline);
+        } }
+    }
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let cancelled = CancellationToken::default(); cancelled.cancel(cause);
+        let error = host.resolve_int8_layer_major_with_threads(&model, documents(false), Arc::clone(&planner),
+            bound_config(&model, &planner), process_kernel(), 4, team_prefill(3), cancelled)
+            .err().expect("no-pair snapshot must still observe original cancellation");
+        assert!(matches!(error, HostedError::Stopped { stop: RunStop { kind, .. }, .. } if kind == cause));
+        drained(&host, baseline);
+    }
+    let mut foreign = bound_config(&model, &planner);
+    foreign.identity.logical_model_digest = Sha256Digest::of_bytes(b"foreign model");
+    assert!(matches!(host.resolve_int8_with_threads(&model, documents(false), Arc::clone(&planner),
+        foreign, process_kernel(), 2, CancellationToken::default()), Err(HostedError::ModelIdentity)));
+    drained(&host, baseline);
+    drop(planner); drop(model); drop(caller); drop(lease); drained(&host, 0);
+}
