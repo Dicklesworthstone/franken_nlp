@@ -89,7 +89,7 @@ impl Driver for Native<'_, '_> {
         -> Result<(Int8SourceTaskRun, Int8Work), Int8SourceMapError> {
         let plan = self.plan(passages, control)?;
         if Witness::of(&plan)? != *witness { return Err(Int8SourceMapError::Admission); }
-        let mut driver = NativeDriver { engine: self.engine, vocabulary: self.vocabulary, control, limits: self.mapping };
+        let mut driver = NativeDriver { engine: self.engine, vocabulary: self.vocabulary, control, limits: self.mapping, prefill: None };
         let run = driver.run(&plan, plan.execution_identity())?;
         check_run(&plan, &run, self.mapping.mask_visits_per_chunk)?;
         extract_int8::check_size(&run, plan.max_result_bytes()).map_err(Int8SourceError::from)?;

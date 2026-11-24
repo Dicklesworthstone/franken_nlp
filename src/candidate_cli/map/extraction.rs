@@ -46,10 +46,11 @@ pub(in crate::candidate_cli) struct ExtractionArgs {
     /// Nonrenewable independent source verification work (default 67108864).
     #[arg(long, requires = "schema")]
     max_extraction_scan_steps: Option<u64>,
-    /// With --task extract: bounded layer-major prompt morsels across every
-    /// chunk, 1..=64 rows. Composes with the same persistent compute team.
+    /// Bounded layer-major prompt morsels for extraction, NER, keyphrases or
+    /// cited-summary maps and their exact reducers, 1..=64 rows. Composes with
+    /// the same persistent team. QA and neural synthesis are not supported.
     /// Extra coordinator and worker storage is admitted before private IO.
-    #[arg(long, value_name = "ROWS", requires = "schema")]
+    #[arg(long, value_name = "ROWS")]
     prefill_rows: Option<usize>,
 }
 impl ExtractionArgs {
@@ -57,7 +58,7 @@ impl ExtractionArgs {
         if task != "extract" {
             if self.schema.is_some() || self.source_membership || self.max_extraction_fields.is_some()
                 || self.max_extraction_evidence_spans.is_some() || self.max_extraction_scan_steps.is_some()
-                || self.prefill_rows.is_some() || self.reconcile_object || self.has_object_bounds() {
+                || self.reconcile_object || self.has_object_bounds() {
                 return Err(CandidateError::Arguments);
             }
             return Ok(());
@@ -139,7 +140,7 @@ impl ExtractionArgs {
         }
         Ok(())
     }
-    fn schedule_peak_bytes(&self, command: &MapCommand, args: &CandidateArgs, limits: Limits)
+    pub(super) fn schedule_peak_bytes(&self, command: &MapCommand, args: &CandidateArgs, limits: Limits)
         -> Result<u64, CandidateError> {
         let native = Int8MemoryRequirement::for_context(args.context_tokens).map_err(|_| CandidateError::Arguments)?;
         let tokens = (command.max_chunks as u64).checked_mul(args.max_new_tokens as u64)

@@ -3,8 +3,10 @@ use super::*;
 mod summary;
 mod question;
 mod keyphrase_reduction;
+mod team;
 use crate::{
-    native_engine::{constrained_int8, lmhead::NANBEIGE_VOCAB_SIZE},
+    native_engine::{constrained_int8, lmhead::NANBEIGE_VOCAB_SIZE,
+        simd::Int8Kernel, strict_int8::prefill::Int8PrefillLimits},
     tasks::{ir::{PlanContext, TaskBudget}, source_planning::{SourcePlanningLimits, SourceTaskPlanner,
         quantized::long::{Int8SourceMapError, Int8SourceMapLimits, Int8SourceMapRun, SourceMapTask}}},
 };
@@ -42,10 +44,28 @@ impl NlpEngine {
         planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
         config: SourceMapConfig, cancellation: CancellationToken)
         -> Result<HostedOutput<Int8SourceMapRun>, HostedError> {
+        self.map_int8_source_scheduled(model, source, planner, vocabulary, config, None, cancellation)
+    }
+
+    /// Reuse one admitted bounded prompt workspace for all source chunks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_int8_source_layer_major(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: SourceMapConfig, prefill: Int8PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int8SourceMapRun>, HostedError> {
+        self.map_int8_source_scheduled(model, source, planner, vocabulary, config, Some(prefill), cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn map_int8_source_scheduled(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: SourceMapConfig, prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int8SourceMapRun>, HostedError> {
         dispatch::preflight(self, config.native.run)?;
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), &config.identity)?;
         let required = requirements(config.native)?;
+        let scratch_bytes = team::scratch_bytes(config.native, required, prefill)?;
         validate(&config, source.len(), required.kv_bytes)?;
         check_assets(&config.identity, planner.tokenizer_digest(), *planner.template_digest())?;
         let input_bytes = input_bytes(&config, source.capacity(), &planner)?;
@@ -79,14 +99,16 @@ impl NlpEngine {
                 admitted.push(identity.clone());
             }
             let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-            let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-                sum(&[required.rope_bytes, required.scratch_payload_bound, config.native.allocator_reserve_bytes])?)?;
+            let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch_bytes)?;
             let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value
                 .engine(config.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
             // The consumed plan has no borrowing output. All source validation,
             // merge/error cleanup and final envelope checks precede commit.
-            let result = allocate(output, || prepared.execute_with_control(&admitted,
-                &mut engine.value, &input.value.vocabulary, control).map_err(HostedError::SourceMap))?;
+            let result = allocate(output, || match prefill {
+                None => prepared.execute_with_control(&admitted, &mut engine.value, &input.value.vocabulary, control),
+                Some(prefill) => prepared.execute_layer_major_with_control(&admitted,
+                    &mut engine.value, &input.value.vocabulary, prefill, control),
+            }.map_err(HostedError::SourceMap))?;
             drop(engine);
             drop(admitted);
             drop(input);
@@ -94,6 +116,42 @@ impl NlpEngine {
             drop(lease);
             Ok(GuardedOutput::new(result.value, result._memory))
         })
+    }
+    /// One fixed numerical row team spans all native chunks and exact source
+    /// validation. Complete input/native/output ownership survives worker join.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_int8_source_with_threads(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>, config: SourceMapConfig,
+        kernel: Int8Kernel, compute_threads: usize, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8SourceMapRun>, HostedError> {
+        self.map_int8_source_team(model, source, planner, vocabulary, config,
+            kernel, compute_threads, None, cancellation)
+    }
+
+    /// Bounded layer-major prompts and decoding use the same admitted workers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_int8_source_layer_major_with_threads(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>, config: SourceMapConfig,
+        kernel: Int8Kernel, compute_threads: usize, prefill: Int8PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8SourceMapRun>, HostedError> {
+        self.map_int8_source_team(model, source, planner, vocabulary, config,
+            kernel, compute_threads, Some(prefill), cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn map_int8_source_team(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>, config: SourceMapConfig,
+        kernel: Int8Kernel, compute_threads: usize, prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8SourceMapRun>, HostedError> {
+        let max_result_bytes = config.mapping.reduction.max_result_bytes as u64;
+        team::run(self, model, source, planner, vocabulary, config, kernel, compute_threads,
+            prefill, max_result_bytes, true, cancellation,
+            |prepared, admitted, engine, vocabulary, prefill, control| {
+                match prefill {
+                    None => prepared.execute_with_control(admitted, engine, vocabulary, control),
+                    Some(prefill) => prepared.execute_layer_major_with_control(admitted, engine, vocabulary, prefill, control),
+                }.map_err(HostedError::SourceMap)
+            })
     }
 }
 

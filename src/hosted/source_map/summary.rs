@@ -20,10 +20,28 @@ impl NlpEngine {
         planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
         config: SourceMapConfig, summary: Int8SummaryLimits, cancellation: CancellationToken)
         -> Result<HostedOutput<Int8CorpusSummaryRun>, HostedError> {
+        self.summarize_int8_source_scheduled(model, source, planner, vocabulary, config, summary, None, cancellation)
+    }
+
+    /// Exact evidence-union summary with one bounded prompt workspace.
+    #[allow(clippy::too_many_arguments)]
+    pub fn summarize_int8_source_layer_major(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>, config: SourceMapConfig,
+        summary: Int8SummaryLimits, prefill: Int8PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int8CorpusSummaryRun>, HostedError> {
+        self.summarize_int8_source_scheduled(model, source, planner, vocabulary, config, summary, Some(prefill), cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn summarize_int8_source_scheduled(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>, config: SourceMapConfig,
+        summary: Int8SummaryLimits, prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int8CorpusSummaryRun>, HostedError> {
         dispatch::preflight(self, config.native.run)?;
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), &config.identity)?;
         let required = requirements(config.native)?;
+        let scratch_bytes = team::scratch_bytes(config.native, required, prefill)?;
         validate(&config, source.len(), required.kv_bytes)?;
         validate_summary(&config.task, config.mapping, summary)?;
         check_assets(&config.identity, planner.tokenizer_digest(), *planner.template_digest())?;
@@ -63,12 +81,15 @@ impl NlpEngine {
                 admitted.push(identity.clone());
             }
             let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-            let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-                sum(&[required.rope_bytes, required.scratch_payload_bound, config.native.allocator_reserve_bytes])?)?;
+            let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch_bytes)?;
             let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value
                 .engine(config.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            let result = allocate(output, || prepared.execute_summary_with_control(&admitted,
-                &mut engine.value, &input.value.vocabulary, summary, control).map_err(execution_error))?;
+            let result = allocate(output, || match prefill {
+                None => prepared.execute_summary_with_control(&admitted, &mut engine.value,
+                    &input.value.vocabulary, summary, control),
+                Some(prefill) => prepared.execute_summary_layer_major_with_control(&admitted,
+                    &mut engine.value, &input.value.vocabulary, summary, prefill, control),
+            }.map_err(execution_error))?;
             drop(engine);
             drop(admitted);
             drop(input);
@@ -76,6 +97,44 @@ impl NlpEngine {
             drop(lease);
             Ok(GuardedOutput::new(result.value, result._memory))
         })
+    }
+    /// Keep one physical team through every source map and the exact reducer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn summarize_int8_source_with_threads(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>, config: SourceMapConfig,
+        summary: Int8SummaryLimits, kernel: Int8Kernel, compute_threads: usize, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8CorpusSummaryRun>, HostedError> {
+        self.summarize_int8_source_team(model, source, planner, vocabulary, config,
+            summary, kernel, compute_threads, None, cancellation)
+    }
+
+    /// Prompt morsels and every generated token share the same fixed workers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn summarize_int8_source_layer_major_with_threads(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>, config: SourceMapConfig,
+        summary: Int8SummaryLimits, kernel: Int8Kernel, compute_threads: usize,
+        prefill: Int8PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8CorpusSummaryRun>, HostedError> {
+        self.summarize_int8_source_team(model, source, planner, vocabulary, config,
+            summary, kernel, compute_threads, Some(prefill), cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn summarize_int8_source_team(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>, config: SourceMapConfig,
+        summary: Int8SummaryLimits, kernel: Int8Kernel, compute_threads: usize,
+        prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8CorpusSummaryRun>, HostedError> {
+        validate_summary(&config.task, config.mapping, summary)?;
+        team::run(self, model, source, planner, vocabulary, config, kernel, compute_threads,
+            prefill, summary.max_result_bytes as u64, false, cancellation,
+            move |prepared, admitted, engine, vocabulary, prefill, control| {
+                match prefill {
+                    None => prepared.execute_summary_with_control(admitted, engine, vocabulary, summary, control),
+                    Some(prefill) => prepared.execute_summary_layer_major_with_control(
+                        admitted, engine, vocabulary, summary, prefill, control),
+                }.map_err(execution_error)
+            })
     }
 }
 fn validate_summary(task: &SourceMapTask, mapping: Int8SourceMapLimits, summary: Int8SummaryLimits)

@@ -30,7 +30,7 @@ impl PreparedInt8Question<'_> {
         -> Result<Int8QuestionRun, Int8SourceMapError> {
         checkpoint(control)?;
         self.preflight(admitted, engine)?;
-        let driver = NativeDriver { engine, vocabulary, control, limits: self.mapping };
+        let driver = NativeDriver { engine, vocabulary, control, limits: self.mapping, prefill: None };
         self.execute_with_driver(admitted, driver)
     }
     // Private corruption-test seam only. Public entrypoints always use the SAME

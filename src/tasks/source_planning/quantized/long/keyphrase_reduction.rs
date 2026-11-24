@@ -207,7 +207,22 @@ impl PreparedInt8SourceMap<'_> {
         checkpoint(control)?;
         self.check_keyphrases(limits)?;
         self.preflight(admitted, engine)?;
-        let driver = NativeDriver { engine, vocabulary, control, limits: self.limits };
+        let driver = NativeDriver { engine, vocabulary, control, limits: self.limits, prefill: None };
+        self.execute_keyphrases_with_driver(admitted, limits, driver)
+    }
+
+    /// Reuse bounded prompt morsels across all maps before exact source-backed
+    /// ranking. The complete evidence frontier and work ceilings do not renew.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_keyphrases_layer_major_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary,
+        limits: Int8KeyphraseLimits, prefill: Int8PrefillLimits, control: &mut C)
+        -> Result<Int8CorpusKeyphraseRun, Int8CorpusKeyphraseError> {
+        checkpoint(control)?;
+        check_prefill(prefill)?;
+        self.check_keyphrases(limits)?;
+        self.preflight(admitted, engine)?;
+        let driver = NativeDriver { engine, vocabulary, control, limits: self.limits, prefill: Some(prefill) };
         self.execute_keyphrases_with_driver(admitted, limits, driver)
     }
 

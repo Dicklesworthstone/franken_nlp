@@ -499,3 +499,38 @@ fn controlled_span_lifting_still_rejects_wrong_scalar_coordinates() {
             Err(Int8SourceError::InvalidResult)));
     }
 }
+
+#[test]
+fn packed_map_schedules_leave_the_complete_request_and_work_commitment_unchanged() {
+    let planner = planner();
+    let source = "Alice Bob Carol Dave Eve Frank Grace é上海";
+    let plan = prepare(&planner, source, limits());
+    let binding = plan.preflight_metadata();
+    let identities = admitted(&plan);
+    let work = plan.planned_work();
+    let masks = plan.reserved_mask_visits();
+    let prompts: Vec<_> = plan.plans.iter().map(PreparedInt8SourceTask::prompt_tokens).collect();
+    // Real pinned plans contain full morsels and a tail in this matrix. No
+    // fabricated logits or mocked native result supplies a numerical claim.
+    assert!(prompts.iter().all(|&tokens| tokens > 7));
+    assert!(prompts.iter().any(|&tokens| tokens % 7 != 0));
+    for rows in [1, 3, 7, 64] {
+        let prefill = Int8PrefillLimits { max_batch_rows: rows,
+            max_extra_scratch_bytes: Int8PrefillLimits::required_extra_scratch_bytes(rows).unwrap() };
+        check_prefill(prefill).unwrap();
+        assert_eq!(plan.preflight_metadata(), binding);
+        assert_eq!(admitted(&plan), identities);
+        assert_eq!(plan.planned_work(), work);
+        assert_eq!(plan.reserved_mask_visits(), masks);
+    }
+    for rows in [0, 65, usize::MAX] {
+        assert!(matches!(check_prefill(Int8PrefillLimits {
+            max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX,
+        }), Err(Int8SourceMapError::InvalidLimits)));
+    }
+    let bytes = Int8PrefillLimits::required_extra_scratch_bytes(7).unwrap();
+    assert!(matches!(check_prefill(Int8PrefillLimits {
+        max_batch_rows: 7, max_extra_scratch_bytes: bytes - 1,
+    }), Err(Int8SourceMapError::InvalidLimits)));
+    assert_eq!(plan.preflight_metadata(), binding);
+}

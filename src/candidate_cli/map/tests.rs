@@ -215,3 +215,88 @@ fn compact_synthesis_with_disabled_runtime_refuses_before_private_io() {
         assert_eq!(command(task, &flags).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Unavailable));
     }
 }
+
+#[test]
+fn source_maps_and_exact_reducers_compose_packed_prompts_with_one_team() {
+    for (task, reducer) in [("ner", None), ("keyphrases", None), ("summarize", None),
+        ("keyphrases", Some("--reduce-keyphrases")), ("summarize", Some("--reduce-summary"))] {
+        let baseline = command(task, &[]);
+        let (_, serial) = baseline.validate().unwrap();
+        for width in ["1", "2", "4"] { for rows in [None, Some("1"), Some("7")] {
+            let mut flags = vec!["--compute-threads", width];
+            if let Some(rows) = rows { flags.extend(["--prefill-rows", rows]); }
+            if let Some(reducer) = reducer { flags.push(reducer); }
+            let mut selected = command(task, &flags); selected.host.memory_mib = 16384;
+            let (args, admitted) = selected.validate().unwrap();
+            let prefill = selected.extraction.prefill().unwrap();
+            assert_eq!(admitted.compute, args.compute.admit_prefill(prefill).unwrap());
+            assert_eq!(admitted.compute.threads, width.parse::<usize>().unwrap());
+            assert_eq!(selected.host.task_budget(admitted), baseline.host.task_budget(serial));
+            assert_eq!(selected.work_ceiling(), baseline.work_ceiling());
+            assert_eq!(selected.max_total_mask_node_visits, baseline.max_total_mask_node_visits);
+            assert_eq!(selected.extraction.schema_reserve_per_chunk(), 0);
+        } }
+    }
+}
+
+#[test]
+fn source_schedule_memory_keeps_coordinator_workers_and_the_complete_frontier() {
+    for task in ["ner", "keyphrases", "summarize"] {
+        let mut cmd = command(task, &["--compute-threads", "4", "--prefill-rows", "7",
+            "--input-encoding", "safe-bpe-v1", "--max-chunk-bytes", "4096"]);
+        cmd.host.memory_mib = 16384;
+        let (args, mut limits) = cmd.validate().unwrap();
+        let peak = cmd.extraction.schedule_peak_bytes(&cmd, &args, limits).unwrap();
+        limits.memory_bytes = peak;
+        cmd.extraction.check_schedule_memory(&cmd, &args, limits).unwrap();
+        limits.memory_bytes -= 1;
+        assert_eq!(cmd.extraction.check_schedule_memory(&cmd, &args, limits), Err(CandidateError::Arguments));
+        let mut without_workers = limits; without_workers.compute.workspace_bytes = 0;
+        assert_eq!(peak - cmd.extraction.schedule_peak_bytes(&cmd, &args, without_workers).unwrap(),
+            limits.compute.workspace_bytes);
+        cmd.max_chunks += 1;
+        assert_eq!(cmd.extraction.schedule_peak_bytes(&cmd, &args, limits).unwrap() - peak,
+            4 * cmd.host.max_result_bytes as u64 + 16 * args.max_new_tokens as u64);
+    }
+}
+
+#[test]
+fn unsupported_or_unfunded_source_schedules_refuse_before_private_io() {
+    struct NoRead;
+    impl Read for NoRead { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private source read") } }
+    struct NoWrite;
+    impl Write for NoWrite {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("partial result written") }
+        fn flush(&mut self) -> io::Result<()> { panic!("partial result flushed") }
+    }
+    for task in ["ner", "keyphrases", "summarize"] {
+        for flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+            vec!["--prefill-rows", "0"], vec!["--prefill-rows", "65"],
+            vec!["--compute-threads", "4", "--prefill-rows", "7", "--max-weight-mib", "8192"]] {
+            assert_eq!(command(task, &flags).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+        }
+    }
+    for flags in [vec!["--compute-threads", "2"], vec!["--prefill-rows", "3"]] {
+        let mut synthesis = flags.clone(); synthesis.push("--synthesize-summary");
+        assert_eq!(command("summarize", &synthesis).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+        let mut question = flags; question.extend(["--question", "never-open.txt"]);
+        assert_eq!(command("answer", &question).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+    }
+}
+
+#[cfg(not(feature = "asupersync-runtime"))]
+#[test]
+fn disabled_source_team_runtime_never_reads_or_publishes() {
+    struct NoRead;
+    impl Read for NoRead { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private source read") } }
+    struct NoWrite;
+    impl Write for NoWrite {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("result written") }
+        fn flush(&mut self) -> io::Result<()> { panic!("result flushed") }
+    }
+    for task in ["ner", "keyphrases", "summarize"] {
+        let mut cmd = command(task, &["--compute-threads", "4", "--prefill-rows", "7"]);
+        cmd.host.memory_mib = 16384;
+        assert_eq!(cmd.execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Unavailable));
+    }
+}

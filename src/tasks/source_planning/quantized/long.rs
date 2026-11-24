@@ -11,7 +11,7 @@ use std::{cell::RefCell, sync::Arc};
 use crate::{
     grammar::mask::MaskWorkLimits,
     native_engine::{constrained::JsonWorkBudget, kv::KV_BYTES_PER_TOKEN,
-        strict_int8::Int8RunBudget},
+        strict_int8::{Int8RunBudget, prefill::Int8PrefillLimits}},
     tasks::mapreduce::{self, ChunkLimits, ChunkPlan, ExecutionError, ExecutionLimits,
         MapOutput, MapReduceError, MapReduceResult, MapReduceTask, ReduceInput,
         ReductionPolicy, SourceChunk},
@@ -378,7 +378,21 @@ impl PreparedInt8SourceMap<'_> {
         -> Result<Int8SourceMapRun, Int8SourceMapError> {
         checkpoint(control)?;
         self.preflight(admitted, engine)?;
-        let driver = NativeDriver { engine, vocabulary, control, limits: self.limits };
+        let driver = NativeDriver { engine, vocabulary, control, limits: self.limits, prefill: None };
+        self.execute_with_driver(admitted, driver)
+    }
+
+    /// Reuse bounded layer-major prompt storage across every original chunk.
+    /// The same engine may carry one persistent projection team. Prepared
+    /// identities, per-row arithmetic, source coordinates and the complete
+    /// model/mask allowances remain unchanged.
+    pub fn execute_layer_major_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary,
+        prefill: Int8PrefillLimits, control: &mut C) -> Result<Int8SourceMapRun, Int8SourceMapError> {
+        checkpoint(control)?;
+        check_prefill(prefill)?;
+        self.preflight(admitted, engine)?;
+        let driver = NativeDriver { engine, vocabulary, control, limits: self.limits, prefill: Some(prefill) };
         self.execute_with_driver(admitted, driver)
     }
 
@@ -438,23 +452,33 @@ trait SourceDriver {
 struct NativeDriver<'e, 'w, 'v, 'c, C> {
     engine: &'e mut StrictInt8Engine<'w>, vocabulary: &'v ExtractionVocabulary,
     control: &'c mut C, limits: Int8SourceMapLimits,
+    prefill: Option<Int8PrefillLimits>,
 }
 impl<C: DecodeStepControl> SourceDriver for NativeDriver<'_, '_, '_, '_, C> {
     fn checkpoint(&mut self) -> Result<(), Int8SourceError> { checkpoint(self.control) }
     fn run(&mut self, plan: &PreparedInt8SourceTask, admitted: &ExecutionIdentity) -> Result<Int8SourceTaskRun, Int8SourceError> {
         let work = plan.planned_work();
-        let result = plan.execute_with_control(admitted, self.engine, self.vocabulary, Int8JsonBudget {
+        let budget = Int8JsonBudget {
             native: Int8RunBudget::exact(work), json: JsonWorkBudget {
                 max_forward_positions: work.forward_positions, max_projected_logits: work.projected_logits,
                 max_kv_bytes: plan.task_budget().max_kv_bytes,
                 max_total_mask_node_visits: self.limits.mask_visits_per_chunk, mask_limits: self.limits.mask_limits,
             },
-        }, self.control)?;
+        };
+        let result = match self.prefill {
+            None => plan.execute_with_control(admitted, self.engine, self.vocabulary, budget, self.control),
+            Some(prefill) => plan.execute_layer_major_with_control(admitted, self.engine,
+                self.vocabulary, budget, prefill, self.control),
+        }?;
         if self.engine.is_poisoned() || !self.engine.kv_cache().all_slots_have_len(0)
             || mask_charge(&result.result)? > self.limits.mask_visits_per_chunk { return Err(Int8SourceError::InvalidResult); }
         Ok(result)
     }
 }
+fn check_prefill(prefill: Int8PrefillLimits) -> Result<(), Int8SourceMapError> {
+    prefill.validate().map(|_| ()).map_err(|_| Int8SourceMapError::InvalidLimits)
+}
+
 struct SourceMapExecutor<'a, 's, D> {
     chunks: &'a ChunkPlan<'s>, plans: &'a [PreparedInt8SourceTask], admitted: &'a [ExecutionIdentity],
     driver: D, next_chunk: usize, work: Int8Work, masks: u64, mask_cap: u64,

@@ -27,7 +27,7 @@ impl Driver for Native<'_, '_> {
         let (_, ceiling) = reserve(self.budget, self.planning, self.mapping)?;
         if !within(plan.planned_work(), ceiling) { return Err(Int8SourceMapError::WorkLimit); }
         preflight_plans(std::slice::from_ref(&plan), std::slice::from_ref(plan.execution_identity()), self.engine)?;
-        let mut native = NativeDriver { engine: self.engine, vocabulary: self.vocabulary, control, limits: self.mapping };
+        let mut native = NativeDriver { engine: self.engine, vocabulary: self.vocabulary, control, limits: self.mapping, prefill: None };
         let run = native.run(&plan, plan.execution_identity())?;
         check_run(&plan, &run, self.mapping.mask_visits_per_chunk)?;
         extract_int8::check_size(&run, plan.max_result_bytes()).map_err(Int8SourceError::from)?;

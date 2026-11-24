@@ -186,6 +186,9 @@ fn compact_preparation_preserves_cancellation_at_cli_policy_boundary() {
         ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
         let expected = match cause { Deadline | Timeout => CandidateError::Timeout, _ => CandidateError::Execution };
         assert_eq!(source_error(Int8SourceError::Cancelled(cause)), expected);
+        assert_eq!(host_error(HostedError::Native(
+            crate::native_engine::strict_int8::StrictInt8Error::Cancelled(cause))), expected);
+        assert_eq!(host_error(HostedError::Source(Int8SourceError::Cancelled(cause))), expected);
         assert_eq!(host_error(HostedError::SourceMap(
             crate::tasks::source_planning::quantized::long::Int8SourceMapError::Source(
                 Int8SourceError::Cancelled(cause)))), expected);
@@ -200,4 +203,30 @@ fn compact_preparation_preserves_cancellation_at_cli_policy_boundary() {
         assert!(matches!(preflight(text, &p, &cmd, cap, mapping, b,
             &mut Control { calls: 0, stop_at }), Err(CandidateError::Timeout)));
     }
+}
+
+#[test]
+fn source_map_runtime_rejects_a_stale_team_quote_before_any_private_io() {
+    struct NoRead;
+    impl Read for NoRead { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private source read") } }
+    struct NoWrite;
+    impl Write for NoWrite {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("result written") }
+        fn flush(&mut self) -> io::Result<()> { panic!("result flushed") }
+    }
+    for task in ["ner", "keyphrases", "summarize"] {
+        let mut cmd = command(task, &["--compute-threads", "4", "--prefill-rows", "7"]);
+        cmd.host.memory_mib = 16384;
+        let (args, mut limits) = cmd.validate().unwrap();
+        limits.compute.workspace_bytes -= 1;
+        assert_eq!(execute(cmd, args, limits, &mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
+fn serial_map_encoding_and_scheduling_wrappers_keep_canonical_bytes() {
+    let response = serde_json::json!({"schema_version": 1, "output": {"fixture": true}});
+    let encoded = encoding::EncodedResponse { response: &response, input_encoding: None };
+    let scheduled = compute::Response { response: &encoded, compute: None };
+    assert_eq!(canonjson::canonical_bytes(&scheduled).unwrap(), canonjson::canonical_bytes(&response).unwrap());
 }

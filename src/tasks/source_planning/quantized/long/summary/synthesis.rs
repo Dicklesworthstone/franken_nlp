@@ -275,7 +275,7 @@ impl<'s> PreparedInt8SummarySynthesis<'s> {
             // Dynamic source/prompt/schema identity is admitted against the
             // same model and full resident KV before any synthesis forward.
             preflight_plans(std::slice::from_ref(plan), std::slice::from_ref(plan.execution_identity()), engine)?;
-            let mut driver = NativeDriver { engine, vocabulary, control, limits: mapping };
+            let mut driver = NativeDriver { engine, vocabulary, control, limits: mapping, prefill: None };
             driver.run(plan, plan.execution_identity()).map_err(Into::into)
         }, control)
     }

@@ -269,7 +269,7 @@ fn synthesis_pass<C: DecodeStepControl>(plan: &PreparedInt8SourceTask, engine: &
     // Admit the actual evidence identity and full resident KV before the
     // final forward; a completed discovery cannot waive either requirement.
     preflight_plans(std::slice::from_ref(plan), std::slice::from_ref(plan.execution_identity()), engine)?;
-    let mut driver = NativeDriver { engine, vocabulary, control, limits: mapping };
+    let mut driver = NativeDriver { engine, vocabulary, control, limits: mapping, prefill: None };
     Ok(driver.run(plan, plan.execution_identity())?)
 }
 

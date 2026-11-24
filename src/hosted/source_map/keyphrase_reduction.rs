@@ -17,10 +17,28 @@ impl NlpEngine {
         planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
         config: SourceMapConfig, keyphrases: Int8KeyphraseLimits, cancellation: CancellationToken)
         -> Result<HostedOutput<Int8CorpusKeyphraseRun>, HostedError> {
+        self.keyphrases_int8_source_scheduled(model, source, planner, vocabulary, config, keyphrases, None, cancellation)
+    }
+
+    /// Exact phrase/evidence ranking with one bounded prompt workspace.
+    #[allow(clippy::too_many_arguments)]
+    pub fn keyphrases_int8_source_layer_major(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>, config: SourceMapConfig,
+        keyphrases: Int8KeyphraseLimits, prefill: Int8PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int8CorpusKeyphraseRun>, HostedError> {
+        self.keyphrases_int8_source_scheduled(model, source, planner, vocabulary, config, keyphrases, Some(prefill), cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn keyphrases_int8_source_scheduled(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>, config: SourceMapConfig,
+        keyphrases: Int8KeyphraseLimits, prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int8CorpusKeyphraseRun>, HostedError> {
         dispatch::preflight(self, config.native.run)?;
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), &config.identity)?;
         let required = requirements(config.native)?;
+        let scratch_bytes = team::scratch_bytes(config.native, required, prefill)?;
         validate(&config, source.len(), required.kv_bytes)?;
         validate_keyphrases(&config.task, config.mapping, keyphrases)?;
         check_assets(&config.identity, planner.tokenizer_digest(), *planner.template_digest())?;
@@ -58,12 +76,15 @@ impl NlpEngine {
                 admitted.push(identity.clone());
             }
             let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-            let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-                sum(&[required.rope_bytes, required.scratch_payload_bound, config.native.allocator_reserve_bytes])?)?;
+            let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch_bytes)?;
             let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value
                 .engine(config.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            let result = allocate(output, || prepared.execute_keyphrases_with_control(&admitted,
-                &mut engine.value, &input.value.vocabulary, keyphrases, control).map_err(execution_error))?;
+            let result = allocate(output, || match prefill {
+                None => prepared.execute_keyphrases_with_control(&admitted, &mut engine.value,
+                    &input.value.vocabulary, keyphrases, control),
+                Some(prefill) => prepared.execute_keyphrases_layer_major_with_control(&admitted,
+                    &mut engine.value, &input.value.vocabulary, keyphrases, prefill, control),
+            }.map_err(execution_error))?;
             drop(engine);
             drop(admitted);
             drop(input);
@@ -71,6 +92,44 @@ impl NlpEngine {
             drop(lease);
             Ok(GuardedOutput::new(result.value, result._memory))
         })
+    }
+    /// Every native map and exact reduction shares one persistent row team.
+    #[allow(clippy::too_many_arguments)]
+    pub fn keyphrases_int8_source_with_threads(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>, config: SourceMapConfig,
+        keyphrases: Int8KeyphraseLimits, kernel: Int8Kernel, compute_threads: usize, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8CorpusKeyphraseRun>, HostedError> {
+        self.keyphrases_int8_source_team(model, source, planner, vocabulary, config,
+            keyphrases, kernel, compute_threads, None, cancellation)
+    }
+
+    /// Bounded prompt morsels use the same workers and whole-document ledger.
+    #[allow(clippy::too_many_arguments)]
+    pub fn keyphrases_int8_source_layer_major_with_threads(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>, config: SourceMapConfig,
+        keyphrases: Int8KeyphraseLimits, kernel: Int8Kernel, compute_threads: usize,
+        prefill: Int8PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8CorpusKeyphraseRun>, HostedError> {
+        self.keyphrases_int8_source_team(model, source, planner, vocabulary, config,
+            keyphrases, kernel, compute_threads, Some(prefill), cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn keyphrases_int8_source_team(&self, model: &ResidentInt8, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>, config: SourceMapConfig,
+        keyphrases: Int8KeyphraseLimits, kernel: Int8Kernel, compute_threads: usize,
+        prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8CorpusKeyphraseRun>, HostedError> {
+        validate_keyphrases(&config.task, config.mapping, keyphrases)?;
+        team::run(self, model, source, planner, vocabulary, config, kernel, compute_threads,
+            prefill, keyphrases.max_result_bytes as u64, false, cancellation,
+            move |prepared, admitted, engine, vocabulary, prefill, control| {
+                match prefill {
+                    None => prepared.execute_keyphrases_with_control(admitted, engine, vocabulary, keyphrases, control),
+                    Some(prefill) => prepared.execute_keyphrases_layer_major_with_control(
+                        admitted, engine, vocabulary, keyphrases, prefill, control),
+                }.map_err(execution_error)
+            })
     }
 }
 fn validate_keyphrases(task: &SourceMapTask, mapping: Int8SourceMapLimits, keyphrases: Int8KeyphraseLimits)

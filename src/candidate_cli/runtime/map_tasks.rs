@@ -63,7 +63,10 @@ pub(in crate::candidate_cli) fn execute(command: MapCommand, args: CandidateArgs
     if command.summary.synthesis.synthesize_summary {
         return synthesis::execute(command, args, limits, input, output);
     }
-    let session = Session::new(&args, limits)?;
+    let prefill = command.extraction.prefill()?;
+    if limits.compute != command.compute.admit_prefill(prefill)? { return Err(CandidateError::Arguments); }
+    // Check the exact prompt/worker quote before private source/options IO.
+    let session = Session::new_with_prefill(&args, limits, prefill)?;
     let text = session.read(&command.input, input, args.max_input_bytes)?;
     let option_text = command.options.as_ref()
         .map(|path| session.read(path, input, crate::candidate_cli::source::OPTIONS_BYTES)).transpose()?;
@@ -102,25 +105,66 @@ pub(in crate::candidate_cli) fn execute(command: MapCommand, args: CandidateArgs
     // Retain the exact planner, not a fresh ledger, through hosted recompilation
     // and final usage reporting. All private source storage stays charged.
     let planner = Arc::new(planner);
-    if let (Some(limits), Some(expected)) = (summary, expected_summary) {
-        let result = session.engine.summarize_int8_source(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
-            config, limits, cancellation).map_err(host_error)?;
+    let vocabulary = Arc::new(vocabulary);
+    let width = limits.compute.threads;
+    let kernel = crate::native_engine::simd::config::process_kernel();
+    if let (Some(summary), Some(expected)) = (summary, expected_summary) {
+        let result = if width == 1 {
+            compute::Completion::Serial(match prefill {
+                None => session.engine.summarize_int8_source(&model, text, Arc::clone(&planner),
+                    vocabulary, config, summary, cancellation),
+                Some(prefill) => session.engine.summarize_int8_source_layer_major(&model, text,
+                    Arc::clone(&planner), vocabulary, config, summary, prefill, cancellation),
+            }.map_err(host_error)?)
+        } else {
+            compute::Completion::Team(match prefill {
+                None => session.engine.summarize_int8_source_with_threads(&model, text, Arc::clone(&planner),
+                    vocabulary, config, summary, kernel, width, cancellation),
+                Some(prefill) => session.engine.summarize_int8_source_layer_major_with_threads(&model,
+                    text, Arc::clone(&planner), vocabulary, config, summary, kernel, width, prefill, cancellation),
+            }.map_err(host_error)?)
+        };
         summary::check_completed(&expected, result.result(), &mut session.control())?;
-        return deliver_encoded(&session, &facts, &result, encoding::report(&planner)?.as_ref(),
-            command.max_map_result_bytes + 4096, output);
+        return deliver_scheduled(&session, &facts, result.result(), encoding::report(&planner)?.as_ref(),
+            result.compute(), command.max_map_result_bytes + 4096, output);
     }
-    if let (Some(limits), Some(expected)) = (keyphrases, expected_keyphrases) {
-        let result = session.engine.keyphrases_int8_source(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
-            config, limits, cancellation).map_err(host_error)?;
+    if let (Some(keyphrases), Some(expected)) = (keyphrases, expected_keyphrases) {
+        let result = if width == 1 {
+            compute::Completion::Serial(match prefill {
+                None => session.engine.keyphrases_int8_source(&model, text, Arc::clone(&planner),
+                    vocabulary, config, keyphrases, cancellation),
+                Some(prefill) => session.engine.keyphrases_int8_source_layer_major(&model, text,
+                    Arc::clone(&planner), vocabulary, config, keyphrases, prefill, cancellation),
+            }.map_err(host_error)?)
+        } else {
+            compute::Completion::Team(match prefill {
+                None => session.engine.keyphrases_int8_source_with_threads(&model, text, Arc::clone(&planner),
+                    vocabulary, config, keyphrases, kernel, width, cancellation),
+                Some(prefill) => session.engine.keyphrases_int8_source_layer_major_with_threads(&model,
+                    text, Arc::clone(&planner), vocabulary, config, keyphrases, kernel, width, prefill, cancellation),
+            }.map_err(host_error)?)
+        };
         keyphrase_reduction::check_completed(&expected, result.result(), &mut session.control())?;
-        return deliver_encoded(&session, &facts, &result, encoding::report(&planner)?.as_ref(),
-            command.max_map_result_bytes + 4096, output);
+        return deliver_scheduled(&session, &facts, result.result(), encoding::report(&planner)?.as_ref(),
+            result.compute(), command.max_map_result_bytes + 4096, output);
     }
-    let result = session.engine.map_int8_source(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
-        config, cancellation).map_err(host_error)?;
+    let result = if width == 1 {
+        compute::Completion::Serial(match prefill {
+            None => session.engine.map_int8_source(&model, text, Arc::clone(&planner), vocabulary, config, cancellation),
+            Some(prefill) => session.engine.map_int8_source_layer_major(&model, text, Arc::clone(&planner),
+                vocabulary, config, prefill, cancellation),
+        }.map_err(host_error)?)
+    } else {
+        compute::Completion::Team(match prefill {
+            None => session.engine.map_int8_source_with_threads(&model, text, Arc::clone(&planner),
+                vocabulary, config, kernel, width, cancellation),
+            Some(prefill) => session.engine.map_int8_source_layer_major_with_threads(&model, text,
+                Arc::clone(&planner), vocabulary, config, kernel, width, prefill, cancellation),
+        }.map_err(host_error)?)
+    };
     check_completed(&expected, result.result(), &mut session.control())?;
-    deliver_encoded(&session, &facts, &result, encoding::report(&planner)?.as_ref(),
-        command.max_map_result_bytes + 4096, output)
+    deliver_scheduled(&session, &facts, result.result(), encoding::report(&planner)?.as_ref(),
+        result.compute(), command.max_map_result_bytes + 4096, output)
 }
 fn deliver<T: Serialize>(session: &Session, facts: &ArtifactIdentity, result: &T,
     cap: usize, output: &mut impl Write) -> Result<(), CandidateError> {
