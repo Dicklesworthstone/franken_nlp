@@ -12,7 +12,7 @@ use crate::{
         PINNED_ADDED_TOKENS_BYTES, PINNED_TOKENIZER_CONFIG_BYTES, PINNED_SPECIAL_TOKENS_MAP_BYTES}},
 };
 
-pub const REFERENCE_BPE_MAX_INPUT_BYTES: usize = 4096;
+pub const REFERENCE_BPE_MAX_INPUT_BYTES: usize = crate::tokenizer::bpe::INSPECTION_MAX_BYTES;
 fn default_true() -> bool { true }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -200,17 +200,32 @@ mod tests {
     }
     #[test]
     fn overlong_bpe_is_rejected_before_loading_and_never_silently_falls_back() {
-        let mut p = processor();
+        let mut p = TextBatchProcessor::new(TextBatchOptions::for_task(TextBatchTask::Tokens),
+            TextBudget { max_items: REFERENCE_BPE_MAX_INPUT_BYTES + 1, ..Default::default() }).unwrap();
         let source = "a".repeat(REFERENCE_BPE_MAX_INPUT_BYTES + 1);
         assert!(p.prepare(request(&source, TokenBatchOptions::default())).is_err());
         assert_eq!(p.tokens.loads, 0);
-        let options = TokenBatchOptions { encoding: TokenEncoding::ByteFallback {}, include_ids: true };
+        let options = TokenBatchOptions { encoding: TokenEncoding::ByteFallback {}, include_ids: false };
         let item = p.prepare(request(&source, options)).unwrap();
         let output = p.execute(item, &mut CliControl).unwrap();
         assert_eq!(output.result["count"], source.len());
         assert_eq!(output.result["byte_exact_decode_checked"], true);
         assert_eq!(output.result["profile"], "byte-fallback-only-v1");
         assert_eq!(p.tokens.loads, 1);
+    }
+    #[test]
+    fn document_sized_bpe_matches_single_inspection_including_added_tokens() {
+        let source = "local text <|im_start|>".repeat(400);
+        let options = TokenBatchOptions {
+            encoding: TokenEncoding::PinnedBpe { add_bos: false, add_eos: false },
+            include_ids: true,
+        };
+        let mut processor = processor();
+        let item = processor.prepare(request(&source, options)).unwrap();
+        let output = processor.execute(item, &mut CliControl).unwrap();
+        assert_eq!(output.result, single(&["tokens", "--json", "--ids", "--no-bos"], &source));
+        let ids = output.result["ids"].as_array().unwrap();
+        assert_eq!(ids.iter().filter(|id| id.as_u64() == Some(166100)).count(), 400);
     }
     #[test]
     fn omitted_ids_and_private_source_never_appear_in_count_only_output() {
@@ -294,7 +309,7 @@ mod tests {
     }
     #[test]
     fn a_rejected_long_bpe_document_does_not_prevent_later_valid_work() {
-        let first = json!({"id":"too-long","text":"a".repeat(4097)}).to_string();
+        let first = json!({"id":"too-long","text":"a".repeat(REFERENCE_BPE_MAX_INPUT_BYTES + 1)}).to_string();
         let second = json!({"id":"ok","text":"Hello"}).to_string();
         let input = format!("{first}\n{second}\n");
         let mut p = processor(); let mut output = Vec::new();

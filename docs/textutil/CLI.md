@@ -25,9 +25,10 @@ This is **tokenizer inspection**, not untrusted-prompt construction. Marker-like
 text may be recognized as an added token in L0 mode. SourceDocument's separate
 trust boundary must still be used for model prompts.
 
-The simple reference BPE algorithm is currently admitted only for input budgets
-up to **4096 bytes**. The command refuses larger declared budgets before reading
-input. It does not silently switch algorithms or return approximate counts.
+Exact BPE inspection admits input budgets up to **65536 bytes**. The command
+checks the declared budget before reading input. Longer segments use a priority
+queue of adjacent merges with the same score and leftmost tie order as the
+short-input full rescan.
 
 `--byte-fallback` explicitly selects a different byte-table encoding with no
 BOS/EOS insertion or added-token recognition. Its count equals the original
@@ -90,7 +91,7 @@ not proof that a transformed span still has the original surface text.
 Each command accepts a positional UTF-8 file, or `-`/omission for stdin; malformed
 UTF-8 is refused rather than repaired. `--max-input-bytes` bounds reads to at
 most the cap plus one overflow-detection byte. Its default is 1 MiB for split
-and normalize, and 4096 bytes for token inspection. `--max-items` bounds tokens,
+and normalize, and 65536 bytes for token inspection. `--max-items` bounds tokens,
 chunks or normalization edits, respectively (default 16384). `--max-output-bytes`
 bounds the complete result including metadata and emitted record newlines
 (default 4 MiB). CLI byte budgets cannot exceed 64 MiB, and item limits cannot

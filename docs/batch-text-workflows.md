@@ -104,7 +104,7 @@ Token IDs are opt-in:
 {"id":"t2","text":"Hello","task_args":{"kind":"tokens","options":{"include_ids":true,"encoding":{"kind":"pinned_bpe","add_bos":false,"add_eos":true}}}}
 ```
 
-The reference BPE input cap is **4096 bytes per document**, even when the general
+The exact BPE input cap is **65536 bytes per document**, even when the general
 `--max-document-bytes` limit is higher. Longer documents are refused, never
 truncated, approximately counted or silently switched to another encoding.
 This is tokenizer inspection, not the safe construction of an untrusted prompt;

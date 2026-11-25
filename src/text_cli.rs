@@ -1,6 +1,5 @@
 //! Real model-free command dispatch over the pinned tokenizer and textutil.
-//! The simple L0 BPE authority is intentionally capped at 4096 input bytes;
-//! a larger request is refused, never silently given byte-fallback counts.
+//! Exact token inspection bounds the merge workspace before reading input.
 use std::{io::{Read, Write}, path::PathBuf, process::ExitCode};
 use clap::{Args, ArgMatches, FromArgMatches};
 use serde::Serialize;
@@ -73,9 +72,9 @@ pub(crate) enum TextCommand { Tokens(Tokens), Split(Split), Normalize(Normalize)
 
 pub(crate) fn definitions() -> [clap::Command; 3] {
     [Tokens::augment_args(clap::Command::new("tokens"))
-        .mut_arg("max_input_bytes", |a| a.default_value("4096"))
+        .mut_arg("max_input_bytes", |a| a.default_value("65536"))
         .about("Inspect exact pinned tokenizer counts/IDs without model weights")
-        .after_help("Default: L0 BPE, added-token recognition, BOS enabled, EOS disabled. This is tokenizer inspection, NOT untrusted prompt construction. The reference BPE path is capped at 4096 input bytes. --byte-fallback is a different explicit encoding with byte-exact decode and no special insertion; counts are not interchangeable."),
+        .after_help("Default: L0 BPE, added-token recognition, BOS enabled, EOS disabled. This is tokenizer inspection, NOT untrusted prompt construction. Exact BPE inspection accepts up to 65536 UTF-8 bytes. --byte-fallback is a different explicit encoding with byte-exact decode and no special insertion; counts are not interchangeable."),
      Split::augment_args(clap::Command::new("split"))
         .about("Partition text without dropping bytes; original byte/scalar offsets survive")
         .after_help("Without --json, emit one versioned NDJSON row per chunk. With --json, emit one complete envelope. This is size/whitespace splitting, not linguistic sentence detection. Concatenating chunk text reproduces the exact source; CRLF pairs stay together. --max-chunk-tokens reports exact counts matching tokens --no-bos on each chunk, using probes of at most 4096 bytes. An indivisible unit over the cap rejects the whole document."),
@@ -99,8 +98,8 @@ impl TextCommand {
     fn validate(&self) -> Result<TextBudget, Failure> {
         let budget = self.common().budget()?;
         match self {
-            Self::Tokens(c) if !c.byte_fallback && budget.max_input_bytes > 4096 =>
-                Err(Failure::new(ErrorCode::AdmissionOrResourceLimit, "reference_bpe_input_limit_4096_bytes")),
+            Self::Tokens(c) if !c.byte_fallback && budget.max_input_bytes > crate::tokenizer::bpe::INSPECTION_MAX_BYTES =>
+                Err(Failure::new(ErrorCode::AdmissionOrResourceLimit, "reference_bpe_input_limit_65536_bytes")),
             Self::Split(c) if c.max_chunk_tokens == Some(0) => Err(TextError::InvalidOptions.into()),
             Self::Split(c) if !(4..=64 * 1024 * 1024).contains(&c.max_chunk_bytes) => Err(TextError::InvalidOptions.into()),
             _ => Ok(budget),
@@ -186,8 +185,8 @@ struct TokenReport {
 }
 fn token_report(source: &str, options: &Tokens, budget: TextBudget) -> Result<TokenReport, Failure> {
     if source.len() > budget.max_input_bytes { return Err(TextError::InputBudget.into()); }
-    if !options.byte_fallback && source.len() > 4096 {
-        return Err(Failure::new(ErrorCode::AdmissionOrResourceLimit, "reference_bpe_input_limit_4096_bytes"));
+    if !options.byte_fallback && source.len() > crate::tokenizer::bpe::INSPECTION_MAX_BYTES {
+        return Err(Failure::new(ErrorCode::AdmissionOrResourceLimit, "reference_bpe_input_limit_65536_bytes"));
     }
     if options.byte_fallback && source.len() > budget.max_items { return Err(TextError::ItemBudget.into()); }
     let tokenizer = EmbeddedTokenizer::pinned().map_err(|_| Failure::new(ErrorCode::ArtifactIntegrityOrFormatOrVersion, "embedded_tokenizer_refused"))?;
@@ -325,7 +324,7 @@ mod tests {
         struct NoRead;
         impl Read for NoRead { fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> { panic!("must refuse first"); } }
         let mut out = Vec::new(); let mut err = Vec::new();
-        assert_ne!(command(&["tokens", "--max-input-bytes", "4097"]).run(&mut NoRead, &mut out, &mut err), ExitCode::SUCCESS);
+        assert_ne!(command(&["tokens", "--max-input-bytes", "65537"]).run(&mut NoRead, &mut out, &mut err), ExitCode::SUCCESS);
         assert!(out.is_empty());
     }
     #[test]
