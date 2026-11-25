@@ -194,10 +194,15 @@ fn execute_driver<D: Driver>(prompt: &[u32], scorer: &CandidateScorer, mode: Sco
             numerics_profile: STRICT_INT4_PROFILE.to_owned(), group_width: schedule.group_width,
             scores, model_work, rewound_positions: backend.rewound };
         backend.driver.checkpoint()?;
-        if canonjson::canonical_bytes(&run).map_err(|_| Int4ScoringError::Serialization)?.len() as u64 > max_output_bytes {
+        // Serialization spends the original run allowance even when it fails
+        // or exceeds the output cap. Observe its terminal cancellation before
+        // interpreting either refusal; it must never become a retryable one.
+        let serialized_len = canonjson::canonical_bytes(&run)
+            .map(|bytes| bytes.len() as u64).map_err(|_| Int4ScoringError::Serialization);
+        backend.driver.checkpoint()?;
+        if serialized_len? > max_output_bytes {
             return Err(Int4ScoringError::OutputBudget);
         }
-        backend.driver.checkpoint()?;
         Ok(run)
     })();
     if result.is_err() { driver.abort(); }

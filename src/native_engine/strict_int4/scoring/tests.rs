@@ -23,7 +23,7 @@ fn logits(tokens: &[u32], rows: LinearRows<'_>) -> Vec<f32> {
 struct Model {
     width: usize, tokens: Vec<u32>, work: Int4Work, forwards: Vec<(usize, u32)>,
     projections: Vec<Vec<u32>>, aborted: bool, cancel_at: Option<usize>,
-    corrupt: bool, forge: bool, polls: usize, cancel_poll: Option<usize>,
+    corrupt: bool, forge: bool, polls: usize, cancel_poll: Option<(usize, DecodeCancellationKind)>,
 }
 impl Model {
     fn new(width: usize) -> Self {
@@ -35,8 +35,8 @@ impl Model {
 impl Driver for Model {
     fn checkpoint(&mut self) -> Result<(), Int4ScoringError> {
         self.polls += 1;
-        if self.cancel_poll == Some(self.polls) {
-            return Err(StrictInt4Error::Cancelled(DecodeCancellationKind::User).into());
+        if let Some((at, cause)) = self.cancel_poll {
+            if at == self.polls { return Err(StrictInt4Error::Cancelled(cause).into()); }
         }
         Ok(())
     }
@@ -204,9 +204,59 @@ fn cancellation_after_final_projection_or_serialization_is_not_success() {
     let p = plan(32, ScoringMode::TrieConditional); let mut completed = Model::new(32);
     run(&p, &mut completed).unwrap();
     for at in [1, completed.polls - 1, completed.polls] {
-        let mut model = Model::new(32); model.cancel_poll = Some(at);
+        let mut model = Model::new(32); model.cancel_poll = Some((at, DecodeCancellationKind::User));
         assert_eq!(run(&p, &mut model).unwrap_err().cancellation(), Some(DecodeCancellationKind::User));
         assert!(model.aborted);
+    }
+}
+#[test]
+fn late_cancellation_precedes_oversized_scores_for_every_score_space_and_group_partition() {
+    for mode in [ScoringMode::FullVocabulary, ScoringMode::TrieConditional,
+        ScoringMode::SequenceSoftmax { rule: SequenceScoreRule::SumLogits },
+        ScoringMode::SequenceSoftmax { rule: SequenceScoreRule::MeanLogits },
+        ScoringMode::SequenceSoftmax { rule: SequenceScoreRule::TerminalLogit }] {
+        for width in [3, 32, 128] {
+            let mut p = plan(width, mode); let mut baseline = Model::new(width);
+            let output = run(&p, &mut baseline).unwrap();
+            p.max_output_bytes = canonjson::canonical_bytes(&output).unwrap().len() as u64;
+            let mut exact = Model::new(width);
+            assert_eq!(run(&p, &mut exact).unwrap(), output);
+            assert!(!exact.aborted);
+            p.max_output_bytes -= 1;
+            let mut uncancelled = Model::new(width);
+            assert!(matches!(run(&p, &mut uncancelled), Err(Int4ScoringError::OutputBudget)));
+            assert!(uncancelled.aborted);
+            let mut model = Model::new(width);
+            model.cancel_poll = Some((baseline.polls, DecodeCancellationKind::Deadline));
+            assert_eq!(run(&p, &mut model).unwrap_err().cancellation(), Some(DecodeCancellationKind::Deadline));
+            assert_eq!(model.work, baseline.work);
+            assert_eq!(model.forwards, baseline.forwards);
+            assert_eq!(model.projections, baseline.projections);
+            assert_eq!(model.polls, baseline.polls);
+            assert!(model.aborted);
+        }
+    }
+}
+#[test]
+fn oversized_terminal_scores_preserve_every_cancellation_cause_and_spent_work() {
+    let mut p = plan(3, ScoringMode::TrieConditional); let mut baseline = Model::new(3);
+    run(&p, &mut baseline).unwrap();
+    p.max_output_bytes = 1;
+    for cause in [DecodeCancellationKind::User, DecodeCancellationKind::Timeout,
+        DecodeCancellationKind::Deadline, DecodeCancellationKind::PollQuota,
+        DecodeCancellationKind::CostBudget, DecodeCancellationKind::FailFast,
+        DecodeCancellationKind::RaceLost, DecodeCancellationKind::ParentCancelled,
+        DecodeCancellationKind::ResourceUnavailable, DecodeCancellationKind::Shutdown,
+        DecodeCancellationKind::LinkedExit] {
+        for at in [baseline.polls - 1, baseline.polls] {
+            let mut model = Model::new(3); model.cancel_poll = Some((at, cause));
+            assert_eq!(run(&p, &mut model).unwrap_err().cancellation(), Some(cause));
+            assert_eq!(model.work, baseline.work);
+            assert_eq!(model.forwards, baseline.forwards);
+            assert_eq!(model.projections, baseline.projections);
+            assert_eq!(model.polls, at);
+            assert!(model.aborted);
+        }
     }
 }
 #[test]
