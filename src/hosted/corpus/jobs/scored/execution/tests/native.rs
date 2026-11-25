@@ -23,7 +23,7 @@ use std::{fs, io::{self, Cursor, Read}, os::unix::fs::DirBuilderExt,
     path::Path, sync::atomic::{AtomicUsize, Ordering}, time::SystemTime};
 
 #[derive(Clone, Copy, Debug)]
-enum Kind { Classify, Sentiment, Judge, Extract, Keyphrases }
+enum Kind { Classify, Sentiment, CompactClassify, CompactSentiment, Judge, Extract, Keyphrases }
 
 fn native() -> NativeLimits {
     NativeLimits { context_tokens: 8192, allocator_reserve_bytes: 64 << 20,
@@ -66,10 +66,23 @@ fn identity(facts: &ArtifactIdentity, task: &str, tokenizer: Sha256Digest, templ
         calibration_digest: absent, decision_policy_digest: absent,
         backend_semantic_version: STRICT_INT8_EXECUTION.to_owned(), host_class: None, compiler_identity: None }
 }
+fn compact_encoding() -> UntrustedEncoding {
+    UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 8192,
+        max_output_tokens: 4096, max_pair_checks: 1 << 22, max_pair_bytes: 1 << 26 })
+}
+fn encoding_work_limits() -> SafeBpeWorkLimits {
+    SafeBpeWorkLimits { max_input_bytes: 65536, max_output_tokens: 32768,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 }
+}
 fn classification(model: &ResidentInt8) -> (Arc<ClassificationPlanner>, ClassificationCorpusConfig) {
+    classification_with_encoding(model, UntrustedEncoding::ByteFallback)
+}
+fn classification_with_encoding(model: &ResidentInt8, encoding: UntrustedEncoding)
+    -> (Arc<ClassificationPlanner>, ClassificationCorpusConfig) {
     let registry = pinned_controls::pinned().unwrap(); let controls = registry.template_controls();
     let eos = controls.entries().iter().find(|e| e.special && e.surface == crate::template::IM_END).unwrap().id;
-    let planner = Arc::new(ClassificationPlanner::pinned(controls, eos).unwrap());
+    let planner = Arc::new(ClassificationPlanner::pinned(controls, eos).unwrap()
+        .with_document_encoding(encoding).unwrap());
     let config = ClassificationCorpusConfig {
         identity: identity(model.artifact_identity(), "classify-v1", planner.tokenizer_digest(), *planner.template_digest()),
         task_ceiling: budget(), planning: ClassificationLimits::default(),
@@ -85,12 +98,12 @@ fn input(kind: Kind) -> Vec<u8> {
                 "grounding":"structural","budget":budget()}),
             Kind::Keyphrases => json!({"task":"keyphrases","options":{
                 "max_phrases":1,"max_phrase_scalars":12},"budget":budget()}),
-            Kind::Classify => json!({
+            Kind::Classify | Kind::CompactClassify => json!({
                 "labels":[{"id":"billing","description":"Invoices"},{"id":"refund","description":"Refunds"}],
                 "mode":if index == 1 { "multi_label" } else { "exclusive" },
                 "policy":{"minimum_candidate_weight_ppm":0,"minimum_margin_ppm":0},"budget":budget(),
             }),
-            Kind::Sentiment => json!({
+            Kind::Sentiment | Kind::CompactSentiment => json!({
                 "axes":if index == 1 { vec!["valence","arousal","dominance","approach"] } else { vec!["valence"] },
                 "budget":budget(),
             }),
@@ -193,9 +206,15 @@ fn run_case(host: &NlpEngine, model: &ResidentInt8, kind: Kind, root: &Path,
                     schedule, team, reader, cancellation)
             }
         }
-        Kind::Classify => {
-            let (planner, config) = classification(model);
-            match (width, schedule) {
+        Kind::Classify | Kind::CompactClassify => {
+            let (planner, config) = if matches!(kind, Kind::CompactClassify) {
+                classification_with_encoding(model, compact_encoding())
+            } else { classification(model) };
+            if matches!(kind, Kind::CompactClassify) {
+                host.job_int8_classify_scheduled(model, planner, config, request, limits,
+                    Some(encoding_work_limits()), schedule, (width > 1).then_some((kernel, width)),
+                    reader, cancellation)
+            } else { match (width, schedule) {
                 (1, None) => host.job_int8_classify(model, planner, config, request, limits, reader, cancellation),
                 (1, Some(prefill)) => host.job_int8_classify_layer_major(model, planner, config, request,
                     limits, prefill, reader, cancellation),
@@ -203,18 +222,24 @@ fn run_case(host: &NlpEngine, model: &ResidentInt8, kind: Kind, root: &Path,
                     limits, kernel, width, reader, cancellation),
                 (_, Some(prefill)) => host.job_int8_classify_layer_major_with_threads(model, planner, config, request,
                     limits, kernel, width, prefill, reader, cancellation),
-            }
+            } }
         }
-        Kind::Sentiment => {
+        Kind::Sentiment | Kind::CompactSentiment => {
             let planner = Arc::new(SentimentPlanner::pinned(controls, SentimentOptions {
                 mode: ScoringMode::FullVocabulary, eos_token_id: eos,
                 policy: SentimentPolicy { minimum_peak_weight_ppm: 0, maximum_normalized_entropy_ppm: 1_000_000 },
-            }).unwrap());
+            }).unwrap().with_document_encoding(if matches!(kind, Kind::CompactSentiment) {
+                compact_encoding()
+            } else { UntrustedEncoding::ByteFallback }).unwrap());
             let config = SentimentCorpusConfig {
                 identity: identity(model.artifact_identity(), "sentiment-v1", planner.tokenizer_digest(), *planner.template_digest()),
                 task_ceiling: budget(), planning: SentimentLimits::default(), defaults: None,
                 max_item_work: work(), max_model_work: work() };
-            match (width, schedule) {
+            if matches!(kind, Kind::CompactSentiment) {
+                host.job_int8_sentiment_scheduled(model, planner, config, request, limits,
+                    Some(encoding_work_limits()), schedule, (width > 1).then_some((kernel, width)),
+                    reader, cancellation)
+            } else { match (width, schedule) {
                 (1, None) => host.job_int8_sentiment(model, planner, config, request, limits, reader, cancellation),
                 (1, Some(prefill)) => host.job_int8_sentiment_layer_major(model, planner, config, request,
                     limits, prefill, reader, cancellation),
@@ -222,7 +247,7 @@ fn run_case(host: &NlpEngine, model: &ResidentInt8, kind: Kind, root: &Path,
                     limits, kernel, width, reader, cancellation),
                 (_, Some(prefill)) => host.job_int8_sentiment_layer_major_with_threads(model, planner, config, request,
                     limits, kernel, width, prefill, reader, cancellation),
-            }
+            } }
         }
         Kind::Judge => {
             let planner = Arc::new(JudgePlanner::pinned(controls, eos).unwrap());
@@ -247,14 +272,15 @@ fn run_case(host: &NlpEngine, model: &ResidentInt8, kind: Kind, root: &Path,
 // Deterministically abandon the real planner's exact first-item debit at the
 // durable pre-forward boundary. This is an interrupted reservation fixture,
 // not a simulated successful processor or a claim about mid-kernel crashes.
-fn abandon_first_attempt(host: &NlpEngine, model: &ResidentInt8, root: &Path, input: &[u8]) -> JobWork {
+fn abandon_first_attempt(host: &NlpEngine, model: &ResidentInt8, root: &Path, input: &[u8], compact: bool) -> JobWork {
     #[derive(serde::Serialize)]
     struct Envelope<'a, R> { protocol: &'static str, input_profile: &'static str, processor: &'a R }
-    let (planner, config) = classification(model);
+    let (planner, config) = classification_with_encoding(model,
+        if compact { compact_encoding() } else { UntrustedEncoding::ByteFallback });
     let root = root.to_path_buf(); let input = input.to_vec();
     dispatch::run(host, native().run, CancellationToken::default(), move |control| {
-        let factory = Int8ClassificationJobPlanner::new(&planner, config.identity, config.task_ceiling,
-            config.planning, config.defaults, config.max_model_work).unwrap();
+        let factory = Int8ClassificationJobPlanner::new_with_document_encoding(&planner, config.identity, config.task_ceiling,
+            config.planning, config.defaults, config.max_model_work, compact.then(encoding_work_limits)).unwrap();
         let key = JobSecret::from_bytes([41; 32]); let job_id = JobId([42; 16]);
         let population = JobPopulation::read_ndjson(&mut Cursor::new(input), &key, job_id,
             lifetime(), host_limits().transport, control).unwrap();
@@ -289,6 +315,14 @@ fn structured_compact_jobs_preserve_all_stored_bytes_and_debits_across_schedules
     check_schedules(concat!(module_path!(),
         "::structured_compact_jobs_preserve_all_stored_bytes_and_debits_across_schedules_and_replay"),
         &[Kind::Extract, Kind::Keyphrases]);
+}
+
+#[test]
+#[ignore = "requires independently pinned INT8 model, admitted host memory and protected job storage"]
+fn compact_scoring_jobs_preserve_all_stored_bytes_and_debits_across_schedules_and_replay() {
+    check_schedules(concat!(module_path!(),
+        "::compact_scoring_jobs_preserve_all_stored_bytes_and_debits_across_schedules_and_replay"),
+        &[Kind::CompactClassify, Kind::CompactSentiment]);
 }
 
 fn check_schedules(full_name: &str, kinds: &[Kind]) {
@@ -383,10 +417,11 @@ fn check_schedules(full_name: &str, kinds: &[Kind]) {
             assert_eq!(original, actual, "original-input replay authenticates the same complete contract");
             drained(&host, baseline);
         }
-        if matches!(kind, Kind::Classify) {
-            let root = parent.join("abandoned-classification");
+        if matches!(kind, Kind::Classify | Kind::CompactClassify) {
+            let root = parent.join(format!("abandoned-classification-{task}"));
             fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
-            let abandoned = abandon_first_attempt(&host, &model, &root, &input);
+            let abandoned = abandon_first_attempt(&host, &model, &root, &input,
+                matches!(kind, Kind::CompactClassify));
             drained(&host, baseline);
             let resumed = run_case(&host, &model, kind, &root,
                 JobOpenMode::Resume(TailPolicy::Refuse), 4, Some(prefill(3)), &input);

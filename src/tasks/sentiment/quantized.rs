@@ -97,9 +97,19 @@ impl SentimentPlanner {
     pub fn plan_int8_with_control<C: DecodeStepControl>(&self, request: &SentimentRequest,
         context: &PlanContext<'_>, limits: SentimentLimits, control: &mut C)
         -> Result<PreparedInt8Sentiment, Int8SentimentError> {
+        self.plan_int8_with_encoding_budget(request, context, limits, control,
+            &mut crate::tokenizer::untrusted::SafeBpeWork::default(), None)
+    }
+    /// The invocation retains spent work across records and rejected plans.
+    /// Remaining execution caps never replace the original prompt identity.
+    pub(crate) fn plan_int8_with_encoding_budget<C: DecodeStepControl>(&self, request: &SentimentRequest,
+        context: &PlanContext<'_>, limits: SentimentLimits, control: &mut C,
+        work: &mut crate::tokenizer::untrusted::SafeBpeWork,
+        ceiling: Option<crate::tokenizer::untrusted::SafeBpeLimits>)
+        -> Result<PreparedInt8Sentiment, Int8SentimentError> {
         checkpoint(control)?;
-        let inner = self.plan_for_profile_with_control(request, context, limits,
-            NumericsProfile::StrictQuantized { version: 1 }, control)?;
+        let inner = self.plan_for_profile_with_encoding_ceiling(request, context, limits,
+            NumericsProfile::StrictQuantized { version: 1 }, control, work, ceiling)?;
         checkpoint(control)?;
         PreparedInt8Sentiment::compile(inner, context.execution_identity().clone(), request.budget, control)
     }

@@ -2,9 +2,10 @@
 use super::*;
 use crate::{
     batch::classify::quantized::Int8ClassificationAdmission,
-    jobs::runner::scored::{Int8ClassificationJobPlanner, Int8ClassificationJobProcessor,
+    jobs::runner::scored::{EncodingWorkScope, Int8ClassificationJobPlanner, Int8ClassificationJobProcessor,
         Int8SentimentJobPlanner, Int8SentimentJobProcessor},
     tasks::{classify::ClassificationPlanner, sentiment::SentimentPlanner, ir::TaskBudget},
+    tokenizer::untrusted::SafeBpeWorkLimits,
 };
 
 mod execution;
@@ -19,8 +20,8 @@ impl NlpEngine {
         config: ClassificationCorpusConfig, request: SourceJobRequest, limits: JobHostLimits,
         reader: R, cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        run(self, model, ClassificationTask { planner, config }, request, limits,
-            None, None, reader, cancellation)
+        self.job_int8_classify_scheduled(model, planner, config, request, limits,
+            None, None, None, reader, cancellation)
     }
 
     /// Bound every classification head's prompt without changing the private
@@ -31,8 +32,8 @@ impl NlpEngine {
         prefill: Int8PrefillLimits, reader: R, cancellation: CancellationToken)
         -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        run(self, model, ClassificationTask { planner, config }, request, limits,
-            Some(prefill), None, reader, cancellation)
+        self.job_int8_classify_scheduled(model, planner, config, request, limits,
+            None, Some(prefill), None, reader, cancellation)
     }
 
     /// Reuse one admitted projection team across every pending record and
@@ -43,8 +44,8 @@ impl NlpEngine {
         kernel: Int8Kernel, compute_threads: usize, reader: R, cancellation: CancellationToken)
         -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        run(self, model, ClassificationTask { planner, config }, request, limits,
-            None, Some((kernel, compute_threads)), reader, cancellation)
+        self.job_int8_classify_scheduled(model, planner, config, request, limits,
+            None, None, Some((kernel, compute_threads)), reader, cancellation)
     }
 
     /// Compose packed prompts with one persistent team. Coordinator and child
@@ -56,8 +57,8 @@ impl NlpEngine {
         prefill: Int8PrefillLimits, reader: R, cancellation: CancellationToken)
         -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        run(self, model, ClassificationTask { planner, config }, request, limits,
-            Some(prefill), Some((kernel, compute_threads)), reader, cancellation)
+        self.job_int8_classify_scheduled(model, planner, config, request, limits,
+            None, Some(prefill), Some((kernel, compute_threads)), reader, cancellation)
     }
 
     /// Commit one complete independently scored axis bundle per durable item.
@@ -67,8 +68,8 @@ impl NlpEngine {
         config: SentimentCorpusConfig, request: SourceJobRequest, limits: JobHostLimits,
         reader: R, cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        run(self, model, SentimentTask { planner, config }, request, limits,
-            None, None, reader, cancellation)
+        self.job_int8_sentiment_scheduled(model, planner, config, request, limits,
+            None, None, None, reader, cancellation)
     }
 
     /// Bound prompts for every axis while retaining the unchanged semantic
@@ -79,8 +80,8 @@ impl NlpEngine {
         prefill: Int8PrefillLimits, reader: R, cancellation: CancellationToken)
         -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        run(self, model, SentimentTask { planner, config }, request, limits,
-            Some(prefill), None, reader, cancellation)
+        self.job_int8_sentiment_scheduled(model, planner, config, request, limits,
+            None, Some(prefill), None, reader, cancellation)
     }
 
     /// A fixed projection team spans every pending document and complete axis
@@ -91,8 +92,8 @@ impl NlpEngine {
         kernel: Int8Kernel, compute_threads: usize, reader: R, cancellation: CancellationToken)
         -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        run(self, model, SentimentTask { planner, config }, request, limits,
-            None, Some((kernel, compute_threads)), reader, cancellation)
+        self.job_int8_sentiment_scheduled(model, planner, config, request, limits,
+            None, None, Some((kernel, compute_threads)), reader, cancellation)
     }
 
     /// Share admitted worker batch capacity across packed prompts and candidate
@@ -104,14 +105,52 @@ impl NlpEngine {
         prefill: Int8PrefillLimits, reader: R, cancellation: CancellationToken)
         -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        run(self, model, SentimentTask { planner, config }, request, limits,
-            Some(prefill), Some((kernel, compute_threads)), reader, cancellation)
+        self.job_int8_sentiment_scheduled(model, planner, config, request, limits,
+            None, Some(prefill), Some((kernel, compute_threads)), reader, cancellation)
+    }
+    /// Explicit compact retained classification with one nonrenewable
+    /// invocation tokenizer allowance. Original policy and all four total
+    /// caps authenticate on resume; physical scheduling grants no new work.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int8_classify_scheduled<R>(&self, model: &ResidentInt8, planner: Arc<ClassificationPlanner>,
+        config: ClassificationCorpusConfig, request: SourceJobRequest, limits: JobHostLimits,
+        encoding_work_limits: Option<SafeBpeWorkLimits>, prefill: Option<Int8PrefillLimits>,
+        team: Option<(Int8Kernel, usize)>, reader: R, cancellation: CancellationToken)
+        -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        let encoding = EncodingWorkScope::new(planner.document_encoding(), encoding_work_limits)
+            .map_err(HostedError::BatchSetup)?;
+        run(self, model, ClassificationTask { planner, config, encoding }, request, limits,
+            prefill, team, reader, cancellation)
+    }
+
+    /// Retain complete independent-axis results with the same invocation
+    /// tokenizer owner across original or retained-record job populations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int8_sentiment_scheduled<R>(&self, model: &ResidentInt8, planner: Arc<SentimentPlanner>,
+        config: SentimentCorpusConfig, request: SourceJobRequest, limits: JobHostLimits,
+        encoding_work_limits: Option<SafeBpeWorkLimits>, prefill: Option<Int8PrefillLimits>,
+        team: Option<(Int8Kernel, usize)>, reader: R, cancellation: CancellationToken)
+        -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        let encoding = EncodingWorkScope::new(planner.document_encoding(), encoding_work_limits)
+            .map_err(HostedError::BatchSetup)?;
+        run(self, model, SentimentTask { planner, config, encoding }, request, limits,
+            prefill, team, reader, cancellation)
     }
 }
 
-struct ClassificationTask { planner: Arc<ClassificationPlanner>, config: ClassificationCorpusConfig }
+struct ClassificationTask {
+    planner: Arc<ClassificationPlanner>, config: ClassificationCorpusConfig, encoding: Arc<EncodingWorkScope>,
+}
 impl Int8JobTask for ClassificationTask {
     fn identity(&self) -> &ExecutionIdentity { &self.config.identity }
+    fn retain_for_join(&self) -> Option<Box<dyn Send>> {
+        Some(Box::new((Arc::clone(&self.planner), Arc::clone(&self.encoding))))
+    }
+    fn preparation_workspace_bytes(&self) -> Result<u64, HostedError> {
+        self.encoding.workspace_bytes().map_err(HostedError::BatchSetup)
+    }
     fn validate(&self, native: Int8MemoryRequirement, job: JobLimits) -> Result<(), HostedError> {
         validate_work(self.config.max_model_work)?;
         capacity(self.config.task_ceiling, native.kv_bytes, job.max_result_bytes)?;
@@ -120,10 +159,10 @@ impl Int8JobTask for ClassificationTask {
     fn execute(self, engine: &mut StrictInt8Engine<'_>, admission: CorpusAdmission<'_>,
         request: SourceJobRequest, population: &Population<'_>, prefill: Option<Int8PrefillLimits>,
         control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
-        let Self { planner, config } = self;
+        let Self { planner, config, encoding } = self;
         let output_bytes = config.task_ceiling.max_output_bytes;
-        let factory = Int8ClassificationJobPlanner::new(&planner, config.identity,
-            config.task_ceiling, config.planning, config.defaults, config.max_model_work)
+        let factory = Int8ClassificationJobPlanner::with_encoding_scope(&planner, config.identity,
+            config.task_ceiling, config.planning, config.defaults, config.max_model_work, encoding)
             .map_err(HostedError::BatchSetup)?;
         let admission = ClassificationJobAdmission { output_bytes, inner: admission };
         let result = (|| {
@@ -137,19 +176,27 @@ impl Int8JobTask for ClassificationTask {
     }
 }
 
-struct SentimentTask { planner: Arc<SentimentPlanner>, config: SentimentCorpusConfig }
+struct SentimentTask {
+    planner: Arc<SentimentPlanner>, config: SentimentCorpusConfig, encoding: Arc<EncodingWorkScope>,
+}
 impl Int8JobTask for SentimentTask {
     fn identity(&self) -> &ExecutionIdentity { &self.config.identity }
+    fn retain_for_join(&self) -> Option<Box<dyn Send>> {
+        Some(Box::new((Arc::clone(&self.planner), Arc::clone(&self.encoding))))
+    }
+    fn preparation_workspace_bytes(&self) -> Result<u64, HostedError> {
+        self.encoding.workspace_bytes().map_err(HostedError::BatchSetup)
+    }
     fn validate(&self, native: Int8MemoryRequirement, job: JobLimits) -> Result<(), HostedError> {
-        self.config.validate(&self.planner).map_err(HostedError::BatchSetup)?;
+        self.config.validate_with_document_encoding(&self.planner).map_err(HostedError::BatchSetup)?;
         capacity(self.config.task_ceiling, native.kv_bytes, job.max_result_bytes)?;
         Ok(())
     }
     fn execute(self, engine: &mut StrictInt8Engine<'_>, admission: CorpusAdmission<'_>,
         request: SourceJobRequest, population: &Population<'_>, prefill: Option<Int8PrefillLimits>,
         control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
-        let Self { planner, config } = self;
-        let factory = Int8SentimentJobPlanner::new(&planner, config).map_err(HostedError::BatchSetup)?;
+        let Self { planner, config, encoding } = self;
+        let factory = Int8SentimentJobPlanner::with_encoding_scope(&planner, config, encoding).map_err(HostedError::BatchSetup)?;
         let result = (|| {
             let processor = match prefill {
                 None => Int8SentimentJobProcessor::new(factory, engine, admission),

@@ -153,3 +153,30 @@ fn retained_job_assets_and_exact_population_survive_callback_error_and_unwind() 
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }
+
+
+#[test]
+fn derived_compact_workspace_is_additive_for_every_input_and_prompt_worker_schedule() {
+    use crate::{jobs::runner::scored::EncodingWorkScope,
+        tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding}};
+    let call = SafeBpeLimits { max_input_bytes: 8192, max_output_tokens: 2048,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
+    let scope = EncodingWorkScope::new(&UntrustedEncoding::SafeBpeV1(call),
+        Some(SafeBpeWorkLimits { max_input_bytes: 65536, max_output_tokens: 32768,
+            max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 })).unwrap();
+    let encoder = scope.workspace_bytes().unwrap();
+    assert_eq!(encoder, call.requirements().unwrap().workspace_bytes + 1024);
+    let limits = limits(); let native = requirements(limits.native).unwrap();
+    for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
+        for (prefill, width) in [(None, None), (Some(prefill(4)), None),
+            (None, Some(3)), (Some(prefill(4)), Some(3))] {
+            let byte = quote(limits, job(), input, native, 0, prefill, width).unwrap();
+            let compact = quote(limits, job(), input, native, encoder, prefill, width).unwrap();
+            assert_eq!(compact.input_bytes, byte.input_bytes + encoder);
+            assert_eq!(compact.total_bytes().unwrap(), byte.total_bytes().unwrap() + encoder);
+            assert_eq!(compact.native, byte.native);
+            assert_eq!(compact.scratch_bytes, byte.scratch_bytes);
+            assert_eq!(compact.worker_bytes, byte.worker_bytes);
+        }
+    }
+}

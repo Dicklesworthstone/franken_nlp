@@ -79,10 +79,21 @@ impl<'p> Int8ClassificationBatchPlanner<'p> {
     /// its explicitly uncontrolled compatibility behavior.
     pub fn prepare_with_control<C: DecodeStepControl>(&self, document: BatchDocument<ClassificationBatchArgs>,
         control: &mut C) -> Result<PreparedInt8BatchClassification, BatchItemFailure> {
+        self.prepare_with_encoding_budget(document, control,
+            &mut crate::tokenizer::untrusted::SafeBpeWork::default(), None)
+    }
+    /// The durable owner supplies one pass's tightened execution ceiling and
+    /// receives consumed work even if a later planning step rejects the item.
+    pub(crate) fn prepare_with_encoding_budget<C: DecodeStepControl>(&self,
+        document: BatchDocument<ClassificationBatchArgs>, control: &mut C,
+        work: &mut crate::tokenizer::untrusted::SafeBpeWork,
+        ceiling: Option<crate::tokenizer::untrusted::SafeBpeLimits>)
+        -> Result<PreparedInt8BatchClassification, BatchItemFailure> {
         checkpoint(control)?;
         let args = document.task_args.or_else(|| self.defaults.clone()).ok_or_else(|| BatchItemFailure::reject(BatchCode::Planning))?;
         let context = PlanContext::new(&self.identity, self.ceiling).map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
-        let plan = self.planner.plan_int8_with_control(&args.into_request(document.text), &context, self.limits, control)
+        let plan = self.planner.plan_int8_with_encoding_budget(&args.into_request(document.text),
+            &context, self.limits, control, work, ceiling)
             .map_err(planning_failure)?;
         checkpoint(control)?;
         Ok(PreparedInt8BatchClassification { plan, factory_binding: self.binding })
@@ -116,6 +127,25 @@ impl<'p, 'e, 'w, A: Int8ClassificationAdmission> NativeInt8ClassificationBatch<'
     }
     pub fn remaining_work(&self) -> Int8Work { self.ledger.remaining }
     pub fn ready(&self) -> bool { self.ledger.state == State::Ready }
+    pub(crate) fn prepare_with_encoding_budget<C: DecodeStepControl>(&mut self,
+        document: BatchDocument<ClassificationBatchArgs>, control: &mut C,
+        work: &mut crate::tokenizer::untrusted::SafeBpeWork,
+        ceiling: Option<crate::tokenizer::untrusted::SafeBpeLimits>)
+        -> Result<PreparedInt8BatchClassification, BatchItemFailure> {
+        self.ledger.ready()?;
+        // A panic during compilation must not leave the adapter reusable.
+        self.ledger.state = State::Running;
+        let result = (|| {
+            let prepared = self.compiler.prepare_with_encoding_budget(document, control, work, ceiling)?;
+            subtract(self.ledger.remaining, prepared.model_work())?;
+            prepared.plan.preflight(prepared.execution_identity(), self.engine, budget(&prepared.plan))
+                .map_err(planning_failure)?;
+            checkpoint(control)?;
+            Ok(prepared)
+        })();
+        self.ledger.finish(result.as_ref().err());
+        result
+    }
 }
 impl<A: Int8ClassificationAdmission> BatchProcessor for NativeInt8ClassificationBatch<'_, '_, '_, A> {
     type Args = ClassificationBatchArgs;
@@ -126,19 +156,8 @@ impl<A: Int8ClassificationAdmission> BatchProcessor for NativeInt8Classification
     }
     fn prepare_with_control<C: DecodeStepControl>(&mut self, document: BatchDocument<Self::Args>,
         control: &mut C) -> Result<Self::Prepared, BatchItemFailure> {
-        self.ledger.ready()?;
-        // A panic during compilation must not leave the adapter reusable.
-        self.ledger.state = State::Running;
-        let result = (|| {
-            let prepared = self.compiler.prepare_with_control(document, control)?;
-            subtract(self.ledger.remaining, prepared.model_work())?;
-            prepared.plan.preflight(prepared.execution_identity(), self.engine, budget(&prepared.plan))
-                .map_err(planning_failure)?;
-            checkpoint(control)?;
-            Ok(prepared)
-        })();
-        self.ledger.finish(result.as_ref().err());
-        result
+        self.prepare_with_encoding_budget(document, control,
+            &mut crate::tokenizer::untrusted::SafeBpeWork::default(), None)
     }
     fn planned_work(&self, prepared: &Self::Prepared) -> BatchWork { transport_work(prepared.model_work()) }
     fn execute<C: DecodeStepControl>(&mut self, prepared: Self::Prepared, control: &mut C)

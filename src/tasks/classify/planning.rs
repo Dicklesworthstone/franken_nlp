@@ -16,7 +16,7 @@ use crate::{
     template::{Conversation, Message, MessageRole, RenderOptions, TemplateBuilder, ToolFormat,
         IM_START, IM_END, THINK_START, THINK_END},
     tokenizer::{bpe::EncodeOptions, specials::TemplateControlIds,
-        untrusted::{SafeBpeWork, UntrustedDocument, UntrustedDocumentEncoder, UntrustedDocumentError, UntrustedEncoding},
+        untrusted::{SafeBpeLimits, SafeBpeWork, UntrustedDocument, UntrustedDocumentEncoder, UntrustedDocumentError, UntrustedEncoding},
         embedded::{EmbeddedTokenizer, PINNED_TOKENIZER_MODEL_BYTES, PINNED_ADDED_TOKENS_BYTES,
             PINNED_TOKENIZER_CONFIG_BYTES, PINNED_SPECIAL_TOKENS_MAP_BYTES}},
 };
@@ -287,6 +287,28 @@ impl ClassificationPlanner {
     pub(super) fn plan_with_profile_and_work<C: DecodeStepControl>(&self, request: &ClassificationRequest,
         context: &PlanContext<'_>, limits: ClassificationLimits, control: &mut C, profile: NumericsProfile,
         encoding_work: &mut SafeBpeWork) -> Result<PreparedClassification, ClassificationPlanningError> {
+        self.plan_with_profile_and_encoding_ceiling(request, context, limits, control, profile, encoding_work, None)
+    }
+    /// Tighten execution work without changing the original prompt policy or
+    /// identity. The invocation owner debits this pass even when planning fails.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn plan_with_profile_and_encoding_ceiling<C: DecodeStepControl>(&self, request: &ClassificationRequest,
+        context: &PlanContext<'_>, limits: ClassificationLimits, control: &mut C, profile: NumericsProfile,
+        encoding_work: &mut SafeBpeWork, ceiling: Option<SafeBpeLimits>)
+        -> Result<PreparedClassification, ClassificationPlanningError> {
+        let effective = match (&self.document_encoding, ceiling) {
+            (_, None) => self.document_encoding.clone(),
+            (UntrustedEncoding::SafeBpeV1(call), Some(left)) => {
+                left.validate().map_err(|_| ClassificationPlanningError::InvalidLimits)?;
+                UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+                    max_input_bytes: call.max_input_bytes.min(left.max_input_bytes),
+                    max_output_tokens: call.max_output_tokens.min(left.max_output_tokens),
+                    max_pair_checks: call.max_pair_checks.min(left.max_pair_checks),
+                    max_pair_bytes: call.max_pair_bytes.min(left.max_pair_bytes),
+                })
+            }
+            _ => return Err(ClassificationPlanningError::InvalidLimits),
+        };
         let backend = match &profile {
             NumericsProfile::HfBf16Eager => None,
             NumericsProfile::StrictQuantized { version: 1 } => Some((
@@ -319,7 +341,7 @@ impl ClassificationPlanner {
             .ok_or(ClassificationPlanningError::ContextBudget)?;
         let codes = opaque_codes(labels.len())?;
         let maximum_code = if request.mode == ClassificationMode::Exclusive { codes[0].len() } else { 1 };
-        let compact = match &self.document_encoding {
+        let compact = match &effective {
             UntrustedEncoding::ByteFallback => None,
             UntrustedEncoding::SafeBpeV1(limits) => Some(*limits),
         };
@@ -370,13 +392,13 @@ impl ClassificationPlanner {
             drafts.push((record, candidates, label_index, maximum));
         }
         let encoder = UntrustedDocumentEncoder::new(self.tokenizer.tokenizer(), &self.controls);
-        let document = encode_input(&encoder, request.document.as_bytes(), &self.document_encoding, encoding_work, control)?;
+        let document = encode_input(&encoder, request.document.as_bytes(), &effective, encoding_work, control)?;
         let mut encoded = reserved(count)?; total_prompt = 0;
         // The unique source is tokenized once even for independent labels. All
         // metadata shares that same request ledger; repeated prompt copies are
         // still counted by aggregate prompt and native scoring work limits.
         for (record, candidates, label_index, maximum) in drafts {
-            let metadata = encode_input(&encoder, &record, &self.document_encoding, encoding_work, control)?;
+            let metadata = encode_input(&encoder, &record, &effective, encoding_work, control)?;
             let prompt_len = overhead.checked_add(metadata.ids().len()).and_then(|n| n.checked_add(document.ids().len()))
                 .ok_or(ClassificationPlanningError::ContextBudget)?;
             total_prompt = total_prompt.checked_add(prompt_len).ok_or(ClassificationPlanningError::ContextBudget)?;

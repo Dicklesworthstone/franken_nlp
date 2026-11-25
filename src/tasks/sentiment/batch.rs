@@ -112,6 +112,14 @@ impl<'p> Int8SentimentBatchPlanner<'p> {
     }
     pub fn prepare_with_control<C: DecodeStepControl>(&self, document: BatchDocument<SentimentBatchArgs>,
         control: &mut C) -> Result<PreparedInt8BatchSentiment, BatchItemFailure> {
+        self.prepare_with_encoding_budget(document, control,
+            &mut crate::tokenizer::untrusted::SafeBpeWork::default(), None)
+    }
+    pub(crate) fn prepare_with_encoding_budget<C: DecodeStepControl>(&self,
+        document: BatchDocument<SentimentBatchArgs>, control: &mut C,
+        work: &mut crate::tokenizer::untrusted::SafeBpeWork,
+        ceiling: Option<crate::tokenizer::untrusted::SafeBpeLimits>)
+        -> Result<PreparedInt8BatchSentiment, BatchItemFailure> {
         checkpoint(control)?;
         // Defaults are validated before any per-document clone (at most four axes).
         let args = document.task_args.or_else(|| self.config.defaults.clone())
@@ -121,7 +129,7 @@ impl<'p> Int8SentimentBatchPlanner<'p> {
         let request = SentimentRequest { document: document.text, axes: axes.clone(), budget: args.budget };
         let context = PlanContext::new(&self.config.identity, self.config.task_ceiling)
             .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
-        let plan = self.planner.plan_int8_with_control(&request, &context, self.config.planning, control)
+        let plan = self.planner.plan_int8_with_encoding_budget(&request, &context, self.config.planning, control, work, ceiling)
             .map_err(planning_failure)?;
         if !fits(plan.planned_work(), self.config.max_item_work) {
             return Err(BatchItemFailure::reject(BatchCode::WorkLimit));
@@ -170,6 +178,23 @@ impl<'p, 'e, 'w, A: Int8SentimentAdmission> NativeInt8SentimentBatch<'p, 'e, 'w,
     }
     pub fn remaining_work(&self) -> Int8Work { self.run.remaining }
     pub fn is_poisoned(&self) -> bool { self.run.failed || !self.driver.clean() }
+    pub(crate) fn prepare_with_encoding_budget<C: DecodeStepControl>(&mut self,
+        document: BatchDocument<SentimentBatchArgs>, control: &mut C,
+        work: &mut crate::tokenizer::untrusted::SafeBpeWork,
+        ceiling: Option<crate::tokenizer::untrusted::SafeBpeLimits>)
+        -> Result<PreparedInt8BatchSentiment, BatchItemFailure> {
+        self.run.ready()?; self.run.failed = true;
+        let result = (|| {
+            let prepared = self.compiler.prepare_with_encoding_budget(document, control, work, ceiling)?;
+            preflight(&prepared, &self.driver)?;
+            subtract(self.run.remaining, prepared.model_work())?;
+            Ok(prepared)
+        })();
+        if self.driver.clean() && !result.as_ref().is_err_and(|e: &BatchItemFailure| e.stop) {
+            self.run.failed = false;
+        }
+        result
+    }
 }
 impl<A: Int8SentimentAdmission> BatchProcessor for NativeInt8SentimentBatch<'_, '_, '_, A> {
     type Args = SentimentBatchArgs;
@@ -181,17 +206,8 @@ impl<A: Int8SentimentAdmission> BatchProcessor for NativeInt8SentimentBatch<'_, 
     }
     fn prepare_with_control<C: DecodeStepControl>(&mut self, document: BatchDocument<Self::Args>,
         control: &mut C) -> Result<Self::Prepared, BatchItemFailure> {
-        self.run.ready()?; self.run.failed = true;
-        let result = (|| {
-            let prepared = self.compiler.prepare_with_control(document, control)?;
-            preflight(&prepared, &self.driver)?;
-            subtract(self.run.remaining, prepared.model_work())?;
-            Ok(prepared)
-        })();
-        if self.driver.clean() && !result.as_ref().is_err_and(|e: &BatchItemFailure| e.stop) {
-            self.run.failed = false;
-        }
-        result
+        self.prepare_with_encoding_budget(document, control,
+            &mut crate::tokenizer::untrusted::SafeBpeWork::default(), None)
     }
     fn planned_work(&self, prepared: &Self::Prepared) -> BatchWork {
         let w = prepared.model_work(); BatchWork { forward_positions: w.forward_positions, projected_logits: w.projected_logits }

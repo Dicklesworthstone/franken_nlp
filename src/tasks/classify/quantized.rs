@@ -90,8 +90,17 @@ impl ClassificationPlanner {
         context: &PlanContext<'_>, limits: ClassificationLimits, control: &mut C,
         encoding_work: &mut crate::tokenizer::untrusted::SafeBpeWork)
         -> Result<PreparedInt8Classification, Int8ClassificationError> {
-        let inner = self.plan_with_profile_and_work(request, context, limits, control,
-            NumericsProfile::StrictQuantized { version: 1 }, encoding_work)?;
+        self.plan_int8_with_encoding_budget(request, context, limits, control, encoding_work, None)
+    }
+    /// The invocation lends remaining tokenizer work while every identity
+    /// retains the fixed original semantic policy.
+    pub(crate) fn plan_int8_with_encoding_budget<C: DecodeStepControl>(&self, request: &ClassificationRequest,
+        context: &PlanContext<'_>, limits: ClassificationLimits, control: &mut C,
+        encoding_work: &mut crate::tokenizer::untrusted::SafeBpeWork,
+        ceiling: Option<crate::tokenizer::untrusted::SafeBpeLimits>)
+        -> Result<PreparedInt8Classification, Int8ClassificationError> {
+        let inner = self.plan_with_profile_and_encoding_ceiling(request, context, limits, control,
+            NumericsProfile::StrictQuantized { version: 1 }, encoding_work, ceiling)?;
         let mut schedules = planning::reserved(inner.head_count())?;
         let mut work = Int8Work::default();
         for head in &inner.heads {
