@@ -6,6 +6,9 @@ mod scored;
 pub mod semantic;
 mod sentiment;
 pub use sentiment::SentimentCorpusConfig;
+mod sentiment_document;
+pub use sentiment_document::{SentimentDocumentCorpusConfig,
+    int8_sentiment_document_corpus_requirements};
 mod classify;
 pub use classify::{ClassificationCorpusConfig, ClassificationDocumentCorpusConfig,
     int8_classification_document_corpus_requirements};

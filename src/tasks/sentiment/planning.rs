@@ -23,7 +23,7 @@ use crate::{
         embedded::{EmbeddedTokenizer, PINNED_TOKENIZER_MODEL_BYTES, PINNED_ADDED_TOKENS_BYTES,
             PINNED_TOKENIZER_CONFIG_BYTES, PINNED_SPECIAL_TOKENS_MAP_BYTES},
         specials::TemplateControlIds,
-        untrusted::{SafeBpeWork, UntrustedDocument, UntrustedDocumentEncoder, UntrustedDocumentError, UntrustedEncoding},
+        untrusted::{SafeBpeLimits, SafeBpeWork, UntrustedDocument, UntrustedDocumentEncoder, UntrustedDocumentError, UntrustedEncoding},
     },
 };
 use super::{SentimentAnchor, SentimentAxis, SentimentAxisInput, SentimentError,
@@ -264,16 +264,42 @@ impl SentimentPlanner {
     /// Compact token counts need not be monotone as the source grows.
     pub(super) fn source_tokens_with_work<C: DecodeStepControl>(&self, source: &str,
         work: &mut SafeBpeWork, control: &mut C) -> Result<usize, SentimentPlanningError> {
-        checkpoint(control)?;
-        if self.document_encoding == UntrustedEncoding::ByteFallback { return Ok(source.len()); }
-        Ok(self.encode_source(source.as_bytes(), work, control)?.ids().len())
+        self.source_tokens_with_encoding_ceiling(source, work, control, None)
     }
 
-    fn encode_source<C: DecodeStepControl>(&self, source: &[u8],
-        work: &mut SafeBpeWork, control: &mut C) -> Result<UntrustedDocument, SentimentPlanningError> {
+    /// A population may tighten execution work without changing the semantic
+    /// encoder policy or its template digest. This cannot increase any bound.
+    pub(super) fn source_tokens_with_encoding_ceiling<C: DecodeStepControl>(&self, source: &str,
+        work: &mut SafeBpeWork, control: &mut C, ceiling: Option<SafeBpeLimits>)
+        -> Result<usize, SentimentPlanningError> {
+        checkpoint(control)?;
+        if self.document_encoding == UntrustedEncoding::ByteFallback {
+            if ceiling.is_some() { return Err(SentimentPlanningError::Budget); }
+            return Ok(source.len());
+        }
+        Ok(self.encode_source_with_ceiling(source.as_bytes(), work, control, ceiling)?.ids().len())
+    }
+
+    fn encode_source_with_ceiling<C: DecodeStepControl>(&self, source: &[u8],
+        work: &mut SafeBpeWork, control: &mut C, ceiling: Option<SafeBpeLimits>)
+        -> Result<UntrustedDocument, SentimentPlanningError> {
+        let effective = match (&self.document_encoding, ceiling) {
+            (_, None) => self.document_encoding.clone(),
+            (UntrustedEncoding::SafeBpeV1(original), Some(ceiling)) => {
+                ceiling.validate().map_err(|_| SentimentPlanningError::Budget)?;
+                if ceiling.max_input_bytes > original.max_input_bytes
+                    || ceiling.max_output_tokens > original.max_output_tokens
+                    || ceiling.max_pair_checks > original.max_pair_checks
+                    || ceiling.max_pair_bytes > original.max_pair_bytes {
+                    return Err(SentimentPlanningError::Budget);
+                }
+                UntrustedEncoding::SafeBpeV1(ceiling)
+            },
+            (UntrustedEncoding::ByteFallback, Some(_)) => return Err(SentimentPlanningError::Budget),
+        };
         let mut cancelled = None;
         let encoded = UntrustedDocumentEncoder::new(self.tokenizer.tokenizer(), &self.controls)
-            .encode_with_policy(source, &self.document_encoding, work, &mut || {
+            .encode_with_policy(source, &effective, work, &mut || {
                 cancelled = control.prefill_checkpoint(0); cancelled.is_none()
             });
         if let Some(cause) = cancelled { return Err(SentimentPlanningError::Cancelled(cause)); }
@@ -330,6 +356,16 @@ impl SentimentPlanner {
     pub(super) fn plan_for_profile_with_work<C: DecodeStepControl>(&self, request: &SentimentRequest,
         context: &PlanContext<'_>, limits: SentimentLimits, profile: NumericsProfile, control: &mut C,
         work: &mut SafeBpeWork) -> Result<SentimentPlan, SentimentPlanningError> {
+        self.plan_for_profile_with_encoding_ceiling(request, context, limits, profile, control, work, None)
+    }
+
+    /// The execution ceiling only tightens available encoding work. Identity
+    /// remains bound to the original explicit document policy.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn plan_for_profile_with_encoding_ceiling<C: DecodeStepControl>(&self,
+        request: &SentimentRequest, context: &PlanContext<'_>, limits: SentimentLimits,
+        profile: NumericsProfile, control: &mut C, work: &mut SafeBpeWork,
+        ceiling: Option<SafeBpeLimits>) -> Result<SentimentPlan, SentimentPlanningError> {
         checkpoint(control)?;
         let identity = context.execution_identity();
         let backend_matches = match &profile {
@@ -364,7 +400,7 @@ impl SentimentPlanner {
             preflight_prompt_lengths(request.document.len(), &overheads,
                 request.budget.max_input_tokens as usize, limits.max_total_prompt_tokens)?;
         }
-        let document = self.encode_source(request.document.as_bytes(), work, control)?;
+        let document = self.encode_source_with_ceiling(request.document.as_bytes(), work, control, ceiling)?;
         preflight_prompt_lengths(document.ids().len(), &overheads,
             request.budget.max_input_tokens as usize, limits.max_total_prompt_tokens)?;
         let mut inputs = Vec::new();

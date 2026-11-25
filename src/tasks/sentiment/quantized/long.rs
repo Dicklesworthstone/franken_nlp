@@ -260,6 +260,18 @@ impl SentimentPlanner {
         request: &'a SentimentRequest, context: &PlanContext<'_>, planning: SentimentLimits,
         limits: Int8SentimentMapLimits, control: &mut C, work: &mut SafeBpeWork)
         -> Result<PreparedInt8SentimentMap<'a>, Int8SentimentMapError> {
+        self.plan_int8_document_with_encoding_ceiling(request, context, planning, limits, control, work, None)
+    }
+
+    /// A resident population lends the original document ledger and a tighter
+    /// execution allowance. Failed probes still mutate `work`; only this pass's
+    /// delta enters the exact completion binding. The semantic policy is fixed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan_int8_document_with_encoding_ceiling<'a, C: DecodeStepControl>(&self,
+        request: &'a SentimentRequest, context: &PlanContext<'_>, planning: SentimentLimits,
+        limits: Int8SentimentMapLimits, control: &mut C, work: &mut SafeBpeWork,
+        ceiling: Option<SafeBpeLimits>)
+        -> Result<PreparedInt8SentimentMap<'a>, Int8SentimentMapError> {
         checkpoint(control)?;
         limits.validate(request.budget)?;
         constrained_int8::check_profile(context.execution_identity())
@@ -275,9 +287,10 @@ impl SentimentPlanner {
         let chunks = {
             let control = RefCell::new(&mut *control);
             ChunkPlan::build_with_checkpoints(&request.document, chunk_limits,
-                |text| self.source_tokens_with_work(text, work, &mut **control.borrow_mut()).map_err(|cause| {
-                    *error.borrow_mut() = Some(cause); MapReduceError::Tokenizer
-                }),
+                |text| self.source_tokens_with_encoding_ceiling(text, work, &mut **control.borrow_mut(), ceiling)
+                    .map_err(|cause| {
+                        *error.borrow_mut() = Some(cause); MapReduceError::Tokenizer
+                    }),
                 || match control.borrow_mut().prefill_checkpoint(0) {
                     Some(cause) => {
                         *error.borrow_mut() = Some(SentimentPlanningError::Cancelled(cause));
@@ -306,8 +319,8 @@ impl SentimentPlanner {
             document.try_reserve_exact(chunk.text().len()).map_err(|_| Int8SentimentMapError::Allocation)?;
             document.push_str(chunk.text());
             let row = SentimentRequest { document, axes: request.axes.clone(), budget: request.budget };
-            let inner = self.plan_for_profile_with_work(&row, context, planning,
-                NumericsProfile::StrictQuantized { version: 1 }, control, work)?;
+            let inner = self.plan_for_profile_with_encoding_ceiling(&row, context, planning,
+                NumericsProfile::StrictQuantized { version: 1 }, control, work, ceiling)?;
             let plan = PreparedInt8Sentiment::compile(inner, context.execution_identity().clone(), row.budget, control)?;
             if plan.head_count() != expected.heads || plan.task_budget() != request.budget
                 || plan.source_token_count()? != chunk.tokens() || plan.required_context() > chunk_limits.context_tokens {
