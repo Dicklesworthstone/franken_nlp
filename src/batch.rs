@@ -9,6 +9,9 @@ use std::{collections::BTreeSet, error::Error, fmt, io::{BufRead, Write}};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::{canonjson, native_engine::decode::{DecodeCancellationKind, DecodeStepControl}};
 
+#[cfg(any(feature = "asupersync-runtime", all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64"))))]
+pub(crate) mod encoding_work;
 pub mod classify;
 pub mod extract;
 pub mod generation;

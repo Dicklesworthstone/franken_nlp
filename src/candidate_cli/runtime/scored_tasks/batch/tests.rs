@@ -114,34 +114,39 @@ fn compact_sentiment_stream_keeps_one_policy_for_every_axis_and_record() {
 }
 
 #[test]
-fn exact_compact_policy_is_reported_on_flush_and_empty_terminal_frames_only_when_selected() {
+fn exact_compact_policy_and_judge_totals_are_reported_on_flush_and_terminal_frames() {
     use std::io::Write;
-    for extra in [&[][..], &["--input-encoding", "safe-bpe-v1"][..]] {
-        let c = command("sentiment", extra);
-        let encoding = c.host.encoding_policy(&c.encoding).unwrap(); let facts = facts();
-        let provenance = Provenance { protocol: "fnlp-candidate-batch-v1", schema_version: 1,
-            scope: "real-artifact-current-candidate", evidence: "non_authoritative",
-            model_id: &facts.model_id, source_revision: &facts.revision, source_root_sha256: &facts.source_root_sha256,
-            logical_model_sha256: &facts.logical_model_sha256, quant_recipe: &facts.recipe_id, task: "sentiment",
-            input_encoding: input_encoding::reported_policy(&encoding),
-            compute_threads: None, prefill_rows: None };
-        let mut output = Vec::new();
-        {
-            let mut writer = CandidateWriter::new(&mut output, &provenance, 1024, 16 * 1024).unwrap();
-            // Transport framing only: these fixtures do not invent scored results.
-            for kind in ["flush", "run_complete"] {
-                writeln!(writer, "{}", serde_json::json!({"kind":kind})).unwrap();
-                writer.flush().unwrap();
+    for task in ["classify", "sentiment", "judge"] {
+        for extra in [&[][..], &["--input-encoding", "safe-bpe-v1"][..]] {
+            let c = command(task, extra);
+            let encoding = c.encoding_policy().unwrap(); let totals = c.encoding_work_limits().unwrap(); let facts = facts();
+            let provenance = Provenance { protocol: "fnlp-candidate-batch-v1", schema_version: 1,
+                scope: "real-artifact-current-candidate", evidence: "non_authoritative",
+                model_id: &facts.model_id, source_revision: &facts.revision, source_root_sha256: &facts.source_root_sha256,
+                logical_model_sha256: &facts.logical_model_sha256, quant_recipe: &facts.recipe_id, task,
+                input_encoding: input_encoding::reported_policy(&encoding),
+                input_encoding_work_limits: totals, compute_threads: None, prefill_rows: None };
+            let mut output = Vec::new();
+            {
+                let mut writer = CandidateWriter::new(&mut output, &provenance, 1024, 16 * 1024).unwrap();
+                // Transport framing only: these fixtures do not invent scored results.
+                for kind in ["flush", "run_complete"] {
+                    writeln!(writer, "{}", serde_json::json!({"kind":kind})).unwrap();
+                    writer.flush().unwrap();
+                }
             }
-        }
-        let frames = serde_json::Deserializer::from_slice(&output).into_iter::<serde_json::Value>()
-            .collect::<Result<Vec<_>, _>>().unwrap();
-        assert_eq!(frames.len(), 2);
-        for (frame, kind) in frames.iter().zip(["flush", "run_complete"]) {
-            assert_eq!(frame["record"], serde_json::json!({"kind":kind}));
-            assert!(frame.get("compute_threads").is_none()); assert!(frame.get("prefill_rows").is_none());
-            if extra.is_empty() { assert!(frame.get("input_encoding").is_none()); }
-            else { assert_eq!(frame["input_encoding"], serde_json::to_value(&encoding).unwrap()); }
+            let frames = serde_json::Deserializer::from_slice(&output).into_iter::<serde_json::Value>()
+                .collect::<Result<Vec<_>, _>>().unwrap();
+            assert_eq!(frames.len(), 2);
+            for (frame, kind) in frames.iter().zip(["flush", "run_complete"]) {
+                assert_eq!(frame["record"], serde_json::json!({"kind":kind}));
+                assert!(frame.get("compute_threads").is_none()); assert!(frame.get("prefill_rows").is_none());
+                if extra.is_empty() { assert!(frame.get("input_encoding").is_none()); }
+                else { assert_eq!(frame["input_encoding"], serde_json::to_value(&encoding).unwrap()); }
+                if task == "judge" && !extra.is_empty() {
+                    assert_eq!(frame["input_encoding_work_limits"], serde_json::to_value(totals.unwrap()).unwrap());
+                } else { assert!(frame.get("input_encoding_work_limits").is_none()); }
+            }
         }
     }
 }
@@ -209,7 +214,7 @@ fn schedule_provenance_is_optional_and_never_alters_transport_records() {
             scope: "real-artifact-current-candidate", evidence: "non_authoritative",
             model_id: &facts.model_id, source_revision: &facts.revision, source_root_sha256: &facts.source_root_sha256,
             logical_model_sha256: &facts.logical_model_sha256, quant_recipe: &facts.recipe_id, task: "classify",
-            input_encoding: None, compute_threads: threads, prefill_rows: rows };
+            input_encoding: None, input_encoding_work_limits: None, compute_threads: threads, prefill_rows: rows };
         let mut output = Vec::new();
         let record = serde_json::json!({"kind":"run_complete","succeeded":0,"failed":0});
         {

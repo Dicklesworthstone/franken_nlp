@@ -189,3 +189,20 @@ fn owned_corpus_configuration_and_io_cross_the_real_blocking_boundary() {
     send::<JudgeCorpusConfig>();
     send::<StreamInput<(Arc<JudgePlanner>, JudgeCorpusConfig), std::io::Cursor<Vec<u8>>, Vec<u8>>>();
 }
+
+#[test]
+fn compact_stream_retains_actual_compiler_and_ledger_until_workers_join() {
+    let (planner, config, total) = planning::tests::compact_fixture();
+    let planner = Arc::new(planner);
+    let encoding = EncodingWorkScope::new(planner.document_encoding(), Some(total)).unwrap();
+    let compiler_lifetime = Arc::downgrade(&planner);
+    let ledger_lifetime = Arc::downgrade(&encoding);
+    let stream = JudgeStream { planner, config, encoding };
+    let retained = scored::CorpusTask::retain_for_join(&stream).unwrap();
+    drop(stream);
+    assert!(compiler_lifetime.upgrade().is_some());
+    assert!(ledger_lifetime.upgrade().is_some());
+    drop(retained);
+    assert!(compiler_lifetime.upgrade().is_none());
+    assert!(ledger_lifetime.upgrade().is_none());
+}

@@ -18,8 +18,8 @@ impl NlpEngine {
         config: JudgeCorpusConfig, request: SourceJobRequest, limits: JobHostLimits,
         reader: R, cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        scored_job::run(self, model, JudgeTask { planner, config }, request, limits,
-            None, None, reader, cancellation)
+        self.job_int8_judge_scheduled(model, planner, config, request, limits,
+            None, None, None, reader, cancellation)
     }
 
     /// Preserve the existing frozen-prefill recipe contract while sharing
@@ -30,8 +30,8 @@ impl NlpEngine {
         prefill: Int8PrefillLimits, reader: R, cancellation: CancellationToken)
         -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        scored_job::run(self, model, JudgeTask { planner, config }, request, limits,
-            Some(prefill), None, reader, cancellation)
+        self.job_int8_judge_scheduled(model, planner, config, request, limits,
+            None, Some(prefill), None, reader, cancellation)
     }
 
     /// Reuse one fixed team for every comparison order, rubric criterion and
@@ -42,8 +42,8 @@ impl NlpEngine {
         kernel: Int8Kernel, compute_threads: usize, reader: R, cancellation: CancellationToken)
         -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        scored_job::run(self, model, JudgeTask { planner, config }, request, limits,
-            None, Some((kernel, compute_threads)), reader, cancellation)
+        self.job_int8_judge_scheduled(model, planner, config, request, limits,
+            None, None, Some((kernel, compute_threads)), reader, cancellation)
     }
 
     /// Compose the frozen prompt schedule with one admitted persistent team.
@@ -56,25 +56,51 @@ impl NlpEngine {
         prefill: Int8PrefillLimits, reader: R, cancellation: CancellationToken)
         -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        scored_job::run(self, model, JudgeTask { planner, config }, request, limits,
-            Some(prefill), Some((kernel, compute_threads)), reader, cancellation)
+        self.job_int8_judge_scheduled(model, planner, config, request, limits,
+            None, Some(prefill), Some((kernel, compute_threads)), reader, cancellation)
+    }
+
+    /// Share the exact compact policy and one invocation tokenizer allowance
+    /// throughout authenticated start/resume. Policy and all four total caps
+    /// are frozen in the private recipe. Failed preparation remains charged;
+    /// stored native work and attempts never reset when this invocation ends.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int8_judge_scheduled<R>(&self, model: &ResidentInt8, planner: Arc<JudgePlanner>,
+        config: JudgeCorpusConfig, request: SourceJobRequest, limits: JobHostLimits,
+        encoding_work_limits: Option<SafeBpeWorkLimits>, prefill: Option<Int8PrefillLimits>,
+        team: Option<(Int8Kernel, usize)>, reader: R, cancellation: CancellationToken)
+        -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        let encoding = EncodingWorkScope::new(planner.document_encoding(), encoding_work_limits)
+            .map_err(HostedError::BatchSetup)?;
+        scored_job::run(self, model, JudgeTask { planner, config, encoding }, request, limits,
+            prefill, team, reader, cancellation)
     }
 }
 
-struct JudgeTask { planner: Arc<JudgePlanner>, config: JudgeCorpusConfig }
+struct JudgeTask {
+    planner: Arc<JudgePlanner>, config: JudgeCorpusConfig, encoding: Arc<EncodingWorkScope>,
+}
 impl Int8JobTask for JudgeTask {
     fn identity(&self) -> &ExecutionIdentity { &self.config.identity }
+    fn retain_for_join(&self) -> Option<Box<dyn Send>> {
+        Some(Box::new((Arc::clone(&self.planner), Arc::clone(&self.encoding))))
+    }
+    fn preparation_workspace_bytes(&self) -> Result<u64, HostedError> {
+        self.encoding.workspace_bytes().map_err(HostedError::BatchSetup)
+    }
     fn validate(&self, native: Int8MemoryRequirement, job: JobLimits) -> Result<(), HostedError> {
-        self.config.validate(&self.planner)?;
+        let (policy, _, _) = self.config.encoding_requirements(&self.planner, self.encoding.limits())?;
+        if &policy != self.encoding.policy() { return Err(HostedError::ModelIdentity); }
         check_capacity(self.config.task_ceiling, native.kv_bytes, job.max_result_bytes)
     }
     fn execute(self, engine: &mut StrictInt8Engine<'_>, admission: CorpusAdmission<'_>,
         request: SourceJobRequest, population: &Population<'_>, prefill: Option<Int8PrefillLimits>,
         control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
-        let Self { planner, config } = self;
-        let recipe = JudgeJobRecipe::new(&config, prefill)?;
+        let Self { planner, config, encoding } = self;
+        let recipe = JudgeJobRecipe::with_encoding(&config, prefill, &encoding)?;
         let ledger = WorkLedger::new(config.max_model_work);
-        let native = JudgeProcessor { planner: &planner, config, engine, admission, ledger, prefill };
+        let native = JudgeProcessor { planner: &planner, config, engine, admission, ledger, prefill, encoding };
         Ok(run_population(request, population, JudgeJobProcessor { native, recipe }, control))
     }
 }
@@ -122,6 +148,10 @@ struct JudgeJobRecipe {
     version: u32, dependency_scope: &'static str, execution: &'static str,
     prompt_version: &'static str, task_ceiling: TaskBudget, planning: PlanningRecipe,
     max_model_work: Int8Work, defaults: Option<JudgeBatchArgs>, prefill: Option<PrefillRecipe>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<UntrustedEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding_work_limits: Option<SafeBpeWorkLimits>,
 }
 impl JudgeJobRecipe {
     fn new(config: &JudgeCorpusConfig, prefill: Option<Int8PrefillLimits>) -> Result<Self, HostedError> {
@@ -134,7 +164,19 @@ impl JudgeJobRecipe {
         let recipe = Self { version: 1, dependency_scope: "item-local", execution: INT8_JUDGE_EXECUTION,
             prompt_version: JUDGE_PROMPT_VERSION, task_ceiling: config.task_ceiling,
             planning: config.planning.into(), max_model_work: config.max_model_work,
-            defaults: config.defaults.clone(), prefill };
+            defaults: config.defaults.clone(), prefill, input_encoding: None, encoding_work_limits: None };
+        planning::check_serialized_size(&recipe, 1024 * 1024 - 1024)?;
+        Ok(recipe)
+    }
+
+    fn with_encoding(config: &JudgeCorpusConfig, prefill: Option<Int8PrefillLimits>,
+        encoding: &EncodingWorkScope) -> Result<Self, HostedError> {
+        encoding.workspace_bytes().map_err(HostedError::BatchSetup)?;
+        let mut recipe = Self::new(config, prefill)?;
+        if matches!(encoding.policy(), UntrustedEncoding::SafeBpeV1(_)) {
+            recipe.input_encoding = Some(encoding.policy().clone());
+            recipe.encoding_work_limits = encoding.limits();
+        }
         planning::check_serialized_size(&recipe, 1024 * 1024 - 1024)?;
         Ok(recipe)
     }
@@ -146,7 +188,7 @@ struct JudgeJobProcessor<'p, 'e, 'w, 'a> {
 impl BatchProcessor for JudgeJobProcessor<'_, '_, '_, '_> {
     type Args = JudgeBatchArgs;
     type Prepared = PreparedInt8Judge;
-    type Output = GuardedOutput<Int8JudgeRun, Pending>;
+    type Output = GuardedOutput<JudgeOutput, Pending>;
     fn prepare(&mut self, document: BatchDocument<Self::Args>) -> Result<Self::Prepared, BatchItemFailure> {
         self.native.prepare(document)
     }

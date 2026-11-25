@@ -5,11 +5,24 @@ use std::io;
 const MAX_DEFAULT_BYTES: usize = 1024 * 1024;
 
 impl JudgeCorpusConfig {
+    /// Check the actual pinned compiler and quote the simultaneously live
+    /// encoder plus invocation ledger. Plain byte fallback has no policy
+    /// extension; compact execution requires all four whole-invocation caps.
+    pub fn encoding_requirements(&self, planner: &JudgePlanner, limits: Option<SafeBpeWorkLimits>)
+        -> Result<(UntrustedEncoding, Option<SafeBpeWorkLimits>, u64), HostedError> {
+        self.validate(planner)?;
+        let policy = planner.document_encoding().clone();
+        let bytes = EncodingWorkScope::workspace(&policy, limits).map_err(HostedError::BatchSetup)?;
+        Ok((policy, limits, bytes))
+    }
+
     /// Fixed configuration only. Never invent a document to validate a future
     /// stream, and never rewrite the supplied model/task identity.
     pub fn validate(&self, planner: &JudgePlanner) -> Result<(), HostedError> {
         self.identity.validate().map_err(|_| HostedError::ModelIdentity)?;
         check_binding(&self.identity, planner.template_digest(), planner.tokenizer_digest())?;
+        planner.document_encoding().validate()
+            .map_err(|_| HostedError::Limits("judge corpus input encoding"))?;
         self.task_ceiling.validate().map_err(|_| HostedError::Limits("judge corpus task ceiling"))?;
         validate_work(self.max_model_work)?;
         let limits = self.planning;
@@ -31,16 +44,33 @@ impl JudgeCorpusConfig {
     }
 }
 
+#[cfg(test)]
 pub(super) fn prepare<C: DecodeStepControl>(planner: &JudgePlanner, config: &JudgeCorpusConfig,
     document: BatchDocument<JudgeBatchArgs>, control: &mut C) -> Result<PreparedInt8Judge, BatchItemFailure> {
+    let encoding = EncodingWorkScope::new(planner.document_encoding(), None)
+        .map_err(BatchItemFailure::fatal)?;
+    prepare_with_encoding_scope(planner, config, &encoding, document, control)
+}
+
+pub(super) fn prepare_with_encoding_scope<C: DecodeStepControl>(planner: &JudgePlanner,
+    config: &JudgeCorpusConfig, encoding: &EncodingWorkScope,
+    document: BatchDocument<JudgeBatchArgs>, control: &mut C) -> Result<PreparedInt8Judge, BatchItemFailure> {
     checkpoint(control)?;
+    if planner.document_encoding() != encoding.policy() {
+        return Err(BatchItemFailure::fatal(BatchCode::Admission));
+    }
     let args = document.task_args.or_else(|| config.defaults.clone())
         .ok_or_else(|| BatchItemFailure::reject(BatchCode::Planning))?;
     check_args(&args, config.task_ceiling)?;
     let context = PlanContext::new(&config.identity, config.task_ceiling)
         .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
-    let plan = planner.plan_int8_with_control(&args.into_request(document.text),
-        &context, config.planning, control).map_err(planning_failure)?;
+    let request = args.into_request(document.text);
+    let plan = encoding.prepare(control, |remaining, work, control| {
+        let effective = remaining.map(UntrustedEncoding::SafeBpeV1)
+            .unwrap_or(UntrustedEncoding::ByteFallback);
+        planner.plan_int8_with_encoding_budget(&request, &context,
+            config.planning, control, &effective, work).map_err(planning_failure)
+    })?;
     checkpoint(control)?;
     Ok(plan)
 }
@@ -85,6 +115,43 @@ pub(super) fn check_serialized_size<T: Serialize + ?Sized>(value: &T, cap: usize
     }
     serde_json::to_writer(Counter { bytes: 0, cap }, value)
         .map_err(|_| HostedError::Limits("judge settings serialization bound"))
+}
+
+/// Count complete compact-result serialization without allocating a second
+/// output. Preserve terminal cancellation even when the same write also
+/// discovers that the provenance extension exceeds the original byte cap.
+pub(super) fn check_output_bytes<T: Serialize + ?Sized, C: DecodeStepControl>(
+    value: &T, cap: u64, control: &mut C) -> Result<(), BatchItemFailure> {
+    struct Counter<'a, C> {
+        bytes: u64, cap: u64, control: &'a mut C,
+        cancellation: Option<crate::native_engine::decode::DecodeCancellationKind>,
+        limited: bool,
+    }
+    impl<C: DecodeStepControl> io::Write for Counter<'_, C> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if let Some(cause) = self.control.prefill_checkpoint(0) {
+                self.cancellation = Some(cause);
+                return Err(io::Error::other("judge output cancelled"));
+            }
+            let next = self.bytes.checked_add(bytes.len() as u64).filter(|&n| n <= self.cap);
+            match next {
+                Some(next) => { self.bytes = next; Ok(bytes.len()) }
+                None => { self.limited = true; Err(io::Error::other("judge result byte limit")) }
+            }
+        }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+    checkpoint(control)?;
+    let mut writer = Counter { bytes: 0, cap, control, cancellation: None, limited: false };
+    let result = serde_json::to_writer(&mut writer, value);
+    if let Some(cause) = writer.cancellation.or_else(|| writer.control.prefill_checkpoint(0)) {
+        return Err(BatchItemFailure::fatal(BatchFault::cancelled(cause)));
+    }
+    match result {
+        Ok(()) => Ok(()),
+        Err(_) if writer.limited => Err(BatchItemFailure::reject(BatchCode::OutputLineLimit)),
+        Err(_) => Err(BatchItemFailure::fatal(BatchCode::Serialization)),
+    }
 }
 
 #[cfg(test)] pub(super) mod tests;

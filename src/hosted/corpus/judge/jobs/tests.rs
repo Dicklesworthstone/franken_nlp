@@ -1,6 +1,6 @@
 //! Real keyed manifests and pinned settings, not neural or filesystem evidence.
 use super::*;
-use super::super::planning::tests::{fixture, Continue};
+use super::super::planning::tests::{compact_fixture, fixture, Continue};
 use crate::{canonjson, jobs::{FrozenManifest, JobContract, JobId, JobInput, JobLimits, JobSecret,
     JobError, MismatchField}};
 
@@ -97,4 +97,82 @@ fn owned_judge_inputs_cross_the_existing_blocking_boundary() {
     fn send<T: Send + 'static>() {}
     send::<StreamInput<(Arc<JudgePlanner>, JudgeCorpusConfig, SourceJobRequest), std::io::Cursor<Vec<u8>>, ()>>();
     send::<Int8JudgeRun>();
+}
+
+#[test]
+fn byte_default_recipe_remains_exactly_the_original_private_projection() {
+    let (planner, config) = fixture();
+    let encoding = EncodingWorkScope::new(planner.document_encoding(), None).unwrap();
+    for prefill in [None, Some(limits(4))] {
+        let original = JudgeJobRecipe::new(&config, prefill).unwrap();
+        let explicit = JudgeJobRecipe::with_encoding(&config, prefill, &encoding).unwrap();
+        assert_eq!(canonjson::canonical_bytes(&original).unwrap(), canonjson::canonical_bytes(&explicit).unwrap());
+        let value = serde_json::to_value(&explicit).unwrap();
+        assert!(value.get("input_encoding").is_none());
+        assert!(value.get("encoding_work_limits").is_none());
+    }
+}
+
+#[test]
+fn all_compact_policy_and_invocation_caps_authenticate_resume() {
+    let (planner, config, total) = compact_fixture();
+    let UntrustedEncoding::SafeBpeV1(call) = planner.document_encoding().clone() else { panic!("compact fixture") };
+    let encoding = EncodingWorkScope::new(planner.document_encoding(), Some(total)).unwrap();
+    let original = JudgeJobRecipe::with_encoding(&config, None, &encoding).unwrap();
+    let baseline = freeze(&config, &original, INPUT, 7);
+    let value = serde_json::to_value(&original).unwrap();
+    assert_eq!(value["input_encoding"], serde_json::to_value(planner.document_encoding()).unwrap());
+    assert_eq!(value["encoding_work_limits"], serde_json::to_value(total).unwrap());
+    for axis in 0..8 {
+        let mut changed_call = call; let mut changed_total = total;
+        match axis {
+            0 => changed_call.max_input_bytes += 1,
+            1 => changed_call.max_output_tokens += 1,
+            2 => changed_call.max_pair_checks += 1,
+            3 => changed_call.max_pair_bytes += 1,
+            4 => changed_total.max_input_bytes += 1,
+            5 => changed_total.max_output_tokens += 1,
+            6 => changed_total.max_pair_checks += 1,
+            _ => changed_total.max_pair_bytes += 1,
+        }
+        let changed = EncodingWorkScope::new(&UntrustedEncoding::SafeBpeV1(changed_call), Some(changed_total)).unwrap();
+        let recipe = JudgeJobRecipe::with_encoding(&config, None, &changed).unwrap();
+        assert_eq!(baseline.binding.compare(&freeze(&config, &recipe, INPUT, 7).binding),
+            Err(JobError::Mismatch(MismatchField::Recipe)), "axis {axis}");
+    }
+    let grouped = JudgeJobRecipe::with_encoding(&config, Some(limits(4)), &encoding).unwrap();
+    assert_eq!(baseline.binding.compare(&freeze(&config, &grouped, INPUT, 7).binding),
+        Err(JobError::Mismatch(MismatchField::Recipe)));
+}
+
+#[test]
+fn consumed_tokenizer_work_does_not_rewrite_the_immutable_recipe() {
+    let (planner, config, total) = compact_fixture();
+    let encoding = EncodingWorkScope::new(planner.document_encoding(), Some(total)).unwrap();
+    let before = canonjson::canonical_bytes(&JudgeJobRecipe::with_encoding(&config, None, &encoding).unwrap()).unwrap();
+    let item = BatchDocument { id: "item".into(), text: "Alice writes accurate answers.".into(), task_args: None };
+    let prepared = planning::prepare_with_encoding_scope(&planner, &config, &encoding, item, &mut Continue).unwrap();
+    assert!(encoding.work().unwrap().input_bytes() > 0);
+    assert_eq!(prepared.input_encoding_work(), Some(encoding.work().unwrap()));
+    assert_eq!(before, canonjson::canonical_bytes(
+        &JudgeJobRecipe::with_encoding(&config, None, &encoding).unwrap()).unwrap());
+}
+
+#[test]
+fn judge_job_retains_actual_compiler_and_ledger_through_physical_join() {
+    let (planner, config, total) = compact_fixture();
+    let expected = config.encoding_requirements(&planner, Some(total)).unwrap().2;
+    let planner = Arc::new(planner);
+    let encoding = EncodingWorkScope::new(planner.document_encoding(), Some(total)).unwrap();
+    let compiler_lifetime = Arc::downgrade(&planner);
+    let ledger_lifetime = Arc::downgrade(&encoding);
+    let task = JudgeTask { planner, config, encoding };
+    assert_eq!(task.preparation_workspace_bytes().unwrap(), expected);
+    let retained = task.retain_for_join().unwrap();
+    drop(task);
+    assert!(compiler_lifetime.upgrade().is_some());
+    assert!(ledger_lifetime.upgrade().is_some());
+    drop(retained);
+    assert!(compiler_lifetime.upgrade().is_none());
+    assert!(ledger_lifetime.upgrade().is_none());
 }

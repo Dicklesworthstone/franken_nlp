@@ -2,12 +2,13 @@
 //! Recipes are immutable private projections, committed with the job secret.
 //! No generated-label shortcut, alternate scorer or public confidence claim.
 use serde::Serialize;
-use std::sync::{Arc, Mutex};
+#[cfg(test)] use std::sync::Arc;
+#[cfg(test)] use crate::tokenizer::untrusted::SafeBpeWork;
 use crate::{
-    batch::{BatchCode, BatchFault, BatchItemFailure, BatchWork, classify::ClassificationBatchArgs},
+    batch::{BatchCode, BatchFault, BatchWork, classify::ClassificationBatchArgs},
     jobs::manifest::bounded_json,
-    native_engine::{decode::DecodeStepControl, lmhead::scoring::ScoringLimits, strict_int8::Int8Work},
-    tokenizer::untrusted::{SafeBpeLimits, SafeBpeWork, SafeBpeWorkLimits, UntrustedEncoding},
+    native_engine::{lmhead::scoring::ScoringLimits, strict_int8::Int8Work},
+    tokenizer::untrusted::{SafeBpeWorkLimits, UntrustedEncoding},
     tasks::{classify::{ClassificationLimits, CLASSIFICATION_PROMPT_VERSION,
             quantized::INT8_CLASSIFICATION_EXECUTION},
         ir::TaskBudget,
@@ -23,66 +24,7 @@ pub use sentiment::{Int8SentimentJobPlanner, Int8SentimentJobProcessor, Prepared
 
 const RECIPE_BYTES: usize = 1024 * 1024 - 1024;
 
-/// One invocation owns every preparation attempt, including model-free
-/// previews, rejected records and the consuming native handoff. Only counters
-/// are retained, never source text. The same private owner also seals prepared
-/// work so another invocation cannot execute it against a fresh allowance.
-pub(crate) struct EncodingWorkScope {
-    policy: UntrustedEncoding,
-    limits: Option<SafeBpeWorkLimits>,
-    used: Mutex<SafeBpeWork>,
-}
-impl EncodingWorkScope {
-    pub(crate) fn new(policy: &UntrustedEncoding, limits: Option<SafeBpeWorkLimits>)
-        -> Result<Arc<Self>, BatchFault> {
-        Self::workspace(policy, limits)?;
-        Ok(Arc::new(Self { policy: policy.clone(), limits, used: Mutex::new(SafeBpeWork::default()) }))
-    }
-    fn workspace(policy: &UntrustedEncoding, limits: Option<SafeBpeWorkLimits>) -> Result<u64, BatchFault> {
-        match (policy, limits) {
-            (UntrustedEncoding::ByteFallback, None) => Ok(0),
-            (UntrustedEncoding::SafeBpeV1(call), Some(total)) => {
-                total.validate().map_err(|_| BatchCode::InvalidLimits)?;
-                call.requirements().map_err(|_| BatchCode::InvalidLimits)?.workspace_bytes
-                    .checked_add(1024).ok_or_else(|| BatchCode::InvalidLimits.into())
-            }
-            _ => Err(BatchCode::Admission.into()),
-        }
-    }
-    pub(crate) fn workspace_bytes(&self) -> Result<u64, BatchFault> {
-        Self::workspace(&self.policy, self.limits)
-    }
-    fn work(&self) -> Result<SafeBpeWork, BatchFault> {
-        self.used.try_lock().map(|used| *used).map_err(|_| BatchCode::InvalidExecution.into())
-    }
-    fn verify(self: &Arc<Self>, owner: &Arc<Self>) -> Result<(), BatchItemFailure> {
-        if !Arc::ptr_eq(self, owner) { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
-        Ok(())
-    }
-    fn prepare<T, C: DecodeStepControl>(&self, control: &mut C,
-        prepare: impl FnOnce(Option<SafeBpeLimits>, &mut SafeBpeWork, &mut C) -> Result<T, BatchItemFailure>)
-        -> Result<T, BatchItemFailure> {
-        if self.policy == UntrustedEncoding::ByteFallback {
-            return prepare(None, &mut SafeBpeWork::default(), control);
-        }
-        if let Some(cause) = control.prefill_checkpoint(0) {
-            return Err(BatchItemFailure::fatal(BatchFault::cancelled(cause)));
-        }
-        // Refuse overlapping/reentrant use instead of deadlocking or granting
-        // another ledger. A panic poisons this owner and cannot renew work.
-        let mut used = self.used.try_lock().map_err(|_| BatchItemFailure::fatal(BatchCode::InvalidExecution))?;
-        let (UntrustedEncoding::SafeBpeV1(call), Some(total)) = (&self.policy, self.limits) else {
-            return Err(BatchItemFailure::fatal(BatchCode::Admission));
-        };
-        let effective = total.remaining_call(*used, *call)
-            .map_err(|_| BatchItemFailure::fatal(BatchCode::WorkLimit))?;
-        let mut work = SafeBpeWork::default();
-        let result = prepare(Some(effective), &mut work, control);
-        // Debit before inspecting success, failure or typed cancellation.
-        *used = used.checked_add(work).ok_or_else(|| BatchItemFailure::fatal(BatchCode::WorkLimit))?;
-        result
-    }
-}
+pub(crate) use crate::batch::encoding_work::EncodingWorkScope;
 
 /// Exhaustive projection: a new scorer limit must be deliberately frozen here.
 #[derive(Serialize)]

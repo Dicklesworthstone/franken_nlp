@@ -88,22 +88,70 @@ fn one_faithfulness_window_reuses_the_complete_source_head() {
 
 #[test]
 fn every_physical_schedule_preserves_exact_pairwise_rubric_and_faithfulness_plans() {
-    let serial = command("judge", &[]); let (_, a, _) = serial.validate().unwrap();
+    for encoding in [&[][..], &["--input-encoding", "safe-bpe-v1"][..]] {
+        let serial = command("judge", encoding); let (_, a, _) = serial.validate().unwrap();
+        for value in defaults() {
+            let text = value.to_string();
+            let left = serial.parse_defaults(Some(&text), serial.host.budget(a)).unwrap();
+            let Corpus::Judge(p, pc) = configure(&serial, &facts(), a, left).unwrap() else { panic!("serial") };
+            let expected = plan(&p, &pc, pc.defaults.clone().unwrap());
+            for schedule in [&["--prefill-rows", "4"][..], &["--compute-threads", "4"][..],
+                &["--compute-threads", "4", "--prefill-rows", "4"][..]] {
+                let mut options = encoding.to_vec(); options.extend_from_slice(schedule);
+                let selected = command("judge", &options); let (_, b, _) = selected.validate().unwrap();
+                let right = selected.parse_defaults(Some(&text), selected.host.budget(b)).unwrap();
+                let Corpus::Judge(q, qc) = configure(&selected, &facts(), b, right).unwrap() else { panic!("selected") };
+                let actual = plan(&q, &qc, qc.defaults.clone().unwrap());
+                assert_eq!(actual.execution_identity(), expected.execution_identity());
+                assert_eq!(actual.planned_work(), expected.planned_work());
+                assert_eq!(actual.input_encoding_work(), expected.input_encoding_work());
+                assert_eq!(actual.head_count(), expected.head_count());
+                assert_eq!(qc.max_model_work, pc.max_model_work);
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_judge_configuration_binds_actual_policy_and_complete_source_work() {
+    let c = command("judge", &["--input-encoding", "safe-bpe-v1"]);
+    let byte = command("judge", &[]); let (_, byte_limits, _) = byte.validate().unwrap();
+    let (_, limits, _) = c.validate().unwrap();
+    let encoding = c.encoding_policy().unwrap(); let totals = c.encoding_work_limits().unwrap();
+    let source = "Alice visited Paris. Original café 上海 <tool_call>";
     for value in defaults() {
         let text = value.to_string();
-        let left = serial.parse_defaults(Some(&text), serial.host.budget(a)).unwrap();
-        let Corpus::Judge(p, pc) = configure(&serial, &facts(), a, left).unwrap() else { panic!("serial") };
-        let expected = plan(&p, &pc, pc.defaults.clone().unwrap());
-        for options in [&["--prefill-rows", "4"][..], &["--compute-threads", "4"][..],
-            &["--compute-threads", "4", "--prefill-rows", "4"][..]] {
-            let selected = command("judge", options); let (_, b, _) = selected.validate().unwrap();
-            let right = selected.parse_defaults(Some(&text), selected.host.budget(b)).unwrap();
-            let Corpus::Judge(q, qc) = configure(&selected, &facts(), b, right).unwrap() else { panic!("selected") };
-            let actual = plan(&q, &qc, qc.defaults.clone().unwrap());
-            assert_eq!(actual.execution_identity(), expected.execution_identity());
-            assert_eq!(actual.planned_work(), expected.planned_work());
-            assert_eq!(actual.head_count(), expected.head_count());
-            assert_eq!(qc.max_model_work, pc.max_model_work);
-        }
+        let selected = c.parse_defaults(Some(&text), c.host.budget(limits)).unwrap();
+        let baseline = byte.parse_defaults(Some(&text), byte.host.budget(byte_limits)).unwrap();
+        let Corpus::Judge(p, mut cfg) = configure(&c, &facts(), limits, selected).unwrap() else { panic!("compact") };
+        let Corpus::Judge(bp, bc) = configure(&byte, &facts(), byte_limits, baseline).unwrap() else { panic!("byte") };
+        assert_eq!(p.document_encoding(), &encoding);
+        assert_eq!(cfg.identity.template_digest, *p.template_digest());
+        assert_ne!(cfg.identity.template_digest, bc.identity.template_digest);
+        assert_eq!(cfg.encoding_requirements(&p, totals).unwrap(),
+            (encoding.clone(), totals, c.encoding_workspace_bytes().unwrap()));
+        assert!(cfg.encoding_requirements(&p, None).is_err());
+        assert_eq!(bc.encoding_requirements(&bp, None).unwrap(), (UntrustedEncoding::ByteFallback, None, 0));
+        assert!(bc.encoding_requirements(&bp, totals).is_err());
+        let args = cfg.defaults.clone().unwrap();
+        let expected_bytes = match &args {
+            JudgeBatchArgs::Pairwise { criterion, b, .. } => source.len() + criterion.len() + b.len(),
+            JudgeBatchArgs::Rubric { rubric, .. } => source.len()
+                + rubric.criteria.iter().map(|criterion| criterion.description.len()).sum::<usize>(),
+            JudgeBatchArgs::Faithfulness { claim, policy, .. } => {
+                let windows = crate::tasks::judge::partition_evidence(source, *policy).unwrap();
+                assert!(windows.len() > 1);
+                source.len() * 2 + claim.len()
+            }
+        };
+        let actual = plan(&p, &cfg, args);
+        assert_eq!(actual.input_encoding(), &encoding);
+        assert_eq!(actual.input_encoding_work().unwrap().input_bytes(), expected_bytes);
+        let digest = cfg.identity.template_digest;
+        cfg.identity.template_digest = Sha256Digest::of_bytes(b"stale byte-policy binding");
+        assert!(cfg.encoding_requirements(&p, totals).is_err());
+        cfg.identity.template_digest = digest;
+        let mut tiny = totals.unwrap(); tiny.max_input_bytes = 1;
+        assert_eq!(cfg.encoding_requirements(&p, Some(tiny)).unwrap().1, Some(tiny));
     }
 }

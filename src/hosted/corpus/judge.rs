@@ -2,18 +2,21 @@
 //! One resident native engine; complete per-document judgments, no retries.
 
 use super::*;
+use serde::Serialize;
 mod planning;
 #[cfg(test)] use crate::native_engine::decode::DecodeCancellationKind;
 #[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod jobs;
 use crate::{
     batch::{BatchDocument, BatchFault, BatchProcessor, BatchWork, judge::JudgeBatchArgs},
+    batch::encoding_work::EncodingWorkScope,
     native_engine::{constrained_int8::check_profile,
         decode::DecodeStepControl,
         lmhead::scoring::ScoringError,
         strict_int8::{StrictInt8Engine, prefill::Int8PrefillLimits, scoring::{Int8ScoringBudget, Int8ScoringError}}},
     tasks::{ir::{PlanContext, TaskBudget}, judge::{JudgeError, JudgeLimits, JudgePlanner,
         quantized::{Int8JudgeError, Int8JudgeRun, PreparedInt8Judge}}},
+    tokenizer::untrusted::{SafeBpeWork, SafeBpeWorkLimits, UntrustedEncoding},
 };
 
 /// Caller-owned planning settings, not deserialized executable task authority.
@@ -35,8 +38,8 @@ impl NlpEngine {
         planner: Arc<JudgePlanner>, config: JudgeCorpusConfig, limits: CorpusLimits,
         reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        scored::run(self, model, JudgeStream { planner, config }, limits,
-            None, None, reader, writer, cancellation)
+        self.batch_int8_judge_scheduled(model, planner, config, limits,
+            None, None, None, reader, writer, cancellation)
     }
 
     /// Bounded prompt groups for every comparison order, criterion and evidence
@@ -47,8 +50,8 @@ impl NlpEngine {
         prefill: Int8PrefillLimits, reader: R, writer: W, cancellation: CancellationToken)
         -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        scored::run(self, model, JudgeStream { planner, config }, limits,
-            Some(prefill), None, reader, writer, cancellation)
+        self.batch_int8_judge_scheduled(model, planner, config, limits,
+            None, Some(prefill), None, reader, writer, cancellation)
     }
 
     /// Use one persistent row team throughout every complete judgment and
@@ -59,8 +62,8 @@ impl NlpEngine {
         kernel: crate::native_engine::simd::Int8Kernel, compute_threads: usize,
         reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        scored::run(self, model, JudgeStream { planner, config }, limits,
-            None, Some((kernel, compute_threads)), reader, writer, cancellation)
+        self.batch_int8_judge_scheduled(model, planner, config, limits,
+            None, None, Some((kernel, compute_threads)), reader, writer, cancellation)
     }
 
     /// Share the admitted worker batch capacity across packed prompts and
@@ -72,29 +75,56 @@ impl NlpEngine {
         prefill: Int8PrefillLimits, reader: R, writer: W, cancellation: CancellationToken)
         -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        scored::run(self, model, JudgeStream { planner, config }, limits,
-            Some(prefill), Some((kernel, compute_threads)), reader, writer, cancellation)
+        self.batch_int8_judge_scheduled(model, planner, config, limits,
+            None, Some(prefill), Some((kernel, compute_threads)), reader, writer, cancellation)
+    }
+
+    /// Explicit compact judgments share one invocation tokenizer allowance
+    /// across records, rejected preparations and flushes. Every record still
+    /// obeys the planner's original policy; tightening the remaining budget
+    /// changes neither prompt identity nor successful output. The extra
+    /// encoder and ledger remain admitted until physical worker completion.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_judge_scheduled<R, W>(&self, model: &ResidentInt8,
+        planner: Arc<JudgePlanner>, config: JudgeCorpusConfig, limits: CorpusLimits,
+        encoding_work_limits: Option<SafeBpeWorkLimits>, prefill: Option<Int8PrefillLimits>,
+        team: Option<(crate::native_engine::simd::Int8Kernel, usize)>,
+        reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        let encoding = EncodingWorkScope::new(planner.document_encoding(), encoding_work_limits)
+            .map_err(HostedError::BatchSetup)?;
+        scored::run(self, model, JudgeStream { planner, config, encoding }, limits,
+            prefill, team, reader, writer, cancellation)
     }
 }
 
-struct JudgeStream { planner: Arc<JudgePlanner>, config: JudgeCorpusConfig }
+struct JudgeStream {
+    planner: Arc<JudgePlanner>, config: JudgeCorpusConfig, encoding: Arc<EncodingWorkScope>,
+}
 impl scored::CorpusTask for JudgeStream {
     fn identity(&self) -> &ExecutionIdentity { &self.config.identity }
+    fn retain_for_join(&self) -> Option<Box<dyn Send>> {
+        Some(Box::new((Arc::clone(&self.planner), Arc::clone(&self.encoding))))
+    }
     fn validate(&self, _model: &ArtifactIdentity, _limits: CorpusLimits, native: Int8MemoryRequirement) -> Result<u64, HostedError> {
-        self.config.validate(&self.planner)?;
+        let (policy, _, workspace) = self.config.encoding_requirements(&self.planner, self.encoding.limits())?;
+        if &policy != self.encoding.policy()
+            || workspace != self.encoding.workspace_bytes().map_err(HostedError::BatchSetup)? {
+            return Err(HostedError::ModelIdentity);
+        }
         if native.kv_bytes > self.config.task_ceiling.max_kv_bytes {
             return Err(HostedError::Limits("judge corpus whole KV allocation"));
         }
-        Ok(0)
+        Ok(workspace)
     }
     #[allow(clippy::too_many_arguments)]
     fn execute<R: BufRead, W: Write>(self, engine: &mut StrictInt8Engine<'_>,
         admission: CorpusAdmission<'_>, prefill: Option<Int8PrefillLimits>,
         reader: &mut R, writer: &mut W, limits: BatchLimits, defer: bool,
         control: &mut RunControl) -> Result<scored::Completion, HostedError> {
-        let Self { planner, config } = self;
+        let Self { planner, config, encoding } = self;
         let ledger = WorkLedger::new(config.max_model_work);
-        let mut processor = JudgeProcessor { planner: &planner, config, engine, admission, ledger, prefill };
+        let mut processor = JudgeProcessor { planner: &planner, config, engine, admission, ledger, prefill, encoding };
         scored::execute_stream(reader, writer, &mut processor, limits, defer, control)
     }
 }
@@ -114,11 +144,32 @@ struct JudgeProcessor<'p, 'e, 'w, 'a> {
     admission: CorpusAdmission<'a>,
     ledger: WorkLedger,
     prefill: Option<Int8PrefillLimits>,
+    encoding: Arc<EncodingWorkScope>,
+}
+
+/// Native task data stays intact. Compact provenance is added only when that
+/// policy actually prepared the complete result; byte-default result bytes
+/// retain their original schema. Failed records never manufacture work here.
+#[derive(Serialize)]
+struct JudgeOutput {
+    #[serde(flatten)]
+    run: Int8JudgeRun,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<UntrustedEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding_work: Option<SafeBpeWork>,
+}
+impl JudgeOutput {
+    fn complete(prepared: &PreparedInt8Judge, run: Int8JudgeRun) -> Self {
+        let input_encoding_work = prepared.input_encoding_work();
+        let input_encoding = input_encoding_work.map(|_| prepared.input_encoding().clone());
+        Self { run, input_encoding, input_encoding_work }
+    }
 }
 impl BatchProcessor for JudgeProcessor<'_, '_, '_, '_> {
     type Args = JudgeBatchArgs;
     type Prepared = PreparedInt8Judge;
-    type Output = GuardedOutput<Int8JudgeRun, Pending>;
+    type Output = GuardedOutput<JudgeOutput, Pending>;
 
     fn prepare(&mut self, _: BatchDocument<Self::Args>) -> Result<Self::Prepared, BatchItemFailure> {
         // Both stream and durable runners supply the SAME invocation control.
@@ -128,7 +179,8 @@ impl BatchProcessor for JudgeProcessor<'_, '_, '_, '_> {
     fn prepare_with_control<C: DecodeStepControl>(&mut self, document: BatchDocument<Self::Args>, control: &mut C)
         -> Result<Self::Prepared, BatchItemFailure> {
         self.ledger.ready()?;
-        let prepared = planning::prepare(self.planner, &self.config, document, control)?;
+        let prepared = planning::prepare_with_encoding_scope(self.planner, &self.config,
+            &self.encoding, document, control)?;
         self.ledger.preview(prepared.planned_work())?;
         if prepared.max_result_bytes() > self.admission.output_bytes {
             return Err(BatchItemFailure::reject(BatchCode::OutputLineLimit));
@@ -163,7 +215,13 @@ impl BatchProcessor for JudgeProcessor<'_, '_, '_, '_> {
                 return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
             }
             checkpoint(control)?;
-            Ok(GuardedOutput::new(run, guard))
+            let output = JudgeOutput::complete(&prepared, run);
+            // Compact provenance is part of the complete admitted result,
+            // not an unpriced suffix appended by the transport or spool.
+            if output.input_encoding.is_some() {
+                planning::check_output_bytes(&output, prepared.max_result_bytes(), control)?;
+            }
+            Ok(GuardedOutput::new(output, guard))
         })();
         self.ledger.finish(result.as_ref().err());
         result

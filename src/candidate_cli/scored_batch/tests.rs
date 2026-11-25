@@ -69,15 +69,27 @@ fn compact_score_streams_keep_whole_run_authority_and_reserve_encoder_memory() {
     }
 }
 #[test]
-fn compact_judgment_and_invalid_tokenizer_work_refuse_before_any_io() {
+fn invalid_tokenizer_work_refuses_before_defaults_model_or_stream_io() {
     struct Never;
     impl Read for Never { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("input read") } }
     impl Write for Never {
         fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("output write") }
         fn flush(&mut self) -> io::Result<()> { panic!("output flush") }
     }
-    let c = command("judge", &["--input-encoding", "safe-bpe-v1", "--defaults", "never-open.json"]);
-    assert_eq!(c.execute_owned(Never, Never), Err(CandidateError::Arguments));
+    for flag in ["--max-tokenizer-input-bytes", "--max-tokenizer-output-tokens",
+        "--max-total-tokenizer-input-bytes", "--max-total-tokenizer-output-tokens",
+        "--max-total-tokenizer-pair-checks", "--max-total-tokenizer-pair-bytes"] {
+        let c = command("judge", &["--input-encoding", "safe-bpe-v1", flag, "0",
+            "--defaults", "never-open.json"]);
+        assert_eq!(c.execute_owned(Never, Never), Err(CandidateError::Arguments));
+        let c = command("judge", &[flag, "1", "--defaults", "never-open.json"]);
+        assert_eq!(c.execute_owned(Never, Never), Err(CandidateError::Arguments));
+        for task in ["classify", "sentiment"] {
+            let c = command(task, &["--input-encoding", "safe-bpe-v1", flag, "1",
+                "--defaults", "never-open.json"]);
+            assert_eq!(c.execute_owned(Never, Never), Err(CandidateError::Arguments));
+        }
+    }
     for name in ["classify", "sentiment"] {
         for flag in ["--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
             let c = command(name, &["--input-encoding", "safe-bpe-v1", flag, "0"]);
@@ -254,5 +266,71 @@ fn live_and_retained_scoring_adapters_share_explicit_bounded_prefill_capability(
             let c = command(task, &["--prefill-rows", rows]);
             assert!(corpus_prefill(c.kind().unwrap(), &c.prefill).is_err());
         }
+    }
+}
+
+#[test]
+fn compact_judge_caps_cover_complete_record_work_and_one_finite_stream() {
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    let compact = command("judge", &["--input-encoding", "safe-bpe-v1"]);
+    let (args, limits, envelope) = compact.validate().unwrap();
+    let byte = command("judge", &[]); let (_, byte_limits, byte_envelope) = byte.validate().unwrap();
+    assert_eq!(compact.encoding_policy().unwrap(), UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: SafeBpeLimits::MAX_INPUT_BYTES, max_output_tokens: SafeBpeLimits::MAX_OUTPUT_TOKENS,
+        max_pair_checks: 4_194_304, max_pair_bytes: 67_108_864 }));
+    assert_eq!(compact.encoding_work_limits().unwrap(), Some(SafeBpeWorkLimits {
+        max_input_bytes: 64 * 1024 * 1024, max_output_tokens: 4 * 1024 * 1024,
+        max_pair_checks: 256 * 1024 * 1024, max_pair_bytes: 4096 * 1024 * 1024 }));
+    assert!(args.input_encoding.is_default());
+    assert_eq!(limits.preparation_bytes, byte_limits.preparation_bytes);
+    assert_eq!(compact.host.budget(limits), byte.host.budget(byte_limits));
+    assert_eq!(compact.host.work_ceiling(), byte.host.work_ceiling());
+    assert_eq!(envelope.transport.max_work, byte_envelope.transport.max_work);
+    let custom = command("judge", &["--input-encoding", "safe-bpe-v1",
+        "--max-tokenizer-input-bytes", "4096", "--max-tokenizer-output-tokens", "2048",
+        "--max-tokenizer-pair-checks", "7777", "--max-tokenizer-pair-bytes", "65536",
+        "--max-total-tokenizer-input-bytes", "8192", "--max-total-tokenizer-output-tokens", "4096",
+        "--max-total-tokenizer-pair-checks", "15554", "--max-total-tokenizer-pair-bytes", "131072"]);
+    custom.validate().unwrap();
+    assert_eq!(custom.encoding_policy().unwrap(), UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 4096, max_output_tokens: 2048, max_pair_checks: 7777, max_pair_bytes: 65536 }));
+    assert_eq!(custom.encoding_work_limits().unwrap(), Some(SafeBpeWorkLimits {
+        max_input_bytes: 8192, max_output_tokens: 4096, max_pair_checks: 15554, max_pair_bytes: 131072 }));
+    let few = command("judge", &["--input-encoding", "safe-bpe-v1", "--max-requests", "10"]);
+    let many = command("judge", &["--input-encoding", "safe-bpe-v1", "--max-requests", "1000"]);
+    assert_eq!(few.encoding_policy().unwrap(), many.encoding_policy().unwrap());
+    assert_eq!(few.encoding_work_limits().unwrap(), many.encoding_work_limits().unwrap());
+    assert_eq!(few.host.work_ceiling(), many.host.work_ceiling());
+    assert_eq!(byte.encoding_workspace_bytes().unwrap(), 0);
+    assert!(byte.encoding_work_limits().unwrap().is_none());
+}
+
+#[test]
+fn every_compact_judge_schedule_prices_one_workspace_and_invocation_ledger_before_io() {
+    struct Never;
+    impl Read for Never { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("input read"); } }
+    impl Write for Never {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("output write"); }
+        fn flush(&mut self) -> io::Result<()> { panic!("output flush"); }
+    }
+    for schedule in [&[][..], &["--prefill-rows", "4"][..], &["--compute-threads", "4"][..],
+        &["--compute-threads", "4", "--prefill-rows", "4"][..]] {
+        let mut byte = command("judge", schedule); byte.host.memory_mib = 32768;
+        let (_, baseline, base_envelope) = byte.validate().unwrap();
+        let mut flags = vec!["--input-encoding", "safe-bpe-v1", "--defaults", "never-open.json"];
+        flags.extend_from_slice(schedule);
+        let mut compact = command("judge", &flags); compact.host.memory_mib = 32768;
+        let (_, mut limits, envelope) = compact.validate().unwrap();
+        let prefill = compact.prefill_limits().unwrap();
+        let UntrustedEncoding::SafeBpeV1(policy) = compact.encoding_policy().unwrap() else { panic!("policy"); };
+        let workspace = policy.requirements().unwrap().workspace_bytes + 1024;
+        let peak = compact.peak_bytes(limits, envelope, prefill).unwrap();
+        assert_eq!(peak, byte.peak_bytes(baseline, base_envelope, prefill).unwrap() + workspace);
+        limits.memory_bytes = peak;
+        compact.check_scheduling_memory(limits, envelope, prefill).unwrap();
+        limits.memory_bytes -= 1;
+        assert_eq!(compact.check_scheduling_memory(limits, envelope, prefill), Err(CandidateError::Arguments));
+        compact.host.memory_mib = (peak - 1) / MIB;
+        assert_eq!(compact.execute_owned(Never, Never), Err(CandidateError::Arguments));
     }
 }

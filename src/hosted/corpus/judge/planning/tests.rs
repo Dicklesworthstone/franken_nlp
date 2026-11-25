@@ -5,6 +5,7 @@ use crate::{
     native_engine::strict_int8::STRICT_INT8_EXECUTION,
     tasks::judge::{PairwisePolicy, RubricDefinition, RubricCriterion, RubricPolicy, FaithfulnessPolicy},
     tokenizer::pinned_controls,
+    tokenizer::untrusted::SafeBpeLimits,
 };
 
 pub(in crate::hosted::corpus::judge) struct Continue;
@@ -136,4 +137,170 @@ fn malformed_fixed_identity_and_unbounded_defaults_refuse_before_stream_use() {
     config.identity.task_spec = "judge-v1".into();
     if let Some(JudgeBatchArgs::Pairwise { b, .. }) = &mut config.defaults { *b = "\n".repeat(MAX_DEFAULT_BYTES); }
     assert!(config.validate(&planner).is_err());
+}
+
+pub(in crate::hosted::corpus::judge) fn compact_fixture()
+    -> (JudgePlanner, JudgeCorpusConfig, SafeBpeWorkLimits) {
+    let (planner, mut config) = fixture();
+    let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 4096, max_output_tokens: 4096,
+        max_pair_checks: 1_000_000, max_pair_bytes: 16_000_000,
+    });
+    let planner = planner.with_document_encoding(policy).unwrap();
+    config.identity.template_digest = *planner.template_digest();
+    let total = SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 16_000_000, max_pair_bytes: 256_000_000 };
+    (planner, config, total)
+}
+
+#[test]
+fn compact_host_quote_prices_the_actual_policy_and_one_shared_owner() {
+    let (planner, config, total) = compact_fixture();
+    let (policy, caps, bytes) = config.encoding_requirements(&planner, Some(total)).unwrap();
+    assert_eq!(&policy, planner.document_encoding());
+    assert_eq!(caps, Some(total));
+    let UntrustedEncoding::SafeBpeV1(call) = policy else { panic!("compact fixture") };
+    assert_eq!(bytes, call.requirements().unwrap().workspace_bytes + 1024);
+    assert!(config.encoding_requirements(&planner, None).is_err());
+    let mut invalid = total; invalid.max_pair_checks = 0;
+    assert!(config.encoding_requirements(&planner, Some(invalid)).is_err());
+    let (plain, config) = fixture();
+    assert_eq!(config.encoding_requirements(&plain, None).unwrap(), (UntrustedEncoding::ByteFallback, None, 0));
+    assert!(config.encoding_requirements(&plain, Some(total)).is_err());
+}
+
+#[test]
+fn compact_pairwise_rubric_and_evidence_share_real_work_without_rebinding_prompts() {
+    let (planner, config, total) = compact_fixture();
+    let encoding = EncodingWorkScope::new(planner.document_encoding(), Some(total)).unwrap();
+    for args in [None, Some(rubric(config.task_ceiling)), Some(faithful(config.task_ceiling))] {
+        let before = encoding.work().unwrap();
+        let first = prepare_with_encoding_scope(&planner, &config, &encoding,
+            document(args.clone()), &mut Continue).unwrap();
+        let charged = encoding.work().unwrap().checked_sub(before).unwrap();
+        assert_eq!(first.input_encoding_work(), Some(charged));
+        assert!(charged.input_bytes() > 0 && charged.output_tokens() > 0 && charged.pair_checks() > 0);
+        assert_eq!(first.input_encoding(), planner.document_encoding());
+        let again = prepare_with_encoding_scope(&planner, &config, &encoding,
+            document(args), &mut Continue).unwrap();
+        assert_eq!(first.execution_identity(), again.execution_identity());
+        assert_eq!(first.input_encoding_work(), again.input_encoding_work());
+        assert_eq!(first.planned_work(), again.planned_work());
+    }
+}
+
+#[test]
+fn compact_pairwise_and_rubric_reuse_encoded_segments_across_heads() {
+    let (planner, config, total) = compact_fixture();
+    let encoding = EncodingWorkScope::new(planner.document_encoding(), Some(total)).unwrap();
+    let pair = prepare_with_encoding_scope(&planner, &config, &encoding,
+        document(None), &mut Continue).unwrap();
+    assert_eq!(pair.head_count(), 2);
+    assert_eq!(pair.input_encoding_work().unwrap().input_bytes(),
+        "Accuracy".len() + "Bob lives in London.".len() + document(None).text.len());
+    let rubric = prepare_with_encoding_scope(&planner, &config, &encoding,
+        document(Some(rubric(config.task_ceiling))), &mut Continue).unwrap();
+    assert_eq!(rubric.head_count(), 2);
+    assert_eq!(rubric.input_encoding_work().unwrap().input_bytes(),
+        document(None).text.len() + "Accuracy".len() + "Clarity".len());
+}
+
+#[test]
+fn rejected_partial_encoding_stays_charged_and_a_bounded_record_can_continue() {
+    let (planner, config, total) = compact_fixture();
+    let encoding = EncodingWorkScope::new(planner.document_encoding(), Some(total)).unwrap();
+    let mut invalid = pairwise(config.task_ceiling);
+    if let JudgeBatchArgs::Pairwise { b, .. } = &mut invalid { *b = "x".repeat(4096); }
+    let error = prepare_with_encoding_scope(&planner, &config, &encoding,
+        document(Some(invalid)), &mut Continue).err().unwrap();
+    assert!(!error.stop);
+    let failed = encoding.work().unwrap();
+    assert!(failed.input_bytes() > 0 && failed.pair_checks() > 0);
+    let next = prepare_with_encoding_scope(&planner, &config, &encoding,
+        document(None), &mut Continue).unwrap();
+    assert_eq!(encoding.work().unwrap(), failed.checked_add(next.input_encoding_work().unwrap()).unwrap());
+}
+
+#[test]
+fn every_invocation_axis_stays_spent_across_records() {
+    let (planner, config, total) = compact_fixture();
+    let probe = EncodingWorkScope::new(planner.document_encoding(), Some(total)).unwrap();
+    prepare_with_encoding_scope(&planner, &config, &probe, document(None), &mut Continue).unwrap();
+    let work = probe.work().unwrap();
+    for axis in 0..4 {
+        let mut bounded = total;
+        match axis {
+            0 => bounded.max_input_bytes = work.input_bytes() as u64,
+            1 => bounded.max_output_tokens = work.output_tokens() as u64,
+            2 => bounded.max_pair_checks = work.pair_checks(),
+            _ => bounded.max_pair_bytes = work.pair_bytes(),
+        }
+        let encoding = EncodingWorkScope::new(planner.document_encoding(), Some(bounded)).unwrap();
+        prepare_with_encoding_scope(&planner, &config, &encoding, document(None), &mut Continue).unwrap();
+        assert_eq!(encoding.work().unwrap(), work);
+        let error = prepare_with_encoding_scope(&planner, &config, &encoding,
+            document(None), &mut Continue).err().unwrap();
+        assert!(error.stop); assert_eq!(error.fault.code, BatchCode::WorkLimit);
+        assert_eq!(encoding.work().unwrap(), work);
+    }
+}
+
+#[test]
+fn compact_preparation_retains_all_cancellation_causes_and_spent_work() {
+    use DecodeCancellationKind::*;
+    struct Count(usize);
+    impl DecodeStepControl for Count {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { self.0 += 1; None }
+    }
+    struct Stop { seen: usize, at: usize, cause: DecodeCancellationKind }
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.seen += 1; (self.seen >= self.at).then_some(self.cause)
+        }
+    }
+    let (planner, config, total) = compact_fixture();
+    let item = || {
+        let mut item = document(None); item.text = "Alice writes accurate answers. ".repeat(16); item
+    };
+    let probe = EncodingWorkScope::new(planner.document_encoding(), Some(total)).unwrap();
+    let mut count = Count(0);
+    prepare_with_encoding_scope(&planner, &config, &probe, item(), &mut count).unwrap();
+    assert!(count.0 > 16);
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast,
+        RaceLost, ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let encoding = EncodingWorkScope::new(planner.document_encoding(), Some(total)).unwrap();
+        let error = prepare_with_encoding_scope(&planner, &config, &encoding, item(),
+            &mut Stop { seen: 0, at: count.0 / 2, cause }).err().unwrap();
+        assert!(error.stop); assert_eq!(error.fault.cancellation, Some(cause));
+        assert!(encoding.work().unwrap().input_bytes() > 0);
+    }
+}
+
+#[test]
+fn another_policy_cannot_borrow_a_scope_even_when_workspace_geometry_matches() {
+    let (planner, config, total) = compact_fixture();
+    let UntrustedEncoding::SafeBpeV1(mut call) = planner.document_encoding().clone() else { panic!("compact fixture") };
+    call.max_pair_checks -= 1;
+    let encoding = EncodingWorkScope::new(&UntrustedEncoding::SafeBpeV1(call), Some(total)).unwrap();
+    let error = prepare_with_encoding_scope(&planner, &config, &encoding,
+        document(None), &mut Continue).err().unwrap();
+    assert!(error.stop); assert_eq!(error.fault.code, BatchCode::Admission);
+    assert_eq!(encoding.work().unwrap(), SafeBpeWork::default());
+}
+
+#[test]
+fn output_count_includes_metadata_and_retains_terminal_cancellation_precedence() {
+    let value = serde_json::json!({ "result": "é\n\"", "input_encoding": "safe-bpe-v1" });
+    let bytes = serde_json::to_vec(&value).unwrap().len() as u64;
+    check_output_bytes(&value, bytes, &mut Continue).unwrap();
+    let error = check_output_bytes(&value, bytes - 1, &mut Continue).unwrap_err();
+    assert!(!error.stop); assert_eq!(error.fault.code, BatchCode::OutputLineLimit);
+    struct StopOnTerminal(usize);
+    impl DecodeStepControl for StopOnTerminal {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.0 += 1; (self.0 >= 3).then_some(DecodeCancellationKind::Deadline)
+        }
+    }
+    let error = check_output_bytes(&value, 0, &mut StopOnTerminal(0)).unwrap_err();
+    assert!(error.stop); assert_eq!(error.fault.cancellation, Some(DecodeCancellationKind::Deadline));
 }

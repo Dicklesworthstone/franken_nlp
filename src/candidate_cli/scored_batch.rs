@@ -6,6 +6,7 @@ use crate::{batch::{BatchLimits, BatchWork, classify::ClassificationBatchArgs},
         sentiment::{SentimentAxis, SentimentPolicy, batch::SentimentBatchArgs}, ir::TaskBudget}};
 use super::{scored::{ScoredArgs, prefill::ScoringPrefillArgs}, batch::{FRAME_ALLOWANCE, IO_BUFFER_BYTES}};
 use crate::native_engine::strict_int8::prefill::Int8PrefillLimits;
+use crate::tokenizer::untrusted::{SafeBpeWorkLimits, UntrustedEncoding};
 
 mod judge;
 
@@ -33,6 +34,10 @@ pub(crate) struct ScoreBatchCommand {
     #[arg(skip)]
     pub(super) encoding: input_encoding::InputEncodingArgs,
     #[arg(skip)]
+    pub(super) judge_encoding: super::judge::EncodingArgs,
+    #[command(flatten)]
+    pub(super) encoding_work: super::jobs::EncodingWorkArgs,
+    #[arg(skip)]
     pub(super) compute: compute::Args,
     /// Local task settings, without document, budget, model or execution identity.
     #[arg(long, value_name = "FILE")]
@@ -54,16 +59,17 @@ pub(super) struct ScoreEnvelope {
     pub io_bytes: u64,
 }
 pub(super) fn definition() -> clap::Command {
-    compute::definition(input_encoding::definition(ScoreBatchCommand::augment_args(clap::Command::new("score-batch")
+    compute::definition(super::judge::encoding_definition(ScoreBatchCommand::augment_args(clap::Command::new("score-batch")
         .about("Classify, score sentiment or judge with one resident candidate INT8 model")
         .long_about("Run a fixed finite-scoring task over bounded ordered NDJSON. All five model-work limits are WHOLE-RUN ceilings, not renewed per document or flush. Full-vocabulary candidate/EOS scoring, no generated-label shortcut, no network and no calibrated-confidence claim. Judge mode supports pairwise, rubric and whole-source faithfulness; text supplies A, the document or the complete source. All three tasks support --prefill-rows for bounded per-head prompt morsels and --compute-threads for one persistent INT8 row team across the entire stream. Documents remain ordered; both schedules admit their full simultaneous memory before IO. Omitted options preserve serial execution. A threaded run_complete is emitted only after every worker physically joins, under the original invocation deadline. Every event retains non-authoritative candidate provenance; any failed document causes a nonzero exit."))
         .mut_arg("input", |arg| arg.help("NDJSON {id,text,task_args?} records; '-' reads stdin without whole-file buffering"))))
-        .after_long_help("Classification and sentiment accept --input-encoding safe-bpe-v1. Every record gets one bounded tokenizer allowance shared by all document/label segments and scoring heads. Pair limits are per record; native work and transport ceilings remain whole-run limits across every record and flush. One transient encoder workspace is reserved beside retained plans and stream buffers. The exact policy binds every prompt and appears on all compact-stream events, including flush and run_complete. Byte-fallback remains the default; compact input changes prompt tokens without a quality, speed or identical-output claim. Judge mode remains byte-fallback and rejects compact input before any IO. Retained score-job commands keep their separate scheduling contract.")
+        .after_long_help("All tasks accept --input-encoding safe-bpe-v1. Every record gets one bounded tokenizer allowance shared by all its untrusted document, label, criterion, candidate and claim segments. Judgment additionally accepts --max-tokenizer-input-bytes and --max-tokenizer-output-tokens for complete-record planning work, independently of original line size and native head context; faithfulness includes the full source and every original-byte evidence window. Compact judgment shares one additional --max-total-tokenizer-* invocation allowance across all records, failed preparation and flush boundaries. These four total flags are judgment-only; classification and sentiment retain their per-record tokenizer contract. Native work and transport ceilings remain whole-run limits for every task. One transient encoder workspace and any invocation ledger are reserved beside retained plans and stream buffers before private IO. Every compact event reports its exact policy; judgment events also report invocation caps, including flush and run_complete. Byte-fallback remains the default. Compact input changes prompt tokens without a quality, speed or identical-output claim. Retained score-job commands keep their separate scheduling contract.")
 }
 impl ScoreBatchCommand {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let mut command = Self::from_arg_matches(matches)?;
         command.encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+        command.judge_encoding = super::judge::EncodingArgs::from_arg_matches(matches)?;
         command.compute = compute::Args::from_matches(matches)?;
         Ok(command)
     }
@@ -77,10 +83,15 @@ impl ScoreBatchCommand {
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits, ScoreEnvelope), CandidateError> {
         let prefill = self.prefill_limits()?;
         let compute = self.compute.admit_prefill(prefill)?;
-        if self.kind()? == ScoreTask::Judge && !self.encoding.is_default() {
-            return Err(CandidateError::Arguments);
-        }
-        let (mut args, mut limits) = self.host.common_with_encoding(&self.encoding)?;
+        self.encoding_policy()?;
+        self.encoding_work_limits()?;
+        // Judgment tokenization happens inside the transferred corpus owner.
+        // Its complete-record policy is independent of the wire/head ceilings,
+        // and peak_bytes prices that actual workspace beside retained plans.
+        let selected = if self.kind()? == ScoreTask::Judge {
+            input_encoding::InputEncodingArgs::default()
+        } else { self.encoding.clone() };
+        let (mut args, mut limits) = self.host.common_with_encoding(&selected)?;
         args.compute = self.compute;
         limits.compute = compute;
         if !(1..=100_000).contains(&self.max_requests)
@@ -113,6 +124,37 @@ impl ScoreBatchCommand {
         Ok((args, limits, envelope))
     }
 
+    pub(super) fn encoding_policy(&self) -> Result<UntrustedEncoding, CandidateError> {
+        if self.kind()? == ScoreTask::Judge {
+            self.judge_encoding.policy(&self.encoding)
+        } else {
+            if !self.judge_encoding.is_default() { return Err(CandidateError::Arguments); }
+            self.host.encoding_policy(&self.encoding)
+        }
+    }
+
+    pub(super) fn encoding_work_limits(&self) -> Result<Option<SafeBpeWorkLimits>, CandidateError> {
+        if self.kind()? == ScoreTask::Judge {
+            self.encoding_work.limits(&self.encoding).map_err(|_| CandidateError::Arguments)
+        } else if self.encoding_work == super::jobs::EncodingWorkArgs::default() {
+            Ok(None)
+        } else { Err(CandidateError::Arguments) }
+    }
+
+    pub(super) fn encoding_workspace_bytes(&self) -> Result<u64, CandidateError> {
+        if self.kind()? != ScoreTask::Judge {
+            let tokens = self.host.context_tokens.checked_sub(self.host.max_candidate_tokens)
+                .and_then(|tokens| tokens.checked_add(1)).ok_or(CandidateError::Arguments)?;
+            return self.encoding.workspace_bytes(self.host.max_input_bytes, tokens);
+        }
+        match self.encoding_policy()? {
+            UntrustedEncoding::ByteFallback => Ok(0),
+            UntrustedEncoding::SafeBpeV1(policy) => policy.requirements()
+                .map_err(|_| CandidateError::Arguments)?.workspace_bytes
+                .checked_add(1024).ok_or(CandidateError::Arguments),
+        }
+    }
+
     /// Complete simultaneous stream commitment. The caller's preparation,
     /// transferred compiler/IO owner, temporary encoder, coordinator prompt
     /// scratch, fixed worker buffers and one output guard all coexist.
@@ -127,7 +169,7 @@ impl ScoreBatchCommand {
             .and_then(|n| n.checked_add(t.max_epoch_id_bytes as u64))
             .and_then(|n| n.checked_add(limits.preparation_bytes))
             .and_then(|n| n.checked_add(envelope.io_bytes)).ok_or(CandidateError::Arguments)?;
-        let encoding_bytes = self.encoding.workspace_bytes(self.host.max_input_bytes, limits.max_prompt_tokens)?;
+        let encoding_bytes = self.encoding_workspace_bytes()?;
         let transferred = transferred.checked_add(encoding_bytes).ok_or(CandidateError::Arguments)?;
         let tokens = self.host.work_ceiling().projected_logits
             / crate::native_engine::lmhead::NANBEIGE_VOCAB_SIZE as u64;
@@ -142,7 +184,8 @@ impl ScoreBatchCommand {
         if limits.compute != self.compute.admit_prefill(prefill)? {
             return Err(CandidateError::Arguments);
         }
-        if (limits.compute.threads > 1 || prefill.is_some())
+        if (limits.compute.threads > 1 || prefill.is_some()
+            || (self.kind()? == ScoreTask::Judge && !self.encoding.is_default()))
             && self.peak_bytes(limits, envelope, prefill)? > limits.memory_bytes {
             return Err(CandidateError::Arguments);
         }
