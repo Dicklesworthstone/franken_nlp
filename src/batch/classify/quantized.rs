@@ -14,6 +14,9 @@ use crate::{canonjson,
         ir::{PlanContext, TaskBudget}}};
 use super::{ClassificationBatchArgs, GuardedOutput};
 
+/// Complete original-document classification on the same resident stream.
+pub mod long;
+
 /// The host's existing admission authority must price the WHOLE model work,
 /// not only head rows. This hook creates no broker, runtime, or model loader.
 /// The returned real guard covers task/output storage through sink delivery.

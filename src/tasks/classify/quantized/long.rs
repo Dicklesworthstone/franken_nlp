@@ -254,6 +254,19 @@ impl ClassificationPlanner {
         request: &'a ClassificationRequest, context: &PlanContext<'_>, planning: ClassificationLimits,
         limits: Int8ClassificationMapLimits, control: &mut C)
         -> Result<PreparedInt8ClassificationMap<'a>, Int8ClassificationMapError> {
+        self.plan_int8_document_with_encoding_work(request, context, planning, limits,
+            control, &mut SafeBpeWork::default())
+    }
+
+    /// Preserve compact work across initial preparation and exact reconstruction.
+    /// Failed probes and partially prepared documents retain the caller's debt.
+    /// The sealed metadata reports this pass's work, so reconstruction preserves
+    /// the original request identity and independently checked result contract.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan_int8_document_with_encoding_work<'a, C: DecodeStepControl>(&self,
+        request: &'a ClassificationRequest, context: &PlanContext<'_>, planning: ClassificationLimits,
+        limits: Int8ClassificationMapLimits, control: &mut C, work: &mut SafeBpeWork)
+        -> Result<PreparedInt8ClassificationMap<'a>, Int8ClassificationMapError> {
         planning::checkpoint(control)?;
         limits.validate(request.budget)?; planning.validate()?;
         self.document_encoding().validate().map_err(|_| Int8ClassificationMapError::Limits)?;
@@ -261,9 +274,9 @@ impl ClassificationPlanner {
         if request.document.len() > limits.chunks.max_input_bytes {
             return Err(Int8ClassificationMapError::Chunk(MapReduceError::InputBudget));
         }
-        let mut work = SafeBpeWork::default();
+        let before = *work;
         let capacity = self.source_token_capacity_with_work(request, *context.budget_ceiling(), planning,
-            limits.chunks.context_tokens, &mut work, control)?;
+            limits.chunks.context_tokens, work, control)?;
         let reserved = limits.chunks.context_tokens.checked_sub(capacity)
             .ok_or(Int8ClassificationMapError::Limits)?;
         let chunk_limits = ChunkLimits {
@@ -273,7 +286,7 @@ impl ClassificationPlanner {
         let chunks = {
             let control = RefCell::new(&mut *control);
             ChunkPlan::build_with_checkpoints(&request.document, chunk_limits,
-                |text| self.source_tokens_with_work(text, &mut work, &mut **control.borrow_mut())
+                |text| self.source_tokens_with_work(text, work, &mut **control.borrow_mut())
                     .map_err(|cause| { *error.borrow_mut() = Some(cause); MapReduceError::Tokenizer }),
                 || match control.borrow_mut().prefill_checkpoint(0) {
                     None => Ok(()),
@@ -296,7 +309,7 @@ impl ClassificationPlanner {
             document.push_str(chunk.text());
             let row = ClassificationRequest { document, labels: request.labels.clone(), mode: request.mode,
                 policy: request.policy, budget: request.budget };
-            let plan = self.plan_int8_with_encoding_work(&row, context, planning, control, &mut work)?;
+            let plan = self.plan_int8_with_encoding_work(&row, context, planning, control, work)?;
             if plan.head_count() != heads || plan.task_budget() != request.budget
                 || source_token_count(&plan)? != chunk.tokens()
                 || plan.required_context() > chunk_limits.context_tokens {
@@ -306,8 +319,9 @@ impl ClassificationPlanner {
             if !fits(total, limits.max_model_work) { return Err(Int8ClassificationMapError::Work); }
             plans.push(plan);
         }
+        let pass_work = work.checked_sub(before).ok_or(Int8ClassificationMapError::Admission)?;
         let request_binding = request_binding(request, context, planning, limits,
-            self.document_encoding(), work, &chunks, &plans, control)?;
+            self.document_encoding(), pass_work, &chunks, &plans, control)?;
         let expected = Int8ClassificationMapPreflight {
             source: VerifiedSourceSpan { byte_start: 0, byte_end: last.byte_end,
                 scalar_start: 0, scalar_end: last.scalar_end },
@@ -317,7 +331,7 @@ impl ClassificationPlanner {
             source_geometry: geometry(chunks.chunks().iter().map(|chunk| (chunk.id(), chunk.span(), chunk.tokens()))),
             encoding: match self.document_encoding() { UntrustedEncoding::ByteFallback => None,
                 UntrustedEncoding::SafeBpeV1(limits) => Some(*limits) },
-            encoding_work: work, request_binding,
+            encoding_work: pass_work, request_binding,
         };
         planning::checkpoint(control)?;
         Ok(PreparedInt8ClassificationMap { chunks, plans, limits, expected, task: request.budget })

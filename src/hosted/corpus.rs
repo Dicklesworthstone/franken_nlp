@@ -7,7 +7,8 @@ pub mod semantic;
 mod sentiment;
 pub use sentiment::SentimentCorpusConfig;
 mod classify;
-pub use classify::ClassificationCorpusConfig;
+pub use classify::{ClassificationCorpusConfig, ClassificationDocumentCorpusConfig,
+    int8_classification_document_corpus_requirements};
 mod judge;
 pub use judge::JudgeCorpusConfig;
 mod source;
