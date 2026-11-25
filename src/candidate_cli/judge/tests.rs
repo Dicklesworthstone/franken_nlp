@@ -201,3 +201,75 @@ fn invalid_judgment_team_or_peak_cannot_read_or_publish() {
         }
     }
 }
+
+#[test]
+fn compact_judgment_limits_are_separate_from_wire_size_and_native_context() {
+    let c = command(&["--input-encoding", "safe-bpe-v1",
+        "--max-tokenizer-input-bytes", "65536", "--max-tokenizer-output-tokens", "32768",
+        "--max-tokenizer-pair-checks", "131072", "--max-tokenizer-pair-bytes", "1048576"]);
+    assert_eq!(c.encoding_limits.policy(&c.encoding).unwrap(), UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 65536, max_output_tokens: 32768, max_pair_checks: 131072, max_pair_bytes: 1048576,
+    }));
+    assert_eq!(c.args.context_tokens, 2048);
+    assert_eq!(c.args.max_input_bytes, 65536);
+    assert_eq!(c.args.work_ceiling(), command(&[]).args.work_ceiling());
+    let explicit_byte = command(&["--input-encoding", "byte-fallback"]);
+    assert_eq!(explicit_byte.encoding_limits.policy(&explicit_byte.encoding).unwrap(), UntrustedEncoding::ByteFallback);
+    assert_eq!(explicit_byte.validate().unwrap().1, command(&[]).validate().unwrap().1);
+}
+
+#[test]
+fn compact_judgment_encoder_is_admitted_additively_for_every_physical_schedule() {
+    for threads in ["1", "4"] {
+        for rows in [None, Some("3")] {
+            let mut args = vec!["--compute-threads", threads];
+            if let Some(rows) = rows { args.extend(["--prefill-rows", rows]); }
+            let mut byte = command(&args); byte.args.memory_mib = 32768;
+            let (_, plain) = byte.validate().unwrap();
+            args.extend(["--input-encoding", "safe-bpe-v1"]);
+            let mut compact = command(&args); compact.args.memory_mib = 32768;
+            let (common, quoted) = compact.validate().unwrap();
+            let encoder = compact.encoding_limits.workspace_bytes(&compact.encoding).unwrap();
+            assert!(encoder > 0);
+            assert_eq!(quoted.preparation_bytes, plain.preparation_bytes + encoder);
+            assert_eq!(quoted.compute, plain.compute);
+            assert_eq!(compact.args.budget(quoted), byte.args.budget(plain));
+            assert!(common.input_encoding.is_default());
+
+            let native = Int8MemoryRequirement::for_context(compact.args.context_tokens).unwrap();
+            let prefill = compact.prefill.limits().unwrap();
+            let extra = prefill.map(|p| p.validate().unwrap()).unwrap_or(0);
+            let peak = compute::request_peak_bytes(quoted, native, compact.args.max_result_bytes as u64,
+                compact.args.max_candidate_tokens as u64, 0, 0).unwrap() + extra;
+            compact.args.memory_mib = peak.div_ceil(MIB);
+            compact.validate().unwrap();
+            compact.args.memory_mib -= 1;
+            assert!(matches!(compact.validate(), Err(CandidateError::Arguments)));
+        }
+    }
+}
+
+#[test]
+fn invalid_compact_judgment_caps_refuse_before_private_input_or_model_io() {
+    struct NoIo;
+    impl Read for NoIo {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("invalid judge accessed private input") }
+    }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("invalid judge emitted output") }
+        fn flush(&mut self) -> io::Result<()> { panic!("invalid judge flushed output") }
+    }
+    for flag in ["--max-tokenizer-input-bytes", "--max-tokenizer-output-tokens",
+        "--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
+        let words = ["candidate", "judge", "--model", "local.fnlpq", "--memory-mib", "8192", flag, "1"];
+        if let Ok(matches) = super::super::definition().try_get_matches_from(words) {
+            match CandidateCommand::from_matches(&matches) {
+                Ok(CandidateCommand::Judge(c)) => assert_eq!(c.execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments)),
+                Err(_) => {},
+                _ => panic!("wrong command"),
+            }
+        }
+        let c = command(&["--input-encoding", "safe-bpe-v1", flag, "0"]);
+        assert_eq!(c.execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+    }
+}

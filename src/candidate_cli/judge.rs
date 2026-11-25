@@ -5,6 +5,42 @@ use crate::{native_engine::lmhead::scoring::ScoringLimits,
     tasks::{ir::TaskBudget, judge::{JudgeLimits, JudgeRequest, PairwisePolicy,
         RubricDefinition, RubricPolicy, FaithfulnessPolicy, partition_evidence}}};
 use super::scored::{ScoredArgs, prefill::ScoringPrefillArgs};
+use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+
+/// One judgment may encode a full source and all of its evidence windows.
+/// Tokenizer work therefore has independent ceilings from wire bytes and the
+/// largest native head context; it is never renewed between judgment heads.
+#[derive(Args, Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::candidate_cli) struct EncodingArgs {
+    #[arg(long, value_name = "BYTES")]
+    max_tokenizer_input_bytes: Option<usize>,
+    #[arg(long, value_name = "TOKENS")]
+    max_tokenizer_output_tokens: Option<usize>,
+}
+impl EncodingArgs {
+    pub(in crate::candidate_cli) fn is_default(self) -> bool { self == Self::default() }
+    pub(in crate::candidate_cli) fn policy(self, encoding: &input_encoding::InputEncodingArgs)
+        -> Result<UntrustedEncoding, CandidateError> {
+        if encoding.is_default() && !self.is_default() { return Err(CandidateError::Arguments); }
+        encoding.policy(self.max_tokenizer_input_bytes.unwrap_or(SafeBpeLimits::MAX_INPUT_BYTES),
+            self.max_tokenizer_output_tokens.unwrap_or(SafeBpeLimits::MAX_OUTPUT_TOKENS))
+    }
+    pub(in crate::candidate_cli) fn workspace_bytes(self, encoding: &input_encoding::InputEncodingArgs)
+        -> Result<u64, CandidateError> {
+        match self.policy(encoding)? {
+            UntrustedEncoding::ByteFallback => Ok(0),
+            UntrustedEncoding::SafeBpeV1(limits) => limits.requirements()
+                .map(|quote| quote.workspace_bytes).map_err(|_| CandidateError::Arguments),
+        }
+    }
+}
+pub(in crate::candidate_cli) fn encoding_definition(command: clap::Command) -> clap::Command {
+    EncodingArgs::augment_args(input_encoding::definition(command))
+        .mut_arg("max_tokenizer_input_bytes", |arg| arg.help("Cumulative untrusted bytes encoded across every head of one complete judgment; safe-bpe-v1 only, default 1048576"))
+        .mut_arg("max_tokenizer_output_tokens", |arg| arg.help("Cumulative untrusted tokens across every head of one complete judgment; separate from native context, safe-bpe-v1 only, default 1048576"))
+        .mut_arg("max_tokenizer_pair_checks", |arg| arg.help("Cumulative BPE pair checks across the complete judgment; safe-bpe-v1 only, default 4194304"))
+        .mut_arg("max_tokenizer_pair_bytes", |arg| arg.help("Cumulative examined BPE pair bytes across the complete judgment; safe-bpe-v1 only, default 67108864"))
+}
 
 #[derive(Args)]
 pub(crate) struct JudgeCommand {
@@ -14,22 +50,48 @@ pub(crate) struct JudgeCommand {
     pub(super) prefill: ScoringPrefillArgs,
     #[arg(skip)]
     pub(super) compute: compute::Args,
+    #[arg(skip)]
+    pub(super) encoding: input_encoding::InputEncodingArgs,
+    #[arg(skip)]
+    pub(super) encoding_limits: EncodingArgs,
 }
 
 pub(super) fn definition() -> clap::Command {
-    compute::definition(JudgeCommand::augment_args(clap::Command::new("judge")
+    compute::definition(encoding_definition(JudgeCommand::augment_args(clap::Command::new("judge")
         .about("Score both comparison orders, every rubric criterion, or full-source faithfulness")
-        .long_about("Judge one bounded JSON request with mode pairwise, rubric or faithfulness and an explicit uncalibrated policy. Scores use the complete finite candidate language and full-vocabulary denominators, including EOS. Faithfulness requires the whole source to fit and retains every evidence window; this is not a factuality certificate. No free generation, automatic retries, thinking or tools. One failed head fails the whole request.")))
+        .long_about("Judge one bounded JSON request with mode pairwise, rubric or faithfulness and an explicit uncalibrated policy. Scores use the complete finite candidate language and full-vocabulary denominators, including EOS. Faithfulness requires the whole source to fit and retains every evidence window; this is not a factuality certificate. No free generation, automatic retries, thinking or tools. One failed head fails the whole request."))))
+        .after_long_help("--input-encoding safe-bpe-v1 preserves exact untrusted criterion, candidate, document and claim bytes while excluding template controls. One bounded tokenizer allowance covers the complete pairwise or rubric judgment, or the full faithfulness source plus every original-byte evidence window. --max-tokenizer-input-bytes and --max-tokenizer-output-tokens are cumulative planning-work ceilings, independent of wire size and native context; pair-work caps cover the same complete preparation. The encoder workspace is admitted before private IO and retained through completion. All four serial/prefill/team schedules preserve the selected semantic identity. Compact responses report the exact policy and actual preparation work. Byte-fallback remains the default; compact input changes prompt tokens and makes no tokenizer-parity, identical-output, quality or speed claim.")
 }
 impl JudgeCommand {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let mut command = Self::from_arg_matches(matches)?;
         command.compute = compute::Args::from_matches(matches)?;
+        command.encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+        command.encoding_limits = EncodingArgs::from_arg_matches(matches)?;
         Ok(command)
     }
+    pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), CandidateError> {
+        let workspace = self.encoding_limits.workspace_bytes(&self.encoding)?;
+        let prefill = self.prefill.limits()?;
+        // The shared score quote prices retained prompts. This route owns a
+        // distinct transient encoder whose cumulative bounds are independent
+        // from the largest head, so add it once to the caller's held charge.
+        let (common, mut limits) = self.args.common_with_compute(
+            &input_encoding::InputEncodingArgs::default(), self.compute, prefill, false)?;
+        limits.preparation_bytes = limits.preparation_bytes.checked_add(workspace)
+            .ok_or(CandidateError::Arguments)?;
+        let native = Int8MemoryRequirement::for_context(self.args.context_tokens)
+            .map_err(|_| CandidateError::Arguments)?;
+        let extra = prefill.map(|limits| limits.validate()).transpose()
+            .map_err(|_| CandidateError::Arguments)?.unwrap_or(0);
+        let peak = compute::request_peak_bytes(limits, native, self.args.max_result_bytes as u64,
+            self.args.max_candidate_tokens as u64, 0, 0)?
+            .checked_add(extra).ok_or(CandidateError::Arguments)?;
+        if peak > limits.memory_bytes { return Err(CandidateError::Arguments); }
+        Ok((common, limits))
+    }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
-        let (common, limits) = self.args.common_with_compute(&input_encoding::InputEncodingArgs::default(),
-            self.compute, self.prefill.limits()?, false)?;
+        let (common, limits) = self.validate()?;
         #[cfg(feature = "asupersync-runtime")]
         { runtime::judgment::execute(self, common, limits, input, output) }
         #[cfg(not(feature = "asupersync-runtime"))]
