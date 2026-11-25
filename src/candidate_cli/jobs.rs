@@ -105,7 +105,18 @@ pub(super) struct EncodingWorkArgs {
 impl EncodingWorkArgs {
     pub(super) fn limits(self, encoding: &input_encoding::InputEncodingArgs)
         -> Result<Option<SafeBpeWorkLimits>, Failure> {
-        if encoding.is_default() {
+        self.for_compact_encoding(!encoding.is_default())
+    }
+
+    pub(super) fn for_document(self, encoding: &UntrustedEncoding)
+        -> Result<Option<SafeBpeWorkLimits>, Failure> {
+        encoding.validate().map_err(|_| Failure::usage("job_input_encoding"))?;
+        self.for_compact_encoding(matches!(encoding, UntrustedEncoding::SafeBpeV1(_)))
+    }
+
+    fn for_compact_encoding(self, compact: bool)
+        -> Result<Option<SafeBpeWorkLimits>, Failure> {
+        if !compact {
             return if self == Self::default() { Ok(None) }
                 else { Err(Failure::usage("job_input_encoding")) };
         }

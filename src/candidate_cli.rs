@@ -29,6 +29,7 @@ mod scored;
 mod sentiment_map;
 mod classify_map;
 mod scored_batch;
+mod scored_documents;
 mod extract;
 mod semantic;
 mod jobs;
@@ -126,6 +127,7 @@ pub(crate) enum CandidateCommand {
     Resolve(resolve::ResolveCommand),
     Batch(batch::BatchCommand),
     ScoreBatch(scored_batch::ScoreBatchCommand),
+    DocumentCorpus(scored_documents::DocumentCorpusCommand),
     Job(jobs::JobCommand),
     ScoreJob(jobs::scored::ScoreJobCommand),
     Stream(stream::StreamCommand),
@@ -143,6 +145,7 @@ pub(crate) fn definition() -> clap::Command {
         .subcommand(classify_map::definition())
         .subcommand(batch::definition())
         .subcommand(scored_batch::definition())
+        .subcommands(scored_documents::definitions())
         .subcommand(extract::definition())
         .subcommand(semantic::definition())
         .subcommand(semantic::corpus::definition())
@@ -206,6 +209,9 @@ impl CandidateCommand {
         if name == "job" {
             return jobs::JobCommand::from_matches(matches).map(Self::Job);
         }
+        if matches!(name, "classify-corpus" | "sentiment-corpus") {
+            return scored_documents::DocumentCorpusCommand::from_matches(name, matches).map(Self::DocumentCorpus);
+        }
         if name == "score-batch" {
             return scored_batch::ScoreBatchCommand::from_matches(matches).map(Self::ScoreBatch);
         }
@@ -245,6 +251,7 @@ impl CandidateCommand {
             Self::SourceInt4(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::Batch(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::ScoreBatch(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
+            Self::DocumentCorpus(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::SemanticBatch(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::SemanticJob(command) => command.run_owned(io::stdin(), &mut io::stdout(), &mut io::stderr()),
             Self::Job(command) => command.run_owned(io::stdin(), &mut io::stdout(), &mut io::stderr()),
@@ -287,7 +294,7 @@ impl CandidateCommand {
             Self::Resolve(command) => return command.execute(input, output),
             // A borrowed stream cannot outlive the hosted blocking closure.
             // The executable dispatcher always takes run_stdio for owned IO.
-            Self::Batch(_) | Self::ScoreBatch(_) | Self::SemanticBatch(_) | Self::SemanticJob(_)
+            Self::Batch(_) | Self::ScoreBatch(_) | Self::DocumentCorpus(_) | Self::SemanticBatch(_) | Self::SemanticJob(_)
                 | Self::Job(_) | Self::ScoreJob(_) | Self::TextJob(_) | Self::Stream(_) => return Err(CandidateError::Arguments),
             Self::Text { task, args } => (task, args),
         };

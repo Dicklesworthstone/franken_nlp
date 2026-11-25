@@ -1058,6 +1058,87 @@ method quotes admission before private IO. This remains a source-inventoried
 candidate surface; controller-selected build, model-present correctness and
 quality gates remain pending.
 
+## Implemented candidate INT8 complete-document scoring corpora
+
+`fnlp candidate classify-corpus` and `fnlp candidate sentiment-corpus` extend the
+complete-document INT8 maps to ordered NDJSON populations. One resident model,
+native context and optional persistent CPU team serve the entire stream.
+Each successful record contains every completed source chunk, its original
+byte/scalar coordinates and the source-weighted aggregate. A failed chunk
+refuses that document; earlier completed records remain usable.
+
+Both commands read the existing `{id,text,task_args?}` envelope. For example,
+`documents.ndjson` can contain:
+
+```json
+{"id":"ticket-1","text":"The invoice is incorrect. The application also crashes during checkout."}
+{"id":"ticket-2","text":"Support resolved the issue quickly and explained the correction."}
+```
+
+Classification accepts fixed labels, mode and policy from `--defaults`.
+For example, `labels.json`:
+
+```json
+{"labels":[{"id":"billing","description":"Invoices, payments and charges"},{"id":"technical","description":"Software errors and technical support"}],"mode":"multi_label"}
+```
+
+Run complete-document classification or independent dimensional sentiment:
+
+```sh
+fnlp candidate classify-corpus documents.ndjson \
+  --defaults labels.json --model ./model.fnlpq --memory-mib 16384 \
+  --max-chunk-bytes 4096 --max-chunks 64 \
+  --compute-threads 4 --prefill-rows 4
+
+fnlp candidate sentiment-corpus documents.ndjson \
+  --model ./model.fnlpq --memory-mib 16384 \
+  --max-chunk-bytes 4096 --max-chunks 64 \
+  --compute-threads 4 --prefill-rows 4
+```
+
+Without classification defaults, every record supplies complete classification
+`task_args` with `labels`, `mode`, `policy` and `budget`. Supplied `task_args`
+replaces the complete defaults object. Sentiment defaults to valence, arousal,
+dominance and approach; `--defaults` accepts axes and peak/entropy policy without
+source content or execution identity. The CLI supplies the task ceilings;
+per-record budgets may only tighten them.
+
+`--max-input-bytes` caps each complete source; `--max-line-bytes` separately
+caps its NDJSON envelope. `--max-result-bytes` caps each chunk result, while
+`--max-retained-result-bytes` and `--max-map-result-bytes` bound the retained
+frontier and complete document. `--max-requests`, `--max-input-mib` and
+`--max-output-mib` bound the population and transport. All five native work
+ceilings apply once to the entire invocation, including failed execution;
+accepting more records or a flush command never multiplies or renews them.
+
+Compact input is available through `--input-encoding safe-bpe-v1`. Its
+per-document tokenizer allowance spans partition probes, chunk/head planning
+and reconstruction. The four `--max-total-tokenizer-*` options add a distinct
+invocation-wide allowance, charging actual work from rejected preparations as
+well as successful documents. The declared policy and invocation caps appear
+on candidate event provenance. Byte fallback remains the default.
+
+The host admits the complete map frontier, transport, encoder workspace,
+native buffers, prompt staging and worker payloads before private IO. It
+retains the owned reader/writer and memory claims until workers join.
+The final `run_complete` event follows that join under the original run control;
+a failed document produces a nonzero CLI exit. Inputs and results are not
+retained by these live commands.
+
+Library callers use
+`NlpEngine::batch_int8_classification_documents` or
+`NlpEngine::batch_int8_sentiment_documents`, with the corresponding
+`_layer_major`, `_with_threads` and `_layer_major_with_threads` variants.
+`ClassificationDocumentCorpusConfig`, `SentimentDocumentCorpusConfig` and
+their `int8_*_document_corpus_requirements` functions are exported from
+`hosted::corpus`.
+
+These candidate commands require `asupersync-runtime`. The aggregates retain
+the map commands' descriptive, uncalibrated mixture semantics; they do not
+claim equivalence to a single larger context. Source review and regression
+definitions are present, while DSR compilation, executable regression tests
+and real-model qualification remain pending.
+
 ## Implemented candidate INT4 token streaming
 
 `fnlp candidate source-int4 stream generate|chat` exposes live native token
