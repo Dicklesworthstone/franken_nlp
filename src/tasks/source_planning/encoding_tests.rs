@@ -122,11 +122,11 @@ fn policy_and_work_limits_bind_even_identical_tokens_and_default_identity_is_res
     assert!(restored.with_document_encoding(UntrustedEncoding::SafeBpeV1(limits)).is_err());
 }
 
-struct Stop { calls: usize, cause: DecodeCancellationKind }
+struct Stop { calls: usize, at: usize, cause: DecodeCancellationKind }
 impl DecodeStepControl for Stop {
     fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
         self.calls += 1;
-        (self.calls == 8).then_some(self.cause)
+        (self.calls == self.at).then_some(self.cause)
     }
 }
 #[test]
@@ -137,10 +137,29 @@ fn nested_question_encoding_preserves_every_typed_cancellation_on_every_profile(
     for profile in [Profile::Eager, Profile::Int8, Profile::Int4] {
         for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
             ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
-            let mut control = Stop { calls: 0, cause };
+            let mut control = Stop { calls: 0, at: 8, cause };
             assert_eq!(prepare(&p, &request, profile, SourcePlanningLimits::default(), &mut control).err(), Some(Some(cause)));
             assert_eq!(control.calls, 8);
         }
+    }
+}
+
+#[test]
+fn eager_source_plans_poll_inside_the_suffix_sort_for_every_task() {
+    let planner = planner(UntrustedEncoding::ByteFallback);
+    let source = "a".repeat(4096);
+    for kind in [BuiltInTask::Ner, BuiltInTask::Keyphrases, BuiltInTask::Summarize, BuiltInTask::Answer] {
+        let request = request(kind, &source);
+        let mut limits = SourcePlanningLimits::default();
+        limits.source.index.max_build_steps = 0;
+        let mut control = Stop { calls: 0, at: usize::MAX, cause: DecodeCancellationKind::Shutdown };
+        assert_eq!(prepare(&planner, &request, Profile::Eager, limits, &mut control).err(), Some(None));
+        // Use the preflight poll count so differences in the four tokenization
+        // recipes do not affect where this interrupt falls inside the sort.
+        control.at = control.calls + 32;
+        control.calls = 0;
+        assert_eq!(prepare(&planner, &request, Profile::Eager, SourcePlanningLimits::default(), &mut control).err(),
+            Some(Some(DecodeCancellationKind::Shutdown)));
     }
 }
 

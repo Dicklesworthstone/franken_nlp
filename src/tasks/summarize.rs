@@ -11,7 +11,7 @@ use crate::{
     execution_identity::ExecutionIdentity,
     grammar::{CompileLimits, runtime::SourceRuntimeLimits},
     native_engine::{constrained::{JsonDecodeOptions, JsonWorkBudget},
-        decode::DecodeStepControl, hf_bf16_eager::HfBf16EagerEngine},
+        decode::{DecodeCancellationKind, DecodeStepControl}, hf_bf16_eager::HfBf16EagerEngine},
     tokenizer::specials::TemplateControlIds,
     validation::{JsonLimits, JsonValue, parse_json_with_limits,
         grounded_fields::{SourceFieldEvidence, SourceOccurrence, VerifiedSourceSpan}},
@@ -164,9 +164,21 @@ impl SummaryPlan {
     pub fn from_task_plan(task: &TaskPlan, document: &SourceDocument, options: SummaryOptions,
         decode: JsonDecodeOptions, compiler: CompileLimits, controls: &TemplateControlIds,
         source_limits: SourceRuntimeLimits) -> Result<Self, SummaryError> {
+        Self::from_task_plan_with_control(task, document, options, decode, compiler, controls,
+            source_limits, &mut || None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_task_plan_with_control(
+        task: &TaskPlan, document: &SourceDocument, options: SummaryOptions,
+        decode: JsonDecodeOptions, compiler: CompileLimits, controls: &TemplateControlIds,
+        source_limits: SourceRuntimeLimits, checkpoint: &mut impl FnMut() -> Option<DecodeCancellationKind>,
+    ) -> Result<Self, SummaryError> {
         let schema = options.schema_source()?;
-        let extraction = ExtractPlan::from_builtin(task, &schema, decode, compiler,
-            controls, Some((document, source_limits)), SUMMARIZE_TASK_VERSION)?;
+        let extraction = ExtractPlan::from_builtin_with_encoding_control(
+            task, &schema, decode, compiler, controls, Some((document, source_limits)),
+            SUMMARIZE_TASK_VERSION, document.document_encoding(), checkpoint,
+        )?;
         Ok(Self { extraction, options, max_result_bytes: task.ir().budget().max_output_bytes })
     }
     pub fn bind_identity(&self, identity: ExecutionIdentity) -> Result<ExecutionIdentity, SummaryError> {

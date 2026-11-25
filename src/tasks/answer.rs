@@ -265,9 +265,21 @@ impl AnswerPlan {
     pub fn from_task_plan(task: &TaskPlan, context: &AnswerContext, options: AnswerOptions,
         decode: JsonDecodeOptions, compiler: CompileLimits, controls: &TemplateControlIds,
         source_limits: SourceRuntimeLimits) -> Result<Self, AnswerError> {
+        Self::from_task_plan_with_control(task, context, options, decode, compiler, controls,
+            source_limits, &mut || None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_task_plan_with_control(
+        task: &TaskPlan, context: &AnswerContext, options: AnswerOptions,
+        decode: JsonDecodeOptions, compiler: CompileLimits, controls: &TemplateControlIds,
+        source_limits: SourceRuntimeLimits, checkpoint: &mut impl FnMut() -> Option<DecodeCancellationKind>,
+    ) -> Result<Self, AnswerError> {
         let schema = options.schema_source()?;
-        let extraction = ExtractPlan::from_builtin(task, &schema, decode, compiler, controls,
-            Some((&context.document, source_limits)), ANSWER_TASK_VERSION)?;
+        let extraction = ExtractPlan::from_builtin_with_encoding_control(
+            task, &schema, decode, compiler, controls, Some((context.document(), source_limits)),
+            ANSWER_TASK_VERSION, context.document().document_encoding(), checkpoint,
+        )?;
         let mut passages = Vec::new();
         passages.try_reserve_exact(context.passages.len()).map_err(|_| AnswerError::AllocationRefused)?;
         for passage in &context.passages {

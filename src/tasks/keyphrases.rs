@@ -12,7 +12,7 @@ use crate::{
     grammar::{CompileLimits, runtime::SourceRuntimeLimits},
     native_engine::{
         constrained::{JsonDecodeOptions, JsonWorkBudget},
-        decode::DecodeStepControl,
+        decode::{DecodeCancellationKind, DecodeStepControl},
         hf_bf16_eager::HfBf16EagerEngine,
     },
     tokenizer::specials::TemplateControlIds,
@@ -141,9 +141,21 @@ impl KeyphrasePlan {
         decode: JsonDecodeOptions, compiler: CompileLimits,
         controls: &TemplateControlIds, source_limits: SourceRuntimeLimits,
     ) -> Result<Self, KeyphraseError> {
+        Self::from_task_plan_with_control(task, document, options, decode, compiler, controls,
+            source_limits, &mut || None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_task_plan_with_control(
+        task: &TaskPlan, document: &SourceDocument, options: KeyphraseOptions,
+        decode: JsonDecodeOptions, compiler: CompileLimits, controls: &TemplateControlIds,
+        source_limits: SourceRuntimeLimits, checkpoint: &mut impl FnMut() -> Option<DecodeCancellationKind>,
+    ) -> Result<Self, KeyphraseError> {
         let schema = options.schema_source()?;
-        let extraction = ExtractPlan::from_builtin(task, &schema, decode, compiler,
-            controls, Some((document, source_limits)), KEYPHRASES_TASK_VERSION)?;
+        let extraction = ExtractPlan::from_builtin_with_encoding_control(
+            task, &schema, decode, compiler, controls, Some((document, source_limits)),
+            KEYPHRASES_TASK_VERSION, document.document_encoding(), checkpoint,
+        )?;
         Ok(Self { extraction, options, max_result_bytes: task.ir().budget().max_output_bytes })
     }
     pub fn bind_identity(&self, identity: ExecutionIdentity) -> Result<ExecutionIdentity, KeyphraseError> {

@@ -332,21 +332,24 @@ impl SourceTaskPlanner {
                 let schema = options.schema_source()?; let document = encode(document, control)?;
                 let task = self.task(kind, &document, &schema, context, budget, limits)?;
                 planning_checkpoint(control)?;
-                let plan = NerPlan::from_task_plan(&task, &document, options.clone(), decode, limits.compiler, &self.controls, limits.source)?;
+                let plan = NerPlan::from_task_plan_with_control(&task, &document, options.clone(), decode, limits.compiler, &self.controls, limits.source,
+                    &mut || control.prefill_checkpoint(0))?;
                 (Executable::Ner(plan), task)
             }
             SourceTaskRequest::Keyphrases { document, options, .. } => {
                 let schema = options.schema_source()?; let document = encode(document, control)?;
                 let task = self.task(kind, &document, &schema, context, budget, limits)?;
                 planning_checkpoint(control)?;
-                let plan = KeyphrasePlan::from_task_plan(&task, &document, *options, decode, limits.compiler, &self.controls, limits.source)?;
+                let plan = KeyphrasePlan::from_task_plan_with_control(&task, &document, *options, decode, limits.compiler, &self.controls, limits.source,
+                    &mut || control.prefill_checkpoint(0))?;
                 (Executable::Keyphrases(plan), task)
             }
             SourceTaskRequest::Summarize { document, options, .. } => {
                 let schema = options.schema_source()?; let document = encode(document, control)?;
                 let task = self.task(kind, &document, &schema, context, budget, limits)?;
                 planning_checkpoint(control)?;
-                let plan = SummaryPlan::from_task_plan(&task, &document, *options, decode, limits.compiler, &self.controls, limits.source)?;
+                let plan = SummaryPlan::from_task_plan_with_control(&task, &document, *options, decode, limits.compiler, &self.controls, limits.source,
+                    &mut || control.prefill_checkpoint(0))?;
                 (Executable::Summarize(plan), task)
             }
             SourceTaskRequest::Answer { question, passages, options, .. } => {
@@ -357,7 +360,8 @@ impl SourceTaskPlanner {
                 }, &mut || control.prefill_checkpoint(0))?;
                 let task = self.task(kind, answer.document(), &schema, context, budget, limits)?;
                 planning_checkpoint(control)?;
-                let plan = AnswerPlan::from_task_plan(&task, &answer, *options, decode, limits.compiler, &self.controls, limits.source)?;
+                let plan = AnswerPlan::from_task_plan_with_control(&task, &answer, *options, decode, limits.compiler, &self.controls, limits.source,
+                    &mut || control.prefill_checkpoint(0))?;
                 (Executable::Answer(plan), task)
             }
         };
