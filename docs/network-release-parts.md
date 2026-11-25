@@ -16,7 +16,7 @@ model root, or weaken the blocked platform transaction contract.
 The caller provides:
 
 - an explicit manifest pathname;
-- the independently obtained domain-separated manifest SHA-256;
+- the independently obtained standard SHA-256 of the exact canonical manifest bytes;
 - an existing non-symlink parts directory;
 - an explicit asupersync `Cx`.
 
@@ -28,8 +28,16 @@ Before network access, the implementation:
 4. applies the installed binary's exact Nanbeige4.2-3B/int8 compatibility row;
 5. refuses non-active lifecycle states.
 
+The manifest pin and the report's `release_manifest_sha256` use ordinary
+SHA-256 over the exact file bytes, as produced by `sha256sum` or
+`shasum -a 256`. The hash does not prepend a domain or reserialize JSON.
+Earlier domain-prefixed pins are rejected rather than silently accepted as a
+second authority scheme. The supplied checksum must still come from an
+independently trusted channel; hashing the downloaded manifest itself does not
+authenticate its publisher.
+
 A mirror URL never becomes its own trust root. Final success for a part requires
-its full manifest SHA-256.
+its full manifest-declared SHA-256.
 
 ## Transfer contract
 
@@ -42,8 +50,8 @@ Every request is an explicit byte range and sends:
 The pinned asupersync client is configured with no automatic redirects, no
 automatic retries, no cookies, a finite request timeout and a body cap no larger
 than **8 MiB** (or the largest declared part, when smaller). Each release part is
-downloaded in contiguous requests of at most 8 MiB. The immutable release-part
-size and all manifest digests are unchanged. Redirects are followed explicitly so
+downloaded in contiguous requests of at most 8 MiB. Bounded range windows do not change the immutable release-part
+size or its content-digest verification. Redirects are followed explicitly so
 that every hop is checked **before** the next request is constructed. Every
 target must be an absolute HTTPS URL with a plain ASCII hostname, no userinfo,
 no explicit port (including `:443`), and no whitespace, controls, backslashes or

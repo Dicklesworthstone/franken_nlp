@@ -42,7 +42,6 @@ pub const MAX_RELEASE_URL_BYTES: usize = 2048;
 /// the manifest boundary as model or compatibility labels.
 pub const MAX_IDENTIFIER_BYTES: usize = 160;
 
-const RELEASE_MANIFEST_DIGEST_DOMAIN: &[u8] = b"franken_nlp/release-manifest/v1\0";
 const RELEASE_PART_BYTES: u64 = 1_957_046_720;
 
 /// Canonical, release-bound metadata for one immutable Generic artifact.
@@ -326,7 +325,7 @@ impl ReleaseManifest {
         })
     }
 
-    /// Compute the exact domain-separated manifest identity used in receipts.
+    /// Compute the ordinary SHA-256 of the exact canonical manifest bytes.
     pub fn release_manifest_sha256(&self) -> Result<String, ManifestError> {
         let bytes = self.canonical_bytes()?;
         Ok(release_manifest_sha256(&bytes))
@@ -741,7 +740,7 @@ impl EmbeddedReleaseManifest {
         self.bytes
     }
 
-    /// Return the independently embedded domain-separated digest.
+    /// Return the independently embedded ordinary SHA-256 of the exact bytes.
     #[must_use]
     pub const fn release_manifest_sha256(self) -> &'static str {
         self.release_manifest_sha256
@@ -777,13 +776,16 @@ impl EmbeddedReleaseManifest {
     }
 }
 
-/// Hash exact canonical release-manifest bytes in their dedicated domain.
+/// Hash the exact release-manifest bytes with ordinary SHA-256.
+///
+/// This is the same digest produced by standard checksum tools. No domain
+/// prefix, length framing, parsing, or reserialization participates in this
+/// identity. Pull callers authenticate these exact bytes before separately
+/// checking their canonical form and compatibility; a differently serialized
+/// manifest never inherits a pin for the original bytes.
 #[must_use]
 pub fn release_manifest_sha256(canonical_manifest_bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(RELEASE_MANIFEST_DIGEST_DOMAIN);
-    hasher.update(canonical_manifest_bytes);
-    hex_lower(&hasher.finalize())
+    hex_lower(&Sha256::digest(canonical_manifest_bytes))
 }
 
 fn expect_exact(

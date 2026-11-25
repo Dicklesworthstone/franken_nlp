@@ -5,7 +5,7 @@ use franken_nlp::{
         EmbeddedReleaseManifest, FNLPQ_FORMAT_V1, LOCAL_DERIVATION_PACKING_POLICY_V1,
         NANBEIGE42_INT8_V1_COMPATIBILITY, PULL_API_V1, RELEASE_MANIFEST_SCHEMA_V1, ReleaseArtifact,
         ReleaseCompatibility, ReleaseDigests, ReleaseLifecycle, ReleaseManifest, ReleasePart,
-        ReleaseSourceClosure, ReleaseSourceFile,
+        ReleaseSourceClosure, ReleaseSourceFile, release_manifest_sha256,
     },
     canonjson,
 };
@@ -13,6 +13,55 @@ use franken_nlp::{
 const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const TAG: &str = "models-nanbeige42-fnlpq-v1";
 const LOGICAL_NAME: &str = "nanbeige4.2-3b.fnlpq-v1.int8.generic.fnlpq";
+
+#[test]
+fn manifest_pins_match_standard_sha256_without_accepting_the_old_domain_hash() {
+    // Fixed answers independently checked with sha256sum and Python hashlib,
+    // not derived through the manifest implementation under test.
+    for (bytes, expected) in [
+        (
+            b"".as_slice(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        (
+            b"abc".as_slice(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ),
+        (
+            b"{}".as_slice(),
+            "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        ),
+    ] {
+        assert_eq!(release_manifest_sha256(bytes), expected);
+    }
+
+    const EXPECTED: &str = "88c9447d9ecaa6020ccd7e2af888cb222b47df6a3e1fbbe4d6d21694b847546c";
+    const OLD_DOMAIN_HASH: &str = "4d8ed688796da74d06f5f53963b80e6af8a0e8c08693cf5827d4ae68fa545013";
+    let manifest = valid_manifest();
+    let canonical: &'static [u8] = Box::leak(manifest.canonical_bytes().unwrap().into_boxed_slice());
+    assert_eq!(canonical.len(), 1709);
+    assert_eq!(release_manifest_sha256(canonical), EXPECTED);
+    assert_eq!(manifest.release_manifest_sha256().unwrap(), EXPECTED);
+    let embedded = EmbeddedReleaseManifest::new(canonical, EXPECTED)
+        .expect("a standard checksum authenticates the canonical manifest");
+    assert_eq!(embedded.release_manifest_sha256(), EXPECTED);
+    assert_eq!(embedded.parse().unwrap(), manifest);
+    let error = EmbeddedReleaseManifest::new(canonical, OLD_DOMAIN_HASH)
+        .expect_err("old domain-prefixed pins have no compatibility fallback");
+    assert_eq!(error.invariant, "embedded-manifest-digest");
+    assert_eq!(error.expected, OLD_DOMAIN_HASH);
+    assert_eq!(error.observed, EXPECTED);
+
+    let mut with_newline = canonical.to_vec();
+    with_newline.push(b'\n');
+    assert_ne!(
+        release_manifest_sha256(&with_newline), EXPECTED,
+        "the pin covers exact bytes, never normalized JSON",
+    );
+    let error = EmbeddedReleaseManifest::new(Box::leak(with_newline.into_boxed_slice()), EXPECTED)
+        .expect_err("even semantically equivalent changed bytes need their own pin");
+    assert_eq!(error.invariant, "embedded-manifest-digest");
+}
 
 #[test]
 fn release_manifest_rejection_matrix() {

@@ -2,9 +2,18 @@
 
 `fnlp models reconstruct` assembles an explicit local release package into a
 checked Generic `.fnlpq` file. The manifest must be canonical, compatible and
-active, and its domain-separated SHA-256 must come from an independently
-trusted channel. The command reads local parts only. The resulting file is
+active, and its ordinary SHA-256 must come from an independently trusted
+channel. The command reads local parts only. The resulting file is
 not an activated model or a release-qualification receipt.
+
+`--manifest-sha256` and the report's `release_manifest_sha256` name the
+standard SHA-256 of the exact canonical manifest file bytes, matching
+`sha256sum model.manifest.json` or `shasum -a 256 model.manifest.json`.
+There is no domain prefix or JSON normalization in the hash. Pins from the
+earlier domain-prefixed candidate deliberately fail with a manifest-digest
+mismatch; obtain the corrected standard checksum through the same independent
+trusted channel. Computing a checksum over an untrusted download alone does
+not establish publisher identity.
 
 ## Start and resume
 
@@ -78,6 +87,8 @@ system calls cannot be preempted.
 
 Regression fixtures cover real package assembly, interrupted/resumed byte
 identity, complete staging, corrupt prefixes and parts, cancellation, budgets,
-no-replace publication, symlink refusal and multipart boundaries. Compilation
+no-replace publication, symlink refusal and multipart boundaries. Independent
+standard-checksum goldens and old-domain-pin refusals cover embedded manifests,
+local reconstruction, final-cache reuse and HTTPS acquisition entrypoints. Compilation
 and Rust tests remain pending the repository's controller-selected DSR
 checkpoint; these source fixtures do not qualify a model or a release.

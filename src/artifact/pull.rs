@@ -2,7 +2,7 @@
 //!
 //! Network acquisition and model-root activation remain separate authority
 //! boundaries. This module only consumes an explicit local release manifest
-//! whose domain-separated digest was obtained through an independent trusted
+//! whose ordinary SHA-256 was obtained through an independent trusted
 //! channel, verifies every local part, reconstructs one staged Generic fnlpq,
 //! verifies the complete artifact and its internal identities, and then
 //! publishes the final pathname with a no-replace hard link.
@@ -57,9 +57,10 @@ pub const LOCAL_RELEASE_WORKSPACE_RESERVE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Explicit offline reconstruction request.
 ///
-/// `expected_release_manifest_sha256` is the domain-separated manifest digest
-/// from an independently trusted channel. The manifest file and release parts
-/// themselves are therefore not allowed to choose their own authority root.
+/// `expected_release_manifest_sha256` is the ordinary SHA-256 of the exact
+/// canonical manifest bytes, obtained from an independently trusted channel.
+/// The manifest file and release parts themselves are therefore not allowed
+/// to choose their own authority root.
 #[derive(Clone, Debug)]
 pub struct LocalReconstructRequest {
     pub manifest: PathBuf,

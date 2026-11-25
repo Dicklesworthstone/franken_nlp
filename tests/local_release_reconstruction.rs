@@ -444,6 +444,48 @@ fn manifest_pin_mismatch_cannot_touch_retained_staging() {
 }
 
 #[test]
+fn old_domain_pin_and_changed_manifest_refuse_before_parts_or_staging_access() {
+    let fixture = Fixture::new("standard-manifest-pin");
+    let mut request = fixture.request("retained");
+    let manifest_bytes = fs::read(&request.manifest).unwrap();
+    let raw_pin = digest(&manifest_bytes);
+    let old_domain_pin = former_manifest_domain_digest(&manifest_bytes);
+    assert_eq!(request.expected_release_manifest_sha256, raw_pin);
+    assert_ne!(raw_pin, old_domain_pin);
+
+    let retained = fixture.artifact[..137].to_vec();
+    fs::write(&request.staging_output, &retained).unwrap();
+    request.parts_dir = fixture.root.join("must-not-open-parts");
+    request.expected_release_manifest_sha256 = old_domain_pin.clone();
+    let error = reconstruct_local_release_with_options(
+        &request, &resume_options(None), |_| None,
+    ).expect_err("the old domain-prefixed pin cannot authorize reconstruction");
+    assert!(matches!(error, PullError::ManifestDigestMismatch { expected, observed }
+        if expected == old_domain_pin && observed == raw_pin));
+    let existing = fixture.root.join(LOGICAL_NAME);
+    let error = verify_local_release_cache(
+        &request.manifest, &old_domain_pin, &existing, |_| None,
+    ).expect_err("cache reuse has the same exact raw-checksum authority");
+    assert!(matches!(error, PullError::ManifestDigestMismatch { expected, observed }
+        if expected == old_domain_pin && observed == raw_pin));
+
+    let mut changed_bytes = manifest_bytes;
+    changed_bytes.push(b'\n');
+    request.manifest = fixture.root.join("changed.manifest.json");
+    fs::write(&request.manifest, &changed_bytes).unwrap();
+    request.expected_release_manifest_sha256 = raw_pin.clone();
+    let error = reconstruct_local_release_with_options(
+        &request, &resume_options(None), |_| None,
+    ).expect_err("equivalent JSON bytes cannot inherit an unchanged authority pin");
+    assert!(matches!(error, PullError::ManifestDigestMismatch { expected, observed }
+        if expected == raw_pin && observed == digest(&changed_bytes)));
+    assert_eq!(fs::read(&request.staging_output).unwrap(), retained);
+    assert_eq!(fs::read(&existing).unwrap(), fixture.artifact);
+    assert!(!request.parts_dir.exists());
+    assert!(!request.output.exists());
+}
+
+#[test]
 fn retained_trailing_bytes_are_refused_without_truncation() {
     let fixture = Fixture::new("overlong");
     let request = fixture.request("resume");
@@ -714,7 +756,8 @@ impl Fixture {
     fn request(&self, label: &str) -> LocalReconstructRequest {
         LocalReconstructRequest {
             manifest: self.manifest_path.clone(),
-            expected_release_manifest_sha256: self.manifest.release_manifest_sha256().unwrap(),
+            // The caller's checksum is independent of the manifest hashing API.
+            expected_release_manifest_sha256: digest(&fs::read(&self.manifest_path).unwrap()),
             parts_dir: self.parts_dir.clone(),
             staging_output: self.root.join(format!("{label}.stage")),
             output: self.root.join(format!("{label}.fnlpq")),
@@ -796,6 +839,13 @@ fn census_digest() -> String {
 
 fn digest(bytes: &[u8]) -> String { hex(&Sha256::digest(bytes)) }
 
+fn former_manifest_domain_digest(bytes: &[u8]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"franken_nlp/release-manifest/v1\0");
+    hash.update(bytes);
+    hex(&hash.finalize())
+}
+
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -808,7 +858,7 @@ mod direct_acquisition {
     use super::*;
     use franken_nlp::native_engine::decode::DecodeStepControl;
     use franken_nlp::artifact::pull::http::{
-        NetworkPartsOptions, NetworkPullError,
+        NetworkPartsOptions, NetworkPartsRequest, NetworkPullError, download_release_parts,
         direct::{NetworkArtifactReport, NetworkArtifactRequest, acquire_release_artifact},
     };
 
@@ -836,6 +886,58 @@ mod direct_acquisition {
                 resume, max_new_bytes: Some(0), ..NetworkPartsOptions::default()
             }, &mut NeverStopped).await
         })
+    }
+
+    #[test]
+    fn network_and_direct_acquisition_use_the_standard_manifest_checksum() {
+        let fixture = Fixture::new("network-standard-manifest-pin");
+        let manifest_bytes = fs::read(&fixture.manifest_path).unwrap();
+        let raw_pin = digest(&manifest_bytes);
+        let old_domain_pin = former_manifest_domain_digest(&manifest_bytes);
+        let mut parts = NetworkPartsRequest {
+            manifest: fixture.manifest_path.clone(),
+            expected_release_manifest_sha256: raw_pin.clone(),
+            parts_dir: fixture.parts_dir.clone(),
+        };
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let report = runtime.block_on(async {
+            let cx = asupersync::cx::Cx::current().unwrap();
+            download_release_parts(&cx, &parts, NetworkPartsOptions {
+                max_new_bytes: Some(0), ..NetworkPartsOptions::default()
+            }, &mut NeverStopped).await
+        }).expect("standard checksum permits reusing fully verified parts without network");
+        assert_eq!(report.release_manifest_sha256, raw_pin);
+        assert_eq!(report.downloaded_bytes, 0);
+        assert_eq!(report.reused_bytes, fixture.artifact.len() as u64);
+        assert_eq!(report.complete_bytes, fixture.artifact.len() as u64);
+        assert!(report.parts.iter().all(|part| part.mirror_index.is_none()));
+
+        let mut direct = request(&fixture, "unused-staging");
+        direct.output = fixture.root.join(LOGICAL_NAME);
+        let cached = acquire(&direct, false).expect("direct cache uses the same raw pin");
+        assert!(cached.cache_hit);
+        assert_eq!(cached.release_manifest_sha256, raw_pin);
+        assert_eq!(cached.downloaded_bytes, 0);
+
+        parts.expected_release_manifest_sha256 = old_domain_pin.clone();
+        parts.parts_dir = fixture.root.join("must-not-open-parts");
+        let error = runtime.block_on(async {
+            let cx = asupersync::cx::Cx::current().unwrap();
+            download_release_parts(&cx, &parts, NetworkPartsOptions {
+                max_new_bytes: Some(0), ..NetworkPartsOptions::default()
+            }, &mut NeverStopped).await
+        }).expect_err("old domain pin refuses before inspecting parts or constructing a request");
+        assert!(matches!(error, NetworkPullError::Manifest(
+            PullError::ManifestDigestMismatch { expected, observed }
+        ) if expected == old_domain_pin && observed == raw_pin));
+        direct.expected_release_manifest_sha256 = old_domain_pin.clone();
+        assert!(matches!(acquire(&direct, false), Err(NetworkPullError::Manifest(
+            PullError::ManifestDigestMismatch { expected, observed }
+        )) if expected == old_domain_pin && observed == raw_pin));
+        assert!(!parts.parts_dir.exists());
+        assert!(!direct.staging_output.exists());
+        assert_eq!(fs::read(&direct.output).unwrap(), fixture.artifact);
+        assert_eq!(fs::read(fixture.part()).unwrap(), fixture.artifact);
     }
 
     #[test]

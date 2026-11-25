@@ -157,7 +157,7 @@ struct ModelsDownloadPartsCommand {
     /// Canonical release manifest acquired through the release channel.
     #[arg(long)]
     manifest: PathBuf,
-    /// Independently trusted domain-separated manifest SHA-256.
+    /// Independently trusted standard SHA-256 of the exact manifest file bytes.
     #[arg(long)]
     manifest_sha256: String,
     /// Existing caller-controlled directory for final .partNN and .partial files.
@@ -192,7 +192,7 @@ struct ModelsAcquireCommand {
     /// Canonical release manifest acquired through the release channel.
     #[arg(long)]
     manifest: PathBuf,
-    /// Independently trusted domain-separated manifest SHA-256.
+    /// Independently trusted standard SHA-256 of the exact manifest file bytes.
     #[arg(long)]
     manifest_sha256: String,
     /// Stream directly into staging without storing a separate copy of every part.
@@ -240,7 +240,7 @@ struct ModelsReconstructCommand {
     /// Canonical release manifest acquired through the release channel.
     #[arg(long)]
     manifest: PathBuf,
-    /// Independently trusted domain-separated manifest SHA-256.
+    /// Independently trusted standard SHA-256 of the exact manifest file bytes.
     #[arg(long)]
     manifest_sha256: String,
     /// Directory containing the exact immutable .partNN members.
