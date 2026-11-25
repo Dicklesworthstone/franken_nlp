@@ -45,6 +45,7 @@ impl<C: DecodeStepControl> PromptDriver for Int8Session<'_, '_, C> {
 }
 struct Grouped<'a, D> { driver: &'a mut D, limits: Int8PrefillLimits }
 impl<D: PromptDriver> Driver for Grouped<'_, D> {
+    fn checkpoint(&mut self) -> Result<(), Int8ScoringError> { self.driver.checkpoint() }
     fn position(&self) -> Result<usize, Int8ScoringError> { self.driver.position() }
     fn rewind(&mut self, retain: usize) -> Result<(), Int8ScoringError> { self.driver.rewind(retain) }
     fn append(&mut self, token: u32) -> Result<(), Int8ScoringError> { self.driver.append(token) }

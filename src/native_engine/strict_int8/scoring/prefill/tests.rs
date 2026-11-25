@@ -24,8 +24,16 @@ struct Model {
     tokens: Vec<u32>, work: Int8Work, forwards: Vec<(usize, u32)>, projections: Vec<Vec<u32>>,
     groups: Vec<usize>, prompt_calls: usize, aborted: bool,
     fail_at: Option<usize>, invalid_head: bool, forged_work: bool, short_prompt: bool,
+    polls: usize, cancel_poll: Option<(usize, DecodeCancellationKind)>,
 }
 impl Driver for Model {
+    fn checkpoint(&mut self) -> Result<(), Int8ScoringError> {
+        self.polls += 1;
+        if let Some((at, cause)) = self.cancel_poll {
+            if at == self.polls { return Err(StrictInt8Error::Cancelled(cause).into()); }
+        }
+        Ok(())
+    }
     fn position(&self) -> Result<usize, Int8ScoringError> { Ok(self.tokens.len()) }
     fn rewind(&mut self, retain: usize) -> Result<(), Int8ScoringError> {
         if retain > self.tokens.len() { return Err(Int8ScoringError::Traversal); }
@@ -114,6 +122,31 @@ fn every_prompt_and_continuation_cancellation_is_fatal_without_partial_scores() 
         if position < p.prompt.len() { assert!(model.projections.is_empty()); }
         assert_eq!(model.prompt_calls, 1);
     }
+}
+#[test]
+fn packed_prompt_routes_keep_terminal_control_through_complete_serialization() {
+    let mut p = plan(ScoringMode::TrieConditional); let mut baseline = Model::default();
+    let result = grouped(&p, 4, &mut baseline).unwrap();
+    for width in [1, 2, 4, 64] {
+        for at in [1, 2, baseline.polls - 1, baseline.polls] {
+            let mut model = Model { cancel_poll: Some((at, DecodeCancellationKind::ParentCancelled)), ..Model::default() };
+            let error = grouped(&p, width, &mut model).unwrap_err();
+            assert_eq!(error.cancellation(), Some(DecodeCancellationKind::ParentCancelled));
+            assert!(model.aborted); assert_eq!(model.polls, at);
+            if at <= 2 {
+                assert_eq!(model.prompt_calls, 0); assert!(model.forwards.is_empty());
+            } else {
+                assert_eq!(model.work, baseline.work); assert_eq!(model.projections, baseline.projections);
+                assert_eq!(model.prompt_calls, 1);
+            }
+        }
+    }
+    // The post-serialization cancellation remains authoritative even when the
+    // complete record would also exceed its bounded output allowance.
+    p.max_output_bytes = canonjson::canonical_bytes(&result).unwrap().len() as u64 - 1;
+    let mut model = Model { cancel_poll: Some((baseline.polls, DecodeCancellationKind::CostBudget)), ..Model::default() };
+    assert_eq!(grouped(&p, 4, &mut model).unwrap_err().cancellation(), Some(DecodeCancellationKind::CostBudget));
+    assert!(model.aborted);
 }
 #[test]
 fn invalid_geometry_and_insufficient_workspace_refuse_before_any_driver_operation() {

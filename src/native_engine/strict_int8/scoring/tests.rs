@@ -22,8 +22,16 @@ fn logits(tokens: &[u32], rows: LinearRows<'_>) -> Vec<f32> {
 struct Model {
     tokens: Vec<u32>, work: Int8Work, forwards: Vec<(usize, u32)>, projections: Vec<Vec<u32>>,
     aborted: bool, cancel_at: Option<usize>, corrupt: bool, forge: bool,
+    polls: usize, cancel_poll: Option<(usize, DecodeCancellationKind)>,
 }
 impl Driver for Model {
+    fn checkpoint(&mut self) -> Result<(), Int8ScoringError> {
+        self.polls += 1;
+        if let Some((at, cause)) = self.cancel_poll {
+            if at == self.polls { return Err(StrictInt8Error::Cancelled(cause).into()); }
+        }
+        Ok(())
+    }
     fn position(&self) -> Result<usize, Int8ScoringError> { Ok(self.tokens.len()) }
     fn rewind(&mut self, retain: usize) -> Result<(), Int8ScoringError> {
         assert!(retain <= self.tokens.len()); self.tokens.truncate(retain); Ok(())
@@ -157,6 +165,53 @@ fn cancellation_keeps_cause_and_never_returns_partial_candidate_scores() {
     let error = run(&p, &mut model).unwrap_err();
     assert_eq!(error.cancellation(), Some(DecodeCancellationKind::Deadline));
     assert_eq!(model.forwards.len(), 4); assert!(model.aborted);
+}
+#[test]
+fn every_score_space_rejects_cancellation_after_its_last_projection_and_serialization() {
+    for mode in [ScoringMode::FullVocabulary, ScoringMode::TrieConditional,
+        ScoringMode::SequenceSoftmax { rule: SequenceScoreRule::SumLogits },
+        ScoringMode::SequenceSoftmax { rule: SequenceScoreRule::MeanLogits },
+        ScoringMode::SequenceSoftmax { rule: SequenceScoreRule::TerminalLogit }] {
+        let p = plan(mode); let mut baseline = Model::default();
+        run(&p, &mut baseline).unwrap();
+        for at in [baseline.polls - 1, baseline.polls] {
+            let mut model = Model { cancel_poll: Some((at, DecodeCancellationKind::Deadline)), ..Model::default() };
+            assert_eq!(run(&p, &mut model).unwrap_err().cancellation(), Some(DecodeCancellationKind::Deadline));
+            assert_eq!(model.work, baseline.work);
+            assert_eq!(model.projections, baseline.projections);
+            assert!(model.aborted);
+        }
+    }
+}
+#[test]
+fn cancellation_at_every_traversal_boundary_preserves_all_causes_and_aborts() {
+    // A single continuation still has the empty-root projection and its sole
+    // EOS edge. Neither a deterministic row nor an empty prefix skips control.
+    let p = Int8CandidatePlan::compile(vec![9], &[candidate("only", &[1])], 0,
+        ScoringMode::TrieConditional, ScoringLimits::default(), 1_000_000).unwrap();
+    let mut baseline = Model::default(); run(&p, &mut baseline).unwrap();
+    for cause in [DecodeCancellationKind::User, DecodeCancellationKind::Timeout,
+        DecodeCancellationKind::Deadline, DecodeCancellationKind::PollQuota,
+        DecodeCancellationKind::CostBudget, DecodeCancellationKind::FailFast,
+        DecodeCancellationKind::RaceLost, DecodeCancellationKind::ParentCancelled,
+        DecodeCancellationKind::ResourceUnavailable, DecodeCancellationKind::Shutdown,
+        DecodeCancellationKind::LinkedExit] {
+        for at in 1..=baseline.polls {
+            let mut model = Model { cancel_poll: Some((at, cause)), ..Model::default() };
+            assert_eq!(run(&p, &mut model).unwrap_err().cancellation(), Some(cause));
+            assert_eq!(model.polls, at); assert!(model.aborted);
+            if at <= 2 { assert!(model.forwards.is_empty()); assert!(model.projections.is_empty()); }
+        }
+    }
+}
+#[test]
+fn late_cancellation_takes_precedence_over_output_size_failure() {
+    let mut p = plan(ScoringMode::TrieConditional); let mut baseline = Model::default();
+    let output = run(&p, &mut baseline).unwrap();
+    p.max_output_bytes = canonjson::canonical_bytes(&output).unwrap().len() as u64 - 1;
+    let mut model = Model { cancel_poll: Some((baseline.polls, DecodeCancellationKind::Shutdown)), ..Model::default() };
+    assert_eq!(run(&p, &mut model).unwrap_err().cancellation(), Some(DecodeCancellationKind::Shutdown));
+    assert_eq!(model.work, baseline.work); assert!(model.aborted);
 }
 #[test]
 fn corrupt_projection_and_counter_mismatch_abort_the_native_driver() {

@@ -182,6 +182,7 @@ pub(crate) fn execute_compiled<C: DecodeStepControl>(prompt: &[u32], scorer: &Ca
 fn execute_driver<D: Driver>(prompt: &[u32], scorer: &CandidateScorer, mode: ScoringMode,
     schedule: CandidateSchedule, max_output_bytes: u64, driver: &mut D) -> Result<Int8CandidateRun, Int8ScoringError> {
     let result = (|| {
+        driver.checkpoint()?;
         let mut backend = PrefixEvaluator { prompt, previous: reserve(schedule.max_prefix)?,
             primed: false, poisoned: false, last_error: None, max_prefix: schedule.max_prefix,
             evaluations: 0, rewound: 0, driver: &mut *driver };
@@ -196,7 +197,15 @@ fn execute_driver<D: Driver>(prompt: &[u32], scorer: &CandidateScorer, mode: Sco
         }
         let run = Int8CandidateRun { schema_version: 1, execution: INT8_SCORING_EXECUTION.to_owned(),
             numerics_profile: STRICT_INT8_PROFILE.to_owned(), scores, model_work, rewound_positions: backend.rewound };
-        if canonjson::canonical_bytes(&run).map_err(|_| Int8ScoringError::Serialization)?.len() as u64 > max_output_bytes {
+        // The last projection is not the terminal boundary: candidate-score
+        // finalization and serialization still spend the SAME run allowance.
+        // Observe cancellation before interpreting an output/serialization
+        // error so the original terminal cause cannot become a retryable one.
+        backend.driver.checkpoint()?;
+        let serialized_len = canonjson::canonical_bytes(&run)
+            .map(|bytes| bytes.len() as u64).map_err(|_| Int8ScoringError::Serialization);
+        backend.driver.checkpoint()?;
+        if serialized_len? > max_output_bytes {
             return Err(Int8ScoringError::OutputBudget);
         }
         Ok(run)
@@ -217,6 +226,7 @@ impl<D: Driver> PrefixEvaluator<'_, D> {
             || (!self.primed && !prefix.is_empty()) || (self.primed && prefix <= self.previous.as_slice()) {
             return Err(Int8ScoringError::Traversal);
         }
+        self.driver.checkpoint()?;
         let current = if self.primed { self.prompt.len() + self.previous.len() } else { 0 };
         if self.driver.position()? != current { return Err(Int8ScoringError::Traversal); }
         let common = self.previous.iter().zip(prefix).take_while(|(a, b)| a == b).count();
@@ -249,6 +259,7 @@ impl<D: Driver> CandidateLogits for PrefixEvaluator<'_, D> {
 // A private static seam for differential tests. Only the real quantized
 // engine can produce the public native execution receipt.
 trait Driver {
+    fn checkpoint(&mut self) -> Result<(), Int8ScoringError>;
     fn position(&self) -> Result<usize, Int8ScoringError>;
     fn rewind(&mut self, retain: usize) -> Result<(), Int8ScoringError>;
     fn append(&mut self, token: u32) -> Result<(), Int8ScoringError>;
@@ -261,6 +272,7 @@ trait Driver {
     fn abort(&mut self);
 }
 impl<C: DecodeStepControl> Driver for Int8Session<'_, '_, C> {
+    fn checkpoint(&mut self) -> Result<(), Int8ScoringError> { super::poll(self.control()).map_err(Into::into) }
     fn position(&self) -> Result<usize, Int8ScoringError> { Int8Session::position(self).map_err(Into::into) }
     fn rewind(&mut self, retain: usize) -> Result<(), Int8ScoringError> {
         let current = Int8Session::position(self)?;
