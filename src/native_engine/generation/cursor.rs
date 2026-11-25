@@ -62,10 +62,11 @@ impl<'a> Cursor<'a> {
         let p = &self.plan.options;
         let index = self.output.token_ids.len();
         checkpoint(control, index)?;
-        let selected = self.workspace.select(logits, p, self.plan.key, self.plan.sample_index, index as u64)?;
+        let selected = self.workspace.select_with_control(logits, p, self.plan.key,
+            self.plan.sample_index, index, control)?;
         if matches!(&p.sampling, GenerationSampling::Seeded { .. }) { self.output.native_work.sampled_steps += 1; }
         let eos = p.eos_token_ids.binary_search(&selected).is_ok();
-        let score = if p.capture_logprobs { Some(raw_logprob(logits, selected)?) } else { None };
+        let score = if p.capture_logprobs { Some(raw_logprob(logits, selected, control, index)?) } else { None };
         let mut ids = reserved(index + 1)?; ids.extend_from_slice(&self.output.token_ids); ids.push(selected);
         let decoded = if eos {
             let mut bytes = reserved(self.output.content_bytes.len())?; bytes.extend_from_slice(&self.output.content_bytes); bytes

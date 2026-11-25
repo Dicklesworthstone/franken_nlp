@@ -10,7 +10,7 @@ use std::{cmp::Ordering, error::Error, fmt, str::FromStr};
 
 use sha2::{Digest, Sha256};
 
-use super::lmhead;
+use super::{decode::{DecodeCancellationKind, DecodeStepControl}, lmhead};
 
 /// Version of the frozen draw, ranking, and interval rules in this module.
 pub const SAMPLER_VERSION: &str = "fnlp-sampler-v1";
@@ -18,6 +18,34 @@ pub const SAMPLER_VERSION: &str = "fnlp-sampler-v1";
 pub const DEFAULT_TOP_K: usize = 20;
 /// Largest top-k selection held entirely on the stack by [`TopK`].
 pub const MAX_TOP_K: usize = DEFAULT_TOP_K;
+
+/// At most this many vocabulary entries or nucleus-sort comparisons are processed
+/// between cooperative sampler checkpoints. This is a work quantum, not a
+/// wall-clock guarantee for an allocator or the operating system.
+pub const SAMPLING_CHECKPOINT_STRIDE: usize = 256;
+
+pub(crate) struct SamplingCheckpoints<'a, C: DecodeStepControl + ?Sized> {
+    control: &'a mut C,
+    step: usize,
+    remaining: usize,
+}
+impl<'a, C: DecodeStepControl + ?Sized> SamplingCheckpoints<'a, C> {
+    pub(crate) fn new(control: &'a mut C, step: usize) -> Self {
+        Self { control, step, remaining: 0 }
+    }
+    pub(crate) fn checkpoint(&mut self) -> Result<(), SamplerError> {
+        if let Some(cause) = self.control.checkpoint(self.step) {
+            return Err(SamplerError::Cancelled(cause));
+        }
+        self.remaining = SAMPLING_CHECKPOINT_STRIDE;
+        Ok(())
+    }
+    pub(crate) fn visit(&mut self) -> Result<(), SamplerError> {
+        if self.remaining == 0 { self.checkpoint()?; }
+        self.remaining -= 1;
+        Ok(())
+    }
+}
 
 /// A caller-provided or admission-generated 256-bit sampling seed.
 ///
@@ -268,6 +296,27 @@ impl TopK {
         Ok(result)
     }
 
+    /// The same fixed heap and ranking as [Self::select], with caller-owned
+    /// cancellation during both validation and full-vocabulary traversal.
+    pub fn select_with_control<C: DecodeStepControl + ?Sized>(logits: &[f32], k: usize,
+        control: &mut C, step: usize) -> Result<Self, SamplerError> {
+        let mut checkpoints = SamplingCheckpoints::new(control, step);
+        validate_logits_controlled(logits, &mut checkpoints)?;
+        if !(1..=MAX_TOP_K).contains(&k) {
+            return Err(SamplerError::InvalidTopK { requested: k });
+        }
+        let mut result = Self { entries: [RankedToken::PLACEHOLDER; MAX_TOP_K], len: 0 };
+        for (token_id, logit) in logits.iter().copied().enumerate() {
+            checkpoints.visit()?;
+            result.push_heap(RankedToken { token_id, logit }, k);
+        }
+        // Sorting the fixed <=20-entry heap is a bounded stack-only phase.
+        checkpoints.checkpoint()?;
+        result.sort_descending();
+        checkpoints.checkpoint()?;
+        Ok(result)
+    }
+
     /// Ranked candidates in best-to-worst order.
     #[must_use]
     pub fn as_slice(&self) -> &[RankedToken] {
@@ -383,15 +432,12 @@ impl Nucleus {
         });
         debug_assert!(normalizer.is_finite() && normalizer > 0.0);
 
-        let mut ranked: Vec<NucleusToken> = logits
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(token_id, logit)| NucleusToken {
-                token: RankedToken { token_id, logit },
-                probability: (f64::from(logit) - f64::from(maximum)).exp() / normalizer,
-            })
-            .collect();
+        let mut ranked = Vec::new();
+        ranked.try_reserve_exact(logits.len()).map_err(|_| SamplerError::Allocation)?;
+        ranked.extend(logits.iter().copied().enumerate().map(|(token_id, logit)| NucleusToken {
+            token: RankedToken { token_id, logit },
+            probability: (f64::from(logit) - f64::from(maximum)).exp() / normalizer,
+        }));
         ranked.sort_unstable_by(|left, right| rank_order(left.token, right.token));
 
         let (cutoff_len, cutoff_mass) = if top_p == 1.0 {
@@ -416,6 +462,56 @@ impl Nucleus {
             entries: ranked,
             cutoff_mass,
         })
+    }
+
+    /// Exact top-p with bounded checkpoints throughout validation, numerical
+    /// passes, ranking and cutoff construction. The in-place heap sort uses
+    /// the frozen total ranking and allocates no additional vocabulary-sized
+    /// buffer. Maximum, normalizer and probability accumulation retain the
+    /// original operation order and bits from [Self::exact_top_p].
+    pub fn exact_top_p_with_control<C: DecodeStepControl + ?Sized>(logits: &[f32], top_p: f64,
+        control: &mut C, step: usize) -> Result<Self, SamplerError> {
+        let mut checkpoints = SamplingCheckpoints::new(control, step);
+        validate_logits_controlled(logits, &mut checkpoints)?;
+        if !(top_p.is_finite() && top_p > 0.0 && top_p <= 1.0) {
+            return Err(SamplerError::InvalidTopP);
+        }
+        let mut maximum = logits[0];
+        for &logit in &logits[1..] {
+            checkpoints.visit()?;
+            maximum = maximum.max(logit);
+        }
+        checkpoints.checkpoint()?;
+        let mut normalizer = 0.0_f64;
+        for &logit in logits {
+            checkpoints.visit()?;
+            normalizer += (f64::from(logit) - f64::from(maximum)).exp();
+        }
+        debug_assert!(normalizer.is_finite() && normalizer > 0.0);
+        checkpoints.checkpoint()?;
+        let mut ranked = Vec::new();
+        ranked.try_reserve_exact(logits.len()).map_err(|_| SamplerError::Allocation)?;
+        for (token_id, logit) in logits.iter().copied().enumerate() {
+            checkpoints.visit()?;
+            ranked.push(NucleusToken {
+                token: RankedToken { token_id, logit },
+                probability: (f64::from(logit) - f64::from(maximum)).exp() / normalizer,
+            });
+        }
+        checkpoints.checkpoint()?;
+        sort_nucleus_controlled(&mut ranked, &mut checkpoints)?;
+        checkpoints.checkpoint()?;
+        let mut cutoff_len = 0;
+        let mut cutoff_mass = 0.0;
+        for candidate in &ranked {
+            checkpoints.visit()?;
+            if top_p != 1.0 && cutoff_mass >= top_p { break; }
+            cutoff_mass += candidate.probability;
+            cutoff_len += 1;
+        }
+        ranked.truncate(cutoff_len);
+        checkpoints.checkpoint()?;
+        Ok(Self { entries: ranked, cutoff_mass })
     }
 
     /// Entries retained by exact top-p, in frozen rank order.
@@ -445,6 +541,61 @@ impl Nucleus {
         // terminal fallback is therefore frozen rather than retrying a draw.
         Ok(last.token.token_id)
     }
+
+    /// The same half-open cumulative intervals and terminal fallback as
+    /// [Self::select_uniform], without an uninterruptible full-vocabulary
+    /// scan when an addressed draw falls near the end of a dense nucleus.
+    pub fn select_uniform_with_control<C: DecodeStepControl + ?Sized>(&self, uniform: f64,
+        control: &mut C, step: usize) -> Result<usize, SamplerError> {
+        let mut checkpoints = SamplingCheckpoints::new(control, step);
+        checkpoints.checkpoint()?;
+        validate_uniform(uniform)?;
+        let last = self.entries.last().ok_or(SamplerError::EmptyLogits)?;
+        let mut cumulative = 0.0;
+        let mut selected = last.token.token_id;
+        for candidate in &self.entries {
+            checkpoints.visit()?;
+            cumulative += candidate.probability / self.cutoff_mass;
+            if uniform < cumulative { selected = candidate.token.token_id; break; }
+        }
+        checkpoints.checkpoint()?;
+        Ok(selected)
+    }
+}
+
+fn sort_nucleus_controlled<C: DecodeStepControl + ?Sized>(ranked: &mut [NucleusToken],
+    checkpoints: &mut SamplingCheckpoints<'_, C>) -> Result<(), SamplerError> {
+    // A worst-first heap extracts its maximum rank to the end, producing the
+    // exact best-first total order. Token IDs make every rank unique, so no
+    // stability assumption can affect ties or the subsequent floating sums.
+    for root in (0..ranked.len() / 2).rev() {
+        sift_nucleus_worst(ranked, root, checkpoints)?;
+    }
+    for end in (1..ranked.len()).rev() {
+        checkpoints.visit()?;
+        ranked.swap(0, end);
+        sift_nucleus_worst(&mut ranked[..end], 0, checkpoints)?;
+    }
+    Ok(())
+}
+
+fn sift_nucleus_worst<C: DecodeStepControl + ?Sized>(ranked: &mut [NucleusToken], mut root: usize,
+    checkpoints: &mut SamplingCheckpoints<'_, C>) -> Result<(), SamplerError> {
+    // The division guard precedes 2*root+1, even for the largest slice.
+    while root < ranked.len() / 2 {
+        let left = root * 2 + 1;
+        let right = left + 1;
+        let mut worst = left;
+        if right < ranked.len() {
+            checkpoints.visit()?;
+            if is_worse(ranked[right].token, ranked[left].token) { worst = right; }
+        }
+        checkpoints.visit()?;
+        if !is_worse(ranked[worst].token, ranked[root].token) { break; }
+        ranked.swap(root, worst);
+        root = worst;
+    }
+    Ok(())
 }
 
 /// A nucleus entry carrying its pre-renormalization full-vocabulary mass.
@@ -471,6 +622,10 @@ impl NucleusToken {
 /// Sampling input rejected before a stochastic distribution is constructed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SamplerError {
+    /// The admitted nucleus payload could not be allocated.
+    Allocation,
+    /// Caller cancellation retains its exact cause through every sampler phase.
+    Cancelled(DecodeCancellationKind),
     /// No vocabulary entries were supplied.
     EmptyLogits,
     /// A stochastic path refuses a NaN or infinity at the named vocabulary row.
@@ -486,6 +641,8 @@ pub enum SamplerError {
 impl fmt::Display for SamplerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Allocation => formatter.write_str("sampling allocation refused"),
+            Self::Cancelled(cause) => write!(formatter, "sampling cancelled: {cause:?}"),
             Self::EmptyLogits => formatter.write_str("sampling requires at least one logit"),
             Self::NonFiniteLogit { token_id } => {
                 write!(
@@ -531,6 +688,17 @@ fn validate_logits(logits: &[f32]) -> Result<(), SamplerError> {
         return Err(SamplerError::NonFiniteLogit { token_id });
     }
     Ok(())
+}
+
+fn validate_logits_controlled<C: DecodeStepControl + ?Sized>(logits: &[f32],
+    checkpoints: &mut SamplingCheckpoints<'_, C>) -> Result<(), SamplerError> {
+    checkpoints.checkpoint()?;
+    if logits.is_empty() { return Err(SamplerError::EmptyLogits); }
+    for (token_id, logit) in logits.iter().enumerate() {
+        checkpoints.visit()?;
+        if !logit.is_finite() { return Err(SamplerError::NonFiniteLogit { token_id }); }
+    }
+    checkpoints.checkpoint()
 }
 
 fn validate_uniform(uniform: f64) -> Result<(), SamplerError> {

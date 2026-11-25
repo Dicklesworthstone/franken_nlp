@@ -312,19 +312,35 @@ impl GenerationPlan {
         row.finish()
     }
 }
-fn checkpoint<C: DecodeStepControl>(control: &mut C, index: usize) -> Result<(), GenerationError> {
+fn checkpoint<C: DecodeStepControl + ?Sized>(control: &mut C, index: usize) -> Result<(), GenerationError> {
     match control.checkpoint(index) { Some(cause) => Err(GenerationError::Cancelled(cause)), None => Ok(()) }
 }
 fn check_logits(logits: &[f32]) -> Result<(), GenerationError> {
     if logits.len() != NANBEIGE_VOCAB_SIZE || logits.iter().any(|v| !v.is_finite()) { return Err(GenerationError::InvalidLogits); }
     Ok(())
 }
-fn raw_logprob(logits: &[f32], selected: u32) -> Result<f32, GenerationError> {
-    check_logits(logits)?;
-    let maximum = logits.iter().copied().map(f64::from).fold(f64::NEG_INFINITY, f64::max);
-    let sum = logits.iter().fold(0.0_f64, |s, &x| s + (f64::from(x) - maximum).exp());
+fn raw_logprob<C: DecodeStepControl + ?Sized>(logits: &[f32], selected: u32,
+    control: &mut C, step: usize) -> Result<f32, GenerationError> {
+    if logits.len() != NANBEIGE_VOCAB_SIZE || selected as usize >= logits.len() {
+        return Err(GenerationError::InvalidLogits);
+    }
+    let mut checkpoints = super::sampler::SamplingCheckpoints::new(control, step);
+    checkpoints.checkpoint().map_err(policy::sampler_error)?;
+    let mut maximum = f64::NEG_INFINITY;
+    for &value in logits {
+        checkpoints.visit().map_err(policy::sampler_error)?;
+        if !value.is_finite() { return Err(GenerationError::InvalidLogits); }
+        maximum = maximum.max(f64::from(value));
+    }
+    checkpoints.checkpoint().map_err(policy::sampler_error)?;
+    let mut sum = 0.0_f64;
+    for &value in logits {
+        checkpoints.visit().map_err(policy::sampler_error)?;
+        sum += (f64::from(value) - maximum).exp();
+    }
     let score = ((f64::from(logits[selected as usize]) - maximum) - sum.ln()) as f32;
     if !score.is_finite() { return Err(GenerationError::InvalidLogits); }
+    checkpoints.checkpoint().map_err(policy::sampler_error)?;
     Ok(score)
 }
 fn digest<T: Serialize>(value: &T) -> Result<Sha256Digest, GenerationError> {

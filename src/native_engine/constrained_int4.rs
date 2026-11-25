@@ -303,15 +303,29 @@ fn select(logits: &[f32], mask: &DenseTokenMask, accepting: bool, options: &Json
 /// path and the explicitly seeded full-head path. Both retain one grammar,
 /// one causal driver, scored EOS and the same independent final validation.
 trait Selection {
-    fn select(&mut self, logits: &[f32], mask: &DenseTokenMask, accepting: bool,
-        options: &JsonDecodeOptions, step: usize) -> Result<u32, Int4JsonError>;
+    #[allow(clippy::too_many_arguments)]
+    fn select<C: DecodeStepControl>(&mut self, logits: &[f32], mask: &DenseTokenMask, accepting: bool,
+        options: &JsonDecodeOptions, step: usize, control: &mut C) -> Result<u32, Int4JsonError>;
     fn execution(&self) -> &'static str;
 }
 struct Greedy;
 impl Selection for Greedy {
-    fn select(&mut self, logits: &[f32], mask: &DenseTokenMask, accepting: bool,
-        options: &JsonDecodeOptions, _: usize) -> Result<u32, Int4JsonError> {
-        select(logits, mask, accepting, options)
+    fn select<C: DecodeStepControl>(&mut self, logits: &[f32], mask: &DenseTokenMask, accepting: bool,
+        options: &JsonDecodeOptions, step: usize, control: &mut C) -> Result<u32, Int4JsonError> {
+        if logits.len() != mask.vocab_size() { return Err(JsonDecodeError::InvalidLogits.into()); }
+        let mut best = None;
+        for (index, chunk) in logits.chunks(super::sampler::SAMPLING_CHECKPOINT_STRIDE).enumerate() {
+            if let Some(cause) = control.checkpoint(step) { return Err(JsonDecodeError::Cancelled(cause).into()); }
+            for (offset, &value) in chunk.iter().enumerate() {
+                if !value.is_finite() { return Err(JsonDecodeError::InvalidLogits.into()); }
+                let id = (index * super::sampler::SAMPLING_CHECKPOINT_STRIDE + offset) as u32;
+                let legal = if id == options.eos_token_id { accepting }
+                    else { mask.contains(id) && !options.excluded_token_ids.contains(&id) };
+                if legal && best.is_none_or(|(_, score)| value > score) { best = Some((id, value)); }
+            }
+        }
+        if let Some(cause) = control.checkpoint(step) { return Err(JsonDecodeError::Cancelled(cause).into()); }
+        best.map(|(id, _)| id).ok_or_else(|| JsonDecodeError::NoLegalToken.into())
     }
     fn execution(&self) -> &'static str { INT4_JSON_EXECUTION }
 }
@@ -362,7 +376,7 @@ fn run<V: Vocabulary, D: Driver, S: Selection>(group_width: usize, prompt: &[u32
             .filter(|&count| count <= budget.json.max_total_mask_node_visits)
             .ok_or(JsonDecodeError::BudgetExceeded("mask work"))?;
         let mask = vocabulary.mask(&state, budget.json.mask_limits, driver.control(), step)?;
-        let selected = selection.select(&logits, &mask, state.is_accepting(), options, step)?;
+        let selected = selection.select(&logits, &mask, state.is_accepting(), options, step, driver.control())?;
         if let Some(cause) = driver.control().checkpoint(step) { return Err(JsonDecodeError::Cancelled(cause).into()); }
         tokens.push(selected);
         if selected == options.eos_token_id {

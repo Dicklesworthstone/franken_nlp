@@ -101,8 +101,8 @@ impl selected_head::Selection for Selected {
         let count = selected_head::selection::visit(mask, accepting, options, cap, remaining, driver, step,
             |rows, logits| sampled.workspace.extend_legal_rows(rows, logits, &sampled.options, step as u64)
                 .map_err(sampling_error))?;
-        let token = sampled.workspace.finish_legal_rows(&sampled.options, sampled.key,
-            sampled.sample_index, step as u64).map_err(sampling_error)?;
+        let token = sampled.workspace.finish_legal_rows_with_control(&sampled.options, sampled.key,
+            sampled.sample_index, step, driver.control()).map_err(sampling_error)?;
         Ok((token, count))
     }
     fn execution(&self) -> &'static str {

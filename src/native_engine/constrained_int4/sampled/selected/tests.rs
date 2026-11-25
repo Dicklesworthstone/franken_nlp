@@ -144,7 +144,7 @@ fn original_ids_and_exact_nucleus_survive_multiple_projection_blocks() {
         for sample_index in 0..12 {
             let s = JsonSamplingOptions { sample_index, top_k, top_p_ppm: p_ppm, ..sampling() };
             let mut full = Sampled::new(&identity(), &[1], &p, &o, &s, json_sampling_workspace_bytes().unwrap()).unwrap();
-            let expected = full.select(&row, &mask, false, &o, 0).unwrap();
+            let expected = full.select(&row, &mask, false, &o, 0, &mut Control::default()).unwrap();
             let mut selected = Selected::new(&identity(), &[1], &p, &o, &s,
                 json_sampling_workspace_bytes().unwrap(), false).unwrap();
             let mut d = Script::new(row.clone());
@@ -306,5 +306,30 @@ fn replay_tail_cancellation_and_late_finalizer_failure_refuse_the_complete_bundl
             });
         assert_eq!(result.unwrap_err().cancellation(), Some(cause));
         assert_eq!(checked, 2); assert!(late.aborted); assert_eq!(late.rewinds, [2]);
+    }
+}
+
+#[test]
+fn selected_sampling_cancellation_after_complete_projection_never_returns_a_token() {
+    let p = program(r#"{"type":"boolean"}"#); let o = options(2);
+    let mut mask = DenseTokenMask::empty(1025);
+    for id in 1..1025 { mask.set_legal(id).unwrap(); }
+    let row: Vec<_> = (0..1025).map(|index| ((index * 19 % 71) as f32 - 35.0) / 5.0).collect();
+    let mut selection = Selected::new(&identity(), &[1], &p, &o, &sampling(),
+        json_sampling_workspace_bytes().unwrap(), false).unwrap();
+    let mut baseline = Script::new(row.clone());
+    selected_head::Selection::project(&mut selection, &mask, false, &o, 1024, 1024, &mut baseline, 0).unwrap();
+    let last_checkpoint = baseline.control.calls;
+    assert_eq!(baseline.rows.iter().map(Vec::len).sum::<usize>(), 1024);
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let mut d = Script::new(row.clone());
+        d.control = Control { stop_at: Some(last_checkpoint), cause: Some(cause), ..Default::default() };
+        let error = selected_head::Selection::project(&mut selection, &mask, false, &o,
+            1024, 1024, &mut d, 0).unwrap_err();
+        assert_eq!(error.cancellation(), Some(cause));
+        assert_eq!(d.rows.iter().map(Vec::len).sum::<usize>(), 1024);
+        assert!(d.forwards.is_empty(), "cancelled selection must not feed a token back");
     }
 }

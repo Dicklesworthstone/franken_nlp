@@ -169,10 +169,10 @@ fn top_k_precedes_nucleus_after_exact_mask_and_preserves_original_ids() {
     for id in [1, 3, 5] { mask.set_legal(id).unwrap(); }
     // The two equal best LEGAL logits are 3 and 5, so their conditional
     // nucleus at 0.5 keeps exactly original ID 3. Illegal high logits lose.
-    assert_eq!(select.select(&[100.0, -10.0, 1000.0, 0.0, 1000.0, 0.0], &mask, false, &o, 0).unwrap(), 3);
+    assert_eq!(select.select(&[100.0, -10.0, 1000.0, 0.0, 1000.0, 0.0], &mask, false, &o, 0, &mut Control::default()).unwrap(), 3);
     let s = JsonSamplingOptions { top_k: Some(1), ..sampling() };
     let mut select = Sampled::new(&identity(), &[1], &p, &o, &s, json_sampling_workspace_bytes().unwrap()).unwrap();
-    assert_eq!(select.select(&[100.0, -0.0, 1000.0, 0.0, 1000.0, 0.0], &mask, false, &o, 0).unwrap(), 3);
+    assert_eq!(select.select(&[100.0, -0.0, 1000.0, 0.0, 1000.0, 0.0], &mask, false, &o, 0, &mut Control::default()).unwrap(), 3);
 }
 
 #[test]
@@ -701,5 +701,35 @@ fn reused_work_delta_checks_every_counter_without_saturating_or_refunding() {
             2 => bad.attention_pairs += 1, 3 => bad.projections.dot_products += 1,
             _ => bad.projections.multiply_accumulates += 1 }
         assert!(matches!(work_delta(full, bad), Err(Int4JsonError::WorkMismatch)));
+    }
+}
+
+#[test]
+fn dense_sample_selection_preserves_cancellation_inside_processor_and_nucleus_passes() {
+    #[derive(Default)]
+    struct Stops { calls: usize, at: Option<usize>, cause: Option<DecodeCancellationKind> }
+    impl DecodeStepControl for Stops {
+        fn checkpoint(&mut self, step: usize) -> Option<DecodeCancellationKind> {
+            assert_eq!(step, 7); self.calls += 1;
+            if self.at == Some(self.calls) { self.cause } else { None }
+        }
+    }
+    let p = program(r#"{"type":"boolean"}"#); let o = options(2);
+    let mut selection = Sampled::new(&identity(), &[1], &p, &o, &sampling(),
+        json_sampling_workspace_bytes().unwrap()).unwrap();
+    let mut mask = DenseTokenMask::empty(1025);
+    for id in 1..1025 { mask.set_legal(id).unwrap(); }
+    let row: Vec<_> = (0..1025).map(|index| ((index * 17 % 67) as f32 - 33.0) / 7.0).collect();
+    let mut completed = Stops::default();
+    let expected = selection.select(&row, &mask, false, &o, 7, &mut completed).unwrap();
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        for at in [1, 3, completed.calls / 2, completed.calls] {
+            let mut control = Stops { at: Some(at), cause: Some(cause), ..Default::default() };
+            let error = selection.select(&row, &mask, false, &o, 7, &mut control).unwrap_err();
+            assert_eq!(error.cancellation(), Some(cause)); assert_eq!(control.calls, at);
+        }
+        assert_eq!(selection.select(&row, &mask, false, &o, 7, &mut Stops::default()).unwrap(), expected);
     }
 }

@@ -180,3 +180,64 @@ fn context_and_sampler_work_are_declared_before_model_calls() {
         max_sampler_bytes: u64::MAX }; assert!(p.check_budget(budget).is_err());
     let budget = GenerationBudget { max_forward_positions: 5, max_sampler_bytes: 0, ..budget }; assert!(p.check_budget(budget).is_err());
 }
+
+
+#[derive(Default)]
+struct SelectionControl { calls: usize, stop_at: Option<usize>, cause: Option<DecodeCancellationKind> }
+impl DecodeStepControl for SelectionControl {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+        self.calls += 1;
+        if self.stop_at == Some(self.calls) { self.cause } else { None }
+    }
+}
+
+#[test]
+fn processor_cancellation_never_decodes_delivers_or_counts_a_sampled_token() {
+    struct UnreachableDecoder;
+    impl DecodeByteDecoder for UnreachableDecoder {
+        type Error = &'static str;
+        fn decode_token_ids(&self, _: &[u32]) -> Result<Vec<u8>, Self::Error> {
+            panic!("cancelled token selection must not reach decoding");
+        }
+    }
+    for sampling in [GenerationSampling::Greedy, GenerationSampling::Seeded {
+        effective_seed: [9; 32], temperature_milli: 1000, top_k: None, top_p_ppm: 1_000_000,
+    }, GenerationSampling::Seeded {
+        effective_seed: [9; 32], temperature_milli: 1000, top_k: Some(20), top_p_ppm: 950_000,
+    }] {
+        let mut options = GenerationOptions::greedy(1, 100, 0); options.sampling = sampling;
+        let p = plan(options);
+        for cause in CANCELLATION_KINDS {
+            let mut cursor = cursor::Cursor::new(&p, 3, GENERATION_VERSION).unwrap();
+            for _ in 0..p.prompt_tokens() { cursor.record_forward(true).unwrap(); }
+            let mut control = SelectionControl { stop_at: Some(3), cause: Some(cause), ..Default::default() };
+            let mut sink = Sink::default();
+            let error = cursor.emit_next(&row(1), &UnreachableDecoder, &mut sink, &mut control).unwrap_err();
+            assert!(matches!(error, GenerationError::Cancelled(actual) if actual == cause));
+            assert!(sink.0.is_empty()); assert!(cursor.output.token_ids.is_empty());
+            assert_eq!(cursor.output.native_work.sampled_steps, 0);
+        }
+    }
+}
+
+#[test]
+fn controlled_raw_logprobs_keep_full_denominator_bits_and_terminal_cancel_causes() {
+    let logits: Vec<_> = (0..NANBEIGE_VOCAB_SIZE).map(|index| ((index * 17 % 101) as f32 - 50.0) / 7.0).collect();
+    let maximum = logits.iter().copied().map(f64::from).fold(f64::NEG_INFINITY, f64::max);
+    let sum = logits.iter().fold(0.0_f64, |sum, &value| sum + (f64::from(value) - maximum).exp());
+    let mut completed = SelectionControl::default();
+    for selected in [0, NANBEIGE_VOCAB_SIZE / 2, NANBEIGE_VOCAB_SIZE - 1] {
+        let expected = ((f64::from(logits[selected]) - maximum) - sum.ln()) as f32;
+        let actual = raw_logprob(&logits, selected as u32, &mut Continue, 0).unwrap();
+        assert_eq!(actual.to_bits(), expected.to_bits());
+    }
+    raw_logprob(&logits, 0, &mut completed, 0).unwrap();
+    for cause in CANCELLATION_KINDS {
+        for stop_at in [1, 2, completed.calls / 2, completed.calls] {
+            let mut control = SelectionControl { stop_at: Some(stop_at), cause: Some(cause), ..Default::default() };
+            assert!(matches!(raw_logprob(&logits, 0, &mut control, 0),
+                Err(GenerationError::Cancelled(actual)) if actual == cause));
+            assert_eq!(control.calls, stop_at);
+        }
+    }
+}

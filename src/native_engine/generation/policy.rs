@@ -1,6 +1,7 @@
 //! Ordered processor stack and the existing pinned top-k/nucleus sampler.
 use super::*;
-use crate::native_engine::sampler::{DrawAddress, MAX_TOP_K, Nucleus, NucleusToken, TopK, addressed_uniform};
+use crate::native_engine::sampler::{DrawAddress, MAX_TOP_K, Nucleus, NucleusToken, TopK,
+    SamplerError, SamplingCheckpoints, addressed_uniform};
 
 pub(super) fn validate(p: &GenerationOptions, limits: GenerationLimits) -> Result<(), GenerationError> {
     if p.max_new_tokens == 0 || p.max_new_tokens > limits.max_new_tokens || p.min_new_tokens > p.max_new_tokens
@@ -53,35 +54,54 @@ impl Workspace {
         let count = self.counts.get_mut(token as usize).ok_or(GenerationError::InvalidLogits)?;
         *count = count.checked_add(1).ok_or(GenerationError::Limit("token frequency"))?; Ok(())
     }
-    pub fn select(&mut self, raw: &[f32], p: &GenerationOptions, key: StableRequestKey,
+    pub fn select_with_control<C: DecodeStepControl + ?Sized>(&mut self, raw: &[f32],
+        p: &GenerationOptions, key: StableRequestKey, sample_index: u64, step: usize,
+        control: &mut C) -> Result<u32, GenerationError> {
+        if raw.len() != NANBEIGE_VOCAB_SIZE { return Err(GenerationError::InvalidLogits); }
+        self.select_processed(raw, p, key, sample_index, step, |_| true, control)
+    }
+    #[cfg(test)]
+    fn select(&mut self, raw: &[f32], p: &GenerationOptions, key: StableRequestKey,
         sample_index: u64, step: u64) -> Result<u32, GenerationError> {
-        check_logits(raw)?;
-        self.select_processed(raw, p, key, sample_index, step, |_| true)
+        self.select_with_control(raw, p, key, sample_index,
+            usize::try_from(step).map_err(|_| GenerationError::Limit("decode step"))?, &mut Continue)
     }
     /// Exact external legality intersects the existing ordered processor
     /// stack before temperature, top-k and nucleus selection. The native
     /// owner checks its full vocabulary; a smaller finite width is admitted
     /// only for the closed decoder's synthetic differential fixtures.
-    pub(in crate::native_engine) fn select_legal<F: Fn(u32) -> bool>(
-        &mut self, raw: &[f32], p: &GenerationOptions, key: StableRequestKey,
-        sample_index: u64, step: u64, legal: F,
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::native_engine) fn select_legal_with_control<F: Fn(u32) -> bool,
+        C: DecodeStepControl + ?Sized>(&mut self, raw: &[f32], p: &GenerationOptions,
+        key: StableRequestKey, sample_index: u64, step: usize, legal: F, control: &mut C,
     ) -> Result<u32, GenerationError> {
-        if raw.is_empty() || raw.len() > self.counts.len() || raw.iter().any(|value| !value.is_finite()) {
-            return Err(GenerationError::InvalidLogits);
-        }
-        self.select_processed(raw, p, key, sample_index, step, legal)
+        if raw.is_empty() || raw.len() > self.counts.len() { return Err(GenerationError::InvalidLogits); }
+        self.select_processed(raw, p, key, sample_index, step, legal, control)
     }
-    fn select_processed<F: Fn(u32) -> bool>(
+    #[cfg(test)]
+    fn select_legal<F: Fn(u32) -> bool>(&mut self, raw: &[f32], p: &GenerationOptions,
+        key: StableRequestKey, sample_index: u64, step: u64, legal: F) -> Result<u32, GenerationError> {
+        self.select_legal_with_control(raw, p, key, sample_index,
+            usize::try_from(step).map_err(|_| GenerationError::Limit("decode step"))?, legal, &mut Continue)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn select_processed<F: Fn(u32) -> bool, C: DecodeStepControl + ?Sized>(
         &mut self, raw: &[f32], p: &GenerationOptions, key: StableRequestKey,
-        sample_index: u64, step: u64, legal: F,
+        sample_index: u64, step: usize, legal: F, control: &mut C,
     ) -> Result<u32, GenerationError> {
         self.begin_legal_rows();
         let scales = processor_scales(p);
+        let mut checkpoints = SamplingCheckpoints::new(control, step);
+        checkpoints.checkpoint().map_err(sampler_error)?;
         for (index, &raw_logit) in raw.iter().enumerate() {
+            checkpoints.visit().map_err(sampler_error)?;
+            // Illegal or banned rows must not conceal a corrupt projection.
+            if !raw_logit.is_finite() { return Err(GenerationError::InvalidLogits); }
             let id = index as u32;
-            if legal(id) { self.push_processed(id, raw_logit, p, step, scales)?; }
+            if legal(id) { self.push_processed(id, raw_logit, p, step as u64, scales)?; }
         }
-        self.finish_legal_rows(p, key, sample_index, step)
+        checkpoints.checkpoint().map_err(sampler_error)?;
+        self.finish_legal_rows_with_control(p, key, sample_index, step, control)
     }
 
     /// Start one exact selected-row step using the already admitted sampler
@@ -136,23 +156,36 @@ impl Workspace {
 
     /// Select only after the complete exact legal set has been projected.
     /// No native block, cap or physical schedule enters the addressed draw.
-    pub(in crate::native_engine) fn finish_legal_rows(&self, p: &GenerationOptions,
-        key: StableRequestKey, sample_index: u64, step: u64) -> Result<u32, GenerationError> {
+    pub(in crate::native_engine) fn finish_legal_rows_with_control<C: DecodeStepControl + ?Sized>(
+        &self, p: &GenerationOptions, key: StableRequestKey, sample_index: u64, step: usize,
+        control: &mut C) -> Result<u32, GenerationError> {
+        checkpoint(control, step)?;
         if self.ids.is_empty() { return Err(GenerationError::NoLegalToken); }
         let selected = match &p.sampling {
             GenerationSampling::Greedy => {
+                let mut checkpoints = SamplingCheckpoints::new(control, step);
                 let mut best = 0;
                 for index in 1..self.logits.len() {
+                    checkpoints.visit().map_err(sampler_error)?;
                     if self.logits[index] > self.logits[best] { best = index; }
                 }
+                checkpoints.checkpoint().map_err(sampler_error)?;
                 best
             }
             GenerationSampling::Seeded { effective_seed, top_k, top_p_ppm, .. } => {
-                let uniform = addressed_uniform(Seed256::from(*effective_seed), key, DrawAddress::new(sample_index, step, 0));
-                select_uniform(&self.logits, *top_k, f64::from(*top_p_ppm) / 1_000_000.0, uniform)?
+                let uniform = addressed_uniform(Seed256::from(*effective_seed), key,
+                    DrawAddress::new(sample_index, step as u64, 0));
+                select_uniform_with_control(&self.logits, *top_k,
+                    f64::from(*top_p_ppm) / 1_000_000.0, uniform, control, step)?
             }
         };
         self.ids.get(selected).copied().ok_or(GenerationError::InvalidLogits)
+    }
+    #[cfg(test)]
+    fn finish_legal_rows(&self, p: &GenerationOptions, key: StableRequestKey,
+        sample_index: u64, step: u64) -> Result<u32, GenerationError> {
+        self.finish_legal_rows_with_control(p, key, sample_index,
+            usize::try_from(step).map_err(|_| GenerationError::Limit("decode step"))?, &mut Continue)
     }
 }
 fn processor_scales(p: &GenerationOptions) -> (f64, f64) {
@@ -161,22 +194,42 @@ fn processor_scales(p: &GenerationOptions) -> (f64, f64) {
         GenerationSampling::Seeded { temperature_milli, .. } => f64::from(*temperature_milli) / 1000.0 };
     (repetition, temperature)
 }
-fn select_uniform(logits: &[f32], top_k: Option<usize>, p: f64, u: f64) -> Result<usize, GenerationError> {
+fn select_uniform_with_control<C: DecodeStepControl + ?Sized>(logits: &[f32], top_k: Option<usize>,
+    p: f64, u: f64, control: &mut C, step: usize) -> Result<usize, GenerationError> {
     match top_k {
-        None => Nucleus::exact_top_p(logits, p).and_then(|n| n.select_uniform(u)).map_err(|_| GenerationError::InvalidLogits),
+        None => Nucleus::exact_top_p_with_control(logits, p, control, step)
+            .and_then(|n| n.select_uniform_with_control(u, control, step)).map_err(sampler_error),
         Some(k) => {
-            let top = TopK::select(logits, k).map_err(|_| GenerationError::InvalidLogits)?;
-            if p == 1.0 { return top.select_uniform(u).map_err(|_| GenerationError::InvalidLogits); }
+            let top = TopK::select_with_control(logits, k, control, step).map_err(sampler_error)?;
+            if p == 1.0 { return top.select_uniform(u).map_err(sampler_error); }
             let entries = top.as_slice();
             let mut restricted = [0.0_f32; MAX_TOP_K];
             for (index, token) in entries.iter().enumerate() { restricted[index] = token.logit(); }
             // Nucleus is conditional on the exact top-k set here. Without k,
             // the other branch computes the complete legal-vocabulary normalizer.
-            let index = Nucleus::exact_top_p(&restricted[..entries.len()], p)
-                .and_then(|n| n.select_uniform(u)).map_err(|_| GenerationError::InvalidLogits)?;
+            let index = Nucleus::exact_top_p_with_control(&restricted[..entries.len()], p, control, step)
+                .and_then(|n| n.select_uniform_with_control(u, control, step)).map_err(sampler_error)?;
             Ok(entries[index].token_id())
         }
     }
+}
+
+pub(super) fn sampler_error(error: SamplerError) -> GenerationError {
+    match error {
+        SamplerError::Allocation => GenerationError::Allocation,
+        SamplerError::Cancelled(cause) => GenerationError::Cancelled(cause),
+        _ => GenerationError::InvalidLogits,
+    }
+}
+#[cfg(test)]
+struct Continue;
+#[cfg(test)]
+impl DecodeStepControl for Continue {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
+}
+#[cfg(test)]
+fn select_uniform(logits: &[f32], top_k: Option<usize>, p: f64, u: f64) -> Result<usize, GenerationError> {
+    select_uniform_with_control(logits, top_k, p, u, &mut Continue, 0)
 }
 
 #[cfg(test)]
@@ -294,5 +347,38 @@ mod tests {
         workspace.begin_legal_rows();
         workspace.extend_legal_rows(&[1], &[1.0], &p, 0).unwrap();
         assert_eq!(workspace.finish_legal_rows(&p, key, 0, 0).unwrap(), 1);
+    }
+
+    #[test]
+    fn processor_visits_are_bounded_even_when_every_row_is_illegal() {
+        use std::cell::Cell;
+        use crate::native_engine::sampler::SAMPLING_CHECKPOINT_STRIDE;
+        struct Stop<'a> { visits: &'a Cell<usize>, cause: DecodeCancellationKind }
+        impl DecodeStepControl for Stop<'_> {
+            fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+                (self.visits.get() >= SAMPLING_CHECKPOINT_STRIDE).then_some(self.cause)
+            }
+        }
+        let p = GenerationOptions::greedy(2, 100, 0);
+        let key = StableRequestKey::from_canonical_digest([13; 32]);
+        for cause in super::super::tests::CANCELLATION_KINDS {
+            let visits = Cell::new(0);
+            let mut control = Stop { visits: &visits, cause };
+            let mut workspace = Workspace::new(&[]).unwrap();
+            let result = workspace.select_legal_with_control(&vec![0.0; 1025], &p, key, 0, 7,
+                |_| { visits.set(visits.get() + 1); false }, &mut control);
+            assert!(matches!(result, Err(GenerationError::Cancelled(actual)) if actual == cause));
+            assert_eq!(visits.get(), SAMPLING_CHECKPOINT_STRIDE);
+            assert!(workspace.ids.is_empty());
+        }
+    }
+
+    #[test]
+    fn sampler_allocation_and_cancellation_are_not_flattened_to_invalid_logits() {
+        assert!(matches!(sampler_error(SamplerError::Allocation), GenerationError::Allocation));
+        for cause in super::super::tests::CANCELLATION_KINDS {
+            assert!(matches!(sampler_error(SamplerError::Cancelled(cause)),
+                GenerationError::Cancelled(actual) if actual == cause));
+        }
     }
 }

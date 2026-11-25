@@ -281,9 +281,9 @@ fn work_delta(total: Int4Work, before: Int4Work) -> Result<Int4Work, Int4JsonErr
 
 struct ReusedSelection(Sampled);
 impl Selection for ReusedSelection {
-    fn select(&mut self, logits: &[f32], mask: &DenseTokenMask, accepting: bool,
-        options: &JsonDecodeOptions, step: usize) -> Result<u32, Int4JsonError> {
-        self.0.select(logits, mask, accepting, options, step)
+    fn select<C: DecodeStepControl>(&mut self, logits: &[f32], mask: &DenseTokenMask, accepting: bool,
+        options: &JsonDecodeOptions, step: usize, control: &mut C) -> Result<u32, Int4JsonError> {
+        self.0.select(logits, mask, accepting, options, step, control)
     }
     fn execution(&self) -> &'static str { INT4_JSON_SAMPLED_REUSED_PREFILL_EXECUTION }
 }
@@ -378,13 +378,13 @@ impl Sampled {
 }
 
 impl Selection for Sampled {
-    fn select(&mut self, logits: &[f32], mask: &DenseTokenMask, accepting: bool,
-        options: &JsonDecodeOptions, step: usize) -> Result<u32, Int4JsonError> {
-        checked_logits(logits, mask.vocab_size())?;
-        self.workspace.select_legal(logits, &self.options, self.key, self.sample_index, step as u64, |id| {
+    fn select<C: DecodeStepControl>(&mut self, logits: &[f32], mask: &DenseTokenMask, accepting: bool,
+        options: &JsonDecodeOptions, step: usize, control: &mut C) -> Result<u32, Int4JsonError> {
+        if logits.len() != mask.vocab_size() { return Err(JsonDecodeError::InvalidLogits.into()); }
+        self.workspace.select_legal_with_control(logits, &self.options, self.key, self.sample_index, step, |id| {
             if id == options.eos_token_id { accepting }
             else { mask.contains(id) && !options.excluded_token_ids.contains(&id) }
-        }).map_err(sampling_error)
+        }, control).map_err(sampling_error)
     }
     fn execution(&self) -> &'static str { INT4_JSON_SAMPLED_EXECUTION }
 }
