@@ -447,17 +447,25 @@ fn publish<T: Serialize>(value: &T, cap: usize, output: &mut impl Write) -> Resu
 /// first external byte, and after write/flush before reporting success.
 /// Blocking IO is cooperative: an expired write cannot retract bytes already
 /// delivered, but it must never return successful command completion.
+/// A terminal caller refusal also wins over a coincident staging or delivery
+/// failure; those errors must not hide the original run control's decision.
 fn publish_checked<T: Serialize>(value: &T, cap: usize, output: &mut impl Write,
     check: &impl Fn() -> Result<(), CandidateError>) -> Result<(), CandidateError> {
     check()?;
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(cap).map_err(|_| CandidateError::Memory)?;
-    let mut stage = BoundedOutput { bytes, cap };
-    serde_json::to_writer(&mut stage, value).map_err(|_| CandidateError::Output)?;
-    stage.write_all(b"\n").map_err(|_| CandidateError::Output)?;
+    let staged: Result<BoundedOutput, CandidateError> = (|| {
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(cap).map_err(|_| CandidateError::Memory)?;
+        let mut stage = BoundedOutput { bytes, cap };
+        serde_json::to_writer(&mut stage, value).map_err(|_| CandidateError::Output)?;
+        stage.write_all(b"\n").map_err(|_| CandidateError::Output)?;
+        Ok(stage)
+    })();
     check()?;
-    output.write_all(&stage.bytes).and_then(|()| output.flush()).map_err(|_| CandidateError::Output)?;
-    check()
+    let stage = staged?;
+    let delivered = output.write_all(&stage.bytes).and_then(|()| output.flush())
+        .map_err(|_| CandidateError::Output);
+    check()?;
+    delivered
 }
 struct BoundedOutput { bytes: Vec<u8>, cap: usize }
 impl Write for BoundedOutput {

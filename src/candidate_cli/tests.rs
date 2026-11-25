@@ -258,6 +258,105 @@ fn serialization_that_exhausts_the_deadline_publishes_no_bytes() {
 }
 
 #[test]
+fn terminal_refusal_wins_over_serializer_and_framing_failures_without_publishing() {
+    use std::cell::Cell;
+    struct StoppingSerialization<'a> {
+        stopped: &'a Cell<bool>,
+        fail_directly: bool,
+    }
+    impl Serialize for StoppingSerialization<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.stopped.set(true);
+            if self.fail_directly {
+                return Err(serde::ser::Error::custom("private serialization detail"));
+            }
+            serializer.serialize_str("private")
+        }
+    }
+    for refusal in [None, Some(CandidateError::Timeout), Some(CandidateError::Execution)] {
+        // Direct serialization failure, a body exceeding the cap, and an
+        // otherwise complete JSON body with no room for its NDJSON newline.
+        for (fail_directly, cap) in [(true, 128), (false, 1), (false, 9)] {
+            let stopped = Cell::new(false);
+            let check = || if stopped.get() { refusal.map_or(Ok(()), Err) } else { Ok(()) };
+            let value = StoppingSerialization { stopped: &stopped, fail_directly };
+            let mut output = Vec::new();
+            assert_eq!(publish_checked(&value, cap, &mut output, &check),
+                Err(refusal.unwrap_or(CandidateError::Output)));
+            assert!(stopped.get());
+            assert!(output.is_empty());
+        }
+    }
+}
+
+#[test]
+fn terminal_refusal_wins_over_failed_write_partial_write_and_flush() {
+    use std::cell::Cell;
+    #[derive(Clone, Copy)]
+    enum Failure { Write, PartialWrite, Flush }
+    struct StoppingOutput<'a> {
+        stopped: &'a Cell<bool>,
+        failure: Failure,
+        bytes: Vec<u8>,
+        writes: usize,
+        flushed: bool,
+    }
+    impl Write for StoppingOutput<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            match self.failure {
+                Failure::Flush => { self.bytes.extend_from_slice(bytes); Ok(bytes.len()) }
+                Failure::PartialWrite if self.writes == 1 => {
+                    self.bytes.push(bytes[0]);
+                    Ok(1)
+                }
+                _ => {
+                    self.stopped.set(true);
+                    Err(io::Error::other("private sink detail"))
+                }
+            }
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushed = true;
+            self.stopped.set(true);
+            Err(io::Error::other("private flush detail"))
+        }
+    }
+    for refusal in [None, Some(CandidateError::Timeout), Some(CandidateError::Execution)] {
+        for failure in [Failure::Write, Failure::PartialWrite, Failure::Flush] {
+            let stopped = Cell::new(false);
+            let check = || if stopped.get() { refusal.map_or(Ok(()), Err) } else { Ok(()) };
+            let mut output = StoppingOutput { stopped: &stopped, failure,
+                bytes: Vec::new(), writes: 0, flushed: false };
+            let expected = refusal.unwrap_or(CandidateError::Output);
+            assert_eq!(publish_checked(&"private", 128, &mut output, &check), Err(expected));
+            assert_ne!(expected.exit_code(), ExitCode::SUCCESS);
+            assert!(stopped.get());
+            // No rollback or retry can undo bytes already accepted by a sink.
+            // A partial/full frame therefore remains transport data only;
+            // this invocation must return the original non-success result.
+            match failure {
+                Failure::Write => {
+                    assert!(output.bytes.is_empty());
+                    assert_eq!(output.writes, 1);
+                    assert!(!output.flushed);
+                }
+                Failure::PartialWrite => {
+                    assert_eq!(output.bytes, b"\"");
+                    assert_eq!(output.writes, 2);
+                    assert!(!output.flushed);
+                }
+                Failure::Flush => {
+                    assert_eq!(output.bytes, b"\"private\"\n");
+                    assert_eq!(output.writes, 1);
+                    assert!(output.flushed);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn deadline_exhausted_during_write_or_flush_cannot_return_success() {
     use std::cell::Cell;
     struct ExpiringOutput<'a> {
