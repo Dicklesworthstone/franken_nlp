@@ -2596,8 +2596,9 @@ fn run_schema_command_with_reader(
         SchemaSubcommand::Check { schema } => ("check", schema),
         SchemaSubcommand::Sample { schema } => ("sample", schema),
     };
-    let source = match read_schema_source_from(&path, schema_input) {
-        Ok(source) => source,
+    let limits = CompileLimits::default();
+    let bytes = match read_schema_source_from(&path, schema_input, limits.max_schema_bytes) {
+        Ok(bytes) => bytes,
         Err(error) => {
             eprintln!(
                 "SCHEMA mode={mode} RESULT=FAIL pointer=$ keyword=none reason=input-read:{error}"
@@ -2605,7 +2606,18 @@ fn run_schema_command_with_reader(
             return ErrorCode::InputDecodeOrParse.as_process_exit();
         }
     };
-    let compiled = match compile_json_schema(&source, CompileLimits::default()) {
+    if bytes.len() > limits.max_schema_bytes {
+        emit_schema_error(mode, &SchemaError::Resource {
+            pointer: "$".to_owned(),
+            reason: format!("schema exceeds schema cap {}", limits.max_schema_bytes),
+        });
+        return ErrorCode::SchemaOrRecipeCompile.as_process_exit();
+    }
+    let Ok(source) = std::str::from_utf8(&bytes) else {
+        eprintln!("SCHEMA mode={mode} RESULT=FAIL pointer=$ keyword=none reason=input-read:invalid UTF-8");
+        return ErrorCode::InputDecodeOrParse.as_process_exit();
+    };
+    let compiled = match compile_json_schema(source, limits) {
         Ok(compiled) => compiled,
         Err(error) => {
             emit_schema_error(mode, &error);
@@ -2625,14 +2637,17 @@ fn run_schema_command_with_reader(
     ExitCode::SUCCESS
 }
 
-fn read_schema_source_from(path: &Path, schema_input: &mut impl Read) -> io::Result<String> {
-    if path == Path::new("-") {
-        let mut source = String::new();
-        schema_input.read_to_string(&mut source)?;
-        Ok(source)
+fn read_schema_source_from(path: &Path, schema_input: &mut impl Read, max_bytes: usize) -> io::Result<Vec<u8>> {
+    let mut file;
+    let reader: &mut dyn Read = if path == Path::new("-") {
+        schema_input
     } else {
-        fs::read_to_string(path)
-    }
+        file = fs::File::open(path)?;
+        &mut file
+    };
+    let mut bytes = Vec::new();
+    reader.take((max_bytes as u64).saturating_add(1)).read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn emit_schema_success(mode: &str, compiled: &CompiledSchema) {
@@ -2673,6 +2688,13 @@ mod tests {
     };
 
     use clap::{Parser, error::ErrorKind};
+
+    #[test]
+    fn streaming_schema_input_stops_at_cap_plus_one() {
+        let mut input = Cursor::new([b' '; 32]);
+        assert_eq!(super::read_schema_source_from(Path::new("-"), &mut input, 8).unwrap().len(), 9);
+        assert_eq!(input.position(), 9);
+    }
 
     use super::{
         Cli, Command, KvCacheQuantization, LogicalTensorFirstPass, ModelsSubcommand,

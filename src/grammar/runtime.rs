@@ -7,15 +7,13 @@
 //! within the output-byte bound. Bound source fields additionally advance a
 //! request-owned substring cursor; unbound source annotations still refuse.
 
-use std::collections::BTreeMap;
-
 use crate::validation::{JsonValue as ValidationValue, JsonLimits, parse_json_with_limits, validate_value};
 
 use super::{
     compiler::{CompileLimits, CompiledSchema, SchemaNode, SourceAnnotation, compile_json_schema},
     mask::ByteState,
     source_index::{SourceCursor, SourceLanguage},
-    schema::{IntegerValue, JsonValue, ScalarValue, SchemaError, escape_json_string, parse_json},
+    schema::{ScalarValue, SchemaError, escape_json_string},
 };
 
 mod source;
@@ -49,15 +47,6 @@ struct Node {
     minimum: usize,
 }
 
-/// Scalar-length rules follow schema edges. A long ancestor property name is
-/// stored once instead of being copied into every descendant's lookup key.
-#[derive(Clone, Debug, Default)]
-struct LengthRules {
-    max_chars: Option<usize>,
-    properties: BTreeMap<String, LengthRules>,
-    items: Option<Box<LengthRules>>,
-}
-
 /// Compile once, then borrow for any number of independent request states.
 #[derive(Clone, Debug)]
 pub struct JsonProgram {
@@ -65,7 +54,6 @@ pub struct JsonProgram {
     nodes: Vec<Node>,
     root: usize,
     max_output_bytes: usize,
-    lengths: LengthRules,
     exponents: Vec<(i32, Vec<u8>)>,
     source: Option<source::SourceBinding>,
 }
@@ -75,54 +63,47 @@ pub struct JsonProgram {
 /// Actual source-bound enum feasibility remains the native planner's check.
 pub(crate) struct JsonValidationSchema {
     root: SchemaNode,
-    lengths: LengthRules,
     requires_source: bool,
 }
 impl JsonValidationSchema {
     pub(crate) fn compile(source: &str, limits: CompileLimits) -> Result<Self, SchemaError> {
-        let (schema, lengths) = compile_declaration(source, limits)?;
+        let schema = compile_json_schema(source, limits)?;
         let mut nodes = Vec::new();
         // The declaration may contain verbatim enums without an invented
         // document. Only this non-executable validator permits that state.
-        let root = build(schema.root(), "$", &lengths, &mut nodes, limits.max_states, 0, None, true)?;
+        let root = build(schema.root(), &mut nodes, limits.max_states, 0, None, true)?;
         if nodes[root].minimum > limits.max_output_bytes { return Err(resource("no JSON value fits output byte limit")); }
-        Ok(Self { root: schema.root().clone(), lengths, requires_source: schema.requires_verbatim_source() })
+        Ok(Self { root: schema.root().clone(), requires_source: schema.requires_verbatim_source() })
     }
     pub(crate) fn root(&self) -> &SchemaNode { &self.root }
     pub(crate) fn requires_verbatim_source(&self) -> bool { self.requires_source }
     pub(crate) fn validate_value(&self, value: &ValidationValue) -> Result<(), SchemaError> {
-        validate_value(&self.root, value).map_err(|_| invalid("independent JSON validation failed"))?;
-        validate_lengths(&self.root, value, "$", &self.lengths)
+        validate_value(&self.root, value).map_err(|_| invalid("independent JSON validation failed"))
     }
 }
 
 impl JsonProgram {
     /// Compile the existing supported schema subset with standard code-point
     /// `maxLength`, separate from the engine's UTF-8 byte cap.
-    ///
-    /// The legacy compiler interprets `maxLength` as bytes. Remove only that
-    /// keyword from a lossless copy, retain its independently checked bounds,
-    /// and let the compiler enforce every other keyword and deployment cap.
-    /// The original schema, not this normalization, belongs in request identity.
     pub fn compile(source: &str, limits: CompileLimits) -> Result<Self, SchemaError> {
         Self::compile_bound(source, limits, None)
     }
 
     fn compile_bound(source: &str, limits: CompileLimits, binding: Option<source::SourceBinding>) -> Result<Self, SchemaError> {
-        let (schema, lengths) = compile_declaration(source, limits)?;
+        let schema = compile_json_schema(source, limits)?;
         if schema.requires_verbatim_source() && binding.is_none() {
             return Err(SchemaError::UnsupportedKeyword {
                 pointer: "$".to_owned(), keyword: "runtime source-product gate".to_owned(),
             });
         }
         let mut nodes = Vec::new();
-        let root = build(schema.root(), "$", &lengths, &mut nodes, limits.max_states, 0,
+        let root = build(schema.root(), &mut nodes, limits.max_states, 0,
             binding.as_ref().map(|b| &b.language), false)?;
         if nodes[root].minimum > limits.max_output_bytes {
             return Err(resource("no JSON value fits output byte limit"));
         }
         Ok(Self {
-            schema, nodes, root, max_output_bytes: limits.max_output_bytes, lengths, source: binding,
+            schema, nodes, root, max_output_bytes: limits.max_output_bytes, source: binding,
             exponents: (-308..=308).map(|e: i32| (e, e.to_string().into_bytes())).collect(),
         })
     }
@@ -146,13 +127,21 @@ impl JsonProgram {
         use sha2::{Digest, Sha256};
         fn number(hash: &mut Sha256, value: usize) { hash.update((value as u64).to_be_bytes()); }
         fn bytes(hash: &mut Sha256, value: &[u8]) { number(hash, value.len()); hash.update(value); }
-        fn lengths(hash: &mut Sha256, rules: &LengthRules) {
-            hash.update([u8::from(rules.max_chars.is_some())]);
-            number(hash, rules.max_chars.unwrap_or(0));
-            number(hash, rules.properties.len());
-            for (key, child) in &rules.properties { bytes(hash, key.as_bytes()); lengths(hash, child); }
-            hash.update([u8::from(rules.items.is_some())]);
-            if let Some(items) = &rules.items { lengths(hash, items); }
+        // Preserve the v1 sampling digest layout using the schema's length rules.
+        fn lengths(hash: &mut Sha256, schema: &SchemaNode) {
+            let max_chars = match schema {
+                SchemaNode::String { max_chars, .. } => *max_chars,
+                _ => None,
+            };
+            hash.update([u8::from(max_chars.is_some())]);
+            number(hash, max_chars.unwrap_or(0));
+            if let SchemaNode::Object { properties, .. } = schema {
+                number(hash, properties.len());
+                for (key, child) in properties { bytes(hash, key.as_bytes()); lengths(hash, child); }
+            } else { number(hash, 0); }
+            if let SchemaNode::Array { items, .. } = schema {
+                hash.update([1]); lengths(hash, items);
+            } else { hash.update([0]); }
         }
         // Node literals below bind exact scalar values without allocating
         // decimal/string renderings. Retain declaration distinctions and
@@ -169,7 +158,7 @@ impl JsonProgram {
                 SchemaNode::Array { items, max_items } => {
                     hash.update([1]); number(hash, *max_items); declaration(hash, items);
                 }
-                SchemaNode::String { max_bytes, allowed, source } => {
+                SchemaNode::String { max_bytes, allowed, source, .. } => {
                     hash.update([2, u8::from(allowed.is_some()), u8::from(*source == SourceAnnotation::Verbatim)]);
                     number(hash, *max_bytes);
                 }
@@ -183,7 +172,7 @@ impl JsonProgram {
         bytes(&mut hash, JSON_RUNTIME_VERSION.as_bytes());
         bytes(&mut hash, self.version().as_bytes());
         number(&mut hash, self.root); number(&mut hash, self.max_output_bytes);
-        declaration(&mut hash, self.schema.root()); lengths(&mut hash, &self.lengths);
+        declaration(&mut hash, self.schema.root()); lengths(&mut hash, self.schema.root());
         number(&mut hash, self.nodes.len());
         for node in &self.nodes {
             number(&mut hash, node.minimum);
@@ -236,8 +225,7 @@ impl JsonProgram {
     /// is minted here and the originating chunk's output byte cap is not a
     /// whole-document cap. Includes runtime-owned Unicode maxLength rules.
     pub(crate) fn validate_declarative_value(&self, value: &ValidationValue) -> Result<(), SchemaError> {
-        validate_value(self.schema.root(), value).map_err(|_| invalid("independent JSON validation failed"))?;
-        validate_lengths(self.schema.root(), value, "$", &self.lengths)
+        validate_value(self.schema.root(), value).map_err(|_| invalid("independent JSON validation failed"))
     }
 
     fn validated_value(&self, text: &str) -> Result<ValidationValue, SchemaError> {
@@ -250,22 +238,8 @@ impl JsonProgram {
         }).map_err(|_| invalid("independent JSON parsing failed"))?;
         validate_value(self.schema.root(), &value)
             .map_err(|_| invalid("independent JSON validation failed"))?;
-        validate_lengths(self.schema.root(), &value, "$", &self.lengths)?;
         Ok(value)
     }
-}
-
-fn compile_declaration(source: &str, limits: CompileLimits)
-    -> Result<(CompiledSchema, LengthRules), SchemaError> {
-    if source.len() > limits.max_schema_bytes { return Err(resource("schema byte limit exceeded")); }
-    let mut raw = parse_json(source)?;
-    let lengths = take_lengths(&mut raw, "$", 0)?;
-    let normalized = render(&raw);
-    // Canonical spelling can expand exact decimals. This internal copy is
-    // bounded by the already checked source plus the exact parser domain.
-    let mut compiler_limits = limits;
-    compiler_limits.max_schema_bytes = normalized.len();
-    Ok((compile_json_schema(&normalized, compiler_limits)?, lengths))
 }
 
 fn resource(reason: &str) -> SchemaError {
@@ -274,48 +248,7 @@ fn resource(reason: &str) -> SchemaError {
 fn invalid(reason: &str) -> SchemaError {
     SchemaError::InvalidSchema { pointer: "$".to_owned(), reason: reason.to_owned() }
 }
-fn child_path(path: &str, key: &str) -> String {
-    format!("{path}/properties/{}", key.replace('~', "~0").replace('/', "~1"))
-}
-
-fn take_lengths(value: &mut JsonValue, path: &str, depth: usize) -> Result<LengthRules, SchemaError> {
-    if depth > MAX_DEPTH { return Err(resource("schema nesting limit exceeded")); }
-    let mut lengths = LengthRules::default();
-    let JsonValue::Object(object) = value else { return Ok(lengths); };
-    if object.get("type").and_then(JsonValue::as_string) == Some("string") {
-        if let Some(bound) = object.remove("maxLength") {
-            let count = match bound.as_number().and_then(|n| n.integer_value()) {
-                Some(IntegerValue::Signed(n)) if n >= 0 => n as u64,
-                Some(IntegerValue::Unsigned(n)) => n,
-                _ => return Err(invalid("maxLength must be a nonnegative integer")),
-            };
-            lengths.max_chars = Some(usize::try_from(count).unwrap_or(usize::MAX));
-        }
-    }
-    if let Some(JsonValue::Object(properties)) = object.get_mut("properties") {
-        for (name, child) in properties {
-            lengths.properties.insert(name.clone(), take_lengths(child, &child_path(path, name), depth + 1)?);
-        }
-    }
-    if let Some(items) = object.get_mut("items") {
-        lengths.items = Some(Box::new(take_lengths(items, &format!("{path}/items"), depth + 1)?));
-    }
-    Ok(lengths)
-}
-
-fn render(value: &JsonValue) -> String {
-    match value {
-        JsonValue::Null => "null".to_owned(),
-        JsonValue::Boolean(v) => v.to_string(),
-        JsonValue::String(v) => escape_json_string(v),
-        JsonValue::Number(v) => v.canonical_spelling(),
-        JsonValue::Array(v) => format!("[{}]", v.iter().map(render).collect::<Vec<_>>().join(",")),
-        JsonValue::Object(v) => format!("{{{}}}", v.iter().map(|(k, v)| format!("{}:{}", escape_json_string(k), render(v))).collect::<Vec<_>>().join(",")),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build(schema: &SchemaNode, path: &str, lengths: &LengthRules, nodes: &mut Vec<Node>,
+fn build(schema: &SchemaNode, nodes: &mut Vec<Node>,
     cap: usize, depth: usize, source: Option<&SourceLanguage>, declaration_only: bool) -> Result<usize, SchemaError> {
     if depth > MAX_DEPTH || nodes.len() >= cap { return Err(resource("runtime schema state limit exceeded")); }
     let literals = |values: &[ScalarValue]| {
@@ -327,27 +260,21 @@ fn build(schema: &SchemaNode, path: &str, lengths: &LengthRules, nodes: &mut Vec
         SchemaNode::Object { properties, required } => {
             let mut fields = Vec::new();
             for (name, child) in properties {
-                let child_lengths = lengths.properties.get(name).ok_or_else(|| invalid("schema length-rule shape differs"))?;
                 fields.push(Property {
                     key: format!("{}:", escape_json_string(name)).into_bytes(),
-                    child: build(child, &child_path(path, name), child_lengths, nodes, cap, depth + 1, source, declaration_only)?,
+                    child: build(child, nodes, cap, depth + 1, source, declaration_only)?,
                     required: required.contains(name),
                 });
             }
             Kind::Object(fields)
         }
         SchemaNode::Array { items, max_items } => Kind::Array {
-            child: build(items, &format!("{path}/items"),
-                lengths.items.as_deref().ok_or_else(|| invalid("schema length-rule shape differs"))?,
-                nodes, cap, depth + 1, source, declaration_only)?, maximum: *max_items,
+            child: build(items, nodes, cap, depth + 1, source, declaration_only)?, maximum: *max_items,
         },
-        SchemaNode::String { max_bytes, allowed, source: annotation } => {
+        SchemaNode::String { max_bytes, max_chars, allowed, source: annotation } => {
             let verbatim = *annotation == SourceAnnotation::Verbatim;
-            let max_chars = lengths.max_chars.unwrap_or(usize::MAX);
+            let max_chars = max_chars.unwrap_or(usize::MAX);
             if let Some(values) = allowed {
-                if values.iter().any(|v| matches!(v, ScalarValue::String(s) if s.chars().count() > max_chars)) {
-                    return Err(invalid("enum/const exceeds maxLength"));
-                }
                 if verbatim && !declaration_only {
                     let index = source.ok_or_else(|| invalid("source annotation has no binding"))?;
                     let filtered: Vec<_> = values.iter().filter(|v| {
@@ -388,30 +315,6 @@ fn build(schema: &SchemaNode, path: &str, lengths: &LengthRules, nodes: &mut Vec
     let id = nodes.len();
     nodes.push(Node { kind, minimum });
     Ok(id)
-}
-
-fn validate_lengths(schema: &SchemaNode, value: &ValidationValue, path: &str, lengths: &LengthRules) -> Result<(), SchemaError> {
-    match (schema, value) {
-        (SchemaNode::String { .. }, ValidationValue::String(s)) => {
-            if lengths.max_chars.is_some_and(|cap| s.chars().count() > cap) {
-                return Err(SchemaError::Validation { pointer: path.to_owned(), reason: "maxLength exceeded".to_owned() });
-            }
-        }
-        (SchemaNode::Object { properties, .. }, ValidationValue::Object(values)) => {
-            for (key, child) in properties {
-                if let Some(value) = values.get(key) {
-                    let rules = lengths.properties.get(key).ok_or_else(|| invalid("schema length-rule shape differs"))?;
-                    validate_lengths(child, value, &child_path(path, key), rules)?;
-                }
-            }
-        }
-        (SchemaNode::Array { items, .. }, ValidationValue::Array(values)) => {
-            let rules = lengths.items.as_deref().ok_or_else(|| invalid("schema length-rule shape differs"))?;
-            for value in values { validate_lengths(items, value, &format!("{path}/items"), rules)?; }
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -837,9 +740,12 @@ mod tests {
 
     #[test]
     fn length_rule_storage_never_repeats_long_ancestor_property_names() {
-        fn stored_key_bytes(rules: &LengthRules) -> usize {
-            rules.properties.iter().map(|(key, child)| key.len() + stored_key_bytes(child)).sum::<usize>()
-                + rules.items.as_deref().map_or(0, stored_key_bytes)
+        fn stored_key_bytes(schema: &SchemaNode) -> usize {
+            match schema {
+                SchemaNode::Object { properties, .. } => properties.iter().map(|(key, child)| key.len() + stored_key_bytes(child)).sum(),
+                SchemaNode::Array { items, .. } => stored_key_bytes(items),
+                _ => 0,
+            }
         }
         let long = "private/~".repeat(256);
         let mut properties = serde_json::Map::new(); let mut values = serde_json::Map::new();
@@ -853,9 +759,9 @@ mod tests {
         let schema = serde_json::to_string(&serde_json::json!({"type":"object","properties":outer,"additionalProperties":false})).unwrap();
         let native = JsonProgram::compile(&schema, CompileLimits::default()).unwrap();
         let declaration = JsonValidationSchema::compile(&schema, CompileLimits::default()).unwrap();
-        assert_eq!(stored_key_bytes(&native.lengths), long.len() + 64 * 3);
-        assert_eq!(stored_key_bytes(&declaration.lengths), long.len() + 64 * 3);
-        assert!(stored_key_bytes(&native.lengths) < schema.len());
+        assert_eq!(stored_key_bytes(native.schema.root()), long.len() + 64 * 3);
+        assert_eq!(stored_key_bytes(&declaration.root), long.len() + 64 * 3);
+        assert!(stored_key_bytes(native.schema.root()) < schema.len());
         let mut document = serde_json::Map::new(); document.insert(long, serde_json::Value::Object(values));
         let text = serde_json::to_string(&document).unwrap();
         let value = crate::validation::parse_json(&text).unwrap();

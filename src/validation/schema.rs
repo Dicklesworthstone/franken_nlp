@@ -251,7 +251,7 @@ fn validate_node(
             Ok(())
         }
         SchemaNode::String {
-            max_bytes, allowed, ..
+            max_bytes, max_chars, allowed, ..
         } => {
             let JsonValue::String(text) = value else {
                 return Err(type_error(pointer, "string", value));
@@ -261,6 +261,9 @@ fn validate_node(
                     pointer,
                     format!("string UTF-8 bytes must be at most {max_bytes}"),
                 ));
+            }
+            if max_chars.is_some_and(|limit| text.chars().count() > limit) {
+                return Err(ValidationError::constraint(pointer, "string exceeds maxLength in Unicode scalars"));
             }
             ensure_allowed(allowed.as_deref(), value, pointer)
         }

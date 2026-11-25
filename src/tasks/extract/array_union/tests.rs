@@ -118,7 +118,7 @@ fn schema_root_depth_and_property_key_limits_are_explicit() {
     let key = "k".repeat(MAX_KEY_BYTES + 1);
     let object = SchemaNode::Object { properties: BTreeMap::from([(key, SchemaNode::Null { allowed: None })]), required: Default::default() };
     assert!(limits().validate_schema(&SchemaNode::Array { items: Box::new(object), max_items: 1 }).is_err());
-    let mut schema = SchemaNode::String { max_bytes: 64, allowed: None, source: SourceAnnotation::None };
+    let mut schema = SchemaNode::String { max_bytes: 64, max_chars: None, allowed: None, source: SourceAnnotation::None };
     for _ in 0..=MAX_DEPTH { schema = SchemaNode::Array { items: Box::new(schema), max_items: 1 }; }
     assert!(limits().validate_schema(&schema).is_err());
 }

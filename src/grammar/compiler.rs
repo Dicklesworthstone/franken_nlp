@@ -68,7 +68,10 @@ pub enum SchemaNode {
         max_items: usize,
     },
     String {
+        /// Engine limit on the decoded UTF-8 representation.
         max_bytes: usize,
+        /// JSON Schema maxLength, in Unicode scalar values.
+        max_chars: Option<usize>,
         allowed: Option<Vec<ScalarValue>>,
         source: SourceAnnotation,
     },
@@ -242,6 +245,12 @@ impl CompiledSchema {
 
     /// Validate an instance using exact decimal equality and v1 bounds.
     pub fn validate_json(&self, input: &str) -> Result<(), SchemaError> {
+        if input.len() > self.limits.max_output_bytes {
+            return Err(SchemaError::Resource {
+                pointer: "$".to_owned(),
+                reason: "instance exceeds output byte limit".to_owned(),
+            });
+        }
         let value = parse_json(input)?;
         validate_node(&self.root, &value, "$")
     }
@@ -429,13 +438,10 @@ fn compile_node(
                 pointer,
                 &["type", "enum", "const", "maxLength", "x-fnlp-source"],
             )?;
-            let max_bytes = match object.get("maxLength") {
-                Some(value) => {
-                    bounded_count(value, &pointer_key(pointer, "maxLength"), "maxLength")?
-                        .min(limits.max_string_bytes)
-                }
-                None => limits.max_string_bytes,
-            };
+            let max_bytes = limits.max_string_bytes;
+            let max_chars = object.get("maxLength")
+                .map(|value| bounded_count(value, &pointer_key(pointer, "maxLength"), "maxLength"))
+                .transpose()?;
             let source = match object.get("x-fnlp-source") {
                 None => SourceAnnotation::None,
                 Some(JsonValue::String(value)) if value == "verbatim" => SourceAnnotation::Verbatim,
@@ -464,15 +470,22 @@ fn compile_node(
                         return Err(SchemaError::Resource {
                             pointer: pointer.to_owned(),
                             reason: format!(
-                                "string enum/const value is {} bytes and exceeds effective maxLength {max_bytes}",
+                                "string enum/const value is {} bytes and exceeds UTF-8 byte cap {max_bytes}",
                                 value.len()
                             ),
+                        });
+                    }
+                    if max_chars.is_some_and(|limit| value.chars().count() > limit) {
+                        return Err(SchemaError::InvalidSchema {
+                            pointer: pointer_key(pointer, "maxLength"),
+                            reason: "string enum/const exceeds maxLength in Unicode scalars".to_owned(),
                         });
                     }
                 }
             }
             Ok(SchemaNode::String {
                 max_bytes,
+                max_chars,
                 allowed,
                 source,
             })
@@ -1034,7 +1047,7 @@ fn validate_node(node: &SchemaNode, value: &JsonValue, pointer: &str) -> Result<
             }
         }
         SchemaNode::String {
-            max_bytes, allowed, ..
+            max_bytes, max_chars, allowed, ..
         } => {
             let string = value
                 .as_string()
@@ -1043,9 +1056,15 @@ fn validate_node(node: &SchemaNode, value: &JsonValue, pointer: &str) -> Result<
                 return Err(SchemaError::Validation {
                     pointer: pointer.to_owned(),
                     reason: format!(
-                        "string is {} bytes and exceeds effective maxLength {max_bytes}",
+                        "string is {} bytes and exceeds UTF-8 byte cap {max_bytes}",
                         string.len()
                     ),
+                });
+            }
+            if max_chars.is_some_and(|limit| string.chars().count() > limit) {
+                return Err(SchemaError::Validation {
+                    pointer: pointer.to_owned(),
+                    reason: "string exceeds maxLength in Unicode scalars".to_owned(),
                 });
             }
             validate_allowed(

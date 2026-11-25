@@ -7,6 +7,33 @@ fn compile(source: &str) -> franken_nlp::grammar::CompiledSchema {
 }
 
 #[test]
+fn schema_sampling_and_native_extraction_agree_on_unicode_lengths() {
+    use franken_nlp::grammar::runtime::JsonProgram;
+    let limits = CompileLimits { max_string_bytes: 4, ..CompileLimits::default() };
+    let schema = r#"{"type":"object","additionalProperties":false,"required":["label"],"properties":{"label":{"type":"string","maxLength":1,"const":"🐈"}}}"#;
+    let compiled = compile_json_schema(schema, limits).unwrap();
+    let sample = compiled.sample_json().unwrap();
+    assert_eq!(sample, r#"{"label":"🐈"}"#);
+    JsonProgram::compile(schema, limits).unwrap().validate_json(&sample).unwrap();
+
+    let schema = r#"{"type":"array","items":{"type":"string","maxLength":1}}"#;
+    let compiled = compile_json_schema(schema, limits).unwrap();
+    let native = JsonProgram::compile(schema, limits).unwrap();
+    for (instance, valid) in [
+        (r#"["é","🐈"]"#, true),
+        (r#"["\uD83D\uDC08"]"#, true),
+        (r#"["e\u0301"]"#, false),
+        (r#"["ab"]"#, false),
+    ] {
+        assert_eq!(compiled.validate_json(instance).is_ok(), valid);
+        assert_eq!(native.validate_json(instance).is_ok(), valid);
+    }
+    let narrow = CompileLimits { max_string_bytes: 3, ..limits };
+    assert!(compile_json_schema(schema, narrow).unwrap().validate_json(r#"["🐈"]"#).is_err());
+    assert!(JsonProgram::compile(schema, narrow).unwrap().validate_json(r#"["🐈"]"#).is_err());
+}
+
+#[test]
 fn supported_nested_schema_samples_and_revalidates_without_a_model() {
     let compiled = compile(
         r#"{
