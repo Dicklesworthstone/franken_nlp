@@ -7,7 +7,8 @@
 //! Future lookup-table acceleration must differential-test against this module.
 
 use std::{
-    collections::BTreeMap,
+    cmp::Ordering,
+    collections::{BTreeMap, BinaryHeap},
     error::Error,
     fmt,
     str::{Utf8Error, from_utf8},
@@ -19,6 +20,9 @@ mod safe_bpe;
 
 /// SentencePiece's visible replacement for an escaped input whitespace byte.
 pub const WHITESPACE_MARKER: char = '\u{2581}';
+
+/// Maximum input size admitted by the single and batch exact inspection commands.
+pub const INSPECTION_MAX_BYTES: usize = 64 * 1024;
 
 /// Controls explicit BOS/EOS insertion for one encoding operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,10 +215,43 @@ enum DecoderPiece {
 
 #[derive(Debug, Clone)]
 struct Symbol {
-    text: String,
+    start: usize,
+    end: usize,
     next: Option<usize>,
-    alive: bool,
 }
+
+impl Symbol {
+    fn from_text(text: &str) -> Vec<Self> {
+        let mut symbols: Vec<_> = text.char_indices().enumerate().map(|(index, (start, ch))| {
+            Self { start, end: start + ch.len_utf8(), next: Some(index + 1) }
+        }).collect();
+        if let Some(last) = symbols.last_mut() { last.next = None; }
+        symbols
+    }
+}
+
+// When an adjacency changes, its left symbol disappears or its combined end
+// advances. This lets a stale heap entry be rejected without redoing lookup.
+struct Merge {
+    score: f32,
+    left: usize,
+    end: usize,
+}
+
+impl Ord for Merge {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score.total_cmp(&other.score)
+            .then_with(|| other.left.cmp(&self.left))
+            .then_with(|| self.end.cmp(&other.end))
+    }
+}
+impl PartialOrd for Merge {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+}
+impl PartialEq for Merge {
+    fn eq(&self, other: &Self) -> bool { self.cmp(other).is_eq() }
+}
+impl Eq for Merge {}
 
 /// Dependency-free SentencePiece BPE encoder/decoder.
 ///
@@ -227,6 +264,7 @@ pub struct SpBpeTokenizer {
     normal_pieces: BTreeMap<String, ScoredPiece>,
     byte_pieces: [Option<u32>; 256],
     injected_by_text: Vec<AddedToken>,
+    injected_initial_bytes: [bool; 256],
     injected_by_id: BTreeMap<u32, String>,
     trainer_special_ids: SpecialPieceIds,
     configured_bos_id: i32,
@@ -348,11 +386,17 @@ impl SpBpeTokenizer {
                 .then_with(|| left.id.cmp(&right.id))
         });
 
+        let mut injected_initial_bytes = [false; 256];
+        for token in &injected_by_text {
+            injected_initial_bytes[usize::from(token.content.as_bytes()[0])] = true;
+        }
+
         Ok(Self {
             pieces,
             normal_pieces,
             byte_pieces,
             injected_by_text,
+            injected_initial_bytes,
             injected_by_id,
             trainer_special_ids: model.special_ids,
             configured_bos_id,
@@ -531,15 +575,19 @@ impl SpBpeTokenizer {
     }
 
     fn next_injected_token<'a>(&'a self, input: &str) -> Option<(usize, &'a AddedToken)> {
-        self.injected_by_text
-            .iter()
-            .filter_map(|token| input.find(&token.content).map(|offset| (offset, token)))
-            .min_by(|(left_offset, left), (right_offset, right)| {
-                left_offset
-                    .cmp(right_offset)
-                    .then_with(|| right.content.len().cmp(&left.content.len()))
-                    .then_with(|| left.id.cmp(&right.id))
-            })
+        if self.injected_by_text.is_empty() {
+            return None;
+        }
+        // The registry is already ordered by length then ID. Stop at the first
+        // matching offset so repeated controls never rescan the remaining tail.
+        input.as_bytes().iter().enumerate().find_map(|(offset, &byte)| {
+            // Every registered surface is nonempty UTF-8. A first byte in
+            // the registry cannot be a continuation byte inside a scalar.
+            if !self.injected_initial_bytes[usize::from(byte)] { return None; }
+            self.injected_by_text.iter()
+                .find(|token| input[offset..].starts_with(&token.content))
+                .map(|token| (offset, token))
+        })
     }
 
     fn encode_normal_text(
@@ -552,61 +600,73 @@ impl SpBpeTokenizer {
             return Ok(());
         }
         let normalized = sentencepiece_whitespace(input, prepend_dummy_prefix);
-        let mut symbols: Vec<Symbol> = normalized
-            .chars()
-            .map(|character| Symbol {
-                text: character.to_string(),
-                next: None,
-                alive: true,
-            })
-            .collect();
-        for index in 0..symbols.len().saturating_sub(1) {
-            symbols[index].next = Some(index + 1);
+        let mut symbols = Symbol::from_text(&normalized);
+        if symbols.len() <= 32 {
+            self.merge_symbols(&normalized, &mut symbols);
+        } else {
+            self.merge_frontier(&normalized, &mut symbols);
         }
-        self.merge_symbols(&mut symbols);
 
         let mut current = Some(0);
         while let Some(index) = current {
             let symbol = &symbols[index];
-            if symbol.alive {
-                if let Some(piece) = self.normal_pieces.get(&symbol.text) {
-                    ids.push(piece.id);
-                } else {
-                    self.encode_byte_fallback(symbol.text.as_bytes(), ids)?;
-                }
+            let surface = &normalized[symbol.start..symbol.end];
+            if let Some(piece) = self.normal_pieces.get(surface) {
+                ids.push(piece.id);
+            } else {
+                self.encode_byte_fallback(surface.as_bytes(), ids)?;
             }
             current = symbol.next;
         }
         Ok(())
     }
 
-    fn merge_symbols(&self, symbols: &mut [Symbol]) {
+    fn merge_symbols(&self, normalized: &str, symbols: &mut [Symbol]) {
         loop {
-            let mut best: Option<(usize, usize, f32, String)> = None;
+            let mut best: Option<(usize, usize, f32)> = None;
             let mut left = Some(0);
-            while let Some(left_index) = left {
-                let Some(right_index) = symbols[left_index].next else {
-                    break;
-                };
-                let joined = format!("{}{}", symbols[left_index].text, symbols[right_index].text);
-                if let Some(piece) = self.normal_pieces.get(&joined) {
-                    let should_replace = best
-                        .as_ref()
-                        .is_none_or(|(_, _, score, _)| piece.score.total_cmp(score).is_gt());
-                    if should_replace {
-                        best = Some((left_index, right_index, piece.score, joined));
+            while let Some(index) = left {
+                let Some(right) = symbols[index].next else { break; };
+                let joined = &normalized[symbols[index].start..symbols[right].end];
+                if let Some(piece) = self.normal_pieces.get(joined) {
+                    if best.as_ref().is_none_or(|(_, _, score)| piece.score.total_cmp(score).is_gt()) {
+                        best = Some((index, right, piece.score));
                     }
                 }
-                left = symbols[left_index].next;
+                left = symbols[index].next;
             }
+            let Some((left, right, _)) = best else { return; };
+            symbols[left].end = symbols[right].end;
+            symbols[left].next = symbols[right].next.take();
+        }
+    }
 
-            let Some((left_index, right_index, _, joined)) = best else {
-                return;
-            };
-            symbols[left_index].text = joined;
-            symbols[left_index].next = symbols[right_index].next;
-            symbols[right_index].alive = false;
-            symbols[right_index].next = None;
+    fn merge_frontier(&self, normalized: &str, symbols: &mut [Symbol]) {
+        let mut previous: Vec<_> = (0..symbols.len()).map(|index| index.checked_sub(1)).collect();
+        let mut candidates = BinaryHeap::new();
+        let enqueue = |queue: &mut BinaryHeap<Merge>, symbols: &[Symbol], left: usize| {
+            if let Some(right) = symbols[left].next {
+                let end = symbols[right].end;
+                if let Some(piece) = self.normal_pieces.get(&normalized[symbols[left].start..end]) {
+                    queue.push(Merge { score: piece.score, left, end });
+                }
+            }
+        };
+        for left in 0..symbols.len() {
+            enqueue(&mut candidates, symbols, left);
+        }
+        while let Some(Merge { left, end, .. }) = candidates.pop() {
+            let Some(right) = symbols[left].next else { continue; };
+            if symbols[right].end != end { continue; }
+            symbols[left].end = end;
+            symbols[left].next = symbols[right].next.take();
+            if let Some(after) = symbols[left].next {
+                previous[after] = Some(left);
+            }
+            if let Some(before) = previous[left] {
+                enqueue(&mut candidates, symbols, before);
+            }
+            enqueue(&mut candidates, symbols, left);
         }
     }
 
@@ -717,5 +777,36 @@ fn decode_utf8_error(error: std::string::FromUtf8Error) -> DecodeTextError {
     DecodeTextError::InvalidUtf8 {
         valid_up_to: utf8_error.valid_up_to(),
         error_len: utf8_error.error_len(),
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use crate::tokenizer::embedded::EmbeddedTokenizer;
+
+    #[test]
+    fn frontier_matches_full_rescan_on_overlaps_and_multibyte_boundaries() {
+        let pinned = EmbeddedTokenizer::pinned().unwrap();
+        let tokenizer = pinned.tokenizer();
+        let mut state = 19_u32;
+        let alphabet = ['a', 'a', 'b', ' ', '中', '▁', 'é', '\n', '🦊'];
+        let random: String = (0..1024).map(|_| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            alphabet[(state >> 16) as usize % alphabet.len()]
+        }).collect();
+        for text in ["a".repeat(129), "abababa".repeat(31), random] {
+            let normalized = sentencepiece_whitespace(&text, true);
+            let mut expected = Symbol::from_text(&normalized);
+            let mut actual = expected.clone();
+            tokenizer.merge_symbols(&normalized, &mut expected);
+            tokenizer.merge_frontier(&normalized, &mut actual);
+            let mut index = Some(0);
+            while let Some(left) = index {
+                assert_eq!(actual[left].end, expected[left].end);
+                assert_eq!(actual[left].next, expected[left].next);
+                index = expected[left].next;
+            }
+        }
     }
 }
