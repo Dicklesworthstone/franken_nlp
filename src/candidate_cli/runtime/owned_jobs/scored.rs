@@ -39,7 +39,8 @@ fn check_encoding_quote(corpus: &Corpus, policy: &UntrustedEncoding,
             (factory.document_encoding().clone(), factory.encoding_work_limits(),
                 factory.encoding_workspace_bytes().map_err(|_| CandidateError::Planning)?)
         }
-        Corpus::Judge(_, _) => (UntrustedEncoding::ByteFallback, None, 0),
+        Corpus::Judge(planner, config) => config.encoding_requirements(planner, total)
+            .map_err(|_| CandidateError::Planning)?,
     };
     if actual != *policy || actual_total != total || workspace != expected {
         return Err(Failure::usage("score_job_encoding_quote_mismatch"));
@@ -110,16 +111,8 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
             planner, config, request, host, encoding_work_limits, prefill, team, reader, cancellation.clone()),
         Corpus::Sentiment(planner, config) => session.engine.job_int8_sentiment_scheduled(&model,
             planner, config, request, host, encoding_work_limits, prefill, team, reader, cancellation.clone()),
-        Corpus::Judge(planner, config) => match (limits.compute.threads, prefill) {
-            (1, None) => session.engine.job_int8_judge(&model,
-                planner, config, request, host, reader, cancellation.clone()),
-            (1, Some(prefill)) => session.engine.job_int8_judge_layer_major(&model,
-                planner, config, request, host, prefill, reader, cancellation.clone()),
-            (width, None) => session.engine.job_int8_judge_with_threads(&model,
-                planner, config, request, host, kernel, width, reader, cancellation.clone()),
-            (width, Some(prefill)) => session.engine.job_int8_judge_layer_major_with_threads(
-                &model, planner, config, request, host, kernel, width, prefill, reader, cancellation.clone()),
-        },
+        Corpus::Judge(planner, config) => session.engine.job_int8_judge_scheduled(&model,
+            planner, config, request, host, encoding_work_limits, prefill, team, reader, cancellation.clone()),
     }.map_err(host_failure)?;
     if let Some(cause) = cancellation.cause() { return Err(job_failure(JobError::Cancelled(cause))); }
     session.remaining()?;

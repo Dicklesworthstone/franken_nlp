@@ -193,7 +193,7 @@ fn compact_recipe(corpus: &Corpus, total: Option<SafeBpeWorkLimits>) -> serde_js
             let factory = Int8SentimentJobPlanner::new_with_document_encoding(p, config, total).unwrap();
             serde_json::to_value(factory.job_recipe()).unwrap()
         }
-        Corpus::Judge(_, _) => panic!("compact judgment is unsupported"),
+        Corpus::Judge(_, _) => panic!("judgment recipe is checked by the hosted job contract tests"),
     }
 }
 
@@ -265,7 +265,7 @@ fn every_cli_tokenizer_cap_changes_the_authenticated_recipe_without_changing_nat
 
 #[test]
 fn compact_quote_checks_exact_policy_even_when_workspace_size_is_identical() {
-    for task in ["classify", "sentiment"] {
+    for task in ["classify", "sentiment", "judge"] {
         let (a, _, corpus) = compact_corpus(task, &["--input-encoding", "safe-bpe-v1"]);
         let policy = a.encoding_policy().unwrap(); let total = a.encoding_work_limits().unwrap();
         let workspace = a.encoding_workspace_bytes().unwrap();
@@ -280,7 +280,7 @@ fn compact_quote_checks_exact_policy_even_when_workspace_size_is_identical() {
 
 #[test]
 fn compact_population_quote_includes_encoder_with_original_or_retained_record_buffers() {
-    for task in ["classify", "sentiment"] { for retained in [false, true] {
+    for task in ["classify", "sentiment", "judge"] { for retained in [false, true] {
         let mut flags = vec!["--input-encoding", "safe-bpe-v1", "--compute-threads", "4", "--prefill-rows", "4"];
         if retained { flags.extend(["--spool-input", "--max-retained-input-mib", "4"]); }
         let a = args(task, &flags); let (_, limits) = a.validate().unwrap();
@@ -304,7 +304,7 @@ fn stale_compact_policy_is_refused_before_runtime_private_io_or_output() {
         fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("output write") }
         fn flush(&mut self) -> io::Result<()> { panic!("output flush") }
     }
-    for task in ["classify", "sentiment"] {
+    for task in ["classify", "sentiment", "judge"] {
         for old in [vec![], vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "4194305"]] {
             let original = args(task, &old); let (common, limits) = original.validate().unwrap();
             let current = args(task, &["--input-encoding", "safe-bpe-v1"]);
@@ -331,4 +331,66 @@ fn compact_job_metadata_reports_only_policy_and_invocation_limits() {
     for private in ["labels", "dimensions", "source_text", "candidate_weight", "prompt_digest"] {
         assert!(!value.to_string().contains(private));
     }
+}
+
+#[test]
+fn compact_judgment_job_configuration_reaches_all_complete_native_modes_and_schedules() {
+    for schedule in [vec![], vec!["--prefill-rows", "4"],
+        vec!["--compute-threads", "4"], vec!["--compute-threads", "4", "--prefill-rows", "4"]] {
+        let mut flags = vec!["--input-encoding", "safe-bpe-v1",
+            "--max-tokenizer-input-bytes", "65536", "--max-tokenizer-output-tokens", "8192"];
+        flags.extend(schedule);
+        let a = args("judge", &flags); let (_, limits) = a.validate().unwrap();
+        for (mode, source_key, heads) in [("pairwise", "a", 2), ("rubric", "document", 2), ("faithfulness", "source", 1)] {
+            let mut data = crate::candidate_cli::judge::tests::fixture(mode);
+            let text = data.as_object_mut().unwrap().remove(source_key).unwrap().as_str().unwrap().to_owned();
+            let defaults = a.parse_defaults(Some(&data.to_string()), a.host.budget(limits)).unwrap();
+            let corpus = configure(&a, &facts(), limits, defaults).unwrap();
+            let policy = a.encoding_policy().unwrap();
+            let totals = a.encoding_work_limits().unwrap();
+            let workspace = a.encoding_workspace_bytes().unwrap();
+            check_encoding_quote(&corpus, &policy, totals, workspace).unwrap();
+            assert!(check_encoding_quote(&corpus, &policy, None, workspace).is_err());
+            assert_eq!(check_encoding_quote(&corpus, &policy, totals, workspace - 1).unwrap_err().code,
+                "score_job_encoding_quote_mismatch");
+            let Corpus::Judge(planner, config) = corpus else { panic!("judgment") };
+            assert_eq!(planner.document_encoding(), &policy);
+            assert_eq!(config.identity.template_digest, *planner.template_digest());
+            let request = config.defaults.clone().unwrap().into_request(text);
+            let context = crate::tasks::ir::PlanContext::new(&config.identity, config.task_ceiling).unwrap();
+            let plan = planner.plan_int8_with_control(&request, &context, config.planning, &mut Continue).unwrap();
+            assert_eq!(plan.head_count(), heads);
+            assert_eq!(plan.input_encoding(), &policy);
+            assert!(plan.input_encoding_work().unwrap().input_bytes() > 0);
+            assert_eq!(plan.execution_identity().template_digest, config.identity.template_digest);
+        }
+    }
+}
+
+#[test]
+fn compact_judgment_job_quote_checks_all_invocation_caps_without_renewing_native_limits() {
+    let (a, _, corpus) = compact_corpus("judge", &["--input-encoding", "safe-bpe-v1"]);
+    let policy = a.encoding_policy().unwrap();
+    let totals = a.encoding_work_limits().unwrap().unwrap();
+    let workspace = a.encoding_workspace_bytes().unwrap();
+    let Corpus::Judge(planner, config) = &corpus else { panic!("judgment") };
+    for axis in 0..4 {
+        let mut changed = totals;
+        match axis {
+            0 => changed.max_input_bytes += 1,
+            1 => changed.max_output_tokens += 1,
+            2 => changed.max_pair_checks += 1,
+            _ => changed.max_pair_bytes += 1,
+        }
+        let (actual_policy, actual_totals, actual_workspace) =
+            config.encoding_requirements(planner, Some(changed)).unwrap();
+        assert_eq!(actual_policy, policy);
+        assert_eq!(actual_totals, Some(changed));
+        assert_eq!(actual_workspace, workspace);
+        assert_eq!(config.max_model_work, a.host.work_ceiling());
+    }
+    let (byte, _, corpus) = compact_corpus("judge", &[]);
+    check_encoding_quote(&corpus, &UntrustedEncoding::ByteFallback, None, 0).unwrap();
+    assert!(check_encoding_quote(&corpus, &UntrustedEncoding::ByteFallback, Some(totals), 0).is_err());
+    assert_eq!(byte.encoding_work_limits().unwrap(), None);
 }

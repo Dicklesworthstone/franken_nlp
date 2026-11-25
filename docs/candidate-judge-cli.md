@@ -15,6 +15,55 @@ and a compatible explicitly selected local current-candidate artifact. The
 command does not download or activate models, authenticate a publisher, or
 promote artifact, numerical-fidelity or task-quality evidence.
 
+## Bounded compact INT8 input
+
+All three one-context judgment modes accept explicit compact input:
+
+```sh
+fnlp candidate judge request.json --model ./model.fnlpq --memory-mib 8192 \
+  --input-encoding safe-bpe-v1 --compute-threads 4 --prefill-rows 4
+```
+
+Omitting `--input-encoding` keeps `byte-fallback`. The compact policy preserves
+the exact untrusted UTF-8 bytes while excluding template-control token IDs.
+It applies to the criterion and both candidates in pairwise mode, the document
+and every criterion description in rubric mode, and the claim, full source and
+every original-byte evidence window in faithfulness mode. A byte offset never
+becomes a slice into compact token IDs. Both presentation orders, every rubric
+criterion and all required faithfulness heads must still complete.
+
+One tokenizer allowance covers the complete judgment, with these defaults:
+
+| Option | Default | Scope |
+| --- | ---: | --- |
+| `--max-tokenizer-input-bytes` | 1048576 | Sum of untrusted bytes encoded across the complete preparation |
+| `--max-tokenizer-output-tokens` | 1048576 | Sum of untrusted tokens produced across the complete preparation |
+| `--max-tokenizer-pair-checks` | 4194304 | All BPE pair comparisons in the same preparation |
+| `--max-tokenizer-pair-bytes` | 67108864 | All examined BPE pair bytes in the same preparation |
+
+These limits are independent of `--max-input-bytes`, which bounds the original
+request JSON, and `--context-tokens`, which bounds each native head. In
+faithfulness mode the source is encoded for the whole-source head and, when
+there is more than one evidence window, again across the complete evidence
+partition. No allowance renews between segments or heads. Exhaustion refuses
+the complete request before inference; it never switches back to byte input
+or drops evidence.
+
+The selected policy and all four ceilings bind the actual planner's template
+identity. Serial execution, prompt prefill, a persistent CPU team and their
+combination use that same semantic plan. Before private input or model IO, the
+CLI admits one complete transient encoder workspace beside the retained plans,
+native storage and selected schedule's workspace. Invalid or unused encoding
+flags refuse before IO. Planning preserves the original terminal cancellation
+cause and never returns a partial judgment.
+
+Compact responses add `input_encoding` with the exact policy and
+`input_encoding_work` with the actual complete preparation counters. Byte
+responses omit both fields. Compact input changes the prompt token sequence;
+these routes make no identical-output, tokenizer-parity, task-quality or
+measured-speed claim. Native context, model work and result limits remain
+separate requirements.
+
 ## Pairwise comparison: both presentation orders
 
 ```json
@@ -226,9 +275,9 @@ execution refuses before input or model IO.
 
 `fnlp candidate source-int4 judge` accepts `--input-encoding safe-bpe-v1`
 for all three request modes. Its model input is an explicit pinned source or an
-independently pinned INT4 snapshot. The one-context strict-INT8 `judge` command retains its existing encoding
-contract; the complete-source `faithfulness-map` command explicitly supports
-compact input as described above.
+independently pinned INT4 snapshot. The one-context strict-INT8 `judge` and
+complete-source `faithfulness-map` commands support compact input under their
+separately described preparation and admission contracts above.
 
 Compact input preserves exact untrusted bytes and excludes template-control
 tokens. Evidence windows are independently encoded from original UTF-8 spans,
@@ -251,7 +300,8 @@ ceiling flags for every record, including explicit head cohorts and persistent
 CPU teams. Its input-byte and output-token defaults remain the record-byte cap
 and per-head prompt capacity. Larger explicit tokenizer ceilings may therefore
 be needed for repeated preparation. Every frame reports the fixed policy.
-Generic `score-job` remains byte encoded; its factory rejects a compact planner.
+Retained scoring policy and resume requirements are documented separately in
+[candidate-scored-jobs.md](candidate-scored-jobs.md).
 
 Compact encoding selects different prompt tokens. These candidate routes do
 not claim identical model output, qualified task accuracy or measured speed.
@@ -273,6 +323,12 @@ compact tokenizer limits, private completion binding, strict request parsing and
 all eleven typed cancellation causes. These definitions were independently
 source-reviewed but remain unrun; DSR production compilation and model qualification
 are still required.
+
+The compact one-context INT8 additions include further regression definitions
+for all three actual pinned planners, cumulative tokenizer work and exhaustion,
+policy-bound identities, all scheduling combinations, optional output fields,
+exact memory admission and original cancellation causes. These are source
+definitions only; they have not been compiled or executed in this session.
 
 ## Persistent CPU teams for one complete judgment
 

@@ -167,6 +167,86 @@ flags are not accepted by `score-job`.
 bounds the complete original NDJSON record including its arguments. Shared
 per-record settings still carry real budgets. There is no silent truncation.
 
+## Compact input for INT8 judgment jobs
+
+INT8 `score-job start|resume --task judge` accepts
+`--input-encoding safe-bpe-v1` for pairwise, rubric and faithfulness judgments.
+It works with serial execution, persistent workers, bounded prompts and their
+combination. Omitting the encoding option keeps byte fallback and the existing
+byte-mode recipe and result shape.
+
+For example, using the protected storage setup above and a judgment defaults
+file described in [candidate-judge-corpus.md](candidate-judge-corpus.md):
+
+```sh
+fnlp candidate score-job start corpus.ndjson \
+  --task judge --defaults judgments.json \
+  --model ./model.fnlpq --memory-mib 16384 \
+  --input-encoding safe-bpe-v1 \
+  --max-tokenizer-input-bytes 65536 \
+  --max-tokenizer-output-tokens 8192 \
+  --store-results --job-dir ./protected-job \
+  --job-id "$JOB_ID" --key-file ./protected.key \
+  --limits ./job-limits.json --materialize
+```
+
+Four tokenizer ceilings apply to a complete judgment, and four additional
+ceilings cover compact input encoding across all attempted records in one
+hosted invocation:
+
+| Work axis | Per-judgment flag and default | Per-invocation flag and default |
+| --- | --- | --- |
+| Input bytes | `--max-tokenizer-input-bytes`: 1,048,576 | `--max-total-tokenizer-input-bytes`: 67,108,864 |
+| Output tokens | `--max-tokenizer-output-tokens`: 1,048,576 | `--max-total-tokenizer-output-tokens`: 4,194,304 |
+| Pair checks | `--max-tokenizer-pair-checks`: 4,194,304 | `--max-total-tokenizer-pair-checks`: 268,435,456 |
+| Examined pair bytes | `--max-tokenizer-pair-bytes`: 67,108,864 | `--max-total-tokenizer-pair-bytes`: 4,294,967,296 |
+
+These limits are separate from transport bytes, per-head context capacity and
+native scoring work. Pairwise judgments encode the criterion and both answers
+once and reuse them for both orders. Rubric judgments share the allowance across
+the document and all descriptions; faithfulness judgments share it across the
+source, claim and independently encoded evidence windows. Original text and
+UTF-8 evidence coordinates are preserved. Exhaustion never silently switches
+encoding or commits a partial judgment.
+
+A shared invocation counter charges actual tokenizer work even when preparation
+fails or is cancelled. Remaining totals can tighten a later record below its
+per-record cap. Durable jobs stop on a failed record; reopening is explicit.
+Each `start` or `resume` has its own bounded tokenizer invocation, while native
+work and attempts remain persisted lifetime charges. Tokenizer invocation caps
+do not replace or reset those durable limits.
+
+Resume must use the same encoding policy, all four per-record caps and all four
+invocation caps. They are authenticated in the private recipe, including when
+two policies happen to produce identical tokens. The same requirement applies
+to retained-input replay and is checked before uncommitted-tail repair. Worker
+width may change; judgment's existing `--prefill-rows` setting, including its
+absence, remains frozen.
+
+Compact stored results add `input_encoding` and actual
+`input_encoding_work`; their bytes count toward the complete result ceiling.
+Completion metadata adds the configured `input_encoding` and
+`invocation_encoding_work_limits` without documents or scores; actual tokenizer
+work stays with each stored result. The host admits one encoder workspace and its shared
+counter bookkeeping alongside the original or retained input owner, all prepared
+heads, native KV and scratch, optional prompt/team buffers and complete output.
+These owners remain alive until physical worker completion.
+
+Library callers configure the actual `JudgePlanner` with
+`with_document_encoding(policy)`, bind its updated template digest in
+`JudgeCorpusConfig`, and call `NlpEngine::job_int8_judge_scheduled` with
+explicit `SafeBpeWorkLimits` and the optional prompt/team settings.
+`JudgeCorpusConfig::encoding_requirements` validates and returns the exact
+policy, invocation limits and extra workspace for admission. Existing
+`job_int8_judge` variants remain byte-default entry points; compact planners
+must use the scheduled method with explicit totals.
+
+Focused regression definitions cover cumulative limits, failed and cancelled
+preparation, complete result sizing, authenticated recipe mutations and owner
+lifetime. This is source implementation; executable validation remains
+**UNRUN** pending the designated controller. Compact input makes no claim of
+measured speedup, demonstrated native parity or improved judgment quality.
+
 ## Persistence and process ownership
 
 Stdout contains a non-authoritative candidate provenance wrapper and metadata:
@@ -311,8 +391,8 @@ The grouped INT4 route is
 `fnlp candidate source-int4 score-job start|resume --task classify|sentiment|judge`.
 It uses the same authenticated storage protocol, with an explicit local source
 closure or a digest-pinned INT4 snapshot. Its three tasks accept
-`--input-encoding safe-bpe-v1`; this does not enable compact input on the INT8
-commands documented above.
+`--input-encoding safe-bpe-v1` with the grouped INT4 limits below. INT8
+judgment invocation limits are described in the INT8 section above.
 
 For example, with an existing protected job directory and key and immutable
 limits as described above:

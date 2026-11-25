@@ -1139,15 +1139,67 @@ claim equivalence to a single larger context. Source review and regression
 definitions are present, while DSR compilation, executable regression tests
 and real-model qualification remain pending.
 
+## Implemented candidate INT8 compact judgment
+
+`fnlp candidate judge` and `fnlp candidate score-batch --task judge` accept
+`--input-encoding safe-bpe-v1` for complete pairwise, rubric and faithfulness
+judgments. The selected policy configures the actual pinned planner before
+its prompt identity is formed. Pairwise retains both presentation orders;
+rubric retains every criterion; faithfulness retains the entire source and
+every required evidence window at original UTF-8 coordinates. Each native
+head must still fit its context, and every required head must complete.
+
+For a request using one of the explicit policies in the
+[judgment guide](docs/candidate-judge-cli.md):
+
+```sh
+fnlp candidate judge request.json \
+  --model ./model.fnlpq --memory-mib 8192 \
+  --input-encoding safe-bpe-v1 \
+  --max-tokenizer-input-bytes 1048576 \
+  --max-tokenizer-output-tokens 1048576 \
+  --max-tokenizer-pair-checks 4194304 \
+  --max-tokenizer-pair-bytes 67108864 \
+  --compute-threads 4 --prefill-rows 4
+```
+
+The four tokenizer ceilings cover all untrusted segments of one complete
+judgment together. They are independent of JSON/NDJSON transport size and
+the largest native head's `--context-tokens`. Shared input is encoded once
+where the pinned planner permits reuse; evidence-window preparation spends
+the same allowance. The host admits one encoder workspace beside existing
+preparation, native buffers, output and optional prefill/team scratch.
+
+Live `score-batch --task judge` uses the existing `{id,text,task_args?}`
+envelope and required explicit judgment policy, with optional fixed
+`--defaults`. Its four `--max-total-tokenizer-*` options add an invocation
+allowance across all records and preparation attempts. Failed or cancelled
+preparation spends completed work; flush boundaries do not renew the ledger.
+Compact result metadata reports the policy and actual tokenizer work, while
+stream provenance reports the declared invocation caps. Planner and ledger
+owners remain charged until physical worker completion.
+
+Serial, bounded prefill, persistent CPU teams and combined schedules use the
+same planned judgment. Full-vocabulary scoring and terminal EOS remain in
+place. Byte fallback remains the default and omits the optional compact
+metadata. Compact input preserves source bytes and excludes template control
+tokens, but changes prompt tokens and can change judgments; no output-parity,
+quality or measured-speed claim follows. Source review and regression
+definitions are present; DSR compilation and executable/model qualification
+remain pending. See the [resident judgment guide](docs/candidate-judge-corpus.md)
+for corpus limits and `NlpEngine::batch_int8_judge_scheduled`.
+
 ## Implemented candidate INT8 compact retained scoring jobs
 
-`fnlp candidate score-job start|resume --task classify|sentiment` accepts
+`fnlp candidate score-job start|resume --task classify|sentiment|judge` accepts
 `--input-encoding safe-bpe-v1` for authenticated retained scoring. It uses
 the same pinned planners and full-vocabulary native scorers as `score-batch`,
 with one resident INT8 model across the pending population. Classification
 includes private label metadata in its tokenizer allowance; sentiment encodes
-the source once for all requested axes. The existing per-record context and
-task ceilings apply.
+the source once for all requested axes. Judgment shares one per-record
+allowance across both pairwise orders, every rubric criterion or the complete
+faithfulness source and evidence windows. The existing per-record context
+and task ceilings apply.
 
 For example, with the classification defaults shown above and an existing
 protected job directory, secret key and immutable `JobLimits` file:
@@ -1171,7 +1223,11 @@ fnlp candidate score-job start documents.ndjson \
 hex characters; the protected key file contains exactly 32 raw secret bytes.
 The command requires explicit result-retention consent and never creates or
 adopts the job directory. Use `--task sentiment` without classification
-defaults for dimensional sentiment.
+defaults for dimensional sentiment. Use `--task judge --defaults judge.json`
+with the explicit policy and mode from the judgment guide for retained
+judgments. Judgment additionally accepts `--max-tokenizer-input-bytes` and
+`--max-tokenizer-output-tokens` for its complete per-record preparation;
+both default to 1048576 and remain independent of native context size.
 
 The per-record encoding policy and all four invocation-wide tokenizer caps
 are part of the authenticated recipe. Resume repeats the original policy,
@@ -1179,13 +1235,15 @@ caps, defaults, secret and immutable job limits, using the complete original
 population or explicitly retained input. A byte-default job therefore keeps
 its original encoding when resumed. Each explicit resume invocation receives
 the same declared tokenizer allowance; persisted native work and abandoned or
-failed attempts remain spent.
+failed attempts remain spent. Judgment also retains its existing authenticated
+prefill recipe: resume repeats the original prefill selection, while physical
+CPU-team width may change within the admitted host envelope.
 
 One private tokenizer ledger spans every record and every preparation attempt.
 Failed or cancelled tokenization, and native planning rejected after successful
-encoding, still consume completed tokenizer work. The same ledger moves from
-the planning factory into the native processor; prepared requests are bound
-to that invocation. Remaining allowance can tighten execution without changing
+encoding, still consume completed tokenizer work. The same ledger remains owned through
+preparation and native handoff. Classification and sentiment additionally
+bind their public prepared-job values to that invocation. Remaining allowance can tighten execution without changing
 the original policy or prompt identity.
 
 Serial, bounded prefill, persistent CPU team and combined schedules all admit
@@ -1195,10 +1253,12 @@ physical worker completion; each result remains guarded through its durable
 commit. Compact completion metadata reports the
 declared policy and invocation limits without exposing private document text,
 labels or scores. Byte fallback remains the default with unchanged recipe and
-completion metadata; judgment jobs retain their byte-fallback contract.
+completion metadata. Stored compact judgment results additionally retain the
+actual per-record tokenizer work within the complete result-byte ceiling.
 
-Library callers use `NlpEngine::job_int8_classify_scheduled` and
-`NlpEngine::job_int8_sentiment_scheduled`, or the
+Library callers use `NlpEngine::job_int8_classify_scheduled`,
+`NlpEngine::job_int8_sentiment_scheduled` and
+`NlpEngine::job_int8_judge_scheduled`. Classification and sentiment also expose the
 `Int8ClassificationJobPlanner::new_with_document_encoding` and
 `Int8SentimentJobPlanner::new_with_document_encoding` factories. Their prepared
 job types retain a private invocation owner and expose scoring identity, head

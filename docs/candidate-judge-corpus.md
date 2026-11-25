@@ -67,6 +67,80 @@ rejection does not erase earlier completed records; a failed item means a
 nonzero command exit. Native corruption, admission failure and cancellation
 remain terminal. Sink failure does not imply earlier writes were rolled back.
 
+## Compact INT8 judgments over a live stream
+
+All three judgment modes accept the explicit `safe-bpe-v1` input policy,
+including serial, prompt-prefill, persistent-team and combined schedules:
+
+```sh
+fnlp candidate score-batch answers.ndjson --task judge \
+  --defaults comparison.json --model ./model.fnlpq --memory-mib 8192 \
+  --input-encoding safe-bpe-v1 --compute-threads 4 --prefill-rows 4
+```
+
+Byte fallback remains the default. Compact preparation preserves exact untrusted
+criterion, candidate, document and claim bytes and excludes template-control
+token IDs. Faithfulness still requires the complete source head to fit; all
+evidence windows are encoded independently from their original UTF-8 spans.
+Compact tokens do not replace source byte coordinates or authorize truncation.
+
+Every record receives one complete-judgment tokenizer allowance:
+
+| Option | Default |
+| --- | ---: |
+| `--max-tokenizer-input-bytes` | 1048576 |
+| `--max-tokenizer-output-tokens` | 1048576 |
+| `--max-tokenizer-pair-checks` | 4194304 |
+| `--max-tokenizer-pair-bytes` | 67108864 |
+
+The byte/token limits measure cumulative preparation work, independently of
+`--max-input-bytes` for the original record text, `--max-line-bytes` for the
+wire record and `--context-tokens` for a native head. Pairwise preparation
+counts the criterion and both candidates; rubric preparation counts the document
+and every criterion description. Faithfulness counts the claim and full source,
+plus the entire source again across its evidence windows when the partition has
+multiple windows. Limits never renew between heads, and refusal never falls
+back to byte encoding.
+
+A second ledger bounds the entire live invocation, including work spent on
+rejected preparations:
+
+| Option | Default |
+| --- | ---: |
+| `--max-total-tokenizer-input-bytes` | 67108864 |
+| `--max-total-tokenizer-output-tokens` | 4194304 |
+| `--max-total-tokenizer-pair-checks` | 268435456 |
+| `--max-total-tokenizer-pair-bytes` | 4294967296 |
+
+These totals do not renew at record or flush boundaries and do not grow with
+`--max-requests`. A total may be smaller than the corresponding per-record
+ceiling: preparation uses the remaining invocation allowance. When any work
+axis has no invocation allowance left, further preparation is refused with a
+terminal `WorkLimit`. An encoding refusal under a tightened remaining cap can
+instead produce a recoverable planning rejection, as can a record's own limit.
+Rejected preparation never restores work already spent. Earlier complete frames
+remain delivered; cancellation remains terminal and never creates a successful
+partial judgment.
+
+The complete memory quote adds one derived encoder workspace and its invocation
+ledger beside caller preparation, retained plans, stream buffers, native storage
+and any selected scheduling workspace before private IO. The actual configured
+planner supplies the encoding policy and template identity. Library callers use
+`JudgeCorpusConfig::encoding_requirements` to validate that binding and quote
+the workspace, and `NlpEngine::batch_int8_judge_scheduled` to supply explicit
+invocation totals with optional prefill and team configuration.
+
+Every compact candidate-framed event reports the exact `input_encoding` and
+`input_encoding_work_limits`, including errors, flushes and `run_complete`.
+Completed judgment results also retain the actual record's
+`input_encoding_work` and selected policy. Byte-default output omits these
+extensions. Changed prompt tokens do not establish identical model output,
+tokenizer parity, task quality or measured speed.
+
+Retained compact judgment recipes, invocation caps and resume requirements are
+described in [candidate-scored-jobs.md](candidate-scored-jobs.md). The live
+invocation ledger is not a persisted lifetime tokenizer-work receipt.
+
 ## Durable evaluation and resume
 
 Retained jobs require `metadata-store` and `asupersync-runtime` on supported
@@ -109,28 +183,37 @@ also retain the immutable lifetime `JobLimits.max_work` and attempt ceiling.
 Independent criteria, comparison orders and evidence windows reuse one native
 context; their work is summed, never discounted or renewed by a flush/record.
 
-Preparation uses the invocation's real cancellation controller. Bounded legacy
-tokenization is checked around compilation, not preempted inside a tokenizer
-call. Output guards survive complete-result serialization, external write and
-flush, or durable spool synchronization and journal acknowledgement.
+Preparation uses the invocation's real cancellation controller. Compact encoding
+checks that controller during bounded preparation. Legacy byte tokenization is
+checked around compilation, not preempted inside a tokenizer call. Output guards
+survive complete-result serialization, external write and flush, or durable
+spool synchronization and journal acknowledgement.
 
-Bulk judgment commands accept `--prefill-rows 1..64` for explicit layer-major
-prompt processing. Omit the option to retain serial execution. Both
-`score-batch --task judge` and `score-job start/resume --task judge` use the
-same bounded schedule as the hosted `batch_int8_judge_layer_major` and
-`job_int8_judge_layer_major` methods. This groups tokens within each prompt;
-it does not batch documents or execute independent heads simultaneously.
+Both `score-batch --task judge` and `score-job start/resume --task judge` accept
+`--prefill-rows 1..64` for explicit layer-major prompt processing and
+`--compute-threads 1..64` for one persistent CPU team, including the coordinator.
+The options can be combined; omitting both preserves serial execution. The
+prompt schedule groups tokens within each prompt. It does not combine documents
+or independent heads into one causal context. One selected team serves the
+complete ordered invocation and physically joins before terminal publication.
 
-Extra scratch is derived from native geometry and reserved in the existing
-process ledger for the whole invocation. The schedule does not enlarge any
-task or work ceiling. A retained job freezes its effective row schedule in
-the private keyed recipe: use the original option (or its original absence)
-on every resume. Changed schedules refuse authentication, rather than
-replaying committed work with different settings. Invalid row counts and
-classification/sentiment bulk requests with this option refuse before
-input, defaults, key or model IO; no unsupported schedule is ignored.
+Prompt scratch and fixed worker capacity are derived from native geometry and
+reserved in the existing process ledger for the whole invocation. The complete
+simultaneous memory commitment is checked before private IO. Neither schedule
+enlarges any task or work ceiling or changes the sealed judgment identity.
+A retained job freezes its prefill selection, including its absence, in the
+private keyed recipe: repeat the original `--prefill-rows` selection on every
+resume. Changed prefill selection refuses authentication. CPU-team width may
+change between invocations within the admitted process-memory ceiling. Invalid
+row/thread counts and insufficient combined memory refuse before input,
+defaults, key or model IO; no unsupported schedule is ignored.
 
 Reservations model admitted ownership, not measured RSS. Synthetic or pinned
 planning fixtures are not native success, numerical equivalence, performance
 or task-quality evidence. Rust compilation, regression execution, DSR and
 full-model qualification have not been run for this implementation.
+
+Compact INT8 regression definitions additionally cover complete-judgment work,
+fixed invocation caps, exact additive memory, invalid flags before IO, actual
+planner policy binding, optional provenance and all three modes across the four
+schedules. They remain uncompiled and unexecuted source definitions.

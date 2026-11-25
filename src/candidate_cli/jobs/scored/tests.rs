@@ -244,7 +244,7 @@ fn retained_scoring_does_not_silently_accept_generated_task_options() {
 
 #[test]
 fn compact_scoring_retains_exact_encoding_caps_across_operations_and_schedules() {
-    for operation in ["start", "resume"] { for task in ["classify", "sentiment"] {
+    for operation in ["start", "resume"] { for task in ["classify", "sentiment", "judge"] {
         let byte = args(task, &[]); let (_, ordinary) = byte.validate().unwrap();
         for schedule in [vec![], vec!["--prefill-rows", "4"],
             vec!["--compute-threads", "4"], vec!["--compute-threads", "4", "--prefill-rows", "4"]] {
@@ -262,8 +262,13 @@ fn compact_scoring_retains_exact_encoding_caps_across_operations_and_schedules()
             assert_eq!(a.host.budget(admitted), byte.host.budget(ordinary));
             let UntrustedEncoding::SafeBpeV1(call) = a.encoding_policy().unwrap()
                 else { panic!("compact encoding") };
-            assert_eq!(call.max_input_bytes, a.host.max_input_bytes);
-            assert_eq!(call.max_output_tokens, a.host.context_tokens - a.host.max_candidate_tokens);
+            if task == "judge" {
+                assert_eq!(call.max_input_bytes, 1_048_576);
+                assert_eq!(call.max_output_tokens, 1_048_576);
+            } else {
+                assert_eq!(call.max_input_bytes, a.host.max_input_bytes);
+                assert_eq!(call.max_output_tokens, a.host.context_tokens - a.host.max_candidate_tokens);
+            }
             assert_eq!((call.max_pair_checks, call.max_pair_bytes), (1000000, 4000000));
             assert_eq!(a.encoding_work_limits().unwrap(), Some(SafeBpeWorkLimits {
                 max_input_bytes: 1048576, max_output_tokens: 131072,
@@ -284,7 +289,7 @@ fn byte_scoring_retains_zero_encoding_workspace_and_explicit_compact_defaults_ar
         assert_eq!(a.encoding_workspace_bytes().unwrap(), 0);
         assert_eq!(a.encoding, explicit.encoding);
     }
-    for task in ["classify", "sentiment"] {
+    for task in ["classify", "sentiment", "judge"] {
         let a = args(task, &["--input-encoding", "safe-bpe-v1"]);
         a.validate().unwrap();
         assert_eq!(a.encoding_work_limits().unwrap(), Some(SafeBpeWorkLimits {
@@ -303,10 +308,7 @@ fn invalid_compact_jobs_refuse_before_keys_population_models_or_output() {
         fn flush(&mut self) -> io::Result<()> { panic!("output flush") }
     }
     for operation in ["start", "resume"] {
-        let (mode, a) = command(operation, "judge", &["--input-encoding", "safe-bpe-v1"]).into_parts();
-        assert_eq!(a.validate().err().unwrap().code, "score_job_input_encoding");
-        assert!(execute_owned(mode, a, NoIo, &mut NoIo).is_err());
-        for task in ["classify", "sentiment"] {
+        for task in ["classify", "sentiment", "judge"] {
             for flag in ["--max-total-tokenizer-input-bytes", "--max-total-tokenizer-output-tokens",
                 "--max-total-tokenizer-pair-checks", "--max-total-tokenizer-pair-bytes"] {
                 let (mode, a) = command(operation, task, &[flag, "1"]).into_parts();
@@ -330,7 +332,7 @@ fn invalid_compact_jobs_refuse_before_keys_population_models_or_output() {
 
 #[test]
 fn compact_job_workspace_coexists_with_workers_prompts_and_retained_input_ownership() {
-    for task in ["classify", "sentiment"] {
+    for task in ["classify", "sentiment", "judge"] {
         for retained in [false, true] {
             let mut flags = vec!["--compute-threads", "4", "--prefill-rows", "4"];
             if retained { flags.extend(["--spool-input", "--max-retained-input-mib", "4"]); }
@@ -344,6 +346,39 @@ fn compact_job_workspace_coexists_with_workers_prompts_and_retained_input_owners
             let mut under = compact;
             under.host.memory_mib = (under.execution_memory_bytes(compact_limits).unwrap() - 1) / MIB;
             assert!(under.validate().is_err());
+        }
+    }
+}
+
+#[test]
+fn judgment_job_tokenizer_caps_cover_all_heads_independently_of_context_and_transport() {
+    for operation in ["start", "resume"] {
+        let (_, compact) = command(operation, "judge", &["--input-encoding", "safe-bpe-v1",
+            "--max-tokenizer-input-bytes", "65536", "--max-tokenizer-output-tokens", "8192",
+            "--compute-threads", "4", "--prefill-rows", "4"]).into_parts();
+        let (_, limits) = compact.validate().unwrap();
+        let UntrustedEncoding::SafeBpeV1(policy) = compact.encoding_policy().unwrap()
+            else { panic!("compact judgment") };
+        assert_eq!(policy.max_input_bytes, 65536);
+        assert_eq!(policy.max_output_tokens, 8192);
+        assert!(policy.max_output_tokens > compact.host.context_tokens);
+        let ordinary = args("judge", &[]);
+        assert_eq!(compact.host.work_ceiling(), ordinary.host.work_ceiling());
+        assert_eq!(compact.host.budget(limits), ordinary.host.budget(ordinary.validate().unwrap().1));
+        assert_eq!(compact.encoding_workspace_bytes().unwrap(), policy.requirements().unwrap().workspace_bytes + 1024);
+        for flag in ["--max-tokenizer-input-bytes", "--max-tokenizer-output-tokens"] {
+            for value in ["0", "1048577"] {
+                let (_, invalid) = command(operation, "judge",
+                    &["--input-encoding", "safe-bpe-v1", flag, value]).into_parts();
+                assert!(invalid.validate().is_err(), "{operation} {flag} {value}");
+            }
+            let (_, byte) = command(operation, "judge", &[flag, "1024"]).into_parts();
+            assert!(byte.validate().is_err());
+            for task in ["classify", "sentiment"] {
+                let (_, unrelated) = command(operation, task,
+                    &["--input-encoding", "safe-bpe-v1", flag, "1024"]).into_parts();
+                assert_eq!(unrelated.validate().err().unwrap().code, "score_job_judge_encoding_limits");
+            }
         }
     }
 }

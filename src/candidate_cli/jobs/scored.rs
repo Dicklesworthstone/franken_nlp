@@ -27,6 +27,7 @@ pub(in crate::candidate_cli) struct ScoreJobArgs {
     #[command(flatten)] pub prefill: crate::candidate_cli::scored::prefill::ScoringPrefillArgs,
     #[arg(skip)] pub compute: compute::Args,
     #[arg(skip)] pub encoding: input_encoding::InputEncodingArgs,
+    #[arg(skip)] pub judge_encoding: crate::candidate_cli::judge::EncodingArgs,
     #[command(flatten)] pub encoding_work: EncodingWorkArgs,
     /// Required consent to retain private native output in the protected spool.
     #[arg(long)] pub store_results: bool,
@@ -87,11 +88,15 @@ impl ScoreJobArgs {
         Ok((common, limits))
     }
     pub(in crate::candidate_cli) fn encoding_policy(&self) -> Result<UntrustedEncoding, Failure> {
-        let policy = self.host.encoding_policy(&self.encoding)?;
-        if self.kind()? == ScoreTask::Judge && policy != UntrustedEncoding::ByteFallback {
-            return Err(Failure::usage("score_job_input_encoding"));
+        match self.kind()? {
+            ScoreTask::Judge => self.judge_encoding.policy(&self.encoding).map_err(Into::into),
+            ScoreTask::Classify | ScoreTask::Sentiment => {
+                if !self.judge_encoding.is_default() {
+                    return Err(Failure::usage("score_job_judge_encoding_limits"));
+                }
+                self.host.encoding_policy(&self.encoding).map_err(Into::into)
+            }
         }
-        Ok(policy)
     }
     pub(in crate::candidate_cli) fn encoding_work_limits(&self) -> Result<Option<SafeBpeWorkLimits>, Failure> {
         self.encoding_work.limits(&self.encoding)
@@ -147,8 +152,11 @@ pub(in crate::candidate_cli) fn definition() -> clap::Command {
         .mut_subcommand("resume", encoding_definition)
 }
 fn encoding_definition(command: clap::Command) -> clap::Command {
-    compute::definition(input_encoding::definition(command)).after_long_help(
-        "Classification and sentiment jobs accept explicit --input-encoding safe-bpe-v1. One per-record allowance covers every untrusted document/label segment; one additional --max-total-tokenizer-* invocation ledger covers all records and failed or cancelled preparation. Both policies and all caps are authenticated: repeat them on resume. Each resumed invocation receives the same bounded tokenizer allowance while persisted native work and attempts remain spent. Compact input preserves original bytes and excludes template controls, but changes prompt tokens and makes no identical-output, tokenizer-parity, quality or measured-speed claim. Encoder workspace is admitted before private IO and held through physical completion. Byte-fallback remains the default with unchanged result/recipe metadata. Judgment remains byte-fallback only.")
+    compute::definition(crate::candidate_cli::judge::encoding_definition(command))
+        .mut_arg("max_tokenizer_pair_checks", |arg| arg.help("Cumulative BPE pair checks per complete scoring record; safe-bpe-v1 only"))
+        .mut_arg("max_tokenizer_pair_bytes", |arg| arg.help("Cumulative examined BPE pair bytes per complete scoring record; safe-bpe-v1 only"))
+        .after_long_help(
+        "Classification, sentiment and judgment jobs accept explicit --input-encoding safe-bpe-v1. One per-record allowance covers every untrusted segment, including both pairwise orders, all rubric criteria and every faithfulness evidence head. Judgment additionally accepts --max-tokenizer-input-bytes and --max-tokenizer-output-tokens, independent of wire size and native head context. One additional --max-total-tokenizer-* invocation ledger covers all records and failed or cancelled preparation. Both policies and all caps are authenticated: repeat them on resume. Each resumed invocation receives the same bounded tokenizer allowance while persisted native work and attempts remain spent. Compact input preserves original bytes and excludes template controls, but changes prompt tokens and makes no identical-output, tokenizer-parity, quality or measured-speed claim. Encoder workspace is admitted before private IO and held through physical completion. Byte-fallback remains the default with unchanged result/recipe metadata. Judgment keeps its existing frozen prefill schedule on resume.")
 }
 impl ScoreJobCommand {
     pub(crate) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
@@ -160,6 +168,7 @@ impl ScoreJobCommand {
             ScoreOperation::Resume(args) => &mut args.common,
         };
         args.encoding = input_encoding::InputEncodingArgs::from_matches(request)?;
+        args.judge_encoding = crate::candidate_cli::judge::EncodingArgs::from_arg_matches(request)?;
         args.compute = compute::Args::from_matches(request)?;
         Ok(command)
     }

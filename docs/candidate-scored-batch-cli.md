@@ -4,7 +4,9 @@
 stream using one resident INT8 model and one native engine. It uses the existing
 candidate scorer, typed task finalizers, process resource host and ordered batch
 transport. It does not generate labels as free text or retry failed parsing.
-This is serial resident execution, not parallel/GEMM batching or a durable job.
+Records remain ordered. Serial execution is the default; explicit prompt-prefill
+and persistent CPU-team schedules are available. Retained jobs use a separate
+command and lifecycle.
 
 The binary needs `asupersync-runtime`, an explicit local compatible candidate
 artifact, and an explicit process memory ceiling. No model download, catalog
@@ -74,10 +76,10 @@ documents, while the resident model and native allocations remain shared.
 
 ## Compute, memory and transport bounds
 
-### Compact classification and sentiment records
+### Compact INT8 scoring records
 
-The INT8 stream accepts `--input-encoding safe-bpe-v1` for `--task classify` and
-`--task sentiment`:
+The INT8 stream accepts `--input-encoding safe-bpe-v1` for `--task classify`,
+`--task sentiment` and `--task judge`:
 
 ```sh
 fnlp candidate score-batch reviews.ndjson --task sentiment \
@@ -87,19 +89,34 @@ fnlp candidate score-batch reviews.ndjson --task sentiment \
 The default remains `byte-fallback`. Compact input preserves exact untrusted
 bytes and excludes template-control token IDs. It can fit more ordinary source
 text into the selected context; it does not truncate documents or imply the same
-model output, quality or measured speed. INT8 `--task judge` rejects compact input
-before defaults, source or model IO. Retained INT8 `score-job` commands continue
-to use their existing byte-only recipes and do not accept these options.
+model output, quality or measured speed. Pairwise, rubric and whole-source
+faithfulness judgments use the actual compact judge planner described in
+[candidate-judge-corpus.md](candidate-judge-corpus.md). Retained INT8 input
+policies and authenticated resume are documented in
+[candidate-scored-jobs.md](candidate-scored-jobs.md).
 
-Each record gets one bounded tokenizer ledger shared by its document and every
-canonical label-metadata segment across all scoring heads. Sentiment reuses the
-one encoded document for all requested axes. `--max-input-bytes` bounds the
+Each classification or sentiment record gets one bounded tokenizer ledger shared
+by its document and every canonical label-metadata segment across all scoring
+heads. Sentiment reuses the one encoded document for all requested axes. `--max-input-bytes` bounds the
 cumulative untrusted bytes within a record, and context minus reserved candidate
 depth bounds its cumulative untrusted output tokens. The per-record work caps
 are `--max-tokenizer-pair-checks` (default 4194304) and
 `--max-tokenizer-pair-bytes` (default 67108864). Exhaustion fails that record;
 there is no per-head renewal or silent byte fallback. Native work remains one
 whole-run allowance across all records and flushes.
+
+Judgment additionally accepts `--max-tokenizer-input-bytes` and
+`--max-tokenizer-output-tokens`, each defaulting to 1048576 for the complete
+record's preparation work, independently of wire size and native head context.
+The same pair-check/byte defaults apply. Faithfulness includes the full source
+and every original-byte evidence window. Compact judgment also has four finite
+`--max-total-tokenizer-*` ceilings for input bytes, output tokens, pair checks
+and pair bytes across the entire live invocation, including failed preparation.
+They do not renew on a record or flush or grow with `--max-requests`. These
+additional record byte/token and total flags are judgment-only; classification
+and sentiment retain the per-record contract above. The exact defaults and
+refusal behavior are listed in
+[candidate-judge-corpus.md](candidate-judge-corpus.md).
 
 Preparation admission includes the selected encoder's derived workspace beside
 retained prompt and stream storage. The hosted INT8 classification and sentiment
@@ -115,6 +132,20 @@ The exact policy binds every prepared identity and appears as `input_encoding`
 on every compact-stream event, including failures, flushes and an empty terminal
 `run_complete`. Omitting the option preserves the prior wire shape. Source and
 label content remains untrusted even when marker tokens are excluded.
+Compact judgment events additionally report `input_encoding_work_limits`;
+completed judgment results include actual `input_encoding_work`. One transient
+encoder workspace and the judgment invocation ledger coexist with retained
+plans, stream buffers and the selected schedule's workspace.
+
+### INT8 prompt and CPU-team scheduling
+
+All three tasks accept `--prefill-rows 1..64` and `--compute-threads 1..64`,
+including their combination. A fixed team includes the coordinator and spans
+the entire ordered stream. Prompt rows group work within each existing causal
+prompt; they do not combine documents or independent heads. The full simultaneous
+memory quote is checked before private IO. These schedules preserve the selected
+task plan, policies and work ceilings. Terminal `run_complete` publication
+follows physical worker join under the original invocation controller.
 
 ### Whole-run bounds
 
