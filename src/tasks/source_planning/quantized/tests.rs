@@ -178,6 +178,30 @@ fn cancellation_before_and_after_compilation_remains_typed() {
 }
 
 #[test]
+fn repeated_source_index_can_be_cancelled_after_preflight_without_loading_weights() {
+    let planner = planner();
+    let request = ner(&"a".repeat(4096));
+    let id = identity(&planner, &request);
+    let context = PlanContext::new(&id, budget()).unwrap();
+
+    // Identify the end of encoding and source-index preflight without relying
+    // on a fixed number of tokenizer or template checkpoints.
+    let mut limits = SourcePlanningLimits::default();
+    limits.source.index.max_build_steps = 0;
+    let mut probe = StopAfter { calls: 0, at: usize::MAX };
+    let refused = planner.plan_int8_with_control(&request, &context, limits, &mut probe).err().unwrap();
+    assert!(matches!(refused, Int8SourceError::Extraction(Int8ExtractError::Extraction(ExtractError::Schema(_)))));
+
+    // The repetitive document requires multiple suffix-sort rounds and polls
+    // well beyond preflight. The old path ran all those rounds without polling.
+    let mut stop = StopAfter { calls: 0, at: probe.calls + 32 };
+    let cancelled = planner.plan_int8_with_control(&request, &context, SourcePlanningLimits::default(),
+        &mut stop).err().unwrap();
+    assert_eq!(stop.calls, stop.at);
+    assert_eq!(cancelled.cancellation(), Some(DecodeCancellationKind::Deadline));
+}
+
+#[test]
 fn ner_preserves_all_unicode_occurrences_and_the_quantized_profile() {
     let p = planner(); let source = "é上海 and 上海"; let r = ner(source); let prepared = prepare(&p, &r);
     let run = prepared.finish(synthetic(&prepared, &r, source, r#"[{"text":"上海","type":"location"}]"#)).unwrap();

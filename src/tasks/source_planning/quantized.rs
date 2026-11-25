@@ -112,8 +112,7 @@ pub struct PreparedInt8SourceTask {
 }
 impl SourceTaskPlanner {
     /// The supplied context must ALREADY name the strict INT8 profile/backend.
-    /// Safe-BPE polls during bounded encoding work. Other bounded compiler
-    /// operations remain cooperative around calls; no OS preemption is claimed.
+    /// Encoding and source-index construction poll the same request control.
     pub fn plan_int8_with_control<C: DecodeStepControl>(&self, request: &SourceTaskRequest,
         context: &PlanContext<'_>, limits: SourcePlanningLimits, control: &mut C)
         -> Result<PreparedInt8SourceTask, Int8SourceError> {
@@ -133,8 +132,11 @@ impl SourceTaskPlanner {
             let task = self.task(kind, document, schema, context, budget, limits)?;
             let decode = JsonDecodeOptions { max_new_tokens: budget.max_output_tokens as usize,
                 eos_token_id: self.eos, excluded_token_ids: Default::default() };
-            let extraction = Int8ExtractPlan::from_builtin(&task, schema, decode, limits.compiler, &self.controls,
-                Some((document, limits.source)), task_spec, context.execution_identity().clone())?
+            let extraction = Int8ExtractPlan::from_builtin_with_encoding_control(
+                &task, schema, decode, limits.compiler, &self.controls, Some((document, limits.source)),
+                task_spec, context.execution_identity().clone(), document.document_encoding(),
+                &mut || control.prefill_checkpoint(0),
+            )?
                 .with_finalizer_version(INT8_SOURCE_EXECUTION)?;
             checkpoint(control)?;
             Ok(extraction)
