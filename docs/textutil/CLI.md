@@ -41,6 +41,7 @@ No decode-to-text or lossy decode CLI mode is implied.
 ```sh
 fnlp split --max-chunk-bytes 4096 document.txt
 fnlp split --max-chunk-bytes 4096 --json document.txt
+fnlp split --max-chunk-bytes 4096 --max-chunk-tokens 256 --json document.txt
 ```
 
 Without `--json`, emit one versioned NDJSON row per chunk; each row contains
@@ -54,6 +55,13 @@ they use a UTF-8 boundary. CRLF pairs remain together. No whitespace is trimmed,
 no overlap duplicated, and no character or separator is synthesized. The byte
 ceiling must be at least 4 to admit every Unicode scalar. Chunk-count or output
 exhaustion returns no result rather than truncating the document.
+
+With `--max-chunk-tokens`, each chunk includes a `tokens` count equal to
+running `fnlp tokens --no-bos` on that chunk alone. The pinned tokenizer
+recognizes added tokens and inserts neither BOS nor EOS. Prompt scaffolding and
+output tokens use separate budgets. The planner probes at most 4096 bytes at
+a time and may leave room under either limit. If an indivisible scalar or
+CRLF exceeds the token limit, the whole document fails.
 
 ## Narrow normalization and coordinate maps
 

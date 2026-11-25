@@ -123,11 +123,8 @@ pub(super) struct TokenState {
     #[cfg(test)] loads: usize,
 }
 impl TokenState {
-    pub(super) fn execute<C: DecodeStepControl>(&mut self, source: &str, options: TokenBatchOptions,
-        budget: TextBudget, control: &mut C) -> Result<TokenReport, BatchItemFailure> {
+    fn ensure_loaded(&mut self) -> Result<(), BatchItemFailure> {
         if self.failed { return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)); }
-        options.admit(source, budget)?;
-        super::checkpoint(control)?;
         if self.cached.is_none() {
             // Do not repeatedly rebuild or retry an invalid pinned authority.
             self.failed = true;
@@ -135,6 +132,19 @@ impl TokenState {
             self.cached = Some(CachedTokenizer::pinned()?);
             self.failed = false;
         }
+        Ok(())
+    }
+    pub(super) fn pinned(&mut self) -> Result<&EmbeddedTokenizer, BatchItemFailure> {
+        self.ensure_loaded()?;
+        self.cached.as_ref().map(|cached| &cached.tokenizer)
+            .ok_or_else(|| BatchItemFailure::fatal(BatchCode::InvalidExecution))
+    }
+    pub(super) fn execute<C: DecodeStepControl>(&mut self, source: &str, options: TokenBatchOptions,
+        budget: TextBudget, control: &mut C) -> Result<TokenReport, BatchItemFailure> {
+        if self.failed { return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)); }
+        options.admit(source, budget)?;
+        super::checkpoint(control)?;
+        self.ensure_loaded()?;
         super::checkpoint(control)?;
         let cached = self.cached.as_ref().ok_or_else(|| BatchItemFailure::fatal(BatchCode::InvalidExecution))?;
         let result = cached.inspect(source, options, budget);

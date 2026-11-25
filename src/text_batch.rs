@@ -42,6 +42,7 @@ pub enum TextBatchOptions {
     },
     Split {
         #[serde(default = "default_chunk_bytes")] max_chunk_bytes: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")] max_chunk_tokens: Option<usize>,
     },
     RedactRules {
         #[serde(default)] options: redact::RulesOnlyOptions,
@@ -56,7 +57,7 @@ impl TextBatchOptions {
             TextBatchTask::Normalize => Self::Normalize {
                 trim_ascii_horizontal: false, collapse_ascii_horizontal: false,
             },
-            TextBatchTask::Split => Self::Split { max_chunk_bytes: default_chunk_bytes() },
+            TextBatchTask::Split => Self::Split { max_chunk_bytes: default_chunk_bytes(), max_chunk_tokens: None },
             TextBatchTask::RedactRules => Self::RedactRules { options: Default::default() },
             TextBatchTask::Tokens => Self::Tokens { options: Default::default() },
         }
@@ -67,8 +68,8 @@ impl TextBatchOptions {
             Self::Tokens { .. } => TextBatchTask::Tokens }
     }
     fn validate(&self) -> Result<(), BatchFault> {
-        if let Self::Split { max_chunk_bytes } = self {
-            if !(4..=MAX_BYTES).contains(max_chunk_bytes) { return Err(BatchCode::Planning.into()); }
+        if let Self::Split { max_chunk_bytes, max_chunk_tokens } = self {
+            if !(4..=MAX_BYTES).contains(max_chunk_bytes) || *max_chunk_tokens == Some(0) { return Err(BatchCode::Planning.into()); }
         }
         if let Self::RedactRules { options } = self { options.validate()?; }
         Ok(())
@@ -134,8 +135,13 @@ impl BatchProcessor for TextBatchProcessor {
                     NormalizeOptions { trim_ascii_horizontal, collapse_ascii_horizontal }, self.budget).map_err(text_failure)?;
                 owned_result("normalize", &value, self.budget.max_output_bytes)?
             }
-            TextBatchOptions::Split { max_chunk_bytes } => {
-                let value = textutil::split(&prepared.text, SplitOptions { max_chunk_bytes }, self.budget).map_err(text_failure)?;
+            TextBatchOptions::Split { max_chunk_bytes, max_chunk_tokens } => {
+                let geometry = SplitOptions { max_chunk_bytes };
+                let value = match max_chunk_tokens {
+                    Some(limit) => textutil::split_by_tokens_cached(&prepared.text, geometry, limit, self.budget,
+                        self.tokens.pinned()?, || control.checkpoint(0)),
+                    None => textutil::split(&prepared.text, geometry, self.budget),
+                }.map_err(text_failure)?;
                 owned_result("split", &value, self.budget.max_output_bytes)?
             }
             TextBatchOptions::RedactRules { options } => {
@@ -160,6 +166,9 @@ fn checkpoint<C: DecodeStepControl>(control: &mut C) -> Result<(), BatchItemFail
 }
 fn text_failure(error: TextError) -> BatchItemFailure {
     let code = match error {
+        TextError::Cancelled(cause) => return BatchItemFailure::fatal(BatchFault::cancelled(cause)),
+        TextError::TokenBudget | TextError::TokenizerWorkBudget => BatchCode::Admission,
+        TextError::Tokenization => return BatchItemFailure::fatal(BatchCode::InvalidExecution),
         TextError::InvalidOptions => BatchCode::Planning,
         TextError::InputBudget => BatchCode::DocumentLimit,
         TextError::OutputBudget | TextError::ItemBudget => BatchCode::OutputLineLimit,
@@ -225,7 +234,7 @@ pub(crate) struct BatchCommand {
 pub(crate) fn definition() -> clap::Command {
     BatchCommand::augment_args(clap::Command::new("batch"))
         .about("Process bounded NDJSON documents with model-free tasks")
-        .after_help("Input: {\"id\":\"doc-1\",\"text\":\"original UTF-8\",\"task_args\":null}. Optional task_args is a complete override with kind=normalize, split, tokens or redact_rules. --task tokens uses exact pinned L0 BPE with BOS and without EOS by default; BPE documents over 4096 bytes are refused, never truncated or silently encoded differently. task_args.options may set include_ids=true and encoding={kind:pinned_bpe,add_bos:false,add_eos:true} or encoding={kind:byte_fallback}. Byte fallback omits special insertion and verifies exact byte decode. Token IDs are sensitive result content. This is tokenizer inspection, not untrusted prompt construction. --task redact-rules uses only the declared rules, not person/org/location NER; verification always reruns that rule set before publication. task_args.options may set action=mask|placeholder, rules={enabled:[email,phone,url,ip_address,credit_card,date]}, and include_map=true. Default rules omit dates. A clean declared scan is not a guarantee of no PII; Unicode obfuscations may be missed. Pseudonymization and keys are not accepted in this stream. {\"flush\":true} acknowledges the epoch and permits ID reuse. Output uses fnlp-item-local-batch-v1, not robot schema. One document is live; each event is flushed before further input. Empty LF/CRLF records are ignored; malformed records get typed errors and processing continues. Any rejected document makes the process exit nonzero, even when run_complete is emitted. No weights, network, background pool, file output or implicit persistence. A complete run requires its terminal event; a terminated process may have delivered only a prefix.")
+        .after_help("Input: {\"id\":\"doc-1\",\"text\":\"original UTF-8\",\"task_args\":null}. Optional task_args is a complete override with kind=normalize, split, tokens or redact_rules. For split, max_chunk_tokens adds an exact per-chunk pinned BPE cap excluding BOS/EOS alongside max_chunk_bytes. --task tokens uses exact pinned L0 BPE with BOS and without EOS by default; BPE documents over 4096 bytes are refused, never truncated or silently encoded differently. task_args.options may set include_ids=true and encoding={kind:pinned_bpe,add_bos:false,add_eos:true} or encoding={kind:byte_fallback}. Byte fallback omits special insertion and verifies exact byte decode. Token IDs are sensitive result content. This is tokenizer inspection, not untrusted prompt construction. --task redact-rules uses only the declared rules, not person/org/location NER; verification always reruns that rule set before publication. task_args.options may set action=mask|placeholder, rules={enabled:[email,phone,url,ip_address,credit_card,date]}, and include_map=true. Default rules omit dates. A clean declared scan is not a guarantee of no PII; Unicode obfuscations may be missed. Pseudonymization and keys are not accepted in this stream. {\"flush\":true} acknowledges the epoch and permits ID reuse. Output uses fnlp-item-local-batch-v1, not robot schema. One document is live; each event is flushed before further input. Empty LF/CRLF records are ignored; malformed records get typed errors and processing continues. Any rejected document makes the process exit nonzero, even when run_complete is emitted. No weights, network, background pool, file output or implicit persistence. A complete run requires its terminal event; a terminated process may have delivered only a prefix.")
 }
 impl BatchCommand {
     fn configure(&self) -> Result<(TextBatchProcessor, BatchLimits), ErrorCode> {
@@ -323,6 +332,23 @@ mod tests {
         assert_eq!(last["summary"]["succeeded"], 2);
         assert_eq!(last["summary"]["reserved_work"], json!({"forward_positions":0,"projected_logits":0}));
         assert!(rows.iter().all(|r| r["protocol"] == batch::BATCH_PROTOCOL));
+    }
+    #[test]
+    fn token_limited_split_uses_item_limits_and_recovers_after_an_indivisible_scalar() {
+        let args = json!({"kind":"split","max_chunk_bytes":8,"max_chunk_tokens":1});
+        let bad = json!({"id":"bad","text":"\u{10ffff}","task_args":args});
+        let good = json!({"id":"good","text":"abc","task_args":args});
+        let plain = json!({"id":"plain","text":"abc"});
+        let input = format!("{bad}\n{good}\n{plain}\n");
+        let (code, rows, _) = run(&["batch", "--task", "split"], input.as_bytes());
+        assert_ne!(code, ExitCode::SUCCESS);
+        let values: Vec<_> = rows.iter().filter_map(|row| row.get("result"))
+            .filter_map(|result| result.get("result")).collect();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["profile"], textutil::TOKEN_SPLIT_PROFILE);
+        assert!(values[0]["chunks"].as_array().unwrap().iter().all(|chunk| chunk["tokens"] == 1));
+        assert_eq!(values[1]["profile"], textutil::SPLIT_PROFILE);
+        assert!(values[1]["chunks"][0].get("tokens").is_none());
     }
     #[test]
     fn split_stream_roundtrips_unicode_crlf_and_original_coordinates() {

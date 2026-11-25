@@ -4,6 +4,10 @@ use std::{error::Error, fmt, io::Read};
 use serde::{Deserialize, Serialize};
 use crate::{canonjson, validation::grounded_fields::VerifiedSourceSpan};
 
+mod token_split;
+pub use token_split::{split_by_tokens, TOKEN_SPLIT_PROFILE};
+pub(crate) use token_split::split_by_tokens_cached;
+
 pub const NORMALIZE_PROFILE: &str = "crlf-cr-lf-ascii-horizontal-v1";
 pub const SPLIT_PROFILE: &str = "utf8-whitespace-partition-v1";
 const MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -11,7 +15,8 @@ const MAX_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TextError {
     InvalidOptions, InputBudget, OutputBudget, ItemBudget, AllocationRefused,
-    InputRead, InvalidUtf8, Serialization,
+    InputRead, InvalidUtf8, Serialization, TokenBudget, TokenizerWorkBudget, Tokenization,
+    Cancelled(crate::native_engine::decode::DecodeCancellationKind),
 }
 impl fmt::Display for TextError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -19,6 +24,10 @@ impl fmt::Display for TextError {
             Self::InvalidOptions => "invalid text utility options", Self::InputBudget => "text input byte budget exceeded",
             Self::OutputBudget => "complete text result byte budget exceeded", Self::ItemBudget => "text item budget exceeded",
             Self::AllocationRefused => "text allocation refused", Self::InputRead => "text input read failed",
+            Self::TokenBudget => "indivisible UTF-8 scalar or CRLF exceeds chunk token limit",
+            Self::TokenizerWorkBudget => "split tokenizer work limit exceeded",
+            Self::Tokenization => "pinned split tokenization failed",
+            Self::Cancelled(_) => "token splitting cancelled",
             Self::InvalidUtf8 => "text input is not UTF-8", Self::Serialization => "text result serialization failed",
         })
     }
@@ -182,13 +191,23 @@ pub fn normalize(source: &str, options: NormalizeOptions, budget: TextBudget) ->
 pub struct SplitOptions { pub max_chunk_bytes: usize }
 impl Default for SplitOptions { fn default() -> Self { Self { max_chunk_bytes: 4096 } } }
 #[derive(Clone, Debug, Serialize)]
-pub struct TextChunk<'a> { pub span: VerifiedSourceSpan, pub text: &'a str }
+pub struct TextChunk<'a> {
+    pub span: VerifiedSourceSpan, pub text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")] pub tokens: Option<usize>,
+}
 #[derive(Serialize)]
 pub struct SplitText<'a> {
-    schema_version: u32, profile: &'static str, options: SplitOptions,
+    schema_version: u32, profile: &'static str, options: ReportSplitOptions,
     original_bytes: usize, original_scalars: usize, chunks: Vec<TextChunk<'a>>,
 }
-impl<'a> SplitText<'a> { pub fn chunks(&self) -> &[TextChunk<'a>] { &self.chunks } }
+#[derive(Serialize)]
+struct ReportSplitOptions {
+    max_chunk_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")] max_chunk_tokens: Option<usize>,
+}
+impl<'a> SplitText<'a> {
+    pub fn profile(&self) -> &'static str { self.profile }
+    pub fn chunks(&self) -> &[TextChunk<'a>] { &self.chunks } }
 
 /// Lossless contiguous partition, not a semantic sentence segmenter. Prefer
 /// the last ASCII whitespace boundary in the latter half of a bounded chunk;
@@ -216,13 +235,14 @@ pub fn split(source: &str, options: SplitOptions, budget: TextBudget) -> Result<
         if end <= start { return Err(TextError::InvalidOptions); }
         let text = &source[start..end]; let next_scalar = scalar + text.chars().count();
         chunks.try_reserve(1).map_err(|_| TextError::AllocationRefused)?;
-        let chunk = TextChunk { span: VerifiedSourceSpan { byte_start: start, byte_end: end, scalar_start: scalar, scalar_end: next_scalar }, text };
+        let chunk = TextChunk { span: VerifiedSourceSpan { byte_start: start, byte_end: end, scalar_start: scalar, scalar_end: next_scalar }, text, tokens: None };
         chunk_bytes = chunk_bytes.checked_add(canonjson::canonical_bytes(&chunk).map_err(|_| TextError::Serialization)?.len())
             .filter(|&n| n <= budget.max_output_bytes).ok_or(TextError::OutputBudget)?;
         chunks.push(chunk);
         start = end; scalar = next_scalar;
     }
-    let result = SplitText { schema_version: 1, profile: SPLIT_PROFILE, options,
+    let result = SplitText { schema_version: 1, profile: SPLIT_PROFILE,
+        options: ReportSplitOptions { max_chunk_bytes: options.max_chunk_bytes, max_chunk_tokens: None },
         original_bytes: source.len(), original_scalars: scalar, chunks };
     budget.result(&result)?; Ok(result)
 }

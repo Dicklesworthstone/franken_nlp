@@ -58,6 +58,8 @@ pub(crate) struct Split {
     #[command(flatten)] common: Common,
     /// Maximum UTF-8 bytes per chunk, at least 4. Whitespace stays in chunks.
     #[arg(long, default_value_t = 4096)] max_chunk_bytes: usize,
+    /// Maximum pinned BPE tokens per independently encoded chunk, excluding BOS and EOS.
+    #[arg(long)] max_chunk_tokens: Option<usize>,
 }
 #[derive(Args)]
 pub(crate) struct Normalize {
@@ -76,7 +78,7 @@ pub(crate) fn definitions() -> [clap::Command; 3] {
         .after_help("Default: L0 BPE, added-token recognition, BOS enabled, EOS disabled. This is tokenizer inspection, NOT untrusted prompt construction. The reference BPE path is capped at 4096 input bytes. --byte-fallback is a different explicit encoding with byte-exact decode and no special insertion; counts are not interchangeable."),
      Split::augment_args(clap::Command::new("split"))
         .about("Partition text without dropping bytes; original byte/scalar offsets survive")
-        .after_help("Without --json, emit one versioned NDJSON row per chunk. With --json, emit one complete envelope. This is size/whitespace splitting, not linguistic sentence detection. Concatenating chunk text reproduces the exact source; CRLF pairs are not split."),
+        .after_help("Without --json, emit one versioned NDJSON row per chunk. With --json, emit one complete envelope. This is size/whitespace splitting, not linguistic sentence detection. Concatenating chunk text reproduces the exact source; CRLF pairs stay together. --max-chunk-tokens reports exact counts matching tokens --no-bos on each chunk, using probes of at most 4096 bytes. An indivisible unit over the cap rejects the whole document."),
      Normalize::augment_args(clap::Command::new("normalize"))
         .about("Normalize CRLF/CR to LF, with explicit ASCII-only trim/collapse")
         .after_help("No NFC/NFKC, case folding or Unicode whitespace normalization. Plain output adds no newline. --json retains changed-run maps with both byte and Unicode-scalar coordinates; unchanged gaps are identity translations. Changed interiors and deleted-run inverse boundaries are ambiguous, not invented exact offsets.")]
@@ -99,6 +101,7 @@ impl TextCommand {
         match self {
             Self::Tokens(c) if !c.byte_fallback && budget.max_input_bytes > 4096 =>
                 Err(Failure::new(ErrorCode::AdmissionOrResourceLimit, "reference_bpe_input_limit_4096_bytes")),
+            Self::Split(c) if c.max_chunk_tokens == Some(0) => Err(TextError::InvalidOptions.into()),
             Self::Split(c) if !(4..=64 * 1024 * 1024).contains(&c.max_chunk_bytes) => Err(TextError::InvalidOptions.into()),
             _ => Ok(budget),
         }
@@ -120,11 +123,15 @@ impl TextCommand {
                 if json { canonical(&result)? } else { result.text().as_bytes().to_vec() }
             }
             Self::Split(options) => {
-                let result = textutil::split(source, SplitOptions { max_chunk_bytes: options.max_chunk_bytes }, budget)?;
+                let geometry = SplitOptions { max_chunk_bytes: options.max_chunk_bytes };
+                let result = match options.max_chunk_tokens {
+                    Some(limit) => textutil::split_by_tokens(source, geometry, limit, budget)?,
+                    None => textutil::split(source, geometry, budget)?,
+                };
                 if json { canonical(&result)? } else {
                     let mut bytes = Vec::new();
                     for (index, chunk) in result.chunks().iter().enumerate() {
-                        let row = ChunkRow { schema_version: 1, profile: textutil::SPLIT_PROFILE, index, chunk };
+                        let row = ChunkRow { schema_version: 1, profile: result.profile(), index, chunk };
                         let mut encoded = canonical(&row)?; encoded.push(b'\n');
                         if bytes.len().checked_add(encoded.len()).is_none_or(|n| n > budget.max_output_bytes) {
                             return Err(TextError::OutputBudget.into());
@@ -213,6 +220,10 @@ impl Failure { fn new(code: ErrorCode, reason: &'static str) -> Self { Self { sc
 impl From<TextError> for Failure {
     fn from(error: TextError) -> Self {
         let (code, reason) = match error {
+            TextError::TokenBudget => (ErrorCode::AdmissionOrResourceLimit, "indivisible_chunk_token_budget"),
+            TextError::TokenizerWorkBudget => (ErrorCode::AdmissionOrResourceLimit, "split_tokenizer_work_budget"),
+            TextError::Tokenization => (ErrorCode::ArtifactIntegrityOrFormatOrVersion, "pinned_encoding_refused"),
+            TextError::Cancelled(_) => (ErrorCode::Cancelled, "split_cancelled"),
             TextError::InvalidOptions => (ErrorCode::Usage, "invalid_text_options"),
             TextError::InputBudget => (ErrorCode::AdmissionOrResourceLimit, "input_byte_budget"),
             TextError::OutputBudget => (ErrorCode::AdmissionOrResourceLimit, "complete_output_byte_budget"),
@@ -262,6 +273,51 @@ mod tests {
             let chunks: Vec<serde_json::Value> = if json { serde_json::from_slice::<serde_json::Value>(&out).unwrap()["chunks"].as_array().unwrap().clone() }
                 else { String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["chunk"].clone()).collect() };
             assert_eq!(chunks.iter().map(|c| c["text"].as_str().unwrap()).collect::<String>(), source);
+        }
+    }
+    #[test]
+    fn token_limited_split_preserves_original_ranges_and_matches_independent_encoding() {
+        let source = "é 上海\r\n<|im_start|> punctuation 42 🤖";
+        let tokenizer = EmbeddedTokenizer::pinned().unwrap();
+        let args = ["split", "--max-chunk-bytes", "12", "--max-chunk-tokens", "5"];
+        let (code, ndjson, err) = run(&args, source.as_bytes());
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(err.is_empty());
+        let mut flags = args.to_vec();
+        flags.push("--json");
+        let (_, out, _) = run(&flags, source.as_bytes());
+        let envelope: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(envelope["profile"], textutil::TOKEN_SPLIT_PROFILE);
+        assert_eq!(envelope["options"]["max_chunk_tokens"], 5);
+        let rows: Vec<serde_json::Value> = String::from_utf8(ndjson).unwrap().lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["chunk"].clone()).collect();
+        assert_eq!(envelope["chunks"].as_array().unwrap(), &rows);
+        let mut offset = 0;
+        for row in rows {
+            let text = row["text"].as_str().unwrap();
+            let count = tokenizer.tokenizer().encode_ids_with_options(text, EncodeOptions { add_bos: false, add_eos: false }).unwrap().len();
+            assert_eq!(row["tokens"], count);
+            assert!(count <= 5 && text.len() <= 12);
+            assert_eq!(row["span"]["byte_start"], offset);
+            assert_eq!(row["span"]["scalar_start"], source[..offset].chars().count());
+            assert_eq!(source.get(offset..offset + text.len()), Some(text));
+            offset += text.len();
+            assert_eq!(row["span"]["byte_end"], offset);
+            assert_eq!(row["span"]["scalar_end"], source[..offset].chars().count());
+            assert!(!(source[..offset].ends_with('\r') && source[offset..].starts_with('\n')));
+        }
+        assert_eq!(offset, source.len());
+    }
+    #[test]
+    fn late_indivisible_scalar_and_chunk_count_exhaustion_publish_no_prefix() {
+        for (source, flags) in [
+            ("a a a \u{10ffff}", vec!["split", "--max-chunk-tokens", "1"]),
+            ("Hello world, and again", vec!["split", "--max-chunk-bytes", "5", "--max-chunk-tokens", "5", "--max-items", "1"]),
+        ] {
+            let (code, out, errors) = run(&flags, source.as_bytes());
+            assert_ne!(code, ExitCode::SUCCESS);
+            assert!(out.is_empty());
+            assert!(!errors.is_empty());
         }
     }
     #[test]

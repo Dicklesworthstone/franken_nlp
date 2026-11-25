@@ -75,7 +75,7 @@ fnlp batch --task split < requests.ndjson
 ```
 
 ```json
-{"id":"s1","text":"Original text and all its whitespace","task_args":{"kind":"split","max_chunk_bytes":1024}}
+{"id":"s1","text":"Original text and all its whitespace","task_args":{"kind":"split","max_chunk_bytes":1024,"max_chunk_tokens":128}}
 ```
 
 Chunk text concatenates to the original bytes. Chunk boundaries preserve UTF-8
@@ -83,6 +83,11 @@ and CRLF pairs, and each chunk retains original byte and Unicode-scalar spans.
 This is size/whitespace partitioning, not linguistic sentence segmentation.
 Chunks are returned inside one bounded document result; an oversized result
 fails rather than publishing a partial set of chunks.
+
+The optional `max_chunk_tokens` limit adds a `tokens` field to each chunk.
+It counts the independently encoded chunk with the pinned BPE tokenizer,
+including added-token recognition and excluding BOS and EOS. Each document
+uses the byte and token limits from its own task arguments or the batch defaults.
 
 ## Exact tokenizer counts and IDs
 
