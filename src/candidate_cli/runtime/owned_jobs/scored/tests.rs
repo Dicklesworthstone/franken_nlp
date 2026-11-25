@@ -166,3 +166,169 @@ fn cancelled_final_delivery_keeps_all_causes_and_never_claims_rollback() {
         assert!(!writer.bytes.is_empty(), "durable progress is not rolled back by delivery failure");
     }
 }
+
+fn compact_corpus(task: &str, flags: &[&str]) -> (ScoreJobArgs, Limits, Corpus) {
+    let a = args(task, flags); let (_, limits) = a.validate().unwrap();
+    let defaults = a.parse_defaults((task == "classify").then_some(LABELS), a.host.budget(limits)).unwrap();
+    let configured = configure(&a, &facts(), limits, defaults).unwrap();
+    (a, limits, configured)
+}
+
+fn compact_document<A>(id: &str) -> BatchDocument<A> {
+    BatchDocument { id: id.to_owned(), text: "A welcome legal result. é 上海 <tool_call>".to_owned(), task_args: None }
+}
+
+fn compact_recipe(corpus: &Corpus, total: Option<SafeBpeWorkLimits>) -> serde_json::Value {
+    match corpus {
+        Corpus::Classify(p, c) => {
+            let factory = Int8ClassificationJobPlanner::new_with_document_encoding(p, c.identity.clone(),
+                c.task_ceiling, c.planning, c.defaults.clone(), c.max_model_work, total).unwrap();
+            serde_json::to_value(factory.job_recipe()).unwrap()
+        }
+        Corpus::Sentiment(p, c) => {
+            let config = crate::hosted::corpus::SentimentCorpusConfig {
+                identity: c.identity.clone(), task_ceiling: c.task_ceiling, planning: c.planning,
+                defaults: c.defaults.clone(), max_item_work: c.max_item_work, max_model_work: c.max_model_work,
+            };
+            let factory = Int8SentimentJobPlanner::new_with_document_encoding(p, config, total).unwrap();
+            serde_json::to_value(factory.job_recipe()).unwrap()
+        }
+        Corpus::Judge(_, _) => panic!("compact judgment is unsupported"),
+    }
+}
+
+#[test]
+fn compact_cli_configuration_reaches_the_real_durable_compilers_in_every_schedule() {
+    for task in ["classify", "sentiment"] {
+        for schedule in [vec![], vec!["--prefill-rows", "4"],
+            vec!["--compute-threads", "4"], vec!["--compute-threads", "4", "--prefill-rows", "4"]] {
+            let mut flags = vec!["--input-encoding", "safe-bpe-v1"]; flags.extend(schedule);
+            let (a, _, corpus) = compact_corpus(task, &flags);
+            let policy = a.encoding_policy().unwrap(); let total = a.encoding_work_limits().unwrap();
+            let workspace = a.encoding_workspace_bytes().unwrap();
+            check_encoding_quote(&corpus, &policy, total, workspace).unwrap();
+            assert_eq!(check_encoding_quote(&corpus, &policy, total, workspace - 1).unwrap_err().code,
+                "score_job_encoding_quote_mismatch");
+            let recipe = compact_recipe(&corpus, total);
+            assert_eq!(recipe["input_encoding"], serde_json::to_value(&policy).unwrap());
+            assert_eq!(recipe["encoding_work_limits"], serde_json::to_value(total.unwrap()).unwrap());
+            match corpus {
+                Corpus::Classify(p, c) => {
+                    let factory = Int8ClassificationJobPlanner::new_with_document_encoding(&p, c.identity,
+                        c.task_ceiling, c.planning, c.defaults, c.max_model_work, total).unwrap();
+                    let plan = factory.prepare_with_control(compact_document("one"), &mut Continue).unwrap();
+                    assert_eq!(plan.head_count(), 2);
+                    let once = factory.encoding_work().unwrap(); assert!(once.input_bytes() > 0);
+                    factory.prepare_with_control(compact_document("two"), &mut Continue).unwrap();
+                    assert_eq!(factory.encoding_work().unwrap(), once.checked_add(once).unwrap());
+                }
+                Corpus::Sentiment(p, c) => {
+                    let factory = Int8SentimentJobPlanner::new_with_document_encoding(&p, c, total).unwrap();
+                    let plan = factory.prepare_with_control(compact_document("one"), &mut Continue).unwrap();
+                    assert_eq!(plan.head_count(), crate::tasks::sentiment::SentimentAxis::ALL.len());
+                    let once = factory.encoding_work().unwrap(); assert!(once.input_bytes() > 0);
+                    factory.prepare_with_control(compact_document("two"), &mut Continue).unwrap();
+                    assert_eq!(factory.encoding_work().unwrap(), once.checked_add(once).unwrap());
+                }
+                Corpus::Judge(_, _) => panic!("wrong task"),
+            }
+        }
+    }
+}
+
+#[test]
+fn every_cli_tokenizer_cap_changes_the_authenticated_recipe_without_changing_native_limits() {
+    for task in ["classify", "sentiment"] {
+        let (a, _, corpus) = compact_corpus(task, &["--input-encoding", "safe-bpe-v1"]);
+        let original = compact_recipe(&corpus, a.encoding_work_limits().unwrap());
+        for (flag, value) in [
+            ("--max-tokenizer-pair-checks", "4194305"), ("--max-tokenizer-pair-bytes", "67108865"),
+            ("--max-total-tokenizer-input-bytes", "67108865"),
+            ("--max-total-tokenizer-output-tokens", "4194305"),
+            ("--max-total-tokenizer-pair-checks", "268435457"),
+            ("--max-total-tokenizer-pair-bytes", "4294967297"),
+        ] {
+            let (changed, _, corpus) = compact_corpus(task, &["--input-encoding", "safe-bpe-v1", flag, value]);
+            let recipe = compact_recipe(&corpus, changed.encoding_work_limits().unwrap());
+            assert_ne!(recipe, original, "{task} {flag}");
+            assert_eq!(changed.host.work_ceiling(), a.host.work_ceiling());
+            assert_eq!(recipe["task_ceiling"], original["task_ceiling"]);
+            assert_eq!(recipe["max_model_work"], original["max_model_work"]);
+            assert_eq!(changed.encoding_workspace_bytes().unwrap(), a.encoding_workspace_bytes().unwrap());
+        }
+        let (byte, _, corpus) = compact_corpus(task, &[]);
+        let legacy = compact_recipe(&corpus, byte.encoding_work_limits().unwrap());
+        assert!(legacy.get("input_encoding").is_none());
+        assert!(legacy.get("encoding_work_limits").is_none());
+    }
+}
+
+#[test]
+fn compact_quote_checks_exact_policy_even_when_workspace_size_is_identical() {
+    for task in ["classify", "sentiment"] {
+        let (a, _, corpus) = compact_corpus(task, &["--input-encoding", "safe-bpe-v1"]);
+        let policy = a.encoding_policy().unwrap(); let total = a.encoding_work_limits().unwrap();
+        let workspace = a.encoding_workspace_bytes().unwrap();
+        let UntrustedEncoding::SafeBpeV1(mut changed) = policy else { panic!("compact") };
+        changed.max_pair_checks += 1;
+        assert_eq!(changed.requirements().unwrap().workspace_bytes + 1024, workspace);
+        assert_eq!(check_encoding_quote(&corpus, &UntrustedEncoding::SafeBpeV1(changed),
+            total, workspace).unwrap_err().code, "score_job_encoding_quote_mismatch");
+        assert!(check_encoding_quote(&corpus, &UntrustedEncoding::ByteFallback, None, 0).is_err());
+    }
+}
+
+#[test]
+fn compact_population_quote_includes_encoder_with_original_or_retained_record_buffers() {
+    for task in ["classify", "sentiment"] { for retained in [false, true] {
+        let mut flags = vec!["--input-encoding", "safe-bpe-v1", "--compute-threads", "4", "--prefill-rows", "4"];
+        if retained { flags.extend(["--spool-input", "--max-retained-input-mib", "4"]); }
+        let a = args(task, &flags); let (_, limits) = a.validate().unwrap();
+        let host = quoted_host(&a, limits); let job = lifetime();
+        let peak = population_memory_bytes(&a, host, job, limits).unwrap();
+        let workspace = a.encoding_workspace_bytes().unwrap();
+        let buffers = host.required_buffer_bytes_for_input(job, a.input_retention.input_memory().unwrap()).unwrap();
+        assert_eq!(peak, a.execution_memory_bytes(limits).unwrap() + buffers);
+        let mut exact = limits; exact.memory_bytes = peak;
+        check_population_memory(&a, host, job, exact).unwrap();
+        exact.memory_bytes -= workspace;
+        assert_eq!(check_population_memory(&a, host, job, exact).unwrap_err().code, "score_job_population_memory");
+    } }
+}
+
+#[test]
+fn stale_compact_policy_is_refused_before_runtime_private_io_or_output() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private input read") } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("output write") }
+        fn flush(&mut self) -> io::Result<()> { panic!("output flush") }
+    }
+    for task in ["classify", "sentiment"] {
+        for old in [vec![], vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "4194305"]] {
+            let original = args(task, &old); let (common, limits) = original.validate().unwrap();
+            let current = args(task, &["--input-encoding", "safe-bpe-v1"]);
+            let error = execute(RunMode::Start, current, common, limits, NoIo, &mut NoIo).unwrap_err();
+            assert_eq!(error.code, "score_job_encoding_admission");
+        }
+    }
+}
+
+#[test]
+fn compact_job_metadata_reports_only_policy_and_invocation_limits() {
+    let a = args("classify", &["--input-encoding", "safe-bpe-v1"]);
+    let policy = a.encoding_policy().unwrap(); let total = a.encoding_work_limits().unwrap();
+    let report = serde_json::json!({"output":{"committed":2,"attempts":3}});
+    let byte = EncodingReport { response: &report, input_encoding: None,
+        invocation_encoding_work_limits: None, root_object_reconciliation: None };
+    assert_eq!(crate::canonjson::canonical_bytes(&byte).unwrap(), crate::canonjson::canonical_bytes(&report).unwrap());
+    let compact = EncodingReport { response: &report, input_encoding: Some(&policy),
+        invocation_encoding_work_limits: total, root_object_reconciliation: None };
+    let value = serde_json::to_value(compact).unwrap();
+    assert_eq!(value["output"], report["output"]);
+    assert_eq!(value["input_encoding"], serde_json::to_value(policy).unwrap());
+    assert_eq!(value["invocation_encoding_work_limits"], serde_json::to_value(total.unwrap()).unwrap());
+    for private in ["labels", "dimensions", "source_text", "candidate_weight", "prompt_digest"] {
+        assert!(!value.to_string().contains(private));
+    }
+}

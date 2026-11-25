@@ -232,12 +232,118 @@ fn complete_native_quote_prices_both_scratch_owners_and_rejects_underfunded_invo
 }
 
 #[test]
-fn retained_scoring_does_not_silently_accept_compact_or_generated_task_options() {
+fn retained_scoring_does_not_silently_accept_generated_task_options() {
     for task in ["classify", "sentiment", "judge"] {
         assert!(parse("start", task, &["--compute-threads", "4", "--prefill-rows", "4"]).is_ok());
-        for (flag, value) in [("--input-encoding", "safe-bpe-v1"), ("--seed", "00"),
+        for (flag, value) in [("--seed", "00"),
             ("--schema", "schema.json"), ("--cohort-rows", "4"), ("--active-rows", "4")] {
             assert!(parse("start", task, &[flag, value]).is_err(), "{task} {flag}");
+        }
+    }
+}
+
+#[test]
+fn compact_scoring_retains_exact_encoding_caps_across_operations_and_schedules() {
+    for operation in ["start", "resume"] { for task in ["classify", "sentiment"] {
+        let byte = args(task, &[]); let (_, ordinary) = byte.validate().unwrap();
+        for schedule in [vec![], vec!["--prefill-rows", "4"],
+            vec!["--compute-threads", "4"], vec!["--compute-threads", "4", "--prefill-rows", "4"]] {
+            let mut flags = vec!["--input-encoding", "safe-bpe-v1",
+                "--max-tokenizer-pair-checks", "1000000", "--max-tokenizer-pair-bytes", "4000000",
+                "--max-total-tokenizer-input-bytes", "1048576",
+                "--max-total-tokenizer-output-tokens", "131072",
+                "--max-total-tokenizer-pair-checks", "8388608",
+                "--max-total-tokenizer-pair-bytes", "134217728"];
+            flags.extend(schedule);
+            let (_, a) = command(operation, task, &flags).into_parts();
+            let (common, admitted) = a.validate().unwrap();
+            assert_eq!(common.input_encoding, a.encoding);
+            assert_eq!(a.host.work_ceiling(), byte.host.work_ceiling());
+            assert_eq!(a.host.budget(admitted), byte.host.budget(ordinary));
+            let UntrustedEncoding::SafeBpeV1(call) = a.encoding_policy().unwrap()
+                else { panic!("compact encoding") };
+            assert_eq!(call.max_input_bytes, a.host.max_input_bytes);
+            assert_eq!(call.max_output_tokens, a.host.context_tokens - a.host.max_candidate_tokens);
+            assert_eq!((call.max_pair_checks, call.max_pair_bytes), (1000000, 4000000));
+            assert_eq!(a.encoding_work_limits().unwrap(), Some(SafeBpeWorkLimits {
+                max_input_bytes: 1048576, max_output_tokens: 131072,
+                max_pair_checks: 8388608, max_pair_bytes: 134217728,
+            }));
+            assert_eq!(a.encoding_workspace_bytes().unwrap(), call.requirements().unwrap().workspace_bytes + 1024);
+        }
+    } }
+}
+
+#[test]
+fn byte_scoring_retains_zero_encoding_workspace_and_explicit_compact_defaults_are_bounded() {
+    for task in ["classify", "sentiment", "judge"] {
+        let a = args(task, &[]); let explicit = args(task, &["--input-encoding", "byte-fallback"]);
+        a.validate().unwrap(); explicit.validate().unwrap();
+        assert_eq!(a.encoding_policy().unwrap(), UntrustedEncoding::ByteFallback);
+        assert_eq!(a.encoding_work_limits().unwrap(), None);
+        assert_eq!(a.encoding_workspace_bytes().unwrap(), 0);
+        assert_eq!(a.encoding, explicit.encoding);
+    }
+    for task in ["classify", "sentiment"] {
+        let a = args(task, &["--input-encoding", "safe-bpe-v1"]);
+        a.validate().unwrap();
+        assert_eq!(a.encoding_work_limits().unwrap(), Some(SafeBpeWorkLimits {
+            max_input_bytes: 64 * MIB, max_output_tokens: 4 * MIB,
+            max_pair_checks: 256 * MIB, max_pair_bytes: 4096 * MIB,
+        }));
+    }
+}
+
+#[test]
+fn invalid_compact_jobs_refuse_before_keys_population_models_or_output() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private input read") } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("output write") }
+        fn flush(&mut self) -> io::Result<()> { panic!("output flush") }
+    }
+    for operation in ["start", "resume"] {
+        let (mode, a) = command(operation, "judge", &["--input-encoding", "safe-bpe-v1"]).into_parts();
+        assert_eq!(a.validate().err().unwrap().code, "score_job_input_encoding");
+        assert!(execute_owned(mode, a, NoIo, &mut NoIo).is_err());
+        for task in ["classify", "sentiment"] {
+            for flag in ["--max-total-tokenizer-input-bytes", "--max-total-tokenizer-output-tokens",
+                "--max-total-tokenizer-pair-checks", "--max-total-tokenizer-pair-bytes"] {
+                let (mode, a) = command(operation, task, &[flag, "1"]).into_parts();
+                assert!(a.validate().is_err());
+                assert!(execute_owned(mode, a, NoIo, &mut NoIo).is_err());
+                let (mode, a) = command(operation, task,
+                    &["--input-encoding", "safe-bpe-v1", flag, "0"]).into_parts();
+                assert!(a.validate().is_err());
+                assert!(execute_owned(mode, a, NoIo, &mut NoIo).is_err());
+            }
+            for flag in ["--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
+                assert!(parse(operation, task, &[flag, "1"]).is_err());
+                let (mode, a) = command(operation, task,
+                    &["--input-encoding", "safe-bpe-v1", flag, "0"]).into_parts();
+                assert!(a.validate().is_err());
+                assert!(execute_owned(mode, a, NoIo, &mut NoIo).is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_job_workspace_coexists_with_workers_prompts_and_retained_input_ownership() {
+    for task in ["classify", "sentiment"] {
+        for retained in [false, true] {
+            let mut flags = vec!["--compute-threads", "4", "--prefill-rows", "4"];
+            if retained { flags.extend(["--spool-input", "--max-retained-input-mib", "4"]); }
+            let byte = args(task, &flags); let (_, byte_limits) = byte.validate().unwrap();
+            flags.extend(["--input-encoding", "safe-bpe-v1"]);
+            let compact = args(task, &flags); let (_, compact_limits) = compact.validate().unwrap();
+            let workspace = compact.encoding_workspace_bytes().unwrap();
+            assert!(workspace > 1024);
+            assert_eq!(compact.execution_memory_bytes(compact_limits).unwrap(),
+                byte.execution_memory_bytes(byte_limits).unwrap() + workspace);
+            let mut under = compact;
+            under.host.memory_mib = (under.execution_memory_bytes(compact_limits).unwrap() - 1) / MIB;
+            assert!(under.validate().is_err());
         }
     }
 }

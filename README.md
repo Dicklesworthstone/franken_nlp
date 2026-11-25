@@ -1139,6 +1139,80 @@ claim equivalence to a single larger context. Source review and regression
 definitions are present, while DSR compilation, executable regression tests
 and real-model qualification remain pending.
 
+## Implemented candidate INT8 compact retained scoring jobs
+
+`fnlp candidate score-job start|resume --task classify|sentiment` accepts
+`--input-encoding safe-bpe-v1` for authenticated retained scoring. It uses
+the same pinned planners and full-vocabulary native scorers as `score-batch`,
+with one resident INT8 model across the pending population. Classification
+includes private label metadata in its tokenizer allowance; sentiment encodes
+the source once for all requested axes. The existing per-record context and
+task ceilings apply.
+
+For example, with the classification defaults shown above and an existing
+protected job directory, secret key and immutable `JobLimits` file:
+
+```sh
+fnlp candidate score-job start documents.ndjson \
+  --task classify --defaults labels.json \
+  --model ./model.fnlpq --memory-mib 16384 \
+  --input-encoding safe-bpe-v1 \
+  --max-total-tokenizer-input-bytes 67108864 \
+  --max-total-tokenizer-output-tokens 4194304 \
+  --max-total-tokenizer-pair-checks 268435456 \
+  --max-total-tokenizer-pair-bytes 4294967296 \
+  --compute-threads 4 --prefill-rows 4 \
+  --store-results --job-dir ./private-score-job \
+  --job-id "$JOB_ID" --key-file ./score-job.key \
+  --limits ./score-job-limits.json --materialize
+```
+
+`JOB_ID` is the expected random 128-bit identifier encoded as 32 lowercase
+hex characters; the protected key file contains exactly 32 raw secret bytes.
+The command requires explicit result-retention consent and never creates or
+adopts the job directory. Use `--task sentiment` without classification
+defaults for dimensional sentiment.
+
+The per-record encoding policy and all four invocation-wide tokenizer caps
+are part of the authenticated recipe. Resume repeats the original policy,
+caps, defaults, secret and immutable job limits, using the complete original
+population or explicitly retained input. A byte-default job therefore keeps
+its original encoding when resumed. Each explicit resume invocation receives
+the same declared tokenizer allowance; persisted native work and abandoned or
+failed attempts remain spent.
+
+One private tokenizer ledger spans every record and every preparation attempt.
+Failed or cancelled tokenization, and native planning rejected after successful
+encoding, still consume completed tokenizer work. The same ledger moves from
+the planning factory into the native processor; prepared requests are bound
+to that invocation. Remaining allowance can tighten execution without changing
+the original policy or prompt identity.
+
+Serial, bounded prefill, persistent CPU team and combined schedules all admit
+the encoder workspace alongside the original or retained-input owner, prompt
+buffers, worker payloads and durable output. The host retains shared planner, tokenizer, input and admission owners through
+physical worker completion; each result remains guarded through its durable
+commit. Compact completion metadata reports the
+declared policy and invocation limits without exposing private document text,
+labels or scores. Byte fallback remains the default with unchanged recipe and
+completion metadata; judgment jobs retain their byte-fallback contract.
+
+Library callers use `NlpEngine::job_int8_classify_scheduled` and
+`NlpEngine::job_int8_sentiment_scheduled`, or the
+`Int8ClassificationJobPlanner::new_with_document_encoding` and
+`Int8SentimentJobPlanner::new_with_document_encoding` factories. Their prepared
+job types retain a private invocation owner and expose scoring identity, head
+count and native work. Explicit prepared return-type annotations use
+`PreparedInt8ClassificationJob` or `PreparedInt8SentimentJob`.
+
+These candidate commands require `metadata-store` and `asupersync-runtime`
+on Linux x86-64 or AArch64. Compact encoding preserves original source bytes and
+excludes template controls, while changing prompt tokens. It makes no
+identical-output, tokenizer-parity, quality or measured-speed claim. Source
+review and bounded-policy, cancellation, memory and replay regression
+definitions are present; DSR compilation, executable regressions and the
+explicitly ignored real-model replay gate remain pending.
+
 ## Implemented candidate INT4 token streaming
 
 `fnlp candidate source-int4 stream generate|chat` exposes live native token

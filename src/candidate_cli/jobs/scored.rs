@@ -26,6 +26,8 @@ pub(in crate::candidate_cli) struct ScoreJobArgs {
     #[command(flatten)] pub host: ScoredArgs,
     #[command(flatten)] pub prefill: crate::candidate_cli::scored::prefill::ScoringPrefillArgs,
     #[arg(skip)] pub compute: compute::Args,
+    #[arg(skip)] pub encoding: input_encoding::InputEncodingArgs,
+    #[command(flatten)] pub encoding_work: EncodingWorkArgs,
     /// Required consent to retain private native output in the protected spool.
     #[arg(long)] pub store_results: bool,
     #[command(flatten)] pub input_retention: InputRetentionArgs,
@@ -57,6 +59,8 @@ impl ScoreJobArgs {
     }
     pub(in crate::candidate_cli) fn validate(&self) -> Result<(CandidateArgs, Limits), Failure> {
         self.input_retention.limits()?;
+        self.encoding_work_limits()?;
+        self.encoding_policy()?;
         let prefill = self.prefill_limits()?;
         let admitted = self.compute.admit_prefill(prefill)?;
         let local = |p: &std::path::Path| !p.as_os_str().is_empty() && p.as_os_str() != "-";
@@ -67,7 +71,7 @@ impl ScoreJobArgs {
             || self.journal_memory_mib == 0 || self.serialization_memory_mib == 0 {
             return Err(Failure::usage("explicit_scored_job_storage"));
         }
-        let (mut common, mut limits) = self.host.common()?;
+        let (mut common, mut limits) = self.host.common_with_encoding(&self.encoding)?;
         common.compute = self.compute;
         limits.compute = admitted;
         for mib in [self.journal_memory_mib, self.serialization_memory_mib] {
@@ -81,6 +85,25 @@ impl ScoreJobArgs {
             return Err(Failure { exit: ErrorCode::AdmissionOrResourceLimit, code: "score_job_native_memory" });
         }
         Ok((common, limits))
+    }
+    pub(in crate::candidate_cli) fn encoding_policy(&self) -> Result<UntrustedEncoding, Failure> {
+        let policy = self.host.encoding_policy(&self.encoding)?;
+        if self.kind()? == ScoreTask::Judge && policy != UntrustedEncoding::ByteFallback {
+            return Err(Failure::usage("score_job_input_encoding"));
+        }
+        Ok(policy)
+    }
+    pub(in crate::candidate_cli) fn encoding_work_limits(&self) -> Result<Option<SafeBpeWorkLimits>, Failure> {
+        self.encoding_work.limits(&self.encoding)
+    }
+    pub(in crate::candidate_cli) fn encoding_workspace_bytes(&self) -> Result<u64, Failure> {
+        match (self.encoding_policy()?, self.encoding_work_limits()?) {
+            (UntrustedEncoding::ByteFallback, None) => Ok(0),
+            (UntrustedEncoding::SafeBpeV1(call), Some(_)) => call.requirements()
+                .map_err(|_| Failure::usage("score_job_input_encoding"))?.workspace_bytes
+                .checked_add(1024).ok_or_else(|| Failure::usage("score_job_memory_arithmetic")),
+            _ => Err(Failure::usage("score_job_input_encoding")),
+        }
     }
     pub(in crate::candidate_cli) fn execution_memory_bytes(&self, limits: Limits) -> Result<u64, Failure> {
         let prefill = self.prefill_limits()?;
@@ -104,7 +127,8 @@ impl ScoreJobArgs {
         // separately after the immutable lifetime limits are read.
         [limits.preparation_bytes, limits.weight_bytes, 128 * MIB, 64 * MIB,
             native.kv_bytes, native.rope_bytes, native.scratch_payload_bound,
-            64 * MIB, extra, limits.compute.workspace_bytes, output, 65_536]
+            64 * MIB, extra, limits.compute.workspace_bytes, output, 65_536,
+            self.encoding_workspace_bytes()?]
             .into_iter().try_fold(0_u64, |total, bytes| total.checked_add(bytes)
                 .ok_or_else(|| Failure::usage("score_job_memory_arithmetic")))
     }
@@ -119,8 +143,12 @@ pub(in crate::candidate_cli) fn definition() -> clap::Command {
         .about("Start or resume retained native classification/sentiment/judgment corpus jobs")
         .long_about("Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64. The input is the COMPLETE original NDJSON {id,text,task_args?} population; resume can explicitly restore it from retained input storage. Uses the same full-vocabulary scorers and defaults as score-batch; no generated-label shortcut or calibrated-confidence claim. Task settings and defaults are frozen for resume. All three tasks accept --prefill-rows for bounded prompts and --compute-threads for one persistent INT8 row team across every pending record and scoring head. Both workspace owners are admitted together. Worker width may change on authenticated resume; classification/sentiment prompt width may also change. Judgment preserves its existing frozen prompt-schedule recipe and rejects a changed prefill schedule on resume. Lifetime work and failed attempts remain debited. Explicit --store-results, protected directory, original secret and immutable JobLimits are mandatory. Stdout is completion metadata only, emitted after all workers physically join. No automatic retry.")
         .after_help(INPUT_RETENTION_HELP))
-        .mut_subcommand("start", compute::definition)
-        .mut_subcommand("resume", compute::definition)
+        .mut_subcommand("start", encoding_definition)
+        .mut_subcommand("resume", encoding_definition)
+}
+fn encoding_definition(command: clap::Command) -> clap::Command {
+    compute::definition(input_encoding::definition(command)).after_long_help(
+        "Classification and sentiment jobs accept explicit --input-encoding safe-bpe-v1. One per-record allowance covers every untrusted document/label segment; one additional --max-total-tokenizer-* invocation ledger covers all records and failed or cancelled preparation. Both policies and all caps are authenticated: repeat them on resume. Each resumed invocation receives the same bounded tokenizer allowance while persisted native work and attempts remain spent. Compact input preserves original bytes and excludes template controls, but changes prompt tokens and makes no identical-output, tokenizer-parity, quality or measured-speed claim. Encoder workspace is admitted before private IO and held through physical completion. Byte-fallback remains the default with unchanged result/recipe metadata. Judgment remains byte-fallback only.")
 }
 impl ScoreJobCommand {
     pub(crate) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
@@ -131,6 +159,7 @@ impl ScoreJobCommand {
             ScoreOperation::Start(args) => args,
             ScoreOperation::Resume(args) => &mut args.common,
         };
+        args.encoding = input_encoding::InputEncodingArgs::from_matches(request)?;
         args.compute = compute::Args::from_matches(request)?;
         Ok(command)
     }

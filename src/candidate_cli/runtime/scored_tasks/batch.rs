@@ -24,7 +24,7 @@ pub(in crate::candidate_cli) fn configure_scored(kind: ScoreTask, host: &ScoredA
     facts: &ArtifactIdentity, limits: Limits, defaults: Defaults) -> Result<Corpus, CandidateError> {
     configure_scored_with_encoding(kind, host, facts, limits, defaults, &UntrustedEncoding::ByteFallback)
 }
-fn configure_scored_with_encoding(kind: ScoreTask, host: &ScoredArgs,
+pub(in crate::candidate_cli) fn configure_scored_with_encoding(kind: ScoreTask, host: &ScoredArgs,
     facts: &ArtifactIdentity, limits: Limits, defaults: Defaults, encoding: &UntrustedEncoding)
     -> Result<Corpus, CandidateError> {
     encoding.validate().map_err(|_| CandidateError::Arguments)?;
