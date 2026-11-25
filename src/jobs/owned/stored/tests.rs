@@ -1,8 +1,9 @@
 //! Storage-management fixtures, not model, replay, or power-loss evidence.
 use super::*;
 use crate::jobs::tests::{Control, error, input, key, limits, manifest, work};
-use std::{fs::{self, OpenOptions}, io::{Seek, SeekFrom, Write},
-    os::unix::fs::{DirBuilderExt, PermissionsExt}, path::PathBuf,
+use crate::native_engine::decode::DecodeCancellationKind;
+use std::{fs::{self, File, OpenOptions}, io::{Seek, SeekFrom, Write},
+    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt}, path::PathBuf,
     sync::atomic::{AtomicU64, Ordering}};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -183,4 +184,208 @@ fn cancellation_cannot_publish_or_leave_a_usable_management_session() {
     assert!(stored.materialize_ordered(&mut Control { calls: 0, stop_at: Some(1) }).is_err());
     assert_eq!(error(stored.status()), JobError::Poisoned);
     assert!(!dir.join("materialized.ndjson").exists());
+}
+
+const CANCELLATION_CAUSES: [DecodeCancellationKind; 11] = [
+    DecodeCancellationKind::User, DecodeCancellationKind::Timeout, DecodeCancellationKind::Deadline,
+    DecodeCancellationKind::PollQuota, DecodeCancellationKind::CostBudget, DecodeCancellationKind::FailFast,
+    DecodeCancellationKind::RaceLost, DecodeCancellationKind::ParentCancelled,
+    DecodeCancellationKind::ResourceUnavailable, DecodeCancellationKind::Shutdown, DecodeCancellationKind::LinkedExit,
+];
+
+#[test]
+fn management_preserves_the_first_cancellation_without_polling_a_replacement() {
+    struct FirstStop { cause: DecodeCancellationKind, calls: usize }
+    impl DecodeStepControl for FirstStop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.calls += 1;
+            Some(if self.calls == 1 { self.cause } else { DecodeCancellationKind::User })
+        }
+    }
+    for cause in CANCELLATION_CAUSES {
+        let dir = root(); complete(&dir);
+        let mut control = FirstStop { cause, calls: 0 };
+        assert_eq!(error(StoredJob::open(&dir, key(), JobId([7; 16]), limits(), &mut control)),
+            JobError::Cancelled(cause));
+        assert_eq!(control.calls, 1);
+        for materialize in [false, true] {
+            let mut stored = open(&dir); let before = stored.status().unwrap();
+            let mut control = FirstStop { cause, calls: 0 };
+            let result = if materialize { stored.materialize_ordered(&mut control) }
+                else { stored.verify(&mut control) };
+            assert_eq!(error(result), JobError::Cancelled(cause));
+            assert_eq!(control.calls, 1);
+            assert_eq!(error(stored.status()), JobError::Poisoned);
+            assert_eq!(stored.report, before);
+            assert!(!dir.join("materialized.ndjson").exists());
+        }
+    }
+}
+
+#[test]
+fn opening_checks_terminal_cancellation_after_failed_metadata_authentication() {
+    struct StopAfterAdmission { cause: DecodeCancellationKind, calls: usize }
+    impl DecodeStepControl for StopAfterAdmission {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.calls += 1;
+            if self.calls == 1 { None } else { Some(self.cause) }
+        }
+    }
+    for cause in CANCELLATION_CAUSES {
+        let dir = root(); complete(&dir);
+        let before = open(&dir).status().unwrap();
+        let journal = fs::read(dir.join("journal.fsqlite")).unwrap();
+        let spool = fs::read(dir.join("results.spool")).unwrap();
+        let mut control = StopAfterAdmission { cause, calls: 0 };
+        // No row checkpoint can follow a header MAC failure. The second
+        // checkpoint is the terminal boundary after that synchronous read.
+        assert_eq!(error(StoredJob::open(&dir, JobSecret::from_bytes([33; 32]),
+            JobId([7; 16]), limits(), &mut control)), JobError::Cancelled(cause));
+        assert_eq!(control.calls, 2);
+        assert_eq!(fs::read(dir.join("journal.fsqlite")).unwrap(), journal);
+        assert_eq!(fs::read(dir.join("results.spool")).unwrap(), spool);
+        assert_eq!(open(&dir).status().unwrap(), before);
+        assert_eq!(error(StoredJob::open(&dir, JobSecret::from_bytes([33; 32]),
+            JobId([7; 16]), limits(), &mut Control::default())), JobError::Authentication);
+    }
+}
+
+/// A cloned held descriptor shares the actual frame cursor. Output verification
+/// can be armed only after the result prefix was read and then stopped after
+/// the first materialized row was compared, independently of checkpoint counts.
+struct StopAfterRead {
+    spool: File, end: u64, cause: DecodeCancellationKind,
+    output_comparison: bool, armed: bool, observed: bool,
+}
+impl StopAfterRead {
+    fn new(job: &mut OwnedJob, cause: DecodeCancellationKind, output_comparison: bool) -> Self {
+        job.files.spool.seek(SeekFrom::Start(0)).unwrap();
+        Self { spool: job.files.spool.try_clone().unwrap(), end: job.header.spool_end,
+            cause, output_comparison, armed: false, observed: false }
+    }
+}
+impl DecodeStepControl for StopAfterRead {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+        if self.armed {
+            // A corrupted first output row is read only after the complete
+            // prefix scan; its source frame leaves the cursor below the end.
+            assert!(self.spool.stream_position().unwrap() < self.end);
+            self.observed = true; return Some(self.cause);
+        }
+        if self.spool.stream_position().unwrap() == self.end {
+            if self.output_comparison { self.armed = true; return None; }
+            self.observed = true; return Some(self.cause);
+        }
+        None
+    }
+}
+
+#[test]
+fn management_cancellation_precedes_corrupt_committed_frames_without_repair() {
+    for cause in CANCELLATION_CAUSES {
+        for materialize in [false, true] {
+            let dir = root(); complete(&dir);
+            let mut stored = open(&dir); let before = stored.status().unwrap();
+            let pointer = stored.job.item(1).unwrap().pointer.unwrap();
+            stored.job.files.spool.seek(SeekFrom::Start(pointer.offset + frame::HEADER_BYTES as u64)).unwrap();
+            stored.job.files.spool.write_all(b"X").unwrap();
+            stored.job.files.spool.sync_all().unwrap();
+            let bytes = fs::read(dir.join("results.spool")).unwrap();
+            let mut control = StopAfterRead::new(&mut stored.job, cause, false);
+            let result = if materialize { stored.materialize_ordered(&mut control) }
+                else { stored.verify(&mut control) };
+            assert_eq!(error(result), JobError::Cancelled(cause));
+            assert!(control.observed);
+            assert_eq!(error(stored.status()), JobError::Poisoned);
+            assert_eq!(stored.report, before);
+            assert_eq!(fs::read(dir.join("results.spool")).unwrap(), bytes);
+            assert!(!dir.join("materialized.ndjson").exists());
+            drop(control); drop(stored);
+            assert_eq!(error(StoredJob::open(&dir, key(), JobId([7; 16]), limits(),
+                &mut Control::default())), JobError::Authentication);
+        }
+    }
+}
+
+#[test]
+fn management_cancellation_precedes_corrupt_materialized_bytes_without_replacement() {
+    for cause in CANCELLATION_CAUSES {
+        for materialize in [false, true] {
+            let dir = root(); complete(&dir);
+            let mut stored = open(&dir);
+            let before = stored.materialize_ordered(&mut Control::default()).unwrap();
+            let destination = dir.join("materialized.ndjson");
+            let inode = fs::metadata(&destination).unwrap().ino();
+            let mut corrupted = fs::read(&destination).unwrap();
+            corrupted[0] = b'X';
+            write_private(&destination, &corrupted);
+            let mut control = StopAfterRead::new(&mut stored.job, cause, true);
+            let result = if materialize { stored.materialize_ordered(&mut control) }
+                else { stored.verify(&mut control) };
+            assert_eq!(error(result), JobError::Cancelled(cause));
+            assert!(control.armed && control.observed);
+            assert_eq!(error(stored.status()), JobError::Poisoned);
+            assert_eq!(stored.report, before);
+            assert_eq!(fs::read(&destination).unwrap(), corrupted);
+            assert_eq!(fs::metadata(&destination).unwrap().ino(), inode);
+            drop(control); drop(stored);
+            assert_eq!(error(StoredJob::open(&dir, key(), JobId([7; 16]), limits(),
+                &mut Control::default())), JobError::Corrupt);
+        }
+    }
+}
+
+#[test]
+fn cancelled_final_management_report_keeps_the_committed_file_and_work() {
+    struct StopDuringReport {
+        journal: PathBuf, before: Vec<u8>, destination: PathBuf,
+        cause: DecodeCancellationKind, committed_checks: usize, observed: bool,
+    }
+    impl DecodeStepControl for StopDuringReport {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            if fs::read(&self.journal).unwrap() == self.before { return None; }
+            self.committed_checks += 1;
+            match self.committed_checks {
+                // The owned materializer's final check accepts its commit.
+                1 => None,
+                // Refuse the final management metadata scan, after publication
+                // committed. No private output bytes or journal rows change.
+                2 => {
+                    fs::set_permissions(&self.destination, fs::Permissions::from_mode(0o640)).unwrap();
+                    None
+                }
+                _ => { self.observed = true; Some(self.cause) }
+            }
+        }
+    }
+    for cause in CANCELLATION_CAUSES {
+        let dir = root(); complete(&dir);
+        let mut stored = open(&dir); let before = stored.status().unwrap();
+        let journal = dir.join("journal.fsqlite");
+        let destination = dir.join("materialized.ndjson");
+        let mut control = StopDuringReport { before: fs::read(&journal).unwrap(),
+            journal, destination: destination.clone(), cause, committed_checks: 0, observed: false };
+        assert_eq!(error(stored.materialize_ordered(&mut control)), JobError::Cancelled(cause));
+        assert!(control.observed); assert_eq!(control.committed_checks, 3);
+        assert_eq!(error(stored.status()), JobError::Poisoned);
+        assert_eq!(stored.report, before);
+        assert!(stored.job.progress().materialized);
+        assert_eq!(stored.job.progress().attempts, before.attempts);
+        assert_eq!(stored.job.progress().reserved_work, before.reserved_work);
+        let output = fs::read(&destination).unwrap();
+        let inode = fs::metadata(&destination).unwrap().ino();
+        assert_eq!(output, b"{\"private_result\":0}\n{\"private_result\":1}\n");
+        // Repair only the fixture's permission mutation, then require a fresh
+        // authenticated owner. The poisoned instance cannot acknowledge it.
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(error(stored.status()), JobError::Poisoned);
+        drop(stored);
+        let mut restored = open(&dir);
+        let after = restored.materialize_ordered(&mut Control::default()).unwrap();
+        assert!(after.materialized); assert!(!after.unacknowledged_output_present);
+        assert_eq!(after.attempts, before.attempts);
+        assert_eq!(after.reserved_work, before.reserved_work);
+        assert_eq!(fs::read(&destination).unwrap(), output);
+        assert_eq!(fs::metadata(&destination).unwrap().ino(), inode);
+    }
 }

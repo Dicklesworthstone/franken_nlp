@@ -114,6 +114,17 @@ byte comparison with committed frames. An unrelated or different existing
 output is refused, never overwritten. Output records do not gain a new envelope;
 the host's typed result schema determines their content.
 
+Materialization polls the original caller control after synchronous storage work,
+including errors and the final journal sync. A terminal cancellation retains its
+exact cause and leaves the owner poisoned until authenticated reopen. If the
+output or journal transition has already committed, cancellation loses only the
+acknowledgement: recovery verifies the same output inode and bytes without
+replacing it, rerunning inference, or refunding attempt/work debits. An earlier
+captured cancellation is returned unchanged instead of polling a replacement
+cause. Stored-state management applies the same terminal checks when opening,
+verifying, and reporting publication; it cannot expose a usable session or a
+success report after the caller has stopped.
+
 `journal.fsqlite`, `results.spool`, `job.lock`, `materialized.ndjson`, and the
 `.fnlp-redact-<pid>-<sequence>.part` stage namespace are reserved within a
 pre-existing private job directory. Files are mode 0600, the parent is mode
@@ -142,6 +153,13 @@ persistent retries, injected commit-boundary failures, lost acknowledgements,
 corrupt committed prefixes, explicit tail/stage recovery, publication recovery,
 and uninterrupted-versus-resumed output equivalence. Synthetic stored results
 are not native inference or NER-quality evidence.
+
+Nine additional terminal-cancellation regression definitions cover all eleven
+causes during materialization and stored-state management. They check failed
+frame/output authentication, publication and journal-commit boundaries, original
+cause preservation, poisoned handles, unchanged output inodes/bytes, and recovery
+without additional attempts or refunded work. These definitions remain pending
+execution in the required DSR checkpoint.
 
 Compilation, Rust tests, real-model execution, and real power-loss/disk-full
 campaigns were not run in this session; validation remains controller-owned

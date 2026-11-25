@@ -45,12 +45,18 @@ pub struct StoredJob {
 impl StoredJob {
     pub fn open<C: DecodeStepControl>(root: &Path, key: JobSecret, expected_job: JobId,
         limits: super::super::JobLimits, control: &mut C) -> Result<Self, JobError> {
-        let mut job = load_metadata(root, key, expected_job, limits, control)?;
-        job.verify_prefix(control)?;
-        job.check_retained_inputs(control)?;
-        let report = describe(&job, control)?;
-        job.poisoned = false;
-        Ok(Self { job, report })
+        let opened = (|| {
+            let mut job = load_metadata(root, key, expected_job, limits, control)?;
+            job.verify_prefix(control)?;
+            job.check_retained_inputs(control)?;
+            let report = describe(&job, control)?;
+            Ok(Self { job, report })
+        })();
+        // Authentication failures must not hide a terminal caller stop, and a
+        // successful owner stays poisoned until the final check accepts it.
+        let mut opened = finish_storage(opened, control)?;
+        opened.job.poisoned = false;
+        Ok(opened)
     }
 
     /// Snapshot from the last successful authenticated open/verification while
@@ -67,12 +73,15 @@ impl StoredJob {
     pub fn verify<C: DecodeStepControl>(&mut self, control: &mut C) -> Result<StoredJobReport, JobError> {
         self.job.ready()?;
         self.job.poisoned = true;
-        self.job.verify_prefix(control)?;
-        self.job.check_retained_inputs(control)?;
-        let report = describe(&self.job, control)?;
-        reject_orphans(&report)?;
-        if report.unacknowledged_output_present { self.job.verify_materialized(control)?; }
-        checkpoint(control)?;
+        let verification = (|| {
+            self.job.verify_prefix(control)?;
+            self.job.check_retained_inputs(control)?;
+            let report = describe(&self.job, control)?;
+            reject_orphans(&report)?;
+            if report.unacknowledged_output_present { self.job.verify_materialized(control)?; }
+            Ok(report)
+        })();
+        let report = finish_storage(verification, control)?;
         self.report = report;
         self.job.poisoned = false;
         Ok(report)
@@ -89,7 +98,8 @@ impl StoredJob {
         // Failure during this final report must close the management session
         // even if publication committed: reopen to reconcile acknowledgement.
         self.job.poisoned = true;
-        let report = describe(&self.job, control)?;
+        let description = describe(&self.job, control);
+        let report = finish_storage(description, control)?;
         self.report = report;
         self.job.poisoned = false;
         Ok(report)

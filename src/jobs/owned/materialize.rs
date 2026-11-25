@@ -13,12 +13,22 @@ impl OwnedJob {
         self.ready()?; checkpoint(control)?;
         if self.header.committed != self.header.items { return Err(JobError::Incomplete); }
         self.poisoned = true;
+        let publication = self.materialize_inner(control);
+        // Authentication, publication and the journal's final sync can all
+        // finish after the caller stops. A terminal stop loses only the
+        // acknowledgement: retain known durable state and require an
+        // authenticated reopen before the owner can be reused.
+        finish_storage(publication, control)?;
+        self.poisoned = false;
+        Ok(self.progress())
+    }
+    fn materialize_inner<C: DecodeStepControl>(&mut self, control: &mut C) -> Result<(), JobError> {
         self.verify_retained_inputs(control)?;
         self.verify_prefix(control)?;
         if self.files.spool.metadata().map_err(|_| JobError::Io)?.len() != self.header.spool_end {
             return Err(JobError::UncommittedTail);
         }
-        if self.header.materialized { self.poisoned = false; return Ok(self.progress()); }
+        if self.header.materialized { return Ok(()); }
         if self.files.materialized(self.manifest.limits.max_materialized_bytes)?.is_some() {
             // An existing destination is acceptable only as exact committed
             // output from an interrupted publication, never as caller input.
@@ -53,7 +63,7 @@ impl OwnedJob {
         self.files.sync_database()?;
         self.header = header;
         self.fault(Fault::Materialized)?;
-        self.poisoned = false; Ok(self.progress())
+        Ok(())
     }
     fn write_materialized<W: Write, C: DecodeStepControl>(&mut self, writer: &mut W, control: &mut C) -> Result<(), JobError> {
         let mut total = 0_u64;

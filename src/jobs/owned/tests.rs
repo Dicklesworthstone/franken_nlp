@@ -428,6 +428,107 @@ fn cancellation_after_durable_commit_loses_only_acknowledgement() {
     }
 }
 #[test]
+fn cancellation_after_materialization_commit_retains_exact_output_and_debits() {
+    for cause in CANCELLATION_CAUSES {
+        let dir = root(); let mut job = create(&dir); commit(&mut job, 0); commit(&mut job, 1);
+        let before = job.progress();
+        let path = dir.join("journal.fsqlite");
+        let mut control = CancelAfterJournalChange { before: fs::read(&path).unwrap(), path, cause, observed: false };
+        assert_eq!(error(job.materialize_ordered(&mut control)), JobError::Cancelled(cause));
+        assert!(control.observed); assert!(job.is_poisoned());
+        let expected = JobProgress { materialized: true, ..before };
+        assert_eq!(job.progress(), expected);
+        let destination = dir.join("materialized.ndjson");
+        let output = fs::read(&destination).unwrap();
+        assert_eq!(output, b"{\"result\":0}\n{\"result\":1}\n");
+        let inode = fs::metadata(&destination).unwrap().ino();
+        assert_eq!(error(job.materialize_ordered(&mut Control::default())), JobError::Poisoned);
+        assert_eq!(error(job.read_committed(0, &mut Control::default())), JobError::Poisoned);
+        drop(job);
+        let mut job = resume(&dir, TailPolicy::Refuse);
+        assert_eq!(job.progress(), expected);
+        assert_eq!(job.materialize_ordered(&mut Control::default()).unwrap(), expected);
+        assert_eq!(job.verify(&mut Control::default()).unwrap(), expected);
+        assert_eq!(fs::read(&destination).unwrap(), output);
+        assert_eq!(fs::metadata(&destination).unwrap().ino(), inode);
+    }
+}
+#[test]
+fn cancellation_after_output_publication_recovers_without_replacing_or_reexecuting() {
+    struct CancelAfterPublication { destination: PathBuf, cause: DecodeCancellationKind, observed: bool }
+    impl DecodeStepControl for CancelAfterPublication {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            if self.destination.exists() { self.observed = true; Some(self.cause) } else { None }
+        }
+    }
+    for cause in CANCELLATION_CAUSES {
+        for storage_failure in [false, true] {
+            let dir = root(); let mut job = create(&dir); commit(&mut job, 0); commit(&mut job, 1);
+            let before = job.progress();
+            if storage_failure { job.fail_at = Some(Fault::Published); }
+            let destination = dir.join("materialized.ndjson");
+            let mut control = CancelAfterPublication { destination: destination.clone(), cause, observed: false };
+            assert_eq!(error(job.materialize_ordered(&mut control)), JobError::Cancelled(cause));
+            assert!(control.observed); assert!(job.is_poisoned());
+            assert_eq!(job.progress(), before);
+            let output = fs::read(&destination).unwrap();
+            let inode = fs::metadata(&destination).unwrap().ino();
+            assert_eq!(output, b"{\"result\":0}\n{\"result\":1}\n");
+            assert_eq!(error(job.materialize_ordered(&mut Control::default())), JobError::Poisoned);
+            drop(job);
+            let mut job = resume(&dir, TailPolicy::Refuse);
+            assert_eq!(job.progress(), before);
+            let after = job.materialize_ordered(&mut Control::default()).unwrap();
+            assert_eq!(after, JobProgress { materialized: true, ..before });
+            assert_eq!(fs::read(&destination).unwrap(), output);
+            assert_eq!(fs::metadata(&destination).unwrap().ino(), inode);
+        }
+    }
+}
+#[test]
+fn materialization_cancellation_precedes_failed_final_frame_authentication() {
+    for cause in CANCELLATION_CAUSES {
+        let dir = root(); let mut job = create(&dir); commit(&mut job, 0); commit(&mut job, 1);
+        let before = job.progress();
+        let pointer = job.item(1).unwrap().pointer.unwrap();
+        job.files.spool.seek(SeekFrom::Start(pointer.offset + frame::HEADER_BYTES as u64)).unwrap();
+        job.files.spool.write_all(b"X").unwrap(); job.files.spool.sync_all().unwrap();
+        let bytes = fs::read(dir.join("results.spool")).unwrap();
+        let mut control = CancelAfterSpoolRead::new(&mut job, cause);
+        assert_eq!(error(job.materialize_ordered(&mut control)), JobError::Cancelled(cause));
+        assert!(control.observed); assert!(job.is_poisoned());
+        assert_eq!(job.progress(), before);
+        assert!(!dir.join("materialized.ndjson").exists());
+        assert_eq!(fs::read(dir.join("results.spool")).unwrap(), bytes);
+        drop(control); drop(job);
+        assert_eq!(error(OwnedJob::resume(&dir, key(), manifest(), TailPolicy::Refuse,
+            &mut Control::default())), JobError::Authentication);
+    }
+}
+#[test]
+fn materialization_preserves_the_first_cancellation_without_repolling() {
+    struct ChangingCause { first: DecodeCancellationKind, calls: usize }
+    impl DecodeStepControl for ChangingCause {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.calls += 1;
+            match self.calls {
+                1 => None,
+                2 => Some(self.first),
+                _ => Some(DecodeCancellationKind::User),
+            }
+        }
+    }
+    for cause in CANCELLATION_CAUSES {
+        let dir = root(); let mut job = create(&dir); commit(&mut job, 0); commit(&mut job, 1);
+        let before = job.progress();
+        let mut control = ChangingCause { first: cause, calls: 0 };
+        assert_eq!(error(job.materialize_ordered(&mut control)), JobError::Cancelled(cause));
+        assert_eq!(control.calls, 2); assert!(job.is_poisoned());
+        assert_eq!(job.progress(), before);
+        assert!(!dir.join("materialized.ndjson").exists());
+    }
+}
+#[test]
 fn spool_length_caps_and_serialization_failure_never_commit_a_result() {
     let dir = root(); let mut job = create(&dir);
     let attempt = job.begin(&input(0), work(), &mut Control::default()).unwrap();
