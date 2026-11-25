@@ -2,7 +2,8 @@
 //! These are storage fixtures, never native model or platform-ratification evidence.
 use super::*;
 use crate::jobs::tests::{Control, error, input, key, limits, manifest, manifest_with, work};
-use std::{fs::{self, OpenOptions}, io::{Seek, SeekFrom, Write},
+use crate::native_engine::decode::DecodeCancellationKind;
+use std::{fs::{self, File, OpenOptions}, io::{Seek, SeekFrom, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, symlink},
     path::PathBuf, sync::atomic::{AtomicU64, Ordering}};
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -23,6 +24,39 @@ fn commit(job: &mut OwnedJob, ordinal: usize) {
 fn append_tail(root: &Path, bytes: &[u8]) {
     let mut spool = OpenOptions::new().append(true).open(root.join("results.spool")).unwrap();
     spool.write_all(bytes).unwrap(); spool.sync_all().unwrap();
+}
+const CANCELLATION_CAUSES: [DecodeCancellationKind; 11] = [
+    DecodeCancellationKind::User, DecodeCancellationKind::Timeout, DecodeCancellationKind::Deadline,
+    DecodeCancellationKind::PollQuota, DecodeCancellationKind::CostBudget, DecodeCancellationKind::FailFast,
+    DecodeCancellationKind::RaceLost, DecodeCancellationKind::ParentCancelled,
+    DecodeCancellationKind::ResourceUnavailable, DecodeCancellationKind::Shutdown, DecodeCancellationKind::LinkedExit,
+];
+/// File::try_clone shares the held spool's seek position. Arm only after the
+/// last committed frame was actually read, independently of checkpoint counts.
+struct CancelAfterSpoolRead { file: File, end: u64, cause: DecodeCancellationKind, observed: bool }
+impl CancelAfterSpoolRead {
+    fn new(job: &mut OwnedJob, cause: DecodeCancellationKind) -> Self {
+        assert_ne!(job.header.spool_end, 0);
+        job.files.spool.seek(SeekFrom::Start(0)).unwrap();
+        Self { file: job.files.spool.try_clone().unwrap(), end: job.header.spool_end, cause, observed: false }
+    }
+}
+impl DecodeStepControl for CancelAfterSpoolRead {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+        if self.file.stream_position().unwrap() == self.end {
+            self.observed = true; Some(self.cause)
+        } else { None }
+    }
+}
+/// The DELETE/FULL journal persists its changed header and item in the actual
+/// database. Stop only once that commit has changed the durable bytes.
+struct CancelAfterJournalChange { path: PathBuf, before: Vec<u8>, cause: DecodeCancellationKind, observed: bool }
+impl DecodeStepControl for CancelAfterJournalChange {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+        if fs::read(&self.path).unwrap() != self.before {
+            self.observed = true; Some(self.cause)
+        } else { None }
+    }
 }
 fn retained_population() -> [JobInput<'static>; 2] {
     let a = br#"{"id":"alpha","text":"Alice retained private source","task_args":{"v":1}}"#;
@@ -294,6 +328,104 @@ fn cancellation_after_admission_preserves_the_typed_cause_and_debit() {
         JobError::Cancelled(crate::native_engine::decode::DecodeCancellationKind::Deadline));
     assert!(job.is_poisoned()); drop(job);
     assert_eq!(resume(&dir, TailPolicy::Refuse).progress().reserved_work, work());
+}
+#[test]
+fn terminal_read_cancellation_never_returns_private_bytes_or_renews_work() {
+    for cause in CANCELLATION_CAUSES {
+        let dir = root(); let mut job = create(&dir); commit(&mut job, 0);
+        let before = job.progress();
+        let bytes = fs::read(dir.join("results.spool")).unwrap();
+        let mut control = CancelAfterSpoolRead::new(&mut job, cause);
+        assert_eq!(error(job.read_committed(0, &mut control)), JobError::Cancelled(cause));
+        assert!(control.observed); assert!(job.is_poisoned());
+        assert_eq!(job.progress(), before);
+        assert_eq!(fs::read(dir.join("results.spool")).unwrap(), bytes);
+        assert_eq!(error(job.read_committed(0, &mut Control::default())), JobError::Poisoned);
+        drop(control); drop(job);
+        let mut job = resume(&dir, TailPolicy::Refuse);
+        assert_eq!(job.progress(), before);
+        assert_eq!(job.read_committed(0, &mut Control::default()).unwrap(), br#"{"result":0}"#);
+    }
+}
+#[test]
+fn terminal_verification_cancellation_refuses_complete_unmaterialized_jobs() {
+    for cause in CANCELLATION_CAUSES {
+        let dir = root(); let mut job = create(&dir); commit(&mut job, 0); commit(&mut job, 1);
+        let before = job.progress(); assert!(!before.materialized);
+        let bytes = fs::read(dir.join("results.spool")).unwrap();
+        let mut control = CancelAfterSpoolRead::new(&mut job, cause);
+        assert_eq!(error(job.verify(&mut control)), JobError::Cancelled(cause));
+        assert!(control.observed); assert!(job.is_poisoned());
+        assert_eq!(job.progress(), before);
+        assert_eq!(fs::read(dir.join("results.spool")).unwrap(), bytes);
+        assert_eq!(error(job.verify(&mut Control::default())), JobError::Poisoned);
+        drop(control); drop(job);
+        let mut job = resume(&dir, TailPolicy::Refuse);
+        assert_eq!(job.verify(&mut Control::default()).unwrap(), before);
+    }
+}
+#[test]
+fn terminal_storage_cancellation_precedes_coincident_authentication_failure() {
+    for cause in CANCELLATION_CAUSES {
+        for verify in [false, true] {
+            let dir = root(); let mut job = create(&dir); commit(&mut job, 0); commit(&mut job, 1);
+            let pointer = job.item(1).unwrap().pointer.unwrap();
+            job.files.spool.seek(SeekFrom::Start(pointer.offset + frame::HEADER_BYTES as u64)).unwrap();
+            job.files.spool.write_all(b"X").unwrap(); job.files.spool.sync_all().unwrap();
+            let bytes = fs::read(dir.join("results.spool")).unwrap();
+            let mut control = CancelAfterSpoolRead::new(&mut job, cause);
+            let failure = if verify { error(job.verify(&mut control)) }
+                else { error(job.read_committed(1, &mut control)) };
+            assert_eq!(failure, JobError::Cancelled(cause));
+            assert!(control.observed); assert!(job.is_poisoned());
+            assert_eq!(fs::read(dir.join("results.spool")).unwrap(), bytes);
+            drop(control); drop(job);
+            // Cancellation did not authenticate, repair or authorize the bad
+            // frame. A fresh uncancelled recovery must still reject it.
+            assert_eq!(error(OwnedJob::resume(&dir, key(), manifest(), TailPolicy::Refuse,
+                &mut Control::default())), JobError::Authentication);
+        }
+    }
+}
+#[test]
+fn verification_preserves_the_first_cancellation_without_polling_a_replacement() {
+    struct ChangingCause { first: DecodeCancellationKind, calls: usize }
+    impl DecodeStepControl for ChangingCause {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.calls += 1;
+            Some(if self.calls == 1 { self.first } else { DecodeCancellationKind::User })
+        }
+    }
+    for cause in CANCELLATION_CAUSES {
+        let dir = root(); let mut job = create(&dir);
+        let mut control = ChangingCause { first: cause, calls: 0 };
+        assert_eq!(error(job.verify(&mut control)), JobError::Cancelled(cause));
+        assert_eq!(control.calls, 1); assert!(job.is_poisoned());
+    }
+}
+#[test]
+fn cancellation_after_durable_commit_loses_only_acknowledgement() {
+    for cause in CANCELLATION_CAUSES {
+        let dir = root(); let mut job = create(&dir);
+        let attempt = job.begin(&input(0), work(), &mut Control::default()).unwrap();
+        let path = dir.join("journal.fsqlite");
+        let mut control = CancelAfterJournalChange { before: fs::read(&path).unwrap(), path, cause, observed: false };
+        assert_eq!(error(attempt.commit(&"private committed result", &mut control)), JobError::Cancelled(cause));
+        assert!(control.observed); assert!(job.is_poisoned());
+        assert_eq!(job.progress().committed, 1); assert_eq!(job.progress().attempts, 1);
+        assert_eq!(job.progress().reserved_work, work());
+        assert_eq!(error(job.read_committed(0, &mut Control::default())), JobError::Poisoned);
+        drop(job);
+        let mut job = resume(&dir, TailPolicy::Refuse);
+        assert_eq!(job.progress().committed, 1); assert_eq!(job.progress().attempts, 1);
+        assert_eq!(job.progress().reserved_work, work());
+        assert_eq!(job.read_committed(0, &mut Control::default()).unwrap(), b"\"private committed result\"");
+        // Resume advances to the next frozen item; no recomputation or extra
+        // debit is needed to recover the record whose acknowledgement stopped.
+        commit(&mut job, 1);
+        assert_eq!(job.progress().committed, 2); assert_eq!(job.progress().attempts, 2);
+        assert_eq!(job.progress().reserved_work, work().checked_add(work()).unwrap());
+    }
 }
 #[test]
 fn spool_length_caps_and_serialization_failure_never_commit_a_result() {

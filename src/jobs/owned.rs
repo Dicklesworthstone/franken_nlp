@@ -224,11 +224,15 @@ impl OwnedJob {
     /// looking tail remains an error here; only explicit resume policy repairs.
     pub fn verify<C: DecodeStepControl>(&mut self, control: &mut C) -> Result<JobProgress, JobError> {
         self.ready()?; self.poisoned = true;
-        self.verify_retained_inputs(control)?;
-        self.verify_prefix(control)?;
-        if self.files.spool.metadata().map_err(|_| JobError::Io)?.len() != self.header.spool_end {
-            return Err(JobError::UncommittedTail);
-        }
+        let verification = (|| {
+            self.verify_retained_inputs(control)?;
+            self.verify_prefix(control)?;
+            if self.files.spool.metadata().map_err(|_| JobError::Io)?.len() != self.header.spool_end {
+                return Err(JobError::UncommittedTail);
+            }
+            Ok(())
+        })();
+        finish_storage(verification, control)?;
         self.poisoned = false; Ok(self.progress())
     }
     fn verify_prefix<C: DecodeStepControl>(&mut self, control: &mut C) -> Result<(), JobError> {
@@ -279,8 +283,10 @@ impl OwnedJob {
         self.ready()?; checkpoint(control)?;
         if ordinal >= self.header.committed { return Err(JobError::Incomplete); }
         self.poisoned = true;
-        let row = self.item(ordinal)?;
-        let result = self.read_row(&row)?;
+        let result = self.item(ordinal).and_then(|row| self.read_row(&row));
+        // Authentication may read a complete bounded frame synchronously.
+        // Never release its private bytes after the caller's terminal stop.
+        let result = finish_storage(result, control)?;
         self.poisoned = false; Ok(result)
     }
     fn read_row(&mut self, row: &Item) -> Result<Vec<u8>, JobError> {
@@ -315,8 +321,12 @@ impl Attempt<'_> {
         header.committed = header.committed.checked_add(1).ok_or(JobError::Limit)?;
         header.spool_end = pointer.end()?;
         self.row.pointer = Some(pointer); self.row.stage = Stage::ResultCommitted;
-        self.job.persist(&self.row, &header)?;
-        self.job.header = header;
+        let committed = self.job.persist(&self.row, &header);
+        if committed.is_ok() { self.job.header = header; }
+        // A late stop is a lost acknowledgement, not a rollback or refund.
+        // Keep known committed state; the poisoned owner requires reopen to
+        // authenticate it before any result read or further attempt.
+        finish_storage(committed, control)?;
         self.job.fault(Fault::ResultCommitted)?;
         self.job.poisoned = false; self.finished = true;
         Ok(self.job.progress())
@@ -324,6 +334,15 @@ impl Attempt<'_> {
 }
 impl Drop for Attempt<'_> {
     fn drop(&mut self) { if !self.finished { self.job.poisoned = true; } }
+}
+/// Poll after synchronous storage work even when it returned an error. An
+/// already captured cancellation keeps its original cause; otherwise a new
+/// terminal caller stop outranks a coincident storage/authentication failure.
+/// Callers leave their session poisoned until this check and the work succeed.
+fn finish_storage<T, C: DecodeStepControl>(result: Result<T, JobError>, control: &mut C) -> Result<T, JobError> {
+    if matches!(&result, Err(JobError::Cancelled(_))) { return result; }
+    checkpoint(control)?;
+    result
 }
 fn check_secret(key: &JobSecret, manifest: &FrozenManifest) -> Result<(), JobError> {
     manifest.limits.validate()?;
