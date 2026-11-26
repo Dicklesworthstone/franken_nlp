@@ -367,6 +367,9 @@ pub(in crate::candidate_cli) fn host_failure(error: HostedJobError) -> Failure {
             };
             Failure { exit, code: "job_task_failed" }
         }
+        HostedJobError::Host(HostedError::Join { physical_error: Some(error), .. }
+            | HostedError::Scope { physical_error: Some(error), .. }) =>
+            host_failure(HostedJobError::Host(*error)),
         HostedJobError::Host(HostedError::Stopped { stop, task_error: Some(error) })
             if matches!(stop.kind, DecodeCancellationKind::FailFast | DecodeCancellationKind::LinkedExit) =>
                 host_failure(HostedJobError::Host(*error)),

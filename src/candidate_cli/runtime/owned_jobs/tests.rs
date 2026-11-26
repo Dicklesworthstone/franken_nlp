@@ -298,3 +298,20 @@ fn supervised_job_stops_preserve_retained_typed_host_failures() {
     assert_eq!(ordinary.exit, ErrorCode::Cancelled);
     assert_eq!(ordinary.code, "job_cancelled");
 }
+
+#[test]
+fn physical_job_scope_failures_keep_the_original_stop_after_worker_drain() {
+    let scope = |error: Option<HostedError>| HostedError::Scope {
+        source: asupersync::cx::ScopedCpuError::WorkerCapExceeded { cap: 1 },
+        physical_error: error.map(Box::new),
+    };
+    for cause in [DecodeCancellationKind::CostBudget, DecodeCancellationKind::User,
+        DecodeCancellationKind::ResourceUnavailable] {
+        let physical = HostedError::Native(crate::native_engine::strict_int8::StrictInt8Error::Cancelled(cause));
+        let nested = scope(Some(scope(Some(physical))));
+        let failure = host_failure(HostedJobError::Host(nested));
+        let expected = job_failure(JobError::Cancelled(cause));
+        assert_eq!((failure.exit, failure.code), (expected.exit, expected.code));
+    }
+    assert_eq!(host_failure(HostedJobError::Host(scope(None))).code, "job_runtime_or_completion");
+}
