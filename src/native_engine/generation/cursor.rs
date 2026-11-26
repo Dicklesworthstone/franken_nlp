@@ -1,6 +1,7 @@
 //! One sequence's resumable decode state; shared by scalar and batch drivers.
 //! Physical row index and scheduler tick never enter the addressed sampler.
 use super::*;
+use crate::native_engine::decode::DecodedProposal;
 
 pub(super) struct Cursor<'a> {
     pub plan: &'a GenerationPlan,
@@ -8,6 +9,7 @@ pub(super) struct Cursor<'a> {
     pub prompt_cursor: usize,
     pub done: bool,
     awaiting_selection: bool,
+    marker_consumed: bool,
     workspace: policy::Workspace,
 }
 impl<'a> Cursor<'a> {
@@ -23,7 +25,7 @@ impl<'a> Cursor<'a> {
             logprob_score_space: p.capture_logprobs.then_some(DecodeScoreSpace::FullVocabularyLogSoftmax),
             native_work: GenerationWork::default(),
         };
-        Ok(Self { plan, output, prompt_cursor: 0, done: false, awaiting_selection: false,
+        Ok(Self { plan, output, prompt_cursor: 0, done: false, awaiting_selection: false, marker_consumed: false,
             workspace: policy::Workspace::new(&plan.prompt)? })
     }
     /// The boolean is true precisely when this forward must select a token.
@@ -67,22 +69,31 @@ impl<'a> Cursor<'a> {
         if matches!(&p.sampling, GenerationSampling::Seeded { .. }) { self.output.native_work.sampled_steps += 1; }
         let eos = p.eos_token_ids.binary_search(&selected).is_ok();
         let score = if p.capture_logprobs { Some(raw_logprob(logits, selected, control, index)?) } else { None };
-        let mut ids = reserved(index + 1)?; ids.extend_from_slice(&self.output.token_ids); ids.push(selected);
-        let decoded = if eos {
-            let mut bytes = reserved(self.output.content_bytes.len())?; bytes.extend_from_slice(&self.output.content_bytes); bytes
-        } else { decoder.decode_token_ids(&ids).map_err(|_| GenerationError::Decoder)? };
+        let mut marker_consumed = self.marker_consumed;
+        let decoded = if eos { DecodedProposal::Piece(Vec::new()) } else {
+            DecodedProposal::decode(decoder, &mut self.output.token_ids, selected, &mut marker_consumed)
+                .map_err(|_| GenerationError::Decoder)?
+        };
         // Decoding may consume the remaining budget or observe external
         // cancellation. In particular, a byte-limit stop is still a successful
         // result and must not conceal cancellation at this boundary.
         checkpoint(control, index)?;
-        if !decoded.starts_with(&self.output.content_bytes) { return Err(GenerationError::DecoderNotPrefixStable); }
-        if decoded.len() > p.max_output_bytes {
+        let delta = decoded.delta(&self.output.content_bytes).map_err(|_| GenerationError::DecoderNotPrefixStable)?;
+        if delta.len() > p.max_output_bytes - self.output.content_bytes.len() {
             self.output.finish_reason = GenerationFinish::ByteLimit; self.done = true; self.awaiting_selection = false; return Ok(());
         }
-        let mut delta = reserved(decoded.len() - self.output.content_bytes.len())?;
-        delta.extend_from_slice(&decoded[self.output.content_bytes.len()..]);
+        // Reserve before the sink can publish the event. Cap geometric growth
+        // at the admitted byte ceiling when extending the retained output.
+        let length = self.output.content_bytes.len();
+        let capacity = self.output.content_bytes.capacity();
+        if length + delta.len() > capacity {
+            let target = (length + delta.len()).max(capacity.saturating_mul(2)).min(p.max_output_bytes);
+            self.output.content_bytes.try_reserve_exact(target - length).map_err(|_| GenerationError::Allocation)?;
+        }
+        let mut event_bytes = reserved(delta.len())?;
+        event_bytes.extend_from_slice(delta);
         let event = DecodeTokenEvent { schema_version: DECODE_TOKEN_EVENT_SCHEMA_VERSION,
-            request_seq: self.output.request_seq, token_index: index, token_id: selected, decoded_bytes: delta, logprob: score };
+            request_seq: self.output.request_seq, token_index: index, token_id: selected, decoded_bytes: event_bytes, logprob: score };
         checkpoint(control, index)?;
         let permit = sink.reserve(&event).map_err(|_| GenerationError::Stream)?;
         // Cancellation while the sink waited releases the permit, not a token.
@@ -92,7 +103,9 @@ impl<'a> Cursor<'a> {
         // delivered event cannot be retracted, but it must not authorize a
         // successful terminal result or retirement/refill of this row.
         checkpoint(control, index)?;
-        self.output.token_ids = ids; self.output.content_bytes = decoded;
+        self.output.token_ids.push(selected);
+        self.output.content_bytes.extend_from_slice(delta);
+        self.marker_consumed = marker_consumed;
         if let Some(scores) = &mut self.output.token_logprobs { scores.push(score.ok_or(GenerationError::InvalidLogits)?); }
         self.workspace.commit(selected)?;
         self.awaiting_selection = false;

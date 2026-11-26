@@ -241,3 +241,68 @@ fn controlled_raw_logprobs_keep_full_denominator_bits_and_terminal_cancel_causes
         }
     }
 }
+
+// Exercise the actual generation cursor, including zero-byte non-EOS events
+// and partial UTF-8 pieces. Opaque decoders retain the full-prefix contract.
+#[test]
+fn native_piece_delivery_matches_prefix_replay_at_every_commit() {
+    use crate::tokenizer::{
+        bpe::{AddedToken, DecodeBytesError, SpBpeTokenizer},
+        sp_model::{ModelType, NormalizerFacts, PieceType, SpecialPieceIds, SpmModel, SpmPiece},
+    };
+
+    struct DecoderRoute<'a> { tokenizer: &'a SpBpeTokenizer, incremental: bool }
+    impl DecodeByteDecoder for DecoderRoute<'_> {
+        type Error = DecodeBytesError;
+        fn decode_token_ids(&self, ids: &[u32]) -> Result<Vec<u8>, Self::Error> {
+            assert!(!self.incremental, "native cursor replayed a complete prefix");
+            self.tokenizer.decode_bytes(ids)
+        }
+        fn sentencepiece_decoder(&self) -> Option<&SpBpeTokenizer> {
+            self.incremental.then_some(self.tokenizer)
+        }
+    }
+
+    let pieces = [
+        ("<unk>", PieceType::Unknown), ("<s>", PieceType::Control),
+        ("</s>", PieceType::Control), ("▁", PieceType::Normal),
+        ("▁x", PieceType::Normal), ("<0xC3>", PieceType::Byte),
+        ("<0xA9>", PieceType::Byte), ("<extra>", PieceType::Control),
+    ].into_iter().map(|(piece, piece_type)| SpmPiece { piece: piece.to_owned(), score: 0.0, piece_type }).collect();
+    let tokenizer = SpBpeTokenizer::with_added_tokens(SpmModel {
+        pieces, model_type: ModelType::Bpe,
+        normalizer: NormalizerFacts { name: "identity".to_owned(), is_identity: true,
+            precompiled_charsmap_is_empty: true },
+        special_ids: SpecialPieceIds { unk_id: 0, bos_id: 1, eos_id: 2, pad_id: -1 },
+    }, [AddedToken::new("<added>", 7)]).unwrap();
+
+    let script = [1_usize, 3, 4, 5, 6, 7, 2];
+    let deltas: [&[u8]; 7] = [b"", b"", b" x", &[0xc3], &[0xa9], b"<added>", b""];
+    for (limit, stop, finish, count) in [
+        (64, false, GenerationFinish::Eos, 7),
+        (3, false, GenerationFinish::ByteLimit, 4),
+        (64, true, GenerationFinish::StopSuffix, 5),
+    ] {
+        let mut options = GenerationOptions::greedy(script.len(), limit, 2);
+        if stop { options.stop_suffixes = vec!["é".as_bytes().to_vec()]; }
+        let p = plan(options);
+        for incremental in [false, true] {
+            let mut calls = 0usize;
+            let mut sink = Sink::default();
+            let actual = p.run(&DecoderRoute { tokenizer: &tokenizer, incremental }, 7,
+                &mut sink, &mut Continue, |_| {
+                    let choice = script[calls.saturating_sub(p.prompt_tokens() - 1)];
+                    calls += 1;
+                    Ok(row(choice))
+                }).unwrap();
+            assert_eq!(actual.finish_reason, finish);
+            assert_eq!(actual.token_ids, script[..count].iter().map(|&id| id as u32).collect::<Vec<_>>());
+            assert_eq!(actual.content_bytes, deltas[..count].concat());
+            assert_eq!(sink.0.len(), count);
+            for (index, event) in sink.0.iter().enumerate() {
+                assert_eq!(event.token_index, index);
+                assert_eq!(event.decoded_bytes, deltas[index]);
+            }
+        }
+    }
+}

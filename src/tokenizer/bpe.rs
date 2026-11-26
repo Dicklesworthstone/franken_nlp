@@ -496,30 +496,38 @@ impl SpBpeTokenizer {
         let mut output = Vec::new();
         let mut initial_marker_consumed = false;
         for &id in ids {
-            if let Some(surface) = self.injected_by_id.get(&id) {
-                output.extend_from_slice(surface.as_bytes());
-                initial_marker_consumed = true;
-                continue;
-            }
-            let piece = self.piece_for_id(id)?;
-            match piece {
-                DecoderPiece::Byte(byte) => {
-                    output.push(*byte);
-                    initial_marker_consumed = true;
-                }
-                DecoderPiece::Text {
-                    content: _,
-                    piece_type: PieceType::Control,
-                } => {
-                    // SentencePiece control pieces are not rendered by ordinary
-                    // decode; registered added-token surfaces are handled above.
-                }
-                DecoderPiece::Text { content, .. } => {
-                    append_sentencepiece_text(&mut output, &mut initial_marker_consumed, content);
-                }
-            }
+            self.decode_piece_into(id, &mut initial_marker_consumed, &mut output)?;
         }
         Ok(output)
+    }
+
+    /// Append one exact piece's bytes. Even a piece that emits no bytes may
+    /// consume the initial whitespace marker, so output length is not state.
+    pub(crate) fn decode_piece_into(&self, id: u32, initial_marker_consumed: &mut bool,
+        output: &mut Vec<u8>) -> Result<(), DecodeBytesError> {
+        if let Some(surface) = self.injected_by_id.get(&id) {
+            output.extend_from_slice(surface.as_bytes());
+            *initial_marker_consumed = true;
+            return Ok(());
+        }
+        let piece = self.piece_for_id(id)?;
+        match piece {
+            DecoderPiece::Byte(byte) => {
+                output.push(*byte);
+                *initial_marker_consumed = true;
+            }
+            DecoderPiece::Text {
+                content: _,
+                piece_type: PieceType::Control,
+            } => {
+                // SentencePiece control pieces are not rendered by ordinary
+                // decode; registered added-token surfaces are handled above.
+            }
+            DecoderPiece::Text { content, .. } => {
+                append_sentencepiece_text(output, initial_marker_consumed, content);
+            }
+        }
+        Ok(())
     }
 
     /// Decodes only valid UTF-8. No U+FFFD replacement is ever implicit.

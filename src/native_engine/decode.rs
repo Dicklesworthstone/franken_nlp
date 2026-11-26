@@ -320,6 +320,10 @@ pub trait DecodeByteDecoder {
 
     /// Decode the complete generated token prefix without lossy replacement.
     fn decode_token_ids(&self, token_ids: &[u32]) -> Result<Vec<u8>, Self::Error>;
+
+    /// Return the tokenizer only when it supplies this decoder's exact byte
+    /// semantics. Custom decoders default to checked whole-prefix decoding.
+    fn sentencepiece_decoder(&self) -> Option<&SpBpeTokenizer> { None }
 }
 
 impl DecodeByteDecoder for SpBpeTokenizer {
@@ -327,6 +331,40 @@ impl DecodeByteDecoder for SpBpeTokenizer {
 
     fn decode_token_ids(&self, token_ids: &[u32]) -> Result<Vec<u8>, Self::Error> {
         self.decode_bytes(token_ids)
+    }
+
+    fn sentencepiece_decoder(&self) -> Option<&SpBpeTokenizer> { Some(self) }
+}
+
+/// Native generation only materializes the next piece. An opaque decoder can
+/// inspect every ID and its entire result is checked against committed bytes.
+pub(super) enum DecodedProposal { Piece(Vec<u8>), Prefix(Vec<u8>) }
+
+impl DecodedProposal {
+    pub(super) fn decode<D: DecodeByteDecoder>(
+        decoder: &D, committed_ids: &mut Vec<u32>, next: u32, marker_consumed: &mut bool,
+    ) -> Result<Self, DecodeError> {
+        if let Some(tokenizer) = decoder.sentencepiece_decoder() {
+            let mut piece = Vec::new();
+            tokenizer.decode_piece_into(next, marker_consumed, &mut piece)
+                .map_err(|error| DecodeError::Decoder { detail: error.to_string() })?;
+            return Ok(Self::Piece(piece));
+        }
+        // The vector is reserved for max_new_tokens and restored before
+        // error handling, cancellation, byte admission or sink delivery.
+        committed_ids.push(next);
+        let decoded = decoder.decode_token_ids(committed_ids);
+        let _ = committed_ids.pop();
+        decoded.map(Self::Prefix).map_err(|error| DecodeError::Decoder { detail: error.to_string() })
+    }
+
+    pub(super) fn delta(&self, committed: &[u8]) -> Result<&[u8], DecodeError> {
+        match self {
+            Self::Piece(bytes) => Ok(bytes),
+            Self::Prefix(bytes) => bytes.strip_prefix(committed).ok_or(DecodeError::DecoderNotPrefixStable {
+                previous_len: committed.len(), decoded_len: bytes.len(),
+            }),
+        }
     }
 }
 
@@ -572,6 +610,7 @@ pub fn greedy_decode_with_hooks<D: DecodeByteDecoder, S: DecodeEventSink, C: Dec
         (selected, logprob)
     };
 
+    let mut marker_consumed = false;
     loop {
         let token_index = output.emitted_token_ids.len();
         if let Some(cancellation) = control.checkpoint(token_index) {
@@ -580,36 +619,24 @@ pub fn greedy_decode_with_hooks<D: DecodeByteDecoder, S: DecodeEventSink, C: Dec
             return Ok(output);
         }
 
-        let mut candidate_token_ids = output.emitted_token_ids.clone();
-        candidate_token_ids.push(selected);
-        let decoded = decoder
-            .decode_token_ids(&candidate_token_ids)
-            .map_err(|error| DecodeError::Decoder {
-                detail: error.to_string(),
-            })?;
-        if !decoded.starts_with(&output.decoded_bytes) {
-            return Err(DecodeError::DecoderNotPrefixStable {
-                previous_len: output.decoded_bytes.len(),
-                decoded_len: decoded.len(),
-            });
-        }
-        if decoded.len() > params.max_output_bytes {
+        let decoded = DecodedProposal::decode(decoder, &mut output.emitted_token_ids, selected, &mut marker_consumed)?;
+        let delta = decoded.delta(&output.decoded_bytes)?;
+        if delta.len() > params.max_output_bytes - output.decoded_bytes.len() {
             output.finish_reason = DecodeFinishReason::Budget;
             return Ok(output);
         }
-        let token_bytes = decoded[output.decoded_bytes.len()..].to_vec();
         let event = DecodeTokenEvent {
             schema_version: DECODE_TOKEN_EVENT_SCHEMA_VERSION,
             request_seq: params.request_seq,
             token_index,
             token_id: selected,
-            decoded_bytes: token_bytes,
+            decoded_bytes: delta.to_vec(),
             logprob: selected_logprob,
         };
         deliver_stream_event(sink, event)?;
 
-        output.emitted_token_ids = candidate_token_ids;
-        output.decoded_bytes = decoded;
+        output.emitted_token_ids.push(selected);
+        output.decoded_bytes.extend_from_slice(delta);
         if let Some(logprobs) = &mut output.token_logprobs {
             logprobs.push(selected_logprob.expect("capture_logprobs selected this logprob"));
         }
