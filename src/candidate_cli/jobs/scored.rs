@@ -44,10 +44,14 @@ pub(in crate::candidate_cli) struct ScoreJobArgs {
     #[arg(long = "limits")] pub limits_file: PathBuf,
     /// Same settings JSON as score-batch; no document, budget or identity fields.
     #[arg(long)] pub defaults: Option<PathBuf>,
-    /// Classify/sentiment only: immutable complete-document chunk/aggregate settings.
+    /// Immutable complete-document chunk/aggregate settings.
     /// Each original document commits once, after every chunk completes.
     #[arg(long, value_name = "FILE")]
     pub document_config: Option<PathBuf>,
+    /// Required fixed policy for complete-document judge jobs. Each input
+    /// record supplies only its claim beside the complete source text.
+    #[arg(long, value_name = "FILE")]
+    pub faithfulness_policy: Option<PathBuf>,
     /// Publish verified materialized.ndjson only after all items commit.
     #[arg(long)] pub materialize: bool,
     #[arg(long, default_value_t = 64)] pub max_stream_mib: u64,
@@ -116,9 +120,9 @@ impl ScoreJobArgs {
     }
     pub(in crate::candidate_cli) fn encoding_work_limits(&self) -> Result<Option<SafeBpeWorkLimits>, Failure> {
         let total = self.encoding_work.limits(&self.encoding)?;
-        // Classification reserves a complete preparation allowance up front.
-        // Sentiment can tighten its per-call allowance to the remaining work.
-        if self.document_config.is_some() && matches!(self.kind()?, ScoreTask::Classify) {
+        // Classification and faithfulness reserve a complete preparation
+        // allowance up front. Sentiment can tighten it to the remaining work.
+        if self.document_config.is_some() && matches!(self.kind()?, ScoreTask::Classify | ScoreTask::Judge) {
             if let (UntrustedEncoding::SafeBpeV1(call), Some(total)) = (self.encoding_policy()?, total) {
                 if total.remaining_call(Default::default(), call).ok() != Some(call) {
                     return Err(Failure::usage("score_document_job_tokenizer_work"));
@@ -170,10 +174,15 @@ impl ScoreJobArgs {
     pub(in crate::candidate_cli) fn task_budget(&self, limits: Limits)
         -> Result<crate::tasks::ir::TaskBudget, Failure> {
         let mut budget = self.host.budget(limits);
-        if self.document_config.is_some() && matches!(self.kind()?, ScoreTask::Sentiment) {
-            // Every affect head belongs to one semantic task. The physical
-            // document runner still reuses one native cache between heads.
-            budget.max_kv_bytes = budget.max_kv_bytes.checked_mul(4)
+        if self.document_config.is_some() {
+            // Every semantic head belongs to one task. The physical runner
+            // still reuses one admitted cache between chunks and heads.
+            let heads = match self.kind()? {
+                ScoreTask::Classify => 1,
+                ScoreTask::Sentiment => 4,
+                ScoreTask::Judge => crate::tasks::judge::quantized::faithfulness_map::MAX_FAITHFULNESS_MAP_HEADS as u64,
+            };
+            budget.max_kv_bytes = budget.max_kv_bytes.checked_mul(heads)
                 .ok_or_else(|| Failure::usage("score_document_job_budget"))?;
         }
         Ok(budget)
@@ -183,7 +192,7 @@ impl ScoreJobArgs {
 pub(in crate::candidate_cli) fn definition() -> clap::Command {
     ScoreJobCommand::augment_args(clap::Command::new("score-job")
         .about("Start or resume retained native classification/sentiment/judgment corpus jobs")
-        .long_about("Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64. The input is the COMPLETE original NDJSON {id,text,task_args?} population; resume can explicitly restore it from retained input storage. Uses the same full-vocabulary scorers and defaults as score-batch; no generated-label shortcut or calibrated-confidence claim. Task settings and defaults are frozen for resume. All three tasks accept --prefill-rows for bounded prompts and --compute-threads for one persistent INT8 row team across every pending record and scoring head. Both workspace owners are admitted together. Worker width may change on authenticated resume; classification/sentiment prompt width may also change. Judgment preserves its existing frozen prompt-schedule recipe and rejects a changed prefill schedule on resume. Lifetime work and failed attempts remain debited. Explicit --store-results, protected directory, original secret and immutable JobLimits are mandatory. Stdout is completion metadata only, emitted after all workers physically join. No automatic retry.")
+        .long_about("Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64. The input is the COMPLETE original NDJSON {id,text,task_args?} population; resume can explicitly restore it from retained input storage. Uses the same full-vocabulary scorers and defaults as score-batch; no generated-label shortcut or calibrated-confidence claim. Task settings and defaults are frozen for resume. All three tasks accept --prefill-rows for bounded prompts and --compute-threads for one persistent INT8 row team across every pending record and scoring head. Both workspace owners are admitted together. Worker width may change on authenticated resume; classification/sentiment prompt width may also change. Single-context judgment preserves its existing frozen prompt-schedule recipe and rejects a changed prefill schedule on resume. Complete-document judgment authenticates the whole-source faithfulness policy and allows physical prompt width to change. Lifetime work and failed attempts remain debited. Explicit --store-results, protected directory, original secret and immutable JobLimits are mandatory. Stdout is completion metadata only, emitted after all workers physically join. No automatic retry.")
         .after_help(INPUT_RETENTION_HELP))
         .mut_subcommand("start", encoding_definition)
         .mut_subcommand("resume", encoding_definition)
@@ -195,7 +204,7 @@ fn encoding_definition(command: clap::Command) -> clap::Command {
         .mut_arg("max_tokenizer_input_bytes", |arg| arg.help("Cumulative encoded bytes for judgment or --document-config preparation, including all chunk probes; safe-bpe-v1 only"))
         .mut_arg("max_tokenizer_output_tokens", |arg| arg.help("Cumulative untrusted tokens for judgment or --document-config preparation; independent of native context, safe-bpe-v1 only"))
         .after_long_help(
-        "Classification, sentiment and judgment jobs accept explicit --input-encoding safe-bpe-v1. One per-record allowance covers every untrusted segment, including both pairwise orders, all rubric criteria and every faithfulness evidence head. Judgment and complete-document classification/sentiment additionally accept --max-tokenizer-input-bytes and --max-tokenizer-output-tokens, independent of wire size and native head context. One additional --max-total-tokenizer-* invocation ledger covers all records and failed or cancelled preparation. Both policies and all caps are authenticated: repeat them on resume. Each resumed invocation receives the same bounded tokenizer allowance while persisted native work and attempts remain spent. Compact input preserves original bytes and excludes template controls, but changes prompt tokens and makes no identical-output, tokenizer-parity, quality or measured-speed claim. Encoder workspace is admitted before private IO and held through physical completion. Byte-fallback remains the default. Judgment keeps its existing frozen prefill schedule on resume.\n\nFor --task classify or sentiment, add --document-config FILE to process complete original documents larger than one context. The strict version-1 JSON sets max_chunks, max_chunk_bytes, max_tokenizer_calls, max_retained_result_bytes, max_result_bytes and minimum_coverage_ppm. One original document is one durable item: every native chunk must complete before its full map and source-weighted aggregate commit. --max-result-bytes caps each chunk; the JSON max_result_bytes caps the complete result and must fit JobLimits. All five native work ceilings span the invocation and must fit immutable lifetime work; more chunks or retries never multiply them. Chunking, coverage, output bounds, defaults and tokenizer policies are authenticated and must match on resume. Worker and prefill widths may change without changing task semantics. Per-record task_args may replace fixed defaults and only tighten task budgets. Compact document encoding shares one allowance across every sizing probe and chunk/head reconstruction. No partial successful document is committed. Stdout remains metadata only; complete_document identifies this mode.")
+        "Classification, sentiment and judgment jobs accept explicit --input-encoding safe-bpe-v1. One per-record allowance covers every untrusted segment, including both pairwise orders, all rubric criteria and every faithfulness evidence head. Judgment and complete-document classification/sentiment additionally accept --max-tokenizer-input-bytes and --max-tokenizer-output-tokens, independent of wire size and native head context. One additional --max-total-tokenizer-* invocation ledger covers all records and failed or cancelled preparation. Both policies and all caps are authenticated: repeat them on resume. Each resumed invocation receives the same bounded tokenizer allowance while persisted native work and attempts remain spent. Compact input preserves original bytes and excludes template controls, but changes prompt tokens and makes no identical-output, tokenizer-parity, quality or measured-speed claim. Encoder workspace is admitted before private IO and held through physical completion. Byte-fallback remains the default. Single-context judgment keeps its existing frozen prefill schedule on resume.\n\nFor --task classify, sentiment or judge, add --document-config FILE to process complete original documents larger than one context. The strict version-1 JSON sets max_chunks, max_chunk_bytes, max_tokenizer_calls, max_retained_result_bytes, max_result_bytes and minimum_coverage_ppm. One original document is one durable item: every native chunk and evidence head must complete before its full map and declared aggregate commit. --max-result-bytes caps each chunk; the JSON max_result_bytes caps the complete result and must fit JobLimits. All five native work ceilings span the invocation and must fit immutable lifetime work; more chunks or retries never multiply them. Chunking, coverage, output bounds, defaults and tokenizer policies are authenticated and must match on resume. Worker and prefill widths may change without changing task semantics. Classification/sentiment task_args may replace fixed defaults and only tighten task budgets. Complete-document judgment requires --faithfulness-policy FILE and forbids --defaults. Its strict records are {id,text,task_args:{claim}}: text is the COMPLETE original source, each claim is required, and policy/budget overrides are refused. Source and claim share the immutable per-item input-byte ceiling. All evidence, including contrary and uncertain witnesses, is retained with original coordinates. Compact document encoding shares one allowance across every sizing probe and chunk/head reconstruction. No partial successful document is committed. Stdout remains metadata only; complete_document identifies this mode.")
 }
 impl ScoreJobCommand {
     pub(crate) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {

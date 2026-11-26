@@ -1,7 +1,8 @@
 use super::*;
 use crate::{
     candidate_cli::jobs::scored::document::tests::{document_args, lifetime, SETTINGS},
-    jobs::runner::scored::document::{Int8ClassificationDocumentJobPlanner, Int8SentimentDocumentJobPlanner},
+    jobs::runner::scored::document::{Int8ClassificationDocumentJobPlanner,
+        Int8SentimentDocumentJobPlanner, Int8FaithfulnessDocumentJobPlanner},
 };
 
 fn facts() -> ArtifactIdentity {
@@ -18,7 +19,8 @@ fn prepared(task: &str, extra: &[&str]) -> (ScoreJobArgs, Limits, Mapping, Docum
     let mapping = settings::load(SETTINGS, &args, limits, lifetime(&args)).unwrap();
     let defaults = args.parse_defaults((task == "classify").then_some(LABELS),
         args.task_budget(limits).unwrap()).unwrap();
-    let corpus = configure(&args, &facts(), limits, mapping, defaults).unwrap();
+    let policy = (task == "judge").then_some(faithfulness_policy());
+    let corpus = configure(&args, &facts(), limits, mapping, defaults, policy).unwrap();
     let mapping = settings::load(SETTINGS, &args, limits, lifetime(&args)).unwrap();
     (args, limits, mapping, corpus)
 }
@@ -33,6 +35,12 @@ fn recipe(corpus: DocumentCorpus) -> serde_json::Value {
         }
         DocumentCorpus::Sentiment(planner, config) => {
             let factory = Int8SentimentDocumentJobPlanner::new(planner, config).unwrap();
+            serde_json::to_value(factory.job_recipe()).unwrap()
+        }
+        DocumentCorpus::Faithfulness(planner, config) => {
+            let factory = Int8FaithfulnessDocumentJobPlanner::new(planner, config.identity,
+                config.task_ceiling, config.planning, config.mapping, config.policy,
+                config.max_model_work, config.max_tokenizer_work).unwrap();
             serde_json::to_value(factory.job_recipe()).unwrap()
         }
     }
@@ -63,7 +71,7 @@ fn cli_settings_reach_distinct_complete_document_factories_and_immutable_recipes
 
 #[test]
 fn physical_prefill_and_team_widths_cannot_change_authenticated_document_semantics() {
-    for task in ["classify", "sentiment"] {
+    for task in ["classify", "sentiment", "judge"] {
         let expected = recipe(prepared(task, &[]).3);
         for flags in [vec!["--prefill-rows", "4"], vec!["--compute-threads", "4"],
             vec!["--prefill-rows", "4", "--compute-threads", "4"]] {
@@ -90,7 +98,7 @@ fn host(args: &ScoreJobArgs, limits: Limits) -> JobHostLimits {
 
 #[test]
 fn complete_map_population_prefill_and_workers_share_one_exact_memory_ceiling() {
-    for task in ["classify", "sentiment"] {
+    for task in ["classify", "sentiment", "judge"] {
         for flags in [vec![], vec!["--compute-threads", "4", "--prefill-rows", "4"],
             vec!["--input-encoding", "safe-bpe-v1", "--spool-input", "--max-retained-input-mib", "4"]] {
             let (args, mut limits, mapping, _) = prepared(task, &flags);
@@ -113,7 +121,69 @@ fn metadata_marks_whole_document_completion_without_private_chunk_results() {
     let report = serde_json::to_value(DocumentReport { response: &value, complete_document: true }).unwrap();
     assert_eq!(report["complete_document"], true);
     assert_eq!(report["output"]["committed"], 2);
-    for field in ["labels", "text", "chunks", "scores", "task_args"] {
+    for field in ["labels", "text", "claim", "evidence", "chunks", "scores", "task_args"] {
         assert!(report.get(field).is_none());
     }
+}
+
+fn faithfulness_policy() -> FaithfulnessPolicy {
+    FaithfulnessPolicy { minimum_candidate_weight_ppm: 500_000, minimum_margin_milli: 100,
+        evidence_window_bytes: 128, max_evidence_windows: 31, max_evidence_spans: 4 }
+}
+
+#[test]
+fn complete_faithfulness_cli_binds_policy_whole_source_limits_and_both_encoding_scopes() {
+    for compact in [false, true] {
+        let flags: &[&str] = if compact { &["--input-encoding", "safe-bpe-v1"] } else { &[] };
+        let (args, limits, mapping, corpus) = prepared("judge", flags);
+        let wire = recipe(corpus);
+        assert_eq!(wire["dependency_scope"], "item-local-complete-source-claim");
+        assert_eq!(wire["input_policy"], "fixed-faithfulness-policy-required-claim-item-args-v1");
+        assert_eq!(wire["policy"], serde_json::to_value(faithfulness_policy()).unwrap());
+        assert_eq!(wire["task_ceiling"], serde_json::to_value(args.task_budget(limits).unwrap()).unwrap());
+        assert_eq!(wire["chunks"]["max_input_bytes"], 65536);
+        assert_eq!(wire["chunks"]["max_chunks"], 4);
+        assert_eq!(wire["max_result_bytes"], 4 << 20);
+        assert_eq!(wire["per_document_model_work"], serde_json::to_value(mapping.work()).unwrap());
+        assert_eq!(wire["max_model_work"], serde_json::to_value(args.host.work_ceiling()).unwrap());
+        assert_eq!(wire["input_encoding"], serde_json::to_value(args.encoding_policy().unwrap()).unwrap());
+        let actual = wire.get("encoding_work_limits");
+        if let Some(total) = args.encoding_work_limits().unwrap() {
+            assert_eq!(actual, Some(&serde_json::to_value(total).unwrap()));
+        } else { assert!(actual.is_none()); }
+        for private in ["claim", "source", "text", "defaults"] { assert!(wire.get(private).is_none()); }
+    }
+}
+
+#[test]
+fn complete_faithfulness_cannot_fall_back_to_one_context_defaults_or_missing_policy() {
+    let (args, limits, mapping, _) = prepared("judge", &[]);
+    assert!(configure(&args, &facts(), limits, mapping, Defaults::Judge(None), None).is_err());
+    let mapping = settings::load(SETTINGS, &args, limits, lifetime(&args)).unwrap();
+    let defaults = Defaults::Judge(Some(crate::batch::judge::JudgeBatchArgs::Faithfulness {
+        claim: "a private fixed claim must not replace per-item claims".to_owned(),
+        policy: faithfulness_policy(), budget: args.task_budget(limits).unwrap(),
+    }));
+    assert!(configure(&args, &facts(), limits, mapping, defaults, Some(faithfulness_policy())).is_err());
+    let (args, limits, mapping, _) = prepared("classify", &[]);
+    assert!(configure(&args, &facts(), limits, mapping, Defaults::Classify(None),
+        Some(faithfulness_policy())).is_err());
+}
+
+#[test]
+fn fixed_faithfulness_policy_uses_the_strict_existing_parser_before_model_io() {
+    let policy = faithfulness_policy();
+    let canonical = crate::canonjson::canonical_string(&policy).unwrap();
+    assert_eq!(faithfulness::parse_policy(&canonical).unwrap(), policy);
+    for field in ["minimum_candidate_weight_ppm", "minimum_margin_milli",
+        "evidence_window_bytes", "max_evidence_windows", "max_evidence_spans"] {
+        let mut wire: serde_json::Value = serde_json::from_str(&canonical).unwrap();
+        wire.as_object_mut().unwrap().remove(field);
+        assert!(faithfulness::parse_policy(&wire.to_string()).is_err(), "{field}");
+    }
+    let mut wire: serde_json::Value = serde_json::from_str(&canonical).unwrap();
+    wire["claim"] = "must remain item-local".into();
+    assert!(faithfulness::parse_policy(&wire.to_string()).is_err());
+    let repeated = format!("{},\"max_evidence_spans\":4}}", canonical.strip_suffix('}').unwrap());
+    assert!(faithfulness::parse_policy(&repeated).is_err());
 }

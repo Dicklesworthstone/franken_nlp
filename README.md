@@ -1487,6 +1487,75 @@ or AArch64. Source review and focused recipe, ownership, limits, memory and CLI
 regression definitions are present. Compilation, executable tests, model-present
 interruption/resume qualification and the required DSR checkpoint remain pending.
 
+### Retained complete-source faithfulness
+
+Complete-document judgment uses the same job lifecycle with
+`--task judge --document-config FILE --faithfulness-policy FILE`.
+The policy file has the strict `FaithfulnessPolicy` shape shown in the
+[resident faithfulness example](#implemented-candidate-int8-complete-source-faithfulness-corpora).
+It is required and fixed for the whole job; `--defaults` is refused in this mode.
+Each input record contains its complete source and one required claim:
+
+```json
+{"id":"retrieval-1","text":"The original complete source.","task_args":{"claim":"The exact claim to check."}}
+```
+
+With a protected job directory and key, provision immutable job limits large
+enough for the declared source, complete result and native work allowances:
+
+```sh
+fnlp candidate score-job start retrieval-log.ndjson \
+  --task judge --document-config document-job.json \
+  --faithfulness-policy faithfulness-policy.json \
+  --model ./model.fnlpq --memory-mib 32768 --preparation-mib 1024 \
+  --max-input-bytes 1048576 --max-result-bytes 65536 \
+  --max-forward-positions 262144 --max-projected-logits 10000000000 \
+  --max-attention-pairs 1000000000000 \
+  --max-dot-products 10000000000000000 \
+  --max-multiply-accumulates 10000000000000000 \
+  --input-encoding safe-bpe-v1 --compute-threads 4 --prefill-rows 4 \
+  --store-results --job-dir ./private-faithfulness-job \
+  --job-id "$JOB_ID" --key-file ./faithfulness-job.key \
+  --limits ./faithfulness-job-limits.json --materialize
+```
+
+Use `resume` with the same semantic settings, policy, original population,
+secret and immutable limits. Explicit retained-input replay is also supported.
+The exact source and claim authenticate together; both count toward the
+per-item input ceiling. Per-record policy or budget overrides are refused.
+The source is partitioned without shortening its claim, and every chunk and
+evidence head must finish before the complete original document commits.
+The retained result includes contrary and uncertain evidence, original
+byte/scalar coordinates, and the named complete-source coverage/conflict
+reduction. A failed chunk produces no successful document prefix.
+
+All five native work axes are durably charged before an attempted document
+executes. Failed attempts and resume do not replenish the job's lifetime
+allowance. The per-document compact-tokenizer allowance covers partition
+probes, all evidence heads and execution reconstruction; the authenticated
+invocation allowance spans all attempted documents. An explicit resume gets
+that same bounded invocation tokenizer allowance, while persisted native
+work and attempts remain spent. Physical prompt and CPU-team widths may
+change within the admitted host envelope.
+
+The complete source/claim, map frontier, native storage, journal/input buffers,
+retained identities, optional compact encoder, prompt workspace, workers and
+guarded result are admitted together. The actual compiler and resource owners
+remain held through worker join. Stdout contains completion metadata with
+`complete_document: true`; private claims, source text, evidence and results
+remain in protected storage.
+
+Library callers use `NlpEngine::job_int8_faithfulness_documents_scheduled`
+with `FaithfulnessDocumentCorpusConfig` and the existing `SourceJobRequest`.
+The pure `int8_faithfulness_document_job_requirements` quote is exported through
+`hosted::corpus::jobs`. This candidate requires the same runtime/metadata
+features and Linux targets as the other retained INT8 jobs. Its policies are
+uncalibrated; complete source coverage and verified evidence coordinates do
+not establish factual correctness or equivalence to one full-context
+inference. Recipe, ownership, memory and CLI regression definitions have
+been added; DSR compilation, executable regressions and model-present
+interruption/resume qualification remain pending.
+
 ## Implemented candidate INT4 token streaming
 
 `fnlp candidate source-int4 stream generate|chat` exposes live native token

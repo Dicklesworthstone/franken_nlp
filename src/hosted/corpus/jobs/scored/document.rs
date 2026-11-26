@@ -4,12 +4,16 @@
 use super::*;
 use crate::{
     batch::{classify::quantized::long::CLASSIFICATION_DOCUMENT_CHUNK_METADATA_BYTES,
+        judge::quantized::FAITHFULNESS_DOCUMENT_CHUNK_METADATA_BYTES,
         sentiment::quantized::INT8_SENTIMENT_DOCUMENT_CHUNK_METADATA_BYTES},
-    hosted::{Int8ClassificationMapHostConfig, Int8ClassificationMapMemoryRequirement},
+    hosted::{Int8ClassificationMapHostConfig, Int8ClassificationMapMemoryRequirement,
+        Int8FaithfulnessMapHostConfig, Int8FaithfulnessMapMemoryRequirement},
     jobs::{JobInputMemory, runner::scored::document::{Int8ClassificationDocumentJobPlanner,
         Int8ClassificationDocumentJobProcessor, Int8SentimentDocumentJobPlanner,
-        Int8SentimentDocumentJobProcessor}},
+        Int8SentimentDocumentJobProcessor, Int8FaithfulnessDocumentJobPlanner,
+        Int8FaithfulnessDocumentJobProcessor}},
     tasks::{classify::{ClassificationLimits, quantized::long::Int8ClassificationMapLimits},
+        judge::{JudgeLimits, JudgePlanner, quantized::faithfulness_map::Int8FaithfulnessMapLimits},
         sentiment::{SentimentLimits, quantized::long::{Int8SentimentMapLimits,
             memory::{Int8SentimentMapMemoryLimits, Int8SentimentMapMemoryRequirement}}}},
     tokenizer::untrusted::UntrustedEncoding,
@@ -49,6 +53,24 @@ pub fn int8_sentiment_document_job_requirements(task: TaskBudget,
     Ok(required)
 }
 
+/// Price the complete original source/claim, every chunk and evidence head,
+/// retained identities, durable buffers and guarded result before private IO.
+/// Optional compact encoding is additive to the same native memory envelope.
+#[allow(clippy::too_many_arguments)]
+pub fn int8_faithfulness_document_job_requirements(task: TaskBudget,
+    planning: JudgeLimits, mapping: Int8FaithfulnessMapLimits,
+    encoding: &UntrustedEncoding, limits: JobHostLimits, job: JobLimits, input: JobInputMemory)
+    -> Result<Int8FaithfulnessMapMemoryRequirement, HostedJobError> {
+    check_document_envelope(job, mapping.chunks.max_input_bytes, mapping.max_result_bytes,
+        mapping.max_model_work)?;
+    let mut required = faithfulness_map_requirements(task, planning, mapping, encoding, limits)?;
+    required.input_bytes = sum(&[required.input_bytes,
+        limits.required_buffer_bytes_for_input(job, input)?])?;
+    sum(&[required.input_bytes, required.native.kv_bytes, required.workspace_bytes,
+        required.output_reservation_bytes])?;
+    Ok(required)
+}
+
 fn classification_map_requirements(task: TaskBudget, planning: ClassificationLimits,
     mapping: Int8ClassificationMapLimits, encoding: &UntrustedEncoding, limits: JobHostLimits)
     -> Result<Int8ClassificationMapMemoryRequirement, HostedError> {
@@ -70,6 +92,16 @@ fn sentiment_map_requirements(task: TaskBudget, planning: SentimentLimits,
         .map_err(HostedError::SentimentMap)?;
     required.input_bytes = sum(&[required.input_bytes, metadata(mapping.chunks.max_chunks,
         INT8_SENTIMENT_DOCUMENT_CHUNK_METADATA_BYTES)?])?;
+    Ok(required)
+}
+fn faithfulness_map_requirements(task: TaskBudget, planning: JudgeLimits,
+    mapping: Int8FaithfulnessMapLimits, encoding: &UntrustedEncoding, limits: JobHostLimits)
+    -> Result<Int8FaithfulnessMapMemoryRequirement, HostedError> {
+    let mut required = Int8FaithfulnessMapHostConfig { native: limits.native, planning, mapping,
+        preparation_reserve_bytes: limits.preparation_reserve_bytes }
+        .requirements_with_encoding(task, encoding)?;
+    required.input_bytes = sum(&[required.input_bytes, metadata(mapping.chunks.max_chunks,
+        FAITHFULNESS_DOCUMENT_CHUNK_METADATA_BYTES)?])?;
     Ok(required)
 }
 fn metadata(chunks: usize, per_chunk: u64) -> Result<u64, HostedError> {
@@ -135,6 +167,27 @@ impl NlpEngine {
         run(self, model, SentimentDocumentTask { factory: Arc::new(factory), required },
             request, limits, prefill, team, reader, cancellation)
     }
+
+    /// Retain one complete source/claim judgment per authenticated item. Every
+    /// chunk and evidence head must finish before spool-first publication;
+    /// explicit resume preserves the policy, source bytes and lifetime work.
+    /// One resident model and optional persistent team span this invocation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int8_faithfulness_documents_scheduled<R>(&self, model: &ResidentInt8,
+        planner: Arc<JudgePlanner>, config: FaithfulnessDocumentCorpusConfig,
+        request: SourceJobRequest, limits: JobHostLimits, prefill: Option<Int8PrefillLimits>,
+        team: Option<(Int8Kernel, usize)>, reader: R, cancellation: CancellationToken)
+        -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        let factory = Int8FaithfulnessDocumentJobPlanner::new(planner, config.identity,
+            config.task_ceiling, config.planning, config.mapping, config.policy,
+            config.max_model_work, config.max_tokenizer_work).map_err(HostedError::BatchSetup)?;
+        factory.check_job_limits(request.limits).map_err(HostedError::BatchSetup)?;
+        let required = faithfulness_map_requirements(factory.task_ceiling(), factory.planning_limits(),
+            factory.mapping_limits(), factory.document_encoding(), limits)?;
+        run(self, model, FaithfulnessDocumentTask { factory: Arc::new(factory), required },
+            request, limits, prefill, team, reader, cancellation)
+    }
 }
 
 struct ClassificationDocumentTask {
@@ -182,6 +235,32 @@ impl Int8JobTask for SentimentDocumentTask {
         request: SourceJobRequest, population: &Population<'_>, prefill: Option<Int8PrefillLimits>,
         control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
         Ok(Int8SentimentDocumentJobProcessor::scheduled(&self.factory, engine, admission, prefill)
+            .map_err(JobRunError::Processor)
+            .and_then(|processor| run_population(request, population, processor, control)))
+    }
+}
+
+struct FaithfulnessDocumentTask {
+    factory: Arc<Int8FaithfulnessDocumentJobPlanner>,
+    required: Int8FaithfulnessMapMemoryRequirement,
+}
+impl Int8JobTask for FaithfulnessDocumentTask {
+    fn identity(&self) -> &ExecutionIdentity { self.factory.execution_identity() }
+    fn retain_for_join(&self) -> Option<Box<dyn Send>> { Some(Box::new(Arc::clone(&self.factory))) }
+    fn validate(&self, native: Int8MemoryRequirement, job: JobLimits) -> Result<(), HostedError> {
+        self.factory.check_job_limits(job).map_err(HostedError::BatchSetup)?;
+        if native != self.required.native {
+            return Err(HostedError::Limits("faithfulness document job native geometry differs"));
+        }
+        Ok(())
+    }
+    fn preparation_workspace_bytes(&self) -> Result<u64, HostedError> { Ok(self.required.input_bytes) }
+    fn execute(self, engine: &mut StrictInt8Engine<'_>, admission: CorpusAdmission<'_>,
+        request: SourceJobRequest, population: &Population<'_>, prefill: Option<Int8PrefillLimits>,
+        control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
+        let admission = crate::hosted::corpus::faithfulness_document::document_admission(admission,
+            self.factory.mapping_limits(), self.factory.task_ceiling())?;
+        Ok(Int8FaithfulnessDocumentJobProcessor::scheduled(self.factory, engine, admission, prefill)
             .map_err(JobRunError::Processor)
             .and_then(|processor| run_population(request, population, processor, control)))
     }

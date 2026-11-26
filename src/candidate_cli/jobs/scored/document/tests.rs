@@ -10,6 +10,7 @@ pub(in crate::candidate_cli) const SETTINGS: &str = r#"{
 pub(in crate::candidate_cli) fn document_args(task: &str, extra: &[&str]) -> ScoreJobArgs {
     let mut flags = vec!["--document-config", "document.json", "--max-input-bytes", "65536",
         "--max-result-bytes", "65536", "--preparation-mib", "1024"];
+    if task == "judge" { flags.extend_from_slice(&["--faithfulness-policy", "faithfulness.json"]); }
     flags.extend_from_slice(extra);
     let mut result = args(task, &flags);
     result.host.memory_mib = 32768;
@@ -25,7 +26,7 @@ pub(in crate::candidate_cli) fn lifetime(args: &ScoreJobArgs) -> JobLimits {
 
 #[test]
 fn whole_document_settings_preserve_context_output_and_lifetime_work_scopes() {
-    for task in ["classify", "sentiment"] {
+    for task in ["classify", "sentiment", "judge"] {
         let a = document_args(task, &[]);
         let (_, limits) = a.validate().unwrap();
         let job = lifetime(&a);
@@ -37,6 +38,8 @@ fn whole_document_settings_preserve_context_output_and_lifetime_work_scopes() {
                 mapping.max_retained_result_bytes, mapping.aggregation.minimum_classified_coverage_ppm),
             Mapping::Sentiment { mapping, .. } => (mapping.chunks, mapping.max_result_bytes,
                 mapping.max_retained_result_bytes, mapping.aggregation.minimum_estimated_coverage_ppm),
+            Mapping::Faithfulness { mapping, .. } => (mapping.chunks, mapping.max_result_bytes,
+                mapping.max_retained_result_bytes, mapping.aggregation.minimum_classified_coverage_ppm),
         };
         assert_eq!((chunks.max_chunks, chunks.max_chunk_bytes), (4, 1024));
         assert_eq!(chunks.context_tokens, a.host.context_tokens);
@@ -73,7 +76,7 @@ fn config_rejects_duplicate_unknown_unbounded_and_wrong_version_fields() {
 
 #[test]
 fn more_chunks_cannot_increase_any_immutable_native_work_axis() {
-    for task in ["classify", "sentiment"] {
+    for task in ["classify", "sentiment", "judge"] {
         let a = document_args(task, &[]);
         let (_, limits) = a.validate().unwrap();
         for axis in 0..5 {
@@ -124,7 +127,9 @@ fn invalid_document_modes_and_insufficient_preparation_refuse_before_private_io(
         a.document_config = Some("-".into());
         assert!(a.validate().is_err());
     }
-    assert!(document_args("judge", &[]).validate().is_err());
+    let mut judge = document_args("judge", &[]);
+    judge.faithfulness_policy = None;
+    assert!(judge.validate().is_err());
     let a = document_args("classify", &[]);
     let (_, mut limits) = a.validate().unwrap();
     limits.preparation_bytes = 1;
@@ -140,5 +145,63 @@ fn impossible_classification_encoding_allowances_fail_before_private_io() {
         let a = document_args("classify", &flags);
         assert_eq!(a.validate().err().unwrap().code, "score_document_job_tokenizer_work");
         assert!(document_args("sentiment", &flags).encoding_work_limits().is_ok());
+    }
+}
+
+#[test]
+fn complete_faithfulness_requires_one_fixed_local_policy_and_rejects_other_modes() {
+    let mut judge = document_args("judge", &[]);
+    judge.validate().unwrap();
+    for path in ["", "-"] {
+        judge.faithfulness_policy = Some(path.into());
+        assert_eq!(judge.validate().err().unwrap().code, "score_document_job_faithfulness_policy");
+    }
+    judge.faithfulness_policy = Some("policy.json".into());
+    judge.defaults = Some("defaults.json".into());
+    assert_eq!(judge.validate().err().unwrap().code, "score_document_job_faithfulness_policy");
+    judge.defaults = None;
+    judge.document_config = None;
+    assert_eq!(judge.validate().err().unwrap().code, "score_document_job_faithfulness_policy");
+    for task in ["classify", "sentiment"] {
+        let mut ordinary = document_args(task, &[]);
+        ordinary.faithfulness_policy = Some("policy.json".into());
+        assert_eq!(ordinary.validate().err().unwrap().code, "score_document_job_faithfulness_policy");
+    }
+}
+
+#[test]
+fn complete_faithfulness_prices_all_evidence_heads_but_reuses_one_physical_context() {
+    let document = document_args("judge", &[]);
+    let (common, limits) = document.validate().unwrap();
+    let task = document.task_budget(limits).unwrap();
+    assert_eq!(task.max_kv_bytes, limits.kv_bytes
+        * crate::tasks::judge::quantized::faithfulness_map::MAX_FAITHFULNESS_MAP_HEADS as u64);
+    assert_eq!(common.context_tokens, document.host.context_tokens);
+    let ordinary = args("judge", &[]);
+    let (_, native) = ordinary.validate().unwrap();
+    assert_eq!(ordinary.task_budget(native).unwrap().max_kv_bytes, native.kv_bytes);
+    let Mapping::Faithfulness { planning, mapping } =
+        load(SETTINGS, &document, limits, lifetime(&document)).unwrap()
+        else { panic!("whole-source judge route") };
+    assert_eq!(planning.max_output_bytes, document.host.max_result_bytes as u64);
+    assert_eq!(mapping.max_result_bytes, 4 << 20);
+    assert_eq!(mapping.max_model_work, document.host.work_ceiling());
+}
+
+#[test]
+fn complete_faithfulness_compact_work_never_renews_at_a_chunk_or_evidence_head() {
+    let flags = ["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "131072",
+        "--max-tokenizer-output-tokens", "65536"];
+    let a = document_args("judge", &flags);
+    let (common, limits) = a.validate().unwrap();
+    let UntrustedEncoding::SafeBpeV1(policy) = a.encoding_policy().unwrap()
+        else { panic!("compact whole-source policy") };
+    assert_eq!((policy.max_input_bytes, policy.max_output_tokens), (131072, 65536));
+    assert!(policy.max_output_tokens > common.context_tokens);
+    load(SETTINGS, &a, limits, lifetime(&a)).unwrap();
+    for option in ["--max-total-tokenizer-input-bytes", "--max-total-tokenizer-output-tokens",
+        "--max-total-tokenizer-pair-checks", "--max-total-tokenizer-pair-bytes"] {
+        let a = document_args("judge", &["--input-encoding", "safe-bpe-v1", option, "1"]);
+        assert_eq!(a.validate().err().unwrap().code, "score_document_job_tokenizer_work");
     }
 }

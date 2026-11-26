@@ -2,17 +2,36 @@
 //! Native work remains bounded by both the invocation and the durable journal.
 use super::*;
 use crate::{
-    candidate_cli::scored_documents::Mapping,
     jobs::JobWork,
     tasks::{
-        classify::{ClassificationAggregationPolicy, quantized::long::Int8ClassificationMapLimits},
-        sentiment::{SentimentAggregationPolicy, quantized::long::Int8SentimentMapLimits},
+        classify::{ClassificationAggregationPolicy, ClassificationLimits,
+            quantized::long::Int8ClassificationMapLimits},
+        sentiment::{SentimentAggregationPolicy, SentimentLimits,
+            quantized::long::Int8SentimentMapLimits},
+        judge::{FaithfulnessAggregationPolicy, JudgeLimits,
+            quantized::faithfulness_map::Int8FaithfulnessMapLimits},
         mapreduce::ChunkLimits,
     },
 };
 
 pub(in crate::candidate_cli) const CONFIG_BYTES: usize = 16 * 1024;
 const MAX_RESULT_BYTES: u64 = 64 * MIB;
+
+pub(in crate::candidate_cli) enum Mapping {
+    Classify { planning: ClassificationLimits, mapping: Int8ClassificationMapLimits },
+    Sentiment { planning: SentimentLimits, mapping: Int8SentimentMapLimits },
+    Faithfulness { planning: JudgeLimits, mapping: Int8FaithfulnessMapLimits },
+}
+impl Mapping {
+    #[cfg(test)]
+    pub(in crate::candidate_cli) fn work(&self) -> crate::native_engine::strict_int8::Int8Work {
+        match self {
+            Self::Classify { mapping, .. } => mapping.max_model_work,
+            Self::Sentiment { mapping, .. } => mapping.max_model_work,
+            Self::Faithfulness { mapping, .. } => mapping.max_model_work,
+        }
+    }
+}
 
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -28,11 +47,21 @@ struct Settings {
 }
 
 pub(in crate::candidate_cli) fn validate_mode(args: &ScoreJobArgs) -> Result<(), Failure> {
+    let local = |path: &std::path::Path| !path.as_os_str().is_empty() && path.as_os_str() != "-";
     if let Some(path) = &args.document_config {
-        if path.as_os_str().is_empty() || path.as_os_str() == "-"
-            || !matches!(args.kind()?, ScoreTask::Classify | ScoreTask::Sentiment) {
+        if !local(path) {
             return Err(Failure::usage("score_document_job_options"));
         }
+        if matches!(args.kind()?, ScoreTask::Judge) {
+            if args.faithfulness_policy.as_ref().is_none_or(|path| !local(path))
+                || args.defaults.is_some() {
+                return Err(Failure::usage("score_document_job_faithfulness_policy"));
+            }
+            return Ok(());
+        }
+    }
+    if args.faithfulness_policy.is_some() {
+        return Err(Failure::usage("score_document_job_faithfulness_policy"));
     }
     Ok(())
 }
@@ -101,7 +130,17 @@ pub(in crate::candidate_cli) fn load(text: &str, args: &ScoreJobArgs,
             mapping.validate(task).map_err(|_| Failure::usage("score_document_job_limits"))?;
             Mapping::Sentiment { planning: args.host.sentiment_limits(), mapping }
         }
-        ScoreTask::Judge => return Err(Failure::usage("score_document_job_options")),
+        ScoreTask::Judge => {
+            let mapping = Int8FaithfulnessMapLimits {
+                chunks, max_model_work: work,
+                max_retained_result_bytes: settings.max_retained_result_bytes,
+                max_result_bytes: settings.max_result_bytes,
+                aggregation: FaithfulnessAggregationPolicy {
+                    minimum_classified_coverage_ppm: settings.minimum_coverage_ppm },
+            };
+            mapping.validate(task).map_err(|_| Failure::usage("score_document_job_limits"))?;
+            Mapping::Faithfulness { planning: crate::candidate_cli::judge::planning_limits(&args.host, task), mapping }
+        }
     };
     // The CLI owns strict config/default parsing beside the host's separate
     // complete-map frontier. This is a reservation estimate, not an RSS cap.

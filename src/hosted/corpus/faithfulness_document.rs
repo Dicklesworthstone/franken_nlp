@@ -97,11 +97,8 @@ impl scored::CorpusTask for FaithfulnessDocumentStream {
     fn execute<R: BufRead, W: Write>(self, engine: &mut crate::native_engine::strict_int8::StrictInt8Engine<'_>,
         admission: CorpusAdmission<'_>, prefill: Option<Int8PrefillLimits>, reader: &mut R, writer: &mut W,
         limits: BatchLimits, defer: bool, control: &mut RunControl) -> Result<scored::Completion, HostedError> {
-        let mapping = self.compiler.mapping_limits();
-        let output_bytes = mapping.max_result_bytes.checked_mul(8).and_then(|n| n.checked_add(4096))
-            .ok_or(HostedError::Limits("faithfulness corpus output arithmetic"))?;
-        let admission = DocumentAdmission { inner: admission, mapping,
-            ceiling: self.compiler.task_budget(), output_bytes };
+        let admission = document_admission(admission, self.compiler.mapping_limits(),
+            self.compiler.task_budget())?;
         let mut processor = match prefill {
             Some(prefill) => NativeInt8FaithfulnessDocumentBatch::new_layer_major(self.compiler,
                 engine, admission, prefill),
@@ -109,6 +106,16 @@ impl scored::CorpusTask for FaithfulnessDocumentStream {
         }.map_err(HostedError::BatchSetup)?;
         scored::execute_stream(reader, writer, &mut processor, limits, defer, control)
     }
+}
+
+/// Live streams and authenticated jobs use the same complete source/evidence
+/// admission. Callers cannot substitute an uncharged guard or a partial quote.
+pub(in crate::hosted::corpus) fn document_admission(inner: CorpusAdmission<'_>,
+    mapping: Int8FaithfulnessMapLimits, ceiling: TaskBudget)
+    -> Result<impl Int8FaithfulnessDocumentBatchAdmission<Guard = Pending>, HostedError> {
+    let output_bytes = mapping.max_result_bytes.checked_mul(8).and_then(|n| n.checked_add(4096))
+        .ok_or(HostedError::Limits("faithfulness corpus output arithmetic"))?;
+    Ok(DocumentAdmission { inner, mapping, ceiling, output_bytes })
 }
 
 struct DocumentAdmission<'a> {
