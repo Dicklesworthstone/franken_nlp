@@ -140,6 +140,21 @@ mod tests {
     use super::*;
     use crate::{tasks::{ner::NamedEntity, extract::ExtractionGrounding, ir::ScoreSpace},
         validation::grounded_fields::{SourceOccurrence, scan_occurrences}};
+    #[test]
+    fn verified_default_redaction_removes_endpoint_hosts_and_keeps_ports() {
+        let mut request = RedactionRequest::default();
+        request.actions.include_map = true;
+        let source = "上海 192.0.2.1:443 → [2001:db8::1]:8443";
+        let output = redact_rules(source, &request, None).unwrap();
+        assert_eq!(output.text(), "上海 [redacted:ip_address]:443 → [[redacted:ip_address]]:8443");
+        assert_eq!(output.verification(), VerificationStatus::CleanDeclaredUnion);
+        assert_eq!(output.edits().len(), 2);
+        let first = &output.edits()[0].original;
+        assert!(first.detectors.contains(&super::super::Detector::IpEndpointV1));
+        assert_eq!(&source[first.span.byte_start..first.span.byte_end], "192.0.2.1");
+        assert_eq!(first.span.scalar_start, 3);
+    }
+
     struct Model { types: BTreeSet<EntityType>, seen: Vec<String>, leak: bool, fail: bool }
     impl NerPass for Model {
         type Error = std::io::Error;

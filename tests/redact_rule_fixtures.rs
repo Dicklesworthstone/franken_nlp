@@ -11,9 +11,14 @@ struct Case { id: String, enabled: BTreeSet<PiiKind>, source: String, expected: 
 
 #[test]
 fn versioned_rule_cases_match_exact_source_bytes() {
-    let value = canonjson::parse_str(include_str!("fixtures/redact/rules-v1.json")).unwrap();
+    check_profile(include_str!("fixtures/redact/rules-v1.json"), "ascii-contact-ip-luhn-iso-date-v1");
+    check_profile(include_str!("fixtures/redact/rules-v2.json"), RULE_PROFILE);
+}
+
+fn check_profile(json: &str, profile: &str) {
+    let value = canonjson::parse_str(json).unwrap();
     let fixture: Fixture = serde_json::from_value(value).unwrap();
-    assert_eq!(fixture.profile, RULE_PROFILE);
+    assert_eq!(fixture.profile, profile);
     for case in fixture.cases {
         let hits = detect(&case.source, &RuleSet { enabled: case.enabled }, RuleBudget::default()).unwrap();
         let actual: Vec<_> = hits.iter().map(|h| (h.kind, case.source[h.span.byte_start..h.span.byte_end].to_owned())).collect();

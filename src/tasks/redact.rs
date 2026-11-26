@@ -44,7 +44,7 @@ impl PiiKind {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Detector { EmailAsciiV1, PhoneAsciiV1, UrlHttpV1, IpLiteralV1, CardLuhnV1, DateIsoV1, NerSourceV1 }
+pub enum Detector { EmailAsciiV1, PhoneAsciiV1, UrlHttpV1, IpLiteralV1, CardLuhnV1, DateIsoV1, NerSourceV1, IpEndpointV1 }
 
 /// Original-source coordinates, never copied private matched text. This is
 /// descriptive input, not authority: editing must recheck every coordinate.

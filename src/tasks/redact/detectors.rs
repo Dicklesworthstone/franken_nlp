@@ -3,12 +3,12 @@
 //! calendar dates. Unicode text around a match retains exact original offsets.
 //! Homoglyph/zero-width obfuscation is NOT normalized or universally detected.
 
-use std::{collections::BTreeSet, net::IpAddr, str::FromStr};
+use std::{collections::BTreeSet, net::{IpAddr, SocketAddrV4}, str::FromStr};
 use serde::{Deserialize, Serialize};
 use super::{Detection, Detector, PiiKind, RedactError};
 use crate::validation::grounded_fields::VerifiedSourceSpan;
 
-pub const RULE_PROFILE: &str = "ascii-contact-ip-luhn-iso-date-v1";
+pub const RULE_PROFILE: &str = "ascii-contact-ip-luhn-iso-date-v2";
 const MAX_DETECTIONS: usize = 16_384;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -133,8 +133,18 @@ impl Scan<'_> {
             }
             if start > 0 && (b[start-1].is_ascii_alphanumeric() || b[start-1] == b'_') { continue; }
             if i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') { continue; }
-            if IpAddr::from_str(&self.source[start..end]).is_ok() {
+            let candidate = &self.source[start..end];
+            if IpAddr::from_str(candidate).is_ok() {
+                // Includes bracket-delimited IPv6 and IPv4-mapped IPv6.
                 self.push(start, end, PiiKind::IpAddress, Detector::IpLiteralV1)?;
+            } else if let Some((host, _)) = candidate.split_once(':')
+                && SocketAddrV4::from_str(candidate).is_ok()
+            {
+                // Admit the complete endpoint, then replace only the host.
+                // A port and the surrounding log punctuation are not PII
+                // under this rule. Parsing the whole token avoids extracting
+                // a plausible IPv4 prefix from an invalid endpoint.
+                self.push(start, start + host.len(), PiiKind::IpAddress, Detector::IpEndpointV1)?;
             }
         }
         Ok(())

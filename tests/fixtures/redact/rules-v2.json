@@ -1,0 +1,10 @@
+{
+  "profile": "ascii-contact-ip-luhn-iso-date-v2",
+  "cases": [
+    {"id":"peer-endpoints","enabled":["ip_address"],"source":"上海 peer=192.0.2.1:443, next=[2001:db8::5]:8443.","expected":[["ip_address","192.0.2.1"],["ip_address","2001:db8::5"]]},
+    {"id":"port-boundaries","enabled":["ip_address"],"source":"(198.51.100.1:0) 203.0.113.12:65535.","expected":[["ip_address","198.51.100.1"],["ip_address","203.0.113.12"]]},
+    {"id":"mapped-v6-keeps-complete-address","enabled":["ip_address"],"source":"[::ffff:192.0.2.1]:8080","expected":[["ip_address","::ffff:192.0.2.1"]]},
+    {"id":"reject-invalid-v4-endpoint","enabled":["ip_address"],"source":"192.0.2.256:443 192.0.2.1:65536 192.0.2.1:80:90","expected":[]},
+    {"id":"reject-embedded-v4-endpoint","enabled":["ip_address"],"source":"host192.0.2.1:443 192.0.2.1:443xyz 192.0.2.1:443_suffix","expected":[]}
+  ]
+}
