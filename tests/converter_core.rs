@@ -13,10 +13,10 @@ use franken_nlp::artifact::safetensors::TensorCensusEntry;
 
 #[test]
 fn pinned_source_manifest_is_closed_and_has_the_required_accounting() {
-    let manifest = ConversionSourceManifest::parse(include_str!(
-        "../docs/truth-pack/nanbeige4.2-3b.source.json"
-    ))
-    .expect("committed canonical source manifest");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("docs/truth-pack/nanbeige4.2-3b.source.json");
+    let manifest = ConversionSourceManifest::load_pinned(path)
+        .expect("committed source manifest must authenticate through the converter entry point");
 
     assert_eq!(manifest.files.len(), 10);
     assert_eq!(manifest.closure_total_bytes, 8_360_887_509);
