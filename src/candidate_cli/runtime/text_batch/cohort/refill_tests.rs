@@ -22,8 +22,10 @@ fn read_ahead_is_the_admitted_queue_not_the_smaller_live_slot_count() {
     assert_eq!(window.ids, ["a", "b", "c", "d"]); assert_eq!(ledger.records, 4);
     assert_eq!(bytes, prefix.len() as u64); assert_eq!(input.position(), bytes);
     assert_eq!(command.refill_strategy(window.ids.len()).unwrap().unwrap().0, 1);
-    let expected: u64 = window.prepared.iter().map(|plan| plan.planned_work().forward_positions).sum();
-    assert_eq!(ledger.work.forward_positions, expected);
+    let expected = window.prepared.iter().try_fold(Int8Work::default(), |total, plan|
+        total.checked_add(plan.planned_work())).unwrap();
+    assert_eq!(ledger.work, expected);
+    assert_eq!(ledger.execution_checkpoints, command.common.max_checkpoints);
 }
 #[test]
 fn partial_window_keeps_full_item_sample_and_corpus_work_identity() {
@@ -39,6 +41,7 @@ fn partial_window_keeps_full_item_sample_and_corpus_work_identity() {
         assert_eq!(plan.execution_identity(), individual.execution_identity());
     }
     assert_eq!(ledger.records, 2);
+    assert_eq!(ledger.execution_checkpoints, command.common.max_checkpoints);
 }
 #[test]
 fn one_live_slot_does_not_admit_only_one_frames_output_budget() {

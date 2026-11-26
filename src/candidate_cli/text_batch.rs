@@ -1,6 +1,7 @@
 //! Bounded, fail-fast text generation corpus protocol, not token streaming.
 use super::*;
-use serde::{Deserialize, Serialize};
+use crate::native_engine::{portable_int8::ProjectionWork, strict_int8::Int8Work};
+use serde::Deserialize;
 use std::{collections::BTreeSet, io::BufRead};
 
 pub(super) const PROTOCOL: &str = "fnlp-candidate-text-batch-v1";
@@ -40,13 +41,26 @@ pub(crate) struct TextBatchCommand {
     /// Sum of admitted worst-case projected logits, without refunds.
     #[arg(long, default_value_t = 100_000_000_000)]
     pub(super) max_total_projected_logits: u64,
+    /// Sum of all admitted QK/value attention pairs, including every decoder layer.
+    #[arg(long, default_value_t = 1_000_000_000_000)]
+    pub(super) max_total_attention_pairs: u64,
+    /// Sum of decoder AND output-head projection dot products, without refunds.
+    #[arg(long, default_value_t = 10_000_000_000_000)]
+    pub(super) max_total_dot_products: u64,
+    /// Sum of decoder AND output-head projection multiply-accumulates.
+    #[arg(long, default_value_t = 1_000_000_000_000_000)]
+    pub(super) max_total_multiply_accumulates: u64,
+    /// Sum of full max-checkpoints quotas reserved once per execution window.
+    /// A serial record is one window; refilling a cohort never starts a new one.
+    #[arg(long, default_value_t = 1_000_000_000_000)]
+    pub(super) max_total_execution_checkpoints: u64,
 }
 
 pub(super) fn definition() -> clap::Command {
     input_encoding::definition(TextBatchCommand::augment_args(clap::Command::new("text-batch")
         .about("Generate or chat over bounded NDJSON with one resident local INT8 model")
         .long_about("Explicit non-certified local candidate only. Each generate record is {\"id\":\"unique\",\"prompt\":\"...\"}; chat uses a messages array instead. Optional sample_index is a u64. IDs, not physical row positions, address seeded draws. Generation options apply to every record. max-input-bytes includes each record's JSON framing; max-checkpoints is per native invocation (one record by default, one whole cohort/window with --cohort-rows); timeout-seconds covers the entire invocation. One model is loaded lazily and reused. --cohort-rows groups 1..=64 documents. With --active-rows N, that group becomes a bounded preplanned FIFO window with N live KV/sampler slots: a finished slot refills while other requests continue. N must be 1..=cohort-rows. Refilling slots each reserve the longest queued context. --prefill-rows bounds TOTAL prompt/decode token rows per pack, not tokens per document; when refilling, omission uses the actual live-slot ceiling as the token width. Preparation and all retained outputs still scale with the entire queued window, not active-rows; extra packed scratch is separately admitted. Without active-rows the existing fixed-cohort modes are unchanged. Output is ordered completed-result NDJSON, never provisional tokens. Every request in the current window must finish and validate before its first result is published. The batch_complete frame plus successful process exit is required for whole-corpus success. Invalid input, duplicate IDs, budgets, native failure or a broken output stream stop the corpus without retries; earlier completed windows remain valid. No slot refill renews work or checkpoint budgets. Empty input completes without opening the model. Input is read in bounded windows, not during native execution. Blocking IO is cooperative, not preemptible. No network or tool execution."))
-        .after_help("--input-encoding safe-bpe-v1 opts every complete record into bounded byte-preserving, control-excluding BPE. One tokenizer work allowance covers all messages in that record; the next record gets a fresh allowance. Native work, total input/output, record count and the invocation deadline never reset. The same exact record plans execute in serial, fixed cohorts and refilling windows. The selected encoding and its limits are reported on results and batch_complete; byte-fallback retains the existing wire shape. Per-record encoding overrides are not accepted."))
+        .after_help("--input-encoding safe-bpe-v1 opts every complete record into bounded byte-preserving, control-excluding BPE. One tokenizer work allowance covers all messages in that record; the next record gets a fresh allowance. The five --max-total-* native work ceilings cover forward positions, projected logits, attention pairs, decoder/head dot products and multiply-accumulates across the ENTIRE invocation. Exact worst-case compiled work is reserved before inference and never refunded for early EOS or failed execution. --max-total-execution-checkpoints separately bounds the sum of full --max-checkpoints allowances: one per serial record or whole cohort/refilling window, never per live slot or prompt morsel. All work axes and checkpoint quota are admitted together before a window can execute. Native work, total input/output, record count and the invocation deadline never reset. The same exact record plans execute in serial, fixed cohorts and refilling windows. batch_complete reports complete reserved_native_work and reserved_execution_checkpoints, not actual work. The selected encoding and its limits are reported on results and batch_complete; byte-fallback adds no encoding field. Per-record encoding overrides are not accepted."))
 }
 
 impl TextBatchCommand {
@@ -69,7 +83,10 @@ impl TextBatchCommand {
             || self.max_total_input_bytes == 0 || self.max_total_input_bytes > 16 * 1024 * MIB
             || self.max_total_output_bytes < FOOTER_BYTES as u64
             || self.max_total_output_bytes > 16 * 1024 * MIB
-            || self.max_total_forward_positions == 0 || self.max_total_projected_logits == 0 {
+            || self.max_total_forward_positions == 0 || self.max_total_projected_logits == 0
+            || self.max_total_attention_pairs == 0 || self.max_total_dot_products == 0
+            || self.max_total_multiply_accumulates == 0 || self.max_total_execution_checkpoints == 0
+            || self.common.max_checkpoints > self.max_total_execution_checkpoints {
             return Err(CandidateError::Arguments);
         }
         // Shared tokenizer and whole-corpus ID set remain single charges;
@@ -93,6 +110,13 @@ impl TextBatchCommand {
             .and_then(|n| n.checked_add(65_536)).ok_or(CandidateError::Arguments)?;
         if floor > limits.preparation_bytes { return Err(CandidateError::Arguments); }
         Ok(limits)
+    }
+    fn work_ceiling(&self) -> Int8Work {
+        Int8Work { forward_positions: self.max_total_forward_positions,
+            projected_logits: self.max_total_projected_logits,
+            attention_pairs: self.max_total_attention_pairs,
+            projections: ProjectionWork { dot_products: self.max_total_dot_products,
+                multiply_accumulates: self.max_total_multiply_accumulates } }
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
         let limits = self.validate()?;
@@ -165,20 +189,35 @@ pub(super) fn read_line(input: &mut impl BufRead, cap: usize, total: &mut u64, t
     String::from_utf8(bytes).map(Some).map_err(|_| CandidateError::Input)
 }
 
-#[derive(Clone, Copy, Default, Serialize)]
-pub(super) struct ReservedWork { pub forward_positions: u64, pub projected_logits: u64 }
 #[derive(Default)]
-pub(super) struct Ledger { ids: BTreeSet<String>, pub records: u64, pub work: ReservedWork }
+pub(super) struct Ledger {
+    ids: BTreeSet<String>, pub records: u64, pub work: Int8Work,
+    pub execution_checkpoints: u64,
+}
 impl Ledger {
-    pub(super) fn admit(&mut self, id: &str, work: ReservedWork, command: &TextBatchCommand) -> Result<(), CandidateError> {
+    /// Reserve the whole compiled request, not its eventual early-stop cost.
+    /// Only the first record in a native invocation charges its full poll quota;
+    /// fixed cohorts and refilling windows share that single allowance. Check
+    /// every axis before changing IDs, counts, work or checkpoints. No refunds.
+    pub(super) fn admit(&mut self, id: &str, work: Int8Work, starts_execution: bool,
+        command: &TextBatchCommand) -> Result<(), CandidateError> {
         if self.records >= command.max_records || self.ids.contains(id) { return Err(CandidateError::Batch); }
-        let forward_positions = self.work.forward_positions.checked_add(work.forward_positions)
-            .filter(|&n| n <= command.max_total_forward_positions).ok_or(CandidateError::Batch)?;
-        let projected_logits = self.work.projected_logits.checked_add(work.projected_logits)
-            .filter(|&n| n <= command.max_total_projected_logits).ok_or(CandidateError::Batch)?;
+        let reserved = self.work.checked_add(work).map_err(|_| CandidateError::Batch)?;
+        let ceiling = command.work_ceiling();
+        if reserved.forward_positions > ceiling.forward_positions
+            || reserved.projected_logits > ceiling.projected_logits
+            || reserved.attention_pairs > ceiling.attention_pairs
+            || !reserved.projections.fits(ceiling.projections) {
+            return Err(CandidateError::Batch);
+        }
+        let quota = if starts_execution { command.common.max_checkpoints } else { 0 };
+        let checkpoints = self.execution_checkpoints.checked_add(quota)
+            .filter(|&n| n <= command.max_total_execution_checkpoints).ok_or(CandidateError::Batch)?;
+        let records = self.records.checked_add(1).ok_or(CandidateError::Batch)?;
         self.ids.insert(id.to_owned());
-        self.records += 1;
-        self.work = ReservedWork { forward_positions, projected_logits };
+        self.records = records;
+        self.work = reserved;
+        self.execution_checkpoints = checkpoints;
         Ok(())
     }
 }
@@ -325,20 +364,131 @@ mod tests {
     fn duplicate_ids_and_whole_corpus_work_limits_do_not_reset_per_record() {
         let command = command(&["--max-total-forward-positions", "10", "--max-total-projected-logits", "20"]);
         let mut ledger = Ledger::default();
-        assert!(ledger.admit("a", ReservedWork { forward_positions: 6, projected_logits: 10 }, &command).is_ok());
-        assert!(ledger.admit("a", ReservedWork::default(), &command).is_err());
-        assert!(ledger.admit("b", ReservedWork { forward_positions: 5, projected_logits: 1 }, &command).is_err());
+        assert!(ledger.admit("a", Int8Work { forward_positions: 6, projected_logits: 10,
+            ..Int8Work::default() }, true, &command).is_ok());
+        assert!(ledger.admit("a", Int8Work::default(), true, &command).is_err());
+        assert!(ledger.admit("b", Int8Work { forward_positions: 5, projected_logits: 1,
+            ..Int8Work::default() }, true, &command).is_err());
         assert_eq!(ledger.records, 1); assert_eq!(ledger.work.forward_positions, 6);
-        assert!(ledger.admit("b", ReservedWork { forward_positions: 4, projected_logits: 10 }, &command).is_ok());
+        assert_eq!(ledger.execution_checkpoints, command.common.max_checkpoints);
+        assert!(ledger.admit("b", Int8Work { forward_positions: 4, projected_logits: 10,
+            ..Int8Work::default() }, true, &command).is_ok());
         assert_eq!(ledger.records, 2);
     }
     #[test]
     fn record_limit_and_id_memory_are_admitted_before_io() {
         let command = command(&["--max-records", "1"]); let mut ledger = Ledger::default();
-        ledger.admit("a", ReservedWork::default(), &command).unwrap();
-        assert!(ledger.admit("b", ReservedWork::default(), &command).is_err());
+        ledger.admit("a", Int8Work::default(), true, &command).unwrap();
+        assert!(ledger.admit("b", Int8Work::default(), true, &command).is_err());
         assert!(super::tests::command(&["--max-records", "1000000"]).validate().is_err());
         assert!(super::tests::command(&["--max-total-output-bytes", "1"]).validate().is_err());
+    }
+    #[test]
+    fn zero_work_axes_and_unpayable_execution_quota_refuse_before_io() {
+        struct NoIo;
+        impl Read for NoIo {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("input before work admission") }
+        }
+        impl Write for NoIo {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("output before work admission") }
+            fn flush(&mut self) -> io::Result<()> { panic!("flush before work admission") }
+        }
+        for flag in ["--max-total-forward-positions", "--max-total-projected-logits",
+            "--max-total-attention-pairs", "--max-total-dot-products",
+            "--max-total-multiply-accumulates", "--max-total-execution-checkpoints"] {
+            assert_eq!(command(&[flag, "0"]).execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+        }
+        assert_eq!(command(&["--max-checkpoints", "9", "--max-total-execution-checkpoints", "8"])
+            .execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+        command(&["--max-checkpoints", "9", "--max-total-execution-checkpoints", "9"]).validate().unwrap();
+    }
+    fn axis_work(axis: usize, value: u64) -> Int8Work {
+        let mut work = Int8Work::default();
+        match axis {
+            0 => work.forward_positions = value,
+            1 => work.projected_logits = value,
+            2 => work.attention_pairs = value,
+            3 => work.projections.dot_products = value,
+            4 => work.projections.multiply_accumulates = value,
+            _ => panic!("native work axis"),
+        }
+        work
+    }
+    fn cap_axis(command: &mut TextBatchCommand, axis: usize, value: u64) {
+        match axis {
+            0 => command.max_total_forward_positions = value,
+            1 => command.max_total_projected_logits = value,
+            2 => command.max_total_attention_pairs = value,
+            3 => command.max_total_dot_products = value,
+            4 => command.max_total_multiply_accumulates = value,
+            _ => panic!("native work axis"),
+        }
+    }
+    #[test]
+    fn every_native_axis_checks_the_complete_sum_before_any_ledger_mutation() {
+        let work = Int8Work { forward_positions: 2, projected_logits: 3, attention_pairs: 5,
+            projections: ProjectionWork { dot_products: 7, multiply_accumulates: 11 } };
+        for (axis, one) in [2, 3, 5, 7, 11].into_iter().enumerate() {
+            let mut command = command(&["--max-checkpoints", "7", "--max-total-execution-checkpoints", "21"]);
+            cap_axis(&mut command, axis, 2 * one - 1);
+            let mut ledger = Ledger::default();
+            ledger.admit("first", work, true, &command).unwrap();
+            assert_eq!(ledger.admit("second", work, true, &command), Err(CandidateError::Batch));
+            assert_eq!(ledger.work, work); assert_eq!(ledger.records, 1);
+            assert_eq!(ledger.execution_checkpoints, 7); assert_eq!(ledger.ids.len(), 1);
+            assert!(!ledger.ids.contains("second"));
+            // A rejected mixed-axis reservation neither consumes the ID nor
+            // charges its already-valid native axes or checkpoint allowance.
+            cap_axis(&mut command, axis, 2 * one);
+            ledger.admit("second", work, true, &command).unwrap();
+            assert_eq!(ledger.work, work.checked_add(work).unwrap());
+            assert_eq!(ledger.records, 2); assert_eq!(ledger.execution_checkpoints, 14);
+        }
+    }
+    #[test]
+    fn overflowing_native_sums_cannot_wrap_or_charge_other_axes() {
+        for axis in 0..5 {
+            let mut command = command(&["--max-checkpoints", "2"]);
+            cap_axis(&mut command, axis, u64::MAX);
+            let mut ledger = Ledger::default();
+            let work = axis_work(axis, u64::MAX);
+            ledger.admit("first", work, true, &command).unwrap();
+            assert_eq!(ledger.admit("overflow", axis_work(axis, 1), true, &command), Err(CandidateError::Batch));
+            assert_eq!(ledger.work, work); assert_eq!(ledger.records, 1);
+            assert_eq!(ledger.execution_checkpoints, 2); assert!(!ledger.ids.contains("overflow"));
+        }
+    }
+    #[test]
+    fn whole_execution_quotas_are_nonrefundable_and_refills_do_not_renew_them() {
+        let command = command(&["--max-checkpoints", "4", "--max-total-execution-checkpoints", "8"]);
+        let mut ledger = Ledger::default();
+        let work = Int8Work { forward_positions: 1, projected_logits: 1, attention_pairs: 1,
+            projections: ProjectionWork { dot_products: 1, multiply_accumulates: 1 } };
+        for (id, starts_execution) in [("a", true), ("b", false), ("c", false)] {
+            ledger.admit(id, work, starts_execution, &command).unwrap();
+        }
+        assert_eq!(ledger.execution_checkpoints, 4);
+        // A later window gets its own full quota, even if the preceding one
+        // would have completed at EOS with fewer actual native checkpoints.
+        ledger.admit("d", work, true, &command).unwrap();
+        ledger.admit("e", work, false, &command).unwrap();
+        assert_eq!(ledger.execution_checkpoints, 8);
+        let reserved = ledger.work;
+        assert_eq!(ledger.admit("f", work, true, &command), Err(CandidateError::Batch));
+        assert_eq!(ledger.work, reserved); assert_eq!(ledger.records, 5);
+        assert_eq!(ledger.execution_checkpoints, 8); assert!(!ledger.ids.contains("f"));
+    }
+    #[test]
+    fn checkpoint_sum_overflow_preserves_ids_and_complete_native_reservations() {
+        let mut command = command(&[]);
+        command.common.max_checkpoints = u64::MAX;
+        command.max_total_execution_checkpoints = u64::MAX;
+        let mut ledger = Ledger::default();
+        ledger.admit("a", axis_work(0, 1), true, &command).unwrap();
+        let reserved = ledger.work;
+        assert_eq!(ledger.admit("b", axis_work(0, 1), true, &command), Err(CandidateError::Batch));
+        assert_eq!(ledger.work, reserved); assert_eq!(ledger.records, 1);
+        assert_eq!(ledger.execution_checkpoints, u64::MAX); assert!(!ledger.ids.contains("b"));
     }
     #[test]
     fn output_budget_reserves_completion_and_counts_short_writes() {

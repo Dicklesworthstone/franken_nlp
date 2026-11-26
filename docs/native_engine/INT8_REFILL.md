@@ -57,8 +57,8 @@ Results are retained by INPUT index, not completion order or delivery-number
 sort. EVERY request must complete and pass the existing pinned text/UTF-8/control
 finalizer before the first result of that window is published. The returned
 output guard survives ordered canonical serialization, each write and flush.
-The existing per-record NDJSON schema and mandatory batch_complete frame are
-unchanged. Successful process exit is also required for whole-corpus success.
+The existing per-record NDJSON schema is unchanged. A mandatory `batch_complete`
+frame and successful process exit are also required for whole-corpus success.
 
 A native, cancellation, decoder or task-finalization failure aborts the entire
 current window with no terminal sibling results and no retry. Earlier windows
@@ -93,7 +93,19 @@ These are modeled process-resource reservations, not measured OS RSS guarantees.
 One hosted invocation owns one deadline/checkpoint budget across all refills.
 CLI max-checkpoints is per complete window, never replenished per slot. The
 invocation-wide timeout still covers the entire corpus including IO, planning,
-model loading and delivery. Whole-corpus work/input/output ceilings never reset.
+model loading and delivery. `--max-total-execution-checkpoints` separately caps
+the sum of full window quotas. One quota is reserved on the first planned row
+of each window, including a partial tail; retirement, refill, prompt packing and
+early EOS never refund or renew it.
+
+The whole-corpus work ledger retains all five exact compiled axes: forward
+positions, projected logits, attention pairs, decoder/head projection dot products
+and multiply-accumulates. The matching `--max-total-*` ceilings never reset at a
+window boundary, and a rejected reservation cannot partially spend another axis
+or a checkpoint quota. The `batch_complete` footer reports this complete
+`reserved_native_work`, including nested `projections` counters, and
+`reserved_execution_checkpoints`. These are reserved ceilings rather than actual
+native work. Whole-corpus input/output and record ceilings remain independent.
 
 ## Library path and receipts
 

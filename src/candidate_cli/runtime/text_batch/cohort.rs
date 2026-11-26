@@ -102,8 +102,9 @@ fn collect(first: Record, input: &mut impl BufRead, planner: &Planner, command: 
         planning_checkpoint(control)?;
         let work = plan.planned_work();
         if work.forward_positions > command.common.context_tokens as u64 { return Err(CandidateError::Planning); }
-        ledger.admit(&id, ReservedWork { forward_positions: work.forward_positions,
-            projected_logits: work.projected_logits }, command)?;
+        // The complete queued window gets one native control allowance. Row
+        // refill and packed prompt morsels cannot purchase additional polls.
+        ledger.admit(&id, work, prepared.is_empty(), command)?;
         ids.push(id); prepared.push(plan);
         // Do not consume a record beyond a full group or the record ceiling.
         // After publishing this admitted group, any excess record will fail

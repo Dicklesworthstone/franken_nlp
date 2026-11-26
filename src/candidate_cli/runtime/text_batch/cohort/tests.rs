@@ -90,15 +90,16 @@ fn packed_strategy_preserves_partial_tail_plans_and_whole_corpus_work() {
         let cohort = collect(first, &mut input, &selected_planner, &selected, &mut ledger, &mut bytes, 3,
             &mut NeverCancelled).unwrap();
         assert!(cohort.eof); assert_eq!(cohort.ids, ["a", "b"]); assert_eq!(ledger.records, 2);
-        let mut positions = 0; let mut logits = 0;
+        let mut work = Int8Work::default();
         for (id, prepared) in cohort.ids.iter().zip(&cohort.prepared) {
             let record = wire::parse_record(ordinary.task, &line(id), ordinary.common.max_input_bytes).unwrap();
             let (_, scalar) = ordinary_planner.prepare(record).unwrap();
             assert_eq!(prepared.execution_identity(), scalar.execution_identity());
             assert_eq!(prepared.planned_work(), scalar.planned_work());
-            positions += scalar.planned_work().forward_positions; logits += scalar.planned_work().projected_logits;
+            work = work.checked_add(scalar.planned_work()).unwrap();
         }
-        assert_eq!(ledger.work.forward_positions, positions); assert_eq!(ledger.work.projected_logits, logits);
+        assert_eq!(ledger.work, work);
+        assert_eq!(ledger.execution_checkpoints, selected.common.max_checkpoints);
     }
 }
 
@@ -131,8 +132,8 @@ fn compact_record_identity_is_the_same_in_serial_fixed_and_refilling_schedules()
             assert_eq!(plan.execution_identity(), expected.execution_identity());
             assert_eq!(plan.planned_work(), expected.planned_work());
         }
-        assert_eq!(ledger.work.forward_positions, expected.iter().map(|plan| plan.planned_work().forward_positions).sum::<u64>());
-        assert_eq!(ledger.work.projected_logits, expected.iter().map(|plan| plan.planned_work().projected_logits).sum::<u64>());
+        assert_eq!(ledger.work, expected[0].planned_work().checked_add(expected[1].planned_work()).unwrap());
+        assert_eq!(ledger.execution_checkpoints, selected.common.max_checkpoints);
     }
 }
 
@@ -145,13 +146,20 @@ fn fresh_compact_record_work_cannot_renew_native_corpus_limits_at_a_window_bound
         "--max-tokenizer-pair-bytes", &bytes_cap];
     let line = |id: &str| format!("{}\n", serde_json::json!({"id": id, "prompt": text}));
     for active in [None, Some(1)] {
-        for cap_positions in [false, true] {
+        for axis in 0..5 {
             let mut selected = command(&flags); selected.cohort_rows = Some(2); selected.active_rows = active;
             let selected_planner = planner(&selected);
             let (_, one) = selected_planner.prepare(wire::parse_record(selected.task, &line("a"),
                 selected.common.max_input_bytes).unwrap()).unwrap();
-            if cap_positions { selected.max_total_forward_positions = 2 * one.planned_work().forward_positions; }
-            else { selected.max_total_projected_logits = 2 * one.planned_work().projected_logits; }
+            let twice = one.planned_work().checked_add(one.planned_work()).unwrap();
+            match axis {
+                0 => selected.max_total_forward_positions = twice.forward_positions,
+                1 => selected.max_total_projected_logits = twice.projected_logits,
+                2 => selected.max_total_attention_pairs = twice.attention_pairs,
+                3 => selected.max_total_dot_products = twice.projections.dot_products,
+                4 => selected.max_total_multiply_accumulates = twice.projections.multiply_accumulates,
+                _ => unreachable!(),
+            }
             selected.validate().unwrap();
             let prefix = line("a") + &line("b");
             let mut input = Cursor::new(prefix.clone() + &line("c") + &line("d"));
@@ -160,16 +168,42 @@ fn fresh_compact_record_work_cannot_renew_native_corpus_limits_at_a_window_bound
             let cohort = collect(first, &mut input, &selected_planner, &selected, &mut ledger,
                 &mut bytes, 2, &mut NeverCancelled).unwrap();
             assert_eq!(cohort.ids, ["a", "b"]); assert_eq!(input.position(), prefix.len() as u64);
-            let reserved_positions = ledger.work.forward_positions; let reserved_logits = ledger.work.projected_logits;
+            let reserved = ledger.work;
+            let checkpoints = ledger.execution_checkpoints;
             let next = read_record(&mut input, &selected, &mut bytes).unwrap().unwrap();
             let consumed = bytes;
             assert!(matches!(collect(next, &mut input, &selected_planner, &selected, &mut ledger,
                 &mut bytes, 2, &mut NeverCancelled), Err(CandidateError::Batch)));
-            assert_eq!(ledger.records, 2); assert_eq!(ledger.work.forward_positions, reserved_positions);
-            assert_eq!(ledger.work.projected_logits, reserved_logits);
+            assert_eq!(ledger.records, 2); assert_eq!(ledger.work, reserved);
+            assert_eq!(ledger.execution_checkpoints, checkpoints);
             assert_eq!(bytes, consumed); assert_eq!(input.position(), consumed);
             assert_eq!(consumed, (prefix.len() + line("c").len()) as u64);
         }
+    }
+}
+
+#[test]
+fn checkpoint_limit_stops_a_later_whole_window_without_charging_any_of_its_work() {
+    for active in [None, Some(1), Some(2)] {
+        let mut selected = command(&["--max-checkpoints", "7", "--max-total-execution-checkpoints", "7"]);
+        selected.cohort_rows = Some(2); selected.active_rows = active;
+        let planner = planner(&selected);
+        let prefix = line("a") + &line("b");
+        let mut input = Cursor::new(prefix.clone() + &line("c") + &line("d"));
+        let mut bytes = 0; let mut ledger = Ledger::default();
+        let first = read_record(&mut input, &selected, &mut bytes).unwrap().unwrap();
+        let window = collect(first, &mut input, &planner, &selected, &mut ledger,
+            &mut bytes, 2, &mut NeverCancelled).unwrap();
+        assert_eq!(window.ids, ["a", "b"]); assert_eq!(ledger.execution_checkpoints, 7);
+        let reserved = ledger.work;
+        let next = read_record(&mut input, &selected, &mut bytes).unwrap().unwrap();
+        let consumed = bytes;
+        assert!(matches!(collect(next, &mut input, &planner, &selected, &mut ledger,
+            &mut bytes, 2, &mut NeverCancelled), Err(CandidateError::Batch)));
+        assert_eq!(ledger.work, reserved); assert_eq!(ledger.records, 2);
+        assert_eq!(ledger.execution_checkpoints, 7); assert_eq!(bytes, consumed);
+        assert_eq!(input.position(), consumed);
+        assert_eq!(consumed, (prefix.len() + line("c").len()) as u64);
     }
 }
 

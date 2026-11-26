@@ -3,7 +3,8 @@
 use super::*;
 use super::source_tasks::Session;
 use crate::candidate_cli::text_batch::{self as wire, Content, Ledger, Output, Record,
-    ReservedWork, TextBatchCommand, FOOTER_BYTES, PROTOCOL};
+    TextBatchCommand, FOOTER_BYTES, PROTOCOL};
+use crate::native_engine::strict_int8::Int8Work;
 use crate::tasks::chat::quantized::PreparedInt8Chat;
 use crate::native_engine::decode::{DecodeCancellationKind, DecodeStepControl};
 use crate::tokenizer::untrusted::UntrustedEncoding;
@@ -103,8 +104,7 @@ fn run(session: &Session, command: &TextBatchCommand, limits: Limits,
         let (id, prepared) = planner.prepare_with_control(record, &mut session.control())?;
         let work = prepared.planned_work();
         if work.forward_positions > args.context_tokens as u64 { return Err(CandidateError::Planning); }
-        ledger.admit(&id, ReservedWork { forward_positions: work.forward_positions,
-            projected_logits: work.projected_logits }, command)?;
+        ledger.admit(&id, work, true, command)?;
         // Admit worst-case delivery before any model load or native request.
         transport.admit_frame(frame_cap)?;
         if model.is_none() { model = Some(session.load(args, limits, &facts, cancellation.clone())?); }
@@ -141,7 +141,8 @@ struct ResultFrame<'a, T: Serialize> {
 struct Complete<'a> {
     protocol: &'static str, schema_version: u32, event: &'static str,
     scope: &'static str, evidence: &'static str, records: u64, input_bytes: u64,
-    result_frame_bytes: u64, reserved_native_work: ReservedWork,
+    result_frame_bytes: u64, reserved_native_work: Int8Work,
+    reserved_execution_checkpoints: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     input_encoding: Option<&'a UntrustedEncoding>,
 }
@@ -150,6 +151,7 @@ fn complete<W: Write>(ledger: &Ledger, input_bytes: u64, encoding: &UntrustedEnc
     let frame = Complete { protocol: PROTOCOL, schema_version: 1, event: "batch_complete",
         scope: "real-artifact-current-candidate", evidence: "non_authoritative", records: ledger.records,
         input_bytes, result_frame_bytes: output.written, reserved_native_work: ledger.work,
+        reserved_execution_checkpoints: ledger.execution_checkpoints,
         input_encoding: input_encoding::reported_policy(encoding) };
     publish_checked(&frame, FOOTER_BYTES, output, check)
 }
@@ -235,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn result_and_completion_report_encoding_without_changing_default_frames_or_expired_delivery() {
+    fn result_and_completion_report_encoding_and_full_work_without_expired_delivery() {
         use std::cell::Cell;
         let facts = ArtifactIdentity { model_id: "Nanbeige4.2-3B".into(),
             revision: "f56ec5a9650268aa098496734743c25ea778bd2d".into(), recipe_id: "framing-only-fixture".into(),
@@ -265,7 +267,9 @@ mod tests {
                 assert_eq!(completed, concat!("{\"protocol\":\"fnlp-candidate-text-batch-v1\",\"schema_version\":1,",
                     "\"event\":\"batch_complete\",\"scope\":\"real-artifact-current-candidate\",",
                     "\"evidence\":\"non_authoritative\",\"records\":0,\"input_bytes\":0,",
-                    "\"result_frame_bytes\":0,\"reserved_native_work\":{\"forward_positions\":0,\"projected_logits\":0}}\n").as_bytes());
+                    "\"result_frame_bytes\":0,\"reserved_native_work\":{\"forward_positions\":0,\"projected_logits\":0,",
+                    "\"attention_pairs\":0,\"projections\":{\"dot_products\":0,\"multiply_accumulates\":0}},",
+                    "\"reserved_execution_checkpoints\":0}\n").as_bytes());
             } else { assert_eq!(footer["input_encoding"], serde_json::to_value(&policy).unwrap()); }
 
             // First check admits serialization; the second observes expiration
@@ -277,5 +281,29 @@ mod tests {
             assert_eq!(complete(&Ledger::default(), 0, &policy, &mut output, &check), Err(CandidateError::Timeout));
             assert_eq!(checks.get(), 2); assert_eq!(output.written, 0); assert!(refused.is_empty());
         }
+    }
+    #[test]
+    fn completion_discloses_reserved_decoder_work_and_full_window_checkpoint_quotas() {
+        use crate::native_engine::portable_int8::ProjectionWork;
+        let command = TextBatchCommand::from_matches(&wire::definition().try_get_matches_from([
+            "text-batch", "--model", "unused.fnlpq", "--memory-mib", "8192", "--max-checkpoints", "17",
+        ]).unwrap()).unwrap();
+        let first = Int8Work { forward_positions: 2, projected_logits: 3, attention_pairs: 5,
+            projections: ProjectionWork { dot_products: 7, multiply_accumulates: 11 } };
+        let second = Int8Work { forward_positions: 13, projected_logits: 17, attention_pairs: 19,
+            projections: ProjectionWork { dot_products: 23, multiply_accumulates: 29 } };
+        let mut ledger = Ledger::default();
+        ledger.admit("first", first, true, &command).unwrap();
+        ledger.admit("second", second, false, &command).unwrap();
+        let mut bytes = Vec::new(); let mut output = Output::new(&mut bytes, FOOTER_BYTES as u64);
+        complete(&ledger, 31, &UntrustedEncoding::ByteFallback, &mut output, &|| Ok(())).unwrap();
+        let footer: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(footer["reserved_native_work"], serde_json::json!({
+            "forward_positions": 15, "projected_logits": 20, "attention_pairs": 24,
+            "projections": {"dot_products": 30, "multiply_accumulates": 40},
+        }));
+        assert_eq!(footer["reserved_execution_checkpoints"], 17);
+        assert_eq!(footer["records"], 2); assert_eq!(footer["input_bytes"], 31);
+        assert!(footer.get("actual_native_work").is_none());
     }
 }

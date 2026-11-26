@@ -2,7 +2,8 @@
 
 `fnlp candidate text-batch` processes bounded NDJSON with one explicitly selected
 local current-candidate INT8 artifact. The model is loaded lazily once and reused
-for sequential hosted requests; this is not grouped-forward or parallel batching.
+for sequential hosted requests by default. Explicit bounded document cohorts and
+slot-refilling windows are described in `INT8_COHORTS.md` and `INT8_REFILL.md`.
 An empty input produces a completion frame without opening model metadata or weights.
 This source increment has not been compiled or exercised with model weights.
 It does not certify the candidate format, artifact, runtime, quality or performance.
@@ -74,9 +75,26 @@ is the physical one-based record order; it is not a sampling address.
 line endings. `--max-total-input-bytes`, `--max-records`, and
 `--max-total-output-bytes` bound the complete corpus. `--timeout-seconds` covers
 input, preparation, loading, execution and delivery across the entire invocation;
-blocking IO is not preempted. `--max-checkpoints` remains a per-record native
-limit. Whole-corpus forward/logit limits conservatively charge each compiled
-plan's worst-case work before execution, without refunding early EOS savings.
+blocking IO is not preempted. All five native work ceilings apply to the complete
+invocation:
+
+| Flag | Reserved work |
+|---|---|
+| `--max-total-forward-positions` | Complete logical decoder positions |
+| `--max-total-projected-logits` | Output-head logits |
+| `--max-total-attention-pairs` | QK/value attention pairs across every logical layer |
+| `--max-total-dot-products` | Decoder and output-head projection dot products |
+| `--max-total-multiply-accumulates` | Decoder and output-head projection multiply-accumulates |
+
+Each compiled plan's complete worst-case work is charged before execution,
+without refunding early EOS savings or failed attempts. A rejected reservation
+changes none of the ID, record, native-work or checkpoint counters.
+
+`--max-checkpoints` bounds one native invocation: one serial record or one complete
+cohort/refilling window. `--max-total-execution-checkpoints` caps the sum of these
+full allowances across the corpus. Each window reserves its allowance once; later
+rows, recycled slots and prompt morsels cannot renew it. Unused checkpoints are
+not refunded. A total smaller than one declared invocation quota rejects before IO.
 Increasing the record ceiling can require a larger preparation reserve because
 the duplicate-ID set is explicitly included in the memory model.
 
@@ -88,7 +106,11 @@ and its hosted output guard survives write and flush.
 
 A final `batch_complete` frame is emitted only after EOF and successful delivery
 of every record. It reports record/input counts, preceding result-frame bytes,
-and reserved native work (not measured work or a throughput claim). The footer
+and `reserved_native_work`, including `attention_pairs` and the nested
+`projections.dot_products`/`projections.multiply_accumulates` counters. Its
+`reserved_execution_checkpoints` field reports full admitted invocation quotas.
+These are reservations, not measured work or a throughput claim. Empty input
+reports zero reservations. The footer
 is included in the total output budget and space is reserved before each native
 request. Whole-corpus success requires this footer AND successful process exit.
 

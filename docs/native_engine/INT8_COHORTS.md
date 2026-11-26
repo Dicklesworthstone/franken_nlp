@@ -53,9 +53,20 @@ frames were written; no completion frame follows a failed write/flush.
 
 `--max-checkpoints` applies to ONE native invocation: one document by default,
 one complete cohort when selected. It is not multiplied/replenished per row.
+`--max-total-execution-checkpoints` bounds the sum of full invocation quotas
+reserved across all groups, without refunding early completion. The first row
+reserves the group's quota together with its complete compiled native work;
+subsequent rows add their native work under that same quota. If any reservation
+fails, the current group never executes.
 `--timeout-seconds` remains one deadline for the entire corpus, including input,
 preparation, model loading and output. Blocking IO is cooperative, not preemptible.
-Whole-corpus record/forward/head/input/output ceilings never reset between groups.
+Whole-corpus forward-position, projected-logit, attention-pair, decoder/head dot-
+product and multiply-accumulate ceilings never reset between groups. All five
+`--max-total-*` native axes retain exact compiled worst-case sums; batching and
+early EOS do not discount them. Record/input/output ceilings remain independent.
+The terminal `batch_complete` reports complete `reserved_native_work` (including
+its nested `projections` counters) and `reserved_execution_checkpoints`, not actual
+execution costs. Per-record result frames are unchanged.
 
 Preparation admission scales retained document plans/staging by the selected
 maximum width. Large cohorts can require a larger explicit `--preparation-mib`.
