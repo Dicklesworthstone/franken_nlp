@@ -16,6 +16,9 @@
 //! for the invocation. This is not the hostile/shared-root transaction profile
 //! or a model activation capability; same-user concurrent mutation is outside
 //! this local candidate operation's authority.
+//! Mutable staging must have exactly one filesystem link. A retained stage
+//! that already aliases a published file may be read as a final cache entry,
+//! but is never reopened for append or recovery.
 
 #[cfg(feature = "asupersync-runtime")]
 pub mod http;
@@ -469,6 +472,7 @@ fn verify_and_publish_staged_artifact(
     progress: &mut LocalReconstructProgress,
     checkpoint: &mut impl FnMut(LocalReconstructProgress) -> Option<DecodeCancellationKind>,
 ) -> Result<(), PullError> {
+    check_mutable_staging_file(staging)?;
     staging.flush().map_err(|error| PullError::Publish {
         operation: "flush staging output",
         detail: error.to_string(),
@@ -500,6 +504,7 @@ fn verify_and_publish_staged_artifact(
     progress.phase = LocalReconstructPhase::Publish;
     reconstruction_checkpoint(*progress, checkpoint)?;
     check_staging_path(staging, staging_output, manifest.artifact.bytes)?;
+    check_mutable_staging_file(staging)?;
     // Hard-link publication cannot replace an existing destination. The held
     // descriptor stays alive through validation and publication; path checks
     // also detect observed replacement. They are not a no-follow transaction
@@ -560,7 +565,45 @@ fn open_staging(path: &Path, resume: bool) -> Result<File, PullError> {
     }) {
         return Err(PullError::StagingChanged("resume target changed while opening"));
     }
+    check_mutable_staging_file(&file)?;
     Ok(file)
+}
+
+/// A no-replace publication deliberately leaves staging and final names on
+/// one inode. Reopening that stage for append/truncation would modify the
+/// published artifact through its alias. Require a unique held file before
+/// every mutation, separately from readonly path/identity verification.
+/// This detects observed aliases within the stable-path candidate contract;
+/// it does not create a hostile-root or concurrent-writer capability.
+fn check_mutable_staging_file(file: &File) -> Result<(), PullError> {
+    let metadata = file.metadata().map_err(|error| PullError::Publish {
+        operation: "inspect mutable staging links", detail: error.to_string(),
+    })?;
+    if !metadata.is_file() || !has_one_file_link(&metadata) {
+        return Err(PullError::StagingChanged(
+            "mutable staging must be a regular file with exactly one filesystem link",
+        ));
+    }
+    Ok(())
+}
+
+fn has_one_file_link(metadata: &Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink() == 1
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // Unknown link ownership is not authority to change retained bytes.
+        metadata.number_of_links() == Some(1)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        false
+    }
 }
 
 // These checks detect observed pathname replacement on Unix. Other targets
@@ -769,6 +812,7 @@ fn copy_remaining_parts(
                 .map_or(available as u64, |limit| limit.saturating_sub(progress.copied_bytes))
                 .min(available as u64) as usize;
             if allowed != 0 {
+                check_mutable_staging_file(staging)?;
                 staging.write_all(&buffer[skip..skip + allowed]).map_err(|error| PullError::Publish {
                     operation: "append staging output", detail: error.to_string(),
                 })?;

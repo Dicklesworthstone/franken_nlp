@@ -151,6 +151,66 @@ fn verified_final_cache_hit_needs_neither_release_parts_nor_retained_staging() {
 }
 
 #[test]
+fn published_staging_cannot_be_resumed_as_mutable_but_final_cache_is_reusable() {
+    let fixture = Fixture::new("published-stage-alias");
+    let request = fixture.request("published");
+    reconstruct_local_release(&request).unwrap();
+    let mut retry = request.clone();
+    retry.output = fixture.root.join("different-final.fnlpq");
+    let error = reconstruct_local_release_with_options(
+        &retry, &resume_options(None), |_| None,
+    ).expect_err("publication leaves a retained hard link, never a reusable mutable inode");
+    assert!(matches!(error, PullError::StagingChanged(_)));
+    assert_eq!(fs::read(&request.output).unwrap(), fixture.artifact);
+    assert_eq!(fs::read(&request.staging_output).unwrap(), fixture.artifact);
+    assert!(!retry.output.exists());
+    let cached = verify_local_release_cache(&request.manifest,
+        &request.expected_release_manifest_sha256, &request.output, |_| None,
+    ).unwrap().expect("readonly final verification permits its retained publication link");
+    assert_eq!(cached.artifact_sha256, fixture.manifest.artifact.sha256);
+}
+
+#[test]
+fn linked_partial_staging_refuses_before_copy_and_preserves_both_names() {
+    let fixture = Fixture::new("linked-resume-prefix");
+    let request = fixture.request("resume");
+    let prior = fixture.root.join("prior-retained-file");
+    let prefix = &fixture.artifact[..137];
+    fs::write(&prior, prefix).unwrap();
+    fs::hard_link(&prior, &request.staging_output).unwrap();
+    assert!(matches!(reconstruct_local_release_with_options(
+        &request, &resume_options(None), |_| None,
+    ), Err(PullError::StagingChanged(_))));
+    assert_eq!(fs::read(&prior).unwrap(), prefix);
+    assert_eq!(fs::read(&request.staging_output).unwrap(), prefix);
+    assert!(!request.output.exists());
+}
+
+#[test]
+fn copy_rechecks_mutable_ownership_after_resume_authentication() {
+    let fixture = Fixture::new("late-resume-alias");
+    let request = fixture.request("resume");
+    let alias = fixture.root.join("retained-prefix-alias");
+    let prefix = &fixture.artifact[..137];
+    fs::write(&request.staging_output, prefix).unwrap();
+    let mut linked = false;
+    let result = reconstruct_local_release_with_options(
+        &request, &resume_options(None), |progress| {
+            if progress.phase == LocalReconstructPhase::Copy && !linked {
+                fs::hard_link(&request.staging_output, &alias).unwrap();
+                linked = true;
+            }
+            None
+        },
+    );
+    assert!(linked, "introduce the alias only after the retained prefix is authenticated");
+    assert!(matches!(result, Err(PullError::StagingChanged(_))));
+    assert_eq!(fs::read(&request.staging_output).unwrap(), prefix);
+    assert_eq!(fs::read(&alias).unwrap(), prefix);
+    assert!(!request.output.exists());
+}
+
+#[test]
 fn absent_final_is_a_cache_miss_only_after_manifest_authentication() {
     let fixture = Fixture::new("cache-miss");
     let request = fixture.request("absent");
@@ -976,6 +1036,26 @@ mod direct_acquisition {
         assert_eq!(report.downloaded_bytes, 0);
         assert_eq!(report.retained_new_bytes, 0);
         assert!(!request.staging_output.exists());
+    }
+
+    #[test]
+    fn direct_published_stage_refuses_mutable_resume_while_original_cache_hit_survives() {
+        let fixture = Fixture::new("direct-published-stage-alias");
+        let request = request(&fixture, "published");
+        fs::write(&request.staging_output, &fixture.artifact).unwrap();
+        acquire(&request, true).unwrap();
+        let mut retry = request.clone();
+        retry.output = fixture.root.join("different-direct-final.fnlpq");
+        assert!(matches!(acquire(&retry, true), Err(NetworkPullError::Manifest(
+            PullError::StagingChanged(_)
+        ))));
+        assert_eq!(fs::read(&request.output).unwrap(), fixture.artifact);
+        assert_eq!(fs::read(&request.staging_output).unwrap(), fixture.artifact);
+        assert!(!retry.output.exists());
+        let cache = acquire(&request, true).unwrap();
+        assert!(cache.cache_hit);
+        assert_eq!(cache.downloaded_bytes, 0);
+        assert_eq!(cache.artifact_sha256, fixture.manifest.artifact.sha256);
     }
 
     #[test]

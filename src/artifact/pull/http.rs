@@ -577,6 +577,7 @@ fn finish_attempt(
         Ok(received)
     });
     if checked.is_err() {
+        check_mutable_part(index, file)?;
         file.set_len(start).map_err(|error| staging_error(index, "rollback-attempt", error))?;
         file.seek(SeekFrom::Start(start)).map_err(|error| staging_error(index, "seek-after-rollback", error))?;
         file.sync_all().map_err(|error| staging_error(index, "sync-rollback", error))?;
@@ -593,6 +594,7 @@ fn restore_window_prefix(
 ) -> Result<(), NetworkPullError> {
     let length = artifact_offset.checked_add(start)
         .ok_or(NetworkPullError::InvalidOptions("window rollback offset overflow"))?;
+    check_mutable_part(part, file)?;
     file.set_len(length).map_err(|error| staging_error(part, "rollback-part-windows", error))?;
     file.seek(SeekFrom::Start(length)).map_err(|error| staging_error(part, "seek-part-windows", error))?;
     file.sync_all().map_err(|error| staging_error(part, "sync-part-windows", error))?;
@@ -618,6 +620,7 @@ fn quarantine_resumed_prefix(
     mut check: impl FnMut() -> Result<(), NetworkPullError>,
 ) -> Result<PathBuf, NetworkPullError> {
     check()?;
+    check_mutable_part(part, file)?;
     if length == 0 {
         return Err(NetworkPullError::InvalidOptions("cannot quarantine an empty resume prefix"));
     }
@@ -661,6 +664,7 @@ fn quarantine_resumed_prefix(
         let want = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
         file.read_exact(&mut buffer[..want])
             .map_err(|error| staging_error(part, "read-resume-quarantine", error))?;
+        check_mutable_part(part, &copy)?;
         copy.write_all(&buffer[..want])
             .map_err(|error| staging_error(part, "write-resume-quarantine", error))?;
         copied.update(&buffer[..want]);
@@ -702,6 +706,15 @@ fn charge_body_bytes(downloaded: &mut u64, bytes: usize) -> Result<(), NetworkPu
         .map_err(|_| NetworkPullError::InvalidOptions("body byte length does not fit u64"))?;
     *downloaded = downloaded.checked_add(bytes)
         .ok_or(NetworkPullError::InvalidOptions("downloaded byte arithmetic overflow"))?;
+    Ok(())
+}
+
+fn append_range_chunk(
+    part: usize, file: &mut File, hasher: &mut Sha256, bytes: &[u8],
+) -> Result<(), NetworkPullError> {
+    check_mutable_part(part, file)?;
+    file.write_all(bytes).map_err(|error| staging_error(part, "write-range", error))?;
+    hasher.update(bytes);
     Ok(())
 }
 
@@ -773,8 +786,7 @@ async fn fetch_range(
                         if next > end - start + 1 {
                             return Err(NetworkPullError::Response { part, mirror, detail: "body exceeds requested range" });
                         }
-                        file.write_all(bytes).map_err(|error| staging_error(part, "write-range", error))?;
-                        hasher.update(bytes);
+                        append_range_chunk(part, file, hasher, bytes)?;
                         received = next;
                         let consumed = bytes.len();
                         data.advance(consumed);
@@ -939,7 +951,7 @@ fn validate_parts_dir(path: &Path) -> Result<(), NetworkPullError> {
 }
 
 fn open_partial(part: usize, path: &Path, resume: bool) -> Result<File, NetworkPullError> {
-    if path.exists() {
+    let file = if path.exists() {
         if !resume {
             return Err(NetworkPullError::Staging { part, operation: "open", detail: "partial exists and resume is disabled".to_owned() });
         }
@@ -948,11 +960,19 @@ fn open_partial(part: usize, path: &Path, resume: bool) -> Result<File, NetworkP
             return Err(NetworkPullError::Staging { part, operation: "type-check", detail: "partial must be a non-symlink regular file".to_owned() });
         }
         OpenOptions::new().read(true).write(true).open(path)
-            .map_err(|error| staging_error(part, "open-resume", error))
+            .map_err(|error| staging_error(part, "open-resume", error))?
     } else {
         OpenOptions::new().read(true).write(true).create_new(true).open(path)
-            .map_err(|error| staging_error(part, "create-new", error))
-    }
+            .map_err(|error| staging_error(part, "create-new", error))?
+    };
+    check_mutable_part(part, &file)?;
+    Ok(file)
+}
+
+fn check_mutable_part(part: usize, file: &File) -> Result<(), NetworkPullError> {
+    super::check_mutable_staging_file(file).map_err(|error| NetworkPullError::Staging {
+        part, operation: "mutable-stage-ownership", detail: error.to_string(),
+    })
 }
 
 fn hash_prefix(part: usize, file: &mut File, length: u64, cx: &PullCheckpoints<'_>) -> Result<Sha256, NetworkPullError> {
@@ -1096,6 +1116,64 @@ mod tests {
             bytes: complete.len() as u64, sha256: hex_lower(&Sha256::digest(complete)),
             mirrors: vec!["https://first.invalid/part".to_owned(), "https://second.invalid/part".to_owned()] };
         (file, part, hasher)
+    }
+
+    #[test]
+    fn published_part_staging_is_not_mutable_but_verified_final_stays_reusable() {
+        let path = attempt_path();
+        let final_path = path.with_extension("part");
+        let mut file = open_partial(0, &path, false).unwrap();
+        file.write_all(b"abcdef").unwrap();
+        let part = ReleasePart { id: 0, name: "fixture.part00".to_owned(), bytes: 6,
+            sha256: hex_lower(&Sha256::digest(b"abcdef")), mirrors: Vec::new() };
+        publish_part(0, &path, &final_path).unwrap();
+        assert!(matches!(open_partial(0, &path, true), Err(NetworkPullError::Staging {
+            operation: "mutable-stage-ownership", ..
+        })));
+        verify_final(0, &part, &final_path, || Ok(())).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"abcdef");
+        assert_eq!(fs::read(&final_path).unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn network_append_rechecks_links_before_changing_staging_or_its_hash() {
+        let path = attempt_path();
+        let alias = path.with_extension("published");
+        let mut file = open_partial(0, &path, false).unwrap();
+        let mut hasher = Sha256::new();
+        append_range_chunk(0, &mut file, &mut hasher, b"abc").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"abc", "unique staging remains appendable");
+        let before = hex_lower(&hasher.clone().finalize());
+        fs::hard_link(&path, &alias).unwrap();
+        let mut downloaded = 0;
+        charge_body_bytes(&mut downloaded, 2).unwrap();
+        assert!(matches!(append_range_chunk(0, &mut file, &mut hasher, b"DE"),
+            Err(NetworkPullError::Staging { operation: "mutable-stage-ownership", .. })));
+        assert_eq!(downloaded, 2, "refused writes do not refund received traffic");
+        assert_eq!(hex_lower(&hasher.finalize()), before);
+        assert_eq!(fs::read(&path).unwrap(), b"abc");
+        assert_eq!(fs::read(&alias).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn part_rollback_and_quarantine_refuse_an_alias_added_after_open() {
+        let path = attempt_path();
+        let alias = path.with_extension("published");
+        let mut file = open_partial(0, &path, false).unwrap();
+        let mut hasher = Sha256::new();
+        append_range_chunk(0, &mut file, &mut hasher, b"abcd").unwrap();
+        fs::hard_link(&path, &alias).unwrap();
+        let part = ReleasePart { id: 0, name: "fixture.part00".to_owned(), bytes: 6,
+            sha256: hex_lower(&Sha256::digest(b"abcdef")), mirrors: Vec::new() };
+        let failed = Err(NetworkPullError::RequestTimeout { part: 0, mirror: 0 });
+        assert!(matches!(finish_attempt(0, 0, &part, 2, 5, &mut file, &hasher, failed),
+            Err(NetworkPullError::Staging { operation: "mutable-stage-ownership", .. })));
+        assert!(matches!(restore_window_prefix(0, &mut file, 0, 2),
+            Err(NetworkPullError::Staging { operation: "mutable-stage-ownership", .. })));
+        assert!(matches!(quarantine_resumed_prefix(0, &mut file, &path, 0, 4, &hasher, || Ok(())),
+            Err(NetworkPullError::Staging { operation: "mutable-stage-ownership", .. })));
+        assert_eq!(fs::read(&path).unwrap(), b"abcd");
+        assert_eq!(fs::read(&alias).unwrap(), b"abcd");
     }
 
     #[test]

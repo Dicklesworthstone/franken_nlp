@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use super::{
     COPY_BUFFER_BYTES, MAX_RANGE_BYTES, NetworkPartsOptions, NetworkPullError, PullCheckpoints,
     ResumeMirrorPasses, USER_AGENT,
-    checkpoint, drive_attempt, exhausted_mirrors, fetch_range, hex_lower,
+    checkpoint, check_mutable_part, drive_attempt, exhausted_mirrors, fetch_range, hex_lower,
     next_range_end, quarantine_resumed_prefix, restore_window_prefix, staging_error, validate_options,
 };
 use super::super::{
@@ -395,6 +395,7 @@ fn finish_artifact_attempt(
     if checked.is_err() {
         let base_len = artifact_offset.checked_add(start)
             .ok_or(NetworkPullError::InvalidOptions("artifact rollback offset overflow"))?;
+        check_mutable_part(index, file)?;
         file.set_len(base_len).map_err(|error| staging_error(index, "rollback-artifact-attempt", error))?;
         file.seek(SeekFrom::Start(base_len)).map_err(|error| staging_error(index, "seek-artifact-rollback", error))?;
         file.sync_all().map_err(|error| staging_error(index, "sync-artifact-rollback", error))?;

@@ -92,6 +92,28 @@ fn corrupt_complete_prefix_and_oversized_staging_refuse_without_modification() {
 }
 
 #[test]
+fn direct_digest_rollback_cannot_shorten_a_published_alias() {
+    let manifest = manifest();
+    let (path, mut file) = stage(b"abcDEXY");
+    let alias = path.with_extension("published");
+    fs::hard_link(&path, &alias).unwrap();
+    let mut hasher = Sha256::new();
+    hasher.update(b"DEXY");
+    assert!(matches!(finish_artifact_attempt(1, 0, &manifest.parts[1], 3, 2, 3,
+        &mut file, &hasher, Ok(2)), Err(NetworkPullError::Staging {
+            operation: "mutable-stage-ownership", ..
+        })));
+    assert!(matches!(restore_window_prefix(1, &mut file, 3, 2),
+        Err(NetworkPullError::Staging { operation: "mutable-stage-ownership", .. })));
+    assert!(matches!(quarantine_resumed_prefix(1, &mut file, &path, 3, 4,
+        &hasher, || Ok(())), Err(NetworkPullError::Staging {
+            operation: "mutable-stage-ownership", ..
+        })));
+    assert_eq!(fs::read(&path).unwrap(), b"abcDEXY");
+    assert_eq!(fs::read(&alias).unwrap(), b"abcDEXY");
+}
+
+#[test]
 fn corruption_in_a_later_complete_part_is_found_before_any_append() {
     let manifest = manifest();
     let (path, mut file) = stage(b"abcDEXGh");
