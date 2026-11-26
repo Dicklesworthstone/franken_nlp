@@ -1,4 +1,5 @@
 //! Complete-source INT8 judgment: charged preparation, native execution and sealed publication.
+pub(in crate::candidate_cli) mod corpus;
 use super::*;
 use super::source_tasks::Session;
 use crate::{

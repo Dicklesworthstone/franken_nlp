@@ -1,4 +1,5 @@
 //! Complete-source INT8 faithfulness using the existing strict judgment wire.
+pub(super) mod corpus;
 use super::*;
 use serde::Deserialize;
 use crate::{

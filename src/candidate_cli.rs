@@ -123,6 +123,7 @@ pub(crate) enum CandidateCommand {
     Map(map::MapCommand),
     Judge(judge::JudgeCommand),
     FaithfulnessMap(faithfulness_map::FaithfulnessMapCommand),
+    FaithfulnessCorpus(faithfulness_map::corpus::FaithfulnessCorpusCommand),
     Redact(redact::RedactCommand),
     Resolve(resolve::ResolveCommand),
     Batch(batch::BatchCommand),
@@ -155,6 +156,7 @@ pub(crate) fn definition() -> clap::Command {
         .subcommand(map::definition())
         .subcommand(judge::definition())
         .subcommand(faithfulness_map::definition())
+        .subcommand(faithfulness_map::corpus::definition())
         .subcommand(redact::definition())
         .subcommand(resolve::definition())
         .subcommand(stream::definition())
@@ -190,6 +192,10 @@ impl CandidateCommand {
         }
         if name == "faithfulness-map" {
             return faithfulness_map::FaithfulnessMapCommand::from_matches(matches).map(Self::FaithfulnessMap);
+        }
+        if name == "faithfulness-corpus" {
+            return faithfulness_map::corpus::FaithfulnessCorpusCommand::from_matches(matches)
+                .map(Self::FaithfulnessCorpus);
         }
         if name == "judge" {
             return judge::JudgeCommand::from_matches(matches).map(Self::Judge);
@@ -252,6 +258,7 @@ impl CandidateCommand {
             Self::Batch(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::ScoreBatch(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::DocumentCorpus(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
+            Self::FaithfulnessCorpus(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::SemanticBatch(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::SemanticJob(command) => command.run_owned(io::stdin(), &mut io::stdout(), &mut io::stderr()),
             Self::Job(command) => command.run_owned(io::stdin(), &mut io::stdout(), &mut io::stderr()),
@@ -294,7 +301,8 @@ impl CandidateCommand {
             Self::Resolve(command) => return command.execute(input, output),
             // A borrowed stream cannot outlive the hosted blocking closure.
             // The executable dispatcher always takes run_stdio for owned IO.
-            Self::Batch(_) | Self::ScoreBatch(_) | Self::DocumentCorpus(_) | Self::SemanticBatch(_) | Self::SemanticJob(_)
+            Self::Batch(_) | Self::ScoreBatch(_) | Self::DocumentCorpus(_) | Self::FaithfulnessCorpus(_)
+                | Self::SemanticBatch(_) | Self::SemanticJob(_)
                 | Self::Job(_) | Self::ScoreJob(_) | Self::TextJob(_) | Self::Stream(_) => return Err(CandidateError::Arguments),
             Self::Text { task, args } => (task, args),
         };

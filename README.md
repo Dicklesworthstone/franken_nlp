@@ -1189,6 +1189,75 @@ definitions are present; DSR compilation and executable/model qualification
 remain pending. See the [resident judgment guide](docs/candidate-judge-corpus.md)
 for corpus limits and `NlpEngine::batch_int8_judge_scheduled`.
 
+## Implemented candidate INT8 complete-source faithfulness corpora
+
+`fnlp candidate faithfulness-corpus` checks an ordered retrieval or evidence
+log with one resident native INT8 model. Each strict NDJSON record supplies
+an original source in `text` and its exact claim in `task_args.claim`:
+
+```json
+{"id":"retrieval-1","text":"The original retrieved source, without shortening or rewriting.","task_args":{"claim":"The exact claim to check against this source."}}
+{"id":"retrieval-2","text":"A second complete source.","task_args":{"claim":"The next unchanged claim."}}
+```
+
+The invocation requires a separate fixed `FaithfulnessPolicy` file. For
+example, `faithfulness-policy.json` can contain:
+
+```json
+{
+  "minimum_candidate_weight_ppm": 700000,
+  "minimum_margin_milli": 100,
+  "evidence_window_bytes": 256,
+  "max_evidence_windows": 8,
+  "max_evidence_spans": 4
+}
+```
+
+```sh
+fnlp candidate faithfulness-corpus retrieval-log.ndjson \
+  --policy faithfulness-policy.json \
+  --model ./model.fnlpq --memory-mib 32768 \
+  --input-encoding safe-bpe-v1 \
+  --compute-threads 4 --prefill-rows 4
+```
+
+Each original source is losslessly partitioned using the unchanged claim's
+actual prompt capacity. Every chunk and evidence head must complete before
+the document can succeed. The result retains the complete chunk judgments,
+supporting and contrary evidence at original byte/scalar coordinates, and
+the existing coverage/conflict reduction. Exhausted work, a failed chunk or
+cancellation cannot publish a successful prefix of that source. Policies are
+uncalibrated, and independent chunk judgments do not establish inference
+across contexts or guarantee the claim's factual correctness.
+
+`--max-input-bytes` bounds the combined decoded source and claim;
+`--max-line-bytes` bounds their NDJSON representation. Chunk results,
+retained evidence and complete document output have separate ceilings.
+All five native work limits cover the whole invocation. Compact input also
+has one per-document allowance covering sizing probes, evidence heads and
+execution reconstruction, plus all four `--max-total-tokenizer-*` invocation
+ceilings. Work spent before rejected or cancelled preparation stays spent.
+The original cooperative deadline and checkpoint allowance span the stream.
+The existing `{"cmd":"flush"}` record starts a new duplicate-ID epoch without
+renewing any work or deadline allowance.
+
+Results remain ordered. Earlier complete records survive a later failure;
+whole-stream success requires both `run_complete` and exit status 0. Candidate
+provenance identifies `judgment_mode: "faithfulness"` and
+`complete_document: true`. The command uses owned IO and supports byte
+fallback, compact input, bounded prompt prefill, persistent CPU teams, and
+their combination. It admits the complete map, transport, encoder, output
+and worker storage before opening the policy, population or model.
+
+The library entrypoint is
+`NlpEngine::batch_int8_faithfulness_documents_scheduled`, configured by
+`FaithfulnessDocumentCorpusConfig`; the pure
+`int8_faithfulness_document_corpus_requirements` quote includes transport and
+all retained chunk identities. This live corpus path does not create a
+retained job. Source review and focused regression definitions are present;
+DSR compilation, executable regressions and real-model qualification remain
+pending.
+
 ## Implemented candidate INT8 compact retained scoring jobs
 
 `fnlp candidate score-job start|resume --task classify|sentiment|judge` accepts
