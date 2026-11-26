@@ -181,6 +181,122 @@ fn every_precancelled_cause_refuses_before_formation_and_survives_drain() {
 }
 
 #[test]
+fn every_cause_during_physical_drain_suppresses_completed_projection_output() {
+    #[derive(Debug)]
+    struct Completed {
+        children: Arc<AtomicUsize>, results: Arc<AtomicUsize>, expected_children: usize,
+    }
+    impl Drop for Completed {
+        fn drop(&mut self) {
+            assert_eq!(self.children.load(Ordering::SeqCst), self.expected_children,
+                "completed output must remain owned through physical worker drain");
+            self.results.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        for batch_rows in [1, 3] {
+            let (weights, _) = projection_fixture(4);
+            let width = 3;
+            let mut workspace = Workspace::with_batch_rows(width, 4, batch_rows).unwrap();
+            let token = CancellationToken::default();
+            // Workers cannot leave the idle command loop until the coordinator
+            // has made its last pre-join checkpoint and disconnected the lanes.
+            workspace.cancel_on_exit = Some((token.clone(), cause));
+            let children = track_children(&mut workspace);
+            let results = Arc::new(AtomicUsize::new(0));
+            let completed_rows = AtomicUsize::new(0);
+            let shared = RunShared::new(limits(100_000), token.clone()).unwrap();
+            let error = run_scope(&Cx::for_testing(), &weights, &mut workspace, width,
+                PackedInt4Kernel::scalar(), shared, |_, control, executor| {
+                    let mut output = vec![Bf16::default(); 3 * batch_rows];
+                    executor.project_batch_bf16_into(Int4ProjectionOp::Head, &batch_inputs(batch_rows),
+                        LinearRows::Selected(&[0, 3, 5]), &mut output, control).map_err(native_error)?;
+                    assert_eq!(executor.stats().completed_projections, 1);
+                    completed_rows.store(executor.stats().completed_rows as usize, Ordering::SeqCst);
+                    assert_eq!(token.cause(), None, "cancellation belongs to physical drain");
+                    assert_eq!(children.load(Ordering::SeqCst), 0);
+                    Ok((Completed { children: Arc::clone(&children), results: Arc::clone(&results),
+                        expected_children: width - 1 }, output))
+                }).and_then(|_| -> Result<(), HostedError> {
+                    panic!("cancelled joined team reached successful output publication")
+                }).unwrap_err();
+            assert!(matches!(error, HostedError::Stopped { stop: RunStop { kind, .. }, task_error: None }
+                if kind == cause));
+            assert_eq!(token.cause(), Some(cause));
+            assert_eq!(completed_rows.load(Ordering::SeqCst), 3 * batch_rows);
+            assert_eq!(children.load(Ordering::SeqCst), width - 1);
+            assert_eq!(results.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+#[test]
+fn joined_team_spends_the_original_terminal_checkpoint_without_renewing_it() {
+    for width in [2, 3, 7] {
+        for batch_rows in [1, 3] {
+            for terminal_allowance in [0, 1] {
+                let (weights, _) = projection_fixture(4);
+                let mut workspace = Workspace::with_batch_rows(width, 4, batch_rows).unwrap();
+                let dropped = track_children(&mut workspace);
+                // One formation and one ready checkpoint per child, followed
+                // by task entry and the last coordinator check before join.
+                let before_join = 2 * (width as u64 - 1) + 2;
+                let shared = RunShared::new(limits(before_join + terminal_allowance),
+                    CancellationToken::default()).unwrap();
+                let original_deadline = shared.deadline;
+                let result = run_scope(&Cx::for_testing(), &weights, &mut workspace, width,
+                    PackedInt4Kernel::scalar(), Arc::clone(&shared), |_, control, _| {
+                        assert!(Arc::ptr_eq(&control.shared, &shared));
+                        assert_eq!(control.shared.deadline, original_deadline);
+                        assert_eq!(control.shared.state.lock().unwrap().remaining, terminal_allowance + 1);
+                        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+                        Ok(width)
+                    });
+                if terminal_allowance == 0 {
+                    assert!(matches!(result, Err(HostedError::Stopped {
+                        stop: RunStop { kind: DecodeCancellationKind::PollQuota, .. }, task_error: None })));
+                } else {
+                    assert_eq!(result.unwrap(), width);
+                }
+                assert_eq!(shared.state.lock().unwrap().remaining, 0);
+                assert_eq!(shared.deadline, original_deadline);
+                assert_eq!(dropped.load(Ordering::SeqCst), width - 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn post_join_observation_preserves_the_original_stop_and_task_failure() {
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let (weights, _) = projection_fixture(4);
+        let mut workspace = Workspace::new(3, 4).unwrap();
+        let token = CancellationToken::default();
+        let later_cause = if cause == Shutdown { User } else { Shutdown };
+        workspace.cancel_on_exit = Some((token.clone(), later_cause));
+        let dropped = track_children(&mut workspace);
+        let shared = RunShared::new(limits(100_000), token.clone()).unwrap();
+        let error = run_scope(&Cx::for_testing(), &weights, &mut workspace, 3,
+            PackedInt4Kernel::scalar(), shared, |_, control, _| -> Result<(), HostedError> {
+                control.shared.stop(cause);
+                assert_eq!(control.checkpoint(0), Some(cause));
+                Err(HostedError::Limits("injected task refusal"))
+            }).unwrap_err();
+        let HostedError::Stopped { stop, task_error: Some(error) } = error else {
+            panic!("physical drain lost the original task refusal");
+        };
+        assert_eq!(stop.kind, cause);
+        assert!(matches!(*error, HostedError::Limits("injected task refusal")));
+        assert_eq!(token.cause(), Some(later_cause));
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[test]
 fn worker_checkpoints_share_one_monotone_request_allowance_and_first_cause() {
     let cx = Cx::for_testing().restrict::<cap::None>();
     let token = CancellationToken::default();

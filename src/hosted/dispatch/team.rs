@@ -43,6 +43,7 @@ struct Workspace {
     children: Vec<WorkerBuffers>, coordinator_scratch: Vec<i8>,
     max_batch_rows: usize,
     #[cfg(test)] panic_worker: Option<usize>,
+    #[cfg(test)] cancel_on_exit: Option<(CancellationToken, DecodeCancellationKind)>,
 }
 impl Workspace {
     #[cfg(test)]
@@ -59,7 +60,7 @@ impl Workspace {
                 .map_err(native_error)?);
         }
         Ok(Self { children, coordinator_scratch: zeroed(group_width).map_err(native_error)?, max_batch_rows,
-            #[cfg(test)] panic_worker: None })
+            #[cfg(test)] panic_worker: None, #[cfg(test)] cancel_on_exit: None })
     }
 }
 
@@ -226,6 +227,7 @@ where F: FnOnce(&Int4ModelWeights, &mut RunControl, &mut dyn Int4ProjectionExecu
         let mut outcome = None;
         let mut formation_complete = false;
         #[cfg(test)] let panic_worker = workspace.panic_worker;
+        #[cfg(test)] let cancel_on_exit = workspace.cancel_on_exit.clone();
         let scope_result = leaf.scoped_cpu(width - 1, |scope| {
             let mut executor = TeamExecutor::new(weights, kernel, width, workspace.max_batch_rows,
                 std::mem::take(&mut workspace.coordinator_scratch),
@@ -242,6 +244,7 @@ where F: FnOnce(&Int4ModelWeights, &mut RunControl, &mut dyn Int4ProjectionExecu
                 let worker_gate = Arc::clone(&gate);
                 let worker_shared = Arc::clone(&shared);
                 let worker_leaf = leaf.clone();
+                #[cfg(test)] let cancel_on_exit = cancel_on_exit.clone();
                 // Store the sender before spawn, so unwinding formation always
                 // disconnects every lane already handed to a child.
                 executor.peers.push(Peer { command: Some(command_sender), reply: reply_receiver,
@@ -261,6 +264,8 @@ where F: FnOnce(&Int4ModelWeights, &mut RunControl, &mut dyn Int4ProjectionExecu
                     let stopped = ready.is_err();
                     if reply_sender.try_send(Reply::Ready(ready)).is_err() || stopped { return; }
                     worker_loop(weights, kernel, command_receiver, reply_sender, &mut control);
+                    #[cfg(test)]
+                    if let Some((token, cause)) = cancel_on_exit { token.cancel(cause); }
                 }).map_err(|source| HostedError::Scope { source, physical_error: None })?;
             }
             team.seal().map_err(|_| native_error(StrictInt4Error::ProjectionExecutor))?;
@@ -291,7 +296,15 @@ where F: FnOnce(&Int4ModelWeights, &mut RunControl, &mut dyn Int4ProjectionExecu
             Ok(Ok(())) => {
                 if formation_complete && team.join().is_err() {
                     drop(outcome); Err(native_error(StrictInt4Error::ProjectionExecutor))
-                } else { shared.finish(outcome) }
+                } else {
+                    // Cancellation or deadline expiry can arrive after the
+                    // coordinator's final check while physical children drain.
+                    // Accept the result only after join, using the original
+                    // first-cause state and remaining checkpoint allowance.
+                    let mut control = RunControl { cx: leaf, shared: Arc::clone(&shared) };
+                    control.checkpoint(0);
+                    shared.finish(outcome)
+                }
             }
             Ok(Err(error)) => shared.finish(Some(Err(error))),
             Err(source) => Err(HostedError::Scope { source,
