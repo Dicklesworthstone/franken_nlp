@@ -114,6 +114,81 @@ fn direct_digest_rollback_cannot_shorten_a_published_alias() {
 }
 
 #[test]
+fn direct_cancellation_survives_refused_rollback_without_touching_published_bytes() {
+    for cause in [Some(CancelKind::User), Some(CancelKind::Timeout), Some(CancelKind::Deadline),
+        Some(CancelKind::PollQuota), Some(CancelKind::CostBudget), Some(CancelKind::FailFast),
+        Some(CancelKind::RaceLost), Some(CancelKind::ParentCancelled),
+        Some(CancelKind::ResourceUnavailable), Some(CancelKind::Shutdown),
+        Some(CancelKind::LinkedExit), None]
+    {
+        let manifest = manifest();
+        let (path, mut file) = stage(b"abcDEF");
+        let alias = path.with_extension("published");
+        fs::hard_link(&path, &alias).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(b"DEF");
+        let mut downloaded = 0;
+        charge_body_bytes(&mut downloaded, 1).unwrap();
+        let cancelled = Err(NetworkPullError::Cancelled { cause, part: Some(1) });
+        assert!(matches!(finish_artifact_attempt(1, 0, &manifest.parts[1], 3, 2, 3,
+            &mut file, &hasher, cancelled),
+            Err(NetworkPullError::Cancelled { cause: observed, part: Some(1) })
+                if observed == cause));
+        assert_eq!(file.stream_position().unwrap(), 6);
+        assert_eq!(fs::read(&path).unwrap(), b"abcDEF");
+        assert_eq!(fs::read(&alias).unwrap(), b"abcDEF");
+        assert_eq!(downloaded, 1, "a refused rollback cannot refund the received suffix");
+        assert_eq!(hex_lower(&hasher.finalize()), hex_lower(&Sha256::digest(b"DEF")));
+    }
+}
+
+#[test]
+fn direct_acquisition_observes_a_stop_after_failed_manifest_verification() {
+    struct StopAfterRead { checks: usize, cause: DecodeCancellationKind }
+    impl DecodeStepControl for StopAfterRead {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.checks += 1;
+            // Network admission and local cache entry pass; the manifest is
+            // then read and fails its independently supplied checksum.
+            (self.checks == 3).then_some(self.cause)
+        }
+    }
+    let (path, file) = stage(b"{}");
+    drop(file);
+    let request = NetworkArtifactRequest { manifest: path.clone(),
+        expected_release_manifest_sha256: "00".repeat(32),
+        staging_output: path.with_extension("untouched-stage"),
+        output: path.with_extension("unpublished") };
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    for cause in [DecodeCancellationKind::User, DecodeCancellationKind::Timeout,
+        DecodeCancellationKind::Deadline, DecodeCancellationKind::PollQuota,
+        DecodeCancellationKind::CostBudget, DecodeCancellationKind::FailFast,
+        DecodeCancellationKind::RaceLost, DecodeCancellationKind::ParentCancelled,
+        DecodeCancellationKind::ResourceUnavailable, DecodeCancellationKind::Shutdown,
+        DecodeCancellationKind::LinkedExit]
+    {
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut caller = StopAfterRead { checks: 0, cause };
+            assert!(matches!(acquire_release_artifact(&cx, &request,
+                NetworkPartsOptions::default(), &mut caller).await,
+                Err(NetworkPullError::Cancelled { cause: Some(observed), part: None })
+                    if observed == super::super::runtime_cancellation_kind(cause)));
+            assert_eq!(caller.checks, 3, "the final boundary preserves the first stop without repolling");
+        });
+    }
+    runtime.block_on(async {
+        let cx = Cx::current().unwrap();
+        assert!(matches!(acquire_release_artifact(&cx, &request,
+            NetworkPartsOptions::default(), &mut NeverStopped).await,
+            Err(NetworkPullError::Manifest(PullError::ManifestDigestMismatch { .. }))));
+    });
+    assert_eq!(fs::read(path).unwrap(), b"{}");
+    assert!(!request.staging_output.exists());
+    assert!(!request.output.exists());
+}
+
+#[test]
 fn corruption_in_a_later_complete_part_is_found_before_any_append() {
     let manifest = manifest();
     let (path, mut file) = stage(b"abcDEXGh");

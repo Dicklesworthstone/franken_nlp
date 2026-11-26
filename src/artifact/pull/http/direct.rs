@@ -28,7 +28,8 @@ use sha2::{Digest, Sha256};
 use super::{
     COPY_BUFFER_BYTES, MAX_RANGE_BYTES, NetworkPartsOptions, NetworkPullError, PullCheckpoints,
     ResumeMirrorPasses, USER_AGENT,
-    checkpoint, check_mutable_part, drive_attempt, exhausted_mirrors, fetch_range, hex_lower,
+    checkpoint, check_mutable_part, drive_attempt, exhausted_mirrors, fetch_range,
+    finish_network_operation, hex_lower,
     next_range_end, quarantine_resumed_prefix, restore_window_prefix, staging_error, validate_options,
 };
 use super::super::{
@@ -96,7 +97,15 @@ pub async fn acquire_release_artifact(
     control: &mut impl DecodeStepControl,
 ) -> Result<NetworkArtifactReport, NetworkPullError> {
     let checkpoints = PullCheckpoints::new(cx, control);
-    let cx = &checkpoints;
+    let result = acquire_release_artifact_inner(&checkpoints, request, options).await;
+    finish_network_operation(&checkpoints, result)
+}
+
+async fn acquire_release_artifact_inner(
+    cx: &PullCheckpoints<'_>,
+    request: &NetworkArtifactRequest,
+    options: NetworkPartsOptions,
+) -> Result<NetworkArtifactReport, NetworkPullError> {
     validate_options(options)?;
     checkpoint(cx, None)?;
     validate_request(request)?;
@@ -393,12 +402,21 @@ fn finish_artifact_attempt(
         Ok(received)
     });
     if checked.is_err() {
-        let base_len = artifact_offset.checked_add(start)
-            .ok_or(NetworkPullError::InvalidOptions("artifact rollback offset overflow"))?;
-        check_mutable_part(index, file)?;
-        file.set_len(base_len).map_err(|error| staging_error(index, "rollback-artifact-attempt", error))?;
-        file.seek(SeekFrom::Start(base_len)).map_err(|error| staging_error(index, "seek-artifact-rollback", error))?;
-        file.sync_all().map_err(|error| staging_error(index, "sync-artifact-rollback", error))?;
+        let rollback: Result<(), NetworkPullError> = (|| {
+            let base_len = artifact_offset.checked_add(start)
+                .ok_or(NetworkPullError::InvalidOptions("artifact rollback offset overflow"))?;
+            check_mutable_part(index, file)?;
+            file.set_len(base_len).map_err(|error| staging_error(index, "rollback-artifact-attempt", error))?;
+            file.seek(SeekFrom::Start(base_len)).map_err(|error| staging_error(index, "seek-artifact-rollback", error))?;
+            file.sync_all().map_err(|error| staging_error(index, "sync-artifact-rollback", error))?;
+            Ok(())
+        })();
+        // The cancelled transfer is already physically dropped. Attempt its
+        // safe rollback, retaining the first terminal cause even if cleanup
+        // refuses an aliased stage or encounters a local filesystem error.
+        if !matches!(&checked, Err(NetworkPullError::Cancelled { .. })) {
+            rollback?;
+        }
     }
     checked
 }

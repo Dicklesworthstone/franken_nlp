@@ -252,7 +252,15 @@ pub async fn download_release_parts(
     control: &mut impl DecodeStepControl,
 ) -> Result<NetworkPartsReport, NetworkPullError> {
     let checkpoints = PullCheckpoints::new(cx, control);
-    let cx = &checkpoints;
+    let result = download_release_parts_inner(&checkpoints, request, options).await;
+    finish_network_operation(&checkpoints, result)
+}
+
+async fn download_release_parts_inner(
+    cx: &PullCheckpoints<'_>,
+    request: &NetworkPartsRequest,
+    options: NetworkPartsOptions,
+) -> Result<NetworkPartsReport, NetworkPullError> {
     validate_options(options)?;
     checkpoint(cx, None)?;
     if !validate_sha256_text(&request.expected_release_manifest_sha256).is_some() {
@@ -577,10 +585,19 @@ fn finish_attempt(
         Ok(received)
     });
     if checked.is_err() {
-        check_mutable_part(index, file)?;
-        file.set_len(start).map_err(|error| staging_error(index, "rollback-attempt", error))?;
-        file.seek(SeekFrom::Start(start)).map_err(|error| staging_error(index, "seek-after-rollback", error))?;
-        file.sync_all().map_err(|error| staging_error(index, "sync-rollback", error))?;
+        let rollback: Result<(), NetworkPullError> = (|| {
+            check_mutable_part(index, file)?;
+            file.set_len(start).map_err(|error| staging_error(index, "rollback-attempt", error))?;
+            file.seek(SeekFrom::Start(start)).map_err(|error| staging_error(index, "seek-after-rollback", error))?;
+            file.sync_all().map_err(|error| staging_error(index, "sync-rollback", error))?;
+            Ok(())
+        })();
+        // Cleanup is still attempted, but a failed rollback must not replace
+        // the already observed terminal cause. Retained bytes remain subject
+        // to full authentication on the next explicit invocation.
+        if !matches!(&checked, Err(NetworkPullError::Cancelled { .. })) {
+            rollback?;
+        }
     }
     checked
 }
@@ -1029,6 +1046,21 @@ fn staging_error(part: usize, operation: &'static str, error: std::io::Error) ->
     NetworkPullError::Staging { part, operation, detail: error.to_string() }
 }
 
+/// Synchronous verification, publication and cleanup may observe a stop after
+/// their last checkpoint, including when they return an ordinary error. Poll
+/// the original control before accepting that result. Never replace an
+/// earlier typed cancellation with a later cause or another checkpoint debit.
+fn finish_network_operation<T>(
+    cx: &PullCheckpoints<'_>,
+    result: Result<T, NetworkPullError>,
+) -> Result<T, NetworkPullError> {
+    if matches!(&result, Err(NetworkPullError::Cancelled { .. })) {
+        return result;
+    }
+    checkpoint(cx, None)?;
+    result
+}
+
 fn checkpoint(cx: &PullCheckpoints<'_>, part: Option<usize>) -> Result<(), NetworkPullError> {
     if cx.stopped.get() {
         return Err(NetworkPullError::Cancelled { cause: cx.cause.get(), part });
@@ -1174,6 +1206,122 @@ mod tests {
             Err(NetworkPullError::Staging { operation: "mutable-stage-ownership", .. })));
         assert_eq!(fs::read(&path).unwrap(), b"abcd");
         assert_eq!(fs::read(&alias).unwrap(), b"abcd");
+    }
+
+    #[test]
+    fn cancelled_part_keeps_its_cause_when_rollback_refuses_a_published_alias() {
+        for cause in CALLER_CAUSES.into_iter()
+            .map(|cause| Some(runtime_cancellation_kind(cause))).chain([None])
+        {
+            let path = attempt_path();
+            let alias = path.with_extension("published");
+            let mut file = open_partial(0, &path, false).unwrap();
+            let mut hasher = Sha256::new();
+            append_range_chunk(0, &mut file, &mut hasher, b"abcd").unwrap();
+            fs::hard_link(&path, &alias).unwrap();
+            let part = ReleasePart { id: 0, name: "fixture.part00".to_owned(), bytes: 6,
+                sha256: hex_lower(&Sha256::digest(b"abcdef")), mirrors: Vec::new() };
+            let mut downloaded = 0;
+            charge_body_bytes(&mut downloaded, 2).unwrap();
+            let cancelled = Err(NetworkPullError::Cancelled { cause, part: Some(0) });
+            assert!(matches!(finish_attempt(0, 0, &part, 2, 5,
+                &mut file, &hasher, cancelled),
+                Err(NetworkPullError::Cancelled { cause: observed, part: Some(0) })
+                    if observed == cause));
+            assert_eq!(file.stream_position().unwrap(), 4);
+            assert_eq!(fs::read(&path).unwrap(), b"abcd");
+            assert_eq!(fs::read(&alias).unwrap(), b"abcd");
+            assert_eq!(downloaded, 2, "a refused rollback never refunds received traffic");
+            assert_eq!(hex_lower(&hasher.finalize()), hex_lower(&Sha256::digest(b"abcd")));
+        }
+    }
+
+    #[test]
+    fn network_acceptance_preserves_original_stops_after_sync_work_and_cleanup() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        for cause in CALLER_CAUSES {
+            for failed in [false, true] {
+                runtime.block_on(async {
+                    let cx = Cx::current().unwrap();
+                    let token = crate::hosted::CancellationToken::default();
+                    let mut caller = TokenControl(token.clone());
+                    let checks = PullCheckpoints::new(&cx, &mut caller);
+                    checkpoint(&checks, None).unwrap();
+                    let result = if failed {
+                        Err(NetworkPullError::Staging {
+                            part: 3, operation: "sync-rollback", detail: "fixture failure".to_owned(),
+                        })
+                    } else { Ok(17_u64) };
+                    token.cancel(cause);
+                    assert!(matches!(finish_network_operation(&checks, result),
+                        Err(NetworkPullError::Cancelled { cause: Some(observed), part: None })
+                            if observed == runtime_cancellation_kind(cause)));
+                    assert!(!cx.is_cancel_requested());
+                });
+            }
+        }
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            struct MustNotPoll;
+            impl DecodeStepControl for MustNotPoll {
+                fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+                    panic!("an earlier terminal result cannot debit or replace its control");
+                }
+            }
+            let mut caller = MustNotPoll;
+            let checks = PullCheckpoints::new(&cx, &mut caller);
+            let original = Err::<u64, _>(NetworkPullError::Cancelled {
+                cause: Some(CancelKind::RaceLost), part: Some(2),
+            });
+            assert!(matches!(finish_network_operation(&checks, original),
+                Err(NetworkPullError::Cancelled { cause: Some(CancelKind::RaceLost), part: Some(2) })));
+
+            let mut caller = NeverStopped;
+            let checks = PullCheckpoints::new(&cx, &mut caller);
+            assert_eq!(finish_network_operation(&checks, Ok(17_u64)).unwrap(), 17);
+            let failure = Err::<u64, _>(NetworkPullError::Staging {
+                part: 3, operation: "sync-rollback", detail: "fixture failure".to_owned(),
+            });
+            assert!(matches!(finish_network_operation(&checks, failure),
+                Err(NetworkPullError::Staging { part: 3, operation: "sync-rollback", detail })
+                    if detail == "fixture failure"));
+        });
+    }
+
+    #[test]
+    fn public_parts_acquisition_polls_original_control_after_failed_manifest_io() {
+        struct StopAfterRead { checks: usize, cause: DecodeCancellationKind }
+        impl DecodeStepControl for StopAfterRead {
+            fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+                self.checks += 1;
+                (self.checks == 2).then_some(self.cause)
+            }
+        }
+        let path = attempt_path();
+        fs::write(&path, b"{}").unwrap();
+        let request = NetworkPartsRequest { manifest: path.clone(),
+            expected_release_manifest_sha256: "00".repeat(32),
+            parts_dir: path.with_extension("unopened-parts") };
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        for cause in CALLER_CAUSES {
+            runtime.block_on(async {
+                let cx = Cx::current().unwrap();
+                let mut caller = StopAfterRead { checks: 0, cause };
+                assert!(matches!(download_release_parts(&cx, &request,
+                    NetworkPartsOptions::default(), &mut caller).await,
+                    Err(NetworkPullError::Cancelled { cause: Some(observed), part: None })
+                        if observed == runtime_cancellation_kind(cause)));
+                assert_eq!(caller.checks, 2);
+            });
+        }
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            assert!(matches!(download_release_parts(&cx, &request,
+                NetworkPartsOptions::default(), &mut NeverStopped).await,
+                Err(NetworkPullError::Manifest(PullError::ManifestDigestMismatch { .. }))));
+        });
+        assert_eq!(fs::read(path).unwrap(), b"{}");
+        assert!(!request.parts_dir.exists());
     }
 
     #[test]

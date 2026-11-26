@@ -57,6 +57,14 @@ const CONFIG: &[u8] = b"{}";
 const TOKENIZER: &[u8] = &[0x0a];
 const TEMPLATE: &[u8] = b"structural reconstruction fixture";
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+const CANCELLATION_CAUSES: [DecodeCancellationKind; 11] = [
+    DecodeCancellationKind::User, DecodeCancellationKind::Timeout,
+    DecodeCancellationKind::Deadline, DecodeCancellationKind::PollQuota,
+    DecodeCancellationKind::CostBudget, DecodeCancellationKind::FailFast,
+    DecodeCancellationKind::RaceLost, DecodeCancellationKind::ParentCancelled,
+    DecodeCancellationKind::ResourceUnavailable, DecodeCancellationKind::Shutdown,
+    DecodeCancellationKind::LinkedExit,
+];
 
 #[test]
 fn checked_candidate_startup_exceeds_the_old_64_poll_limit_and_fits_its_byte_quote() {
@@ -694,6 +702,104 @@ fn cancellation_during_local_publication_preserves_verified_file_without_success
         &request.expected_release_manifest_sha256, &request.output, |_| None)
         .unwrap().expect("a retry may authenticate the already verified publication");
     assert_eq!(cache.artifact_sha256, fixture.manifest.artifact.sha256);
+}
+
+#[test]
+fn local_manifest_failures_observe_the_original_stop_before_returning() {
+    let fixture = Fixture::new("manifest-failure-stop");
+    let mut request = fixture.request("unopened");
+    request.expected_release_manifest_sha256 = "00".repeat(32);
+    let manifest_before = fs::read(&request.manifest).unwrap();
+    for cache in [false, true] {
+        for cause in CANCELLATION_CAUSES {
+            let mut checks = 0;
+            let mut control = |_| {
+                checks += 1;
+                (checks == 2).then_some(cause)
+            };
+            let error = if cache {
+                verify_local_release_cache(&request.manifest,
+                    &request.expected_release_manifest_sha256, &request.output, &mut control)
+                    .expect_err("a manifest error must not hide the original cache-verification stop")
+            } else {
+                reconstruct_local_release_with_options(&request,
+                    &LocalReconstructOptions::default(), &mut control)
+                    .expect_err("a manifest error must not hide the original reconstruction stop")
+            };
+            assert!(matches!(error, PullError::Cancelled { cause: observed, progress }
+                if observed == cause && progress.artifact_bytes == 0 && progress.copied_bytes == 0));
+            assert_eq!(checks, 2);
+        }
+    }
+    assert!(matches!(reconstruct_local_release_with_options(&request,
+        &LocalReconstructOptions::default(), |_| None),
+        Err(PullError::ManifestDigestMismatch { .. })));
+    assert!(matches!(verify_local_release_cache(&request.manifest,
+        &request.expected_release_manifest_sha256, &request.output, |_| None),
+        Err(PullError::ManifestDigestMismatch { .. })));
+    assert_eq!(fs::read(&request.manifest).unwrap(), manifest_before);
+    assert_eq!(fs::read(fixture.part()).unwrap(), fixture.artifact);
+    assert!(!request.staging_output.exists());
+    assert!(!request.output.exists());
+}
+
+#[test]
+fn local_first_cancellation_is_not_repolled_or_replaced_at_final_acceptance() {
+    let fixture = Fixture::new("first-local-stop");
+    let request = fixture.request("unopened");
+    for cache in [false, true] {
+        let mut checks = 0;
+        let mut control = |_| {
+            checks += 1;
+            Some(if checks == 1 { DecodeCancellationKind::RaceLost }
+                else { DecodeCancellationKind::Shutdown })
+        };
+        let error = if cache {
+            verify_local_release_cache(&request.manifest,
+                &request.expected_release_manifest_sha256, &request.output, &mut control).unwrap_err()
+        } else {
+            reconstruct_local_release_with_options(&request,
+                &LocalReconstructOptions::default(), &mut control).unwrap_err()
+        };
+        assert!(matches!(error, PullError::Cancelled { cause: DecodeCancellationKind::RaceLost, .. }));
+        assert_eq!(checks, 1);
+    }
+    assert!(!request.staging_output.exists());
+    assert!(!request.output.exists());
+}
+
+#[test]
+fn failed_no_replace_publication_preserves_terminal_stop_and_all_retained_bytes() {
+    let fixture = Fixture::new("failed-publish-stop");
+    for (index, cause) in CANCELLATION_CAUSES.into_iter().map(Some).chain([None]).enumerate() {
+        let request = fixture.request(&format!("failed-{index}"));
+        let mut publication_started = false;
+        let error = reconstruct_local_release_with_options(&request,
+            &LocalReconstructOptions::default(), |progress| {
+                if progress.phase != LocalReconstructPhase::Publish { return None; }
+                if publication_started { return cause; }
+                // Occupy the final name after all authentication, just before
+                // the real no-replace syscall. Its failure must be settled
+                // under the original caller's now-terminal control.
+                let mut competing = OpenOptions::new().write(true).create_new(true)
+                    .open(&request.output).unwrap();
+                competing.write_all(b"retained unrelated final").unwrap();
+                publication_started = true;
+                None
+            }).expect_err("the occupied final name can never be replaced or reported successful");
+        if let Some(cause) = cause {
+            assert!(matches!(error, PullError::Cancelled { cause: observed, progress }
+                if observed == cause && progress.phase == LocalReconstructPhase::Publish
+                    && progress.copied_bytes == fixture.artifact.len() as u64));
+        } else {
+            assert!(matches!(error, PullError::Publish {
+                operation: "create final no-replace hard link", ..
+            }), "without cancellation, preserve the actual storage failure");
+        }
+        assert_eq!(fs::read(&request.output).unwrap(), b"retained unrelated final");
+        assert_eq!(fs::read(&request.staging_output).unwrap(), fixture.artifact);
+        assert_eq!(fs::read(fixture.part()).unwrap(), fixture.artifact);
+    }
 }
 
 #[test]

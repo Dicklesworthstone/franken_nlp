@@ -297,7 +297,21 @@ pub fn verify_local_release_cache(
         copied_bytes: 0,
         artifact_bytes: 0,
     };
-    reconstruction_checkpoint(progress, &mut checkpoint)?;
+    let result = verify_local_release_cache_inner(
+        manifest_path, expected_release_manifest_sha256, artifact_path,
+        &mut progress, &mut checkpoint,
+    );
+    finish_local_operation(progress, &mut checkpoint, result)
+}
+
+fn verify_local_release_cache_inner(
+    manifest_path: &Path,
+    expected_release_manifest_sha256: &str,
+    artifact_path: &Path,
+    progress: &mut LocalReconstructProgress,
+    checkpoint: &mut impl FnMut(LocalReconstructProgress) -> Option<DecodeCancellationKind>,
+) -> Result<Option<LocalArtifactVerificationReport>, PullError> {
+    reconstruction_checkpoint(*progress, checkpoint)?;
     if manifest_path.as_os_str().is_empty() || artifact_path.as_os_str().is_empty()
         || artifact_path.file_name().is_none()
     {
@@ -305,7 +319,7 @@ pub fn verify_local_release_cache(
     }
     let manifest = read_pinned_manifest(manifest_path, expected_release_manifest_sha256)?;
     progress.artifact_bytes = manifest.artifact.bytes;
-    reconstruction_checkpoint(progress, &mut checkpoint)?;
+    reconstruction_checkpoint(*progress, checkpoint)?;
     let named = match fs::symlink_metadata(artifact_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -336,19 +350,19 @@ pub fn verify_local_release_cache(
         });
     }
     let mut buffer = vec![0_u8; COPY_CHUNK_BYTES];
-    verify_staged_artifact(&mut file, &manifest, &mut buffer, progress, &mut checkpoint)?;
+    verify_staged_artifact(&mut file, &manifest, &mut buffer, *progress, checkpoint)?;
     let pinned_file = file.try_clone().map_err(|error| PullError::ExistingArtifact {
         operation: "clone held descriptor", detail: error.to_string(),
     })?;
     let reader = match FnlpqRangeReader::from_file_with_checkpoint(
-        pinned_file, || checkpoint(progress),
+        pinned_file, || checkpoint(*progress),
     ) {
         Ok(reader) => reader,
-        Err(FnlpqReadError::Cancelled(cause)) => return Err(PullError::Cancelled { cause, progress }),
+        Err(FnlpqReadError::Cancelled(cause)) => return Err(PullError::Cancelled { cause, progress: *progress }),
         Err(error) => return Err(PullError::Container(error)),
     };
-    verify_container_identity(&reader, &manifest, progress, &mut checkpoint)?;
-    reconstruction_checkpoint(progress, &mut checkpoint)?;
+    verify_container_identity(&reader, &manifest, *progress, checkpoint)?;
+    reconstruction_checkpoint(*progress, checkpoint)?;
     check_staging_path(&file, artifact_path, manifest.artifact.bytes)?;
     Ok(Some(LocalArtifactVerificationReport {
         release_manifest_sha256: expected_release_manifest_sha256.to_owned(),
@@ -411,11 +425,21 @@ pub fn reconstruct_local_release_with_options(
         // accepted this phase. The complete size is unknown at that boundary.
         artifact_bytes: 0,
     };
-    reconstruction_checkpoint(progress, &mut checkpoint)?;
+    let result = reconstruct_local_release_inner(request, options, &mut progress, &mut checkpoint);
+    finish_local_operation(progress, &mut checkpoint, result)
+}
+
+fn reconstruct_local_release_inner(
+    request: &LocalReconstructRequest,
+    options: &LocalReconstructOptions,
+    progress: &mut LocalReconstructProgress,
+    checkpoint: &mut impl FnMut(LocalReconstructProgress) -> Option<DecodeCancellationKind>,
+) -> Result<LocalReconstructReport, PullError> {
+    reconstruction_checkpoint(*progress, checkpoint)?;
     validate_request_paths(request)?;
     let manifest = read_pinned_manifest(&request.manifest, &request.expected_release_manifest_sha256)?;
     progress.artifact_bytes = manifest.artifact.bytes;
-    reconstruction_checkpoint(progress, &mut checkpoint)?;
+    reconstruction_checkpoint(*progress, checkpoint)?;
     let mut staging = open_staging(&request.staging_output, options.resume)?;
     let resumed_bytes = staging.metadata().map_err(|error| PullError::Publish {
         operation: "inspect opened staging length",
@@ -431,7 +455,7 @@ pub fn reconstruct_local_release_with_options(
     if resumed_bytes != 0 {
         verify_retained_prefix(
             &mut staging, &manifest, &request.parts_dir, resumed_bytes,
-            &mut buffer, &mut progress, &mut checkpoint,
+            &mut buffer, progress, checkpoint,
         )?;
     }
     check_staging_path(&staging, &request.staging_output, resumed_bytes)?;
@@ -439,12 +463,12 @@ pub fn reconstruct_local_release_with_options(
     progress.part_index = None;
     copy_remaining_parts(
         &mut staging, &manifest, &request.parts_dir, resumed_bytes, options,
-        &mut progress, &mut checkpoint,
+        progress, checkpoint,
     )?;
 
     verify_and_publish_staged_artifact(
         &mut staging, &manifest, &request.staging_output, &request.output,
-        &mut buffer, &mut progress, &mut checkpoint,
+        &mut buffer, progress, checkpoint,
     )?;
 
     Ok(LocalReconstructReport {
@@ -527,6 +551,21 @@ fn reconstruction_checkpoint(
         Some(cause) => Err(PullError::Cancelled { cause, progress }),
         None => Ok(()),
     }
+}
+
+fn finish_local_operation<T>(
+    progress: LocalReconstructProgress,
+    checkpoint: &mut impl FnMut(LocalReconstructProgress) -> Option<DecodeCancellationKind>,
+    result: Result<T, PullError>,
+) -> Result<T, PullError> {
+    if matches!(&result, Err(PullError::Cancelled { .. })) {
+        return result;
+    }
+    // Every error path participates, including failed manifest reads, held
+    // file validation, synchronization and no-replace publication. These
+    // synchronous operations cannot preempt the original caller's stop.
+    reconstruction_checkpoint(progress, checkpoint)?;
+    result
 }
 
 fn open_staging(path: &Path, resume: bool) -> Result<File, PullError> {
