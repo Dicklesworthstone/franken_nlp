@@ -6,6 +6,8 @@ use super::*;
 mod manage;
 mod extract;
 pub(super) mod scored;
+pub use scored::document::{int8_classification_document_job_requirements,
+    int8_sentiment_document_job_requirements};
 mod generation;
 pub mod semantic;
 mod source_document;

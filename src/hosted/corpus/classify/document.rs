@@ -149,10 +149,8 @@ impl scored::CorpusTask for ClassificationDocumentStream {
         reader: &mut R, writer: &mut W, limits: BatchLimits, defer: bool,
         control: &mut RunControl) -> Result<scored::Completion, HostedError> {
         let mapping = self.compiler.mapping_limits();
-        let output_bytes = document_output_reservation(mapping.max_result_bytes)?;
-        let admission = DocumentAdmission { inner: admission, mapping,
-            ceiling: self.compiler.task_budget(), max_heads: self.compiler.planning_limits().max_labels,
-            output_bytes };
+        let admission = document_admission(admission, mapping,
+            self.compiler.task_budget(), self.compiler.planning_limits().max_labels)?;
         let mut processor = match prefill {
             Some(prefill) => NativeInt8ClassificationDocumentBatch::new_layer_major(self.compiler,
                 engine, admission, prefill),
@@ -165,6 +163,15 @@ impl scored::CorpusTask for ClassificationDocumentStream {
 fn document_output_reservation(bytes: u64) -> Result<u64, HostedError> {
     bytes.checked_mul(8).and_then(|bytes| bytes.checked_add(4096))
         .ok_or(HostedError::Limits("classification corpus complete output arithmetic"))
+}
+
+/// Shared concrete admission for live streams and authenticated durable maps.
+/// The caller cannot supply a replacement guard or weaken the complete quote.
+pub(in crate::hosted::corpus) fn document_admission(inner: CorpusAdmission<'_>,
+    mapping: Int8ClassificationMapLimits, ceiling: TaskBudget, max_heads: usize)
+    -> Result<impl Int8ClassificationDocumentBatchAdmission<Guard = Pending>, HostedError> {
+    Ok(DocumentAdmission { inner, mapping, ceiling, max_heads,
+        output_bytes: document_output_reservation(mapping.max_result_bytes)? })
 }
 
 struct DocumentAdmission<'a> {

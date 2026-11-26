@@ -18,6 +18,7 @@ use crate::{
 
 mod classify;
 mod sentiment;
+pub mod document;
 pub mod grouped_int4;
 pub use classify::{Int8ClassificationJobPlanner, Int8ClassificationJobProcessor, PreparedInt8ClassificationJob};
 pub use sentiment::{Int8SentimentJobPlanner, Int8SentimentJobProcessor, PreparedInt8SentimentJob};

@@ -1,6 +1,7 @@
 //! Resident ordered classification with concrete, process-ledger admission.
 mod document;
 pub use document::{ClassificationDocumentCorpusConfig, int8_classification_document_corpus_requirements};
+pub(in crate::hosted::corpus) use document::document_admission;
 use super::*;
 use crate::{
     batch::classify::{ClassificationBatchArgs, quantized::{Int8ClassificationAdmission,
