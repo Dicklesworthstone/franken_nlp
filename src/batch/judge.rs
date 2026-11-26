@@ -4,6 +4,7 @@
 //! native completion, result validation AND delivery by the batch writer.
 
 pub mod grouped_int4;
+pub mod quantized;
 
 use crate::{
     execution_identity::{ExecutionIdentity, NumericsProfile, ThinkingMode, ToolMode},

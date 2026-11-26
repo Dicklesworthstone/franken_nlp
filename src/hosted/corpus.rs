@@ -14,6 +14,9 @@ pub use classify::{ClassificationCorpusConfig, ClassificationDocumentCorpusConfi
     int8_classification_document_corpus_requirements};
 mod judge;
 pub use judge::JudgeCorpusConfig;
+mod faithfulness_document;
+pub use faithfulness_document::{FaithfulnessDocumentCorpusConfig,
+    int8_faithfulness_document_corpus_requirements};
 mod source;
 pub use source::SourceCorpusConfig;
 mod extraction_document;

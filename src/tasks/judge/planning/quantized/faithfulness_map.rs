@@ -261,6 +261,18 @@ impl JudgePlanner {
         request: &'a JudgeRequest, context: &PlanContext<'_>, planning: JudgeLimits,
         limits: Int8FaithfulnessMapLimits, control: &mut C)
         -> Result<PreparedInt8FaithfulnessMap<'a>, Int8FaithfulnessMapError> {
+        self.plan_int8_faithfulness_document_with_encoding_work(request, context, planning,
+            limits, control, &mut SafeBpeWork::default())
+    }
+
+    /// Corpus preparation and exact reconstruction share one document-local
+    /// allowance. The caller retains every completed encoding debit on error;
+    /// successful metadata describes only this pass, preserving plan identity.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan_int8_faithfulness_document_with_encoding_work<'a, C: DecodeStepControl>(&self,
+        request: &'a JudgeRequest, context: &PlanContext<'_>, planning: JudgeLimits,
+        limits: Int8FaithfulnessMapLimits, control: &mut C, encoding_work: &mut SafeBpeWork)
+        -> Result<PreparedInt8FaithfulnessMap<'a>, Int8FaithfulnessMapError> {
         checkpoint(control)?;
         check_profile(context.execution_identity())?;
         self.check_context(context, NumericsProfile::StrictQuantized { version: 1 })?;
@@ -273,10 +285,10 @@ impl JudgePlanner {
         if source.len().checked_add(claim.len()).is_none_or(|n| n > limits.chunks.max_input_bytes) {
             return Err(Int8FaithfulnessMapError::Limits);
         }
-        let mut encoding_work = SafeBpeWork::default();
+        let before = *encoding_work;
         let capacity = self.faithfulness.source_token_capacity_with_work(claim, *policy, *budget,
             *context.budget_ceiling(), planning, limits.chunks.context_tokens, self.document_encoding(),
-            &mut encoding_work, control)?;
+            encoding_work, control)?;
         let byte_capacity = FaithfulnessCompiler::source_byte_limit(*policy)?;
         let reserved_tokens = limits.chunks.context_tokens.checked_sub(capacity)
             .ok_or(Int8FaithfulnessMapError::Limits)?;
@@ -290,7 +302,7 @@ impl JudgePlanner {
             ChunkPlan::build_with_checkpoints_and_byte_cap(source, chunk_limits,
                 byte_capacity.min(chunk_limits.max_chunk_bytes),
                 |text| self.faithfulness.source_tokens_with_work(text, self.document_encoding(),
-                    &mut encoding_work, &mut **control.borrow_mut()).map_err(|cause| {
+                    encoding_work, &mut **control.borrow_mut()).map_err(|cause| {
                         *error.borrow_mut() = Some(cause); MapReduceError::Tokenizer
                     }),
                 || match control.borrow_mut().prefill_checkpoint(0) {
@@ -310,7 +322,7 @@ impl JudgePlanner {
             checkpoint(control)?;
             let row = JudgeRequest::Faithfulness { source: copy_text(chunk.text())?, claim: copy_text(claim)?,
                 policy: *policy, budget: *budget };
-            let plan = self.plan_int8_with_encoding_work(&row, context, planning, control, &mut encoding_work)?;
+            let plan = self.plan_int8_with_encoding_work(&row, context, planning, control, encoding_work)?;
             if plan.head_count() == 0 || plan.head_count() > MAX_FAITHFULNESS_MAP_HEADS
                 || plan.task_budget() != *budget || source_token_count(&plan) != Some(chunk.tokens())
                 || plan.required_context() > chunk_limits.context_tokens {
@@ -322,8 +334,10 @@ impl JudgePlanner {
             max_heads = max_heads.max(plan.head_count());
             plans.push(plan);
         }
+        let pass_encoding_work = encoding_work.checked_sub(before)
+            .ok_or(Int8FaithfulnessMapError::Admission)?;
         let request_binding = binding::request(request, context, planning, limits,
-            self.document_encoding(), encoding_work, &chunks, &plans, control)?;
+            self.document_encoding(), pass_encoding_work, &chunks, &plans, control)?;
         let expected = Int8FaithfulnessMapPreflight {
             source: VerifiedSourceSpan { byte_start: 0, byte_end: last.byte_end,
                 scalar_start: 0, scalar_end: last.scalar_end },
@@ -333,7 +347,7 @@ impl JudgePlanner {
             source_geometry: geometry(chunks.chunks().iter().map(|chunk| (chunk.id(), chunk.span(), chunk.tokens()))),
             encoding: match self.document_encoding() { UntrustedEncoding::ByteFallback => None,
                 UntrustedEncoding::SafeBpeV1(limits) => Some(*limits) },
-            encoding_work, request_binding,
+            encoding_work: pass_encoding_work, request_binding,
         };
         checkpoint(control)?;
         Ok(PreparedInt8FaithfulnessMap { source, chunks, plans, limits, expected, task: *budget })
