@@ -4,16 +4,30 @@ use crate::validation::grounded_fields::VerifiedSourceSpan;
 
 /// Serializes the native result directly with its own execution and warnings.
 /// No wrapper adds bytes outside the admitted native output ceiling.
-pub enum Int8ReducedSourceDocumentRun { Summary(Int8CorpusSummaryRun), Keyphrases(Int8CorpusKeyphraseRun) }
+pub enum Int8ReducedSourceDocumentRun { Entities(Int8DocumentEntityRun), Summary(Int8CorpusSummaryRun), Keyphrases(Int8CorpusKeyphraseRun) }
 impl Serialize for Int8ReducedSourceDocumentRun {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self { Self::Summary(value) => value.serialize(serializer), Self::Keyphrases(value) => value.serialize(serializer) }
+        match self {
+            Self::Entities(value) => value.serialize(serializer),
+            Self::Summary(value) => value.serialize(serializer),
+            Self::Keyphrases(value) => value.serialize(serializer),
+        }
     }
 }
 impl Int8ReducedSourceDocumentRun {
     fn check(&self, policy: SourceDocumentReduction, prepared: &PreparedSourceDocument) -> Result<(), BatchItemFailure> {
         let invalid = || BatchItemFailure::fatal(BatchCode::InvalidExecution);
         let (planned, observed, chunks, span, scans) = match (self, policy) {
+            (Self::Entities(r), SourceDocumentReduction::Entities { limits, .. }) => {
+                if r.schema_version != 1 || r.execution != policy.execution()
+                    || r.reduction_policy != ENTITY_REDUCTION_POLICY || r.entities.len() > r.proposal_count
+                    || r.proposal_count > limits.max_proposals || r.evidence_span_count > limits.max_evidence_spans {
+                    return Err(invalid());
+                }
+                (JobWork { model: r.planned_model_work, mask_node_visits: r.reserved_mask_node_visits },
+                    JobWork { model: r.model_work, mask_node_visits: r.mask_node_visit_charge },
+                    r.mapped_chunks, r.source_span, r.verification_scan_work)
+            }
             (Self::Summary(r), SourceDocumentReduction::Summary { limits, .. }) => {
                 if r.schema_version != 1 || r.execution != policy.execution()
                     || r.summary.reduction_policy != SUMMARY_REDUCTION_POLICY

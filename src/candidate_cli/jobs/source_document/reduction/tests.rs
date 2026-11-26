@@ -29,6 +29,7 @@ fn both_reduction_families_parse_and_keep_native_lifetime_work_unchanged() {
         assert_eq!(mapping.max_model_work, lifetime().max_work.model);
         let reduction = super::super::load_reduction(&value.to_string(), task, mapping, lifetime()).unwrap().unwrap();
         match reduction {
+            PreparedReduction::Entities { .. } => panic!("unexpected entity reduction"),
             PreparedReduction::Summary { limits, max_lifetime_scan_work } => {
                 assert_eq!(task, "summarize"); assert_eq!(limits.max_bullets, 8);
                 assert_eq!(max_lifetime_scan_work, limits.aggregation.max_scan_steps * lifetime().max_attempts);
@@ -117,4 +118,28 @@ fn final_selection_does_not_change_chunking_or_native_reservations() {
         assert_eq!(before.max_model_work, after.max_model_work); assert_eq!(before.max_mask_visits, after.max_mask_visits);
         assert_eq!(reserve, same_reserve);
     }
+}
+
+#[test]
+fn ner_jobs_admit_all_evidence_work_across_attempts_and_the_complete_inventory_workspace() {
+    let mut value = root("ner");
+    value["reduction"] = serde_json::json!({
+        "task":"ner", "schema_version":1, "max_proposals":128, "max_evidence_spans":1024,
+        "max_scan_work":100000, "max_result_bytes":2097152,
+        "max_lifetime_scan_work":100000 * lifetime().max_attempts,
+    });
+    assert!(super::super::preflight_entity_workspace(&value.to_string()).unwrap());
+    let (mapping, _) = load_root("ner", &value, lifetime()).unwrap();
+    let selected = super::super::load_reduction(&value.to_string(), "ner", mapping, lifetime()).unwrap().unwrap();
+    let PreparedReduction::Entities { limits, max_lifetime_scan_work } = selected else { panic!("entity inventory") };
+    assert_eq!((limits.max_proposals, limits.max_evidence_spans), (128, 1024));
+    assert_eq!(max_lifetime_scan_work, limits.max_scan_work * lifetime().max_attempts);
+    assert!(load_root("summarize", &value, lifetime()).is_err());
+    let mut short = value.clone();
+    short["reduction"]["max_lifetime_scan_work"] = serde_json::json!(max_lifetime_scan_work - 1);
+    assert!(load_root("ner", &short, lifetime()).is_err());
+    value["reduction_reserve_mib"] = serde_json::json!(1);
+    assert_eq!(super::super::preflight_entity_workspace(&value.to_string()).err().unwrap().code,
+        "document_entity_reduction_workspace");
+    assert!(load_root("ner", &value, lifetime()).is_err());
 }

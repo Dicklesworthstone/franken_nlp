@@ -73,6 +73,11 @@ pub(crate) fn source_document_job_workspace(planner: &Int8SourceDocumentJobPlann
     let mapping = planner.document_limits();
     let budget = planner.task_budget();
     if reserve == 0 { return Err(HostedError::Limits("source document reduction reservation")); }
+    if let Some(crate::jobs::runner::source::document::reduction::SourceDocumentReduction::Entities { limits, .. })
+        = planner.reduction_policy() {
+        let minimum = limits.workspace_bytes().map_err(|_| HostedError::Limits("entity inventory workspace arithmetic"))?;
+        if reserve < minimum { return Err(HostedError::Limits("entity inventory workspace reservation")); }
+    }
     let chunks = mapping.chunks.max_chunks as u64;
     let native = budget.max_output_bytes.checked_mul(chunks)
         .ok_or(HostedError::Limits("source document result arithmetic"))?;

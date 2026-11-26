@@ -194,3 +194,31 @@ fn invalid_reduction_cannot_silently_fall_back_to_ordinary_maps() {
     let error = prepare(&a, &facts(), defaults(&a, limits), &text.to_string(), lifetime(), limits, &mut Continue).err().unwrap();
     assert_eq!(error.code, "source_document_reduction_lifetime");
 }
+
+#[test]
+fn retained_entity_inventory_keeps_the_exact_map_work_and_authenticates_all_limits() {
+    let a = args("ner");
+    let (_, limits) = a.validate().unwrap();
+    let plain = factory(&a, 64, defaults(&a, limits));
+    let mut value: serde_json::Value = serde_json::from_str(&settings(64)).unwrap();
+    value["reduction"] = serde_json::json!({
+        "schema_version":1, "task":"ner", "max_proposals":128, "max_evidence_spans":1024,
+        "max_scan_work":100000, "max_result_bytes":2097152,
+        "max_lifetime_scan_work":200000 * lifetime().max_attempts,
+    });
+    let reduced = reduced_factory(&a, &value.to_string());
+    let doc = || BatchDocument::<SourceDocumentArgs> { id: "d".into(), text: "é Alice Bob 上海".into(), task_args: None };
+    let before = plain.prepare_with_control(doc(), &mut Continue).unwrap();
+    let after = reduced.prepare_with_control(doc(), &mut Continue).unwrap();
+    assert_eq!(before.execution_identities(), after.execution_identities());
+    assert_eq!(before.planned_work(), after.planned_work());
+    let recipe = canonjson::canonical_bytes(reduced.job_recipe()).unwrap();
+    assert_ne!(recipe, canonjson::canonical_bytes(plain.job_recipe()).unwrap());
+    for key in ["max_proposals", "max_evidence_spans", "max_scan_work", "max_result_bytes", "max_lifetime_scan_work"] {
+        let mut changed = value.clone();
+        let original = changed["reduction"][key].as_u64().unwrap();
+        changed["reduction"][key] = serde_json::json!(original + 1);
+        let revised = reduced_factory(&a, &changed.to_string());
+        assert_ne!(recipe, canonjson::canonical_bytes(revised.job_recipe()).unwrap(), "{key}");
+    }
+}

@@ -1,10 +1,41 @@
-# Durable document summaries and keyphrase rankings
+# Durable document entity inventories, summaries and keyphrase rankings
 
-Source-document jobs can now retain a single selected cited summary or a single
+Source-document jobs can retain an entity inventory, a selected cited summary, or a
 ranked keyphrase list per original document. Add the optional `reduction` object
 to the existing `--source-document-config` JSON. Without that object, the exact
 independent-map behavior and v1 recipe remain unchanged. An explicit null, an
 invalid policy, or a mismatched task is an error, never a map-only fallback.
+
+## Named entity inventories
+
+Use `fnlp candidate job start` or `resume` with `--task ner` and
+`--source-document-config document.json`. Keep the outer chunk and result
+settings shown below for summaries and replace the nested `reduction` with
+this object.
+
+```json
+{
+  "task": "ner",
+  "schema_version": 1,
+  "max_proposals": 16384,
+  "max_evidence_spans": 65536,
+  "max_scan_work": 67108864,
+  "max_result_bytes": 4194304,
+  "max_lifetime_scan_work": 671088640
+}
+```
+
+Each committed document contains the exact typed mentions proposed by its NER
+chunks. Repeated mentions with the same entity type and surface text share an
+entry. Its evidence preserves the original byte and scalar coordinates from the
+contributing chunks, including ambiguous occurrences. Distinct spellings and
+types stay separate. Evidence from other documents does not participate.
+
+The example lifetime cap allows ten full attempts across the job. Set the cap
+to cover `max_scan_work × max_attempts` for the actual job, including retries.
+The complete inventory requires its own workspace within
+`reduction_reserve_mib`. A proposal, evidence, scan, or output limit that is
+too small fails the document. Only a complete inventory can be committed.
 
 ## Cited summaries
 
@@ -137,7 +168,7 @@ private reduced results stay in the explicitly protected spool/materialization.
 ## Library and validation
 
 Construct the existing `Int8SourceDocumentJobPlanner`, then consume it with
-`with_reduction(SourceDocumentReduction::Summary { .. })` or `Keyphrases { .. }`.
+`with_reduction` using `SourceDocumentReduction::Entities`, `Summary`, or `Keyphrases`.
 `NlpEngine::job_int8_source_document` selects the dedicated
 `Int8ReducedSourceDocumentJobProcessor` from that frozen policy. Ordinary map
 processors and their output type remain available and reject reduced recipes.

@@ -6,6 +6,8 @@ use crate::{
     native_engine::decode::DecodeCancellationKind,
     tasks::{corpus_keyphrases::{CorpusKeyphraseLimits, CORPUS_KEYPHRASE_POLICY},
         source_planning::quantized::long::{
+            entity_reduction::{Int8EntityLimits, Int8DocumentEntityRun, ENTITY_REDUCTION_POLICY,
+                INT8_ENTITY_REDUCTION_EXECUTION},
             summary::{Int8SummaryLimits, Int8CorpusSummaryRun, Int8CorpusSummaryError, INT8_CORPUS_SUMMARY_EXECUTION},
             keyphrase_reduction::{Int8KeyphraseLimits, Int8CorpusKeyphraseRun, Int8CorpusKeyphraseError,
                 INT8_CORPUS_KEYPHRASE_EXECUTION}}},
@@ -18,25 +20,33 @@ pub use execution::{Int8ReducedSourceDocumentRun, Int8ReducedSourceDocumentJobPr
 /// including failed and acknowledgement-uncertain attempts.
 #[derive(Clone, Copy, Debug)]
 pub enum SourceDocumentReduction {
+    Entities { limits: Int8EntityLimits, max_lifetime_scan_work: u64 },
     Summary { limits: Int8SummaryLimits, max_lifetime_scan_work: u64 },
     Keyphrases { limits: Int8KeyphraseLimits, max_lifetime_scan_work: u64 },
 }
 impl SourceDocumentReduction {
     pub fn max_result_bytes(self) -> u64 {
-        match self { Self::Summary { limits, .. } => limits.max_result_bytes as u64,
+        match self { Self::Entities { limits, .. } => limits.max_result_bytes as u64,
+            Self::Summary { limits, .. } => limits.max_result_bytes as u64,
             Self::Keyphrases { limits, .. } => limits.max_result_bytes as u64 }
     }
     pub fn scan_work_per_attempt(self) -> u64 {
-        match self { Self::Summary { limits, .. } => limits.aggregation.max_scan_steps,
+        match self { Self::Entities { limits, .. } => limits.max_scan_work,
+            Self::Summary { limits, .. } => limits.aggregation.max_scan_steps,
             Self::Keyphrases { limits, .. } => limits.aggregation.max_scan_work }
     }
     pub fn execution(self) -> &'static str {
-        match self { Self::Summary { .. } => INT8_CORPUS_SUMMARY_EXECUTION,
+        match self { Self::Entities { .. } => INT8_ENTITY_REDUCTION_EXECUTION,
+            Self::Summary { .. } => INT8_CORPUS_SUMMARY_EXECUTION,
             Self::Keyphrases { .. } => INT8_CORPUS_KEYPHRASE_EXECUTION }
     }
     pub fn validate(self, task: &SourceMapTask, mapping: Int8SourceMapLimits, job: JobLimits) -> Result<(), BatchFault> {
         job.validate().map_err(|_| BatchCode::InvalidLimits)?;
         let lifetime = match (self, task) {
+            (Self::Entities { limits, max_lifetime_scan_work }, SourceMapTask::Ner(_)) => {
+                limits.validate(mapping).map_err(|_| BatchCode::InvalidLimits)?;
+                max_lifetime_scan_work
+            }
             (Self::Summary { limits, max_lifetime_scan_work }, SourceMapTask::Summarize(_)) => {
                 limits.validate(mapping).map_err(|_| BatchCode::InvalidLimits)?;
                 max_lifetime_scan_work
@@ -54,13 +64,23 @@ impl SourceDocumentReduction {
         Ok(())
     }
     pub(super) fn check_plan(self, plan: &PreparedInt8SourceMap<'_>) -> Result<(), BatchItemFailure> {
-        match self { Self::Summary { limits, .. } => plan.check_summary(limits).map_err(summary_failure),
+        match self { Self::Entities { limits, .. } => plan.check_entities(limits).map_err(map_failure),
+            Self::Summary { limits, .. } => plan.check_summary(limits).map_err(summary_failure),
             Self::Keyphrases { limits, .. } => plan.check_keyphrases(limits).map_err(keyphrase_failure) }
     }
     fn execute<C: DecodeStepControl>(self, plan: PreparedInt8SourceMap<'_>, identities: &[ExecutionIdentity],
         engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary, prefill: Option<Int8PrefillLimits>, control: &mut C)
         -> Result<Int8ReducedSourceDocumentRun, BatchItemFailure> {
         match self {
+            Self::Entities { limits, .. } => {
+                let expected = plan.preflight_metadata();
+                let mapped = match prefill {
+                    Some(prefill) => plan.execute_layer_major_with_control(identities, engine, vocabulary, prefill, control),
+                    None => plan.execute_with_control(identities, engine, vocabulary, control),
+                }.map_err(map_failure)?;
+                expected.reduce_entities_with_control(&mapped, limits, control)
+                    .map(Int8ReducedSourceDocumentRun::Entities).map_err(map_failure)
+            }
             Self::Summary { limits, .. } => match prefill {
                 Some(prefill) => plan.execute_summary_layer_major_with_control(identities, engine, vocabulary, limits, prefill, control),
                 None => plan.execute_summary_with_control(identities, engine, vocabulary, limits, control),
@@ -90,6 +110,15 @@ impl Serialize for SourceDocumentReduction {
         #[derive(Serialize)]
         struct PhraseLimits { max_unique_phrases: usize, max_evidence_spans: usize, max_value_bytes: usize, max_scan_work: u64 }
         match *self {
+            Self::Entities { limits, max_lifetime_scan_work } => {
+                #[derive(Serialize)]
+                struct EntityContract {
+                    version: u32, execution: &'static str, reduction_policy: &'static str,
+                    limits: Int8EntityLimits, max_lifetime_scan_work: u64,
+                }
+                EntityContract { version: 1, execution: self.execution(), reduction_policy: ENTITY_REDUCTION_POLICY,
+                    limits, max_lifetime_scan_work }.serialize(serializer)
+            }
             Self::Summary { limits, max_lifetime_scan_work } => {
                 let Int8SummaryLimits { aggregation, max_bullets, max_result_bytes } = limits;
                 Contract { version: 1, execution: self.execution(), reduction_policy: SUMMARY_REDUCTION_POLICY,

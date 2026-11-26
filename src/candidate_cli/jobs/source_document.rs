@@ -36,6 +36,13 @@ fn parse(text: &str) -> Result<SourceDocumentSettings, Failure> {
     }
     serde_json::from_value(value).map_err(|_| Failure::usage("source_document_job_configuration"))
 }
+pub(in crate::candidate_cli) fn preflight_entity_workspace(text: &str) -> Result<bool, Failure> {
+    let settings = parse(text)?;
+    match settings.reduction {
+        Some(policy) => policy.check_entity_workspace(settings.reduction_reserve_mib),
+        None => Ok(false),
+    }
+}
 pub(in crate::candidate_cli) fn validate_mode(args: &JobArgs) -> Result<(), Failure> {
     if let Some(path) = &args.source_document_config {
         if path.as_os_str().is_empty() || path.as_os_str() == "-"
@@ -113,7 +120,10 @@ pub(in crate::candidate_cli) fn load(text: &str, args: &JobArgs, budget: TaskBud
         mask_visits_per_chunk: host.max_mask_node_visits, max_mask_visits: masks,
     };
     mapping.chunks.effective_token_limit().map_err(|_| Failure::usage("source_document_job_context"))?;
-    if let Some(policy) = d.reduction { policy.validate(&args.task, mapping, lifetime)?; }
+    if let Some(policy) = d.reduction {
+        policy.check_entity_workspace(d.reduction_reserve_mib)?;
+        policy.validate(&args.task, mapping, lifetime)?;
+    }
     Ok((mapping, reserve))
 }
 

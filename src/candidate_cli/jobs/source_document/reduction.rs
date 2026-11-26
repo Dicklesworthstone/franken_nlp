@@ -3,11 +3,13 @@
 use super::*;
 use crate::{corpus::summarize::CorpusSummaryLimits,
     tasks::{corpus_keyphrases::CorpusKeyphraseLimits,
-        source_planning::quantized::long::{summary::Int8SummaryLimits, keyphrase_reduction::Int8KeyphraseLimits}}};
+        source_planning::quantized::long::{entity_reduction::Int8EntityLimits, summary::Int8SummaryLimits, keyphrase_reduction::Int8KeyphraseLimits}}};
 
 #[derive(Clone, Copy, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "task", rename_all = "snake_case", deny_unknown_fields)]
 pub(in crate::candidate_cli) enum ReductionSettings {
+    Ner { schema_version: u32, max_proposals: usize, max_evidence_spans: usize,
+        max_scan_work: u64, max_result_bytes: usize, max_lifetime_scan_work: u64 },
     Summarize { schema_version: u32, aggregation: CorpusSummaryLimits, max_bullets: usize,
         max_result_bytes: usize, max_lifetime_scan_work: u64 },
     Keyphrases { schema_version: u32, aggregation: PhraseAggregation, max_phrases: usize,
@@ -26,14 +28,35 @@ impl PhraseAggregation {
 }
 /// Checked data, not an executable plan or native/model admission token.
 pub(in crate::candidate_cli) enum PreparedReduction {
+    Entities { limits: Int8EntityLimits, max_lifetime_scan_work: u64 },
     Summary { limits: Int8SummaryLimits, max_lifetime_scan_work: u64 },
     Keyphrases { limits: Int8KeyphraseLimits, max_lifetime_scan_work: u64 },
 }
 impl ReductionSettings {
+    /// Workspace for the complete typed inventory beside the native map.
+    pub(super) fn check_entity_workspace(self, reserve_mib: u64) -> Result<bool, Failure> {
+        let Self::Ner { max_proposals, max_evidence_spans, max_scan_work, max_result_bytes, .. } = self else {
+            return Ok(false);
+        };
+        let required = Int8EntityLimits { max_proposals, max_evidence_spans, max_scan_work, max_result_bytes }
+            .workspace_bytes().map_err(|_| Failure::usage("document_entity_reduction_limits"))?;
+        if reserve_mib.checked_mul(MIB).is_none_or(|bytes| bytes < required) {
+            return Err(Failure::usage("document_entity_reduction_workspace"));
+        }
+        Ok(true)
+    }
+
     pub(super) fn validate(self, task: &str, mapping: Int8SourceMapLimits, lifetime: JobLimits)
         -> Result<PreparedReduction, Failure> {
         lifetime.validate().map_err(|_| Failure::usage("job_limits"))?;
         let (prepared, scans, maximum, output) = match (self, task) {
+            (Self::Ner { schema_version: 1, max_proposals, max_evidence_spans, max_scan_work,
+                max_result_bytes, max_lifetime_scan_work }, "ner") => {
+                let limits = Int8EntityLimits { max_proposals, max_evidence_spans, max_scan_work, max_result_bytes };
+                limits.validate(mapping).map_err(|_| Failure::usage("document_entity_reduction_limits"))?;
+                (PreparedReduction::Entities { limits, max_lifetime_scan_work }, max_scan_work,
+                    max_lifetime_scan_work, max_result_bytes)
+            }
             (Self::Summarize { schema_version: 1, aggregation, max_bullets, max_result_bytes, max_lifetime_scan_work }, "summarize") => {
                 let limits = Int8SummaryLimits { aggregation, max_bullets, max_result_bytes };
                 limits.validate(mapping).map_err(|_| Failure::usage("document_summary_reduction_limits"))?;

@@ -157,7 +157,11 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     let session = Session::new_with_prefill(&common, limits, prefill)?;
     let lifetime = command::parse_limits(&read_config(&session, &args.limits_file, command::LIMIT_BYTES)?)?;
     let native = command::native_limits(&args, lifetime)?;
-    let full_native_memory = prefill.is_some() || limits.compute.threads > 1
+    let raw_source_document = args.source_document_config.as_ref()
+        .map(|path| read_config(&session, path, command::source_document::CONFIG_BYTES)).transpose()?;
+    let entity_reduction = raw_source_document.as_deref().map(command::source_document::preflight_entity_workspace)
+        .transpose()?.unwrap_or(false);
+    let full_native_memory = entity_reduction || prefill.is_some() || limits.compute.threads > 1
         || args.document_config.is_some() && (!args.encoding.is_default() || args.reconciliation.requested());
     // One record owns the output guard. Lifetime work can span millions of
     // records and is not a concurrent memory requirement.
@@ -185,8 +189,6 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     let schema = args.schema.as_ref().map(|path| read_config(&session, path, schema_cli::SCHEMA_BYTES)).transpose()?;
     let raw_document = args.document_config.as_ref()
         .map(|path| read_config(&session, path, command::document::DOCUMENT_BYTES)).transpose()?;
-    let raw_source_document = args.source_document_config.as_ref()
-        .map(|path| read_config(&session, path, command::source_document::CONFIG_BYTES)).transpose()?;
     let ceiling = args.host.task_budget(limits);
     let defaults = command::load_defaults(&args, ceiling, defaults.as_deref(), schema)?;
     let facts = session.facts(&common)?;

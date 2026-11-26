@@ -40,6 +40,8 @@ pub(super) fn prepare(args: &JobArgs, facts: &ArtifactIdentity, defaults: Defaul
         .map_err(planner_failure)?;
     let planner = match reduction {
         None => planner,
+        Some(settings::reduction::PreparedReduction::Entities { limits, max_lifetime_scan_work }) =>
+            planner.with_reduction(SourceDocumentReduction::Entities { limits, max_lifetime_scan_work }).map_err(planner_failure)?,
         Some(settings::reduction::PreparedReduction::Summary { limits, max_lifetime_scan_work }) =>
             planner.with_reduction(SourceDocumentReduction::Summary { limits, max_lifetime_scan_work }).map_err(planner_failure)?,
         Some(settings::reduction::PreparedReduction::Keyphrases { limits, max_lifetime_scan_work }) =>

@@ -50,3 +50,19 @@ fn whole_owned_input_is_send_without_releasing_its_charge_early() {
     send::<StreamInput<(Int8SourceDocumentJobPlanner, Arc<ExtractionVocabulary>, SourceJobRequest),
         std::io::Cursor<Vec<u8>>, ()>>();
 }
+
+#[test]
+fn entity_reduction_workspace_is_admitted_alongside_the_complete_map() {
+    use crate::{jobs::runner::source::document::reduction::SourceDocumentReduction,
+        tasks::source_planning::quantized::long::entity_reduction::Int8EntityLimits};
+    let limits = Int8EntityLimits { max_proposals: 16, max_evidence_spans: 32,
+        max_result_bytes: 65536, max_scan_work: 10000 };
+    let minimum = limits.workspace_bytes().unwrap();
+    let plain = factory();
+    let expected = source_document_job_workspace(&plain, minimum).unwrap();
+    let reduced = plain.with_reduction(SourceDocumentReduction::Entities {
+        limits, max_lifetime_scan_work: u64::MAX,
+    }).unwrap();
+    assert_eq!(source_document_job_workspace(&reduced, minimum).unwrap(), expected);
+    assert!(source_document_job_workspace(&reduced, minimum - 1).is_err());
+}
