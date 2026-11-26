@@ -232,6 +232,53 @@ mod tests {
         assert!(!accepts(&p, "\"Ali\""));
     }
     #[test]
+    fn source_bound_objects_omit_only_uninhabited_optional_properties() {
+        let schema = r#"{
+            "type":"object","additionalProperties":false,"required":["city"],
+            "properties":{
+                "alias":{"type":"object","additionalProperties":false,"required":["code"],
+                    "properties":{"code":{"type":"string","const":"NY","x-fnlp-source":"verbatim"}}},
+                "city":{"type":"string","enum":["Paris","Rome"],"x-fnlp-source":"verbatim"}
+            }
+        }"#;
+        let p = program(schema, "Paris");
+        let city = r#"{"city":"Paris"}"#;
+        assert!(accepts(&p, city));
+        assert_eq!(p.source_fields(city).unwrap()[0].json_pointer, "/city");
+        assert!(!p.initial_state().consume_bytes(br#"{"a"#));
+        assert!(!accepts(&p, "{}"));
+        assert!(p.validate_json(r#"{"alias":{"code":"NY"},"city":"Paris"}"#).is_err());
+
+        let p = program(schema, "NY and Rome");
+        let both = r#"{"alias":{"code":"NY"},"city":"Rome"}"#;
+        assert!(accepts(&p, both));
+        assert_eq!(p.source_fields(both).unwrap().len(), 2);
+        assert!(JsonProgram::compile_with_source(schema, "NY", CompileLimits::default(),
+            SourceRuntimeLimits::default()).is_err());
+    }
+
+    #[test]
+    fn empty_item_languages_leave_exactly_the_empty_array() {
+        let schema = r#"{"type":"array","maxItems":2,"items":{
+            "type":"object","additionalProperties":false,"required":["value"],
+            "properties":{"value":{"type":"string","enum":["A","B"],"x-fnlp-source":"verbatim"}}
+        }}"#;
+        let empty = JsonProgram::compile_with_source(schema, "C",
+            CompileLimits { max_output_bytes: 2, ..CompileLimits::default() },
+            SourceRuntimeLimits::default()).unwrap();
+        assert!(accepts(&empty, "[]"));
+        assert!(empty.source_fields("[]").unwrap().is_empty());
+        let empty = program(schema, "C");
+        assert!(!empty.initial_state().consume_bytes(b"[{"));
+        assert!(empty.validate_json(r#"[{"value":"A"}]"#).is_err());
+
+        let present = program(schema, "B A");
+        let rows = r#"[{"value":"A"},{"value":"B"}]"#;
+        assert!(accepts(&present, rows));
+        assert_eq!(present.source_fields(rows).unwrap().len(), 2);
+        assert!(accepts(&present, "[]"));
+    }
+    #[test]
     fn source_bindings_have_a_distinct_runtime_identity() {
         assert_eq!(program(STRING, "Alice").version(), SOURCE_JSON_RUNTIME_VERSION);
         assert_eq!(JsonProgram::compile(r#"{"type":"string"}"#, CompileLimits::default()).unwrap().version(), JSON_RUNTIME_VERSION);

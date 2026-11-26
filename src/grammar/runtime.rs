@@ -71,7 +71,8 @@ impl JsonValidationSchema {
         let mut nodes = Vec::new();
         // The declaration may contain verbatim enums without an invented
         // document. Only this non-executable validator permits that state.
-        let root = build(schema.root(), &mut nodes, limits.max_states, 0, None, true)?;
+        let root = build(schema.root(), &mut nodes, limits.max_states, 0, None, true)?
+            .ok_or_else(|| invalid("empty schema language"))?;
         if nodes[root].minimum > limits.max_output_bytes { return Err(resource("no JSON value fits output byte limit")); }
         Ok(Self { root: schema.root().clone(), requires_source: schema.requires_verbatim_source() })
     }
@@ -98,7 +99,8 @@ impl JsonProgram {
         }
         let mut nodes = Vec::new();
         let root = build(schema.root(), &mut nodes, limits.max_states, 0,
-            binding.as_ref().map(|b| &b.language), false)?;
+            binding.as_ref().map(|b| &b.language), false)?
+            .ok_or_else(|| invalid("no schema value satisfies the source constraints"))?;
         if nodes[root].minimum > limits.max_output_bytes {
             return Err(resource("no JSON value fits output byte limit"));
         }
@@ -248,8 +250,11 @@ fn resource(reason: &str) -> SchemaError {
 fn invalid(reason: &str) -> SchemaError {
     SchemaError::InvalidSchema { pointer: "$".to_owned(), reason: reason.to_owned() }
 }
+// None denotes a valid declaration with no value for this particular source.
+// A caller may omit such a property or emit an empty array. Resource and
+// malformed-declaration errors remain errors throughout the tree.
 fn build(schema: &SchemaNode, nodes: &mut Vec<Node>,
-    cap: usize, depth: usize, source: Option<&SourceLanguage>, declaration_only: bool) -> Result<usize, SchemaError> {
+    cap: usize, depth: usize, source: Option<&SourceLanguage>, declaration_only: bool) -> Result<Option<usize>, SchemaError> {
     if depth > MAX_DEPTH || nodes.len() >= cap { return Err(resource("runtime schema state limit exceeded")); }
     let literals = |values: &[ScalarValue]| {
         let mut bytes: Vec<_> = values.iter().map(|v| v.canonical_json().into_bytes()).collect();
@@ -259,18 +264,28 @@ fn build(schema: &SchemaNode, nodes: &mut Vec<Node>,
     let kind = match schema {
         SchemaNode::Object { properties, required } => {
             let mut fields = Vec::new();
+            let mut possible = true;
             for (name, child) in properties {
-                fields.push(Property {
-                    key: format!("{}:", escape_json_string(name)).into_bytes(),
-                    child: build(child, nodes, cap, depth + 1, source, declaration_only)?,
-                    required: required.contains(name),
-                });
+                let required = required.contains(name);
+                match build(child, nodes, cap, depth + 1, source, declaration_only)? {
+                    Some(child) => fields.push(Property {
+                        key: format!("{}:", escape_json_string(name)).into_bytes(),
+                        child,
+                        required,
+                    }),
+                    None if required => possible = false,
+                    None => {}
+                }
             }
+            if !possible { return Ok(None); }
             Kind::Object(fields)
         }
-        SchemaNode::Array { items, max_items } => Kind::Array {
-            child: build(items, nodes, cap, depth + 1, source, declaration_only)?, maximum: *max_items,
-        },
+        SchemaNode::Array { items, max_items } => {
+            match build(items, nodes, cap, depth + 1, source, declaration_only)? {
+                Some(child) => Kind::Array { child, maximum: *max_items },
+                None => Kind::Literals(vec![b"[]".to_vec()]),
+            }
+        }
         SchemaNode::String { max_bytes, max_chars, allowed, source: annotation } => {
             let verbatim = *annotation == SourceAnnotation::Verbatim;
             let max_chars = max_chars.unwrap_or(usize::MAX);
@@ -282,6 +297,7 @@ fn build(schema: &SchemaNode, nodes: &mut Vec<Node>,
                         let mut cursor = index.cursor();
                         text.bytes().all(|b| cursor.push_byte(b)) && cursor.is_accepting()
                     }).cloned().collect();
+                    if filtered.is_empty() { return Ok(None); }
                     literals(&filtered)
                 } else { literals(values) }
             } else { Kind::String { max_bytes: *max_bytes, max_chars, verbatim } }
@@ -314,7 +330,7 @@ fn build(schema: &SchemaNode, nodes: &mut Vec<Node>,
     if nodes.len() >= cap { return Err(resource("runtime schema state limit exceeded")); }
     let id = nodes.len();
     nodes.push(Node { kind, minimum });
-    Ok(id)
+    Ok(Some(id))
 }
 
 #[derive(Clone, Debug)]
