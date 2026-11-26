@@ -1,6 +1,7 @@
 //! Explicit retained finite-score jobs; separate from the live score-batch pipe.
 use super::*;
 use crate::candidate_cli::{scored::ScoredArgs, scored_batch::{self, ScoreTask}};
+pub(in crate::candidate_cli) mod document;
 
 #[derive(Args)]
 pub(crate) struct ScoreJobCommand {
@@ -28,6 +29,7 @@ pub(in crate::candidate_cli) struct ScoreJobArgs {
     #[arg(skip)] pub compute: compute::Args,
     #[arg(skip)] pub encoding: input_encoding::InputEncodingArgs,
     #[arg(skip)] pub judge_encoding: crate::candidate_cli::judge::EncodingArgs,
+    #[arg(skip)] pub document_encoding: input_encoding::DocumentInputEncodingArgs,
     #[command(flatten)] pub encoding_work: EncodingWorkArgs,
     /// Required consent to retain private native output in the protected spool.
     #[arg(long)] pub store_results: bool,
@@ -42,6 +44,10 @@ pub(in crate::candidate_cli) struct ScoreJobArgs {
     #[arg(long = "limits")] pub limits_file: PathBuf,
     /// Same settings JSON as score-batch; no document, budget or identity fields.
     #[arg(long)] pub defaults: Option<PathBuf>,
+    /// Classify/sentiment only: immutable complete-document chunk/aggregate settings.
+    /// Each original document commits once, after every chunk completes.
+    #[arg(long, value_name = "FILE")]
+    pub document_config: Option<PathBuf>,
     /// Publish verified materialized.ndjson only after all items commit.
     #[arg(long)] pub materialize: bool,
     #[arg(long, default_value_t = 64)] pub max_stream_mib: u64,
@@ -59,6 +65,7 @@ impl ScoreJobArgs {
         scored_batch::corpus_prefill(self.kind()?, &self.prefill).map_err(Into::into)
     }
     pub(in crate::candidate_cli) fn validate(&self) -> Result<(CandidateArgs, Limits), Failure> {
+        document::validate_mode(self)?;
         self.input_retention.limits()?;
         self.encoding_work_limits()?;
         self.encoding_policy()?;
@@ -72,7 +79,12 @@ impl ScoreJobArgs {
             || self.journal_memory_mib == 0 || self.serialization_memory_mib == 0 {
             return Err(Failure::usage("explicit_scored_job_storage"));
         }
-        let (mut common, mut limits) = self.host.common_with_encoding(&self.encoding)?;
+        let (mut common, mut limits) = if self.document_config.is_some() {
+            self.host.common()?
+        } else {
+            self.host.common_with_encoding(&self.encoding)?
+        };
+        common.input_encoding = self.encoding.clone();
         common.compute = self.compute;
         limits.compute = admitted;
         for mib in [self.journal_memory_mib, self.serialization_memory_mib] {
@@ -88,6 +100,10 @@ impl ScoreJobArgs {
         Ok((common, limits))
     }
     pub(in crate::candidate_cli) fn encoding_policy(&self) -> Result<UntrustedEncoding, Failure> {
+        if self.document_config.is_some() {
+            document::validate_mode(self)?;
+            return self.document_encoding.policy().map_err(Into::into);
+        }
         match self.kind()? {
             ScoreTask::Judge => self.judge_encoding.policy(&self.encoding).map_err(Into::into),
             ScoreTask::Classify | ScoreTask::Sentiment => {
@@ -141,6 +157,17 @@ impl ScoreJobArgs {
         -> Result<scored_batch::Defaults, Failure> {
         scored_batch::parse_defaults(self.kind()?, &self.host, json, budget).map_err(Into::into)
     }
+    pub(in crate::candidate_cli) fn task_budget(&self, limits: Limits)
+        -> Result<crate::tasks::ir::TaskBudget, Failure> {
+        let mut budget = self.host.budget(limits);
+        if self.document_config.is_some() && matches!(self.kind()?, ScoreTask::Sentiment) {
+            // Every affect head belongs to one semantic task. The physical
+            // document runner still reuses one native cache between heads.
+            budget.max_kv_bytes = budget.max_kv_bytes.checked_mul(4)
+                .ok_or_else(|| Failure::usage("score_document_job_budget"))?;
+        }
+        Ok(budget)
+    }
 }
 
 pub(in crate::candidate_cli) fn definition() -> clap::Command {
@@ -155,8 +182,10 @@ fn encoding_definition(command: clap::Command) -> clap::Command {
     compute::definition(crate::candidate_cli::judge::encoding_definition(command))
         .mut_arg("max_tokenizer_pair_checks", |arg| arg.help("Cumulative BPE pair checks per complete scoring record; safe-bpe-v1 only"))
         .mut_arg("max_tokenizer_pair_bytes", |arg| arg.help("Cumulative examined BPE pair bytes per complete scoring record; safe-bpe-v1 only"))
+        .mut_arg("max_tokenizer_input_bytes", |arg| arg.help("Cumulative encoded bytes for judgment or --document-config preparation, including all chunk probes; safe-bpe-v1 only"))
+        .mut_arg("max_tokenizer_output_tokens", |arg| arg.help("Cumulative untrusted tokens for judgment or --document-config preparation; independent of native context, safe-bpe-v1 only"))
         .after_long_help(
-        "Classification, sentiment and judgment jobs accept explicit --input-encoding safe-bpe-v1. One per-record allowance covers every untrusted segment, including both pairwise orders, all rubric criteria and every faithfulness evidence head. Judgment additionally accepts --max-tokenizer-input-bytes and --max-tokenizer-output-tokens, independent of wire size and native head context. One additional --max-total-tokenizer-* invocation ledger covers all records and failed or cancelled preparation. Both policies and all caps are authenticated: repeat them on resume. Each resumed invocation receives the same bounded tokenizer allowance while persisted native work and attempts remain spent. Compact input preserves original bytes and excludes template controls, but changes prompt tokens and makes no identical-output, tokenizer-parity, quality or measured-speed claim. Encoder workspace is admitted before private IO and held through physical completion. Byte-fallback remains the default with unchanged result/recipe metadata. Judgment keeps its existing frozen prefill schedule on resume.")
+        "Classification, sentiment and judgment jobs accept explicit --input-encoding safe-bpe-v1. One per-record allowance covers every untrusted segment, including both pairwise orders, all rubric criteria and every faithfulness evidence head. Judgment and complete-document classification/sentiment additionally accept --max-tokenizer-input-bytes and --max-tokenizer-output-tokens, independent of wire size and native head context. One additional --max-total-tokenizer-* invocation ledger covers all records and failed or cancelled preparation. Both policies and all caps are authenticated: repeat them on resume. Each resumed invocation receives the same bounded tokenizer allowance while persisted native work and attempts remain spent. Compact input preserves original bytes and excludes template controls, but changes prompt tokens and makes no identical-output, tokenizer-parity, quality or measured-speed claim. Encoder workspace is admitted before private IO and held through physical completion. Byte-fallback remains the default. Judgment keeps its existing frozen prefill schedule on resume.\n\nFor --task classify or sentiment, add --document-config FILE to process complete original documents larger than one context. The strict version-1 JSON sets max_chunks, max_chunk_bytes, max_tokenizer_calls, max_retained_result_bytes, max_result_bytes and minimum_coverage_ppm. One original document is one durable item: every native chunk must complete before its full map and source-weighted aggregate commit. --max-result-bytes caps each chunk; the JSON max_result_bytes caps the complete result and must fit JobLimits. All five native work ceilings span the invocation and must fit immutable lifetime work; more chunks or retries never multiply them. Chunking, coverage, output bounds, defaults and tokenizer policies are authenticated and must match on resume. Worker and prefill widths may change without changing task semantics. Per-record task_args may replace fixed defaults and only tighten task budgets. Compact document encoding shares one allowance across every sizing probe and chunk/head reconstruction. No partial successful document is committed. Stdout remains metadata only; complete_document identifies this mode.")
 }
 impl ScoreJobCommand {
     pub(crate) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
@@ -169,6 +198,9 @@ impl ScoreJobCommand {
         };
         args.encoding = input_encoding::InputEncodingArgs::from_matches(request)?;
         args.judge_encoding = crate::candidate_cli::judge::EncodingArgs::from_arg_matches(request)?;
+        if args.document_config.is_some() {
+            args.document_encoding = input_encoding::DocumentInputEncodingArgs::from_matches(request)?;
+        }
         args.compute = compute::Args::from_matches(request)?;
         Ok(command)
     }

@@ -3,6 +3,7 @@ use super::*;
 use crate::candidate_cli::{jobs::scored::ScoreJobArgs,
     runtime::scored_tasks::batch::{self as scored_batch, Corpus}};
 use crate::jobs::runner::scored::{Int8ClassificationJobPlanner, Int8SentimentJobPlanner};
+mod document;
 
 fn configure(args: &ScoreJobArgs, facts: &ArtifactIdentity, limits: Limits,
     defaults: crate::candidate_cli::scored_batch::Defaults) -> Result<Corpus, Failure> {
@@ -67,6 +68,9 @@ fn result_ceiling(args: &ScoreJobArgs, lifetime: JobLimits) -> Result<(), Failur
 
 pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode, args: ScoreJobArgs,
     common: CandidateArgs, limits: Limits, input: R, output: &mut impl Write) -> Result<(), Failure> {
+    if args.document_config.is_some() {
+        return document::execute(mode, args, common, limits, input, output);
+    }
     args.input_retention.validate(mode, &args.host.input)?;
     // First local owner: settings, planners, reader and report drop before the
     // CLI preparation charge. The host separately owns the transferred state.

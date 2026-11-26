@@ -1273,6 +1273,90 @@ review and bounded-policy, cancellation, memory and replay regression
 definitions are present; DSR compilation, executable regressions and the
 explicitly ignored real-model replay gate remain pending.
 
+## Implemented candidate INT8 complete-document scoring jobs
+
+Add `--document-config FILE` to `candidate score-job start|resume --task classify`
+or `--task sentiment` to retain and resume sources that exceed one native
+context. Each `{id,text,task_args?}` record contains the complete original
+document. The existing document planner losslessly partitions it, executes
+every chunk, and retains the full map plus its source-scalar-weighted aggregate
+as **one durable item**. A failed chunk cannot commit a successful prefix.
+Classification supports exclusive and independent multi-label decisions;
+sentiment preserves each selected affect dimension. These descriptive mixtures
+remain uncalibrated and do not claim equivalence to a single full-context model
+posterior.
+
+The strict document configuration is versioned and rejects duplicate or unknown
+keys. For example, `document-job.json` may contain:
+
+```json
+{
+  "schema_version": 1,
+  "max_chunks": 64,
+  "max_chunk_bytes": 4096,
+  "max_tokenizer_calls": 8192,
+  "max_retained_result_bytes": 16777216,
+  "max_result_bytes": 16777216,
+  "minimum_coverage_ppm": 1000000
+}
+```
+
+`minimum_coverage_ppm` requires classified original-source coverage for
+classification and estimated original-source coverage for sentiment.
+`--max-result-bytes` still caps one chunk; the JSON `max_result_bytes` caps the
+complete document and must fit the immutable `JobLimits.max_result_bytes`.
+The complete map, original or retained-input population, result staging,
+tokenizer, prompt workspace and numerical workers are admitted together before
+secret, task-default, source-population or weight IO. The preparation reserve
+and `--memory-mib` must cover the declared maxima; these reservations are not
+an operating-system RSS cap.
+
+With an existing protected directory, key and sufficient immutable job limits:
+
+```sh
+fnlp candidate score-job start documents.ndjson \
+  --task classify --defaults labels.json --document-config document-job.json \
+  --model ./model.fnlpq --memory-mib 32768 --preparation-mib 1024 \
+  --max-input-bytes 1048576 --max-result-bytes 65536 \
+  --input-encoding safe-bpe-v1 --compute-threads 4 --prefill-rows 4 \
+  --store-results --job-dir ./private-document-job \
+  --job-id "$JOB_ID" --key-file ./document-job.key \
+  --limits ./document-job-limits.json --materialize
+```
+
+Use `--task sentiment` and omit classification defaults for all four affect
+dimensions. The `--max-forward-positions`, `--max-projected-logits`,
+`--max-attention-pairs`, `--max-dot-products` and `--max-multiply-accumulates`
+ceilings span the entire invocation and must fit the original journal's
+lifetime work limits. Increase those explicit limits when provisioning a new
+large job; increasing chunk count or retry count does not grant more work.
+Each original-document attempt durably reserves its exact planned five-axis
+work before execution, including work later abandoned by failure.
+
+Resume repeats the original source population, defaults, document configuration,
+encoding policy, secret and job limits. Chunking, coverage, output bounds and
+work limits are part of the keyed recipe; changing them refuses authentication.
+Both physical prefill width and CPU-team width may change within the admitted
+host envelope. Optional `--spool-input` on start and `--use-retained-input` on
+resume preserve the existing explicit consent and one-record replay contract.
+Per-record `task_args` can replace defaults but only tighten the task budget.
+One compact-tokenizer allowance covers all sizing probes and chunk/head
+reconstruction; the invocation tokenizer ledger also spans rejected preparation.
+
+Completion stdout remains metadata only and adds `complete_document: true`.
+Private labels, source text, chunk scores and aggregate results stay in the
+protected result spool or explicitly materialized output. Library callers use
+`NlpEngine::job_int8_classification_documents_scheduled` and
+`NlpEngine::job_int8_sentiment_documents_scheduled` with the existing document
+corpus config types. The pure `int8_classification_document_job_requirements`
+and `int8_sentiment_document_job_requirements` quotes are exported through
+`hosted::corpus::jobs`.
+
+These commands require `metadata-store` and `asupersync-runtime` on Linux x86-64
+or AArch64. Source review and focused recipe, ownership, limits, memory and CLI
+regression definitions are present. Compilation, executable tests, model-present
+interruption/resume qualification and the required DSR checkpoint remain pending.
+
 ## Implemented candidate INT4 token streaming
 
 `fnlp candidate source-int4 stream generate|chat` exposes live native token
