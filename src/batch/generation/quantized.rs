@@ -14,6 +14,7 @@ use crate::{
             prefill::Int8PrefillLimits}},
     tasks::chat::{ChatError, ChatMessage, ChatRequest, ChatRole, GenerateRequest,
         quantized::{Int8ChatError, Int8ChatPlanner, Int8ChatResult, PreparedInt8Chat}},
+    tokenizer::untrusted::{SafeBpeWork, SafeBpeWorkLimits},
 };
 
 pub struct Int8GenerationBatchPlanner<'a> {
@@ -40,6 +41,30 @@ impl<'a> Int8GenerationBatchPlanner<'a> {
                 history.try_reserve_exact(1).map_err(|_| BatchItemFailure::fatal(BatchCode::Allocation))?;
                 history.push(ChatMessage { role: ChatRole::User, content: document.text });
                 self.planner.plan_chat(&ChatRequest { item_id: document.id, sample_index, messages: history, generation, budget })
+            }
+        };
+        result.map_err(planning_failure)
+    }
+    /// Internal composed planning preserves the fixed transcript policy while
+    /// charging the caller's retained invocation ledger, including failures.
+    pub(crate) fn prepare_with_encoding_work<C: DecodeStepControl>(&self,
+        document: BatchDocument<GenerationBatchArgs>, used: &mut SafeBpeWork,
+        limits: Option<SafeBpeWorkLimits>, control: &mut C) -> Result<PreparedInt8Chat, BatchItemFailure> {
+        let args = document.task_args.or_else(|| self.defaults.clone())
+            .ok_or_else(|| BatchItemFailure::reject(BatchCode::Planning))?;
+        check_argument_size(&args).map_err(|_| BatchItemFailure::reject(BatchCode::Planning))?;
+        let result = match args {
+            GenerationBatchArgs::Generate { generation, budget, sample_index } =>
+                self.planner.plan_generate_with_encoding_work(&GenerateRequest {
+                    item_id: document.id, sample_index, prompt: document.text, generation, budget,
+                }, used, limits, control),
+            GenerationBatchArgs::Chat { mut history, generation, budget, sample_index } => {
+                if history.len() >= 128 { return Err(BatchItemFailure::reject(BatchCode::Planning)); }
+                history.try_reserve_exact(1).map_err(|_| BatchItemFailure::fatal(BatchCode::Allocation))?;
+                history.push(ChatMessage { role: ChatRole::User, content: document.text });
+                self.planner.plan_chat_with_encoding_work(&ChatRequest {
+                    item_id: document.id, sample_index, messages: history, generation, budget,
+                }, used, limits, control)
             }
         };
         result.map_err(planning_failure)
@@ -108,6 +133,19 @@ impl<'p, 'e, 'weights, A: Int8GenerationBatchAdmission> NativeInt8GenerationBatc
     }
     pub fn reserved_model_work(&self) -> Int8Work { self.run.reserved }
     pub fn is_poisoned(&self) -> bool { self.run.failed || self.engine.is_poisoned() }
+    pub(crate) fn prepare_with_encoding_work<C: DecodeStepControl>(&mut self,
+        document: BatchDocument<GenerationBatchArgs>, used: &mut SafeBpeWork,
+        limits: Option<SafeBpeWorkLimits>, control: &mut C) -> Result<PreparedInt8Chat, BatchItemFailure> {
+        self.run.ready()?;
+        let result = (|| {
+            let prepared = self.compiler.prepare_with_encoding_work(document, used, limits, control)?;
+            prepared.preflight(prepared.execution_identity(), self.engine, budget(&prepared, self.limits.max_sampler_bytes))
+                .map_err(execution_failure)?;
+            Ok(prepared)
+        })();
+        if result.as_ref().is_err_and(|error: &BatchItemFailure| error.stop) { self.run.failed = true; }
+        result
+    }
 }
 impl<A: Int8GenerationBatchAdmission> BatchProcessor for NativeInt8GenerationBatch<'_, '_, '_, A> {
     type Args = GenerationBatchArgs;
@@ -268,6 +306,7 @@ fn valid_output(prepared: &PreparedInt8Chat, output: &Int8ChatResult, seq: u64, 
 }
 
 fn planning_failure(error: Int8ChatError) -> BatchItemFailure {
+    if let Some(cause) = error.cancellation() { return BatchItemFailure::fatal(BatchFault::cancelled(cause)); }
     match error {
         Int8ChatError::Chat(error) => super::planning_failure(error),
         Int8ChatError::Native(Int8GenerationError::Generation(GenerationError::Allocation)

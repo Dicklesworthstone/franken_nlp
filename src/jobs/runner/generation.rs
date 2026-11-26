@@ -1,6 +1,7 @@
 //! Retained text generation on the existing addressed native batch adapter.
 //! No replacement sampler, tokenizer, result producer or automatic retry.
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 use super::DurableBatchProcessor;
 use crate::{
     batch::{BatchCode, BatchDocument, BatchFault, BatchItemFailure, BatchProcessor, BatchRequestContext,
@@ -12,7 +13,8 @@ use crate::{
         strict_int8::{Int8Work, StrictInt8Engine, prefill::Int8PrefillLimits}},
     tasks::{chat::{ChatLimits, ChatMessage, quantized::{Int8ChatPlanner, Int8ChatResult, PreparedInt8Chat}},
         ir::TaskBudget},
-    tokenizer::specials::TemplateControlIds,
+    tokenizer::{specials::TemplateControlIds,
+        untrusted::{SafeBpeWork, SafeBpeWorkLimits, UntrustedEncoding}},
 };
 mod recipe;
 pub use recipe::GenerationJobRecipe;
@@ -43,10 +45,13 @@ pub struct Int8GenerationJobPlanner {
     planner: Int8ChatPlanner,
     recipe: GenerationJobRecipe,
     binding: Sha256Digest,
+    encoding_workspace_bytes: u64,
+    encoding_work: Mutex<SafeBpeWork>,
+    owner: Arc<()>,
 }
 /// Sealed origin as well as native request. Plans prepared by a different
 /// job contract cannot be transferred to this processor, even on one model.
-pub struct PreparedGenerationJob { native: PreparedInt8Chat, binding: Sha256Digest }
+pub struct PreparedGenerationJob { native: PreparedInt8Chat, binding: Sha256Digest, owner: Arc<()> }
 impl PreparedGenerationJob {
     pub fn execution_identity(&self) -> &ExecutionIdentity { self.native.execution_identity() }
     pub fn model_work(&self) -> Int8Work { self.native.planned_work() }
@@ -54,18 +59,34 @@ impl PreparedGenerationJob {
 impl Int8GenerationJobPlanner {
     pub fn pinned(controls: &TemplateControlIds, eos: u32, identity: ExecutionIdentity,
         config: GenerationJobConfig) -> Result<Self, BatchFault> {
+        Self::pinned_with_document_encoding(controls, eos, identity, config,
+            UntrustedEncoding::ByteFallback, None)
+    }
+    /// Freeze the exact untrusted transcript policy and cumulative tokenizer
+    /// allowance before creating or authenticating a retained job. The same
+    /// factory owns this allowance through every preparation and physical join.
+    pub fn pinned_with_document_encoding(controls: &TemplateControlIds, eos: u32,
+        identity: ExecutionIdentity, config: GenerationJobConfig, encoding: UntrustedEncoding,
+        encoding_work_limits: Option<SafeBpeWorkLimits>) -> Result<Self, BatchFault> {
         if identity.task_spec != config.task.identity() { return Err(BatchCode::Admission.into()); }
         recipe::validate(&config, eos)?;
+        let encoding_workspace_bytes = recipe::encoding_workspace(&encoding, encoding_work_limits)?;
         let planner = Int8ChatPlanner::pinned(controls, eos, identity, config.budget, config.planning)
+            .and_then(|planner| planner.with_document_encoding(encoding))
             .map_err(|_| BatchCode::Admission)?;
-        let recipe = GenerationJobRecipe::new(config)?;
+        let recipe = GenerationJobRecipe::new(config)?
+            .with_document_encoding(planner.document_encoding(), encoding_work_limits)?;
         let bytes = canonjson::canonical_bytes(&(planner.execution_identity(), &recipe))
             .map_err(|_| BatchCode::Serialization)?;
         let binding = Sha256Digest::of_bytes(&bytes);
-        Ok(Self { planner, recipe, binding })
+        Ok(Self { planner, recipe, binding, encoding_workspace_bytes,
+            encoding_work: Mutex::new(SafeBpeWork::default()), owner: Arc::new(()) })
     }
     pub fn execution_identity(&self) -> &ExecutionIdentity { self.planner.execution_identity() }
     pub fn job_recipe(&self) -> &GenerationJobRecipe { &self.recipe }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.planner.document_encoding() }
+    pub fn encoding_work_limits(&self) -> Option<SafeBpeWorkLimits> { self.recipe.encoding_work_limits }
+    pub fn encoding_workspace_bytes(&self) -> u64 { self.encoding_workspace_bytes }
     pub fn task_budget(&self) -> TaskBudget { self.recipe.budget }
     pub fn native_limits(&self) -> Int8BatchLimits { self.recipe.native_limits() }
 
@@ -75,7 +96,10 @@ impl Int8GenerationJobPlanner {
         control: &mut C) -> Result<PreparedGenerationJob, BatchItemFailure> {
         let document = self.document(document, control)?;
         let compiler = Int8GenerationBatchPlanner::new(&self.planner, None).map_err(BatchItemFailure::fatal)?;
-        self.seal(compiler.prepare(document)?, control)
+        let mut used = self.encoding_work.try_lock().map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
+        let native = compiler.prepare_with_encoding_work(document, &mut used, self.encoding_work_limits(), control)?;
+        drop(used);
+        self.seal(native, control)
     }
     fn document<C: DecodeStepControl>(&self, document: BatchDocument<GenerationJobArgs>, control: &mut C)
         -> Result<BatchDocument<GenerationBatchArgs>, BatchItemFailure> {
@@ -99,10 +123,11 @@ impl Int8GenerationJobPlanner {
             || native.native_plan().sampler_bytes() > self.recipe.native_limits().max_sampler_bytes {
             return Err(BatchItemFailure::reject(BatchCode::WorkLimit));
         }
-        Ok(PreparedGenerationJob { native, binding: self.binding })
+        Ok(PreparedGenerationJob { native, binding: self.binding, owner: Arc::clone(&self.owner) })
     }
     fn check(&self, prepared: &PreparedGenerationJob) -> Result<(), BatchItemFailure> {
-        if prepared.binding != self.binding || prepared.native.task_plan().task_spec_identity() != self.recipe.task.identity() {
+        if !Arc::ptr_eq(&self.owner, &prepared.owner) || prepared.binding != self.binding
+            || prepared.native.task_plan().task_spec_identity() != self.recipe.task.identity() {
             return Err(BatchItemFailure::fatal(BatchCode::Admission));
         }
         Ok(())
@@ -148,8 +173,11 @@ impl<A: Int8GenerationBatchAdmission> BatchProcessor for Int8GenerationJobProces
         -> Result<Self::Prepared, BatchItemFailure> {
         self.ready()?; self.failed = true;
         let input = self.planner.document(document, control)?;
-        // Bounded compilation is polled around, not falsely claimed preemptible.
-        let native = self.native.prepare(input)?;
+        let mut used = self.planner.encoding_work.try_lock()
+            .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
+        let native = self.native.prepare_with_encoding_work(input, &mut used,
+            self.planner.encoding_work_limits(), control)?;
+        drop(used);
         let prepared = self.planner.seal(native, control)?;
         self.failed = false; Ok(prepared)
     }

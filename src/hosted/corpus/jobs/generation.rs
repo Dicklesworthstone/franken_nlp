@@ -11,7 +11,11 @@ use crate::{
 /// On early return or unwind, readers, private preparation and every native
 /// reservation remain charged until the last persistent worker has joined.
 struct GenerationExecution<R> {
-    input: Charged<StreamInput<(Int8GenerationJobPlanner, SourceJobRequest), R, ()>>,
+    // The callback consumes input.planner, so a separate share keeps the
+    // actual tokenizer and its monotone ledger alive until physical join.
+    // Drop it before the charged input/native reservations below.
+    _planner: Arc<Int8GenerationJobPlanner>,
+    input: Charged<StreamInput<(Arc<Int8GenerationJobPlanner>, SourceJobRequest), R, ()>>,
     kv: Option<Pending>,
     scratch: Option<Pending>,
     _kv: Option<CommittedMemory>,
@@ -102,7 +106,8 @@ impl NlpEngine {
         let required = requirements(limits.native)?;
         capacity(planner.task_budget(), required.kv_bytes, request.limits.max_result_bytes)?;
         let scratch_bytes = workspace(sum(&[required.rope_bytes, required.scratch_payload_bound,
-            limits.native.allocator_reserve_bytes])?, native.max_sampler_bytes, prefill)?;
+            limits.native.allocator_reserve_bytes])?, native.max_sampler_bytes, prefill,
+            planner.encoding_workspace_bytes())?;
         let max_batch_rows = prefill.map_or(1, |limits| limits.max_batch_rows);
         let worker_bytes = team.map(|(_, width)|
             dispatch::int8_prefill_team_workspace_bytes(width, max_batch_rows)).transpose()?.unwrap_or(0);
@@ -110,11 +115,13 @@ impl NlpEngine {
         // simultaneous envelope before any population or private job IO.
         sum(&[bytes, required.kv_bytes, scratch_bytes, worker_bytes])?;
         let lease = self.resources().acquire_lease();
+        let planner = Arc::new(planner);
+        let retained_planner = Arc::clone(&planner);
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
             || Ok(StreamInput { planner: Some((planner, request)), reader, writer: () }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch_bytes)?;
-        let execution = GenerationExecution { input, kv: Some(kv), scratch: Some(scratch),
+        let execution = GenerationExecution { _planner: retained_planner, input, kv: Some(kv), scratch: Some(scratch),
             _kv: None, _scratch: None, limits, required, prefill, lease };
         let model = model.clone();
         let completed = match team {
@@ -190,10 +197,11 @@ fn capacity(task: TaskBudget, kv: u64, output: usize) -> Result<(), HostedError>
     }
     Ok(())
 }
-fn workspace(ordinary: u64, sampler: u64, prefill: Option<Int8PrefillLimits>) -> Result<u64, HostedError> {
+fn workspace(ordinary: u64, sampler: u64, prefill: Option<Int8PrefillLimits>, encoding: u64)
+    -> Result<u64, HostedError> {
     if sampler == 0 { return Err(HostedError::Limits("text job sampler reservation")); }
     let extra = prefill.map(Int8PrefillLimits::validate).transpose().map_err(HostedError::Native)?.unwrap_or(0);
-    sum(&[ordinary, sampler, extra])
+    sum(&[ordinary, sampler, extra, encoding])
 }
 
 #[cfg(test)]
@@ -212,24 +220,38 @@ mod tests {
     }
     #[test]
     fn sampler_workspace_is_additional_not_a_discount_on_native_scratch() {
-        assert_eq!(workspace(12345, 32 << 20, None).unwrap(), 12345 + (32 << 20));
-        assert!(workspace(12345, 0, None).is_err());
-        assert!(workspace(u64::MAX, 1, None).is_err());
-        assert_eq!(workspace(u64::MAX - 1, 1, None).unwrap(), u64::MAX);
+        assert_eq!(workspace(12345, 32 << 20, None, 0).unwrap(), 12345 + (32 << 20));
+        assert!(workspace(12345, 0, None, 0).is_err());
+        assert!(workspace(u64::MAX, 1, None, 0).is_err());
+        assert_eq!(workspace(u64::MAX - 1, 1, None, 0).unwrap(), u64::MAX);
     }
     #[test]
     fn grouped_prompt_workspace_is_validated_and_additional_for_the_whole_job() {
         for rows in [1, 4, 64] {
             let extra = Int8PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
             let limits = Int8PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: extra };
-            assert_eq!(workspace(12345, 32 << 20, Some(limits)).unwrap(), 12345 + (32 << 20) + extra);
+            assert_eq!(workspace(12345, 32 << 20, Some(limits), 0).unwrap(), 12345 + (32 << 20) + extra);
             assert!(workspace(12345, 32 << 20, Some(Int8PrefillLimits {
-                max_extra_scratch_bytes: extra - 1, ..limits })).is_err());
-            assert!(workspace(u64::MAX - extra, 1, Some(limits)).is_err());
+                max_extra_scratch_bytes: extra - 1, ..limits }), 0).is_err());
+            assert!(workspace(u64::MAX - extra, 1, Some(limits), 0).is_err());
         }
         for rows in [0, 65, usize::MAX] {
             assert!(workspace(12345, 32 << 20, Some(Int8PrefillLimits {
-                max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX })).is_err());
+                max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX }), 0).is_err());
+        }
+    }
+    #[test]
+    fn compact_workspace_coexists_with_native_sampler_and_grouped_prompt_storage() {
+        use crate::tokenizer::untrusted::SafeBpeLimits;
+        let encoding = SafeBpeLimits { max_input_bytes: 8192, max_output_tokens: 2048,
+            max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 }
+            .requirements().unwrap().workspace_bytes + 1024;
+        let prefill = Int8PrefillLimits { max_batch_rows: 4,
+            max_extra_scratch_bytes: Int8PrefillLimits::required_extra_scratch_bytes(4).unwrap() };
+        for schedule in [None, Some(prefill)] {
+            let byte = workspace(12345, 32 << 20, schedule, 0).unwrap();
+            assert_eq!(workspace(12345, 32 << 20, schedule, encoding).unwrap(), byte + encoding);
+            assert!(workspace(u64::MAX - encoding, 1, schedule, encoding).is_err());
         }
     }
     #[test]
@@ -242,7 +264,7 @@ mod tests {
     #[test]
     fn owned_planner_input_and_result_cross_the_existing_blocking_boundary() {
         fn send<T: Send + 'static>() {}
-        send::<StreamInput<(Int8GenerationJobPlanner, SourceJobRequest), std::io::Cursor<Vec<u8>>, ()>>();
+        send::<StreamInput<(Arc<Int8GenerationJobPlanner>, SourceJobRequest), std::io::Cursor<Vec<u8>>, ()>>();
         send::<GenerationExecution<std::io::Cursor<Vec<u8>>>>();
         send::<crate::tasks::chat::quantized::Int8ChatResult>();
         let _entry = NlpEngine::job_int8_text::<std::io::Cursor<Vec<u8>>>;

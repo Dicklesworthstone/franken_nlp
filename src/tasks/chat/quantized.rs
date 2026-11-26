@@ -6,6 +6,7 @@
 //! This adapter does not turn a current-candidate artifact into a certified one.
 
 use super::*;
+use crate::tokenizer::untrusted::SafeBpeWorkLimits;
 use crate::native_engine::{
     decode::DecodeCancellationKind,
     generation::quantized::{Int8GenerationBudget, Int8GenerationError, Int8GenerationPlan, Int8GenerationRun},
@@ -95,6 +96,50 @@ impl Int8ChatPlanner {
         }
         self.compile(BuiltInTask::Generate, &request.item_id, request.sample_index,
             &[ChatMessage { role: ChatRole::User, content: request.prompt.clone() }], &request.generation, request.budget, control)
+    }
+    /// A retained invocation supplies one monotone ledger for every transcript
+    /// preparation. Tightening its remaining allowance never changes the
+    /// pinned encoding identity or refunds work after failure/cancellation.
+    pub(crate) fn plan_chat_with_encoding_work<C: DecodeStepControl>(&self,
+        request: &ChatRequest, used: &mut SafeBpeWork, limits: Option<SafeBpeWorkLimits>,
+        control: &mut C) -> Result<PreparedInt8Chat, Int8ChatError> {
+        self.compile_with_encoding_work(BuiltInTask::Chat, &request.item_id, request.sample_index,
+            &request.messages, &request.generation, request.budget, used, limits, control)
+    }
+    pub(crate) fn plan_generate_with_encoding_work<C: DecodeStepControl>(&self,
+        request: &GenerateRequest, used: &mut SafeBpeWork, limits: Option<SafeBpeWorkLimits>,
+        control: &mut C) -> Result<PreparedInt8Chat, Int8ChatError> {
+        if request.prompt.len() > self.compiler.limits.max_message_bytes
+            || request.prompt.len() > self.compiler.limits.max_total_message_bytes {
+            return Err(ChatError::Limit("prompt bytes").into());
+        }
+        self.compile_with_encoding_work(BuiltInTask::Generate, &request.item_id, request.sample_index,
+            &[ChatMessage { role: ChatRole::User, content: request.prompt.clone() }],
+            &request.generation, request.budget, used, limits, control)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn compile_with_encoding_work<C: DecodeStepControl>(&self, kind: BuiltInTask, item: &str,
+        sample: u64, messages: &[ChatMessage], options: &GenerationOptions, budget: TaskBudget,
+        used: &mut SafeBpeWork, limits: Option<SafeBpeWorkLimits>, control: &mut C)
+        -> Result<PreparedInt8Chat, Int8ChatError> {
+        let encoding = match (self.document_encoding(), limits) {
+            (UntrustedEncoding::ByteFallback, None) => UntrustedEncoding::ByteFallback,
+            (UntrustedEncoding::SafeBpeV1(call), Some(total)) =>
+                UntrustedEncoding::SafeBpeV1(total.remaining_call(*used, *call)
+                    .map_err(|_| ChatError::Limit("invocation tokenizer work"))?),
+            _ => return Err(ChatError::Contract("invocation tokenizer policy").into()),
+        };
+        let mut work = SafeBpeWork::default();
+        let compiled = self.compiler.compile_input_with_encoding_work(
+            kind, messages, options, budget, &encoding, &mut work, control);
+        // Debit even when prompt assembly or subsequent native planning fails.
+        // A later document can use only the remaining invocation allowance.
+        *used = used.checked_add(work).ok_or(ChatError::Limit("invocation tokenizer work"))?;
+        let input = compiled?;
+        let native = Int8GenerationPlan::compile(input.prompt, input.options, input.identity,
+            item, sample, self.compiler.limits.generation)?;
+        Ok(PreparedInt8Chat { task: input.task, native,
+            tokenizer: Arc::clone(&self.compiler.tokenizer), sample_index: sample })
     }
     #[allow(clippy::too_many_arguments)]
     fn compile<C: DecodeStepControl>(&self, kind: BuiltInTask, item: &str, sample: u64, messages: &[ChatMessage],

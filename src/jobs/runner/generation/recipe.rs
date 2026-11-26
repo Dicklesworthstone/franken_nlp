@@ -26,6 +26,10 @@ pub struct GenerationJobRecipe {
     pub(super) generation: GenerationOptions,
     pub(super) budget: TaskBudget,
     planning: PlanningRecipe, max_model_work: Int8Work, max_sampler_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<UntrustedEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) encoding_work_limits: Option<SafeBpeWorkLimits>,
 }
 impl GenerationJobRecipe {
     pub(super) fn new(config: GenerationJobConfig) -> Result<Self, BatchFault> {
@@ -38,11 +42,20 @@ impl GenerationJobRecipe {
             }, processor_version: PROCESSOR_VERSION,
             addressing: "exact-item-id-and-sample-index; original-ordinal-delivery; no-attempt-reseed-v1",
             task: config.task, generation: config.generation, budget: config.budget,
-            planning: config.planning.into(), max_model_work, max_sampler_bytes };
+            planning: config.planning.into(), max_model_work, max_sampler_bytes,
+            input_encoding: None, encoding_work_limits: None };
         // The enclosing JobRunner recipe gets its own remaining envelope room.
         // Only a domain-separated keyed commitment reaches the job manifest.
         bounded_json(&recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
         Ok(recipe)
+    }
+    pub(super) fn with_document_encoding(mut self, encoding: &UntrustedEncoding,
+        total: Option<SafeBpeWorkLimits>) -> Result<Self, BatchFault> {
+        encoding_workspace(encoding, total)?;
+        self.input_encoding = (encoding != &UntrustedEncoding::ByteFallback).then(|| encoding.clone());
+        self.encoding_work_limits = total;
+        bounded_json(&self, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
+        Ok(self)
     }
     pub(super) fn native_limits(&self) -> Int8BatchLimits {
         Int8BatchLimits { max_sampler_bytes: self.max_sampler_bytes, max_model_work: self.max_model_work }
@@ -60,6 +73,18 @@ impl GenerationJobRecipe {
         }
         if bytes > self.planning.max_total_message_bytes { return Err(reject()); }
         Ok(())
+    }
+}
+pub(super) fn encoding_workspace(encoding: &UntrustedEncoding,
+    total: Option<SafeBpeWorkLimits>) -> Result<u64, BatchFault> {
+    match (encoding, total) {
+        (UntrustedEncoding::ByteFallback, None) => Ok(0),
+        (UntrustedEncoding::SafeBpeV1(call), Some(total)) => {
+            total.validate().map_err(|_| BatchCode::InvalidLimits)?;
+            call.requirements().map_err(|_| BatchCode::InvalidLimits)?.workspace_bytes
+                .checked_add(1024).ok_or_else(|| BatchCode::InvalidLimits.into())
+        }
+        _ => Err(BatchCode::InvalidLimits.into()),
     }
 }
 pub(super) fn validate(config: &GenerationJobConfig, eos: u32) -> Result<(), BatchFault> {
