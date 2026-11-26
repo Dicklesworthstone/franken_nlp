@@ -345,11 +345,17 @@ enum SchemaSubcommand {
     Check {
         #[arg(value_name = "SCHEMA")]
         schema: PathBuf,
+        /// Bind verbatim fields to this UTF-8 document (up to 1 MiB); one input may be stdin.
+        #[arg(long, value_name = "DOCUMENT")]
+        source: Option<PathBuf>,
     },
     /// Emit one canonical valid instance; `-` reads schema JSON from stdin.
     Sample {
         #[arg(value_name = "SCHEMA")]
         schema: PathBuf,
+        /// Bind verbatim fields to this UTF-8 document (up to 1 MiB); one input may be stdin.
+        #[arg(long, value_name = "DOCUMENT")]
+        source: Option<PathBuf>,
     },
 }
 
@@ -2592,10 +2598,14 @@ fn run_schema_command_with_reader(
     command: SchemaSubcommand,
     schema_input: &mut impl Read,
 ) -> ExitCode {
-    let (mode, path) = match command {
-        SchemaSubcommand::Check { schema } => ("check", schema),
-        SchemaSubcommand::Sample { schema } => ("sample", schema),
+    let (mode, path, document) = match command {
+        SchemaSubcommand::Check { schema, source } => ("check", schema, source),
+        SchemaSubcommand::Sample { schema, source } => ("sample", schema, source),
     };
+    if path == Path::new("-") && document.as_deref() == Some(Path::new("-")) {
+        eprintln!("SCHEMA mode={mode} RESULT=FAIL reason=schema-and-document-share-stdin");
+        return ErrorCode::Usage.as_process_exit();
+    }
     let limits = CompileLimits::default();
     let bytes = match read_schema_source_from(&path, schema_input, limits.max_schema_bytes) {
         Ok(bytes) => bytes,
@@ -2617,6 +2627,9 @@ fn run_schema_command_with_reader(
         eprintln!("SCHEMA mode={mode} RESULT=FAIL pointer=$ keyword=none reason=input-read:invalid UTF-8");
         return ErrorCode::InputDecodeOrParse.as_process_exit();
     };
+    if let Some(document) = document {
+        return run_bound_schema(mode, source, &document, schema_input, limits);
+    }
     let compiled = match compile_json_schema(source, limits) {
         Ok(compiled) => compiled,
         Err(error) => {
@@ -2634,6 +2647,53 @@ fn run_schema_command_with_reader(
         }
     }
     emit_schema_success(mode, &compiled);
+    ExitCode::SUCCESS
+}
+
+fn run_bound_schema(mode: &str, schema: &str, document: &Path, input: &mut impl Read,
+    limits: CompileLimits) -> ExitCode {
+    use crate::grammar::runtime::{JsonProgram, SourceRuntimeLimits};
+    use crate::textutil::{TextError, read_utf8};
+
+    let source_limits = SourceRuntimeLimits::default();
+    let cap = source_limits.index.max_source_bytes;
+    let result = if document == Path::new("-") {
+        read_utf8(input, cap)
+    } else {
+        crate::local_io::open_document(document).map_err(|_| TextError::InputRead)
+            .and_then(|mut file| read_utf8(&mut file, cap))
+    };
+    let source = match result {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("SCHEMA mode={mode} RESULT=FAIL reason={error}");
+            return match error {
+                TextError::InputBudget | TextError::AllocationRefused => ErrorCode::AdmissionOrResourceLimit,
+                _ => ErrorCode::InputDecodeOrParse,
+            }.as_process_exit();
+        }
+    };
+    let program = match JsonProgram::compile_with_source(schema, &source, limits, source_limits) {
+        Ok(program) => program,
+        Err(error) => {
+            emit_schema_error(mode, &error);
+            return ErrorCode::SchemaOrRecipeCompile.as_process_exit();
+        }
+    };
+    if mode == "sample" {
+        let sample = match program.sample_json() {
+            Ok(sample) => sample,
+            Err(error) => {
+                emit_schema_error(mode, &error);
+                return ErrorCode::StructuredTaskNoResult.as_process_exit();
+            }
+        };
+        let mut out = io::stdout().lock();
+        if writeln!(out, "{sample}").and_then(|()| out.flush()).is_err() {
+            return ErrorCode::Generic.as_process_exit();
+        }
+    }
+    eprintln!("SCHEMA mode={mode} RESULT=PASS runtime={} source_product=BOUND", program.version());
     ExitCode::SUCCESS
 }
 

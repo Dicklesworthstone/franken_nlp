@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "city": {"type": "string", "enum": ["Paris", "東京"], "x-fnlp-source": "verbatim"},
+    "optional": {"type": "string", "const": "absent", "x-fnlp-source": "verbatim"}
+  },
+  "required": ["city"]
+}

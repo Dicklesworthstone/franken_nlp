@@ -212,3 +212,52 @@ fn arbitrary_byte_like_input_never_panics_the_compiler() {
         assert!(result.is_ok(), "compiler panicked for fuzz seed");
     }
 }
+
+#[test]
+fn source_bound_schema_commands_compile_and_sample_the_document_language() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    fn invoke(args: &[&str], input: &[u8]) -> std::process::Output {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_fnlp"))
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn().unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    let schema = "tests/fixtures/schema/accept-grounded-choice.schema.json";
+    let document = "Private source with 東京.".as_bytes();
+    let checked = invoke(&["schema", "check", schema, "--source", "-"], document);
+    assert!(checked.status.success());
+    assert!(checked.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&checked.stderr).contains("source_product=BOUND"));
+    let sample = invoke(&["schema", "sample", schema, "--source", "-"], document);
+    assert!(sample.status.success());
+    assert_eq!(String::from_utf8(sample.stdout).unwrap(), "{\"city\":\"東京\"}\n");
+    assert!(!String::from_utf8_lossy(&sample.stderr).contains("東京"));
+
+    for mode in ["check", "sample"] {
+        let missing = invoke(&["schema", mode, schema, "--source", "-"], b"elsewhere");
+        assert_eq!(missing.status.code(), Some(8));
+        assert!(missing.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&missing.stderr).contains("elsewhere"));
+    }
+
+    let from_file = invoke(&["schema", "sample", "-", "--source", "Cargo.toml"],
+        br#"{"type":"string","enum":["[package]","missing-value"],"x-fnlp-source":"verbatim"}"#);
+    assert!(from_file.status.success());
+    assert_eq!(from_file.stdout, b"\"[package]\"\n");
+
+    let duplicate_stdin = invoke(&["schema", "check", "-", "--source", "-"], b"");
+    assert_eq!(duplicate_stdin.status.code(), Some(2));
+    let invalid = invoke(&["schema", "check", schema, "--source", "-"], &[0xff]);
+    assert_eq!(invalid.status.code(), Some(4));
+    let oversized = invoke(&["schema", "sample", schema, "--source", "-"], &vec![b'A'; 1024 * 1024 + 1]);
+    assert_eq!(oversized.status.code(), Some(9));
+    assert!(oversized.stdout.is_empty());
+}

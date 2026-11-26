@@ -212,6 +212,48 @@ impl JsonProgram {
         hash.finalize().into()
     }
 
+    /// Produce a shortest canonical witness of this executable grammar. In
+    /// source-bound programs, literal choices already reflect the actual
+    /// document. Replay the witness and run the independent verifier before
+    /// making any bytes available to the caller.
+    pub fn sample_json(&self) -> Result<String, SchemaError> {
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(self.nodes[self.root].minimum)
+            .map_err(|_| resource("sample allocation refused"))?;
+        self.write_minimum(self.root, &mut bytes)?;
+        let mut state = self.initial_state();
+        if !state.consume_bytes(&bytes) || !state.is_accepting() {
+            return Err(invalid("sample failed executable grammar validation"));
+        }
+        let text = String::from_utf8(bytes).map_err(|_| invalid("sample is not UTF-8"))?;
+        self.validate_json(&text)?;
+        Ok(text)
+    }
+
+    fn write_minimum(&self, node: usize, bytes: &mut Vec<u8>) -> Result<(), SchemaError> {
+        match &self.nodes[node].kind {
+            Kind::Object(properties) => {
+                bytes.push(b'{');
+                for (i, field) in properties.iter().filter(|field| field.required).enumerate() {
+                    if i != 0 { bytes.push(b','); }
+                    bytes.extend_from_slice(&field.key);
+                    self.write_minimum(field.child, bytes)?;
+                }
+                bytes.push(b'}');
+            }
+            Kind::Array { .. } => bytes.extend_from_slice(b"[]"),
+            Kind::String { .. } => bytes.extend_from_slice(b"\"\""),
+            Kind::Number { .. } => bytes.push(b'0'),
+            Kind::Literals(values) => {
+                // Stored in byte order; ties are deterministic.
+                let minimum = values.iter().min_by_key(|value| value.len())
+                    .ok_or_else(|| invalid("empty literal language"))?;
+                bytes.extend_from_slice(minimum);
+            }
+        }
+        Ok(())
+    }
+
     /// Independent whole-value verification, never acceptance by parser state.
     /// The existing validator receives schema data, not transitions or masks.
     pub fn validate_json(&self, text: &str) -> Result<(), SchemaError> {
