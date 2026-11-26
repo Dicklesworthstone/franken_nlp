@@ -70,14 +70,15 @@ impl<'a> Cursor<'a> {
         let eos = p.eos_token_ids.binary_search(&selected).is_ok();
         let score = if p.capture_logprobs { Some(raw_logprob(logits, selected, control, index)?) } else { None };
         let mut marker_consumed = self.marker_consumed;
-        let decoded = if eos { DecodedProposal::Piece(Vec::new()) } else {
+        let decoded = if eos { Ok(DecodedProposal::Piece(Vec::new())) } else {
             DecodedProposal::decode(decoder, &mut self.output.token_ids, selected, &mut marker_consumed)
-                .map_err(|_| GenerationError::Decoder)?
+                .map_err(|_| GenerationError::Decoder)
         };
         // Decoding may consume the remaining budget or observe external
-        // cancellation. In particular, a byte-limit stop is still a successful
-        // result and must not conceal cancellation at this boundary.
+        // cancellation, including when the decoder itself fails. Preserve the
+        // original control before classifying that failure or a byte-limit stop.
         checkpoint(control, index)?;
+        let decoded = decoded?;
         let delta = decoded.delta(&self.output.content_bytes).map_err(|_| GenerationError::DecoderNotPrefixStable)?;
         let Some(event_bytes) = prepare_token_bytes(&mut self.output.content_bytes, delta, p.max_output_bytes)
             .map_err(|_| GenerationError::Allocation)? else {
@@ -89,14 +90,17 @@ impl<'a> Cursor<'a> {
         let event = DecodeTokenEvent { schema_version: DECODE_TOKEN_EVENT_SCHEMA_VERSION,
             request_seq: self.output.request_seq, token_index: index, token_id: selected, decoded_bytes: event_bytes, logprob: score };
         checkpoint(control, index)?;
-        let permit = sink.reserve(&event).map_err(|_| GenerationError::Stream)?;
-        // Cancellation while the sink waited releases the permit, not a token.
+        let permit = sink.reserve(&event).map_err(|_| GenerationError::Stream);
+        // A failed reservation can also signal cancellation. A successful
+        // permit stays owned here and is dropped if the original control stops.
         checkpoint(control, index)?;
-        sink.permit(permit, event).map_err(|_| GenerationError::Stream)?;
+        let delivery = sink.permit(permit?, event).map_err(|_| GenerationError::Stream);
         // Delivery itself may block or trigger cancellation. An already
         // delivered event cannot be retracted, but it must not authorize a
-        // successful terminal result or retirement/refill of this row.
+        // successful terminal result or retirement/refill of this row. Check
+        // even on failure so a transport error cannot erase the terminal cause.
         checkpoint(control, index)?;
+        delivery?;
         self.output.token_ids.push(selected);
         self.output.content_bytes.extend_from_slice(delta);
         self.marker_consumed = marker_consumed;

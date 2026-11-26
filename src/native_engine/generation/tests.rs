@@ -173,6 +173,158 @@ fn terminal_delivery_cancellation_never_becomes_a_successful_sequence() {
         }
     }
 }
+
+mod callback_failures {
+    use super::*;
+    use std::{cell::Cell, rc::Rc};
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Hook { Decode, Reserve, Deliver }
+    #[derive(Default)]
+    struct Trace {
+        decodes: Cell<usize>, reservations: Cell<usize>, deliveries: Cell<usize>,
+        published: Cell<usize>, permit_drops: Cell<usize>,
+    }
+    struct Permit(Rc<Trace>);
+    impl Drop for Permit {
+        fn drop(&mut self) { self.0.permit_drops.set(self.0.permit_drops.get() + 1); }
+    }
+    #[derive(Clone)]
+    struct Probe {
+        hook: Hook, fail: bool, cause: Option<DecodeCancellationKind>,
+        signal: BoundaryCancellation, trace: Rc<Trace>,
+    }
+    impl Probe {
+        fn enter(&self, hook: Hook) -> Result<(), &'static str> {
+            if self.hook == hook {
+                self.signal.0.set(self.cause);
+                if self.fail { return Err("private callback failure"); }
+            }
+            Ok(())
+        }
+    }
+    impl DecodeByteDecoder for Probe {
+        type Error = &'static str;
+        fn decode_token_ids(&self, tokens: &[u32]) -> Result<Vec<u8>, Self::Error> {
+            self.trace.decodes.set(self.trace.decodes.get() + 1);
+            self.enter(Hook::Decode)?;
+            Decoder.decode_token_ids(tokens)
+        }
+    }
+    impl DecodeEventSink for Probe {
+        type Permit = Permit; type Error = &'static str;
+        fn reserve(&mut self, _: &DecodeTokenEvent) -> Result<Permit, Self::Error> {
+            self.trace.reservations.set(self.trace.reservations.get() + 1);
+            self.enter(Hook::Reserve)?;
+            Ok(Permit(self.trace.clone()))
+        }
+        fn permit(&mut self, _: Permit, _: DecodeTokenEvent) -> Result<(), Self::Error> {
+            self.trace.deliveries.set(self.trace.deliveries.get() + 1);
+            self.enter(Hook::Deliver)?;
+            self.trace.published.set(self.trace.published.get() + 1);
+            Ok(())
+        }
+    }
+    // Return the external cause only once, then a different cause. A boundary
+    // must return the captured cause directly instead of polling it again.
+    struct Control {
+        signal: BoundaryCancellation, observed: Option<DecodeCancellationKind>, terminal_polls: usize,
+    }
+    impl DecodeStepControl for Control {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            if self.observed.is_some() {
+                self.terminal_polls += 1;
+                return Some(DecodeCancellationKind::Shutdown);
+            }
+            let cause = self.signal.0.take();
+            if cause.is_some() { self.observed = cause; self.terminal_polls += 1; }
+            cause
+        }
+    }
+    fn probe(hook: Hook, fail: bool, cause: Option<DecodeCancellationKind>) -> (Probe, Control) {
+        let signal = BoundaryCancellation::default();
+        (Probe { hook, fail, cause, signal: signal.clone(), trace: Rc::new(Trace::default()) },
+            Control { signal, observed: None, terminal_polls: 0 })
+    }
+
+    #[test]
+    fn failing_external_hooks_keep_original_stops_and_otherwise_keep_their_error_kind() {
+        let p = plan(GenerationOptions::greedy(1, 100, 0));
+        for hook in [Hook::Decode, Hook::Reserve, Hook::Deliver] {
+            for cause in std::iter::once(None).chain(CANCELLATION_KINDS.into_iter().map(Some)) {
+                let (decoder, mut control) = probe(hook, true, cause);
+                let mut sink = decoder.clone(); let mut forwards = 0;
+                let error = p.run(&decoder, 7, &mut sink, &mut control, |_| {
+                    forwards += 1; Ok(row(1))
+                }).err().unwrap();
+                if let Some(expected) = cause {
+                    assert!(matches!(&error, GenerationError::Cancelled(actual) if *actual == expected));
+                    assert_eq!(control.observed, Some(expected));
+                    assert_eq!(control.terminal_polls, 1, "the original stop must not be repolled");
+                } else {
+                    match hook {
+                        Hook::Decode => assert!(matches!(&error, GenerationError::Decoder)),
+                        Hook::Reserve | Hook::Deliver => assert!(matches!(&error, GenerationError::Stream)),
+                    }
+                    assert_eq!(control.terminal_polls, 0);
+                }
+                assert!(!error.to_string().contains("private"));
+                assert_eq!(forwards, p.prompt_tokens(), "a failed hook must never feed back or retry");
+                assert_eq!(decoder.trace.decodes.get(), 1);
+                assert_eq!(decoder.trace.reservations.get(), usize::from(hook != Hook::Decode));
+                assert_eq!(decoder.trace.deliveries.get(), usize::from(hook == Hook::Deliver));
+                assert_eq!(decoder.trace.permit_drops.get(), usize::from(hook == Hook::Deliver));
+                assert_eq!(decoder.trace.published.get(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn failing_callbacks_do_not_commit_a_pending_token_or_refund_its_sampled_draw() {
+        let mut options = GenerationOptions::greedy(1, 100, 0);
+        options.capture_logprobs = true;
+        options.sampling = GenerationSampling::Seeded {
+            effective_seed: [9; 32], temperature_milli: 1000, top_k: Some(1), top_p_ppm: 1_000_000,
+        };
+        let p = plan(options);
+        for hook in [Hook::Decode, Hook::Reserve, Hook::Deliver] {
+            let (decoder, mut control) = probe(hook, true, Some(DecodeCancellationKind::Deadline));
+            let mut sink = decoder.clone();
+            let mut cursor = cursor::Cursor::new(&p, 7, GENERATION_VERSION).unwrap();
+            for _ in 0..p.prompt_tokens() { cursor.record_forward(true).unwrap(); }
+            assert!(matches!(cursor.emit_next(&row(1), &decoder, &mut sink, &mut control),
+                Err(GenerationError::Cancelled(DecodeCancellationKind::Deadline))));
+            assert!(cursor.output.token_ids.is_empty());
+            assert!(cursor.output.content_bytes.is_empty());
+            assert!(cursor.output.token_logprobs.as_ref().unwrap().is_empty());
+            assert_eq!(cursor.output.native_work.sampled_steps, 1);
+            assert_eq!(cursor.output.native_work.forward_positions, p.prompt_tokens() as u64);
+            assert!(!cursor.done);
+            assert!(cursor.next_token().is_err(), "an uncommitted token is not feedback");
+            assert!(cursor.finish().is_err(), "a failed hook cannot authorize completion");
+        }
+    }
+
+    #[test]
+    fn successful_reservation_releases_its_permit_for_every_terminal_cause() {
+        let p = plan(GenerationOptions::greedy(1, 100, 0));
+        for cause in CANCELLATION_KINDS {
+            let (decoder, mut control) = probe(Hook::Reserve, false, Some(cause));
+            let mut sink = decoder.clone(); let mut forwards = 0;
+            let error = p.run(&decoder, 7, &mut sink, &mut control, |_| {
+                forwards += 1; Ok(row(1))
+            }).err().unwrap();
+            assert!(matches!(error, GenerationError::Cancelled(actual) if actual == cause));
+            assert_eq!(control.terminal_polls, 1);
+            assert_eq!(forwards, p.prompt_tokens());
+            assert_eq!(decoder.trace.reservations.get(), 1);
+            assert_eq!(decoder.trace.permit_drops.get(), 1);
+            assert_eq!(decoder.trace.deliveries.get(), 0);
+            assert_eq!(decoder.trace.published.get(), 0);
+        }
+    }
+}
+
 #[test]
 fn context_and_sampler_work_are_declared_before_model_calls() {
     let p = plan(GenerationOptions::greedy(4, 100, 0)); assert_eq!(p.planned_work().forward_positions, 5);
