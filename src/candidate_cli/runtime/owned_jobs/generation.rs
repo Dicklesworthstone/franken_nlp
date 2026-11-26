@@ -11,6 +11,9 @@ use crate::{
 fn prepare(args: &TextJobArgs, limits: Limits, job: JobLimits, facts: &ArtifactIdentity)
     -> Result<Int8GenerationJobPlanner, Failure> {
     args.check_lifetime(job, limits)?;
+    let encoding = args.common.input_encoding_policy(limits)?;
+    let encoding_work_limits = args.encoding_work_limits()?;
+    let encoding_workspace = args.encoding_workspace_bytes(limits)?;
     let controls = pinned_controls::pinned().map_err(|_| CandidateError::Identity)?;
     let controls = controls.template_controls();
     let eos = controls.entries().iter().find(|e| e.special && e.surface == crate::template::IM_END)
@@ -27,8 +30,21 @@ fn prepare(args: &TextJobArgs, limits: Limits, job: JobLimits, facts: &ArtifactI
         // The immutable lifetime authority also bounds one physical invocation.
         // Native per-item estimates still debit all five lifetime counters.
         native: Int8BatchLimits { max_sampler_bytes: SAMPLER_BYTES, max_model_work: job.max_work.model } };
-    Int8GenerationJobPlanner::pinned(controls, eos, identity, config)
-        .map_err(|_| Failure::usage("text_job_pinned_configuration"))
+    let planner = Int8GenerationJobPlanner::pinned_with_document_encoding(controls, eos, identity,
+        config, encoding.clone(), encoding_work_limits)
+        .map_err(|_| Failure::usage("text_job_pinned_configuration"))?;
+    check_encoding_quote(&planner, &encoding, encoding_work_limits, encoding_workspace)?;
+    Ok(planner)
+}
+/// Equal workspace geometry does not authorize a different transcript policy
+/// or replenish the authenticated invocation allowance.
+fn check_encoding_quote(planner: &Int8GenerationJobPlanner, encoding: &UntrustedEncoding,
+    total: Option<SafeBpeWorkLimits>, expected: u64) -> Result<(), Failure> {
+    if planner.document_encoding() != encoding || planner.encoding_work_limits() != total
+        || planner.encoding_workspace_bytes() != expected {
+        return Err(Failure::usage("text_job_encoding_quote_mismatch"));
+    }
+    Ok(())
 }
 fn host_limits(args: &TextJobArgs, limits: Limits, session: &Session) -> Result<JobHostLimits, Failure> {
     Ok(JobHostLimits { native: session.native(&args.common)?,
@@ -42,13 +58,19 @@ fn host_limits(args: &TextJobArgs, limits: Limits, session: &Session) -> Result<
 pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode, args: TextJobArgs,
     limits: Limits, input: R, output: &mut impl Write) -> Result<(), Failure> {
     args.input_retention.validate(mode, &args.common.input)?;
+    let encoding = args.common.input_encoding_policy(limits)?;
+    let encoding_work_limits = args.encoding_work_limits()?;
+    let native_bytes = args.execution_memory_bytes(limits)?;
+    if native_bytes > limits.memory_bytes {
+        return Err(Failure { exit: ErrorCode::AdmissionOrResourceLimit, code: "text_job_native_memory" });
+    }
     // First allocation owner survives all input, planner and report locals.
     let session = Session::new(&args.common, limits)?;
     let lifetime = command::parse_limits(&read_config(&session, &args.limits_file, command::LIMIT_BYTES)?)?;
     args.check_lifetime(lifetime, limits)?;
     let buffers = host_limits(&args, limits, &session)?.required_buffer_bytes_for_input(lifetime,
         args.input_retention.input_memory()?).map_err(host_failure)?;
-    let complete = args.execution_memory_bytes(limits)?.checked_add(buffers)
+    let complete = native_bytes.checked_add(buffers)
         .ok_or_else(|| Failure::usage("text_job_memory_arithmetic"))?;
     if complete > limits.memory_bytes {
         return Err(Failure { exit: ErrorCode::AdmissionOrResourceLimit, code: "text_job_population_memory" });
@@ -85,6 +107,9 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
         quant_recipe: &facts.recipe_id, output: &report };
     // No generated content, prompt, token IDs, seed or raw logprobs on stdout.
     // A report delivery failure may follow committed durable progress.
+    let response = EncodingReport { response: &response,
+        input_encoding: input_encoding::reported_policy(&encoding),
+        invocation_encoding_work_limits: encoding_work_limits, root_object_reconciliation: None };
     let response = ScheduledResponse { response: &response,
         prefill_schedule: prefill.map(PrefillSchedule::new).transpose()?,
         compute_schedule: ComputeSchedule::for_admission(limits.compute) };

@@ -226,6 +226,102 @@ fn invalid_or_underfunded_persistent_jobs_refuse_before_private_io() {
         }
     }
 }
+
+#[test]
+fn compact_encoding_and_all_invocation_limits_survive_both_retained_parsers() {
+    let flags = ["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "7777",
+        "--max-tokenizer-pair-bytes", "65536", "--max-total-tokenizer-input-bytes", "131072",
+        "--max-total-tokenizer-output-tokens", "16384", "--max-total-tokenizer-pair-checks", "20000",
+        "--max-total-tokenizer-pair-bytes", "1000000"];
+    for task in ["generate", "chat"] {
+        for operation in ["start", "resume"] {
+            let (_, a) = parse(operation, task, &flags).unwrap().into_parts();
+            let limits = a.validate().unwrap();
+            let UntrustedEncoding::SafeBpeV1(call) = a.common.input_encoding_policy(limits).unwrap()
+                else { panic!("compact transcript policy"); };
+            assert_eq!(call.max_input_bytes, a.common.max_input_bytes);
+            assert_eq!(call.max_output_tokens, limits.max_prompt_tokens);
+            assert_eq!((call.max_pair_checks, call.max_pair_bytes), (7777, 65536));
+            assert_eq!(a.encoding_work_limits().unwrap(), Some(SafeBpeWorkLimits {
+                max_input_bytes: 131072, max_output_tokens: 16384,
+                max_pair_checks: 20000, max_pair_bytes: 1000000 }));
+            assert!(matches!(a.common.options(166_101).unwrap().sampling, GenerationSampling::Greedy));
+            let (_, byte) = parse(operation, task, &[]).unwrap().into_parts();
+            let byte_limits = byte.validate().unwrap();
+            assert_eq!(byte.common.input_encoding_policy(byte_limits).unwrap(), UntrustedEncoding::ByteFallback);
+            assert_eq!(byte.encoding_work_limits().unwrap(), None);
+            assert_eq!(byte.encoding_workspace_bytes(byte_limits).unwrap(), 0);
+        }
+    }
+}
+
+#[test]
+fn compact_workspace_adds_to_native_sampler_prompt_and_persistent_worker_memory() {
+    for task in ["generate", "chat"] {
+        for schedule in [vec![], vec!["--prefill-rows", "4"], vec!["--compute-threads", "4"],
+            vec!["--compute-threads", "4", "--prefill-rows", "4"]] {
+            let byte = args(task, &schedule); let byte_limits = byte.validate().unwrap();
+            let mut flags = schedule; flags.extend_from_slice(&["--input-encoding", "safe-bpe-v1"]);
+            let compact = args(task, &flags); let compact_limits = compact.validate().unwrap();
+            let UntrustedEncoding::SafeBpeV1(call) = compact.common.input_encoding_policy(compact_limits).unwrap()
+                else { panic!("compact transcript policy"); };
+            let expected = call.requirements().unwrap().workspace_bytes + 1024;
+            assert_eq!(compact.encoding_workspace_bytes(compact_limits).unwrap(), expected);
+            assert_eq!(compact.execution_memory_bytes(compact_limits).unwrap()
+                - byte.execution_memory_bytes(byte_limits).unwrap(), expected);
+            assert_eq!(compact_limits.compute, byte_limits.compute);
+            assert!(compact.common.options(166_101).unwrap() == byte.common.options(166_101).unwrap());
+            let mut overflowing = compact_limits; overflowing.preparation_bytes = u64::MAX;
+            assert!(compact.execution_memory_bytes(overflowing).is_err());
+        }
+    }
+}
+
+#[test]
+fn malformed_or_unselected_tokenizer_caps_refuse_before_private_io() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("read"); } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("write"); }
+        fn flush(&mut self) -> io::Result<()> { panic!("flush"); }
+    }
+    for operation in ["start", "resume"] {
+        for flag in ["--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes",
+            "--max-total-tokenizer-input-bytes", "--max-total-tokenizer-output-tokens",
+            "--max-total-tokenizer-pair-checks", "--max-total-tokenizer-pair-bytes"] {
+            if let Ok(command) = parse(operation, "chat", &[flag, "1"]) {
+                let (mode, args) = command.into_parts();
+                assert_eq!(execute_owned(mode, args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+            }
+            for invalid in ["0", "18446744073709551615"] {
+                if let Ok(command) = parse(operation, "chat", &["--input-encoding", "safe-bpe-v1", flag, invalid]) {
+                    let (mode, args) = command.into_parts();
+                    assert_eq!(execute_owned(mode, args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+                }
+            }
+        }
+        assert!(parse(operation, "generate", &["--input-encoding", "automatic"]).is_err());
+    }
+}
+
+#[test]
+fn compact_jobs_refuse_underfunded_memory_before_keys_population_or_model_io() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("read"); } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("write"); }
+        fn flush(&mut self) -> io::Result<()> { panic!("flush"); }
+    }
+    for operation in ["start", "resume"] {
+        for task in ["generate", "chat"] {
+            let (mode, mut a) = parse(operation, task, &["--input-encoding", "safe-bpe-v1",
+                "--compute-threads", "4", "--prefill-rows", "4"]).unwrap().into_parts();
+            a.common.memory_mib = 1024; a.common.max_weight_mib = 512;
+            assert!(a.validate().is_err());
+            assert!(execute_owned(mode, a, NoIo, &mut NoIo).is_err());
+        }
+    }
+}
 #[cfg(not(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64"))))]
 #[test]
@@ -238,7 +334,9 @@ fn unavailable_feature_graph_never_opens_key_config_input_or_output() {
     }
     for task in ["generate", "chat"] {
         for flags in [vec![], vec!["--prefill-rows", "4"], vec!["--compute-threads", "4"],
-            vec!["--compute-threads", "4", "--prefill-rows", "4"]] {
+            vec!["--compute-threads", "4", "--prefill-rows", "4"],
+            vec!["--input-encoding", "safe-bpe-v1"],
+            vec!["--input-encoding", "safe-bpe-v1", "--compute-threads", "4", "--prefill-rows", "4"]] {
             assert_eq!(execute_owned(RunMode::Start, args(task, &flags), NoIo, &mut NoIo).unwrap_err().code,
                 "owned_text_job_profile_unavailable");
         }

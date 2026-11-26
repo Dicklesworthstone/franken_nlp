@@ -22,6 +22,7 @@ pub(in crate::candidate_cli) struct TextJobArgs {
     #[arg(long, value_enum, default_value = "generate")] pub task: TextTask,
     /// Fixed per-item generation options. Input is the COMPLETE original NDJSON population.
     #[command(flatten)] pub common: CandidateArgs,
+    #[command(flatten)] pub encoding_work: EncodingWorkArgs,
     /// Consent to retain private generated content, tokens and optional scores.
     #[arg(long)] pub store_results: bool,
     #[command(flatten)] pub input_retention: InputRetentionArgs,
@@ -43,6 +44,7 @@ impl TextJobArgs {
     }
     pub(in crate::candidate_cli) fn validate(&self) -> Result<Limits, Failure> {
         self.input_retention.limits()?;
+        self.encoding_work_limits()?;
         let limits = self.common.validate()?;
         let local = |p: &std::path::Path| !p.as_os_str().is_empty() && p.as_os_str() != "-";
         if !self.store_results || !local(&self.job_dir) || !local(&self.key_file) || !local(&self.limits_file)
@@ -63,7 +65,22 @@ impl TextJobArgs {
         }
         Ok(limits)
     }
+    pub(in crate::candidate_cli) fn encoding_work_limits(&self) -> Result<Option<SafeBpeWorkLimits>, Failure> {
+        self.encoding_work.limits(&self.common.input_encoding)
+    }
+    pub(in crate::candidate_cli) fn encoding_workspace_bytes(&self, limits: Limits) -> Result<u64, Failure> {
+        match (self.common.input_encoding_policy(limits)?, self.encoding_work_limits()?) {
+            (UntrustedEncoding::ByteFallback, None) => Ok(0),
+            (UntrustedEncoding::SafeBpeV1(call), Some(_)) => call.requirements()
+                .map_err(|_| Failure::usage("text_job_input_encoding"))?.workspace_bytes
+                .checked_add(1024).ok_or_else(|| Failure::usage("text_job_memory_arithmetic")),
+            _ => Err(Failure::usage("text_job_input_encoding")),
+        }
+    }
     pub(in crate::candidate_cli) fn execution_memory_bytes(&self, limits: Limits) -> Result<u64, Failure> {
+        if limits.compute != self.common.compute.admit_prefill(self.common.policy.prefill()?)? {
+            return Err(Failure::usage("text_job_schedule_admission"));
+        }
         let native = Int8MemoryRequirement::for_context(self.common.context_tokens)
             .map_err(|_| Failure::usage("text_job_native_quote"))?;
         let prefill = self.common.policy.prefill()?.map(|limits| limits.validate()).transpose()
@@ -76,7 +93,8 @@ impl TextJobArgs {
         // CLI preparation. This is a conservative quote, not a RAM permit.
         [limits.preparation_bytes, limits.weight_bytes, 128 * MIB, 64 * MIB,
             native.kv_bytes, native.rope_bytes, native.scratch_payload_bound,
-            64 * MIB, SAMPLER_BYTES, prefill, limits.compute.workspace_bytes, output, 65_536]
+            64 * MIB, SAMPLER_BYTES, prefill, limits.compute.workspace_bytes, output, 65_536,
+            self.encoding_workspace_bytes(limits)?]
             .iter().try_fold(0_u64, |total, bytes| total.checked_add(*bytes)
                 .ok_or_else(|| Failure::usage("text_job_memory_arithmetic")))
     }
@@ -99,8 +117,12 @@ pub(in crate::candidate_cli) fn definition() -> clap::Command {
         .about("Start or resume retained native generation/chat jobs")
         .long_about("Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. Input is the COMPLETE original {id,text,task_args?} NDJSON population, not the text-batch prompt/messages protocol; resume can explicitly restore retained inputs. Optional task_args contains sample_index and chat history only; text becomes the final user turn. Shared generation flags, explicit seed, stops and penalties are frozen in the authenticated recipe. No seed means greedy, never random seed generation. Results commit only after whole native completion; no partial token stream is retained. Failed attempts retain all native work charges. --store-results, protected existing storage, original job key and immutable limits are required. Stdout is completion metadata only. No automatic retry, model download, tools or thinking mode. --compute-threads 2..=64 keeps one persistent INT8 output-row team across every pending item, prompt and generated token. --prefill-rows opts in to bounded layer-major prompt execution and may use that same team. Worker batch storage and coordinator prompt scratch are admitted together before private IO. Either physical width may change on authenticated resume without changing the semantic recipe, original sample addresses, committed records or lifetime work. Completion metadata reports the selected schedule only after every worker joins. Width 1 keeps serial execution. Documents still execute in original order; --cohort-rows/active-rows remain unsupported.")
         .after_help(INPUT_RETENTION_HELP))
-        .mut_subcommand("start", compute::definition)
-        .mut_subcommand("resume", compute::definition)
+        .mut_subcommand("start", encoding_definition)
+        .mut_subcommand("resume", encoding_definition)
+}
+fn encoding_definition(command: clap::Command) -> clap::Command {
+    compute::definition(input_encoding::definition(command)).after_long_help(
+        "Both generation and chat jobs accept explicit --input-encoding safe-bpe-v1. One per-transcript tokenizer allowance covers the original prompt or every history message plus the final user turn. --max-input-bytes and the native prompt capacity bound transcript bytes and tokens; --max-tokenizer-pair-checks and --max-tokenizer-pair-bytes bound its BPE work. One additional --max-total-tokenizer-* invocation allowance spans every item and failed or cancelled preparation. The policy and all caps are authenticated: repeat them on resume. A resumed invocation receives the same declared tokenizer allowance while persisted native work and attempts remain spent. Compact encoding preserves original bytes and excludes template controls, but changes prompt tokens and makes no identical-output, tokenizer-parity, quality or speed claim. Encoder workspace is admitted alongside the sampler, native buffers and any prompt/worker scratch, and the actual factory remains owned through physical worker join. Compact completion metadata reports the encoding policy and invocation limits. Byte-fallback remains the default and adds no encoding fields. Retention still requires explicit consent.")
 }
 impl TextJobCommand {
     pub(crate) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
@@ -112,6 +134,7 @@ impl TextJobCommand {
             TextOperation::Resume(args) => &mut args.common.common,
         };
         common.compute = compute::Args::from_matches(request)?;
+        common.input_encoding = input_encoding::InputEncodingArgs::from_matches(request)?;
         Ok(command)
     }
 

@@ -1258,6 +1258,67 @@ retained job. Source review and focused regression definitions are present;
 DSR compilation, executable regressions and real-model qualification remain
 pending.
 
+## Implemented candidate INT8 compact retained text jobs
+
+`fnlp candidate text-job start|resume --task generate|chat` accepts
+`--input-encoding safe-bpe-v1`. Retained native INT8 generation and chat can
+therefore use compact, byte-preserving prompts under the same context limit
+as their live counterparts. The pinned encoder excludes template-control
+tokens from untrusted input and never truncates a transcript to make it fit.
+
+The existing retained-job input protocol is `{id,text,task_args?}`. For chat,
+`task_args.history` contains preceding messages and `text` becomes the final
+user turn. `task_args.sample_index` remains the original sample address.
+For example, a chat record can be:
+
+```json
+{"id":"conversation-1","text":"Explain the source in plain language.","task_args":{"sample_index":0,"history":[{"role":"system","content":"Use the supplied context."},{"role":"user","content":"The complete original context belongs here."}]}}
+```
+
+With an existing protected job directory, a protected 32-byte key file and
+an immutable `JobLimits` file sized for the population:
+
+```sh
+fnlp candidate text-job start conversations.ndjson --task chat \
+  --model ./model.fnlpq --memory-mib 8192 \
+  --store-results --job-dir /private/chat-job \
+  --job-id 0123456789abcdef0123456789abcdef \
+  --key-file /private/chat-job.key --limits text-job-limits.json \
+  --input-encoding safe-bpe-v1 \
+  --max-total-tokenizer-input-bytes 8388608 \
+  --max-total-tokenizer-output-tokens 1048576 \
+  --max-total-tokenizer-pair-checks 33554432 \
+  --max-total-tokenizer-pair-bytes 268435456 \
+  --compute-threads 4 --prefill-rows 4 --materialize
+```
+
+One transcript tokenizer allowance covers every history message and the
+final user turn together. `--max-input-bytes`, native prompt capacity, and
+the two `--max-tokenizer-pair-*` ceilings bound that work. All four
+`--max-total-tokenizer-*` ceilings additionally bound the explicit invocation,
+including work already spent on rejected or cancelled preparations. The
+authenticated recipe includes the exact policy and every encoding ceiling;
+repeat them when changing `start` to `resume`. Each explicit resume receives
+the same declared tokenizer allowance, while durable native-work and attempt
+charges remain spent. Optional retained-input replay still requires its
+existing explicit consent and storage limits.
+
+Compact input composes with greedy or explicitly seeded generation, bounded
+prompt prefill and persistent CPU teams. Changing physical widths on resume
+preserves the semantic recipe and original sample addresses. Admission adds
+encoder workspace to native buffers, the sampler, retained-job buffers and
+optional coordinator/worker storage. The actual factory and its tokenizer
+ledger remain owned until physical worker completion. A prepared item from
+another factory cannot reach a durable native-work debit.
+
+Byte fallback remains the default with its existing recipe and response
+shape. Compact completion metadata reports only public encoding limits and
+the selected schedule; generated content stays in explicitly retained
+results. Compact tokens can change generated output. Focused regression
+definitions include a complete transcript that exceeds byte-token capacity
+but fits compact planning at the same context limit; DSR compilation,
+executable regressions and real-model qualification remain pending.
+
 ## Implemented candidate INT8 compact retained scoring jobs
 
 `fnlp candidate score-job start|resume --task classify|sentiment|judge` accepts

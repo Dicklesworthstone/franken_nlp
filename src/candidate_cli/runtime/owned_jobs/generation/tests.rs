@@ -186,3 +186,114 @@ fn cancellation_during_report_publication_keeps_every_original_policy_outcome() 
         assert!(!writer.bytes.is_empty(), "already delivered progress is not rolled back");
     }
 }
+
+#[test]
+fn compact_cli_factories_preserve_the_exact_admitted_policy_caps_and_workspace() {
+    for task in ["generate", "chat"] {
+        let a = args(task, &["--input-encoding", "safe-bpe-v1",
+            "--max-total-tokenizer-input-bytes", "100000", "--max-total-tokenizer-output-tokens", "5000",
+            "--max-total-tokenizer-pair-checks", "1000000", "--max-total-tokenizer-pair-bytes", "10000000"]);
+        let limits = a.validate().unwrap();
+        let factory = prepare(&a, limits, lifetime(), &facts()).unwrap();
+        assert_eq!(factory.document_encoding(), &a.common.input_encoding_policy(limits).unwrap());
+        assert_eq!(factory.encoding_work_limits(), a.encoding_work_limits().unwrap());
+        assert_eq!(factory.encoding_workspace_bytes(), a.encoding_workspace_bytes(limits).unwrap());
+        let recipe = serde_json::to_value(factory.job_recipe()).unwrap();
+        assert_eq!(recipe["input_encoding"], serde_json::to_value(factory.document_encoding()).unwrap());
+        assert_eq!(recipe["encoding_work_limits"], serde_json::to_value(factory.encoding_work_limits()).unwrap());
+        let prepared = factory.prepare_with_control(document(7, task == "chat"), &mut Continue).unwrap();
+        assert_eq!(prepared.execution_identity().task_spec, format!("{task}-v1"));
+        assert!(prepared.model_work().attention_pairs > 0);
+    }
+}
+
+#[test]
+fn compact_retained_text_admits_a_complete_transcript_beyond_the_byte_prompt_capacity() {
+    for task in ["generate", "chat"] {
+        let byte = args(task, &["--context-tokens", "512", "--max-new-tokens", "8"]);
+        let compact = args(task, &["--context-tokens", "512", "--max-new-tokens", "8",
+            "--input-encoding", "safe-bpe-v1"]);
+        let before = prepare(&byte, byte.validate().unwrap(), lifetime(), &facts()).unwrap();
+        let after = prepare(&compact, compact.validate().unwrap(), lifetime(), &facts()).unwrap();
+        let input = || {
+            let mut item = document(7, task == "chat");
+            item.text = "hello world ".repeat(128); item
+        };
+        assert!(before.prepare_with_control(input(), &mut Continue).is_err());
+        let prepared = after.prepare_with_control(input(), &mut Continue).unwrap();
+        assert!(prepared.model_work().forward_positions <= 512);
+        assert!(byte.common.options(166_101).unwrap() == compact.common.options(166_101).unwrap());
+    }
+}
+
+#[test]
+fn equal_workspace_never_substitutes_for_exact_encoding_or_invocation_authority() {
+    let a = args("generate", &["--input-encoding", "safe-bpe-v1"]);
+    let limits = a.validate().unwrap(); let factory = prepare(&a, limits, lifetime(), &facts()).unwrap();
+    let policy = a.common.input_encoding_policy(limits).unwrap();
+    let total = a.encoding_work_limits().unwrap(); let workspace = a.encoding_workspace_bytes(limits).unwrap();
+    check_encoding_quote(&factory, &policy, total, workspace).unwrap();
+    assert!(check_encoding_quote(&factory, &policy, total, workspace - 1).is_err());
+    assert!(check_encoding_quote(&factory, &UntrustedEncoding::ByteFallback, total, workspace).is_err());
+    assert!(check_encoding_quote(&factory, &policy, None, workspace).is_err());
+    for axis in 0..6 {
+        let mut changed_policy = policy.clone(); let mut changed_total = total.unwrap();
+        let UntrustedEncoding::SafeBpeV1(call) = &mut changed_policy else { unreachable!() };
+        match axis { 0 => call.max_pair_checks -= 1, 1 => call.max_pair_bytes -= 1,
+            2 => changed_total.max_input_bytes -= 1, 3 => changed_total.max_output_tokens -= 1,
+            4 => changed_total.max_pair_checks -= 1, _ => changed_total.max_pair_bytes -= 1 }
+        assert_eq!(call.requirements().unwrap().workspace_bytes + 1024, workspace);
+        assert!(check_encoding_quote(&factory, &changed_policy, Some(changed_total), workspace).is_err());
+    }
+}
+
+#[test]
+fn compact_resume_changes_physical_widths_without_reseeding_or_changing_native_work() {
+    let seed = "07".repeat(32);
+    for task in ["generate", "chat"] {
+        for seeded in [false, true] {
+            let mut flags = vec!["--input-encoding", "safe-bpe-v1"];
+            if seeded { flags.extend_from_slice(&["--seed", seed.as_str()]); }
+            let a = args(task, &flags); let first = prepare(&a, a.validate().unwrap(), lifetime(), &facts()).unwrap();
+            let before = first.prepare_with_control(document(7, task == "chat"), &mut Continue).unwrap();
+            for schedule in [vec!["--prefill-rows", "4"], vec!["--compute-threads", "4"],
+                vec!["--compute-threads", "4", "--prefill-rows", "4"]] {
+                let mut changed = flags.clone(); changed.extend_from_slice(&schedule);
+                let b = args(task, &changed); let resumed = prepare(&b, b.validate().unwrap(), lifetime(), &facts()).unwrap();
+                let mut earlier = document(0, task == "chat"); earlier.id = "other".into();
+                resumed.prepare_with_control(earlier, &mut Continue).unwrap();
+                let after = resumed.prepare_with_control(document(7, task == "chat"), &mut Continue).unwrap();
+                assert_eq!(before.execution_identity(), after.execution_identity());
+                assert_eq!(before.model_work(), after.model_work());
+                assert_eq!(canonjson::canonical_bytes(first.job_recipe()).unwrap(),
+                    canonjson::canonical_bytes(resumed.job_recipe()).unwrap());
+                assert_eq!(first.encoding_work_limits(), resumed.encoding_work_limits());
+                assert_eq!(first.encoding_workspace_bytes(), resumed.encoding_workspace_bytes());
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_completion_metadata_reports_only_public_encoding_and_schedule_settings() {
+    let report = serde_json::json!({"schema_version": 1, "output": {"committed": 2, "attempts": 3}});
+    let byte = EncodingReport { response: &report, input_encoding: None,
+        invocation_encoding_work_limits: None, root_object_reconciliation: None };
+    assert_eq!(serde_json::to_value(ScheduledResponse { response: &byte,
+        prefill_schedule: None, compute_schedule: None }).unwrap(), report);
+    let a = args("chat", &["--input-encoding", "safe-bpe-v1", "--compute-threads", "4", "--prefill-rows", "4"]);
+    let limits = a.validate().unwrap(); let policy = a.common.input_encoding_policy(limits).unwrap();
+    let encoded = EncodingReport { response: &report, input_encoding: input_encoding::reported_policy(&policy),
+        invocation_encoding_work_limits: a.encoding_work_limits().unwrap(), root_object_reconciliation: None };
+    let value = serde_json::to_value(ScheduledResponse { response: &encoded,
+        prefill_schedule: Some(PrefillSchedule::new(a.common.policy.prefill().unwrap().unwrap()).unwrap()),
+        compute_schedule: ComputeSchedule::for_admission(limits.compute) }).unwrap();
+    assert_eq!(value["input_encoding"], serde_json::to_value(&policy).unwrap());
+    assert_eq!(value["invocation_encoding_work_limits"], serde_json::to_value(a.encoding_work_limits().unwrap()).unwrap());
+    assert_eq!(value["output"], report["output"]);
+    assert_eq!(value["compute_schedule"]["compute_threads"], 4);
+    assert_eq!(value["prefill_schedule"]["max_batch_rows"], 4);
+    for private in ["effective_seed", "history", "content", "token_ids", "token_logprobs", "prompt_digest"] {
+        assert!(!value.to_string().contains(private));
+    }
+}
