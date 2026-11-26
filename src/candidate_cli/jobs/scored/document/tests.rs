@@ -131,3 +131,14 @@ fn invalid_document_modes_and_insufficient_preparation_refuse_before_private_io(
     assert!(matches!(load(SETTINGS, &a, limits, lifetime(&a)),
         Err(Failure { code: "score_document_job_preparation", .. })));
 }
+
+#[test]
+fn impossible_classification_encoding_allowances_fail_before_private_io() {
+    for option in ["--max-total-tokenizer-input-bytes", "--max-total-tokenizer-output-tokens",
+        "--max-total-tokenizer-pair-checks", "--max-total-tokenizer-pair-bytes"] {
+        let flags = ["--input-encoding", "safe-bpe-v1", option, "1"];
+        let a = document_args("classify", &flags);
+        assert_eq!(a.validate().err().unwrap().code, "score_document_job_tokenizer_work");
+        assert!(document_args("sentiment", &flags).encoding_work_limits().is_ok());
+    }
+}

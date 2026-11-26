@@ -115,7 +115,17 @@ impl ScoreJobArgs {
         }
     }
     pub(in crate::candidate_cli) fn encoding_work_limits(&self) -> Result<Option<SafeBpeWorkLimits>, Failure> {
-        self.encoding_work.limits(&self.encoding)
+        let total = self.encoding_work.limits(&self.encoding)?;
+        // Classification reserves a complete preparation allowance up front.
+        // Sentiment can tighten its per-call allowance to the remaining work.
+        if self.document_config.is_some() && matches!(self.kind()?, ScoreTask::Classify) {
+            if let (UntrustedEncoding::SafeBpeV1(call), Some(total)) = (self.encoding_policy()?, total) {
+                if total.remaining_call(Default::default(), call).ok() != Some(call) {
+                    return Err(Failure::usage("score_document_job_tokenizer_work"));
+                }
+            }
+        }
+        Ok(total)
     }
     pub(in crate::candidate_cli) fn encoding_workspace_bytes(&self) -> Result<u64, Failure> {
         match (self.encoding_policy()?, self.encoding_work_limits()?) {
