@@ -1,7 +1,7 @@
 //! One sequence's resumable decode state; shared by scalar and batch drivers.
 //! Physical row index and scheduler tick never enter the addressed sampler.
 use super::*;
-use crate::native_engine::decode::DecodedProposal;
+use crate::native_engine::decode::{DecodedProposal, prepare_token_bytes};
 
 pub(super) struct Cursor<'a> {
     pub plan: &'a GenerationPlan,
@@ -79,19 +79,13 @@ impl<'a> Cursor<'a> {
         // result and must not conceal cancellation at this boundary.
         checkpoint(control, index)?;
         let delta = decoded.delta(&self.output.content_bytes).map_err(|_| GenerationError::DecoderNotPrefixStable)?;
-        if delta.len() > p.max_output_bytes - self.output.content_bytes.len() {
-            self.output.finish_reason = GenerationFinish::ByteLimit; self.done = true; self.awaiting_selection = false; return Ok(());
-        }
-        // Reserve before the sink can publish the event. Cap geometric growth
-        // at the admitted byte ceiling when extending the retained output.
-        let length = self.output.content_bytes.len();
-        let capacity = self.output.content_bytes.capacity();
-        if length + delta.len() > capacity {
-            let target = (length + delta.len()).max(capacity.saturating_mul(2)).min(p.max_output_bytes);
-            self.output.content_bytes.try_reserve_exact(target - length).map_err(|_| GenerationError::Allocation)?;
-        }
-        let mut event_bytes = reserved(delta.len())?;
-        event_bytes.extend_from_slice(delta);
+        let Some(event_bytes) = prepare_token_bytes(&mut self.output.content_bytes, delta, p.max_output_bytes)
+            .map_err(|_| GenerationError::Allocation)? else {
+            self.output.finish_reason = GenerationFinish::ByteLimit;
+            self.done = true;
+            self.awaiting_selection = false;
+            return Ok(());
+        };
         let event = DecodeTokenEvent { schema_version: DECODE_TOKEN_EVENT_SCHEMA_VERSION,
             request_seq: self.output.request_seq, token_index: index, token_id: selected, decoded_bytes: event_bytes, logprob: score };
         checkpoint(control, index)?;

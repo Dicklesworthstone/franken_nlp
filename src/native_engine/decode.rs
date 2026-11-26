@@ -368,6 +368,24 @@ impl DecodedProposal {
     }
 }
 
+/// Admit a whole decoded piece and reserve both its retained storage and
+/// its owned stream event before a sink can make any of its bytes visible.
+/// None means the entire piece would exceed the configured content limit.
+pub(super) fn prepare_token_bytes(output: &mut Vec<u8>, delta: &[u8], limit: usize)
+    -> Result<Option<Vec<u8>>, std::collections::TryReserveError> {
+    let Some(end) = output.len().checked_add(delta.len()).filter(|&n| n <= limit) else {
+        return Ok(None);
+    };
+    if end > output.capacity() {
+        let target = end.max(output.capacity().saturating_mul(2)).min(limit);
+        output.try_reserve_exact(target - output.len())?;
+    }
+    let mut event = Vec::new();
+    event.try_reserve_exact(delta.len())?;
+    event.extend_from_slice(delta);
+    Ok(Some(event))
+}
+
 /// The cancellation checkpoint invoked before every generated-token commit.
 pub trait DecodeStepControl {
     /// Return a cancellation chain to stop before the pending token commits.
@@ -440,6 +458,8 @@ pub enum DecodeError {
     },
     /// A requested full-vocabulary score could not be formed from logits.
     LogprobUnavailable { detail: String },
+    /// The retained sequence or the next token event could not be reserved.
+    OutputAllocation,
     /// A two-phase output adapter refused reservation or delivery.
     Stream { detail: String },
 }
@@ -506,6 +526,7 @@ impl fmt::Display for DecodeError {
             Self::LogprobUnavailable { detail } => {
                 write!(formatter, "decode full-vocabulary logprob unavailable: {detail}")
             }
+            Self::OutputAllocation => formatter.write_str("decode output allocation refused"),
             Self::Stream { detail } => write!(formatter, "decode stream delivery refused: {detail}"),
         }
     }
@@ -583,7 +604,7 @@ pub fn greedy_decode_with_hooks<D: DecodeByteDecoder, S: DecodeEventSink, C: Dec
         params.max_new_tokens,
     )?;
 
-    let mut output = empty_output(params, engine.profile());
+    let mut output = empty_output(params, engine.profile())?;
     if params.max_new_tokens == 0 {
         return Ok(output);
     }
@@ -621,24 +642,9 @@ pub fn greedy_decode_with_hooks<D: DecodeByteDecoder, S: DecodeEventSink, C: Dec
 
         let decoded = DecodedProposal::decode(decoder, &mut output.emitted_token_ids, selected, &mut marker_consumed)?;
         let delta = decoded.delta(&output.decoded_bytes)?;
-        if delta.len() > params.max_output_bytes - output.decoded_bytes.len() {
+        if !publish_token(&mut output, params.max_output_bytes, selected, selected_logprob, delta, sink)? {
             output.finish_reason = DecodeFinishReason::Budget;
             return Ok(output);
-        }
-        let event = DecodeTokenEvent {
-            schema_version: DECODE_TOKEN_EVENT_SCHEMA_VERSION,
-            request_seq: params.request_seq,
-            token_index,
-            token_id: selected,
-            decoded_bytes: delta.to_vec(),
-            logprob: selected_logprob,
-        };
-        deliver_stream_event(sink, event)?;
-
-        output.emitted_token_ids.push(selected);
-        output.decoded_bytes.extend_from_slice(delta);
-        if let Some(logprobs) = &mut output.token_logprobs {
-            logprobs.push(selected_logprob.expect("capture_logprobs selected this logprob"));
         }
 
         if let Some(finish_reason) = finish_reason_after_commit(&output, params, selected) {
@@ -656,20 +662,49 @@ pub fn greedy_decode_with_hooks<D: DecodeByteDecoder, S: DecodeEventSink, C: Dec
     }
 }
 
-fn empty_output(params: &DecodeParams, profile: &str) -> DecodeOutput {
-    DecodeOutput {
+/// Returns false only when the proposed bytes do not fit. All three
+/// retained vectors have capacity before the sink reserves or publishes.
+fn publish_token<S: DecodeEventSink>(output: &mut DecodeOutput, max_bytes: usize,
+    selected: u32, logprob: Option<f32>, delta: &[u8], sink: &mut S) -> Result<bool, DecodeError> {
+    let Some(decoded_bytes) = prepare_token_bytes(&mut output.decoded_bytes, delta, max_bytes)
+        .map_err(|_| DecodeError::OutputAllocation)? else { return Ok(false); };
+    let event = DecodeTokenEvent {
+        schema_version: DECODE_TOKEN_EVENT_SCHEMA_VERSION,
+        request_seq: output.request_seq,
+        token_index: output.emitted_token_ids.len(),
+        token_id: selected,
+        decoded_bytes,
+        logprob,
+    };
+    deliver_stream_event(sink, event)?;
+    output.emitted_token_ids.push(selected);
+    output.decoded_bytes.extend_from_slice(delta);
+    if let Some(scores) = &mut output.token_logprobs {
+        scores.push(logprob.expect("capture_logprobs selected this logprob"));
+    }
+    Ok(true)
+}
+
+fn empty_output(params: &DecodeParams, profile: &str) -> Result<DecodeOutput, DecodeError> {
+    let mut ids = Vec::new();
+    ids.try_reserve_exact(params.max_new_tokens).map_err(|_| DecodeError::OutputAllocation)?;
+    let mut token_logprobs = params.capture_logprobs.then(Vec::new);
+    if let Some(scores) = &mut token_logprobs {
+        scores.try_reserve_exact(params.max_new_tokens).map_err(|_| DecodeError::OutputAllocation)?;
+    }
+    Ok(DecodeOutput {
         schema_version: DECODE_SCHEMA_VERSION,
         request_seq: params.request_seq,
         numerics_profile: profile.to_owned(),
-        emitted_token_ids: Vec::with_capacity(params.max_new_tokens),
+        emitted_token_ids: ids,
         decoded_bytes: Vec::new(),
         finish_reason: DecodeFinishReason::Budget,
-        token_logprobs: params.capture_logprobs.then(Vec::new),
+        token_logprobs,
         logprob_score_space: params
             .capture_logprobs
             .then_some(DecodeScoreSpace::FullVocabularyLogSoftmax),
         cancellation: None,
-    }
+    })
 }
 
 fn refuse_primed_engine(engine: &HfBf16EagerEngine) -> Result<(), DecodeError> {
@@ -881,7 +916,7 @@ mod tests {
             stop_sequences: vec![vec![0xe2, 0x80, 0xa6]],
             min_new_tokens: 2,
         };
-        let mut output = empty_output(&params, "hf-bf16-eager");
+        let mut output = empty_output(&params, "hf-bf16-eager").unwrap();
         output.emitted_token_ids.push(9);
         output.decoded_bytes = vec![0xe2, 0x80];
         assert_eq!(finish_reason_after_commit(&output, &params, 9), None);
@@ -898,7 +933,7 @@ mod tests {
     fn eos_has_priority_over_the_same_step_output_budget() {
         let mut params = DecodeParams::hf_bf16_greedy(7, 1, 32);
         params.stop.eos_token_ids.push(9);
-        let mut output = empty_output(&params, "hf-bf16-eager");
+        let mut output = empty_output(&params, "hf-bf16-eager").unwrap();
         output.emitted_token_ids.push(9);
         assert_eq!(
             finish_reason_after_commit(&output, &params, 9),
@@ -910,7 +945,7 @@ mod tests {
     fn output_budget_still_terminates_when_the_minimum_is_larger() {
         let mut params = DecodeParams::hf_bf16_greedy(7, 1, 32);
         params.stop.min_new_tokens = 2;
-        let mut output = empty_output(&params, "hf-bf16-eager");
+        let mut output = empty_output(&params, "hf-bf16-eager").unwrap();
         output.emitted_token_ids.push(41);
         assert_eq!(
             finish_reason_after_commit(&output, &params, 41),
@@ -950,7 +985,7 @@ mod tests {
             })
         );
         assert_eq!(
-            serde_json::to_value(empty_output(&params, "hf-bf16-eager"))
+            serde_json::to_value(empty_output(&params, "hf-bf16-eager").unwrap())
                 .expect("serialize frozen decode output"),
             json!({
                 "schema_version": 1,
@@ -983,6 +1018,7 @@ mod tests {
     }
 
     struct RefusingReservationSink {
+        reserve_calls: usize,
         permit_calls: usize,
     }
 
@@ -991,6 +1027,7 @@ mod tests {
         type Error = TestStreamError;
 
         fn reserve(&mut self, _event: &DecodeTokenEvent) -> Result<Self::Permit, Self::Error> {
+            self.reserve_calls += 1;
             Err(TestStreamError)
         }
 
@@ -1005,8 +1042,48 @@ mod tests {
     }
 
     #[test]
+    fn eager_token_storage_is_reserved_before_delivery_and_refusal_leaves_no_committed_token() {
+        let mut params = DecodeParams::hf_bf16_greedy(7, 2, 3);
+        params.capture_logprobs = true;
+        let mut output = empty_output(&params, "hf-bf16-eager").unwrap();
+        assert!(output.emitted_token_ids.capacity() >= 2);
+        assert!(output.token_logprobs.as_ref().unwrap().capacity() >= 2);
+        assert_eq!(output.decoded_bytes.capacity(), 0);
+        let mut sink = RefusingReservationSink { reserve_calls: 0, permit_calls: 0 };
+
+        assert!(!super::publish_token(&mut output, 3, 1, Some(-1.0), b"long", &mut sink).unwrap());
+        assert_eq!(output.decoded_bytes.capacity(), 0);
+        assert_eq!(sink.reserve_calls, 0);
+
+        assert!(matches!(super::publish_token(&mut output, 3, 1, Some(-1.0), b"abc", &mut sink),
+            Err(DecodeError::Stream { .. })));
+        assert_eq!(sink.reserve_calls, 1);
+        assert_eq!(sink.permit_calls, 0);
+        assert!(output.decoded_bytes.capacity() >= 3);
+        assert!(output.decoded_bytes.is_empty() && output.emitted_token_ids.is_empty());
+        assert!(output.token_logprobs.as_ref().unwrap().is_empty());
+
+        let bytes = output.decoded_bytes.as_ptr();
+        let ids = output.emitted_token_ids.as_ptr();
+        let scores = output.token_logprobs.as_ref().unwrap().as_ptr();
+        assert!(super::publish_token(&mut output, 3, 1, Some(-1.0), b"abc", &mut super::DiscardDecodeEventSink).unwrap());
+        assert_eq!(output.decoded_bytes, b"abc");
+        assert_eq!(output.emitted_token_ids, [1]);
+        assert_eq!(output.token_logprobs.as_deref(), Some(&[-1.0][..]));
+        assert_eq!(bytes, output.decoded_bytes.as_ptr());
+        assert_eq!(ids, output.emitted_token_ids.as_ptr());
+        assert_eq!(scores, output.token_logprobs.as_ref().unwrap().as_ptr());
+    }
+
+    #[test]
+    fn impossible_eager_token_capacity_returns_a_typed_error() {
+        let params = DecodeParams::hf_bf16_greedy(7, usize::MAX, 3);
+        assert!(matches!(empty_output(&params, "hf-bf16-eager"), Err(DecodeError::OutputAllocation)));
+    }
+
+    #[test]
     fn reservation_refusal_never_attempts_stream_delivery() {
-        let mut sink = RefusingReservationSink { permit_calls: 0 };
+        let mut sink = RefusingReservationSink { reserve_calls: 0, permit_calls: 0 };
         let event = DecodeTokenEvent {
             schema_version: DECODE_TOKEN_EVENT_SCHEMA_VERSION,
             request_seq: 7,
