@@ -743,18 +743,28 @@ struct Fixture {
 
 impl Fixture {
     fn new(label: &str) -> Self {
+        let source_root = framed_sha256_hex("fnlpq-source-root-v1", &[b"transport fixture"]).unwrap();
+        Self::with_inputs(label, &source_root, CONFIG, TOKENIZER, CONFIG, TEMPLATE)
+    }
+
+    fn with_inputs(label: &str, source_root: &str, model_config: &[u8], tokenizer: &[u8], tokenizer_config: &[u8], template: &[u8]) -> Self {
         let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "fnlp-local-reconstruct-{label}-{}-{sequence}", std::process::id(),
         ));
         fs::create_dir(&root).expect("unique fixture directory; never adopt an existing root");
-        let artifact = structural_artifact();
+        let artifact = structural_artifact(source_root, model_config, tokenizer, tokenizer_config, template);
         let artifact_path = root.join(LOGICAL_NAME);
         fs::write(&artifact_path, &artifact).unwrap();
         let reader = FnlpqRangeReader::open(&artifact_path).expect("fixture must pass real checked reader");
         assert_eq!(reader.tensors().len(), 201);
         let receipt = root.join("conversion.json");
-        fs::write(&receipt, release_conversion::canonical_receipt(&artifact)).unwrap();
+        let mut conversion = franken_nlp::artifact::converter::ConversionReceipt::parse_canonical_json(
+            &release_conversion::canonical_receipt(&artifact)).unwrap();
+        conversion.source_root_sha256 = reader.source_root_sha256().to_owned();
+        conversion.census_sha256 = census_digest();
+        conversion.logical_model_sha256 = reader.logical_model_sha256().to_owned();
+        fs::write(&receipt, conversion.canonical_json().unwrap()).unwrap();
         let license_dir = root.join("licenses");
         fs::create_dir(&license_dir).unwrap();
         for (name, bytes) in release_conversion::LICENSES {
@@ -787,7 +797,7 @@ impl Fixture {
             }).collect(),
             source: ReleaseSourceClosure {
                 files: vec![ReleaseSourceFile {
-                    name: "config.json".to_owned(), bytes: CONFIG.len() as u64, sha256: digest(CONFIG),
+                    name: "config.json".to_owned(), bytes: model_config.len() as u64, sha256: digest(model_config),
                 }],
                 source_root_sha256: reader.source_root_sha256().to_owned(),
             },
@@ -796,7 +806,7 @@ impl Fixture {
                 fnlpq_format: FNLPQ_FORMAT_V1.to_owned(), pull_api: PULL_API_V1.to_owned(),
             },
             digests: ReleaseDigests {
-                tokenizer_sha256: digest(TOKENIZER), template_sha256: digest(TEMPLATE),
+                tokenizer_sha256: digest(tokenizer), template_sha256: digest(template),
                 census_sha256: census_digest(),
                 logical_model_sha256: reader.logical_model_sha256().to_owned(),
                 packing_set_sha256: reader.packing_set_sha256().to_owned(),
@@ -826,7 +836,57 @@ impl Fixture {
     fn part(&self) -> PathBuf { self.parts_dir.join(&self.manifest.parts[0].name) }
 }
 
-fn structural_artifact() -> Vec<u8> {
+#[test]
+fn generated_manifest_round_trips_through_pull_and_rejects_substituted_artifact() {
+    use std::process::Command;
+    use franken_nlp::tokenizer::embedded::{PINNED_TOKENIZER_MODEL_BYTES, PINNED_TOKENIZER_CONFIG_BYTES};
+    let source_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("docs/truth-pack/nanbeige4.2-3b.source.json");
+    let raw = fs::read_to_string(&source_path).unwrap();
+    let canonical = franken_nlp::canonjson::canonicalize_str(&raw, Default::default()).unwrap();
+    let root = framed_sha256_hex("fnlpq-source-root-v1", &[&canonical]).unwrap();
+    let config: serde_json::Value = serde_json::from_slice(PINNED_TOKENIZER_CONFIG_BYTES).unwrap();
+    let template = config["chat_template"].as_str().unwrap().as_bytes();
+    let model_config = include_bytes!("fixtures/release/nanbeige-config.json");
+    let fixture = Fixture::with_inputs("generated-manifest", &root, model_config,
+        PINNED_TOKENIZER_MODEL_BYTES, PINNED_TOKENIZER_CONFIG_BYTES, template);
+    let artifact = fixture.root.join(LOGICAL_NAME);
+    let invoke = |artifact: &std::path::Path, tag: &str| Command::new(env!("CARGO_BIN_EXE_fnlp"))
+        .args(["release", "create-manifest", "--artifact"]).arg(artifact)
+        .arg("--staging-dir").arg(&fixture.parts_dir)
+        .arg("--source-manifest").arg(&source_path)
+        .args(["--artifact-id", "test-transport-v1", "--release-tag", tag]).output().unwrap();
+    let output = invoke(&artifact, RELEASE_TAG);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let manifest = ReleaseManifest::parse(&output.stdout).unwrap();
+    assert_eq!(manifest.canonical_bytes().unwrap(), output.stdout);
+    assert_eq!(manifest.source.files.len(), 10);
+    assert_eq!(manifest.parts, fixture.manifest.parts);
+    assert_eq!(manifest.digests, fixture.manifest.digests);
+    assert!(String::from_utf8_lossy(&output.stderr).contains(&digest(&output.stdout)[..]));
+    fs::write(&fixture.manifest_path, &output.stdout).unwrap();
+    let request = fixture.request("generated-copy");
+    reconstruct_local_release(&request).unwrap();
+    assert_eq!(fs::read(request.output).unwrap(), fixture.artifact);
+    let wrong_config = Fixture::with_inputs("false-source-closure", &root, b"{}",
+        PINNED_TOKENIZER_MODEL_BYTES, PINNED_TOKENIZER_CONFIG_BYTES, template);
+    let error = franken_nlp::artifact::package::build_release_manifest(
+        &wrong_config.parts_dir, &wrong_config.root.join(LOGICAL_NAME), &source_path,
+        "test-transport-v1", RELEASE_TAG,
+    ).unwrap_err();
+    assert!(error.to_string().contains("config.json"), "{error}");
+    let mut swapped = fixture.artifact.clone();
+    swapped[0] ^= 1;
+    let other = fixture.root.join("different.fnlpq");
+    fs::write(&other, swapped).unwrap();
+    for (path, tag) in [(&other, RELEASE_TAG), (&artifact, "..")] {
+        let rejected = invoke(path, tag);
+        assert!(!rejected.status.success());
+        assert!(rejected.stdout.is_empty());
+    }
+}
+
+fn structural_artifact(source_root: &str, model_config: &[u8], tokenizer: &[u8], tokenizer_config: &[u8], template: &[u8]) -> Vec<u8> {
     // More than one streaming chunk tests cancellation during actual copying.
     const BYTES_PER_TENSOR: usize = 8192;
     let mut payload = Vec::new();
@@ -852,21 +912,21 @@ fn structural_artifact() -> Vec<u8> {
     digests.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
     let ordered: Vec<_> = digests.into_iter().map(|(_, digest)| digest).collect();
     let logical = logical_model_sha256(MODEL_ID, REVISION, &ordered, &[
-        ("model_config", CONFIG), ("tokenizer_model", TOKENIZER),
-        ("tokenizer_config", CONFIG), ("chat_template", TEMPLATE),
+        ("model_config", model_config), ("tokenizer_model", tokenizer),
+        ("tokenizer_config", tokenizer_config), ("chat_template", template),
     ]).unwrap();
     write(&FnlpqWriterInput {
         model_id: MODEL_ID.to_owned(), revision: REVISION.to_owned(), recipe_id: RECIPE.to_owned(),
-        source_root_sha256: framed_sha256_hex("fnlpq-source-root-v1", &[b"transport fixture"]).unwrap(),
+        source_root_sha256: source_root.to_owned(),
         logical_model_sha256: hex(&logical), tensors,
         sections: vec![
             SectionPayload::new("generic-payload", SectionKind::GenericTensorPayload, payload, 64),
             SectionPayload::new("generic-scales", SectionKind::GenericTensorScales, [], 8),
             SectionPayload::new("generic-row-sums", SectionKind::GenericTensorRowSums, [], 8),
-            SectionPayload::new("model-config", SectionKind::ModelConfig, CONFIG, 8),
-            SectionPayload::new("tokenizer-model", SectionKind::TokenizerModel, TOKENIZER, 8),
-            SectionPayload::new("tokenizer-config", SectionKind::TokenizerConfig, CONFIG, 8),
-            SectionPayload::new("chat-template", SectionKind::ChatTemplate, TEMPLATE, 8),
+            SectionPayload::new("model-config", SectionKind::ModelConfig, model_config, 8),
+            SectionPayload::new("tokenizer-model", SectionKind::TokenizerModel, tokenizer, 8),
+            SectionPayload::new("tokenizer-config", SectionKind::TokenizerConfig, tokenizer_config, 8),
+            SectionPayload::new("chat-template", SectionKind::ChatTemplate, template, 8),
             SectionPayload::new("license-bundle", SectionKind::LicenseBundle, release_conversion::license_payload(), 8),
         ],
         packing_sets: vec![PackingSetInput {

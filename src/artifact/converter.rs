@@ -592,7 +592,18 @@ fn snapshot_materialized_sources(
     let tokenizer_model = read_materialized_source_member(source_dir, source, "tokenizer.model", checkpoint)?;
     let tokenizer_config =
         read_materialized_source_member(source_dir, source, "tokenizer_config.json", checkpoint)?;
-    let parsed: Value = serde_json::from_slice(&tokenizer_config).map_err(|error| {
+    let chat_template = extract_chat_template(&tokenizer_config)?;
+    source_checkpoint(checkpoint)?;
+    Ok(VerifiedMaterializedSources {
+        model_config,
+        tokenizer_model,
+        tokenizer_config,
+        chat_template,
+    })
+}
+
+pub(super) fn extract_chat_template(tokenizer_config: &[u8]) -> Result<Vec<u8>, ConverterError> {
+    let parsed: Value = serde_json::from_slice(tokenizer_config).map_err(|error| {
         ConverterError::SourceMaterialization {
             name: "tokenizer_config.json".to_owned(),
             detail: format!("parse JSON for chat_template: {error}"),
@@ -607,13 +618,7 @@ fn snapshot_materialized_sources(
         })?
         .as_bytes()
         .to_vec();
-    source_checkpoint(checkpoint)?;
-    Ok(VerifiedMaterializedSources {
-        model_config,
-        tokenizer_model,
-        tokenizer_config,
-        chat_template,
-    })
+    Ok(chat_template)
 }
 
 fn read_materialized_source_member(
@@ -2958,7 +2963,7 @@ fn stream_sha256<R: Read>(
     Ok(hex_lower(&hasher.finalize()))
 }
 
-fn source_root_digest(manifest: &ConversionSourceManifest) -> Result<String, ConverterError> {
+pub(super) fn source_root_digest(manifest: &ConversionSourceManifest) -> Result<String, ConverterError> {
     let digest = source_root_sha256(manifest.canonical_bytes()).map_err(|error| {
         ConverterError::ManifestSchema {
             path: "$".to_owned(),

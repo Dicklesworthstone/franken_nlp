@@ -370,6 +370,20 @@ enum ReleaseSubcommand {
         #[arg(long)]
         license_bundle_dir: PathBuf,
     },
+    /// Write canonical pull-manifest bytes to stdout after checking the package and original artifact.
+    CreateManifest {
+        #[arg(long)]
+        staging_dir: PathBuf,
+        #[arg(long)]
+        artifact: PathBuf,
+        /// Pinned ten-file conversion source manifest.
+        #[arg(long)]
+        source_manifest: PathBuf,
+        #[arg(long)]
+        artifact_id: String,
+        #[arg(long)]
+        release_tag: String,
+    },
     /// Rehash, reassemble, and validate an immutable release package.
     VerifyModelPackage {
         /// Existing package staging directory to verify.
@@ -2549,6 +2563,32 @@ fn run_release_command(command: ReleaseSubcommand) -> ExitCode {
                 ErrorCode::ArtifactIntegrityOrFormatOrVersion.as_process_exit()
             }
         },
+        ReleaseSubcommand::CreateManifest { staging_dir, artifact, source_manifest, artifact_id, release_tag } => {
+            let manifest = match crate::artifact::package::build_release_manifest(
+                &staging_dir, &artifact, &source_manifest, &artifact_id, &release_tag,
+            ) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    eprintln!("RELEASE_MANIFEST RESULT=FAIL reason={error}");
+                    return ErrorCode::ArtifactIntegrityOrFormatOrVersion.as_process_exit();
+                }
+            };
+            let bytes = match manifest.canonical_bytes() {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    eprintln!("RELEASE_MANIFEST RESULT=FAIL reason={error}");
+                    return ErrorCode::ArtifactIntegrityOrFormatOrVersion.as_process_exit();
+                }
+            };
+            let mut out = io::stdout().lock();
+            if let Err(error) = out.write_all(&bytes).and_then(|()| out.flush()) {
+                eprintln!("RELEASE_MANIFEST RESULT=FAIL write={error}");
+                return ErrorCode::Generic.as_process_exit();
+            }
+            eprintln!("RELEASE_MANIFEST RESULT=PASS release_manifest_sha256={} parts={}",
+                crate::artifact::manifest::release_manifest_sha256(&bytes), manifest.parts.len());
+            ExitCode::SUCCESS
+        }
         ReleaseSubcommand::VerifyModelPackage { staging_dir } => {
             match verify_model_package(&staging_dir) {
                 Ok(report) => {

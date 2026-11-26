@@ -3,6 +3,9 @@
 //! This module deliberately handles every large payload as a bounded stream.
 //! It never loads a part, much less a complete model artifact, into memory.
 
+mod release_manifest;
+pub use release_manifest::build_release_manifest;
+
 use std::{
     collections::BTreeSet,
     error::Error,
@@ -223,6 +226,16 @@ pub fn package_model(request: &PackageRequest) -> Result<PackageReport, PackageE
 /// whole-file hash.  The reconstructed hash must equal the receipt's original
 /// converter-output digest.
 pub fn verify_model_package(staging_dir: &Path) -> Result<PackageReport, PackageError> {
+    let (receipt, _) = verify_package_records(staging_dir)?;
+    Ok(PackageReport {
+        staging_dir: staging_dir.to_owned(),
+        artifact_sha256: receipt.fnlpq_file_sha256,
+        artifact_bytes: receipt.artifact_bytes,
+        parts: receipt.parts,
+    })
+}
+
+fn verify_package_records(staging_dir: &Path) -> Result<(ModelAssetReceipt, ConversionReceipt), PackageError> {
     let receipt_path = staging_dir.join(RECEIPT_FILE);
     let receipt_bytes = read_small_file(&receipt_path)?;
     let receipt: ModelAssetReceipt = serde_json::from_slice(&receipt_bytes)
@@ -306,12 +319,7 @@ pub fn verify_model_package(staging_dir: &Path) -> Result<PackageReport, Package
         });
     }
 
-    Ok(PackageReport {
-        staging_dir: staging_dir.to_owned(),
-        artifact_sha256: receipt.fnlpq_file_sha256,
-        artifact_bytes: receipt.artifact_bytes,
-        parts: receipt.parts,
-    })
+    Ok((receipt, conversion))
 }
 
 fn package_model_with_part_bytes(

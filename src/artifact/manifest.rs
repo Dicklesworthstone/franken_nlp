@@ -346,16 +346,7 @@ impl ReleaseManifest {
             &self.source_revision,
             40,
         )?;
-        expect_identifier("artifact-id", "/artifact_id", &self.artifact_id)?;
-        expect_identifier("release-tag", "/release_tag", &self.release_tag)?;
-        if matches!(self.release_tag.as_str(), "main" | "latest") {
-            return Err(ManifestError::new(
-                "immutable-release-tag",
-                "/release_tag",
-                "an exact immutable release tag, never main or latest",
-                self.release_tag.clone(),
-            ));
-        }
+        validate_release_coordinates(&self.artifact_id, &self.release_tag)?;
 
         self.validate_artifact()?;
         self.validate_parts()?;
@@ -868,6 +859,17 @@ fn expect_lower_hex(
             value,
         ))
     }
+}
+
+pub(super) fn validate_release_coordinates(artifact_id: &str, release_tag: &str) -> Result<(), ManifestError> {
+    expect_identifier("artifact-id", "/artifact_id", artifact_id)?;
+    expect_identifier("release-tag", "/release_tag", release_tag)?;
+    if matches!(release_tag, "main" | "latest" | "." | "..") {
+        return Err(ManifestError::new(
+            "immutable-release-tag", "/release_tag", "an explicit immutable release tag", release_tag,
+        ));
+    }
+    Ok(())
 }
 
 fn validate_release_url(

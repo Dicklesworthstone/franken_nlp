@@ -982,7 +982,7 @@ fn validate_request_paths(request: &LocalReconstructRequest) -> Result<(), PullE
     Ok(())
 }
 
-fn verify_container_identity(
+pub(super) fn verify_container_identity(
     reader: &FnlpqRangeReader,
     manifest: &ReleaseManifest,
     progress: LocalReconstructProgress,

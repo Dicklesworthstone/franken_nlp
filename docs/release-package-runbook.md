@@ -25,6 +25,21 @@ fnlp release verify-model-package \
 
 The package must contain only the ordered `.part00`, `.part01`, … files, `MODEL_ASSET_RECEIPT.json`, `SHA256SUMS`, `RECONSTRUCTION.txt`, `CONVERSION_RECEIPT.json`, and the three license-bundle files. Every non-final part is exactly 1,957,046,720 bytes. The verifier rehashes every member, rejects renamed/reordered/tampered parts, and computes the individual part and reconstructed artifact hashes from the same read of each part.
 
+## Generate the manifest consumed by pull
+
+After local verification, write the canonical manifest to a new file outside the package directory. The verifier checks the directory inventory exactly. The release tag and artifact ID in this example must match the proposed release.
+
+```sh
+fnlp release create-manifest \
+  --staging-dir /absolute/path/release-staging/nanbeige4.2-3b-v1 \
+  --artifact /absolute/path/nanbeige4.2-3b.fnlpq-v1.int8.generic.fnlpq \
+  --source-manifest docs/truth-pack/nanbeige4.2-3b.source.json \
+  --artifact-id nanbeige42-int8-generic-v1 \
+  --release-tag fnlp-model-v1 > /absolute/path/new-release.manifest.json
+```
+
+On success, stdout contains the exact canonical bytes and stderr reports their standard SHA-256. The command checks the ordered parts and license bundle, reads the original artifact through the same file handle used for digest verification, and runs the container-identity checks used by pull. It derives the ten source records from the pinned source manifest and constructs the part URLs for this repository and tag. Treat the manifest as a local release candidate until the release is qualified and the digest is distributed through a trusted channel. Review the exit status before using the redirected file.
+
 ## Create a draft and upload explicit assets
 
 Create the draft release first. Then copy the exact paths from `MODEL_ASSET_RECEIPT.json` into the upload command. Do not use a glob and do not use `--clobber`.
@@ -36,6 +51,7 @@ gh release upload fnlp-model-v1 \
   /absolute/path/release-staging/nanbeige4.2-3b-v1/nanbeige4.2-3b.fnlpq-v1.int8.generic.fnlpq.part00 \
   /absolute/path/release-staging/nanbeige4.2-3b-v1/nanbeige4.2-3b.fnlpq-v1.int8.generic.fnlpq.part01 \
   /absolute/path/release-staging/nanbeige4.2-3b-v1/nanbeige4.2-3b.fnlpq-v1.int8.generic.fnlpq.part02 \
+  /absolute/path/new-release.manifest.json \
   /absolute/path/release-staging/nanbeige4.2-3b-v1/MODEL_ASSET_RECEIPT.json \
   /absolute/path/release-staging/nanbeige4.2-3b-v1/SHA256SUMS \
   /absolute/path/release-staging/nanbeige4.2-3b-v1/RECONSTRUCTION.txt \
@@ -49,7 +65,7 @@ The example names the expected three parts of the int8-all artifact. Before runn
 
 ## Remote inventory and clean download
 
-Query the draft inventory and compare it exactly to the local receipt. Download every individual asset into a newly created clean directory, then run the same verifier there.
+Query the draft inventory and compare it exactly to the local receipt. Download the package members into a newly created clean directory and run the same verifier there. Download the canonical manifest attachment separately, compare its bytes with the generated file, and verify its pinned digest.
 
 ```sh
 gh release view fnlp-model-v1 --json assets
