@@ -534,3 +534,31 @@ fn packed_map_schedules_leave_the_complete_request_and_work_commitment_unchanged
     }), Err(Int8SourceMapError::InvalidLimits)));
     assert_eq!(plan.preflight_metadata(), binding);
 }
+
+#[test]
+fn entity_reduction_authenticates_the_map_and_preserves_its_work_and_cancellation() {
+    use entity_reduction::Int8EntityLimits;
+    let p = planner();
+    let prepared = prepare(&p, "Alice Bob Carol Dave", limits());
+    let expected = prepared.preflight_metadata();
+    let bound = Int8EntityLimits { max_result_bytes: expected.max_result_bytes as usize,
+        ..Int8EntityLimits::default() };
+    prepared.check_entities(bound).unwrap();
+    let ids = admitted(&prepared);
+    let mut run = prepared.execute_with_driver(&ids, driver().0).unwrap();
+    let reduced = expected.reduce_entities_with_control(&run, bound, &mut Continue).unwrap();
+    assert_eq!(reduced.mapped_chunks, expected.chunk_count());
+    assert_eq!(reduced.source_span, expected.source_span());
+    assert_eq!(reduced.model_work, run.model_work);
+    assert!(reduced.entities.is_empty());
+    let tiny = Int8EntityLimits { max_result_bytes: 1, ..bound };
+    assert!(expected.reduce_entities_with_control(&run, tiny, &mut Continue).is_err());
+    struct Stop;
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { Some(DecodeCancellationKind::User) }
+    }
+    assert_eq!(expected.reduce_entities_with_control(&run, bound, &mut Stop).err().unwrap().cancellation(),
+        Some(DecodeCancellationKind::User));
+    run.semantics = "substituted";
+    assert!(expected.reduce_entities_with_control(&run, bound, &mut Continue).is_err());
+}

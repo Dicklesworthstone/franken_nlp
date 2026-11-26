@@ -422,3 +422,13 @@ fn disabled_question_and_synthesis_schedules_never_open_private_inputs() {
         assert_eq!(selected.execute(&mut NoIo, &mut NoIo), Err(CandidateError::Unavailable));
     }
 }
+
+#[test]
+fn entity_union_requires_ner_and_admits_the_complete_workspace_before_io() {
+    command("ner", &["--reduce-entities"]).validate().unwrap();
+    assert!(command("summarize", &["--reduce-entities"]).validate().is_err());
+    for (flag, value) in [("--max-entity-proposals", "0"), ("--max-entity-evidence-spans", "1048577"),
+        ("--max-entity-scan-work", "0"), ("--reduction-reserve-mib", "1")] {
+        assert!(command("ner", &["--reduce-entities", flag, value]).validate().is_err());
+    }
+}

@@ -22,6 +22,8 @@ use crate::{
 pub mod summary;
 /// Exact document-wide keyphrase ranking over all native map candidates.
 pub mod keyphrase_reduction;
+/// Exact typed-surface union with all evidence from proposing chunks.
+pub mod entity_reduction;
 /// Question-aware passage planning and evidence-preserving answer collection.
 pub mod question;
 

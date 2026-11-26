@@ -99,6 +99,8 @@ pub(in crate::candidate_cli) fn execute(command: MapCommand, args: CandidateArgs
     if let Some(limits) = summary { limits.validate(mapping).map_err(|_| CandidateError::Planning)?; }
     let keyphrases = command.keyphrases.limits(command.max_map_result_bytes)?;
     if let Some(limits) = keyphrases { limits.validate(mapping).map_err(|_| CandidateError::Planning)?; }
+    let entities = command.entities.limits(&command.task, command.max_map_result_bytes)?;
+    if let Some(limits) = entities { limits.validate(mapping).map_err(|_| CandidateError::Planning)?; }
     let expected = preflight(&text, &planner, &command, &task, &context, mapping, budget, &mut session.control())?;
     let expected_summary = summary.map(|limits| expected.summary_with_control(limits, &mut session.control())
         .map_err(|error| error.cancellation().map(cancelled).unwrap_or(CandidateError::Planning))).transpose()?;
@@ -171,6 +173,12 @@ pub(in crate::candidate_cli) fn execute(command: MapCommand, args: CandidateArgs
                 Arc::clone(&planner), vocabulary, config, kernel, width, prefill, cancellation),
         }.map_err(host_error)?)
     };
+    if let Some(limits) = entities {
+        let reduced = expected.reduce_entities_with_control(result.result(), limits, &mut session.control())
+            .map_err(|error| error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution))?;
+        return deliver_scheduled(&session, &facts, &reduced, encoding::report(&planner)?.as_ref(),
+            result.compute(), command.max_map_result_bytes + 4096, output);
+    }
     check_completed(&expected, result.result(), &mut session.control())?;
     deliver_scheduled(&session, &facts, result.result(), encoding::report(&planner)?.as_ref(),
         result.compute(), command.max_map_result_bytes + 4096, output)

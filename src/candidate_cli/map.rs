@@ -5,6 +5,7 @@ pub(super) mod summary;
 pub(super) mod question;
 pub(super) mod extraction;
 pub(super) mod keyphrase_reduction;
+pub(super) mod entity_reduction;
 pub(super) mod encoding;
 use serde::de::DeserializeOwned;
 use crate::{native_engine::{portable_int8::ProjectionWork, strict_int8::Int8Work},
@@ -31,6 +32,8 @@ pub(crate) struct MapCommand {
     pub(super) summary: summary::SummaryArgs,
     #[command(flatten)]
     pub(super) keyphrases: keyphrase_reduction::KeyphraseReductionArgs,
+    #[command(flatten)]
+    pub(super) entities: entity_reduction::EntityReductionArgs,
     #[command(flatten)]
     pub(super) question: question::QuestionArgs,
     #[command(flatten)]
@@ -79,7 +82,7 @@ pub(crate) struct MapCommand {
 pub(super) fn definition() -> clap::Command {
     compute::definition(encoding::definition(MapCommand::augment_args(clap::Command::new("map")
         .about("Process a long document with source-aligned, independent native chunk results")
-        .long_about("Losslessly partition one UTF-8 document using the actual pinned task scaffold and source encoder, then run NER, keyphrases or cited summaries on one resident candidate model. By default output retains ordered independent chunk results and original-document coordinates; it is not a global synthesized summary, global entity census or global ranking. Add --reduce-summary with --task summarize for exact bullet/evidence union and a final document-wide ranking of existing bullets, without a neural synthesis pass. Add --reduce-keyphrases with --task keyphrases for exact phrase/evidence union and one document-wide support/rank ordering; --document-keyphrases controls final top-k, never intermediate pruning. Use --task answer --question FILE for independent passage-scoped QA with original-source citations; all differing answer texts remain visible without majority voting or a global answer. Use --task extract --schema FILE for independent exact-schema JSON strings; --source-membership adds verbatim source evidence in original coordinates. Required fields must be satisfiable in each chunk by default. Add --reconcile-object to derive partial root objects by relaxing only root required fields, then combine complementary properties into one independently validated original-schema object. Exactly equal atomic values retain all origins; conflicting values or missing final required fields refuse the complete document. Nested objects and arrays remain atomic. This explicit mode supports the same compact input, bounded prompt morsels and persistent compute team. Source verification uses the remaining original whole-document allowance; no mode repairs or invents a missing value. No mode establishes overlapping-window analysis or single-context equivalence. No partial success is published."))))
+        .long_about("Losslessly partition one UTF-8 document using the actual pinned task scaffold and source encoder, then run NER, keyphrases or cited summaries on one resident candidate model. By default output retains ordered independent chunk results and original-document coordinates; it is not a global synthesized summary, global entity census or global ranking. Add --reduce-entities with --task ner for one document-wide union of exact surface/type pairs. Each group retains original byte/scalar evidence and ambiguity from every proposing chunk. Names and aliases are not resolved, and matching text in chunks that did not propose the type adds no evidence. Add --reduce-summary with --task summarize for exact bullet/evidence union and a final document-wide ranking of existing bullets, without a neural synthesis pass. Add --reduce-keyphrases with --task keyphrases for exact phrase/evidence union and one document-wide support/rank ordering; --document-keyphrases controls final top-k, never intermediate pruning. Use --task answer --question FILE for independent passage-scoped QA with original-source citations; all differing answer texts remain visible without majority voting or a global answer. Use --task extract --schema FILE for independent exact-schema JSON strings; --source-membership adds verbatim source evidence in original coordinates. Required fields must be satisfiable in each chunk by default. Add --reconcile-object to derive partial root objects by relaxing only root required fields, then combine complementary properties into one independently validated original-schema object. Exactly equal atomic values retain all origins; conflicting values or missing final required fields refuse the complete document. Nested objects and arrays remain atomic. This explicit mode supports the same compact input, bounded prompt morsels and persistent compute team. Source verification uses the remaining original whole-document allowance; no mode repairs or invents a missing value. No mode establishes overlapping-window analysis or single-context equivalence. No partial success is published."))))
         .mut_arg("compute_threads", |arg| arg.help("Coordinator plus persistent INT8 row workers, 1..=64, for complete source maps, extraction, QA and neural summary/answer synthesis. One fixed team spans every chunk, evidence pass and hierarchy level; --prefill-rows uses that same team. Default 1 is serial. Worker, prompt and complete-document storage are admitted before private IO"))
 }
 
@@ -125,6 +128,11 @@ impl MapCommand {
             return Err(CandidateError::Arguments);
         }
         let reduction = self.reduction_reserve_mib.checked_mul(MIB).ok_or(CandidateError::Arguments)?;
+        if let Some(entities) = self.entities.limits(&self.task, self.max_map_result_bytes)? {
+            if entities.workspace_bytes().map_err(|_| CandidateError::Arguments)? > reduction {
+                return Err(CandidateError::Arguments);
+            }
+        }
         if reduction > limits.memory_bytes { return Err(CandidateError::Arguments); }
         // The host retains ALL prepared prompts/grammars before any forward.
         // Price that aggregate, plus complete-result staging, not one chunk's
