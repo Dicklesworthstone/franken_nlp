@@ -266,19 +266,18 @@ pub fn verify_model_package(staging_dir: &Path) -> Result<PackageReport, Package
     }
     let conversion = parse_conversion_receipt(&conversion_bytes)?;
     verify_conversion_output(&conversion, receipt.artifact_bytes, &receipt.fnlpq_file_sha256)?;
-    for record in receipt.parts.iter().chain(&receipt.license_bundle).chain([&receipt.reconstruction]) {
-        verify_file_record(staging_dir, record)?;
+    for record in receipt.license_bundle.iter().chain([&receipt.reconstruction]) {
+        verify_file_record(staging_dir, record, None)?;
     }
     verify_sha256sums(staging_dir, &ordered_records)?;
 
     let mut whole_hasher = Sha256::new();
     let mut reconstructed_bytes = 0_u64;
-    for record in &receipt.parts {
-        stream_hash_into(
-            &staging_dir.join(&record.name),
-            &mut whole_hasher,
-            &mut reconstructed_bytes,
-        )?;
+    for part in &receipt.parts {
+        verify_file_record(staging_dir, part, Some(&mut whole_hasher))?;
+        reconstructed_bytes = reconstructed_bytes
+            .checked_add(part.bytes)
+            .ok_or(PackageError::Arithmetic("reconstruction byte count"))?;
     }
     if reconstructed_bytes != receipt.artifact_bytes {
         return Err(PackageError::Integrity {
@@ -464,7 +463,7 @@ fn copy_digest_bound_file(
     source_path: &Path,
     destination_path: &Path,
 ) -> Result<PackageFile, PackageError> {
-    let expected = hash_regular_file(source_path)?;
+    let expected = hash_regular_file(source_path, None, None)?;
     let copied = copy_regular_file(source_path, destination_path)?;
     if copied.bytes != expected.bytes || copied.sha256 != expected.sha256 {
         return Err(PackageError::SourceChanged {
@@ -542,8 +541,20 @@ fn copy_regular_file(
     })
 }
 
-fn hash_regular_file(path: &Path) -> Result<PackageFile, PackageError> {
+fn hash_regular_file(
+    path: &Path,
+    expected_bytes: Option<u64>,
+    mut whole_hasher: Option<&mut Sha256>,
+) -> Result<PackageFile, PackageError> {
     let source_bytes = metadata_regular_file(path)?.len();
+    if let Some(expected) = expected_bytes
+        && expected != source_bytes
+    {
+        return Err(PackageError::Integrity {
+            member: file_name(path)?,
+            detail: format!("length expected={expected} observed={source_bytes}"),
+        });
+    }
     let source = File::open(path).map_err(|source| PackageError::Io {
         operation: "open digest source",
         path: path.to_owned(),
@@ -565,6 +576,9 @@ fn hash_regular_file(path: &Path) -> Result<PackageFile, PackageError> {
                 source,
             })?;
         hasher.update(&buffer[..wanted]);
+        if let Some(whole) = whole_hasher.as_deref_mut() {
+            whole.update(&buffer[..wanted]);
+        }
         bytes = bytes
             .checked_add(u64::try_from(wanted).map_err(|_| PackageError::Arithmetic("hash bytes"))?)
             .ok_or(PackageError::Arithmetic("hash byte count"))?;
@@ -766,8 +780,16 @@ fn validate_receipt_shape(receipt: &ModelAssetReceipt) -> Result<(), PackageErro
     Ok(())
 }
 
-fn verify_file_record(staging_dir: &Path, record: &PackageFile) -> Result<(), PackageError> {
-    let observed = hash_regular_file(&staging_dir.join(&record.name))?;
+fn verify_file_record(
+    staging_dir: &Path,
+    record: &PackageFile,
+    whole_hasher: Option<&mut Sha256>,
+) -> Result<(), PackageError> {
+    let observed = hash_regular_file(
+        &staging_dir.join(&record.name),
+        Some(record.bytes),
+        whole_hasher,
+    )?;
     if observed.bytes != record.bytes || observed.sha256 != record.sha256 {
         return Err(PackageError::Integrity {
             member: record.name.clone(),
@@ -778,35 +800,6 @@ fn verify_file_record(staging_dir: &Path, record: &PackageFile) -> Result<(), Pa
         });
     }
     Ok(())
-}
-
-fn stream_hash_into(path: &Path, hasher: &mut Sha256, total: &mut u64) -> Result<(), PackageError> {
-    let file = File::open(path).map_err(|source| PackageError::Io {
-        operation: "open reconstruction part",
-        path: path.to_owned(),
-        source,
-    })?;
-    let mut reader = BufReader::with_capacity(COPY_BUFFER_BYTES, file);
-    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|source| PackageError::Io {
-                operation: "read reconstruction part",
-                path: path.to_owned(),
-                source,
-            })?;
-        if read == 0 {
-            return Ok(());
-        }
-        hasher.update(&buffer[..read]);
-        *total = total
-            .checked_add(
-                u64::try_from(read)
-                    .map_err(|_| PackageError::Arithmetic("reconstruction bytes"))?,
-            )
-            .ok_or(PackageError::Arithmetic("reconstruction byte count"))?;
-    }
 }
 
 fn ensure_exact_inventory(
@@ -1127,6 +1120,32 @@ mod tests {
             part_name("model.fnlpq", 64),
             Err(PackageError::Integrity { .. })
         ));
+    }
+
+    #[test]
+    fn reconstruction_hash_continues_across_parts_and_checks_each_member() {
+        use sha2::{Digest, Sha256};
+        use std::{fs, time::{SystemTime, UNIX_EPOCH}};
+
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("fnlp-part-hash-{}-{nonce}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let mut whole = Sha256::new();
+        for (name, data) in [("part00", &b"a"[..]), ("part01", &b"bc"[..])] {
+            fs::write(dir.join(name), data).unwrap();
+            let record = PackageFile {
+                name: name.to_owned(),
+                bytes: data.len() as u64,
+                sha256: super::hex_digest(Sha256::digest(data)),
+            };
+            super::verify_file_record(&dir, &record, Some(&mut whole)).unwrap();
+        }
+        assert_eq!(
+            super::hex_digest(whole.finalize()),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        );
+        let wrong = PackageFile { name: "part01".to_owned(), bytes: 2, sha256: "0".repeat(64) };
+        assert!(super::verify_file_record(&dir, &wrong, Some(&mut Sha256::new())).is_err());
     }
 
     #[test]

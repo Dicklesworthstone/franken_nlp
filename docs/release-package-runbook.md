@@ -23,7 +23,7 @@ fnlp release verify-model-package \
   --staging-dir /absolute/path/release-staging/nanbeige4.2-3b-v1
 ```
 
-The package must contain only the ordered `.part00`, `.part01`, … files, `MODEL_ASSET_RECEIPT.json`, `SHA256SUMS`, `RECONSTRUCTION.txt`, `CONVERSION_RECEIPT.json`, and the three license-bundle files. Every non-final part is exactly 1,957,046,720 bytes. The verifier rehashes every member, rejects renamed/reordered/tampered parts, and streams the ordered parts into the whole-artifact SHA-256 without materializing a second multi-GB file.
+The package must contain only the ordered `.part00`, `.part01`, … files, `MODEL_ASSET_RECEIPT.json`, `SHA256SUMS`, `RECONSTRUCTION.txt`, `CONVERSION_RECEIPT.json`, and the three license-bundle files. Every non-final part is exactly 1,957,046,720 bytes. The verifier rehashes every member, rejects renamed/reordered/tampered parts, and computes the individual part and reconstructed artifact hashes from the same read of each part.
 
 ## Create a draft and upload explicit assets
 
