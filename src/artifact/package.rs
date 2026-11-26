@@ -266,9 +266,16 @@ pub fn verify_model_package(staging_dir: &Path) -> Result<PackageReport, Package
     }
     let conversion = parse_conversion_receipt(&conversion_bytes)?;
     verify_conversion_output(&conversion, receipt.artifact_bytes, &receipt.fnlpq_file_sha256)?;
-    for record in receipt.license_bundle.iter().chain([&receipt.reconstruction]) {
-        verify_file_record(staging_dir, record, None)?;
+    let licenses = checked_license_files(staging_dir, &conversion)?;
+    for (record, bytes) in receipt.license_bundle.iter().zip(&licenses) {
+        if record.bytes != bytes.len() as u64 || record.sha256 != hex_digest(Sha256::digest(bytes)) {
+            return Err(PackageError::Integrity {
+                member: record.name.clone(),
+                detail: "license member differs from package inventory".to_owned(),
+            });
+        }
     }
+    verify_file_record(staging_dir, &receipt.reconstruction, None)?;
     verify_sha256sums(staging_dir, &ordered_records)?;
 
     let mut whole_hasher = Sha256::new();
@@ -323,6 +330,7 @@ fn package_model_with_part_bytes(
     let conversion = parse_conversion_receipt(&conversion_bytes)?;
     verify_conversion_length(&conversion, expected_len)?;
     require_license_bundle(&request.license_bundle_dir)?;
+    let licenses = checked_license_files(&request.license_bundle_dir, &conversion)?;
     create_staging_dir(&request.staging_dir)?;
 
     let (artifact_bytes, parts, artifact_sha256) = split_artifact(
@@ -336,11 +344,8 @@ fn package_model_with_part_bytes(
         &conversion_bytes,
     )?;
     let mut license_bundle = Vec::with_capacity(LICENSE_FILES.len());
-    for name in LICENSE_FILES {
-        license_bundle.push(copy_digest_bound_file(
-            &request.license_bundle_dir.join(name),
-            &request.staging_dir.join(name),
-        )?);
+    for (name, bytes) in LICENSE_FILES.into_iter().zip(&licenses) {
+        license_bundle.push(write_new_file(&request.staging_dir.join(name), bytes)?);
     }
     let reconstruction = write_new_file(
         &request.staging_dir.join(RECONSTRUCTION_FILE),
@@ -459,97 +464,13 @@ fn split_artifact(
     Ok((artifact_bytes, parts, hex_digest(whole_hasher.finalize())))
 }
 
-fn copy_digest_bound_file(
-    source_path: &Path,
-    destination_path: &Path,
-) -> Result<PackageFile, PackageError> {
-    let expected = hash_regular_file(source_path, None, None)?;
-    let copied = copy_regular_file(source_path, destination_path)?;
-    if copied.bytes != expected.bytes || copied.sha256 != expected.sha256 {
-        return Err(PackageError::SourceChanged {
-            path: source_path.to_owned(),
-        });
-    }
-    Ok(copied)
-}
-
-fn copy_regular_file(
-    source_path: &Path,
-    destination_path: &Path,
-) -> Result<PackageFile, PackageError> {
-    let source_bytes = metadata_regular_file(source_path)?.len();
-    let source = File::open(source_path).map_err(|source| PackageError::Io {
-        operation: "open release closure source",
-        path: source_path.to_owned(),
-        source,
-    })?;
-    let destination = create_new_file(destination_path)?;
-    let mut reader = BufReader::with_capacity(COPY_BUFFER_BYTES, source);
-    let mut writer = BufWriter::with_capacity(COPY_BUFFER_BYTES, destination);
-    let mut hasher = Sha256::new();
-    let mut total = 0_u64;
-    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
-    while total < source_bytes {
-        let wanted = (source_bytes - total).min(COPY_BUFFER_BYTES as u64);
-        let wanted =
-            usize::try_from(wanted).map_err(|_| PackageError::Arithmetic("copy buffer"))?;
-        reader
-            .read_exact(&mut buffer[..wanted])
-            .map_err(|source| PackageError::Io {
-                operation: "read release closure source",
-                path: source_path.to_owned(),
-                source,
-            })?;
-        writer
-            .write_all(&buffer[..wanted])
-            .map_err(|source| PackageError::Io {
-                operation: "write release closure member",
-                path: destination_path.to_owned(),
-                source,
-            })?;
-        hasher.update(&buffer[..wanted]);
-        total = total
-            .checked_add(
-                u64::try_from(wanted).map_err(|_| PackageError::Arithmetic("copied bytes"))?,
-            )
-            .ok_or(PackageError::Arithmetic("copied byte count"))?;
-    }
-    writer.flush().map_err(|source| PackageError::Io {
-        operation: "flush release closure member",
-        path: destination_path.to_owned(),
-        source,
-    })?;
-    let mut trailing = [0_u8; 1];
-    if reader
-        .read(&mut trailing)
-        .map_err(|source| PackageError::Io {
-            operation: "check release closure source length",
-            path: source_path.to_owned(),
-            source,
-        })?
-        != 0
-        || metadata_regular_file(source_path)?.len() != source_bytes
-    {
-        return Err(PackageError::SourceChanged {
-            path: source_path.to_owned(),
-        });
-    }
-    Ok(PackageFile {
-        name: file_name(destination_path)?,
-        bytes: total,
-        sha256: hex_digest(hasher.finalize()),
-    })
-}
-
 fn hash_regular_file(
     path: &Path,
-    expected_bytes: Option<u64>,
+    expected: u64,
     mut whole_hasher: Option<&mut Sha256>,
 ) -> Result<PackageFile, PackageError> {
     let source_bytes = metadata_regular_file(path)?.len();
-    if let Some(expected) = expected_bytes
-        && expected != source_bytes
-    {
+    if expected != source_bytes {
         return Err(PackageError::Integrity {
             member: file_name(path)?,
             detail: format!("length expected={expected} observed={source_bytes}"),
@@ -787,7 +708,7 @@ fn verify_file_record(
 ) -> Result<(), PackageError> {
     let observed = hash_regular_file(
         &staging_dir.join(&record.name),
-        Some(record.bytes),
+        record.bytes,
         whole_hasher,
     )?;
     if observed.bytes != record.bytes || observed.sha256 != record.sha256 {
@@ -841,6 +762,42 @@ fn ensure_exact_inventory(
         });
     }
     Ok(())
+}
+
+/// Ordered filename and payload fields as embedded by the converter.
+pub(crate) fn encode_license_bundle(contents: [&[u8]; 3]) -> Vec<u8> {
+    let mut bundle = Vec::new();
+    for (name, bytes) in LICENSE_FILES.into_iter().zip(contents) {
+        bundle.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        bundle.extend_from_slice(name.as_bytes());
+        bundle.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        bundle.extend_from_slice(bytes);
+    }
+    bundle
+}
+
+fn checked_license_files(
+    directory: &Path,
+    conversion: &ConversionReceipt,
+) -> Result<[Vec<u8>; 3], PackageError> {
+    use super::format::{digest_domain, framed_sha256_hex};
+
+    let [license, attribution, notice] = LICENSE_FILES;
+    let files = [
+        read_small_file(&directory.join(license))?,
+        read_small_file(&directory.join(attribution))?,
+        read_small_file(&directory.join(notice))?,
+    ];
+    let payload = encode_license_bundle(files.each_ref().map(Vec::as_slice));
+    let digest = framed_sha256_hex(digest_domain::LICENSE_BUNDLE, &[&payload])
+        .map_err(|_| PackageError::Arithmetic("license bundle digest"))?;
+    if digest != conversion.license_bundle_sha256 {
+        return Err(PackageError::Integrity {
+            member: CONVERSION_RECEIPT_FILE.to_owned(),
+            detail: "license_bundle_sha256 differs from the supplied license, attribution or modification notice".to_owned(),
+        });
+    }
+    Ok(files)
 }
 
 fn require_license_bundle(directory: &Path) -> Result<(), PackageError> {

@@ -7,6 +7,23 @@ use franken_nlp::artifact::{
 };
 use sha2::{Digest, Sha256};
 
+pub const LICENSES: [(&str, &[u8]); 3] = [
+    ("APACHE-2.0.txt", b"Apache-2.0\n"),
+    ("ATTRIBUTION.txt", b"Nanbeige Team\n"),
+    ("MODIFICATION_NOTICE.txt", b"fixture modification\n"),
+];
+
+pub fn license_payload() -> Vec<u8> {
+    let mut payload = Vec::new();
+    for (name, bytes) in LICENSES {
+        for field in [name.as_bytes(), bytes] {
+            payload.extend_from_slice(&(field.len() as u64).to_le_bytes());
+            payload.extend_from_slice(field);
+        }
+    }
+    payload
+}
+
 /// Synthetic converter metadata with both file identities computed over the test payload.
 pub fn canonical_receipt(artifact: &[u8]) -> String {
     let bytes = artifact.len() as u64;
@@ -32,7 +49,7 @@ pub fn canonical_receipt(artifact: &[u8]) -> String {
         output_len: bytes,
         fnlpq_file_sha256: framed_sha256_hex(digest_domain::FILE, &[artifact]).unwrap(),
         artifact_raw_sha256: format!("{:x}", Sha256::digest(artifact)),
-        license_bundle_sha256: "d".repeat(64),
+        license_bundle_sha256: framed_sha256_hex(digest_domain::LICENSE_BUNDLE, &[&license_payload()]).unwrap(),
     }
     .canonical_json()
     .expect("canonical synthetic conversion receipt")

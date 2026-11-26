@@ -56,19 +56,10 @@ const CHAT_TEMPLATE_SECTION: &str = "chat-template";
 const LICENSE_BUNDLE_SECTION: &str = "license-bundle";
 const EMISSION_PROGRESS_TENSOR_INTERVAL: usize = 16;
 
-const EMBEDDED_LICENSE_FILES: [(&str, &[u8]); 3] = [
-    (
-        "APACHE-2.0.txt",
-        include_bytes!("../docs/truth-pack/license/APACHE-2.0.txt"),
-    ),
-    (
-        "ATTRIBUTION.txt",
-        include_bytes!("../docs/truth-pack/license/ATTRIBUTION.txt"),
-    ),
-    (
-        "MODIFICATION_NOTICE.txt",
-        include_bytes!("../docs/truth-pack/license/MODIFICATION_NOTICE_TEMPLATE.txt"),
-    ),
+const EMBEDDED_LICENSE_FILES: [&[u8]; 3] = [
+    include_bytes!("../docs/truth-pack/license/APACHE-2.0.txt"),
+    include_bytes!("../docs/truth-pack/license/ATTRIBUTION.txt"),
+    include_bytes!("../docs/truth-pack/license/MODIFICATION_NOTICE_TEMPLATE.txt"),
 ];
 
 #[derive(Parser)]
@@ -2003,23 +1994,8 @@ fn read_materialized_sources(
         tokenizer_model: &verified.tokenizer_model,
         tokenizer_config: &verified.tokenizer_config,
         chat_template: &verified.chat_template,
-        license_bundle: embedded_license_bundle()?,
+        license_bundle: crate::artifact::package::encode_license_bundle(EMBEDDED_LICENSE_FILES),
     })
-}
-
-fn embedded_license_bundle() -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
-    for (name, contents) in EMBEDDED_LICENSE_FILES {
-        let name_len = u64::try_from(name.len())
-            .map_err(|_| "embedded license file name length does not fit u64".to_owned())?;
-        let contents_len = u64::try_from(contents.len())
-            .map_err(|_| "embedded license file length does not fit u64".to_owned())?;
-        bytes.extend_from_slice(&name_len.to_le_bytes());
-        bytes.extend_from_slice(name.as_bytes());
-        bytes.extend_from_slice(&contents_len.to_le_bytes());
-        bytes.extend_from_slice(contents);
-    }
-    Ok(bytes)
 }
 
 fn build_streaming_envelope_plan(

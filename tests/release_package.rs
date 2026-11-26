@@ -192,6 +192,15 @@ fn verifier_rejects_internally_checksummed_receipt_from_a_different_conversion()
     assert!(error.contains("artifact_raw_sha256"), "{error}");
 }
 
+#[test]
+fn substituted_license_member_refuses_packaging_before_staging() {
+    let fixture = package_fixture("wrong-notice", b"abc");
+    fs::write(fixture.license_bundle_dir.join("MODIFICATION_NOTICE.txt"), b"unrelated notice").unwrap();
+    let error = package_model(&fixture.request()).unwrap_err().to_string();
+    assert!(error.contains("license_bundle_sha256"), "{error}");
+    assert!(!fixture.staging_dir.exists());
+}
+
 fn assert_named_rejection(result: Result<package::PackageReport, PackageError>, name: &str) {
     let error = result.expect_err("hostile release package must reject");
     assert!(
@@ -250,14 +259,7 @@ fn package_fixture(label: &str, artifact_bytes: &[u8]) -> Fixture {
     fs::write(&conversion_receipt, release_conversion::canonical_receipt(artifact_bytes)).expect("write conversion receipt");
     let license_bundle_dir = root.join("license-bundle");
     fs::create_dir(&license_bundle_dir).expect("create license bundle directory");
-    for (name, bytes) in [
-        ("APACHE-2.0.txt", b"Apache-2.0\n".as_slice()),
-        ("ATTRIBUTION.txt", b"Nanbeige Team\n".as_slice()),
-        (
-            "MODIFICATION_NOTICE.txt",
-            b"fixture modification\n".as_slice(),
-        ),
-    ] {
+    for (name, bytes) in release_conversion::LICENSES {
         fs::write(license_bundle_dir.join(name), bytes).expect("write required license member");
     }
     Fixture {

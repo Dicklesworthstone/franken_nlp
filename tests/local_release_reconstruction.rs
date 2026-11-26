@@ -697,11 +697,7 @@ impl Fixture {
         fs::write(&receipt, release_conversion::canonical_receipt(&artifact)).unwrap();
         let license_dir = root.join("licenses");
         fs::create_dir(&license_dir).unwrap();
-        for (name, bytes) in [
-            ("APACHE-2.0.txt", b"Apache-2.0\n".as_slice()),
-            ("ATTRIBUTION.txt", b"Nanbeige Team\n".as_slice()),
-            ("MODIFICATION_NOTICE.txt", b"Synthetic transport fixture only\n".as_slice()),
-        ] {
+        for (name, bytes) in release_conversion::LICENSES {
             fs::write(license_dir.join(name), bytes).unwrap();
         }
         let parts_dir = root.join("parts");
@@ -811,7 +807,7 @@ fn structural_artifact() -> Vec<u8> {
             SectionPayload::new("tokenizer-model", SectionKind::TokenizerModel, TOKENIZER, 8),
             SectionPayload::new("tokenizer-config", SectionKind::TokenizerConfig, CONFIG, 8),
             SectionPayload::new("chat-template", SectionKind::ChatTemplate, TEMPLATE, 8),
-            SectionPayload::new("license-bundle", SectionKind::LicenseBundle, b"Apache-2.0\n", 8),
+            SectionPayload::new("license-bundle", SectionKind::LicenseBundle, release_conversion::license_payload(), 8),
         ],
         packing_sets: vec![PackingSetInput {
             id: "generic".to_owned(), target: ArchTarget::Generic,
