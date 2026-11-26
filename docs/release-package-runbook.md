@@ -5,7 +5,7 @@ This runbook packages one immutable Generic `.fnlpq` artifact for a draft GitHub
 ## Preconditions
 
 - The converter output is a finished, independently verified Generic `.fnlpq` file.
-- The converter receipt is retained as a regular file.
+- Supply the canonical receipt sidecar emitted by the converter. Packaging checks its `output_len` and `artifact_raw_sha256` against the bytes it splits. Standalone verification repeats the binding check against the reconstructed artifact.
 - The license directory contains exactly `APACHE-2.0.txt`, `ATTRIBUTION.txt`, and `MODIFICATION_NOTICE.txt`.
 - The output staging directory does not exist. Packaging creates it once; a failed staging directory is retained for inspection and is never reused.
 

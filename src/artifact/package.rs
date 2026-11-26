@@ -12,6 +12,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use super::converter::ConversionReceipt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -223,7 +224,9 @@ pub fn package_model(request: &PackageRequest) -> Result<PackageReport, PackageE
 /// converter-output digest.
 pub fn verify_model_package(staging_dir: &Path) -> Result<PackageReport, PackageError> {
     let receipt_path = staging_dir.join(RECEIPT_FILE);
-    let receipt: ModelAssetReceipt = parse_receipt(&receipt_path)?;
+    let receipt_bytes = read_small_file(&receipt_path)?;
+    let receipt: ModelAssetReceipt = serde_json::from_slice(&receipt_bytes)
+        .map_err(|error| PackageError::ReceiptJson(error.to_string()))?;
     validate_receipt_shape(&receipt)?;
 
     let mut expected_names = BTreeSet::new();
@@ -241,7 +244,6 @@ pub fn verify_model_package(staging_dir: &Path) -> Result<PackageReport, Package
     }
     // The writer's SHA256SUMS ends with the receipt's own record; recompute it
     // from the on-disk receipt so the round-trip covers every hashed member.
-    let receipt_bytes = read_small_file(&receipt_path)?;
     let receipt_file_record = PackageFile {
         name: RECEIPT_FILE.to_owned(),
         bytes: u64::try_from(receipt_bytes.len())
@@ -253,7 +255,18 @@ pub fn verify_model_package(staging_dir: &Path) -> Result<PackageReport, Package
     expected_names.insert(SUMS_FILE.to_owned());
     ensure_exact_inventory(staging_dir, &expected_names)?;
 
-    for record in &ordered_records {
+    let conversion_bytes = read_small_file(&staging_dir.join(CONVERSION_RECEIPT_FILE))?;
+    if conversion_bytes.len() as u64 != receipt.conversion_receipt.bytes
+        || hex_digest(Sha256::digest(&conversion_bytes)) != receipt.conversion_receipt.sha256
+    {
+        return Err(PackageError::Integrity {
+            member: CONVERSION_RECEIPT_FILE.to_owned(),
+            detail: "receipt bytes differ from package inventory".to_owned(),
+        });
+    }
+    let conversion = parse_conversion_receipt(&conversion_bytes)?;
+    verify_conversion_output(&conversion, receipt.artifact_bytes, &receipt.fnlpq_file_sha256)?;
+    for record in receipt.parts.iter().chain(&receipt.license_bundle).chain([&receipt.reconstruction]) {
         verify_file_record(staging_dir, record)?;
     }
     verify_sha256sums(staging_dir, &ordered_records)?;
@@ -306,8 +319,10 @@ fn package_model_with_part_bytes(
             detail: format!("must be in 1..={RELEASE_PART_BYTES}, found {part_bytes}"),
         });
     }
-    require_regular_file(&request.artifact)?;
-    require_regular_file(&request.conversion_receipt)?;
+    let expected_len = metadata_regular_file(&request.artifact)?.len();
+    let conversion_bytes = read_small_file(&request.conversion_receipt)?;
+    let conversion = parse_conversion_receipt(&conversion_bytes)?;
+    verify_conversion_length(&conversion, expected_len)?;
     require_license_bundle(&request.license_bundle_dir)?;
     create_staging_dir(&request.staging_dir)?;
 
@@ -316,9 +331,10 @@ fn package_model_with_part_bytes(
         &request.staging_dir,
         &request.logical_artifact_name,
     )?;
-    let conversion_receipt = copy_digest_bound_file(
-        &request.conversion_receipt,
+    verify_conversion_output(&conversion, artifact_bytes, &artifact_sha256)?;
+    let conversion_receipt = write_new_file(
         &request.staging_dir.join(CONVERSION_RECEIPT_FILE),
+        &conversion_bytes,
     )?;
     let mut license_bundle = Vec::with_capacity(LICENSE_FILES.len());
     for name in LICENSE_FILES {
@@ -631,9 +647,43 @@ fn verify_sha256sums(staging_dir: &Path, records: &[&PackageFile]) -> Result<(),
     Ok(())
 }
 
-fn parse_receipt(path: &Path) -> Result<ModelAssetReceipt, PackageError> {
-    serde_json::from_slice(&read_small_file(path)?)
-        .map_err(|error| PackageError::ReceiptJson(error.to_string()))
+fn parse_conversion_receipt(bytes: &[u8]) -> Result<ConversionReceipt, PackageError> {
+    let text = std::str::from_utf8(bytes).map_err(|error| PackageError::Integrity {
+        member: CONVERSION_RECEIPT_FILE.to_owned(),
+        detail: error.to_string(),
+    })?;
+    ConversionReceipt::parse_canonical_json(text).map_err(|error| PackageError::Integrity {
+        member: CONVERSION_RECEIPT_FILE.to_owned(),
+        detail: error.to_string(),
+    })
+}
+
+fn verify_conversion_length(conversion: &ConversionReceipt, bytes: u64) -> Result<(), PackageError> {
+    if conversion.output_len != bytes {
+        return Err(PackageError::Integrity {
+            member: CONVERSION_RECEIPT_FILE.to_owned(),
+            detail: format!("output_len expected={} observed={bytes}", conversion.output_len),
+        });
+    }
+    Ok(())
+}
+
+fn verify_conversion_output(
+    conversion: &ConversionReceipt,
+    bytes: u64,
+    raw_sha256: &str,
+) -> Result<(), PackageError> {
+    verify_conversion_length(conversion, bytes)?;
+    if conversion.artifact_raw_sha256 != raw_sha256 {
+        return Err(PackageError::Integrity {
+            member: CONVERSION_RECEIPT_FILE.to_owned(),
+            detail: format!(
+                "artifact_raw_sha256 expected={} observed={raw_sha256}",
+                conversion.artifact_raw_sha256
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn validate_receipt_shape(receipt: &ModelAssetReceipt) -> Result<(), PackageError> {

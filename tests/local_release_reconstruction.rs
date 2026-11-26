@@ -7,6 +7,9 @@
 //! qualification. Fixed release chunking remains unchanged: this small artifact
 //! is one legitimate tail part.
 
+#[path = "support/release_conversion.rs"]
+mod release_conversion;
+
 use std::{
     fs::{self, OpenOptions},
     io::{Seek, SeekFrom, Write},
@@ -691,7 +694,7 @@ impl Fixture {
         let reader = FnlpqRangeReader::open(&artifact_path).expect("fixture must pass real checked reader");
         assert_eq!(reader.tensors().len(), 201);
         let receipt = root.join("conversion.json");
-        fs::write(&receipt, b"{\"scope\":\"synthetic-transport-only\"}\n").unwrap();
+        fs::write(&receipt, release_conversion::canonical_receipt(&artifact)).unwrap();
         let license_dir = root.join("licenses");
         fs::create_dir(&license_dir).unwrap();
         for (name, bytes) in [

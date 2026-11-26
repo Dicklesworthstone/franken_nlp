@@ -1,10 +1,9 @@
 //! Integration coverage for the immutable model-release package closure.
 
-// The package code is included directly, matching the established canonjson
-// contract-target pattern.  This ensures Cargo's integration target executes
-// this module even though the two CLI binaries intentionally have `test = false`.
-#[path = "../src/artifact/package.rs"]
-mod package;
+#[path = "support/release_conversion.rs"]
+mod release_conversion;
+
+use franken_nlp::artifact::package;
 
 use std::{
     fs::{self, OpenOptions},
@@ -149,6 +148,50 @@ fn wrong_order_and_edited_receipt_fields_reject_before_exposure() {
     );
 }
 
+#[test]
+fn conversion_receipt_must_bind_the_actual_artifact_before_publication() {
+    for (label, receipt_payload, field) in [
+        ("wrong-length", b"long".as_slice(), "output_len"),
+        ("same-length", b"bad".as_slice(), "artifact_raw_sha256"),
+    ] {
+        let fixture = package_fixture(label, b"abc");
+        fs::write(&fixture.conversion_receipt, release_conversion::canonical_receipt(receipt_payload)).unwrap();
+        let error = package_model(&fixture.request()).unwrap_err().to_string();
+        assert!(error.contains("CONVERSION_RECEIPT.json") && error.contains(field), "{error}");
+        assert!(!fixture.staging_dir.join("MODEL_ASSET_RECEIPT.json").exists());
+    }
+
+    let fixture = package_fixture("malformed-conversion", b"abc");
+    fs::write(&fixture.conversion_receipt, b"{}").unwrap();
+    assert_named_rejection(package_model(&fixture.request()), "CONVERSION_RECEIPT.json");
+    assert!(!fixture.staging_dir.exists());
+}
+
+#[test]
+fn verifier_rejects_internally_checksummed_receipt_from_a_different_conversion() {
+    use sha2::{Digest, Sha256};
+
+    let fixture = package_fixture("swapped-conversion", b"abc");
+    package_model(&fixture.request()).unwrap();
+    let dir = &fixture.staging_dir;
+    let sums_path = dir.join("SHA256SUMS");
+    let sums = fs::read_to_string(&sums_path).unwrap();
+    let mut receipt = read_receipt(dir);
+    let old_conversion = receipt.conversion_receipt.sha256.clone();
+    let model_path = dir.join("MODEL_ASSET_RECEIPT.json");
+    let old_model = format!("{:x}", Sha256::digest(fs::read(&model_path).unwrap()));
+    let swapped = release_conversion::canonical_receipt(b"xyz");
+    fs::write(dir.join("CONVERSION_RECEIPT.json"), swapped.as_bytes()).unwrap();
+    let new_conversion = format!("{:x}", Sha256::digest(swapped.as_bytes()));
+    receipt.conversion_receipt.bytes = swapped.len() as u64;
+    receipt.conversion_receipt.sha256.clone_from(&new_conversion);
+    write_receipt(dir, &receipt);
+    let new_model = format!("{:x}", Sha256::digest(fs::read(model_path).unwrap()));
+    fs::write(sums_path, sums.replace(&old_conversion, &new_conversion).replace(&old_model, &new_model)).unwrap();
+    let error = verify_model_package(dir).unwrap_err().to_string();
+    assert!(error.contains("artifact_raw_sha256"), "{error}");
+}
+
 fn assert_named_rejection(result: Result<package::PackageReport, PackageError>, name: &str) {
     let error = result.expect_err("hostile release package must reject");
     assert!(
@@ -204,7 +247,7 @@ fn package_fixture(label: &str, artifact_bytes: &[u8]) -> Fixture {
     let artifact = root.join(LOGICAL_NAME);
     fs::write(&artifact, artifact_bytes).expect("write synthetic artifact");
     let conversion_receipt = root.join("conversion-source.json");
-    fs::write(&conversion_receipt, b"{\"fixture\":true}\n").expect("write conversion receipt");
+    fs::write(&conversion_receipt, release_conversion::canonical_receipt(artifact_bytes)).expect("write conversion receipt");
     let license_bundle_dir = root.join("license-bundle");
     fs::create_dir(&license_bundle_dir).expect("create license bundle directory");
     for (name, bytes) in [
