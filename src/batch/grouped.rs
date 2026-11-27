@@ -109,12 +109,15 @@ pub fn run_ndjson<R: BufRead, W: Write, P: GroupedBatchProcessor, C: DecodeStepC
     match result {
         Ok(()) => Ok(summary),
         Err(fault) => {
+            let fault = failure_checkpoint(control, fault);
             if !sink.poisoned() {
                 let mut event = event::<()>("run_error", epoch, summary.requests);
                 event.error = Some(fault); event.summary = Some(&summary);
-                sink.emit(&event, true).map_err(|fault| BatchRunError { fault, summary })?;
+                sink.emit(&event, true).map_err(|later| BatchRunError {
+                    fault: failure_checkpoint(control, fault.preserve_cancellation(later)), summary,
+                })?;
             }
-            Err(BatchRunError { fault, summary })
+            Err(BatchRunError { fault: failure_checkpoint(control, fault), summary })
         }
     }
 }
@@ -144,14 +147,14 @@ fn run<R: BufRead, W: Write, P: GroupedBatchProcessor, C: DecodeStepControl>(rea
     loop {
         let Some(frame) = read_frame(reader, limits, summary, control)? else {
             drain(&mut pending, processor, sink, summary, control)?;
-            barrier(sink, summary, epoch, true)?;
+            barrier(sink, summary, epoch, true, control)?;
             return Ok(());
         };
         if frame.bytes.is_empty() && !frame.oversized { continue; }
         let document = match parse::<P::Args>(&frame, limits) {
             Ok(Command::Flush) => {
                 drain(&mut pending, processor, sink, summary, control)?;
-                barrier(sink, summary, epoch, false)?;
+                barrier(sink, summary, epoch, false, control)?;
                 seen.clear(); id_bytes = 0; pending_weight = 0; continue;
             }
             Ok(Command::Document(document)) => Ok(document),
@@ -197,18 +200,21 @@ fn prepare<P: GroupedBatchProcessor, C: DecodeStepControl>(document: Result<Batc
         return Ok(Pending::rejected(context, Some(id), BatchCode::DocumentLimit.into()));
     }
     checkpoint(control)?;
-    let prepared = match processor.prepare_with_control(document, control) {
+    let prepared = match processor.prepare_with_control(document, control).map_err(|failure|
+        BatchItemFailure { fault: failure_checkpoint(control, failure.fault), ..failure }) {
         Ok(prepared) => prepared,
         Err(failure) if failure.must_stop() => return Err(failure.fault),
         Err(failure) => return Ok(Pending::rejected(context, Some(id), failure.fault)),
     };
-    let weight = match processor.group_weight(&prepared) {
+    let weight = match processor.group_weight(&prepared).map_err(|failure|
+        BatchItemFailure { fault: failure_checkpoint(control, failure.fault), ..failure }) {
         Ok(weight) if weight > 0 && weight <= processor.max_group_weight() => weight,
         Ok(_) => return Ok(Pending::rejected(context, Some(id), BatchCode::Admission.into())),
         Err(failure) if failure.must_stop() => return Err(failure.fault),
         Err(failure) => return Ok(Pending::rejected(context, Some(id), failure.fault)),
     };
-    let charge = match processor.planned_work(&prepared) {
+    let charge = match processor.planned_work(&prepared).map_err(|failure|
+        BatchItemFailure { fault: failure_checkpoint(control, failure.fault), ..failure }) {
         Ok(charge) => charge,
         Err(failure) if failure.must_stop() => return Err(failure.fault),
         Err(failure) => return Ok(Pending::rejected(context, Some(id), failure.fault)),
@@ -242,9 +248,10 @@ fn drain<W: Write, P: GroupedBatchProcessor, C: DecodeStepControl>(pending: &mut
     }
     let mut index = 0;
     for row in pending.iter() {
-        checkpoint(control)?;
         if let Some(fault) = row.fault {
+            let fault = failure_checkpoint(control, fault);
             emit_error(sink, summary, row, fault)?;
+            if BatchItemFailure::reject(fault).must_stop() { return Err(fault); }
             continue;
         }
         let result = output.as_ref().and_then(|output| output.rows.get(index)).ok_or(BatchCode::InvalidExecution)?;
@@ -263,6 +270,9 @@ fn drain<W: Write, P: GroupedBatchProcessor, C: DecodeStepControl>(pending: &mut
                 }
             }
             Err(failure) => {
+                let failure = BatchItemFailure {
+                    fault: failure_checkpoint(control, failure.fault), ..*failure
+                };
                 emit_error(sink, summary, row, failure.fault)?;
                 if failure.must_stop() { return Err(failure.fault); }
             }
@@ -278,12 +288,14 @@ fn emit_error<W: Write, P>(sink: &mut Sink<'_, W>, summary: &mut BatchSummary,
     let mut event = event::<()>("doc_error", row.context.epoch, row.context.request_seq);
     event.caller_id = row.id.as_deref(); event.input_line = Some(row.context.input_line);
     event.byte_offset = Some(row.context.byte_offset); event.reserved_work = row.charge; event.error = Some(fault);
-    sink.emit(&event, false)?; summary.failed += 1; Ok(())
+    sink.emit(&event, false).map_err(|later| fault.preserve_cancellation(later))?;
+    summary.failed += 1; Ok(())
 }
-fn barrier<W: Write>(sink: &mut Sink<'_, W>, summary: &mut BatchSummary, epoch: &mut u64, eof: bool) -> Result<(), BatchFault> {
+fn barrier<W: Write, C: DecodeStepControl>(sink: &mut Sink<'_, W>, summary: &mut BatchSummary,
+    epoch: &mut u64, eof: bool, control: &mut C) -> Result<(), BatchFault> {
     let next = epoch.checked_add(1).ok_or(BatchCode::SequenceOverflow)?;
     let mut event = event::<()>("flush", *epoch, summary.requests); event.eof = Some(eof);
-    sink.emit(&event, false)?;
+    sink.emit_with_checkpoint(&event, false, || checkpoint(control))?;
     summary.flushes = summary.flushes.checked_add(1).ok_or(BatchCode::SequenceOverflow)?;
     if !eof { *epoch = next; }
     Ok(())

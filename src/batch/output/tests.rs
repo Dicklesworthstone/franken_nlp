@@ -191,7 +191,7 @@ fn cancellation_in_any_serialization_pass_refuses_serial_and_grouped_document_pu
 }
 
 #[test]
-fn cancellation_at_eof_flush_emits_error_instead_of_success_footer() {
+fn cancellation_during_eof_flush_never_acknowledges_or_appends_after_delivery() {
     struct Writer { output: Vec<u8>, state: Rc<PublicationState>, cause: DecodeCancellationKind, eof: bool }
     impl Write for Writer {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -219,11 +219,11 @@ fn cancellation_at_eof_flush_emits_error_instead_of_success_footer() {
             };
             let error = result.unwrap_err();
             assert_eq!(error.fault, BatchFault::cancelled(cause));
-            assert_eq!(error.summary.flushes, 1);
+            assert_eq!(error.summary.flushes, 0);
             let events: Vec<serde_json::Value> = std::str::from_utf8(&writer.output).unwrap().lines()
                 .map(|line| serde_json::from_str(line).unwrap()).collect();
             assert_eq!(events.iter().map(|event| event["event"].as_str().unwrap()).collect::<Vec<_>>(),
-                vec!["run_start", "flush", "run_error"]);
+                vec!["run_start", "flush"]);
         }
     }
 }
@@ -348,6 +348,202 @@ fn post_write_refusal_seals_sink_without_advancing_its_output_acknowledgement() 
             let bytes = sink.writer.bytes.len();
             assert_eq!(sink.emit(&Event::<()>::new("run_error", 1, 0), true).unwrap_err().code, BatchCode::OutputIo);
             assert_eq!(sink.writer.bytes.len(), bytes); assert_eq!(sink.writer.writes, 1);
+        }
+    }
+}
+
+#[test]
+fn read_callbacks_preserve_cancellation_before_errors_eof_or_admission() {
+    struct Reader {
+        bytes: Cursor<Vec<u8>>, state: Rc<PublicationState>, cause: DecodeCancellationKind,
+        fail: bool, calls: usize,
+    }
+    impl io::Read for Reader {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> { io::Read::read(&mut self.bytes, bytes) }
+    }
+    impl io::BufRead for Reader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            self.calls += 1;
+            self.state.cause.set(Some(self.cause));
+            if self.fail { Err(io::Error::other("private read failure")) }
+            else { io::BufRead::fill_buf(&mut self.bytes) }
+        }
+        fn consume(&mut self, amount: usize) { io::BufRead::consume(&mut self.bytes, amount); }
+    }
+    for cause in CANCELLATION_CAUSES {
+        for (fail, input) in [(true, b"".as_slice()), (false, b"".as_slice()),
+            (false, b"{\"id\":\"a\",\"text\":\"private\"}\n".as_slice())] {
+            for grouped in [false, true] {
+                let state = Rc::new(PublicationState::default());
+                let mut processor = PublicationProcessor { state: Rc::clone(&state), pass: usize::MAX, cause };
+                let mut control = PublicationControl(Rc::clone(&state));
+                let mut reader = Reader { bytes: Cursor::new(input.to_vec()), state: Rc::clone(&state), cause, fail, calls: 0 };
+                let mut output = Vec::new();
+                let result = if grouped {
+                    grouped::run_ndjson(&mut reader, &mut output, &mut processor, BatchLimits::default(),
+                        grouped::GroupLimits::default(), &mut control)
+                } else {
+                    run_ndjson(&mut reader, &mut output, &mut processor, BatchLimits::default(), &mut control)
+                };
+                let error = result.unwrap_err();
+                assert_eq!(error.fault, BatchFault::cancelled(cause));
+                assert_eq!(error.summary, BatchSummary::default());
+                assert_eq!(reader.calls, 1); assert_eq!(reader.bytes.position(), 0);
+                assert_eq!(state.executions.get(), 0);
+                let events: Vec<serde_json::Value> = std::str::from_utf8(&output).unwrap().lines()
+                    .map(|line| serde_json::from_str(line).unwrap()).collect();
+                assert_eq!(events.iter().map(|event| event["event"].as_str().unwrap()).collect::<Vec<_>>(),
+                    vec!["run_start", "run_error"]);
+                assert_eq!(events[1]["error"], serde_json::to_value(BatchFault::cancelled(cause)).unwrap());
+            }
+        }
+    }
+}
+
+struct FailureProcessor {
+    state: Rc<PublicationState>, fault: BatchFault, later: Option<DecodeCancellationKind>,
+    in_prepare: bool, prepared: usize,
+}
+impl BatchProcessor for FailureProcessor {
+    type Args = (); type Prepared = String; type Output = String;
+    fn prepare(&mut self, document: BatchDocument<()>) -> Result<String, BatchItemFailure> {
+        self.prepared += 1;
+        if self.in_prepare {
+            self.state.cause.set(self.later);
+            Err(BatchItemFailure::reject(self.fault))
+        } else { Ok(document.text) }
+    }
+    fn planned_work(&self, _: &String) -> BatchWork { BatchWork { forward_positions: 1, projected_logits: 1 } }
+    fn execute<C: DecodeStepControl>(&mut self, _: String, _: &mut C) -> Result<String, BatchItemFailure> {
+        self.state.executions.set(self.state.executions.get() + 1);
+        self.state.cause.set(self.later);
+        Err(BatchItemFailure::reject(self.fault))
+    }
+}
+impl grouped::GroupedBatchProcessor for FailureProcessor {
+    type Args = (); type Prepared = String; type Output = String; type Guard = ();
+    fn max_group_size(&self) -> usize { 1 }
+    fn prepare(&mut self, document: BatchDocument<()>) -> Result<String, BatchItemFailure> {
+        <Self as BatchProcessor>::prepare(self, document)
+    }
+    fn planned_work(&self, value: &String) -> Result<BatchWork, BatchItemFailure> {
+        Ok(<Self as BatchProcessor>::planned_work(self, value))
+    }
+    fn execute_group<C: DecodeStepControl>(&mut self, requests: Vec<grouped::GroupedRequest<String>>, control: &mut C)
+        -> Result<grouped::GroupedOutput<String, ()>, BatchFault> {
+        let rows = requests.into_iter().map(|request| grouped::GroupedRow {
+            request_seq: request.context.request_seq,
+            result: <Self as BatchProcessor>::execute(self, request.prepared, control),
+        }).collect();
+        Ok(grouped::GroupedOutput::new(rows, ()))
+    }
+}
+
+#[test]
+fn failed_error_delivery_never_replaces_an_already_observed_cancellation() {
+    for cause in CANCELLATION_CAUSES {
+        for target in ["doc_error", "run_error"] {
+            for stage in [DeliveryStage::Write, DeliveryStage::Flush] {
+                for grouped in [false, true] {
+                    let state = Rc::new(PublicationState::default());
+                    let fault = BatchFault::cancelled(cause);
+                    let mut processor = FailureProcessor { state: Rc::clone(&state), fault,
+                        later: Some(DecodeCancellationKind::Deadline), in_prepare: false, prepared: 0 };
+                    let mut control = PublicationControl(Rc::clone(&state));
+                    let mut writer = DeliveryWriter { bytes: Vec::new(), state: Rc::clone(&state),
+                        target, stage, fail: true, cause: Some(DecodeCancellationKind::Shutdown),
+                        armed: false, writes: 0, flushes: 0 };
+                    let first = b"{\"id\":\"a\",\"text\":\"a\"}\n";
+                    let mut bytes = first.to_vec(); bytes.extend_from_slice(b"{\"id\":\"b\",\"text\":\"b\"}\n");
+                    let mut reader = Cursor::new(bytes);
+                    let result = if grouped {
+                        grouped::run_ndjson(&mut reader, &mut writer, &mut processor, BatchLimits::default(),
+                            grouped::GroupLimits::default(), &mut control)
+                    } else {
+                        run_ndjson(&mut reader, &mut writer, &mut processor, BatchLimits::default(), &mut control)
+                    };
+                    let error = result.unwrap_err();
+                    assert_eq!(error.fault, fault, "original stop survives later control and sink failures");
+                    assert_eq!(reader.position(), first.len() as u64);
+                    assert_eq!(processor.prepared, 1); assert_eq!(state.executions.get(), 1);
+                    assert_eq!(error.summary.succeeded, 0);
+                    assert_eq!(error.summary.failed, u64::from(target == "run_error"));
+                    assert_eq!(error.summary.reserved_work.forward_positions, 1);
+                    assert_eq!(writer.writes, 1, "reporting failures are never retried");
+                    assert_eq!(writer.flushes, usize::from(stage == DeliveryStage::Flush));
+                    let output = std::str::from_utf8(&writer.bytes).unwrap();
+                    assert!(!output.contains("run_complete")); assert!(!output.contains("private transport failure"));
+                    if target == "doc_error" { assert!(!output.contains("run_error")); }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn failed_planning_or_execution_observes_the_original_control_before_reporting() {
+    for cause in CANCELLATION_CAUSES {
+        for in_prepare in [false, true] {
+            for grouped in [false, true] {
+                let state = Rc::new(PublicationState::default());
+                let mut processor = FailureProcessor { state: Rc::clone(&state), fault: BatchCode::Planning.into(),
+                    later: Some(cause), in_prepare, prepared: 0 };
+                let mut control = PublicationControl(Rc::clone(&state));
+                let first = b"{\"id\":\"a\",\"text\":\"a\"}\n";
+                let mut bytes = first.to_vec(); bytes.extend_from_slice(b"{\"id\":\"b\",\"text\":\"b\"}\n");
+                let mut reader = Cursor::new(bytes); let mut output = Vec::new();
+                let result = if grouped {
+                    grouped::run_ndjson(&mut reader, &mut output, &mut processor, BatchLimits::default(),
+                        grouped::GroupLimits::default(), &mut control)
+                } else {
+                    run_ndjson(&mut reader, &mut output, &mut processor, BatchLimits::default(), &mut control)
+                };
+                let error = result.unwrap_err();
+                assert_eq!(error.fault, BatchFault::cancelled(cause));
+                assert_eq!(reader.position(), first.len() as u64);
+                assert_eq!(processor.prepared, 1); assert_eq!(state.executions.get(), usize::from(!in_prepare));
+                assert_eq!(error.summary.succeeded, 0);
+                assert_eq!(error.summary.reserved_work.forward_positions, u64::from(!in_prepare));
+                let events: Vec<serde_json::Value> = std::str::from_utf8(&output).unwrap().lines()
+                    .map(|line| serde_json::from_str(line).unwrap()).collect();
+                assert_eq!(events.last().unwrap()["event"], "run_error");
+                for event in events.iter().filter(|event| event.get("error").is_some()) {
+                    assert_eq!(event["error"], serde_json::to_value(BatchFault::cancelled(cause)).unwrap());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn first_cancellation_during_terminal_error_delivery_is_observed_after_the_callback() {
+    for cause in CANCELLATION_CAUSES {
+        for stage in [DeliveryStage::Write, DeliveryStage::Flush] {
+            for fail in [false, true] {
+                for grouped in [false, true] {
+                    let state = Rc::new(PublicationState::default());
+                    let mut processor = FailureProcessor { state: Rc::clone(&state),
+                        fault: BatchCode::InputIo.into(), later: None, in_prepare: true, prepared: 0 };
+                    let mut control = PublicationControl(Rc::clone(&state));
+                    let mut writer = DeliveryWriter { bytes: Vec::new(), state: Rc::clone(&state),
+                        target: "run_error", stage, fail, cause: Some(cause), armed: false, writes: 0, flushes: 0 };
+                    let first = b"{\"id\":\"a\",\"text\":\"a\"}\n";
+                    let mut bytes = first.to_vec(); bytes.extend_from_slice(b"{\"id\":\"b\",\"text\":\"b\"}\n");
+                    let mut reader = Cursor::new(bytes);
+                    let result = if grouped {
+                        grouped::run_ndjson(&mut reader, &mut writer, &mut processor, BatchLimits::default(),
+                            grouped::GroupLimits::default(), &mut control)
+                    } else {
+                        run_ndjson(&mut reader, &mut writer, &mut processor, BatchLimits::default(), &mut control)
+                    };
+                    assert_eq!(result.unwrap_err().fault, BatchFault::cancelled(cause));
+                    assert_eq!(reader.position(), first.len() as u64);
+                    assert_eq!(processor.prepared, 1); assert_eq!(state.executions.get(), 0);
+                    assert_eq!(writer.writes, 1);
+                    assert_eq!(writer.flushes, usize::from(stage == DeliveryStage::Flush || !fail));
+                    assert!(!std::str::from_utf8(&writer.bytes).unwrap().contains("run_complete"));
+                }
+            }
         }
     }
 }

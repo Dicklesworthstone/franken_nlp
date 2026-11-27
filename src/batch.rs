@@ -129,6 +129,11 @@ impl BatchFault {
     pub fn cancelled(cause: DecodeCancellationKind) -> Self {
         Self { code: BatchCode::Cancelled, cancellation: Some(cause) }
     }
+    /// Reporting a terminal stop is best-effort. A broken error sink must not
+    /// replace the original cancellation with an incidental delivery failure.
+    fn preserve_cancellation(self, later: Self) -> Self {
+        if self.cancellation.is_some() || self.code == BatchCode::Cancelled { self } else { later }
+    }
 }
 impl fmt::Display for BatchFault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -259,13 +264,16 @@ fn run_ndjson_with_completion<R: BufRead, W: Write, P: BatchProcessor, C: Decode
     match result {
         Ok(value) => Ok(value),
         Err(fault) => {
+            let fault = failure_checkpoint(control, fault);
             // Never append an error after a partial write or failed flush.
             if !sink.poisoned() {
                 let mut event = Event::<()>::new("run_error", epoch, summary.requests);
                 event.error = Some(fault); event.summary = Some(&summary);
-                sink.emit(&event, true).map_err(|fault| BatchRunError { fault, summary })?;
+                sink.emit(&event, true).map_err(|later| BatchRunError {
+                    fault: failure_checkpoint(control, fault.preserve_cancellation(later)), summary,
+                })?;
             }
-            Err(BatchRunError { fault, summary })
+            Err(BatchRunError { fault: failure_checkpoint(control, fault), summary })
         }
     }
 }
@@ -278,7 +286,7 @@ fn run<R: BufRead, W: Write, P: BatchProcessor, C: DecodeStepControl>(reader: &m
     loop {
         let frame = read_frame(reader, limits, summary, control)?;
         let Some(frame) = frame else {
-            flush(sink, summary, epoch, true)?;
+            flush(sink, summary, epoch, true, control)?;
             return Ok(());
         };
         if frame.bytes.is_empty() && !frame.oversized { continue; }
@@ -286,7 +294,7 @@ fn run<R: BufRead, W: Write, P: BatchProcessor, C: DecodeStepControl>(reader: &m
         // so even a later read/budget error cannot masquerade as the prior item.
         let document = match parse::<P::Args>(&frame, limits) {
             Ok(Command::Flush) => {
-                flush(sink, summary, epoch, false)?;
+                flush(sink, summary, epoch, false, control)?;
                 // Emission/flush is the drain acknowledgement. Never reset
                 // the duplicate set merely upon enqueue or failed delivery.
                 seen.clear(); id_bytes = 0; continue;
@@ -313,6 +321,7 @@ fn run<R: BufRead, W: Write, P: BatchProcessor, C: DecodeStepControl>(reader: &m
         let prepared = match processor.prepare_with_control(document, control) {
             Ok(plan) => plan,
             Err(error) => {
+                let error = BatchItemFailure { fault: failure_checkpoint(control, error.fault), ..error };
                 reject(sink, summary, *epoch, &frame, Some(&id), error.fault)?;
                 if error.must_stop() { return Err(error.fault); } else { continue; }
             }
@@ -344,6 +353,7 @@ fn run<R: BufRead, W: Write, P: BatchProcessor, C: DecodeStepControl>(reader: &m
                 }
             }
             Err(error) => {
+                let error = BatchItemFailure { fault: failure_checkpoint(control, error.fault), ..error };
                 reject(sink, summary, *epoch, &frame, Some(&id), error.fault)?;
                 if error.must_stop() { return Err(error.fault); }
             }
@@ -354,19 +364,27 @@ fn reject<W: Write>(sink: &mut Sink<'_, W>, summary: &mut BatchSummary, epoch: u
     frame: &Frame, id: Option<&str>, fault: BatchFault) -> Result<(), BatchFault> {
     let mut event = Event::<()>::new("doc_error", epoch, summary.requests);
     event.caller_id = id; event.input_line = Some(frame.line); event.byte_offset = Some(frame.offset); event.error = Some(fault);
-    sink.emit(&event, false)?;
+    sink.emit(&event, false).map_err(|later| fault.preserve_cancellation(later))?;
     summary.failed += 1; Ok(())
 }
-fn flush<W: Write>(sink: &mut Sink<'_, W>, summary: &mut BatchSummary, epoch: &mut u64, eof: bool) -> Result<(), BatchFault> {
+fn flush<W: Write, C: DecodeStepControl>(sink: &mut Sink<'_, W>, summary: &mut BatchSummary,
+    epoch: &mut u64, eof: bool, control: &mut C) -> Result<(), BatchFault> {
     let next = epoch.checked_add(1).ok_or(BatchCode::SequenceOverflow)?;
     let mut event = Event::<()>::new("flush", *epoch, summary.requests);
-    event.eof = Some(eof); sink.emit(&event, false)?;
+    event.eof = Some(eof); sink.emit_with_checkpoint(&event, false, || checkpoint(control))?;
     summary.flushes = summary.flushes.checked_add(1).ok_or(BatchCode::SequenceOverflow)?;
     if !eof { *epoch = next; }
     Ok(())
 }
 fn checkpoint<C: DecodeStepControl>(control: &mut C) -> Result<(), BatchFault> {
     match control.prefill_checkpoint(0) { Some(cause) => Err(BatchFault::cancelled(cause)), None => Ok(()) }
+}
+/// Callback failures can arrive after the caller stopped. Preserve an already
+/// observed cause without polling again after its guarded payload has dropped;
+/// otherwise classify the failure under the invocation's original control.
+fn failure_checkpoint<C: DecodeStepControl>(control: &mut C, fault: BatchFault) -> BatchFault {
+    if fault.cancellation.is_some() || fault.code == BatchCode::Cancelled { return fault; }
+    checkpoint(control).err().unwrap_or(fault)
 }
 enum Command<A> { Document(BatchDocument<A>), Flush }
 fn parse<A: DeserializeOwned>(frame: &Frame, limits: BatchLimits) -> Result<Command<A>, BatchFault> {

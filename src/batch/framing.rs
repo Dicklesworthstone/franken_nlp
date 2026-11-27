@@ -9,7 +9,12 @@ pub(super) fn read_frame<R: BufRead, C: DecodeStepControl>(reader: &mut R, limit
     let mut payload_seen = 0_u64; let mut first_is_cr = false;
     loop {
         checkpoint(control)?;
-        let available = match reader.fill_buf() {
+        let available = reader.fill_buf();
+        // Blocking readers may both stop the caller and return an IO error,
+        // EOF or another record. Observe the original invocation before any
+        // of those outcomes authorizes parsing, admission or a flush event.
+        checkpoint(control)?;
+        let available = match available {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => return Err(BatchCode::InputIo.into()),
@@ -48,6 +53,7 @@ pub(super) fn read_frame<R: BufRead, C: DecodeStepControl>(reader: &mut R, limit
         }
         summary.input_bytes += consumed as u64;
         reader.consume(consumed);
+        checkpoint(control)?;
         if newline.is_some() {
             if frame.bytes.last() == Some(&b'\r') { frame.bytes.pop(); }
             return Ok(Some(frame));
