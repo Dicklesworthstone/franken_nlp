@@ -170,7 +170,11 @@ fn task_failure(error: Int8SampledSentimentError, executing: bool) -> BatchItemF
     match error {
         Shared(SampledSentimentError::WorkBudget | SampledSentimentError::TokenizerWork) if !executing =>
             BatchItemFailure::reject(BatchCode::WorkLimit),
-        Shared(SampledSentimentError::Limits) if !executing => BatchItemFailure::reject(BatchCode::Planning),
+        // Each record may tighten the compiled grammar and output ceilings.
+        // A model-free planning refusal leaves the resident engine clean.
+        Shared(SampledSentimentError::Limits | SampledSentimentError::Schema
+            | SampledSentimentError::Template | SampledSentimentError::Tokenizer) if !executing =>
+            BatchItemFailure::reject(BatchCode::Planning),
         Shared(SampledSentimentError::OutputBudget) if !executing => BatchItemFailure::reject(BatchCode::OutputLineLimit),
         Shared(SampledSentimentError::Identity) => BatchItemFailure::fatal(BatchCode::Admission),
         Shared(SampledSentimentError::Allocation) => BatchItemFailure::fatal(BatchCode::Allocation),
@@ -183,6 +187,14 @@ fn task_failure(error: Int8SampledSentimentError, executing: bool) -> BatchItemF
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_rejected_record_grammar_preserves_the_following_population() {
+        let failure = task_failure(SampledSentimentError::Schema.into(), false);
+        assert_eq!(failure.fault.code, BatchCode::Planning);
+        assert!(!failure.stop);
+        assert!(task_failure(SampledSentimentError::Schema.into(), true).stop);
+        assert!(task_failure(SampledSentimentError::Accounting.into(), false).stop);
+    }
     #[test]
     fn refused_attempts_leave_the_complete_prior_debit_intact() {
         let work = crate::native_engine::constrained_int8::planned_work(32, 64).unwrap();
