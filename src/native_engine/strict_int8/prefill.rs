@@ -5,9 +5,12 @@
 //! then append the next. Never preappend the whole chunk to a causal cache.
 //! Both passes use LoopRunner, including both post-pass norms. Sequential
 //! append/prefill remain unchanged; callers must separately admit this extra
-//! workspace. This candidate carries no model-parity or performance award.
+//! workspace. Per-row norms and attention reuse the engine's admitted rails;
+//! batch projection outputs retain their separate workspace allowance. This
+//! candidate carries no model-parity or performance award.
 use super::*;
-use crate::native_engine::{looprun::GroupLayerExecutor, portable_int8::batch::MAX_BATCH_ROWS};
+use crate::native_engine::{attention::eager_gqa_attention_in_place_prefix_with_scratch,
+    looprun::GroupLayerExecutor, portable_int8::batch::MAX_BATCH_ROWS};
 
 pub const LAYER_MAJOR_PREFILL_VERSION: &str = "portable-int8-layer-major-causal-prefill-v1";
 
@@ -75,7 +78,7 @@ impl<C: DecodeStepControl> Int8Session<'_, '_, C> {
             let mut executor = PrefillExecutor {
                 final_norm: self.engine.weights.final_norm, rope: &self.engine.rope,
                 cache: &mut self.engine.cache, activations: &mut activations[..chunk.len()],
-                ledger: &mut self.ledger, control: &mut *self.control,
+                workspace: &mut self.engine.workspace, ledger: &mut self.ledger, control: &mut *self.control,
                 projection: self.engine.projection.get_mut().map_err(|_| StrictInt8Error::ProjectionExecutor)?,
                 start, rows: chunk.len(), completed: 0, norms: 0,
             };
@@ -109,7 +112,8 @@ fn check_tokens(tokens: &[u32]) -> Result<(), StrictInt8Error> {
 
 struct PrefillExecutor<'a, 'executor, C> {
     final_norm: &'a [Bf16], rope: &'a RopeTablesF32, cache: &'a mut KvCache,
-    activations: &'a mut [ActivationBuffer], ledger: &'a mut ProjectionLedger, control: &'a mut C,
+    activations: &'a mut [ActivationBuffer], workspace: &'a mut DecoderWorkspace,
+    ledger: &'a mut ProjectionLedger, control: &'a mut C,
     projection: &'a mut Option<&'executor mut (dyn Int8ProjectionExecutor + 'executor)>,
     start: usize, rows: usize, completed: usize, norms: usize,
 }
@@ -122,35 +126,35 @@ impl<'w, C: DecodeStepControl> GroupLayerExecutor<Int8Layer<'w>> for PrefillExec
             || binding.kv_slot() != self.completed || hidden.len() != self.rows
             || hidden.iter().any(|row| row.len() != H) { return Err(StrictInt8Error::Boundary); }
         let layer = binding.weights();
-        encode_norms(hidden, layer.norm1, self.activations, self.control)?;
+        encode_norms(hidden, layer.norm1, self.activations, &mut self.workspace.normalized, self.control)?;
         let index = binding.layer_index();
         let mut query = self.project(index, Int8ProjectionKind::Query, layer.q)?;
         let mut key = self.project(index, Int8ProjectionKind::Key, layer.k)?;
         let value = self.project(index, Int8ProjectionKind::Value, layer.v)?;
         attend_rows(&mut query, &mut key, &value, self.rows, self.start,
-            binding.kv_slot(), self.rope, self.cache, self.control)?;
+            binding.kv_slot(), self.rope, self.cache, &mut self.workspace.attention, self.control)?;
         drop(key); drop(value);
         for (input, row) in self.activations.iter_mut().zip(query.chunks_exact(Q)) { input.encode_bf16(row)?; }
         let update = self.project(index, Int8ProjectionKind::AttentionOutput, layer.o)?;
         for (row, update) in hidden.iter_mut().zip(update.chunks_exact(H)) {
             poll(self.control)?;
-            *row = residual_add_f32_cast_back(row, update).map_err(|_| StrictInt8Error::Primitive)?;
+            residual_add_f32_cast_back_in_place(row, update).map_err(|_| StrictInt8Error::Primitive)?;
             finite(row)?;
         }
         drop(query); drop(update);
-        encode_norms(hidden, layer.norm2, self.activations, self.control)?;
-        let gate = self.project(index, Int8ProjectionKind::Gate, layer.gate)?;
+        encode_norms(hidden, layer.norm2, self.activations, &mut self.workspace.normalized, self.control)?;
+        let mut gate = self.project(index, Int8ProjectionKind::Gate, layer.gate)?;
         let up = self.project(index, Int8ProjectionKind::Up, layer.up)?;
-        for ((input, gate), up) in self.activations.iter_mut().zip(gate.chunks_exact(I)).zip(up.chunks_exact(I)) {
+        for ((input, gate), up) in self.activations.iter_mut().zip(gate.chunks_exact_mut(I)).zip(up.chunks_exact(I)) {
             poll(self.control)?;
-            let product = swiglu_f32_cast_back(gate, up).map_err(|_| StrictInt8Error::Primitive)?;
-            input.encode_bf16(&product)?;
+            swiglu_f32_cast_back_in_place(gate, up).map_err(|_| StrictInt8Error::Primitive)?;
+            input.encode_bf16(gate)?;
         }
         drop(gate); drop(up);
         let update = self.project(index, Int8ProjectionKind::Down, layer.down)?;
         for (row, update) in hidden.iter_mut().zip(update.chunks_exact(H)) {
             poll(self.control)?;
-            *row = residual_add_f32_cast_back(row, update).map_err(|_| StrictInt8Error::Primitive)?;
+            residual_add_f32_cast_back_in_place(row, update).map_err(|_| StrictInt8Error::Primitive)?;
             finite(row)?;
         }
         self.completed += 1; Ok(())
@@ -159,15 +163,21 @@ impl<'w, C: DecodeStepControl> GroupLayerExecutor<Int8Layer<'w>> for PrefillExec
         if self.norms >= 2 || self.completed != (self.norms + 1) * PHYSICAL_LAYER_COUNT || hidden.len() != self.rows {
             return Err(StrictInt8Error::Boundary);
         }
-        for row in hidden { poll(self.control)?; *row = norm(row, self.final_norm)?; }
+        for row in hidden {
+            poll(self.control)?;
+            norm_into(row, self.final_norm, &mut self.workspace.normalized)?;
+            row.copy_from_slice(&self.workspace.normalized);
+        }
         self.norms += 1; Ok(())
     }
 }
 fn encode_norms<C: DecodeStepControl>(hidden: &[Vec<Bf16>], scale: &[Bf16],
-    activations: &mut [ActivationBuffer], control: &mut C) -> Result<(), StrictInt8Error> {
+    activations: &mut [ActivationBuffer], normalized: &mut [Bf16], control: &mut C) -> Result<(), StrictInt8Error> {
     if hidden.len() != activations.len() { return Err(StrictInt8Error::Boundary); }
     for (row, activation) in hidden.iter().zip(activations) {
-        poll(control)?; activation.encode_bf16(&norm(row, scale)?)?;
+        poll(control)?;
+        norm_into(row, scale, normalized)?;
+        activation.encode_bf16(normalized)?;
     }
     Ok(())
 }
@@ -187,11 +197,15 @@ impl<C: DecodeStepControl> PrefillExecutor<'_, '_, C> {
 /// attention output after its matching K/V has been appended.
 #[allow(clippy::too_many_arguments)]
 fn attend_rows<C: DecodeStepControl>(query: &mut [Bf16], key: &mut [Bf16], value: &[Bf16],
-    rows: usize, start: usize, slot: usize, rope: &RopeTablesF32, cache: &mut KvCache, control: &mut C)
-    -> Result<(), StrictInt8Error> {
+    rows: usize, start: usize, slot: usize, rope: &RopeTablesF32, cache: &mut KvCache,
+    attention: &mut [f32], control: &mut C) -> Result<(), StrictInt8Error> {
     if rows == 0 || rows > MAX_BATCH_ROWS || query.len() != rows * Q || key.len() != rows * K || value.len() != rows * K
         || start.checked_add(rows).is_none_or(|end| end > cache.capacity_positions()) {
         return Err(StrictInt8Error::Input);
+    }
+    let end = start + rows; // checked against cache capacity above
+    if attention.len() < end {
+        return Err(AttentionError::ScratchTooSmall { required: end, actual: attention.len() }.into());
     }
     if cache.len_for_slot(slot).map_err(|_| StrictInt8Error::Cache)? != start { return Err(StrictInt8Error::Cache); }
     for index in 0..rows {
@@ -205,7 +219,7 @@ fn attend_rows<C: DecodeStepControl>(query: &mut [Bf16], key: &mut [Bf16], value
         finite(q)?; finite(k)?; finite(v)?;
         cache.append_bf16(slot, position, k, v).map_err(|_| StrictInt8Error::Cache)?;
         poll(control)?;
-        eager_gqa_attention_in_place_with_control(q, cache, slot, control)?;
+        eager_gqa_attention_in_place_prefix_with_scratch(q, cache, slot, position + 1, attention, control)?;
         finite(q)?;
     }
     poll(control)?; Ok(())
@@ -251,7 +265,12 @@ mod tests {
         let mut key: Vec<_> = (0..rows * K).map(|i| Bf16::from_f32(((i * 7) % 13) as f32 * 0.0625)).collect();
         let values: Vec<_> = [1.0, 3.0, 9.0].into_iter().flat_map(|x| vec![Bf16::from_f32(x); K]).collect();
         let original_query = query.clone(); let original_key = key.clone();
-        attend_rows(&mut query, &mut key, &values, rows, start, slot, &rope, &mut grouped, &mut Control::default()).unwrap();
+        let mut scratch = vec![f32::from_bits(0x7fc0_1234); capacity + 7];
+        let pointer = scratch.as_ptr();
+        attend_rows(&mut query, &mut key, &values, rows, start, slot, &rope, &mut grouped,
+            &mut scratch, &mut Control::default()).unwrap();
+        assert_eq!(scratch.as_ptr(), pointer);
+        assert!(scratch[capacity..].iter().all(|value| value.to_bits() == 0x7fc0_1234));
         let output = query;
         let mut reference = Vec::new();
         for i in 0..rows {
@@ -271,15 +290,16 @@ mod tests {
     }
     #[test] fn batched_prompt_attention_never_sees_future_tokens() { attention_case(0, 0); }
     #[test] fn existing_prefix_and_second_loop_keep_exact_causal_coordinates() { attention_case(2, 22); }
+    #[test] fn retained_prompt_scratch_crosses_attention_checkpoint_blocks() { attention_case(32, 43); }
     #[test] fn malformed_attention_geometry_does_not_append_any_cache_row() {
         let mut cache = KvCache::try_with_capacity(2).unwrap(); let rope = RopeTablesF32::nanbeige(2).unwrap();
-        assert!(attend_rows(&mut [Bf16::from_bits(0)], &mut [], &[], 1, 0, 0, &rope, &mut cache, &mut Control::default()).is_err());
+        assert!(attend_rows(&mut [Bf16::from_bits(0)], &mut [], &[], 1, 0, 0, &rope, &mut cache, &mut [0.0; 2], &mut Control::default()).is_err());
         assert!(cache.all_slots_have_len(0));
     }
     #[test] fn cancellation_before_a_row_cannot_append_its_kv() {
         let mut cache = KvCache::try_with_capacity(2).unwrap(); let rope = RopeTablesF32::nanbeige(2).unwrap();
         let mut q = vec![Bf16::from_bits(0); Q]; let mut k = vec![Bf16::from_bits(0); K]; let v = k.clone();
-        assert!(matches!(attend_rows(&mut q, &mut k, &v, 1, 0, 0, &rope, &mut cache,
+        assert!(matches!(attend_rows(&mut q, &mut k, &v, 1, 0, 0, &rope, &mut cache, &mut [0.0; 2],
             &mut Control { polls: 0, cancel: Some(1) }), Err(StrictInt8Error::Cancelled(DecodeCancellationKind::User))));
         assert!(cache.all_slots_have_len(0));
     }
@@ -300,7 +320,7 @@ mod tests {
         let mut key = vec![Bf16::from_bits(0); 2 * K];
         let value = vec![Bf16::from_f32(3.0); 2 * K];
         let error = attend_rows(&mut query, &mut key, &value, 2, 0, 22, &rope,
-            &mut cache, &mut DeadlineControl { polls: 0 }).unwrap_err();
+            &mut cache, &mut [0.0; 2], &mut DeadlineControl { polls: 0 }).unwrap_err();
         assert_eq!(error, StrictInt8Error::Cancelled(DecodeCancellationKind::Deadline));
         assert_eq!(cache.len_for_slot(22).unwrap(), 1);
         let mut state = RunState { active: true, poisoned: true };
@@ -309,6 +329,78 @@ mod tests {
         assert!(state.poisoned);
         assert!(state.open().is_err());
     }
+    #[test]
+    fn insufficient_prompt_scratch_refuses_before_any_row_or_cache_mutation() {
+        let mut cache = KvCache::try_with_capacity(2).unwrap();
+        let rope = RopeTablesF32::nanbeige(2).unwrap();
+        let mut query = vec![Bf16::from_f32(0.5); 2 * Q];
+        let mut key = vec![Bf16::from_f32(0.25); 2 * K]; let value = key.clone();
+        let before_query = query.clone(); let before_key = key.clone();
+        let mut scratch = [123.0]; let mut control = Control::default();
+        assert_eq!(attend_rows(&mut query, &mut key, &value, 2, 0, 0, &rope,
+            &mut cache, &mut scratch, &mut control), Err(StrictInt8Error::Attention));
+        assert_eq!(query, before_query); assert_eq!(key, before_key);
+        assert_eq!(scratch, [123.0]); assert_eq!(control.polls, 0);
+        assert!(cache.all_slots_have_len(0));
+    }
+
+    #[test]
+    fn prompt_norm_rows_reuse_storage_and_preserve_encoded_activations() {
+        let scale: Vec<_> = (0..H).map(|i| Bf16::from_f32(0.5 + (i % 7) as f32 * 0.125)).collect();
+        let mut hidden: Vec<Vec<_>> = (0..3).map(|row| (0..H).map(|i|
+            Bf16::from_f32(((i * 11 + row * 17) % 63) as f32 * 0.0625 - 1.5)).collect()).collect();
+        let mut activations: Vec<_> = (0..3).map(|_| ActivationBuffer::try_new(I).unwrap()).collect();
+        let mut workspace = DecoderWorkspace::try_new(1).unwrap();
+        let pointer = workspace.normalized.as_ptr(); let mut control = Control::default();
+        for round in 0..2 {
+            workspace.normalized.fill(Bf16::from_bits(0x7fc1));
+            encode_norms(&hidden, &scale, &mut activations, &mut workspace.normalized, &mut control).unwrap();
+            for (row, actual) in hidden.iter().zip(&activations) {
+                let mut expected = ActivationBuffer::try_new(I).unwrap();
+                expected.encode_bf16(&norm(row, &scale).unwrap()).unwrap();
+                assert_eq!(actual.values().unwrap(), expected.values().unwrap());
+                assert_eq!(actual.scale().unwrap().to_bits(), expected.scale().unwrap().to_bits());
+            }
+            assert_eq!(workspace.normalized.as_ptr(), pointer);
+            assert_eq!(control.polls, (round + 1) * hidden.len());
+            hidden.reverse();
+        }
+        let mut stopped: Vec<_> = (0..3).map(|_| ActivationBuffer::try_new(I).unwrap()).collect();
+        let mut control = Control { polls: 0, cancel: Some(2) };
+        assert_eq!(encode_norms(&hidden, &scale, &mut stopped, &mut workspace.normalized, &mut control),
+            Err(StrictInt8Error::Cancelled(DecodeCancellationKind::User)));
+        assert!(stopped[0].values().is_ok()); assert!(stopped[1].values().is_err());
+        assert!(stopped[2].values().is_err()); assert_eq!(control.polls, 2);
+    }
+
+    #[test]
+    fn both_prompt_loop_norms_keep_each_hidden_row_in_its_own_allocation() {
+        let scale = vec![Bf16::from_f32(1.125); H];
+        let mut hidden: Vec<Vec<_>> = (0..3).map(|row| (0..H).map(|i|
+            Bf16::from_f32(((i + row * 7) % 31) as f32 * 0.125 - 1.0)).collect()).collect();
+        let pointers: Vec<_> = hidden.iter().map(|row| row.as_ptr()).collect();
+        let mut expected = hidden.clone(); let rope = RopeTablesF32::nanbeige(1).unwrap();
+        let mut cache = KvCache::try_with_capacity(1).unwrap();
+        let mut activations: Vec<_> = (0..3).map(|_| ActivationBuffer::try_new(I).unwrap()).collect();
+        let mut workspace = DecoderWorkspace::try_new(1).unwrap();
+        let mut ledger = ProjectionLedger::new(ProjectionWork::default());
+        let mut control = Control::default(); let mut projection = None;
+        let mut executor = PrefillExecutor { final_norm: &scale, rope: &rope, cache: &mut cache,
+            activations: &mut activations, workspace: &mut workspace, ledger: &mut ledger,
+            control: &mut control, projection: &mut projection, start: 0, rows: 3,
+            completed: PHYSICAL_LAYER_COUNT, norms: 0 };
+        for pass in 1..=2 {
+            for row in &mut expected { *row = norm(row, &scale).unwrap(); }
+            executor.completed = pass * PHYSICAL_LAYER_COUNT;
+            executor.workspace.normalized.fill(Bf16::from_bits(0x7fc1));
+            executor.final_norm_group(&mut hidden).unwrap();
+            assert_eq!(hidden, expected);
+            assert_eq!(hidden.iter().map(|row| row.as_ptr()).collect::<Vec<_>>(), pointers);
+        }
+        assert_eq!(executor.final_norm_group(&mut hidden), Err(StrictInt8Error::Boundary));
+        assert_eq!(executor.control.polls, 6);
+    }
+
     #[test] fn invalid_prompt_tokens_are_rejected_as_one_complete_input() {
         assert!(check_tokens(&[]).is_err()); assert!(check_tokens(&[0, V as u32]).is_err());
         assert!(check_tokens(&[0, V as u32 - 1]).is_ok());

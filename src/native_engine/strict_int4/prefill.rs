@@ -4,8 +4,11 @@
 //! ONE token's K/V before attending to precisely that prefix. Both loop passes
 //! and post-pass norms use LoopRunner; no cache is prefilled with future rows.
 //! Limits declare additional workspace, not a host memory permit or speed claim.
+//! Per-row norms and attention reuse the engine's admitted rails; batch
+//! projection outputs retain their separately admitted workspace.
 use super::*;
-use crate::native_engine::{layer::NANBEIGE_Q_PROJECTION_SIZE as Q,
+use crate::native_engine::{attention::eager_gqa_attention_in_place_prefix_with_scratch,
+    layer::NANBEIGE_Q_PROJECTION_SIZE as Q,
     looprun::GroupLayerExecutor, portable_int8::int4::batch::MAX_INT4_BATCH_ROWS};
 
 pub const INT4_LAYER_MAJOR_PREFILL_VERSION: &str = "grouped-int4-layer-major-causal-prefill-v1";
@@ -71,7 +74,7 @@ impl<C: DecodeStepControl> Int4Session<'_, '_, C> {
             let mut executor = PrefillExecutor {
                 final_norm: &self.engine.weights.final_norm, rope: &self.engine.rope,
                 cache: &mut self.engine.cache, activations: &mut activations[..chunk.len()],
-                unpack: &mut self.engine.unpack, kernel: self.engine.kernel,
+                workspace: &mut self.engine.workspace, unpack: &mut self.engine.unpack, kernel: self.engine.kernel,
                 projection: self.engine.projection.get_mut().map_err(|_| StrictInt4Error::ProjectionExecutor)?,
                 ledger: &mut self.ledger, control: &mut *self.control,
                 start, rows: chunk.len(), completed: 0, norms: 0,
@@ -105,7 +108,8 @@ fn check_tokens(tokens: &[u32]) -> Result<(), StrictInt4Error> {
 
 struct PrefillExecutor<'a, 'executor, C> {
     final_norm: &'a [Bf16], rope: &'a RopeTablesF32, cache: &'a mut KvCache,
-    activations: &'a mut [ActivationBuffer], unpack: &'a mut [i8], kernel: PackedInt4Kernel,
+    activations: &'a mut [ActivationBuffer], workspace: &'a mut DecoderWorkspace,
+    unpack: &'a mut [i8], kernel: PackedInt4Kernel,
     projection: &'a mut Option<&'executor mut (dyn Int4ProjectionExecutor + 'executor)>,
     ledger: &'a mut ProjectionLedger, control: &'a mut C,
     start: usize, rows: usize, completed: usize, norms: usize,
@@ -120,34 +124,34 @@ impl<C: DecodeStepControl> GroupLayerExecutor<Int4Layer> for PrefillExecutor<'_,
             || hidden.iter().any(|row| row.len() != H) { return Err(StrictInt4Error::Boundary); }
         let layer = binding.weights();
         let projection = |kind| Int4ProjectionOp::Layer { layer: binding.layer_index(), kind };
-        encode_norms(hidden, &layer.norm1, self.activations, self.control)?;
+        encode_norms(hidden, &layer.norm1, self.activations, &mut self.workspace.normalized, self.control)?;
         let mut query = self.project(projection(Int4ProjectionKind::Query), &layer.q)?;
         let mut key = self.project(projection(Int4ProjectionKind::Key), &layer.k)?;
         let value = self.project(projection(Int4ProjectionKind::Value), &layer.v)?;
         attend_rows(&mut query, &mut key, &value, self.rows, self.start,
-            binding.kv_slot(), self.rope, self.cache, self.control)?;
+            binding.kv_slot(), self.rope, self.cache, &mut self.workspace.attention, self.control)?;
         drop(key); drop(value);
         for (input, row) in self.activations.iter_mut().zip(query.chunks_exact(Q)) { input.encode_bf16(row)?; }
         let update = self.project(projection(Int4ProjectionKind::AttentionOutput), &layer.o)?;
         for (row, update) in hidden.iter_mut().zip(update.chunks_exact(H)) {
             poll(self.control)?;
-            *row = residual_add_f32_cast_back(row, update).map_err(|_| StrictInt4Error::Primitive)?;
+            residual_add_f32_cast_back_in_place(row, update).map_err(|_| StrictInt4Error::Primitive)?;
             finite(row)?;
         }
         drop(query); drop(update);
-        encode_norms(hidden, &layer.norm2, self.activations, self.control)?;
-        let gate = self.project(projection(Int4ProjectionKind::Gate), &layer.gate)?;
+        encode_norms(hidden, &layer.norm2, self.activations, &mut self.workspace.normalized, self.control)?;
+        let mut gate = self.project(projection(Int4ProjectionKind::Gate), &layer.gate)?;
         let up = self.project(projection(Int4ProjectionKind::Up), &layer.up)?;
-        for ((input, gate), up) in self.activations.iter_mut().zip(gate.chunks_exact(I)).zip(up.chunks_exact(I)) {
+        for ((input, gate), up) in self.activations.iter_mut().zip(gate.chunks_exact_mut(I)).zip(up.chunks_exact(I)) {
             poll(self.control)?;
-            let product = swiglu_f32_cast_back(gate, up).map_err(|_| StrictInt4Error::Primitive)?;
-            input.encode_bf16(&product)?;
+            swiglu_f32_cast_back_in_place(gate, up).map_err(|_| StrictInt4Error::Primitive)?;
+            input.encode_bf16(gate)?;
         }
         drop(gate); drop(up);
         let update = self.project(projection(Int4ProjectionKind::Down), &layer.down)?;
         for (row, update) in hidden.iter_mut().zip(update.chunks_exact(H)) {
             poll(self.control)?;
-            *row = residual_add_f32_cast_back(row, update).map_err(|_| StrictInt4Error::Primitive)?;
+            residual_add_f32_cast_back_in_place(row, update).map_err(|_| StrictInt4Error::Primitive)?;
             finite(row)?;
         }
         self.completed += 1; Ok(())
@@ -156,7 +160,11 @@ impl<C: DecodeStepControl> GroupLayerExecutor<Int4Layer> for PrefillExecutor<'_,
         if self.norms >= 2 || self.completed != (self.norms + 1) * PHYSICAL_LAYER_COUNT || hidden.len() != self.rows {
             return Err(StrictInt4Error::Boundary);
         }
-        for row in hidden { poll(self.control)?; *row = norm(row, self.final_norm)?; }
+        for row in hidden {
+            poll(self.control)?;
+            norm_into(row, self.final_norm, &mut self.workspace.normalized)?;
+            row.copy_from_slice(&self.workspace.normalized);
+        }
         self.norms += 1; Ok(())
     }
 }
@@ -170,10 +178,12 @@ impl<C: DecodeStepControl> PrefillExecutor<'_, '_, C> {
     }
 }
 fn encode_norms<C: DecodeStepControl>(hidden: &[Vec<Bf16>], scale: &[Bf16],
-    activations: &mut [ActivationBuffer], control: &mut C) -> Result<(), StrictInt4Error> {
+    activations: &mut [ActivationBuffer], normalized: &mut [Bf16], control: &mut C) -> Result<(), StrictInt4Error> {
     if hidden.len() != activations.len() { return Err(StrictInt4Error::Boundary); }
     for (row, activation) in hidden.iter().zip(activations) {
-        poll(control)?; activation.encode_bf16(&norm(row, scale)?)?;
+        poll(control)?;
+        norm_into(row, scale, normalized)?;
+        activation.encode_bf16(normalized)?;
     }
     Ok(())
 }
@@ -181,11 +191,15 @@ fn encode_norms<C: DecodeStepControl>(hidden: &[Vec<Bf16>], scale: &[Bf16],
 /// The causal seam is fixture-tested against the existing single-row primitive.
 #[allow(clippy::too_many_arguments)]
 fn attend_rows<C: DecodeStepControl>(query: &mut [Bf16], key: &mut [Bf16], value: &[Bf16],
-    rows: usize, start: usize, slot: usize, rope: &RopeTablesF32, cache: &mut KvCache, control: &mut C)
-    -> Result<(), StrictInt4Error> {
+    rows: usize, start: usize, slot: usize, rope: &RopeTablesF32, cache: &mut KvCache,
+    attention: &mut [f32], control: &mut C) -> Result<(), StrictInt4Error> {
     if rows == 0 || rows > MAX_INT4_BATCH_ROWS || query.len() != rows * Q || key.len() != rows * K || value.len() != rows * K
         || start.checked_add(rows).is_none_or(|end| end > cache.capacity_positions()) {
         return Err(StrictInt4Error::Input);
+    }
+    let end = start + rows; // checked against cache capacity above
+    if attention.len() < end {
+        return Err(AttentionError::ScratchTooSmall { required: end, actual: attention.len() }.into());
     }
     if cache.len_for_slot(slot).map_err(|_| StrictInt4Error::Cache)? != start { return Err(StrictInt4Error::Cache); }
     for index in 0..rows {
@@ -199,7 +213,7 @@ fn attend_rows<C: DecodeStepControl>(query: &mut [Bf16], key: &mut [Bf16], value
         finite(q)?; finite(k)?; finite(v)?;
         cache.append_bf16(slot, position, k, v).map_err(|_| StrictInt4Error::Cache)?;
         poll(control)?;
-        eager_gqa_attention_in_place_with_control(q, cache, slot, control)?;
+        eager_gqa_attention_in_place_prefix_with_scratch(q, cache, slot, position + 1, attention, control)?;
         finite(q)?;
     }
     poll(control)?; Ok(())

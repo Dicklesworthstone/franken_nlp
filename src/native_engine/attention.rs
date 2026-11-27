@@ -391,6 +391,21 @@ pub(crate) fn eager_gqa_attention_in_place_with_scratch<C: DecodeStepControl + ?
     control: &mut C,
 ) -> Result<(), AttentionError> {
     let sequence_len = cache.len_for_slot(slot)?;
+    eager_gqa_attention_in_place_prefix_with_scratch(
+        query, cache, slot, sequence_len, scratch, control,
+    )
+}
+
+/// Reuse admitted scratch for an explicit causal prefix, even when the slot
+/// contains later K/V rows. No stale scratch or future cache row is read.
+pub(crate) fn eager_gqa_attention_in_place_prefix_with_scratch<C: DecodeStepControl + ?Sized>(
+    query: &mut [Bf16],
+    cache: &KvCache,
+    slot: usize,
+    sequence_len: usize,
+    scratch: &mut [f32],
+    control: &mut C,
+) -> Result<(), AttentionError> {
     validate_eager_prefix(query.len(), cache, slot, sequence_len)?;
     if scratch.len() < sequence_len {
         return Err(AttentionError::ScratchTooSmall { required: sequence_len, actual: scratch.len() });
@@ -751,6 +766,40 @@ mod tests {
             assert_eq!(scratch.as_ptr(), pointer);
             assert!(scratch[positions..].iter().all(|value| value.to_bits() == 0x7fc0_1234));
         }
+    }
+
+    #[test]
+    fn retained_scratch_obeys_explicit_prefix_with_future_kv_already_resident() {
+        let (query, cache) = controlled_case(65, 43);
+        let mut scratch = vec![f32::NAN; 70];
+        let pointer = scratch.as_ptr();
+        for prefix in [33, 1, 65, 2, 32, 64] {
+            let expected = eager_gqa_attention_from_cache_prefix(&query, &cache, 43, prefix).unwrap();
+            let mut reference = Control::uninterrupted();
+            eager_gqa_attention_from_cache_prefix_with_control(
+                &query, &cache, 43, prefix, &mut reference,
+            ).unwrap();
+            let mut actual = query.clone();
+            scratch[prefix..].fill(f32::from_bits(0x7fc0_1234));
+            let mut control = Control::uninterrupted();
+            eager_gqa_attention_in_place_prefix_with_scratch(
+                &mut actual, &cache, 43, prefix, &mut scratch, &mut control,
+            ).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(control.polls, reference.polls);
+            assert_eq!(scratch.as_ptr(), pointer);
+            assert!(scratch[prefix..].iter().all(|value| value.to_bits() == 0x7fc0_1234));
+        }
+        let mut actual = query.clone();
+        let before = scratch.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+        let mut control = Control::uninterrupted();
+        for prefix in [0, 66] {
+            assert!(eager_gqa_attention_in_place_prefix_with_scratch(
+                &mut actual, &cache, 43, prefix, &mut scratch, &mut control,
+            ).is_err());
+        }
+        assert_eq!(actual, query); assert_eq!(control.polls, 0);
+        assert_eq!(scratch.iter().map(|value| value.to_bits()).collect::<Vec<_>>(), before);
     }
 
     #[test]
