@@ -257,7 +257,10 @@ impl CompiledSchema {
 
     /// Emit one canonical valid instance without loading model weights.
     pub fn sample_json(&self) -> Result<String, SchemaError> {
-        let output = sample_node(&self.root, "$")?;
+        // Preflight already reserved the shortest spelling of every required
+        // value. Spend only the surplus on traditional sample choices.
+        let mut extra = self.limits.max_output_bytes - self.estimate.minimum_output_bytes;
+        let output = sample_node(&self.root, "$", &mut extra)?;
         if output.len() > self.limits.max_output_bytes {
             return Err(SchemaError::Resource {
                 pointer: "$".to_owned(),
@@ -715,7 +718,13 @@ fn estimate_node(
     pointer: &str,
     limits: CompileLimits,
 ) -> Result<AutomatonEstimate, SchemaError> {
-    let mut raw = RawEstimate::default();
+    // build_automaton adds a shared accepting state and a final root
+    // transition in addition to the graph produced by build_node.
+    let mut raw = RawEstimate {
+        states: 1,
+        transitions: 1,
+        ..RawEstimate::default()
+    };
     let minimum_output_bytes = estimate_node_inner(node, pointer, &mut raw)?;
     let mask_cache_bytes = raw
         .states
@@ -1128,13 +1137,24 @@ fn validate_allowed(
     Ok(())
 }
 
-fn sample_node(node: &SchemaNode, pointer: &str) -> Result<String, SchemaError> {
+fn sample_node(node: &SchemaNode, pointer: &str, extra: &mut usize) -> Result<String, SchemaError> {
     if let Some(allowed) = node.allowed() {
         let value = allowed.first().ok_or_else(|| SchemaError::InvalidSchema {
             pointer: pointer.to_owned(),
             reason: "empty enum has no sample".to_owned(),
         })?;
-        return Ok(value.canonical_json());
+        let preferred = value.canonical_json();
+        let shortest = allowed.iter().skip(1).map(ScalarValue::canonical_json)
+            .filter(|candidate| candidate.len() < preferred.len())
+            .min_by_key(String::len);
+        if let Some(shortest) = shortest {
+            let cost = preferred.len() - shortest.len();
+            if cost > *extra {
+                return Ok(shortest);
+            }
+            *extra -= cost;
+        }
+        return Ok(preferred);
     }
     match node {
         SchemaNode::Object {
@@ -1154,7 +1174,7 @@ fn sample_node(node: &SchemaNode, pointer: &str) -> Result<String, SchemaError> 
                     })?;
                 output.push_str(&escape_json_string(name));
                 output.push(':');
-                output.push_str(&sample_node(child, &pointer_key(pointer, name))?);
+                output.push_str(&sample_node(child, &pointer_key(pointer, name), extra)?);
             }
             output.push('}');
             Ok(output)
@@ -1162,7 +1182,11 @@ fn sample_node(node: &SchemaNode, pointer: &str) -> Result<String, SchemaError> 
         SchemaNode::Array { .. } => Ok("[]".to_owned()),
         SchemaNode::String { .. } => Ok("\"\"".to_owned()),
         SchemaNode::Number { .. } => Ok("0".to_owned()),
-        SchemaNode::Boolean { .. } => Ok("false".to_owned()),
+        SchemaNode::Boolean { .. } if *extra > 0 => {
+            *extra -= 1;
+            Ok("false".to_owned())
+        }
+        SchemaNode::Boolean { .. } => Ok("true".to_owned()),
         SchemaNode::Null { .. } => Ok("null".to_owned()),
     }
 }

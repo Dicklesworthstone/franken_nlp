@@ -261,3 +261,36 @@ fn source_bound_schema_commands_compile_and_sample_the_document_language() {
     assert_eq!(oversized.status.code(), Some(9));
     assert!(oversized.stdout.is_empty());
 }
+
+#[test]
+fn schema_sampling_reserves_the_minimum_for_every_required_sibling() {
+    let schema = r#"{"type":"object","additionalProperties":false,"required":["a","b","c"],"properties":{"a":{"type":"boolean"},"b":{"type":"string","enum":["aaaa","z"]},"c":{"type":"boolean","enum":[false,true]}}}"#;
+    let minimum = r#"{"a":true,"b":"z","c":true}"#;
+    let preferred = r#"{"a":false,"b":"aaaa","c":false}"#;
+    for cap in minimum.len()..=preferred.len() {
+        let limits = CompileLimits { max_output_bytes: cap, ..CompileLimits::default() };
+        let compiled = compile_json_schema(schema, limits).unwrap();
+        assert_eq!(compiled.estimate().minimum_output_bytes, minimum.len());
+        let sample = compiled.sample_json().unwrap();
+        assert!(sample.len() <= cap);
+        compiled.validate_json(&sample).unwrap();
+        if cap == minimum.len() { assert_eq!(sample, minimum); }
+        if cap == preferred.len() { assert_eq!(sample, preferred); }
+    }
+}
+
+#[test]
+fn resource_caps_include_the_shared_accept_state_and_root_transition() {
+    let schema = r#"{"type":"string"}"#;
+    let compiled = compile(schema);
+    let estimate = compiled.estimate();
+    assert_eq!(estimate.state_count, compiled.automaton().state_count());
+    assert_eq!(estimate.transition_count, compiled.automaton().transition_count());
+    for limits in [
+        CompileLimits { max_states: estimate.state_count - 1, ..CompileLimits::default() },
+        CompileLimits { max_transitions: estimate.transition_count - 1, ..CompileLimits::default() },
+        CompileLimits { max_mask_bytes: estimate.mask_cache_bytes - 1, ..CompileLimits::default() },
+    ] {
+        assert!(matches!(compile_json_schema(schema, limits), Err(SchemaError::Resource { .. })));
+    }
+}
