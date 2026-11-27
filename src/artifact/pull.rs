@@ -489,16 +489,18 @@ fn reconstruct_local_release_inner(
         });
     }
     let mut buffer = vec![0_u8; COPY_CHUNK_BYTES];
-    if resumed_bytes != 0 {
+    let prefix = if resumed_bytes == 0 {
+        VerifiedPrefix { bytes: 0, partial: None }
+    } else {
         verify_retained_prefix(
             &mut staging, &manifest, prefix_source, resumed_bytes, &mut buffer, progress, checkpoint,
-        )?;
-    }
+        )?
+    };
     check_staging_path(&staging, &request.staging_output, resumed_bytes)?;
     progress.phase = LocalReconstructPhase::Copy;
     progress.part_index = None;
     copy_remaining_parts(
-        &mut staging, &manifest, &request.parts_dir, resumed_bytes, options,
+        &mut staging, &manifest, &request.parts_dir, prefix, options,
         progress, checkpoint,
     )?;
 
@@ -790,6 +792,13 @@ fn verify_part(
     Ok(())
 }
 
+// For a partial last part, keep the authenticated descriptor and SHA-256
+// state at the staging boundary. Copy can begin at the first missing byte.
+struct VerifiedPrefix {
+    bytes: u64,
+    partial: Option<(File, Sha256)>,
+}
+
 fn verify_retained_prefix(
     staging: &mut File,
     manifest: &ReleaseManifest,
@@ -798,12 +807,13 @@ fn verify_retained_prefix(
     buffer: &mut [u8],
     progress: &mut LocalReconstructProgress,
     checkpoint: &mut impl FnMut(LocalReconstructProgress) -> Option<DecodeCancellationKind>,
-) -> Result<(), PullError> {
+) -> Result<VerifiedPrefix, PullError> {
     staging.seek(SeekFrom::Start(0)).map_err(|error| PullError::Publish {
         operation: "seek retained staging prefix", detail: error.to_string(),
     })?;
     let mut retained = vec![0_u8; buffer.len()];
     let mut part_start = 0_u64;
+    let mut partial = None;
     for (index, part) in manifest.parts.iter().enumerate() {
         if part_start >= retained_bytes {
             break;
@@ -827,6 +837,7 @@ fn verify_retained_prefix(
         } else {
             let mut source = open_part(prefix_source.parts_dir(), index, part)?;
             let mut part_bytes = 0_u64;
+            let mut boundary_hash = None;
             let mut hasher = Sha256::new();
             loop {
                 reconstruction_checkpoint(*progress, checkpoint)?;
@@ -835,7 +846,6 @@ fn verify_retained_prefix(
                 if read == 0 {
                     break;
                 }
-                hasher.update(&buffer[..read]);
                 let compare = prefix_in_part.saturating_sub(before).min(read as u64) as usize;
                 if compare != 0 {
                     staging.read_exact(&mut retained[..compare]).map_err(|error| PullError::Publish {
@@ -848,9 +858,20 @@ fn verify_retained_prefix(
                             part: index, offset: part_start + before + mismatch as u64,
                         });
                     }
+                    hasher.update(&buffer[..compare]);
+                    if prefix_in_part < part.bytes && before + compare as u64 == prefix_in_part {
+                        boundary_hash = Some(hasher.clone());
+                    }
                 }
+                hasher.update(&buffer[compare..read]);
             }
             verify_part(index, part, part_bytes, hasher)?;
+            if let Some(boundary_hash) = boundary_hash {
+                source.seek(SeekFrom::Start(prefix_in_part)).map_err(|error| PullError::PartIo {
+                    part: index, operation: "seek verified part suffix", detail: error.to_string(),
+                })?;
+                partial = Some((source, boundary_hash));
+            }
         }
         progress.verified_prefix_bytes = part_start + prefix_in_part;
         reconstruction_checkpoint(*progress, checkpoint)?;
@@ -861,18 +882,19 @@ fn verify_retained_prefix(
     if progress.verified_prefix_bytes != retained_bytes {
         return Err(PullError::StagingChanged("retained prefix exceeds the verified part sequence"));
     }
-    Ok(())
+    Ok(VerifiedPrefix { bytes: retained_bytes, partial })
 }
 
 fn copy_remaining_parts(
     staging: &mut File,
     manifest: &ReleaseManifest,
     parts_dir: &Path,
-    retained_bytes: u64,
+    prefix: VerifiedPrefix,
     options: &LocalReconstructOptions,
     progress: &mut LocalReconstructProgress,
     checkpoint: &mut impl FnMut(LocalReconstructProgress) -> Option<DecodeCancellationKind>,
 ) -> Result<(), PullError> {
+    let VerifiedPrefix { bytes: retained_bytes, mut partial } = prefix;
     let mut buffer = vec![0_u8; COPY_CHUNK_BYTES];
     let mut part_start = 0_u64;
     for (index, part) in manifest.parts.iter().enumerate() {
@@ -885,25 +907,25 @@ fn copy_remaining_parts(
         }
         progress.part_index = Some(index);
         reconstruction_checkpoint(*progress, checkpoint)?;
-        let mut source = open_part(parts_dir, index, part)?;
-        let mut part_bytes = 0_u64;
-        let mut hasher = Sha256::new();
+        let mut part_bytes = retained_bytes.saturating_sub(part_start);
+        let (mut source, mut hasher) = if part_bytes == 0 {
+            (open_part(parts_dir, index, part)?, Sha256::new())
+        } else {
+            partial.take().ok_or(PullError::StagingChanged("missing verified part suffix"))?
+        };
         loop {
             reconstruction_checkpoint(*progress, checkpoint)?;
-            let before = part_bytes;
             let read = read_part_chunk(&mut source, &mut buffer, index, part, &mut part_bytes)?;
             if read == 0 {
                 break;
             }
             hasher.update(&buffer[..read]);
-            let skip = retained_bytes.saturating_sub(part_start + before).min(read as u64) as usize;
-            let available = read - skip;
             let allowed = options.max_new_bytes
-                .map_or(available as u64, |limit| limit.saturating_sub(progress.copied_bytes))
-                .min(available as u64) as usize;
+                .map_or(read as u64, |limit| limit.saturating_sub(progress.copied_bytes))
+                .min(read as u64) as usize;
             if allowed != 0 {
                 check_mutable_staging_file(staging)?;
-                staging.write_all(&buffer[skip..skip + allowed]).map_err(|error| PullError::Publish {
+                staging.write_all(&buffer[..allowed]).map_err(|error| PullError::Publish {
                     operation: "append staging output", detail: error.to_string(),
                 })?;
                 progress.copied_bytes = progress.copied_bytes.checked_add(allowed as u64)
@@ -912,7 +934,7 @@ fn copy_remaining_parts(
                     })?;
                 reconstruction_checkpoint(*progress, checkpoint)?;
             }
-            if allowed < available {
+            if allowed < read {
                 return Err(PullError::CopyBudgetExceeded {
                     limit: options.max_new_bytes.unwrap_or(0),
                     copied_bytes: progress.copied_bytes,
@@ -1219,20 +1241,28 @@ mod tests {
     #[test]
     fn scaled_multipart_resume_preserves_every_boundary_and_partial_part() {
         let (root, manifest, combined) = transfer_fixture();
-        for retained in [0, 1, 3, 4, 7, 8, 12] {
+        for retained in 0..=combined.len() {
             let path = root.join(format!("retained-{retained}.stage"));
             let mut stage = open_staging(&path, false).expect("create stage");
             stage.write_all(&combined[..retained]).expect("seed prefix");
             let mut progress = transfer_progress(combined.len() as u64);
             let mut buffer = [0_u8; 2];
-            verify_retained_prefix(
+            let mut prefix = verify_retained_prefix(
                 &mut stage, &manifest, PrefixSource::ReleaseParts(&root), retained as u64, &mut buffer,
                 &mut progress, &mut |_| None,
             ).expect("authenticate complete prefix");
             assert_eq!(progress.verified_prefix_bytes, retained as u64);
+            let start = [0, 3, 7, 12].into_iter().filter(|&n| n <= retained).max().unwrap();
+            if start == retained {
+                assert!(prefix.partial.is_none());
+            } else {
+                let (source, hash) = prefix.partial.as_mut().expect("carry the partial part");
+                assert_eq!(source.stream_position().unwrap(), (retained - start) as u64);
+                assert_eq!(hash.clone().finalize(), Sha256::digest(&combined[start..retained]));
+            }
             progress.phase = LocalReconstructPhase::Copy;
             copy_remaining_parts(
-                &mut stage, &manifest, &root, retained as u64,
+                &mut stage, &manifest, &root, prefix,
                 &LocalReconstructOptions::default(), &mut progress, &mut |_| None,
             ).expect("append exact suffix across parts");
             assert_eq!(progress.copied_bytes, (combined.len() - retained) as u64);
@@ -1251,12 +1281,12 @@ mod tests {
         stage.write_all(&combined[..2]).expect("seed prefix");
         let mut progress = transfer_progress(combined.len() as u64);
         let mut buffer = [0_u8; 2];
-        verify_retained_prefix(
+        let prefix = verify_retained_prefix(
             &mut stage, &manifest, PrefixSource::ReleaseParts(&root), 2, &mut buffer, &mut progress, &mut |_| None,
         ).expect("authenticate original prefix");
         progress.phase = LocalReconstructPhase::Copy;
         let error = copy_remaining_parts(
-            &mut stage, &manifest, &root, 2,
+            &mut stage, &manifest, &root, prefix,
             &LocalReconstructOptions { resume: true, max_new_bytes: Some(4) },
             &mut progress, &mut |_| None,
         ).expect_err("new-byte allowance ends in part one");
@@ -1265,11 +1295,11 @@ mod tests {
         }));
         assert_eq!(fs::read(&path).expect("read retained prefix"), combined[..6]);
         let mut resumed = transfer_progress(combined.len() as u64);
-        verify_retained_prefix(
+        let prefix = verify_retained_prefix(
             &mut stage, &manifest, PrefixSource::ReleaseParts(&root), 6, &mut buffer, &mut resumed, &mut |_| None,
         ).expect("rehash both retained parts");
         copy_remaining_parts(
-            &mut stage, &manifest, &root, 6, &LocalReconstructOptions::default(),
+            &mut stage, &manifest, &root, prefix, &LocalReconstructOptions::default(),
             &mut resumed, &mut |_| None,
         ).expect("finish remaining parts");
         assert_eq!(fs::read(&path).expect("read completed stage"), combined);
@@ -1286,11 +1316,11 @@ mod tests {
         source.seek(SeekFrom::End(-1)).expect("seek unseen source suffix");
         source.write_all(b"X").expect("mutate source suffix only");
         let mut progress = transfer_progress(combined.len() as u64);
-        let error = verify_retained_prefix(
+        let result = verify_retained_prefix(
             &mut stage, &manifest, PrefixSource::ReleaseParts(&root), 8, &mut [0_u8; 2],
             &mut progress, &mut |_| None,
-        ).expect_err("whole source part digest is required before any append");
-        assert!(matches!(error, PullError::PartDigest { part: 2, .. }));
+        );
+        assert!(matches!(result, Err(PullError::PartDigest { part: 2, .. })));
         assert_eq!(fs::read(path).expect("read untouched stage"), combined[..8]);
         assert_eq!(progress.copied_bytes, 0);
     }
@@ -1308,12 +1338,12 @@ mod tests {
             let mut stage = open_staging(&path, false).unwrap();
             stage.write_all(&combined[..retained]).unwrap();
             let mut progress = transfer_progress(combined.len() as u64);
-            verify_retained_prefix(
+            let prefix = verify_retained_prefix(
                 &mut stage, &manifest, PrefixSource::StagedCompleteParts(&suffix_dir), retained as u64, &mut [0; 2], &mut progress, &mut |_| None,
             ).unwrap();
             assert_eq!(progress.verified_prefix_bytes, retained as u64);
             copy_remaining_parts(
-                &mut stage, &manifest, &suffix_dir, retained as u64,
+                &mut stage, &manifest, &suffix_dir, prefix,
                 &LocalReconstructOptions::default(), &mut progress, &mut |_| None,
             ).unwrap();
             assert_eq!(fs::read(path).unwrap(), combined);
