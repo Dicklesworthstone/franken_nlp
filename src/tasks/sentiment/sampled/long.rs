@@ -9,9 +9,9 @@ use std::cell::RefCell;
 use crate::{tasks::mapreduce::{CHUNK_PROFILE, ChunkLimits, ChunkPlan, MapReduceError},
     validation::grounded_fields::VerifiedSourceSpan};
 
-mod binding;
+pub(crate) mod binding;
 mod execution;
-mod reduction;
+pub(crate) mod reduction;
 pub mod memory;
 pub use reduction::{SampledSentimentMapAggregate, SampledSentimentMapAggregateDimension,
     SampledSentimentMapReplicate, SAMPLED_SENTIMENT_MAP_AGGREGATION};

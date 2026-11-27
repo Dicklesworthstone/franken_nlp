@@ -160,3 +160,111 @@ containing rejected records or an interrupted run.
 Library callers use `NlpEngine::batch_int8_sampled_sentiment` with the
 model-bound planner, pinned vocabulary, `SampledSentimentCorpusConfig`,
 `CorpusLimits`, optional `Int8PrefillLimits` and owned input/output streams.
+
+## Complete-document sampled maps
+
+Use `fnlp candidate sentiment-sampled-map` when the complete source exceeds one
+context. It accepts the same strict `{document,axes?}` JSON request as the
+single-context command. It partitions the original source into contiguous,
+nonoverlapping chunks that each fit every requested axis prompt, then generates
+the complete independent sample bundle for every chunk.
+
+```sh
+fnlp candidate sentiment-sampled-map sentiment-request.json \
+  --model /path/to/local-current-candidate-int8-artifact \
+  --memory-mib 12288 \
+  --seed 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --samples 4 --max-chunks 64 \
+  --compute-threads 4 --prefill-rows 8
+```
+
+The memory value is an example declared cap. The command checks its complete
+memory quote and refuses an insufficient cap. Worker and prefill settings are
+optional; a serial document uses the same sample addressing and reduction
+recipe. One persistent numerical team can serve all chunks, axes and samples.
+
+Partitioning preserves original UTF-8 bytes, CRLF sequences and source offsets.
+The response retains every chunk's original byte and Unicode scalar spans,
+every score and explanation, the encoding policy and cumulative work. Equal
+chunk text at different source positions receives distinct sample addresses.
+Replaying the same model, document, seed and task policy preserves those
+addresses. This establishes reproducible draw addressing; executable numerical
+parity across schedules remains a separate model-present gate.
+
+### Document replicates and aggregates
+
+For each axis and sample ordinal, the reducer pairs that ordinal across all
+chunks and weights the chunk scores by their original Unicode scalar counts.
+It retains the checked exact integer numerator and complete source-scalar
+denominator for each document replicate, alongside the resulting score.
+Mean, median, minimum, maximum and population standard deviation summarize
+these complete document replicates.
+
+The reducer shares its recipe with the existing INT4 sampled document path.
+These statistics describe the sampled chunk-based procedure. They do not
+establish calibrated confidence or equivalence to asking the model about the
+entire document in one context. Every explanation remains attributable to its
+own source chunk.
+
+### Whole-document limits and completion
+
+The planner preflights every chunk, axis and sample before the first model
+forward. No successful document omits a source tail, failed chunk or incomplete
+sample. One end-to-end cooperative deadline covers input, model load, planning,
+execution, reduction and publication; blocking IO itself is not preempted.
+
+| Option | Document behavior |
+| --- | --- |
+| `--max-input-bytes` | Complete input envelope; defaults to 1 MiB |
+| `--max-chunks` | Maximum complete source partition; defaults to 64, maximum 256 |
+| `--max-chunk-bytes` | Optional additional source-byte ceiling for each chunk |
+| `--max-tokenizer-calls` | Shared source-sizing probes, including rejected candidates; defaults to 8,192 |
+| `--max-new-tokens` | Each sample, including scored terminal EOS |
+| `--max-result-bytes` | Complete sample bundle for one chunk |
+| `--max-retained-result-bytes` | Cumulative canonical bytes of all retained chunk bundles; defaults to 64 MiB |
+| `--max-map-result-bytes` | Complete map JSON, including chunks and aggregates; defaults to 16 MiB |
+| Native work and mask options listed above | One nonrenewable allowance across every chunk, axis and sample |
+| `--timeout-seconds`, `--max-checkpoints` | Shared complete-document deadline and cooperative control |
+
+Byte fallback remains the default. With explicit
+`--input-encoding safe-bpe-v1`, one complete-document tokenizer-work ledger
+covers accepted and rejected sizing probes and the final chunk plans. No
+tokenizer, native, mask or retained-output allowance renews at a chunk boundary.
+
+The CLI emits one completed response only after full result verification.
+Typed cancellation, work exhaustion, partition failure or invalid model output
+prevents complete-document success. A transport failure during final stdout
+publication can still leave partial bytes, so callers must check process status.
+
+### Complete-document library APIs
+
+`tasks::sentiment::sampled::quantized::long` defines
+`Int8SampledSentimentMapLimits`, `PreparedInt8SampledSentimentMap` and
+`Int8SampledSentimentMapRun`. Use
+`Int8SampledSentimentPlanner::plan_document_with_control` to seal a complete
+document plan. The explicit encoding-work and stable-item variants support
+callers that manage tokenizer work or document identities themselves.
+
+`PreparedInt8SampledSentimentMap::execute_scheduled_with_control` accepts the
+strict INT8 engine, pinned sample vocabulary, complete `Int8JsonBudget`, sampler
+allowance, optional `Int8PrefillLimits` and caller control. The result identifies
+the execution as `portable-int8-complete-sampled-sentiment-map-v1`.
+
+Hosted callers use `Int8SampledSentimentMapHostConfig` with:
+
+- `NlpEngine::map_int8_sampled_sentiment` for byte-preserving serial execution.
+- `NlpEngine::map_int8_sampled_sentiment_with_encoding` for an explicit encoding.
+- `NlpEngine::map_int8_sampled_sentiment_with_threads` for one persistent team.
+- `NlpEngine::map_int8_sampled_sentiment_with_encoding_and_threads` to combine
+  explicit encoding and a persistent team.
+
+The config's `requirements` and `requirements_with_encoding` methods provide
+pure memory quotes before model or source IO. Preparation, vocabulary, plans,
+KV, scratch and guarded output retain their charges through physical worker
+drain. Optional prefill workspace is charged once; the dispatcher separately
+charges the numerical workers.
+
+This new route has source-reviewed task, hosted and CLI regression definitions,
+including an explicitly armed real-model comparison gate. Compilation, executed
+regressions, numerical parity, quality and performance remain pending controller
+validation. The current command processes one complete document per invocation.

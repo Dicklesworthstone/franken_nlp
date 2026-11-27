@@ -2,6 +2,9 @@
 //! Every sample has fresh logical KV and its own addressed draws. Native,
 //! sampler, preparation and output ownership survive physical completion.
 
+mod long;
+pub use long::Int8SampledSentimentMapHostConfig;
+
 use super::*;
 use crate::{
     grammar::mask::MaskWorkLimits,

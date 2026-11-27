@@ -2149,6 +2149,22 @@ is not calibrated confidence, and explanations remain unverified. Compilation,
 executable regression, native-model and quality qualification are still pending
 under the controller gates.
 
+### Complete-document INT8 samples
+
+`fnlp candidate sentiment-sampled-map` extends sampled sentiment to a complete
+UTF-8 document. It losslessly partitions the source into context-sized chunks,
+plans every requested sample before the first model forward, and retains all
+chunk samples, explanations and original byte/scalar spans. Document replicates
+pair each sample ordinal across chunks and weight scores by original Unicode
+scalar count; the result includes exact weighted numerators and descriptive
+aggregates.
+
+The task, hosted and CLI paths share nonrenewable document work, tokenizer,
+mask and output limits. Explicit compact encoding, bounded prompt prefill and
+persistent INT8 workers compose with the same document plan. Failed chunks
+cannot produce a completed document. See the
+[complete-document usage and API guide](docs/native-sampled-sentiment-int8.md#complete-document-sampled-maps).
+
 ## Implemented candidate sampled sentiment
 
 `fnlp candidate source-int4 sentiment-sampled` implements independent seeded

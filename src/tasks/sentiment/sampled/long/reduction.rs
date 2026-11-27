@@ -60,10 +60,47 @@ pub struct SampledSentimentMapAggregate {
     pub dimensions: Vec<SampledSentimentMapAggregateDimension>,
 }
 
+/// A private view over completed native chunks. Each numerical profile owns
+/// its complete-work validation; source coverage and integer-weighted
+/// descriptive reduction are shared without copying explanations.
+pub(crate) trait SampledMapChunk {
+    type Work;
+    fn id(&self) -> usize;
+    fn span(&self) -> VerifiedSourceSpan;
+    fn tokens(&self) -> usize;
+    fn dimensions(&self) -> &[SampledSentimentDimension<Self::Work>];
+    fn compatible(&self, reference: &Self) -> bool;
+    fn validate(&self, samples: usize, control: &mut impl DecodeStepControl)
+        -> Result<(), SampledSentimentMapError>;
+}
+impl SampledMapChunk for SampledSentimentMapChunk {
+    type Work = Int4Work;
+    fn id(&self) -> usize { self.chunk_id }
+    fn span(&self) -> VerifiedSourceSpan { self.source_span }
+    fn tokens(&self) -> usize { self.source_tokens }
+    fn dimensions(&self) -> &[SampledSentimentDimension] { &self.run.dimensions }
+    fn compatible(&self, reference: &Self) -> bool {
+        self.run.execution == reference.run.execution
+            && self.run.prompt_template_sha256 == reference.run.prompt_template_sha256
+            && self.run.group_width == reference.run.group_width
+            && self.run.dimensions.len() == reference.run.dimensions.len()
+    }
+    fn validate(&self, samples: usize, control: &mut impl DecodeStepControl)
+        -> Result<(), SampledSentimentMapError> {
+        validate_run(&self.run, samples, control)
+    }
+}
+
 /// All original scalars count exactly once, including whitespace and CRLF.
 /// Complete cold task finalizers remain responsible for each native receipt;
 /// reduction checks full partition and compatible axis/sample provenance.
 pub(super) fn aggregate_with_control(chunks: &[SampledSentimentMapChunk],
+    source_span: VerifiedSourceSpan, samples: usize, control: &mut impl DecodeStepControl)
+    -> Result<SampledSentimentMapAggregate, SampledSentimentMapError> {
+    aggregate_chunks_with_control(chunks, source_span, samples, control)
+}
+
+pub(crate) fn aggregate_chunks_with_control<T: SampledMapChunk>(chunks: &[T],
     source_span: VerifiedSourceSpan, samples: usize, control: &mut impl DecodeStepControl)
     -> Result<SampledSentimentMapAggregate, SampledSentimentMapError> {
     checkpoint(control)?;
@@ -75,17 +112,17 @@ pub(super) fn aggregate_with_control(chunks: &[SampledSentimentMapChunk],
             .ok_or(SampledSentimentMapError::Aggregation)? {
         return Err(SampledSentimentMapError::Aggregation);
     }
-    let reference = &chunks[0].run;
-    validate_run(reference, samples, control)?;
+    let reference = &chunks[0];
+    reference.validate(samples, control)?;
     let mut sums = [[0_i64; MAX_SENTIMENT_SAMPLES]; 4];
     let (mut byte_end, mut scalar_end) = (0_usize, 0_usize);
     for (index, chunk) in chunks.iter().enumerate() {
         checkpoint(control)?;
-        let span = chunk.source_span;
-        if chunk.chunk_id != index || span.byte_start != byte_end || span.scalar_start != scalar_end
+        let span = chunk.span();
+        if chunk.id() != index || span.byte_start != byte_end || span.scalar_start != scalar_end
             || span.byte_end <= span.byte_start || span.scalar_end <= span.scalar_start
             || span.byte_end > source_span.byte_end || span.scalar_end > source_span.scalar_end
-            || chunk.source_tokens == 0 {
+            || chunk.tokens() == 0 {
             return Err(SampledSentimentMapError::Aggregation);
         }
         let scalars = span.scalar_end - span.scalar_start;
@@ -93,17 +130,14 @@ pub(super) fn aggregate_with_control(chunks: &[SampledSentimentMapChunk],
         if bytes < scalars || bytes > scalars.checked_mul(4).ok_or(SampledSentimentMapError::Aggregation)? {
             return Err(SampledSentimentMapError::Aggregation);
         }
-        validate_run(&chunk.run, samples, control)?;
-        if chunk.run.execution != reference.execution
-            || chunk.run.prompt_template_sha256 != reference.prompt_template_sha256
-            || chunk.run.group_width != reference.group_width
-            || chunk.run.dimensions.len() != reference.dimensions.len() {
+        chunk.validate(samples, control)?;
+        if !chunk.compatible(reference) {
             return Err(SampledSentimentMapError::Aggregation);
         }
         let weight = i64::try_from(scalars).map_err(|_| SampledSentimentMapError::Aggregation)?;
-        for (axis_index, dimension) in chunk.run.dimensions.iter().enumerate() {
+        for (axis_index, dimension) in chunk.dimensions().iter().enumerate() {
             checkpoint(control)?;
-            if dimension.axis != reference.dimensions[axis_index].axis {
+            if dimension.axis != reference.dimensions()[axis_index].axis {
                 return Err(SampledSentimentMapError::Aggregation);
             }
             for sample in &dimension.samples {
@@ -120,8 +154,8 @@ pub(super) fn aggregate_with_control(chunks: &[SampledSentimentMapChunk],
     if byte_end != source_span.byte_end || scalar_end != source_span.scalar_end {
         return Err(SampledSentimentMapError::Aggregation);
     }
-    let mut dimensions = reserved(reference.dimensions.len())?;
-    for (index, dimension) in reference.dimensions.iter().enumerate() {
+    let mut dimensions = reserved(reference.dimensions().len())?;
+    for (index, dimension) in reference.dimensions().iter().enumerate() {
         checkpoint(control)?;
         dimensions.push(finish_axis(dimension.axis, &sums[index][..samples], source_span.scalar_end, control)?);
     }
@@ -177,7 +211,7 @@ fn validate_run(run: &SampledSentimentRun, samples: usize, control: &mut impl De
 
 // Recompute the existing per-chunk descriptive moments from integer scores,
 // without cloning any model explanation or trusting nonfinite wire metrics.
-fn validate_dimension(dimension: &SampledSentimentDimension, samples: usize)
+pub(crate) fn validate_dimension<W>(dimension: &SampledSentimentDimension<W>, samples: usize)
     -> Result<(), SampledSentimentMapError> {
     let (low, high) = dimension.axis.anchors();
     if dimension.samples.len() != samples || dimension.low_anchor != low || dimension.high_anchor != high {

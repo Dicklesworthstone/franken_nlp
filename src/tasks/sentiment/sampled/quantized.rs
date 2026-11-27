@@ -35,6 +35,8 @@ use super::{
     item_address_digest, reserved, unbound_identity, validate_sample_json,
 };
 
+pub mod long;
+
 pub const INT8_SAMPLED_SENTIMENT_EXECUTION: &str = "portable-int8-independent-sampled-sentiment-v1";
 
 /// Existing shared task failures retain their precise category. Native INT8

@@ -82,7 +82,7 @@ pub use scored::{Int8ClassificationMapHostConfig, Int8ClassificationMapMemoryReq
 mod sentiment;
 pub use sentiment::{SentimentHostLimits, Int8SentimentMapHostConfig};
 mod sampled_sentiment;
-pub use sampled_sentiment::Int8SampledSentimentHostLimits;
+pub use sampled_sentiment::{Int8SampledSentimentHostLimits, Int8SampledSentimentMapHostConfig};
 mod redact;
 pub use redact::{RedactConfig, RedactionPseudonyms};
 mod resolve;
@@ -169,6 +169,7 @@ pub enum HostedError {
     FaithfulnessMap(crate::tasks::judge::quantized::faithfulness_map::Int8FaithfulnessMapError),
     Sentiment(crate::tasks::sentiment::quantized::Int8SentimentError),
     SampledSentiment(crate::tasks::sentiment::sampled::quantized::Int8SampledSentimentError),
+    SampledSentimentMap(crate::tasks::sentiment::sampled::quantized::long::Int8SampledSentimentMapError),
     SentimentMap(crate::tasks::sentiment::quantized::long::Int8SentimentMapError),
     Source(crate::tasks::source_planning::quantized::Int8SourceError),
     SourceMap(crate::tasks::source_planning::quantized::long::Int8SourceMapError),
@@ -207,6 +208,7 @@ impl fmt::Display for HostedError {
             Self::FaithfulnessMap(_) => "hosted native faithfulness document failed",
             Self::Sentiment(_) => "hosted native sentiment failed",
             Self::SampledSentiment(_) => "hosted native sampled sentiment failed",
+            Self::SampledSentimentMap(_) => "hosted native sampled sentiment document failed",
             Self::SentimentMap(_) => "hosted native sentiment document failed",
             Self::Source(_) => "hosted native source task failed",
             Self::SourceMap(_) => "hosted native source map failed",
@@ -235,6 +237,7 @@ impl Error for HostedError {
             Self::ClassificationMap(e) => Some(e), Self::FaithfulnessMap(e) => Some(e),
             Self::Redaction(e) => Some(e), Self::Sentiment(e) => Some(e),
             Self::SampledSentiment(e) => Some(e),
+            Self::SampledSentimentMap(e) => Some(e),
             Self::SentimentMap(e) => Some(e),
             Self::Source(e) => Some(e), Self::Judge(e) => Some(e), Self::Classification(e) => Some(e), Self::Extraction(e) => Some(e), Self::BatchSetup(e) => Some(e), Self::Batch(e) => Some(e), _ => None,
         }

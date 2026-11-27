@@ -62,14 +62,14 @@ pub(super) fn result<C: DecodeStepControl>(run: &SampledSentimentMapRun, cap: u6
     writer.hash.update(run.request_binding); writer.hash.update([0]);
     writer.value(run)?; writer.checkpoint()?; Ok(writer.finish().0)
 }
-pub(super) fn value_bytes<C: DecodeStepControl>(value: &impl Serialize, cap: u64, control: &mut C)
+pub(crate) fn value_bytes<C: DecodeStepControl>(value: &impl Serialize, cap: u64, control: &mut C)
     -> Result<u64, SampledSentimentMapError> {
     let mut writer = Writer::new(b"sampled-sentiment-bounded-output-v1", cap, control);
     writer.value(value)?; writer.checkpoint()?; Ok(writer.finish().1)
 }
 
 const CHECKPOINT_BYTES: usize = 64 * 1024;
-struct Writer<'a, C> {
+pub(crate) struct Writer<'a, C> {
     hash: Sha256,
     bytes: u64,
     cap: u64,
@@ -79,23 +79,25 @@ struct Writer<'a, C> {
     cancelled: Option<DecodeCancellationKind>,
 }
 impl<'a, C: DecodeStepControl> Writer<'a, C> {
-    fn new(domain: &[u8], cap: u64, control: &'a mut C) -> Self {
+    pub(crate) fn new(domain: &[u8], cap: u64, control: &'a mut C) -> Self {
         let mut hash = Sha256::new(); hash.update(domain); hash.update([0]);
         Self { hash, bytes: 0, cap, exceeded: false, control, until_checkpoint: 0, cancelled: None }
     }
-    fn checkpoint(&mut self) -> Result<(), SampledSentimentMapError> {
+    pub(crate) fn checkpoint(&mut self) -> Result<(), SampledSentimentMapError> {
         if self.cancelled.is_none() { self.cancelled = self.control.prefill_checkpoint(0); }
         if let Some(cause) = self.cancelled { return Err(SampledSentimentMapError::Cancelled(cause)); }
         self.until_checkpoint = CHECKPOINT_BYTES; Ok(())
     }
-    fn value(&mut self, value: &(impl Serialize + ?Sized)) -> Result<(), SampledSentimentMapError> {
+    pub(crate) fn value(&mut self, value: &(impl Serialize + ?Sized)) -> Result<(), SampledSentimentMapError> {
         if serde_json::to_writer(&mut *self, value).is_err() {
             if let Some(cause) = self.cancelled { return Err(SampledSentimentMapError::Cancelled(cause)); }
             return Err(if self.exceeded { SampledSentimentMapError::Output } else { SampledSentimentMapError::Serialization });
         }
         self.hash.update([0]); Ok(())
     }
-    fn finish(self) -> ([u8; 32], u64) { (self.hash.finalize().into(), self.bytes) }
+    /// Private request authority prefixes the seal without spending output bytes.
+    pub(crate) fn bind_private(&mut self, bytes: &[u8]) { self.hash.update(bytes); self.hash.update([0]); }
+    pub(crate) fn finish(self) -> ([u8; 32], u64) { (self.hash.finalize().into(), self.bytes) }
 }
 impl<C: DecodeStepControl> std::io::Write for Writer<'_, C> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {

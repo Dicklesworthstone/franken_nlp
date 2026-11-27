@@ -12,6 +12,7 @@ use crate::{
 #[cfg(feature = "asupersync-runtime")]
 use super::runtime::sampled_sentiment as runtime;
 pub(super) mod corpus;
+pub(super) mod map;
 #[cfg(test)]
 mod tests;
 

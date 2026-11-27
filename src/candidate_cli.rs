@@ -116,6 +116,7 @@ pub(crate) enum CandidateCommand {
     Source(source::SourceCommand),
     Scored(scored::ScoredCommand),
     SampledSentiment(sampled_sentiment::SampledSentimentCommand),
+    SampledSentimentMap(sampled_sentiment::map::SampledSentimentMapCommand),
     SampledSentimentBatch(sampled_sentiment::corpus::Command),
     SentimentMap(sentiment_map::SentimentMapCommand),
     ClassifyMap(classify_map::ClassifyMapCommand),
@@ -146,6 +147,7 @@ pub(crate) fn definition() -> clap::Command {
         .subcommands(source::definitions())
         .subcommands(scored::definitions())
         .subcommand(sampled_sentiment::definition())
+        .subcommand(sampled_sentiment::map::definition())
         .subcommand(sampled_sentiment::corpus::definition())
         .subcommand(sentiment_map::definition())
         .subcommand(classify_map::definition())
@@ -213,6 +215,10 @@ impl CandidateCommand {
         }
         if name == "sentiment-sampled" {
             return sampled_sentiment::SampledSentimentCommand::from_matches(matches).map(Self::SampledSentiment);
+        }
+        if name == "sentiment-sampled-map" {
+            return sampled_sentiment::map::SampledSentimentMapCommand::from_matches(matches)
+                .map(Self::SampledSentimentMap);
         }
         if name == "map" {
             return map::MapCommand::from_matches(matches).map(Self::Map);
@@ -288,6 +294,7 @@ impl CandidateCommand {
         // through publication; do not collapse them to the legacy error enum.
         let other = match self {
             Self::SampledSentiment(command) => return command.run(input, output, diagnostics),
+            Self::SampledSentimentMap(command) => return command.run(input, output, diagnostics),
             other => other,
         };
         let result = other.execute(input, output);
@@ -318,7 +325,7 @@ impl CandidateCommand {
             Self::Redact(command) => return command.execute(input, output),
             Self::Resolve(command) => return command.execute(input, output),
             // The executable uses the typed command route in run above.
-            Self::SampledSentiment(_) => return Err(CandidateError::Arguments),
+            Self::SampledSentiment(_) | Self::SampledSentimentMap(_) => return Err(CandidateError::Arguments),
             // A borrowed stream cannot outlive the hosted blocking closure.
             // The executable dispatcher always takes run_stdio for owned IO.
             Self::Batch(_) | Self::SampledSentimentBatch(_) | Self::ScoreBatch(_) | Self::DocumentCorpus(_) | Self::FaithfulnessCorpus(_)

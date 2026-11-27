@@ -3,6 +3,7 @@
 //! preparation and guarded output remain charged through checked publication.
 use super::*;
 pub(in crate::candidate_cli) mod corpus;
+pub(in crate::candidate_cli) mod map;
 use super::source_tasks::Session;
 use std::sync::Arc;
 use crate::{

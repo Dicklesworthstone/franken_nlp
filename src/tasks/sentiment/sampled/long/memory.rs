@@ -91,13 +91,22 @@ pub(super) fn grammar_bytes(planning: SampledSentimentLimits) -> Result<u64, Sam
 
 pub(super) fn prepared_bytes(planning: SampledSentimentLimits, mapping: SampledSentimentMapLimits,
     chunks: usize, prompt_tokens: u64, encoder: u64) -> Result<u64, SampledSentimentMapError> {
+    prepared_bytes_bound(planning, mapping.chunks, mapping.max_retained_result_bytes,
+        chunks, prompt_tokens, encoder)
+}
+
+/// Model-independent retained grammar, source, prompt and result storage.
+/// Both numerical profiles use the same compiler and document representation.
+pub(crate) fn prepared_bytes_bound(planning: SampledSentimentLimits, chunk_limits: ChunkLimits,
+    max_retained_result_bytes: u64, chunks: usize, prompt_tokens: u64, encoder: u64)
+    -> Result<u64, SampledSentimentMapError> {
     let chunks = chunks as u64;
     let programs = multiply(chunks, add(&[grammar_bytes(planning)?, CHUNK_METADATA_BYTES])?)?;
     // Retained complete results coexist with the next complete chunk, its
     // canonical validation staging, and the document reducer's bounded copies.
-    let result_bytes = add(&[mapping.max_retained_result_bytes, planning.max_result_bytes, 4096])?;
+    let result_bytes = add(&[max_retained_result_bytes, planning.max_result_bytes, 4096])?;
     add(&[MIN_SAMPLED_SENTIMENT_MAP_PREPARATION_BYTES,
-        multiply(mapping.chunks.max_input_bytes as u64, 4)?,
+        multiply(chunk_limits.max_input_bytes as u64, 4)?,
         multiply(prompt_tokens, PLAN_BYTES_PER_TOKEN)?, programs,
         multiply(result_bytes, 8)?, encoder])
 }
