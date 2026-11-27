@@ -39,7 +39,7 @@ where C: DecodeStepControl, E: From<Int8JsonError>, F: FnOnce(Int8JsonRun) -> Re
 }
 
 // Private static seam: external callers must supply a real admitted engine.
-trait PromptDriver: Driver {
+pub(super) trait PromptDriver: Driver {
     fn append_layer_major(&mut self, prompt: &[u32], limits: Int8PrefillLimits) -> Result<(), Int8JsonError>;
 }
 impl<C: DecodeStepControl> PromptDriver for Int8Session<'_, '_, C> {
@@ -73,8 +73,19 @@ fn drive_layer_major<V, D, T, E, F>(prompt: &[u32], program: &JsonProgram, vocab
     options: &JsonDecodeOptions, budget: Int8JsonBudget, prefill: Int8PrefillLimits,
     driver: &mut D, finalize: F) -> Result<T, E>
 where V: Vocabulary, D: PromptDriver, E: From<Int8JsonError>, F: FnOnce(Int8JsonRun) -> Result<T, E> {
+    drive_layer_major_selected(prompt, program, vocabulary, options, budget, prefill,
+        driver, &mut Greedy, finalize)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn drive_layer_major_selected<V, D, S, T, E, F>(prompt: &[u32], program: &JsonProgram,
+    vocabulary: &V, options: &JsonDecodeOptions, budget: Int8JsonBudget, prefill: Int8PrefillLimits,
+    driver: &mut D, selection: &mut S, finalize: F) -> Result<T, E>
+where V: Vocabulary, D: PromptDriver, S: Selection, E: From<Int8JsonError>,
+    F: FnOnce(Int8JsonRun) -> Result<T, E> {
     prefill.validate().map_err(Int8JsonError::from).map_err(E::from)?;
-    drive(prompt, program, vocabulary, options, budget, &mut LayerMajor { driver, prefill }, finalize)
+    drive_selected(prompt, program, vocabulary, options, budget,
+        &mut LayerMajor { driver, prefill }, selection, finalize)
 }
 
 #[cfg(test)] mod tests;

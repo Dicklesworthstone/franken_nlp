@@ -38,6 +38,8 @@ use crate::{
 use super::{SentimentAxis, SentimentRequest};
 
 pub mod long;
+/// Independent sampled score/justification bundles on portable INT8 weights.
+pub mod quantized;
 mod projection;
 pub use projection::{SAMPLED_SENTIMENT_SPARSE_EXECUTION,
     SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION};
@@ -288,7 +290,41 @@ impl SampledSentimentPlanner {
     }
 }
 
-struct PreparedAxis { axis: SentimentAxis, prompt: Vec<u32>, identity: ExecutionIdentity, work: Int4Work }
+struct PreparedAxis<W = Int4Work> { axis: SentimentAxis, prompt: Vec<u32>, identity: ExecutionIdentity, work: W }
+
+// One compiler owns the exact prompt, source encoding, child grammar and
+// complete axis/sample admission for both numerical backends. The schedule
+// supplies only native geometry and explicitly named identity parameters.
+trait SampledSchedule {
+    type Work: Copy + Default;
+    type Profile: Serialize;
+    const EXECUTION: &'static str;
+    const NATIVE_EXECUTION: &'static str;
+    fn profile(&self) -> Self::Profile;
+    fn planned_work(&self, prompt: usize, tokens: usize) -> Result<Self::Work, SampledSentimentError>;
+    fn add_work(&self, left: Self::Work, right: Self::Work) -> Result<Self::Work, SampledSentimentError>;
+}
+struct Int4SampledSchedule { group_width: usize }
+impl SampledSchedule for Int4SampledSchedule {
+    type Work = Int4Work;
+    type Profile = usize;
+    const EXECUTION: &'static str = SAMPLED_SENTIMENT_EXECUTION;
+    const NATIVE_EXECUTION: &'static str = INT4_JSON_SAMPLED_EXECUTION;
+    fn profile(&self) -> usize { self.group_width }
+    fn planned_work(&self, prompt: usize, tokens: usize) -> Result<Int4Work, SampledSentimentError> {
+        Ok(constrained_int4::planned_work(self.group_width, prompt, tokens)?)
+    }
+    fn add_work(&self, left: Int4Work, right: Int4Work) -> Result<Int4Work, SampledSentimentError> {
+        Ok(left.checked_add(right)?)
+    }
+}
+
+struct CompiledSampledSentiment<W> {
+    axes: Vec<PreparedAxis<W>>, program: JsonProgram, options: SampledSentimentOptions,
+    decode: JsonDecodeOptions, controls: BTreeSet<u32>, identity: ExecutionIdentity,
+    work: W, budget: TaskBudget, context: usize, max_result_bytes: u64, preparation_bytes: u64,
+    input_encoding: UntrustedEncoding, encoding_work: SafeBpeWork,
+}
 
 /// Sealed prompts, sampled policy and complete native schedule. There is no
 /// serde/Debug constructor and no public path accepting invented native runs.
@@ -617,15 +653,7 @@ impl PreparedSampledSentiment {
             || output.forward_positions != expected.forward_positions || output.projected_logits != expected.projected_logits {
             return Err(SampledSentimentError::Accounting);
         }
-        self.program.validate_json(&output.json).map_err(|_| SampledSentimentError::NoResult)?;
-        let value = canonjson::parse_str_with_limits(&output.json, canonjson::ParseLimits {
-            max_depth: 4, max_string_bytes: self.program.max_output_bytes() })
-            .map_err(|_| SampledSentimentError::NoResult)?;
-        let decoded: SampleValue = serde_json::from_value(value).map_err(|_| SampledSentimentError::NoResult)?;
-        if !(-100..=100).contains(&decoded.score) || decoded.justification.trim().is_empty()
-            || decoded.justification.chars().count() > self.options.max_justification_chars {
-            return Err(SampledSentimentError::NoResult);
-        }
+        let decoded = validate_sample_json(&self.program, &self.options, &output.json)?;
         Ok(SampledSentimentSample { sample_index, score: decoded.score, justification: decoded.justification,
             generated_tokens: output.token_ids.len(), model_work: run.model_work,
             mask_node_visit_charge: output.mask_node_visit_charge })
@@ -636,18 +664,32 @@ impl PreparedSampledSentiment {
 #[serde(deny_unknown_fields)]
 struct SampleValue { score: i16, justification: String }
 
+fn validate_sample_json(program: &JsonProgram, options: &SampledSentimentOptions, json: &str)
+    -> Result<SampleValue, SampledSentimentError> {
+    program.validate_json(json).map_err(|_| SampledSentimentError::NoResult)?;
+    let value = canonjson::parse_str_with_limits(json, canonjson::ParseLimits {
+        max_depth: 4, max_string_bytes: program.max_output_bytes() })
+        .map_err(|_| SampledSentimentError::NoResult)?;
+    let decoded: SampleValue = serde_json::from_value(value).map_err(|_| SampledSentimentError::NoResult)?;
+    if !(-100..=100).contains(&decoded.score) || decoded.justification.trim().is_empty()
+        || decoded.justification.chars().count() > options.max_justification_chars {
+        return Err(SampledSentimentError::NoResult);
+    }
+    Ok(decoded)
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct SampledSentimentSample {
+pub struct SampledSentimentSample<W = Int4Work> {
     pub sample_index: usize, pub score: i16, pub justification: String,
-    pub generated_tokens: usize, pub model_work: Int4Work, pub mask_node_visit_charge: u64,
+    pub generated_tokens: usize, pub model_work: W, pub mask_node_visit_charge: u64,
 }
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct SampledSentimentDimension {
+pub struct SampledSentimentDimension<W = Int4Work> {
     pub axis: SentimentAxis, pub low_anchor: String, pub high_anchor: String,
     pub mean: f64, pub median: f64, pub minimum: i16, pub maximum: i16,
-    pub population_stddev: f64, pub samples: Vec<SampledSentimentSample>,
+    pub population_stddev: f64, pub samples: Vec<SampledSentimentSample<W>>,
 }
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -660,8 +702,8 @@ pub struct SampledSentimentRun {
     pub model_work: Int4Work, pub generated_tokens: u64, pub mask_node_visit_charge: u64,
 }
 
-fn aggregate(axis: SentimentAxis, mut samples: Vec<SampledSentimentSample>)
-    -> Result<SampledSentimentDimension, SampledSentimentError> {
+fn aggregate<W>(axis: SentimentAxis, mut samples: Vec<SampledSentimentSample<W>>)
+    -> Result<SampledSentimentDimension<W>, SampledSentimentError> {
     if samples.is_empty() || samples.len() > MAX_SENTIMENT_SAMPLES { return Err(SampledSentimentError::Accounting); }
     samples.sort_unstable_by_key(|sample| sample.sample_index);
     if samples.iter().enumerate().any(|(index, sample)| sample.sample_index != index || !(-100..=100).contains(&sample.score)) {
@@ -795,6 +837,21 @@ fn compile_request_with_work<C: DecodeStepControl>(compiler: &Compiler, identity
     options: &SampledSentimentOptions, ceiling: TaskBudget, limits: SampledSentimentLimits,
     request: &SentimentRequest, control: &mut C, encoding_work: &mut SafeBpeWork)
     -> Result<PreparedSampledSentiment, SampledSentimentError> {
+    let compiled = compile_sampled_request(compiler, identity, &Int4SampledSchedule { group_width },
+        options, ceiling, limits, request, control, encoding_work)?;
+    Ok(PreparedSampledSentiment { axes: compiled.axes, program: compiled.program, options: compiled.options,
+        decode: compiled.decode, controls: compiled.controls, identity: compiled.identity,
+        group_width, work: compiled.work, budget: compiled.budget, context: compiled.context,
+        max_result_bytes: compiled.max_result_bytes, preparation_bytes: compiled.preparation_bytes,
+        input_encoding: compiled.input_encoding, encoding_work: compiled.encoding_work, selected_rows: None })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_sampled_request<C: DecodeStepControl, S: SampledSchedule>(
+    compiler: &Compiler, identity: &ExecutionIdentity, schedule: &S,
+    options: &SampledSentimentOptions, ceiling: TaskBudget, limits: SampledSentimentLimits,
+    request: &SentimentRequest, control: &mut C, encoding_work: &mut SafeBpeWork)
+    -> Result<CompiledSampledSentiment<S::Work>, SampledSentimentError> {
     checkpoint(control)?; options.validate()?; limits.validate()?;
     let encoding_workspace = compiler.encoding_workspace_bytes()?;
     request.budget.validate().map_err(|_| SampledSentimentError::Limits)?;
@@ -824,7 +881,7 @@ fn compile_request_with_work<C: DecodeStepControl>(compiler: &Compiler, identity
     let mut executed_prompt_tokens = 0_usize;
     let mut retained_prompt_tokens = 0_usize;
     let mut context = 0_usize;
-    let mut work = Int4Work::default();
+    let mut work = S::Work::default();
     let mut lengths = reserved(ordered.len())?;
     for axis in &ordered {
         let template = compiler.axes.iter().find(|entry| entry.axis == *axis).ok_or(SampledSentimentError::Template)?;
@@ -838,8 +895,8 @@ fn compile_request_with_work<C: DecodeStepControl>(compiler: &Compiler, identity
             return Err(SampledSentimentError::WorkBudget);
         }
         context = context.max(length.checked_add(options.max_sample_tokens - 1).ok_or(SampledSentimentError::WorkBudget)?);
-        let one = constrained_int4::planned_work(group_width, length, options.max_sample_tokens)?;
-        for _ in 0..options.samples { work = work.checked_add(one)?; }
+        let one = schedule.planned_work(length, options.max_sample_tokens)?;
+        for _ in 0..options.samples { work = schedule.add_work(work, one)?; }
         lengths.push((length, one));
     }
     let bytes = (context as u64).checked_mul(crate::native_engine::kv::KV_BYTES_PER_TOKEN as u64)
@@ -886,8 +943,8 @@ fn compile_request_with_work<C: DecodeStepControl>(compiler: &Compiler, identity
         axis_identity.prompt_digest = digest(task.ir().prompt_segments())?;
         axis_identity.schema_digest = compiler.schema_digest;
         axis_identity.grammar_compiler_version = JSON_RUNTIME_VERSION.to_owned();
-        axis_identity.decision_policy_digest = digest(&(SAMPLED_SENTIMENT_EXECUTION, SAMPLED_SENTIMENT_AGGREGATION_VERSION,
-            INT4_JSON_SAMPLED_EXECUTION, axis, options, group_width, request.budget, program.max_output_bytes()))?;
+        axis_identity.decision_policy_digest = digest(&(S::EXECUTION, SAMPLED_SENTIMENT_AGGREGATION_VERSION,
+            S::NATIVE_EXECUTION, axis, options, schedule.profile(), request.budget, program.max_output_bytes()))?;
         axis_identity.validate().map_err(|_| SampledSentimentError::Identity)?;
         axes.push(PreparedAxis { axis, prompt, identity: axis_identity, work: one });
     }
@@ -895,15 +952,14 @@ fn compile_request_with_work<C: DecodeStepControl>(compiler: &Compiler, identity
     sealed.taskir_digest = digest(&axes.iter().map(|axis| (axis.axis, axis.identity.taskir_digest)).collect::<Vec<_>>())?;
     sealed.prompt_digest = digest(&axes.iter().map(|axis| (axis.axis, axis.identity.prompt_digest)).collect::<Vec<_>>())?;
     sealed.schema_digest = compiler.schema_digest; sealed.grammar_compiler_version = JSON_RUNTIME_VERSION.to_owned();
-    sealed.decision_policy_digest = digest(&(SAMPLED_SENTIMENT_EXECUTION, SAMPLED_SENTIMENT_AGGREGATION_VERSION,
-        options, request.budget, max_result_bytes, group_width, &sealed.taskir_digest))?;
+    sealed.decision_policy_digest = digest(&(S::EXECUTION, SAMPLED_SENTIMENT_AGGREGATION_VERSION,
+        options, request.budget, max_result_bytes, schedule.profile(), &sealed.taskir_digest))?;
     sealed.validate().map_err(|_| SampledSentimentError::Identity)?;
     checkpoint(control)?;
-    Ok(PreparedSampledSentiment { axes, program, options: options.clone(),
+    Ok(CompiledSampledSentiment { axes, program, options: options.clone(),
         decode: compiler.decode.clone(), controls: compiler.controls.ids().clone(), identity: sealed,
-        group_width, work, budget: request.budget, context, max_result_bytes, preparation_bytes,
+        work, budget: request.budget, context, max_result_bytes, preparation_bytes,
         input_encoding: compiler.input_encoding.clone(),
-        selected_rows: None,
         encoding_work: encoding_work.checked_sub(before_encoding).ok_or(SampledSentimentError::Accounting)? })
 }
 

@@ -255,23 +255,51 @@ fn select(logits: &[f32], mask: &DenseTokenMask, accepting: bool, options: &Json
     best.map(|(id, _)| id).ok_or_else(|| JsonDecodeError::NoLegalToken.into())
 }
 
+// Selection changes neither the exact grammar nor native accounting. Greedy
+// and explicitly addressed sampling share the same session and finalizer.
+trait Selection {
+    fn select<C: DecodeStepControl>(&mut self, logits: &[f32], mask: &DenseTokenMask,
+        accepting: bool, options: &JsonDecodeOptions, step: usize, control: &mut C)
+        -> Result<u32, Int8JsonError>;
+    fn execution(&self) -> &'static str;
+}
+struct Greedy;
+impl Selection for Greedy {
+    fn select<C: DecodeStepControl>(&mut self, logits: &[f32], mask: &DenseTokenMask,
+        accepting: bool, options: &JsonDecodeOptions, _: usize, _: &mut C)
+        -> Result<u32, Int8JsonError> {
+        select(logits, mask, accepting, options)
+    }
+    fn execution(&self) -> &'static str { INT8_JSON_EXECUTION }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drive<V, D, T, E, F>(prompt: &[u32], program: &JsonProgram, vocabulary: &V,
     options: &JsonDecodeOptions, budget: Int8JsonBudget, driver: &mut D, finalize: F) -> Result<T, E>
 where V: Vocabulary, D: Driver, E: From<Int8JsonError>, F: FnOnce(Int8JsonRun) -> Result<T, E> {
-    let result = run(prompt, program, vocabulary, options, budget, driver).map_err(E::from).and_then(|run| {
+    drive_selected(prompt, program, vocabulary, options, budget, driver, &mut Greedy, finalize)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drive_selected<V, D, S, T, E, F>(prompt: &[u32], program: &JsonProgram, vocabulary: &V,
+    options: &JsonDecodeOptions, budget: Int8JsonBudget, driver: &mut D, selection: &mut S,
+    finalize: F) -> Result<T, E>
+where V: Vocabulary, D: Driver, S: Selection, E: From<Int8JsonError>, F: FnOnce(Int8JsonRun) -> Result<T, E> {
+    let result = run(prompt, program, vocabulary, options, budget, driver, selection).map_err(E::from).and_then(|run| {
         let next_token = run.output.token_ids.len();
-        let output = finalize(run)?;
+        let output = finalize(run);
         if let Some(cause) = driver.control().checkpoint(next_token) {
             return Err(E::from(JsonDecodeError::Cancelled(cause).into()));
         }
-        Ok(output)
+        output
     });
     if result.is_err() { driver.abort(); }
     result
 }
-fn run<V: Vocabulary, D: Driver>(prompt: &[u32], program: &JsonProgram, vocabulary: &V,
-    options: &JsonDecodeOptions, budget: Int8JsonBudget, driver: &mut D) -> Result<Int8JsonRun, Int8JsonError> {
+#[allow(clippy::too_many_arguments)]
+fn run<V: Vocabulary, D: Driver, S: Selection>(prompt: &[u32], program: &JsonProgram, vocabulary: &V,
+    options: &JsonDecodeOptions, budget: Int8JsonBudget, driver: &mut D, selection: &mut S)
+    -> Result<Int8JsonRun, Int8JsonError> {
     preflight(prompt, vocabulary, options, budget)?;
     let mut tokens = Vec::new();
     tokens.try_reserve_exact(options.max_new_tokens).map_err(|_| JsonDecodeError::AllocationRefused)?;
@@ -289,7 +317,7 @@ fn run<V: Vocabulary, D: Driver>(prompt: &[u32], program: &JsonProgram, vocabula
         charged = charged.checked_add(vocabulary.mask_charge(budget.json.mask_limits) as u64)
             .filter(|&n| n <= budget.json.max_total_mask_node_visits).ok_or(JsonDecodeError::BudgetExceeded("mask work"))?;
         let mask = vocabulary.mask(&state, budget.json.mask_limits, driver.control(), step)?;
-        let selected = select(&logits, &mask, state.is_accepting(), options)?;
+        let selected = selection.select(&logits, &mask, state.is_accepting(), options, step, driver.control())?;
         if let Some(cause) = driver.control().checkpoint(step) { return Err(JsonDecodeError::Cancelled(cause).into()); }
         tokens.push(selected);
         if selected == options.eos_token_id {
@@ -300,7 +328,7 @@ fn run<V: Vocabulary, D: Driver>(prompt: &[u32], program: &JsonProgram, vocabula
                 return Err(Int8JsonError::WorkMismatch);
             }
             if let Some(cause) = driver.control().checkpoint(step) { return Err(JsonDecodeError::Cancelled(cause).into()); }
-            return Ok(Int8JsonRun { schema_version: 1, execution: INT8_JSON_EXECUTION.to_owned(), model_work,
+            return Ok(Int8JsonRun { schema_version: 1, execution: selection.execution().to_owned(), model_work,
                 output: JsonDecodeOutput { schema_version: 1, numerics_profile: STRICT_INT8_PROFILE.to_owned(),
                     token_ids: tokens, json, forward_positions: positions, projected_logits: projected,
                     mask_node_visit_charge: charged } });
@@ -325,3 +353,7 @@ fn run<V: Vocabulary, D: Driver>(prompt: &[u32], program: &JsonProgram, vocabula
 #[cfg(test)] mod tests;
 pub mod sparse;
 pub mod prefill;
+mod sampled;
+pub use sampled::{Int8JsonSamplingOptions, INT8_JSON_SAMPLED_EXECUTION, JSON_SAMPLER_VERSION,
+    json_sampling_workspace_bytes, decode_json_int8_sampled, decode_json_int8_sampled_layer_major};
+pub(crate) use sampled::{decode_json_int8_sampled_with, decode_json_int8_sampled_layer_major_with};
