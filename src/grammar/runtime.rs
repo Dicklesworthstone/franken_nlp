@@ -30,6 +30,9 @@ struct Property {
     key: Vec<u8>,
     child: usize,
     required: bool,
+    // Minimum encoded bytes for required fields starting here, including
+    // one leading comma per required field and excluding the closing brace.
+    required_suffix_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -314,12 +317,25 @@ fn build(schema: &SchemaNode, nodes: &mut Vec<Node>,
                         key: format!("{}:", escape_json_string(name)).into_bytes(),
                         child,
                         required,
+                        required_suffix_bytes: 0,
                     }),
                     None if required => possible = false,
                     None => {}
                 }
             }
             if !possible { return Ok(None); }
+            // Compute this after source binding has eliminated impossible
+            // optional fields. All request states share the compiled suffixes.
+            let mut required_bytes = 0_usize;
+            for field in fields.iter_mut().rev() {
+                if field.required {
+                    required_bytes = required_bytes.checked_add(1)
+                        .and_then(|n| n.checked_add(field.key.len()))
+                        .and_then(|n| n.checked_add(nodes[field.child].minimum))
+                        .ok_or_else(|| resource("minimum output overflow"))?;
+                }
+                field.required_suffix_bytes = required_bytes;
+            }
             Kind::Object(fields)
         }
         SchemaNode::Array { items, max_items } => {
@@ -356,14 +372,9 @@ fn build(schema: &SchemaNode, nodes: &mut Vec<Node>,
     };
     let minimum = match &kind {
         Kind::Object(fields) => {
-            let mut total = 2_usize;
-            let mut count = 0;
-            for field in fields.iter().filter(|f| f.required) {
-                total = total.checked_add(field.key.len()).and_then(|n| n.checked_add(nodes[field.child].minimum))
-                    .and_then(|n| n.checked_add(usize::from(count > 0))).ok_or_else(|| resource("minimum output overflow"))?;
-                count += 1;
-            }
-            total
+            let required = fields.first().map_or(0, |field| field.required_suffix_bytes);
+            // The opening brace takes the place of the first comma.
+            required.max(1).checked_add(1).ok_or_else(|| resource("minimum output overflow"))?
         }
         Kind::Array { .. } | Kind::String { .. } => 2,
         Kind::Number { .. } => 1,
@@ -433,13 +444,8 @@ impl<'a> JsonState<'a> {
         (child, maximum)
     }
     fn object_tail(&self, node: usize, next: usize, comma: bool) -> usize {
-        let mut bytes = 1;
-        let mut separator = comma;
-        for field in self.fields(node)[next..].iter().filter(|f| f.required) {
-            bytes += field.key.len() + self.program.nodes[field.child].minimum + usize::from(separator);
-            separator = true;
-        }
-        bytes
+        let required = self.fields(node).get(next).map_or(0, |field| field.required_suffix_bytes);
+        required + usize::from(comma || required == 0)
     }
     fn frame_minimum(&self, frame: &Frame<'_>) -> Option<usize> {
         Some(match frame {
@@ -447,7 +453,7 @@ impl<'a> JsonState<'a> {
             Frame::ObjectAfter { node, next } => self.object_tail(*node, *next, true),
             Frame::ObjectNext { node, next, close } => {
                 let fields = self.fields(*node);
-                if *close || fields[*next..].iter().any(|f| f.required) {
+                if *close || fields.get(*next).is_some_and(|field| field.required_suffix_bytes != 0) {
                     self.object_tail(*node, *next, false)
                 } else {
                     fields[*next..].iter().map(|f| f.key.len() + self.program.nodes[f.child].minimum + 1).min()?
@@ -494,8 +500,11 @@ impl<'a> JsonState<'a> {
                 },
                 Frame::ObjectNext { node, next, close } => {
                     let fields = self.fields(node);
-                    if byte == b'}' && close && !fields[next..].iter().any(|f| f.required) { return true; }
-                    let end = fields[next..].iter().position(|f| f.required).map_or(fields.len(), |i| next + i + 1);
+                    let suffix_bytes = fields.get(next).map_or(0, |field| field.required_suffix_bytes);
+                    if byte == b'}' && close && suffix_bytes == 0 { return true; }
+                    // The suffix total drops strictly just after the first
+                    // required key. All choices up to and including it are legal.
+                    let end = next + fields[next..].partition_point(|field| field.required_suffix_bytes == suffix_bytes);
                     if next == end { return false; }
                     self.stack.push(Frame::Key { node, choices: (next..end).collect(), position: 0 });
                 }
@@ -512,7 +521,7 @@ impl<'a> JsonState<'a> {
                 }
                 Frame::ObjectAfter { node, next } => {
                     let fields = self.fields(node);
-                    if byte == b'}' && !fields[next..].iter().any(|f| f.required) { return true; }
+                    if byte == b'}' && fields.get(next).is_none_or(|field| field.required_suffix_bytes == 0) { return true; }
                     if byte != b',' || next == fields.len() { return false; }
                     self.stack.push(Frame::ObjectNext { node, next, close: false }); return true;
                 }
@@ -658,6 +667,38 @@ mod tests {
     fn program(schema: &str) -> JsonProgram { JsonProgram::compile(schema, CompileLimits::default()).unwrap() }
     fn accepts(program: &JsonProgram, text: &str) -> bool {
         let mut state = program.initial_state(); state.consume_bytes(text.as_bytes()) && state.is_accepting()
+    }
+
+    #[test]
+    fn every_key_prefix_matches_the_budgeted_object_language() {
+        let schema = r#"{"type":"object","additionalProperties":false,"properties":{
+            "a":{"type":"null"},"aa":{"type":"null"},"aaa":{"type":"null"},
+            "b":{"type":"null"},"bb":{"type":"null"},"c":{"type":"null"}
+        },"required":["aaa","bb"]}"#;
+        let mut documents = Vec::new();
+        for subset in 0..16 {
+            let fields = [("a", subset & 1 != 0), ("aa", subset & 2 != 0), ("aaa", true),
+                ("b", subset & 4 != 0), ("bb", true), ("c", subset & 8 != 0)];
+            let entries: Vec<_> = fields.into_iter().filter(|(_, present)| *present)
+                .map(|(name, _)| format!(r#""{name}":null"#)).collect();
+            documents.push(format!("{{{}}}", entries.join(",")));
+        }
+        let minimum = documents.iter().map(String::len).min().unwrap();
+        let maximum = documents.iter().map(String::len).max().unwrap();
+        for cap in minimum..=maximum {
+            let program = JsonProgram::compile(schema, CompileLimits {
+                max_output_bytes: cap, ..CompileLimits::default()
+            }).unwrap();
+            for candidate in &documents {
+                let mut state = program.initial_state();
+                for (i, byte) in candidate.bytes().enumerate() {
+                    let viable = documents.iter().any(|doc| doc.len() <= cap && doc.starts_with(&candidate[..=i]));
+                    assert_eq!(state.consume(byte), viable, "cap={cap} prefix={}", &candidate[..=i]);
+                    if !viable { break; }
+                }
+                assert_eq!(state.is_accepting(), candidate.len() <= cap);
+            }
+        }
     }
 
     #[test]
