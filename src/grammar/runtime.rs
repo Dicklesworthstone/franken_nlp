@@ -57,7 +57,6 @@ pub struct JsonProgram {
     nodes: Vec<Node>,
     root: usize,
     max_output_bytes: usize,
-    exponents: Vec<(i32, Vec<u8>)>,
     source: Option<source::SourceBinding>,
 }
 
@@ -109,7 +108,6 @@ impl JsonProgram {
         }
         Ok(Self {
             schema, nodes, root, max_output_bytes: limits.max_output_bytes, source: binding,
-            exponents: (-308..=308).map(|e: i32| (e, e.to_string().into_bytes())).collect(),
         })
     }
 
@@ -598,7 +596,7 @@ impl<'a> JsonState<'a> {
                     }
                     if len == NUMBER_BYTES { return false; }
                     bytes[len] = byte;
-                    let Some(tail) = number_tail(&bytes[..len + 1], integer, &self.program.exponents) else { return false; };
+                    let Some(tail) = number_tail(&bytes[..len + 1], integer) else { return false; };
                     self.stack.push(Frame::Number { integer, bytes, len: len + 1, tail }); return true;
                 }
             }
@@ -621,7 +619,7 @@ impl ByteState for JsonState<'_> {
 // scientific decimals with at most 38 significant digits and exponent -308..308.
 // Representable integers never use scientific spelling. This exact prefix test
 // considers exponent completions, so 1e1 is viable (1e100) but is not accepting.
-fn number_tail(bytes: &[u8], integer: bool, exponents: &[(i32, Vec<u8>)]) -> Option<usize> {
+fn number_tail(bytes: &[u8], integer: bool) -> Option<usize> {
     let negative = bytes.first() == Some(&b'-');
     let body = if negative { &bytes[1..] } else { bytes };
     if body.is_empty() { return Some(1); }
@@ -652,12 +650,49 @@ fn number_tail(bytes: &[u8], integer: bool, exponents: &[(i32, Vec<u8>)]) -> Opt
         maximum_integer_shift = Some(shift);
     }
     let exponent_prefix = split.map_or(&[][..], |i| &body[i + 1..]);
-    let tail = exponents.iter().filter(|(e, spelling)| {
-        spelling.starts_with(exponent_prefix) && !maximum_integer_shift.is_some_and(|shift| {
-            *e >= fractional_digits as i32 && *e <= fractional_digits as i32 + shift
-        })
-    }).map(|(_, spelling)| spelling.len() - exponent_prefix.len()).min()?;
+    let plain_integers = maximum_integer_shift.map(|shift| {
+        let first = fractional_digits as i32;
+        (first, first + shift)
+    });
+    let tail = exponent_tail(exponent_prefix, plain_integers)?;
     Some(tail + usize::from(split.is_none()) + usize::from(needs_digit))
+}
+
+// Shortest completion of a normalized exponent in -308..=308. Exponents
+// that would yield an i64/u64 integer require plain output instead. They
+// form one contiguous interval of nonnegative exponents for each mantissa.
+fn exponent_tail(prefix: &[u8], plain_integers: Option<(i32, i32)>) -> Option<usize> {
+    use super::schema::{MAX_ADJUSTED_DECIMAL_EXPONENT, MIN_ADJUSTED_DECIMAL_EXPONENT};
+
+    let all_plain = |low, high| plain_integers.is_some_and(|(first, last)| low >= first && high <= last);
+    if prefix.is_empty() {
+        // If all single digits are forbidden, "-1" always fits.
+        return Some(if all_plain(0, 9) { 2 } else { 1 });
+    }
+    let negative = prefix[0] == b'-';
+    let digits = if negative { &prefix[1..] } else { prefix };
+    if digits.is_empty() { return Some(1); }
+    if digits[0] == b'0' {
+        return (!negative && digits.len() == 1 && !all_plain(0, 0)).then_some(0);
+    }
+    if digits.len() > 3 || !digits.iter().all(u8::is_ascii_digit) { return None; }
+    let magnitude = digits.iter().fold(0_i32, |value, &byte| value * 10 + i32::from(byte - b'0'));
+    if negative {
+        return (-magnitude >= MIN_ADJUSTED_DECIMAL_EXPONENT).then_some(0);
+    }
+
+    // Appending a digit expands [lo, hi] to [10*lo, 10*hi + 9].
+    // A completion exists at this width if any bounded endpoint lies
+    // outside the excluded interval. A nonzero prefix has at most 3 widths.
+    let (mut low, mut high) = (magnitude, magnitude);
+    let mut extra = 0;
+    while low <= MAX_ADJUSTED_DECIMAL_EXPONENT {
+        if !all_plain(low, high.min(MAX_ADJUSTED_DECIMAL_EXPONENT)) { return Some(extra); }
+        low *= 10;
+        high = high * 10 + 9;
+        extra += 1;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -740,6 +775,34 @@ mod tests {
         let mut s = p.initial_state();
         for &b in &[b'"', 0xf0, 0x90, 0x80] { assert!(s.consume(b)); assert!(!s.is_accepting()); }
         assert!(s.consume_bytes(&[0x80, b'"'])); assert!(s.is_accepting());
+    }
+
+    #[test]
+    fn exponent_completion_matches_all_617_canonical_spellings() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let spellings: Vec<_> = (-308_i32..=308).map(|e| (e, e.to_string())).collect();
+        let mut prefixes = BTreeSet::new();
+        for (_, text) in &spellings {
+            for n in 0..=text.len() { prefixes.insert(&text[..n]); }
+        }
+        prefixes.extend(["-0", "00", "01", "+1", "--", "1-", "309", "-309", "3080", "e", "0x"]);
+        for plain in [None, Some((0, 0)), Some((0, 19)), Some((1, 18)),
+            Some((9, 10)), Some((18, 32)), Some((37, 37))] {
+            let mut oracle = BTreeMap::new();
+            for (e, text) in &spellings {
+                if plain.is_some_and(|(lo, hi)| (lo..=hi).contains(e)) { continue; }
+                for n in 0..=text.len() {
+                    let remaining = text.len() - n;
+                    let best = oracle.entry(&text[..n]).or_insert(remaining);
+                    *best = (*best).min(remaining);
+                }
+            }
+            for &prefix in &prefixes {
+                assert_eq!(exponent_tail(prefix.as_bytes(), plain), oracle.get(prefix).copied(),
+                    "prefix={prefix:?} plain={plain:?}");
+            }
+        }
     }
 
     #[test]
