@@ -467,6 +467,25 @@ fn complete_retained_artifact_finishes_with_zero_new_byte_budget() {
 }
 
 #[test]
+fn offline_resume_publishes_complete_staging_without_source_parts() {
+    let fixture = Fixture::new("offline-complete");
+    let mut request = fixture.request("resume");
+    request.parts_dir = fixture.root.join("offline-parts");
+    fs::write(&request.staging_output, &fixture.artifact).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fnlp"))
+        .args(["models", "reconstruct", "--resume", "--verify-staged-parts",
+            "--max-copy-bytes", "0", "--manifest"])
+        .arg(&request.manifest)
+        .arg("--manifest-sha256").arg(&request.expected_release_manifest_sha256)
+        .arg("--parts-dir").arg(&request.parts_dir)
+        .arg("--staging-output").arg(&request.staging_output)
+        .arg("--output").arg(&request.output)
+        .output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(fs::read(request.output).unwrap(), fixture.artifact);
+}
+
+#[test]
 fn mismatching_retained_prefix_is_preserved_and_never_extended() {
     let fixture = Fixture::new("prefix-mismatch");
     let request = fixture.request("resume");

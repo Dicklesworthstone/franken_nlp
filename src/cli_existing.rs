@@ -25,7 +25,7 @@ use crate::{
     artifact::package::{PackageRequest, package_model, verify_model_package},
     artifact::packing::{NativePackingTarget, TILE_TABLE_VERSION_V1},
     artifact::pull::{LocalReconstructOptions, LocalReconstructRequest, PullError,
-        reconstruct_local_release_with_options},
+        reconstruct_local_release_with_options, resume_local_release_from_staged_parts},
     artifact::quantize::{GenericPanelBytes, encode_generic_panel},
     artifact::reader::FnlpqRangeReader,
     artifact::safetensors::{RowPanel, TensorCensusEntry},
@@ -246,6 +246,9 @@ struct ModelsReconstructCommand {
     /// Re-verify and resume an existing staging file without truncating it.
     #[arg(long)]
     resume: bool,
+    /// Verify complete retained parts from staging, even when their source files are offline.
+    #[arg(long, requires = "resume")]
+    verify_staged_parts: bool,
     /// Maximum new bytes to copy in this invocation; a stopped run retains staging.
     #[arg(long)]
     max_copy_bytes: Option<u64>,
@@ -865,17 +868,22 @@ fn network_download_error_code(error: &HostedNetworkPullError) -> ErrorCode {
 }
 
 fn run_models_reconstruct(command: ModelsReconstructCommand) -> ExitCode {
-    let options = LocalReconstructOptions {
-        resume: command.resume,
-        max_new_bytes: command.max_copy_bytes,
-    };
-    match reconstruct_local_release_with_options(&LocalReconstructRequest {
+    let request = LocalReconstructRequest {
         manifest: command.manifest,
         expected_release_manifest_sha256: command.manifest_sha256,
         parts_dir: command.parts_dir,
         staging_output: command.staging_output,
         output: command.output,
-    }, &options, |_| None) {
+    };
+    let result = if command.verify_staged_parts {
+        resume_local_release_from_staged_parts(&request, command.max_copy_bytes, |_| None)
+    } else {
+        let options = LocalReconstructOptions {
+            resume: command.resume, max_new_bytes: command.max_copy_bytes,
+        };
+        reconstruct_local_release_with_options(&request, &options, |_| None)
+    };
+    match result {
         Ok(report) => {
             eprintln!(
                 "MODELS_RECONSTRUCT RESULT=PASS output={} staging={} artifact_bytes={} artifact_sha256={} manifest_sha256={} parts={} resumed_bytes={} copied_bytes={} directory_durability=unconfirmed",

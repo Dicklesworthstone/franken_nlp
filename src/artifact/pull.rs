@@ -410,6 +410,42 @@ pub fn reconstruct_local_release(
 pub fn reconstruct_local_release_with_options(
     request: &LocalReconstructRequest,
     options: &LocalReconstructOptions,
+    checkpoint: impl FnMut(LocalReconstructProgress) -> Option<DecodeCancellationKind>,
+) -> Result<LocalReconstructReport, PullError> {
+    reconstruct_with_prefix_policy(request, options, PrefixSource::ReleaseParts(&request.parts_dir), checkpoint)
+}
+
+/// Resume offline from independently authenticated complete parts in staging.
+/// Only the incomplete and subsequent parts need to be present in `parts_dir`.
+/// A partial part has no digest of its own, so it must match the corresponding
+/// prefix of a full, digest-verified source part before copying can continue.
+pub fn resume_local_release_from_staged_parts(
+    request: &LocalReconstructRequest,
+    max_new_bytes: Option<u64>,
+    checkpoint: impl FnMut(LocalReconstructProgress) -> Option<DecodeCancellationKind>,
+) -> Result<LocalReconstructReport, PullError> {
+    let options = LocalReconstructOptions { resume: true, max_new_bytes };
+    reconstruct_with_prefix_policy(request, &options, PrefixSource::StagedCompleteParts(&request.parts_dir), checkpoint)
+}
+
+#[derive(Clone, Copy)]
+enum PrefixSource<'a> {
+    ReleaseParts(&'a Path),
+    StagedCompleteParts(&'a Path),
+}
+
+impl<'a> PrefixSource<'a> {
+    fn parts_dir(self) -> &'a Path {
+        match self {
+            Self::ReleaseParts(path) | Self::StagedCompleteParts(path) => path,
+        }
+    }
+}
+
+fn reconstruct_with_prefix_policy(
+    request: &LocalReconstructRequest,
+    options: &LocalReconstructOptions,
+    prefix_source: PrefixSource<'_>,
     mut checkpoint: impl FnMut(LocalReconstructProgress) -> Option<DecodeCancellationKind>,
 ) -> Result<LocalReconstructReport, PullError> {
     let mut progress = LocalReconstructProgress {
@@ -425,13 +461,14 @@ pub fn reconstruct_local_release_with_options(
         // accepted this phase. The complete size is unknown at that boundary.
         artifact_bytes: 0,
     };
-    let result = reconstruct_local_release_inner(request, options, &mut progress, &mut checkpoint);
+    let result = reconstruct_local_release_inner(request, options, prefix_source, &mut progress, &mut checkpoint);
     finish_local_operation(progress, &mut checkpoint, result)
 }
 
 fn reconstruct_local_release_inner(
     request: &LocalReconstructRequest,
     options: &LocalReconstructOptions,
+    prefix_source: PrefixSource<'_>,
     progress: &mut LocalReconstructProgress,
     checkpoint: &mut impl FnMut(LocalReconstructProgress) -> Option<DecodeCancellationKind>,
 ) -> Result<LocalReconstructReport, PullError> {
@@ -454,8 +491,7 @@ fn reconstruct_local_release_inner(
     let mut buffer = vec![0_u8; COPY_CHUNK_BYTES];
     if resumed_bytes != 0 {
         verify_retained_prefix(
-            &mut staging, &manifest, &request.parts_dir, resumed_bytes,
-            &mut buffer, progress, checkpoint,
+            &mut staging, &manifest, prefix_source, resumed_bytes, &mut buffer, progress, checkpoint,
         )?;
     }
     check_staging_path(&staging, &request.staging_output, resumed_bytes)?;
@@ -757,7 +793,7 @@ fn verify_part(
 fn verify_retained_prefix(
     staging: &mut File,
     manifest: &ReleaseManifest,
-    parts_dir: &Path,
+    prefix_source: PrefixSource<'_>,
     retained_bytes: u64,
     buffer: &mut [u8],
     progress: &mut LocalReconstructProgress,
@@ -774,33 +810,48 @@ fn verify_retained_prefix(
         }
         progress.part_index = Some(index);
         reconstruction_checkpoint(*progress, checkpoint)?;
-        let mut source = open_part(parts_dir, index, part)?;
         let prefix_in_part = (retained_bytes - part_start).min(part.bytes);
-        let mut part_bytes = 0_u64;
-        let mut hasher = Sha256::new();
-        loop {
-            reconstruction_checkpoint(*progress, checkpoint)?;
-            let before = part_bytes;
-            let read = read_part_chunk(&mut source, buffer, index, part, &mut part_bytes)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-            let compare = prefix_in_part.saturating_sub(before).min(read as u64) as usize;
-            if compare != 0 {
-                staging.read_exact(&mut retained[..compare]).map_err(|error| PullError::Publish {
-                    operation: "read retained staging prefix", detail: error.to_string(),
+        if matches!(prefix_source, PrefixSource::StagedCompleteParts(_)) && prefix_in_part == part.bytes {
+            let mut hasher = Sha256::new();
+            let mut remaining = part.bytes;
+            while remaining != 0 {
+                reconstruction_checkpoint(*progress, checkpoint)?;
+                let count = remaining.min(buffer.len() as u64) as usize;
+                staging.read_exact(&mut buffer[..count]).map_err(|error| PullError::Publish {
+                    operation: "read complete retained part", detail: error.to_string(),
                 })?;
-                if let Some(mismatch) = retained[..compare].iter()
-                    .zip(&buffer[..compare]).position(|(left, right)| left != right)
-                {
-                    return Err(PullError::ResumePrefixMismatch {
-                        part: index, offset: part_start + before + mismatch as u64,
-                    });
+                hasher.update(&buffer[..count]);
+                remaining -= count as u64;
+            }
+            verify_part(index, part, part.bytes, hasher)?;
+        } else {
+            let mut source = open_part(prefix_source.parts_dir(), index, part)?;
+            let mut part_bytes = 0_u64;
+            let mut hasher = Sha256::new();
+            loop {
+                reconstruction_checkpoint(*progress, checkpoint)?;
+                let before = part_bytes;
+                let read = read_part_chunk(&mut source, buffer, index, part, &mut part_bytes)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+                let compare = prefix_in_part.saturating_sub(before).min(read as u64) as usize;
+                if compare != 0 {
+                    staging.read_exact(&mut retained[..compare]).map_err(|error| PullError::Publish {
+                        operation: "read retained staging prefix", detail: error.to_string(),
+                    })?;
+                    if let Some(mismatch) = retained[..compare].iter()
+                        .zip(&buffer[..compare]).position(|(left, right)| left != right)
+                    {
+                        return Err(PullError::ResumePrefixMismatch {
+                            part: index, offset: part_start + before + mismatch as u64,
+                        });
+                    }
                 }
             }
+            verify_part(index, part, part_bytes, hasher)?;
         }
-        verify_part(index, part, part_bytes, hasher)?;
         progress.verified_prefix_bytes = part_start + prefix_in_part;
         reconstruction_checkpoint(*progress, checkpoint)?;
         part_start = part_start.checked_add(part.bytes).ok_or(PullError::ArtifactLength {
@@ -1175,7 +1226,7 @@ mod tests {
             let mut progress = transfer_progress(combined.len() as u64);
             let mut buffer = [0_u8; 2];
             verify_retained_prefix(
-                &mut stage, &manifest, &root, retained as u64, &mut buffer,
+                &mut stage, &manifest, PrefixSource::ReleaseParts(&root), retained as u64, &mut buffer,
                 &mut progress, &mut |_| None,
             ).expect("authenticate complete prefix");
             assert_eq!(progress.verified_prefix_bytes, retained as u64);
@@ -1201,7 +1252,7 @@ mod tests {
         let mut progress = transfer_progress(combined.len() as u64);
         let mut buffer = [0_u8; 2];
         verify_retained_prefix(
-            &mut stage, &manifest, &root, 2, &mut buffer, &mut progress, &mut |_| None,
+            &mut stage, &manifest, PrefixSource::ReleaseParts(&root), 2, &mut buffer, &mut progress, &mut |_| None,
         ).expect("authenticate original prefix");
         progress.phase = LocalReconstructPhase::Copy;
         let error = copy_remaining_parts(
@@ -1215,7 +1266,7 @@ mod tests {
         assert_eq!(fs::read(&path).expect("read retained prefix"), combined[..6]);
         let mut resumed = transfer_progress(combined.len() as u64);
         verify_retained_prefix(
-            &mut stage, &manifest, &root, 6, &mut buffer, &mut resumed, &mut |_| None,
+            &mut stage, &manifest, PrefixSource::ReleaseParts(&root), 6, &mut buffer, &mut resumed, &mut |_| None,
         ).expect("rehash both retained parts");
         copy_remaining_parts(
             &mut stage, &manifest, &root, 6, &LocalReconstructOptions::default(),
@@ -1236,12 +1287,51 @@ mod tests {
         source.write_all(b"X").expect("mutate source suffix only");
         let mut progress = transfer_progress(combined.len() as u64);
         let error = verify_retained_prefix(
-            &mut stage, &manifest, &root, 8, &mut [0_u8; 2],
+            &mut stage, &manifest, PrefixSource::ReleaseParts(&root), 8, &mut [0_u8; 2],
             &mut progress, &mut |_| None,
         ).expect_err("whole source part digest is required before any append");
         assert!(matches!(error, PullError::PartDigest { part: 2, .. }));
         assert_eq!(fs::read(path).expect("read untouched stage"), combined[..8]);
         assert_eq!(progress.copied_bytes, 0);
+    }
+
+    #[test]
+    fn staged_part_resume_reads_only_incomplete_and_remaining_source_parts() {
+        let (root, manifest, combined) = transfer_fixture();
+        let suffix_dir = root.join("suffix");
+        fs::create_dir(&suffix_dir).unwrap();
+        let last = &manifest.parts[2].name;
+        fs::copy(root.join(last), suffix_dir.join(last)).unwrap();
+
+        for retained in [7, 8, combined.len()] {
+            let path = root.join(format!("staged-parts-{retained}"));
+            let mut stage = open_staging(&path, false).unwrap();
+            stage.write_all(&combined[..retained]).unwrap();
+            let mut progress = transfer_progress(combined.len() as u64);
+            verify_retained_prefix(
+                &mut stage, &manifest, PrefixSource::StagedCompleteParts(&suffix_dir), retained as u64, &mut [0; 2], &mut progress, &mut |_| None,
+            ).unwrap();
+            assert_eq!(progress.verified_prefix_bytes, retained as u64);
+            copy_remaining_parts(
+                &mut stage, &manifest, &suffix_dir, retained as u64,
+                &LocalReconstructOptions::default(), &mut progress, &mut |_| None,
+            ).unwrap();
+            assert_eq!(fs::read(path).unwrap(), combined);
+        }
+
+        // The old source still exists and is good. Damage in a staged
+        // complete part must fail at that part, before any copy or repair.
+        let path = root.join("damaged-complete-part");
+        let mut stage = open_staging(&path, false).unwrap();
+        stage.write_all(b"abcXXXXh").unwrap();
+        let mut progress = transfer_progress(combined.len() as u64);
+        let result = verify_retained_prefix(
+            &mut stage, &manifest, PrefixSource::StagedCompleteParts(&root), 8,
+            &mut [0; 2], &mut progress, &mut |_| None,
+        );
+        assert!(matches!(result, Err(PullError::PartDigest { part: 1, .. })));
+        assert_eq!(progress.verified_prefix_bytes, 3);
+        assert_eq!(fs::read(path).unwrap(), b"abcXXXXh");
     }
 
     fn request(staging: &str, output: &str) -> LocalReconstructRequest {

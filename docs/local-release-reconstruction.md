@@ -39,6 +39,15 @@ append. A mismatching prefix, changed part or oversized staging file refuses
 without repairing or extending the retained file. Starting with a new staging
 pathname remains available when the retained file is unusable.
 
+If earlier part files are on removable media or have been archived, add
+`--resume --verify-staged-parts`. This hashes each **complete** retained part
+directly from staging against the pinned manifest. Supply the source file for
+a partially retained part and all remaining parts in `--parts-dir`. A complete
+staging file can be verified and published with an empty parts directory and
+`--max-copy-bytes 0`. Any damaged retained part stops the operation before
+the first append. The equivalent library entry point is
+`resume_local_release_from_staged_parts`.
+
 For an explicit amount of new copying per invocation, add a byte limit:
 
 ```sh
