@@ -1,4 +1,6 @@
 //! Complete-document INT8 samples share one source, work and output contract.
+pub(in crate::candidate_cli) mod corpus;
+pub(in crate::candidate_cli) mod job;
 use super::*;
 use crate::{
     tasks::{mapreduce::ChunkLimits, sentiment::sampled::quantized::long::{

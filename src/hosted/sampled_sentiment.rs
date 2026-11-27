@@ -4,7 +4,11 @@
 //! survive physical completion.
 
 mod long;
-pub use long::Int8SampledSentimentMapHostConfig;
+pub use long::{Int8SampledSentimentMapHostConfig, Int8SampledSentimentDocumentBatchHostConfig};
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub use long::{Int8SampledSentimentDocumentJobRequirements,
+    int8_sampled_sentiment_document_job_requirements};
 
 use super::*;
 use crate::{

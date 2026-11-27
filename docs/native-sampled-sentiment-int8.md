@@ -445,4 +445,135 @@ charges the numerical workers.
 This new route has source-reviewed task, hosted and CLI regression definitions,
 including an explicitly armed real-model comparison gate. Compilation, executed
 regressions, numerical parity, quality and performance remain pending controller
-validation. The current command processes one complete document per invocation.
+validation. The map command processes one complete document per invocation.
+
+## Complete-document resident populations
+
+Use `fnlp candidate sentiment-sampled-corpus` to process ordered NDJSON
+documents while keeping one INT8 model, compiler, vocabulary and native context
+resident. It uses the same lossless complete-document estimator as
+`sentiment-sampled-map`. Each successful record contains every chunk,
+sample and explanation with original source spans.
+
+```jsonl
+{"id":"document-42","text":"The complete first document...","task_args":{"axes":["valence","arousal"]}}
+{"id":"document-43","text":"The complete second document..."}
+{"flush":true}
+```
+
+```sh
+fnlp candidate sentiment-sampled-corpus documents.ndjson \
+  --model /path/to/local-current-candidate-int8-artifact \
+  --memory-mib 65536 \
+  --seed 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --samples 4 --max-chunks 64 \
+  --max-forward-positions 1048576 \
+  --max-document-forward-positions 131072 \
+  --max-requests 100 --max-input-mib 64 --max-output-mib 128 \
+  --compute-threads 4 --prefill-rows 8
+```
+
+The memory value is an example ceiling; the independent CLI and hosted quotes
+must both fit it before input or model IO. Source length, chunk count, retained
+results, output envelopes and physical scheduling all affect that quote.
+
+Stable IDs participate in sample addressing along with the actual source,
+chunk coordinates and task policy. Reordering records or adding flush controls
+preserves those addresses. A flush begins a new duplicate-ID epoch without
+renewing work. Empty or malformed records and failed documents remain visible
+in the ordered protocol; any failed item makes the process exit nonzero.
+The terminal completion frame is published only after physical worker join.
+
+The scopes of the limits are explicit:
+
+| Options | Resident population scope |
+| --- | --- |
+| Five `--max-*` native work flags | One nonrenewable allowance across all records and admitted failures |
+| `--max-mask-node-visits` | One nonrenewable grammar-mask allowance across the population |
+| `--max-document-forward-positions`, `--max-document-projected-logits`, `--max-document-attention-pairs` | Optional complete-document limits, each at most its population allowance |
+| `--max-document-dot-products`, `--max-document-multiply-accumulates`, `--max-document-mask-node-visits` | Optional complete-document projection and mask limits |
+| `--max-input-bytes`, chunk and map-result flags | Each complete original document |
+| `--max-requests`, `--max-input-mib`, `--max-output-mib`, `--max-line-bytes` | Input framing and complete candidate-framed output |
+| Compact tokenizer work flags | One live invocation ledger across all records, accepted/rejected probes and failed preparations |
+| Deadline and checkpoint flags | One end-to-end population invocation |
+
+If a document limit is omitted, it equals that dimension's population ceiling.
+An optional complete `task_args.budget` can further tighten a record.
+Native work is conservatively charged before execution and is not refunded
+after early EOS, output failure or unsuccessful admission. A failed chunk never
+produces a successful partial-document result.
+
+Library users have `Int8SampledSentimentDocumentBatchHostConfig`, its pure
+`requirements()` and `requirements_with_threads(width)` quotes, and
+`NlpEngine::batch_int8_sampled_sentiment_documents` with its
+`_with_threads` variant. Width one uses the serial quote; the threaded
+quote accepts widths two through 64. The lower-level sealed planner and
+processor live in `batch::sentiment::sampled::quantized::long`.
+
+## Durable complete-document start and resume
+
+`fnlp candidate sentiment-sampled-document-job start|resume` applies
+the same complete-document estimator to an authenticated, retained population.
+It requires `metadata-store` and `asupersync-runtime` on Linux
+x86-64 or AArch64. The explicit storage contract uses an existing protected job
+directory, expected job ID, protected file containing a 32-byte raw secret,
+and immutable `JobLimits` JSON.
+
+```sh
+fnlp candidate sentiment-sampled-document-job start documents.ndjson \
+  --model /path/to/local-current-candidate-int8-artifact \
+  --memory-mib 65536 \
+  --seed 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --store-results --job-dir /path/to/protected-job \
+  --job-id 0123456789abcdef0123456789abcdef \
+  --key-file /path/to/raw-32-byte.key \
+  --limits /path/to/immutable-job-limits.json \
+  --samples 4 --max-chunks 64 --prefill-rows 8 --compute-threads 4
+```
+
+For ordinary resume, repeat those semantic and storage arguments with
+`resume` and the complete original NDJSON population. Durable
+populations accept complete records and do not use flush controls. Committed
+results are authenticated and reused; pending work resumes under the remaining
+lifetime allowances.
+
+The private recipe binds the actual model identity, seed and sampling policy,
+prompt/grammar/compiler policy, exact source population, complete-document
+mapping and output limits, encoding policy, and prefill schedule. Changed
+recipes or populations refuse resume before pending inference or tail repair.
+Worker count is physical scheduling metadata and may change on resume.
+Optional `--discard-uncommitted-tail` authorizes repair only after
+authentication.
+
+The five native counters and mask visits in the immutable job limits are
+copied exactly as lifetime ceilings. They are never multiplied by records,
+chunks, sample counts or attempts, and do not renew on restart. CLI native and
+mask flags bound one complete document and must fit those lifetime ceilings.
+Failed-attempt debits remain spent. Compact tokenizer work is cumulative within
+each invocation; its counters are not added to the journal's six persisted
+native/mask dimensions.
+
+Retaining input requires an independent opt-in:
+
+- At start, add `--spool-input --max-retained-input-mib N`.
+- On retained resume, omit the population positional argument and use
+  `--use-retained-input --max-retained-input-mib N` with the original cap.
+- `--store-results` remains required. `--materialize` publishes the
+  verified result file only after all items commit.
+
+Stdout contains verified job metadata rather than private generated document
+results. The guarded complete-document result stays charged through durable
+commit, and final metadata publication preserves the original cancellation
+cause even if its write or flush fails.
+
+Library users have
+`jobs::runner::sampled_sentiment::quantized::long::Int8SampledSentimentDocumentJobPlanner`,
+`int8_sampled_sentiment_document_job_requirements`, and the
+`NlpEngine::job_int8_sampled_sentiment_documents` serial/team APIs.
+The planner derives its immutable recipe from the actual model-bound planner;
+callers cannot replace that authority with a deserialized result envelope.
+
+The resident and durable adapters, command routes, memory and accounting
+regression definitions have source review. Compilation, executed regressions,
+native-model parity/recovery, throughput and task-quality evidence remain
+pending controller validation.

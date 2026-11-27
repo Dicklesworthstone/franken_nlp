@@ -58,7 +58,7 @@ impl EncodingArgs {
     }
 }
 #[derive(Args)]
-pub(super) struct StorageArgs {
+pub(in crate::candidate_cli) struct StorageArgs {
     /// Required consent to retain private extraction results in the owner-only spool.
     #[arg(long)]
     pub store_results: bool,

@@ -1,6 +1,12 @@
 //! Complete INT8 sampled documents on one admitted native lifetime.
 //! Every source chunk, independent axis and sample shares the same deadline,
 //! cold-work allowance, process ledger, native allocation and optional team.
+mod corpus;
+pub use corpus::Int8SampledSentimentDocumentBatchHostConfig;
+#[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod job;
+#[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub use job::{Int8SampledSentimentDocumentJobRequirements, int8_sampled_sentiment_document_job_requirements};
 use super::*;
 use crate::{
     native_engine::decode::DecodeStepControl,

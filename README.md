@@ -2183,6 +2183,26 @@ persistent INT8 workers compose with the same document plan. Failed chunks
 cannot produce a completed document. See the
 [complete-document usage and API guide](docs/native-sampled-sentiment-int8.md#complete-document-sampled-maps).
 
+### Resident and durable complete-document populations
+
+`fnlp candidate sentiment-sampled-corpus` applies the complete-document
+estimator to ordered NDJSON while retaining one model, compiler and native
+context. Stable record IDs preserve sample addressing; all chunks must finish
+before a document succeeds. Native and mask flags cover the entire population,
+with optional `--max-document-*` limits for individual documents.
+Compact tokenizer work spans the invocation, and final completion waits for
+physical worker join.
+
+`fnlp candidate sentiment-sampled-document-job start|resume` adds
+authenticated durable execution with original or explicitly retained input.
+Its actual-planner recipe binds sampling, source, document limits and prefill;
+the journal retains failed-attempt debits across resume. All five native work
+counters and mask visits remain exact lifetime ceilings. Results require
+explicit retention, stdout is verified metadata, and materialization waits for
+every item to commit. See the [population and resume guide](docs/native-sampled-sentiment-int8.md#complete-document-resident-populations)
+for commands, storage options, per-document versus lifetime limits, library APIs
+and pending execution gates.
+
 ## Implemented candidate sampled sentiment
 
 `fnlp candidate source-int4 sentiment-sampled` implements independent seeded

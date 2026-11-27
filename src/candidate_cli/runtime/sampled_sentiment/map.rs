@@ -1,4 +1,8 @@
 //! Complete-document sampled INT8 execution through one charged host request.
+pub(in crate::candidate_cli) mod corpus;
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(in crate::candidate_cli) mod job;
 use super::*;
 use crate::{
     candidate_cli::sampled_sentiment::map::{MapLimits, SampledSentimentMapCommand},
@@ -123,10 +127,10 @@ pub(in crate::candidate_cli) fn execute(command: SampledSentimentMapCommand, lim
     axes.sort_unstable();
     let samples = host.options.samples;
     drop(text);
-    let facts = checked_stage(session.facts(&limits.common), &check, setup_failure)?;
+    let facts = checked_stage(session.facts_with_error_detail(&limits.common), &check, session_failure)?;
     let cancellation = CancellationToken::default();
-    let model = checked_stage(session.load(&limits.common, limits.shared, &facts, cancellation.clone()),
-        &check, setup_failure)?;
+    let model = checked_stage(session.load_with_error_detail(&limits.common, limits.shared, &facts, cancellation.clone()),
+        &check, session_failure)?;
     host.native.run.max_elapsed = checked_stage(session.remaining(), &check, setup_failure)?;
     // Planning, native work and deterministic reduction happen together under
     // the transferred request's deadline and nonrenewable work allowances.

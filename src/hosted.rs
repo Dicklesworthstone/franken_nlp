@@ -82,7 +82,10 @@ pub use scored::{Int8ClassificationMapHostConfig, Int8ClassificationMapMemoryReq
 mod sentiment;
 pub use sentiment::{SentimentHostLimits, Int8SentimentMapHostConfig};
 mod sampled_sentiment;
-pub use sampled_sentiment::{Int8SampledSentimentHostLimits, Int8SampledSentimentMapHostConfig};
+pub use sampled_sentiment::{Int8SampledSentimentHostLimits, Int8SampledSentimentMapHostConfig,
+    Int8SampledSentimentDocumentBatchHostConfig};
+#[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub use sampled_sentiment::{Int8SampledSentimentDocumentJobRequirements, int8_sampled_sentiment_document_job_requirements};
 mod redact;
 pub use redact::{RedactConfig, RedactionPseudonyms};
 mod resolve;

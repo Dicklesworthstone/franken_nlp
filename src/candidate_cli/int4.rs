@@ -19,7 +19,7 @@ mod redact;
 mod extract;
 mod semantic;
 mod extract_batch;
-mod extract_job;
+pub(in crate::candidate_cli) mod extract_job;
 mod extract_map;
 mod extract_document_job;
 mod source;
