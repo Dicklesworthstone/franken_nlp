@@ -39,19 +39,51 @@ pub(in crate::native_engine) fn workspace_bytes() -> Result<u64, GenerationError
     (NANBEIGE_VOCAB_SIZE as u64).checked_mul(per_row as u64)
         .and_then(|n| n.checked_add(4096)).ok_or(GenerationError::Limit("sampler accounting"))
 }
+fn tracks_frequencies(p: &GenerationOptions) -> bool {
+    p.repetition_penalty_milli != 1000 || p.presence_penalty_milli != 0 || p.frequency_penalty_milli != 0
+}
+
+/// Generation binds the complete processor policy before allocating a cursor.
+/// Raw model logits and result storage are accounted for by the native caller.
+pub(super) fn generation_workspace_bytes(p: &GenerationOptions) -> Result<u64, GenerationError> {
+    let mut per_row = if tracks_frequencies(p) { size_of::<u32>() } else { 0 };
+    if let GenerationSampling::Seeded { top_k, .. } = &p.sampling {
+        per_row += size_of::<u32>() + size_of::<f32>();
+        // With top-k enabled, the nucleus contains at most MAX_TOP_K entries,
+        // covered by the fixed 4096-byte allowance (including the top-k heap).
+        if top_k.is_none() { per_row += size_of::<NucleusToken>(); }
+    }
+    (NANBEIGE_VOCAB_SIZE as u64).checked_mul(per_row as u64)
+        .and_then(|bytes| bytes.checked_add(4096)).ok_or(GenerationError::Limit("sampler accounting"))
+}
+
 pub(in crate::native_engine) struct Workspace {
     counts: Vec<u32>, ids: Vec<u32>, logits: Vec<f32>, last_selected_id: Option<u32>,
+    greedy_best: Option<(u32, f32)>,
 }
 impl Workspace {
     pub fn new(prompt: &[u32]) -> Result<Self, GenerationError> {
-        let mut counts = reserved(NANBEIGE_VOCAB_SIZE)?; counts.resize(NANBEIGE_VOCAB_SIZE, 0_u32);
-        let mut result = Self { counts, ids: reserved(NANBEIGE_VOCAB_SIZE)?,
-            logits: reserved(NANBEIGE_VOCAB_SIZE)?, last_selected_id: None };
+        Self::allocate(prompt, NANBEIGE_VOCAB_SIZE, NANBEIGE_VOCAB_SIZE)
+    }
+    pub(super) fn for_generation(prompt: &[u32], p: &GenerationOptions) -> Result<Self, GenerationError> {
+        let frequency_rows = if tracks_frequencies(p) { NANBEIGE_VOCAB_SIZE } else { 0 };
+        let sampled_rows = match &p.sampling {
+            GenerationSampling::Greedy => 0,
+            GenerationSampling::Seeded { .. } => NANBEIGE_VOCAB_SIZE,
+        };
+        Self::allocate(prompt, frequency_rows, sampled_rows)
+    }
+    fn allocate(prompt: &[u32], frequency_rows: usize, sampled_rows: usize) -> Result<Self, GenerationError> {
+        let mut counts = reserved(frequency_rows)?;
+        counts.resize(frequency_rows, 0_u32);
+        let mut result = Self { counts, ids: reserved(sampled_rows)?,
+            logits: reserved(sampled_rows)?, last_selected_id: None, greedy_best: None };
         for &id in prompt { result.commit(id)?; }
         Ok(result)
     }
     pub fn commit(&mut self, token: u32) -> Result<(), GenerationError> {
-        let count = self.counts.get_mut(token as usize).ok_or(GenerationError::InvalidLogits)?;
+        if token as usize >= NANBEIGE_VOCAB_SIZE { return Err(GenerationError::InvalidLogits); }
+        let Some(count) = self.counts.get_mut(token as usize) else { return Ok(()); };
         *count = count.checked_add(1).ok_or(GenerationError::Limit("token frequency"))?; Ok(())
     }
     pub fn select_with_control<C: DecodeStepControl + ?Sized>(&mut self, raw: &[f32],
@@ -75,7 +107,7 @@ impl Workspace {
         C: DecodeStepControl + ?Sized>(&mut self, raw: &[f32], p: &GenerationOptions,
         key: StableRequestKey, sample_index: u64, step: usize, legal: F, control: &mut C,
     ) -> Result<u32, GenerationError> {
-        if raw.is_empty() || raw.len() > self.counts.len() { return Err(GenerationError::InvalidLogits); }
+        if raw.is_empty() || raw.len() > NANBEIGE_VOCAB_SIZE { return Err(GenerationError::InvalidLogits); }
         self.select_processed(raw, p, key, sample_index, step, legal, control)
     }
     #[cfg(test)]
@@ -108,7 +140,7 @@ impl Workspace {
     /// buffers. The caller must supply EVERY legal row, in original ID order,
     /// before finishing; this private seam never invents absent logits.
     pub(in crate::native_engine) fn begin_legal_rows(&mut self) {
-        self.ids.clear(); self.logits.clear(); self.last_selected_id = None;
+        self.ids.clear(); self.logits.clear(); self.last_selected_id = None; self.greedy_best = None;
     }
 
     /// Append a bounded projection block through the SAME ordered arithmetic
@@ -119,7 +151,7 @@ impl Workspace {
         if rows.is_empty() || rows.len() != raw.len()
             || rows.windows(2).any(|pair| pair[0] >= pair[1])
             || self.last_selected_id.is_some_and(|last| rows[0] <= last)
-            || rows.last().is_some_and(|&id| id as usize >= self.counts.len())
+            || rows.last().is_some_and(|&id| id as usize >= NANBEIGE_VOCAB_SIZE)
             || raw.iter().any(|value| !value.is_finite()) {
             return Err(GenerationError::InvalidLogits);
         }
@@ -138,7 +170,7 @@ impl Workspace {
             || (step < p.min_new_tokens as u64 && p.eos_token_ids.binary_search(&id).is_ok()) {
             return Ok(());
         }
-        let count = self.counts[id as usize];
+        let count = self.counts.get(id as usize).copied().unwrap_or(0);
         let mut value = f64::from(raw_logit);
         if count > 0 {
             value = if value > 0.0 { value / repetition } else { value * repetition };
@@ -148,6 +180,13 @@ impl Workspace {
         value += f64::from(*p.logit_bias_milli.get(&id).unwrap_or(&0)) / 1000.0;
         let processed = (value / temperature) as f32;
         if !processed.is_finite() { return Err(GenerationError::InvalidLogits); }
+        if matches!(&p.sampling, GenerationSampling::Greedy) {
+            // Rows arrive in ID order. Exact equality keeps the first legal ID.
+            if self.greedy_best.is_none_or(|(_, best)| processed > best) {
+                self.greedy_best = Some((id, processed));
+            }
+            return Ok(());
+        }
         // Compact IDs remain increasing, preserving the pinned sampler's
         // lowest-original-ID tie break without feeding artificial -Inf.
         self.ids.push(id); self.logits.push(processed);
@@ -160,19 +199,11 @@ impl Workspace {
         &self, p: &GenerationOptions, key: StableRequestKey, sample_index: u64, step: usize,
         control: &mut C) -> Result<u32, GenerationError> {
         checkpoint(control, step)?;
-        if self.ids.is_empty() { return Err(GenerationError::NoLegalToken); }
         let selected = match &p.sampling {
-            GenerationSampling::Greedy => {
-                let mut checkpoints = SamplingCheckpoints::new(control, step);
-                let mut best = 0;
-                for index in 1..self.logits.len() {
-                    checkpoints.visit().map_err(sampler_error)?;
-                    if self.logits[index] > self.logits[best] { best = index; }
-                }
-                checkpoints.checkpoint().map_err(sampler_error)?;
-                best
-            }
+            GenerationSampling::Greedy => return self.greedy_best.map(|(id, _)| id)
+                .ok_or(GenerationError::NoLegalToken),
             GenerationSampling::Seeded { effective_seed, top_k, top_p_ppm, .. } => {
+                if self.ids.is_empty() { return Err(GenerationError::NoLegalToken); }
                 let uniform = addressed_uniform(Seed256::from(*effective_seed), key,
                     DrawAddress::new(sample_index, step as u64, 0));
                 select_uniform_with_control(&self.logits, *top_k,
@@ -370,6 +401,26 @@ mod tests {
             assert!(matches!(result, Err(GenerationError::Cancelled(actual)) if actual == cause));
             assert_eq!(visits.get(), SAMPLING_CHECKPOINT_STRIDE);
             assert!(workspace.ids.is_empty());
+        }
+    }
+
+    #[test]
+    fn greedy_workspace_tracks_only_active_penalties_and_retains_the_first_legal_maximum() {
+        let mut p = GenerationOptions::greedy(2, 100, 0);
+        p.banned_token_ids = vec![0];
+        let key = StableRequestKey::from_canonical_digest([0; 32]);
+        let raw = [100.0, 3.0, 3.0, -1.0];
+        for (penalty, expected, count_rows) in [(1000, 1, 0), (2000, 2, NANBEIGE_VOCAB_SIZE)] {
+            p.repetition_penalty_milli = penalty;
+            let mut workspace = Workspace::for_generation(&[1], &p).unwrap();
+            let expected_bytes = (count_rows * size_of::<u32>()) as u64 + 4096;
+            assert_eq!(generation_workspace_bytes(&p).unwrap(), expected_bytes);
+            assert!(p.validate(GenerationLimits { max_sampler_bytes: expected_bytes, ..Default::default() }).is_ok());
+            assert!(p.validate(GenerationLimits { max_sampler_bytes: expected_bytes - 1, ..Default::default() }).is_err());
+            assert_eq!(workspace.select_legal(&raw, &p, key, 0, 0, |_| true).unwrap(), expected);
+            assert_eq!((workspace.ids.capacity(), workspace.logits.capacity()), (0, 0));
+            assert_eq!(workspace.counts.len(), count_rows);
+            assert!(workspace.commit(NANBEIGE_VOCAB_SIZE as u32).is_err());
         }
     }
 

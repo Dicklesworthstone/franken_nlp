@@ -26,7 +26,7 @@ impl<'a> Cursor<'a> {
             native_work: GenerationWork::default(),
         };
         Ok(Self { plan, output, prompt_cursor: 0, done: false, awaiting_selection: false, marker_consumed: false,
-            workspace: policy::Workspace::new(&plan.prompt)? })
+            workspace: policy::Workspace::for_generation(&plan.prompt, p)? })
     }
     /// The boolean is true precisely when this forward must select a token.
     pub fn next_token(&self) -> Result<(u32, bool), GenerationError> {

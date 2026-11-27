@@ -84,7 +84,7 @@ impl GenerationOptions {
     /// rendering/tokenizing text, allocating a sampler or touching the engine.
     pub fn validate(&self, limits: GenerationLimits) -> Result<(), GenerationError> {
         policy::validate(self, limits)?;
-        if policy::workspace_bytes()? > limits.max_sampler_bytes { return Err(GenerationError::Limit("sampler storage")); }
+        if policy::generation_workspace_bytes(self)? > limits.max_sampler_bytes { return Err(GenerationError::Limit("sampler storage")); }
         Ok(())
     }
 }
@@ -232,7 +232,7 @@ impl GenerationPlan {
         let bound = GenerationWork { forward_positions: positions,
             projected_logits: head_positions.checked_mul(NANBEIGE_VOCAB_SIZE as u64).ok_or(GenerationError::Limit("logits"))?,
             sampled_steps: if matches!(&options.sampling, GenerationSampling::Seeded { .. }) { options.max_new_tokens as u64 } else { 0 } };
-        let sampler_bytes = policy::workspace_bytes()?;
+        let sampler_bytes = policy::generation_workspace_bytes(&options)?;
         identity.prompt_digest = digest(&prompt)?;
         // Item/sample selection affects addressed draws, so admission/resume
         // identity must bind it too, not just the decoder's private request key.
