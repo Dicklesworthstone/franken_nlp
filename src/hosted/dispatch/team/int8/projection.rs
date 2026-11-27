@@ -258,9 +258,15 @@ impl<'view, 'weights> TeamExecutor<'view, 'weights> {
 }
 impl Drop for TeamExecutor<'_, '_> {
     fn drop(&mut self) {
-        let reason = if std::thread::panicking() { TeamDrainReason::CoordinatorPanicked }
+        let panicking = std::thread::panicking();
+        let reason = if panicking { TeamDrainReason::CoordinatorPanicked }
             else if self.complete { TeamDrainReason::Completed } else { TeamDrainReason::Cancelled };
-        if !self.complete { self.shared.stop(DecodeCancellationKind::FailFast); }
+        // A returned projection has already collected every in-flight row.
+        // Ordinary task failures only require disconnecting idle workers;
+        // adding FailFast here would replace both the typed failure and any
+        // authentic cancellation first observed during the physical join.
+        // An unwind can still interrupt projection work and must stop peers.
+        if panicking { self.shared.stop(DecodeCancellationKind::FailFast); }
         self.team.begin_drain(reason);
         self.disconnect();
     }

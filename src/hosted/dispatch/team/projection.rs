@@ -253,9 +253,15 @@ impl<'a> TeamExecutor<'a> {
 }
 impl Drop for TeamExecutor<'_> {
     fn drop(&mut self) {
-        let reason = if std::thread::panicking() { TeamDrainReason::CoordinatorPanicked }
+        let panicking = std::thread::panicking();
+        let reason = if panicking { TeamDrainReason::CoordinatorPanicked }
             else if self.complete { TeamDrainReason::Completed } else { TeamDrainReason::Cancelled };
-        if !self.complete { self.shared.stop(DecodeCancellationKind::FailFast); }
+        // Projection calls are synchronous and recover their in-flight rows
+        // before returning an error. An ordinary task refusal therefore only
+        // has idle workers to disconnect; it must not manufacture cancellation
+        // or mask a real caller stop arriving during physical drain. Unwind
+        // may interrupt a live projection, so it still stops peer work.
+        if panicking { self.shared.stop(DecodeCancellationKind::FailFast); }
         self.team.begin_drain(reason);
         // Both gate abort and lane disconnect run on every unwind/error path.
         // No child depends on a fixed-count barrier or a blocking final reply.

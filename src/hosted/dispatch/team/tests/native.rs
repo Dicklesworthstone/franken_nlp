@@ -297,6 +297,58 @@ fn post_join_observation_preserves_the_original_stop_and_task_failure() {
 }
 
 #[test]
+fn ordinary_task_failure_keeps_its_type_after_completed_projections_and_join() {
+    for width in [2, 3, 7] {
+        let (weights, input) = projection_fixture(4);
+        let mut workspace = Workspace::new(width, 4).unwrap();
+        let dropped = track_children(&mut workspace);
+        let token = CancellationToken::default();
+        let shared = RunShared::new(limits(100_000), token.clone()).unwrap();
+        let error = run_scope(&Cx::for_testing(), &weights, &mut workspace, width,
+            PackedInt4Kernel::scalar(), Arc::clone(&shared), |_, control, executor| {
+                executor.project_f32_into(Int4ProjectionOp::Head, &input,
+                    LinearRows::Selected(&[0, 3, 5]), &mut [0.0; 3], control).map_err(native_error)?;
+                assert_eq!(executor.stats().completed_projections, 1);
+                assert_eq!(dropped.load(Ordering::SeqCst), 0);
+                Err::<(), _>(HostedError::Limits("injected task refusal"))
+            }).unwrap_err();
+        assert!(matches!(error, HostedError::Limits("injected task refusal")),
+            "ordinary task errors must not become fabricated FailFast cancellation");
+        assert_eq!(token.cause(), None);
+        assert!(shared.state.lock().unwrap().stopped.is_none());
+        assert_eq!(dropped.load(Ordering::SeqCst), width - 1);
+    }
+}
+
+#[test]
+fn task_failure_does_not_mask_a_first_caller_stop_during_physical_drain() {
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let (weights, input) = projection_fixture(4);
+        let mut workspace = Workspace::new(3, 4).unwrap();
+        let token = CancellationToken::default();
+        workspace.cancel_on_exit = Some((token.clone(), cause));
+        let dropped = track_children(&mut workspace);
+        let shared = RunShared::new(limits(100_000), token.clone()).unwrap();
+        let error = run_scope(&Cx::for_testing(), &weights, &mut workspace, 3,
+            PackedInt4Kernel::scalar(), shared, |_, control, executor| {
+                executor.project_f32_into(Int4ProjectionOp::Head, &input,
+                    LinearRows::Selected(&[0, 3, 5]), &mut [0.0; 3], control).map_err(native_error)?;
+                assert_eq!(token.cause(), None);
+                Err::<(), _>(HostedError::Limits("injected task refusal"))
+            }).unwrap_err();
+        let HostedError::Stopped { stop, task_error: Some(error) } = error else {
+            panic!("physical drain must retain both caller cancellation and the task failure");
+        };
+        assert_eq!(stop.kind, cause);
+        assert!(matches!(*error, HostedError::Limits("injected task refusal")));
+        assert_eq!(token.cause(), Some(cause));
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[test]
 fn worker_checkpoints_share_one_monotone_request_allowance_and_first_cause() {
     let cx = Cx::for_testing().restrict::<cap::None>();
     let token = CancellationToken::default();

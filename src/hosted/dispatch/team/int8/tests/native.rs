@@ -188,6 +188,62 @@ fn cancellation_during_physical_drain_prevents_a_successful_publication() {
 }
 
 #[test]
+fn ordinary_task_failure_keeps_its_type_after_completed_projections_and_join() {
+    for width in [2, 3, 7] {
+        let fixture = ProjectionFixture::new(51);
+        let weights = fixture.weights(); let input = fixture.input();
+        let mut workspace = Workspace::new(width).unwrap();
+        let dropped = track_children(&mut workspace);
+        let token = CancellationToken::default();
+        let shared = RunShared::new(limits(100_000), token.clone()).unwrap();
+        let error = run_scope(&Cx::for_testing(), &weights, &mut workspace, width,
+            Int8Kernel::scalar(), Arc::clone(&shared), |control, executor| {
+                executor.project_f32_into(Int8ProjectionOp::Head, &input,
+                    LinearRows::Selected(&[0, 3, 5]), &mut [0.0; 3], control)
+                    .map_err(HostedError::Native)?;
+                assert_eq!(executor.stats().completed_projections, 1);
+                assert_eq!(dropped.load(Ordering::SeqCst), 0);
+                Err::<(), _>(HostedError::Limits("injected task refusal"))
+            }).unwrap_err();
+        assert!(matches!(error, HostedError::Limits("injected task refusal")),
+            "ordinary task errors must not become fabricated FailFast cancellation");
+        assert_eq!(token.cause(), None);
+        assert!(shared.state.lock().unwrap().stopped.is_none());
+        assert_eq!(dropped.load(Ordering::SeqCst), width - 1);
+    }
+}
+
+#[test]
+fn task_failure_does_not_mask_a_first_caller_stop_during_physical_drain() {
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let fixture = ProjectionFixture::new(52);
+        let weights = fixture.weights(); let input = fixture.input();
+        let mut workspace = Workspace::new(3).unwrap();
+        let token = CancellationToken::default();
+        workspace.cancel_on_exit = Some((token.clone(), cause));
+        let dropped = track_children(&mut workspace);
+        let shared = RunShared::new(limits(100_000), token.clone()).unwrap();
+        let error = run_scope(&Cx::for_testing(), &weights, &mut workspace, 3,
+            Int8Kernel::scalar(), shared, |control, executor| {
+                executor.project_f32_into(Int8ProjectionOp::Head, &input,
+                    LinearRows::Selected(&[0, 3, 5]), &mut [0.0; 3], control)
+                    .map_err(HostedError::Native)?;
+                assert_eq!(token.cause(), None);
+                Err::<(), _>(HostedError::Limits("injected task refusal"))
+            }).unwrap_err();
+        let HostedError::Stopped { stop, task_error: Some(error) } = error else {
+            panic!("physical drain must retain both caller cancellation and the task failure");
+        };
+        assert_eq!(stop.kind, cause);
+        assert!(matches!(*error, HostedError::Limits("injected task refusal")));
+        assert_eq!(token.cause(), Some(cause));
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[test]
 fn worker_and_coordinator_panics_join_every_child_before_scope_completion() {
     let fixture = ProjectionFixture::new(5); let weights = fixture.weights(); let input = fixture.input();
     let mut workspace = Workspace::new(4).unwrap(); workspace.panic_worker = Some(1);
