@@ -131,6 +131,7 @@ impl Int8SampledSentimentPlanner {
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn task_budget(&self) -> TaskBudget { self.ceiling }
     pub fn limits(&self) -> SampledSentimentLimits { self.limits }
+    pub fn sampling_options(&self) -> &SampledSentimentOptions { &self.options }
     #[cfg(all(feature = "metadata-store", target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub(crate) fn durable_options(&self) -> &SampledSentimentOptions { &self.options }

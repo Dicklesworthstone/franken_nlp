@@ -513,4 +513,6 @@ fn checkpoint<C: DecodeStepControl>(control: &mut C) -> Result<(), BatchItemFail
     }
 }
 
+pub mod long;
+
 #[cfg(test)] mod tests;
