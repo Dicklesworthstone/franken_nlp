@@ -118,6 +118,7 @@ pub(crate) enum CandidateCommand {
     SampledSentiment(sampled_sentiment::SampledSentimentCommand),
     SampledSentimentMap(sampled_sentiment::map::SampledSentimentMapCommand),
     SampledSentimentBatch(sampled_sentiment::corpus::Command),
+    SampledSentimentJob(sampled_sentiment::job::JobCommand),
     SentimentMap(sentiment_map::SentimentMapCommand),
     ClassifyMap(classify_map::ClassifyMapCommand),
     Extract(extract::ExtractCommand),
@@ -149,6 +150,7 @@ pub(crate) fn definition() -> clap::Command {
         .subcommand(sampled_sentiment::definition())
         .subcommand(sampled_sentiment::map::definition())
         .subcommand(sampled_sentiment::corpus::definition())
+        .subcommand(sampled_sentiment::job::definition())
         .subcommand(sentiment_map::definition())
         .subcommand(classify_map::definition())
         .subcommand(batch::definition())
@@ -209,6 +211,9 @@ impl CandidateCommand {
         }
         if name == "sentiment-map" {
             return sentiment_map::SentimentMapCommand::from_matches(matches).map(Self::SentimentMap);
+        }
+        if name == "sentiment-sampled-job" {
+            return sampled_sentiment::job::JobCommand::from_matches(matches).map(Self::SampledSentimentJob);
         }
         if name == "sentiment-sampled-batch" {
             return sampled_sentiment::corpus::Command::from_matches(matches).map(Self::SampledSentimentBatch);
@@ -274,6 +279,7 @@ impl CandidateCommand {
             Self::SourceInt4(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::Batch(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::SampledSentimentBatch(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
+            Self::SampledSentimentJob(command) => command.run_owned(io::stdin(), &mut io::stdout(), &mut io::stderr()),
             Self::ScoreBatch(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::DocumentCorpus(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::FaithfulnessCorpus(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
@@ -330,7 +336,7 @@ impl CandidateCommand {
             // The executable dispatcher always takes run_stdio for owned IO.
             Self::Batch(_) | Self::SampledSentimentBatch(_) | Self::ScoreBatch(_) | Self::DocumentCorpus(_) | Self::FaithfulnessCorpus(_)
                 | Self::SemanticBatch(_) | Self::SemanticJob(_)
-                | Self::Job(_) | Self::ScoreJob(_) | Self::TextJob(_) | Self::Stream(_) => return Err(CandidateError::Arguments),
+                | Self::Job(_) | Self::ScoreJob(_) | Self::TextJob(_) | Self::SampledSentimentJob(_) | Self::Stream(_) => return Err(CandidateError::Arguments),
             Self::Text { task, args } => (task, args),
         };
         let limits = args.validate()?;

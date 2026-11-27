@@ -4,6 +4,9 @@
 use super::*;
 pub(in crate::candidate_cli) mod corpus;
 pub(in crate::candidate_cli) mod map;
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(in crate::candidate_cli) mod job;
 use super::source_tasks::Session;
 use std::sync::Arc;
 use crate::{

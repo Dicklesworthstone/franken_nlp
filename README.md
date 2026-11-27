@@ -2149,6 +2149,19 @@ is not calibrated confidence, and explanations remain unverified. Compilation,
 executable regression, native-model and quality qualification are still pending
 under the controller gates.
 
+### Durable INT8 sampled populations
+
+`fnlp candidate sentiment-sampled-job start|resume` retains complete sampled
+bundles in an authenticated owned job. It freezes the actual seed, sampling,
+grammar, encoding, prefill and work policy; skips committed records on resume;
+and keeps failed-attempt charges across interruptions. Explicit input spooling
+allows authenticated replay without reopening the original population.
+One resident model and an optional persistent INT8 team serve pending records.
+Stdout is metadata only; result retention and ordered materialization are explicit.
+See [durable sampled populations](docs/native-sampled-sentiment-int8.md#durable-sampled-populations)
+for setup, privacy, limits and APIs. Executable and real-model qualification
+remain pending controller gates.
+
 ### Complete-document INT8 samples
 
 `fnlp candidate sentiment-sampled-map` extends sampled sentiment to a complete

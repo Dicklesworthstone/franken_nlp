@@ -23,6 +23,14 @@ pub(super) struct Session {
     started: Instant,
     elapsed_limit: Duration,
 }
+
+/// Keep native/runtime and artifact cancellation typed until the caller's
+/// terminal checkpoint. Setup failures have no private diagnostic payload.
+pub(super) enum SessionStageError {
+    Setup(CandidateError),
+    Artifact(ArtifactBridgeError),
+    Host(HostedError),
+}
 impl Session {
     pub(super) fn new(args: &CandidateArgs, limits: Limits) -> Result<Self, CandidateError> {
         Self::new_with_prefill(args, limits, args.policy.prefill()?)
@@ -55,18 +63,25 @@ impl Session {
         }, || self.remaining().map(|_| ()))
     }
     pub(super) fn facts(&self, args: &CandidateArgs) -> Result<ArtifactIdentity, CandidateError> {
-        checked_session_stage(|| {
-            let mut held = self.checked_source.lock().map_err(|_| CandidateError::Model)?;
-            if let Some((path, source)) = held.as_ref() {
-                if path != &args.model { return Err(CandidateError::Identity); }
-                return Ok(source.identity().clone());
-            }
-            let source = inspect(&args.model, &mut self.control())?;
-            let facts = source.identity().clone();
-            candidate_identity(&facts)?;
-            *held = Some((args.model.clone(), source));
-            Ok(facts)
-        }, || self.remaining().map(|_| ()))
+        checked_session_stage(|| self.facts_with_error_detail(args).map_err(session_stage_error),
+            || self.remaining().map(|_| ()))
+    }
+    /// Inspect and retain the same authenticated file later consumed by load.
+    /// The typed caller performs the post-stage check without erasing a stop.
+    pub(super) fn facts_with_error_detail(&self, args: &CandidateArgs)
+        -> Result<ArtifactIdentity, SessionStageError> {
+        self.remaining().map_err(SessionStageError::Setup)?;
+        let mut held = self.checked_source.lock()
+            .map_err(|_| SessionStageError::Setup(CandidateError::Model))?;
+        if let Some((path, source)) = held.as_ref() {
+            if path != &args.model { return Err(SessionStageError::Setup(CandidateError::Identity)); }
+            return Ok(source.identity().clone());
+        }
+        let source = inspect_stage(&args.model, &mut self.control())?;
+        let facts = source.identity().clone();
+        candidate_identity(&facts).map_err(SessionStageError::Setup)?;
+        *held = Some((args.model.clone(), source));
+        Ok(facts)
     }
     pub(super) fn native(&self, args: &CandidateArgs) -> Result<NativeLimits, CandidateError> {
         Ok(NativeLimits { context_tokens: args.context_tokens, allocator_reserve_bytes: 64 * MIB,
@@ -75,21 +90,33 @@ impl Session {
     }
     pub(super) fn load(&self, args: &CandidateArgs, limits: Limits, facts: &ArtifactIdentity,
         cancellation: CancellationToken) -> Result<ResidentInt8, CandidateError> {
-        checked_session_stage(|| {
-            let (path, source) = self.checked_source.lock().map_err(|_| CandidateError::Model)?
-                .take().ok_or(CandidateError::Identity)?;
-            if path != args.model || source.identity() != facts { return Err(CandidateError::Identity); }
-            let max_checkpoints = current_candidate_load_checkpoints(source.file_bytes()).map_err(artifact_error)?;
-            let model = self.engine.load_checked_current_candidate_int8(source, LoadLimits {
-                artifact: ArtifactLoadBudget::streaming_only(limits.weight_bytes, 64 * 1024),
-                tokenizer_and_metadata_bytes: 128 * MIB, allocator_reserve_bytes: 64 * MIB,
-                run: RunLimits { max_elapsed: self.remaining()?, max_checkpoints, cleanup_reserve_bytes: 65_536 },
-            }, cancellation).map_err(load_error)?;
-            // Plans and weights bind the same held file, including source root and
-            // recipe. The host independently checks the plan against resident data.
-            if model.artifact_identity() != facts { return Err(CandidateError::Identity); }
-            Ok(model)
-        }, || self.remaining().map(|_| ()))
+        checked_session_stage(|| self.load_with_error_detail(args, limits, facts, cancellation)
+            .map_err(session_stage_error), || self.remaining().map(|_| ()))
+    }
+    /// Materialize only the source held by facts; no reopen or alternate path.
+    /// Keep the original HostedError until the typed caller's post-stage check.
+    pub(super) fn load_with_error_detail(&self, args: &CandidateArgs, limits: Limits,
+        facts: &ArtifactIdentity, cancellation: CancellationToken)
+        -> Result<ResidentInt8, SessionStageError> {
+        self.remaining().map_err(SessionStageError::Setup)?;
+        let (path, source) = self.checked_source.lock()
+            .map_err(|_| SessionStageError::Setup(CandidateError::Model))?
+            .take().ok_or(SessionStageError::Setup(CandidateError::Identity))?;
+        if path != args.model || source.identity() != facts {
+            return Err(SessionStageError::Setup(CandidateError::Identity));
+        }
+        let max_checkpoints = current_candidate_load_checkpoints(source.file_bytes())
+            .map_err(SessionStageError::Artifact)?;
+        let model = self.engine.load_checked_current_candidate_int8(source, LoadLimits {
+            artifact: ArtifactLoadBudget::streaming_only(limits.weight_bytes, 64 * 1024),
+            tokenizer_and_metadata_bytes: 128 * MIB, allocator_reserve_bytes: 64 * MIB,
+            run: RunLimits { max_elapsed: self.remaining().map_err(SessionStageError::Setup)?,
+                max_checkpoints, cleanup_reserve_bytes: 65_536 },
+        }, cancellation).map_err(SessionStageError::Host)?;
+        if model.artifact_identity() != facts {
+            return Err(SessionStageError::Setup(CandidateError::Identity));
+        }
+        Ok(model)
     }
     pub(super) fn control(&self) -> PreparationControl {
         PreparationControl { started: self.started, elapsed_limit: self.elapsed_limit }
@@ -119,6 +146,13 @@ fn cancelled(cause: DecodeCancellationKind) -> CandidateError {
         _ => CandidateError::Execution,
     }
 }
+fn session_stage_error(error: SessionStageError) -> CandidateError {
+    match error {
+        SessionStageError::Setup(error) => error,
+        SessionStageError::Artifact(error) => artifact_error(error),
+        SessionStageError::Host(error) => load_error(error),
+    }
+}
 fn artifact_error(error: ArtifactBridgeError) -> CandidateError {
     match error { ArtifactBridgeError::Cancelled(cause) => cancelled(cause), _ => CandidateError::Model }
 }
@@ -133,18 +167,29 @@ fn load_error(error: HostedError) -> CandidateError {
     }
 }
 
+#[cfg(test)]
 fn inspect(path: &std::path::Path, control: &mut impl DecodeStepControl)
     -> Result<CurrentCandidateArtifactSource, CandidateError> {
-    if let Some(cause) = control.checkpoint(0) { return Err(cancelled(cause)); }
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| CandidateError::Model)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() { return Err(CandidateError::Model); }
-    let mut remaining = current_candidate_load_checkpoints(metadata.len()).map_err(artifact_error)?;
+    inspect_stage(path, control).map_err(session_stage_error)
+}
+fn inspect_stage(path: &std::path::Path, control: &mut impl DecodeStepControl)
+    -> Result<CurrentCandidateArtifactSource, SessionStageError> {
+    if let Some(cause) = control.checkpoint(0) {
+        return Err(SessionStageError::Artifact(ArtifactBridgeError::Cancelled(cause)));
+    }
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| SessionStageError::Setup(CandidateError::Model))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(SessionStageError::Setup(CandidateError::Model));
+    }
+    let mut remaining = current_candidate_load_checkpoints(metadata.len())
+        .map_err(SessionStageError::Artifact)?;
     CurrentCandidateArtifactSource::open_with_checkpoint(path, || {
         if let Some(cause) = control.checkpoint(0) { return Some(cause); }
         if remaining == 0 { return Some(DecodeCancellationKind::PollQuota); }
         remaining -= 1;
         None
-    }).map_err(artifact_error)
+    }).map_err(SessionStageError::Artifact)
 }
 
 pub(super) struct PreparationControl { started: Instant, elapsed_limit: Duration }
@@ -629,6 +674,27 @@ mod tests {
             assert_eq!(value["output"], output);
             assert_eq!(value["compute"], serde_json::to_value(compute).unwrap());
             assert!(value["output"].get("compute").is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod typed_stage_tests {
+    use super::*;
+    struct Stop(DecodeCancellationKind);
+    impl DecodeStepControl for Stop {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { Some(self.0) }
+    }
+    #[test]
+    fn typed_inspection_refuses_before_file_io_without_erasing_any_cancellation() {
+        use DecodeCancellationKind::*;
+        for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+            ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+            let result = inspect_stage(std::path::Path::new("must-not-open-typed-candidate.fnlpq"),
+                &mut Stop(cause));
+            let Err(SessionStageError::Artifact(ArtifactBridgeError::Cancelled(actual))) = result
+                else { panic!("inspection must preserve its original typed cancellation"); };
+            assert_eq!(actual, cause);
         }
     }
 }

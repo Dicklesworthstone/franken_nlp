@@ -13,6 +13,7 @@ use crate::{
 use super::runtime::sampled_sentiment as runtime;
 pub(super) mod corpus;
 pub(super) mod map;
+pub(super) mod job;
 #[cfg(test)]
 mod tests;
 
