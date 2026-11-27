@@ -167,20 +167,16 @@ fn conversion_receipt_must_bind_the_actual_artifact_before_publication() {
     assert!(!fixture.staging_dir.exists());
 }
 
-#[test]
-fn verifier_rejects_internally_checksummed_receipt_from_a_different_conversion() {
+/// Preserve the outer package inventory when testing an inconsistent inner identity.
+fn replace_packaged_conversion(dir: &Path, swapped: &str) {
     use sha2::{Digest, Sha256};
 
-    let fixture = package_fixture("swapped-conversion", b"abc");
-    package_model(&fixture.request()).unwrap();
-    let dir = &fixture.staging_dir;
     let sums_path = dir.join("SHA256SUMS");
     let sums = fs::read_to_string(&sums_path).unwrap();
     let mut receipt = read_receipt(dir);
     let old_conversion = receipt.conversion_receipt.sha256.clone();
     let model_path = dir.join("MODEL_ASSET_RECEIPT.json");
     let old_model = format!("{:x}", Sha256::digest(fs::read(&model_path).unwrap()));
-    let swapped = release_conversion::canonical_receipt(b"xyz");
     fs::write(dir.join("CONVERSION_RECEIPT.json"), swapped.as_bytes()).unwrap();
     let new_conversion = format!("{:x}", Sha256::digest(swapped.as_bytes()));
     receipt.conversion_receipt.bytes = swapped.len() as u64;
@@ -188,8 +184,38 @@ fn verifier_rejects_internally_checksummed_receipt_from_a_different_conversion()
     write_receipt(dir, &receipt);
     let new_model = format!("{:x}", Sha256::digest(fs::read(model_path).unwrap()));
     fs::write(sums_path, sums.replace(&old_conversion, &new_conversion).replace(&old_model, &new_model)).unwrap();
+}
+
+#[test]
+fn verifier_rejects_internally_checksummed_receipt_from_a_different_conversion() {
+    let fixture = package_fixture("swapped-conversion", b"abc");
+    package_model(&fixture.request()).unwrap();
+    let dir = &fixture.staging_dir;
+    replace_packaged_conversion(dir, &release_conversion::canonical_receipt(b"xyz"));
     let error = verify_model_package(dir).unwrap_err().to_string();
     assert!(error.contains("artifact_raw_sha256"), "{error}");
+}
+
+#[test]
+fn packaging_and_reverification_bind_the_physical_identity_even_when_raw_hash_matches() {
+    use franken_nlp::artifact::converter::ConversionReceipt;
+
+    let fixture = package_fixture("wrong-framed-digest", b"abc");
+    let mut conversion = ConversionReceipt::parse_canonical_json(
+        &release_conversion::canonical_receipt(b"abc"),
+    ).unwrap();
+    conversion.fnlpq_file_sha256 = "0".repeat(64);
+    let wrong = conversion.canonical_json().unwrap();
+    fs::write(&fixture.conversion_receipt, &wrong).unwrap();
+    let error = package_model(&fixture.request()).unwrap_err().to_string();
+    assert!(error.contains("fnlpq_file_sha256"), "{error}");
+    assert!(!fixture.staging_dir.join("MODEL_ASSET_RECEIPT.json").exists());
+
+    let existing = package_fixture("staged-wrong-framed-digest", b"abc");
+    package_model(&existing.request()).unwrap();
+    replace_packaged_conversion(&existing.staging_dir, &wrong);
+    let error = verify_model_package(&existing.staging_dir).unwrap_err().to_string();
+    assert!(error.contains("fnlpq_file_sha256"), "{error}");
 }
 
 #[test]

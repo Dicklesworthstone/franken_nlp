@@ -1,8 +1,8 @@
 //! Build the release manifest consumed by the existing pull verifier.
-use super::{PackageError, hex_digest, metadata_regular_file, verify_package_records};
+use super::{ArtifactHashers, PackageError, hex_digest, metadata_regular_file, verify_package_records};
 use crate::artifact::{
     converter::{ConversionReceipt, ConversionSourceManifest, extract_chat_template, source_root_digest},
-    format::{ArchTarget, SectionKind, digest_domain, framed_stream_field_prefix, framed_stream_hasher},
+    format::{ArchTarget, SectionKind},
     manifest::{
         LOCAL_DERIVATION_PACKING_POLICY_V1, NANBEIGE42_INT8_V1_COMPATIBILITY, PULL_API_V1,
         RELEASE_MANIFEST_SCHEMA_V1, ReleaseArtifact, ReleaseCompatibility, ReleaseDigests,
@@ -101,23 +101,18 @@ fn open_bound_artifact(path: &Path, receipt: &ConversionReceipt) -> Result<Fnlpq
     if !opened.is_file() || opened.len() != receipt.output_len {
         return Err(mismatch("artifact", "opened file differs from expected regular file"));
     }
-    let mut raw = Sha256::new();
-    let mut physical = framed_stream_hasher(digest_domain::FILE, 1);
-    framed_stream_field_prefix(&mut physical, receipt.output_len);
+    let mut hashes = ArtifactHashers::new(receipt.output_len);
     let mut buffer = vec![0u8; super::COPY_BUFFER_BYTES];
     let mut left = receipt.output_len;
     while left > 0 {
         let take = left.min(buffer.len() as u64) as usize;
         file.read_exact(&mut buffer[..take]).map_err(|e| mismatch("artifact", e))?;
-        raw.update(&buffer[..take]);
-        physical.update(&buffer[..take]);
+        hashes.update(&buffer[..take]);
         left -= take as u64;
     }
-    if file.read(&mut buffer[..1]).map_err(|e| mismatch("artifact", e))? != 0
-        || hex_digest(raw.finalize()) != receipt.artifact_raw_sha256
-        || hex_digest(physical.finalize()) != receipt.fnlpq_file_sha256
-    {
-        return Err(mismatch("artifact", "file digests differ from the conversion receipt"));
+    if file.read(&mut buffer[..1]).map_err(|e| mismatch("artifact", e))? != 0 {
+        return Err(mismatch("artifact", "trailing bytes after expected length"));
     }
+    hashes.verify(receipt)?;
     FnlpqRangeReader::from_file_with_checkpoint(file, || None).map_err(|e| mismatch("artifact", e))
 }

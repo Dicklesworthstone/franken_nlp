@@ -15,7 +15,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::converter::ConversionReceipt;
+use super::{
+    converter::ConversionReceipt,
+    format::{digest_domain, framed_stream_field_prefix, framed_stream_hasher},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -278,7 +281,8 @@ fn verify_package_records(staging_dir: &Path) -> Result<(ModelAssetReceipt, Conv
         });
     }
     let conversion = parse_conversion_receipt(&conversion_bytes)?;
-    verify_conversion_output(&conversion, receipt.artifact_bytes, &receipt.fnlpq_file_sha256)?;
+    verify_conversion_length(&conversion, receipt.artifact_bytes)?;
+    verify_conversion_digest("artifact_raw_sha256", &conversion.artifact_raw_sha256, &receipt.fnlpq_file_sha256)?;
     let licenses = checked_license_files(staging_dir, &conversion)?;
     for (record, bytes) in receipt.license_bundle.iter().zip(&licenses) {
         if record.bytes != bytes.len() as u64 || record.sha256 != hex_digest(Sha256::digest(bytes)) {
@@ -291,7 +295,7 @@ fn verify_package_records(staging_dir: &Path) -> Result<(ModelAssetReceipt, Conv
     verify_file_record(staging_dir, &receipt.reconstruction, None)?;
     verify_sha256sums(staging_dir, &ordered_records)?;
 
-    let mut whole_hasher = Sha256::new();
+    let mut whole_hasher = ArtifactHashers::new(receipt.artifact_bytes);
     let mut reconstructed_bytes = 0_u64;
     for part in &receipt.parts {
         verify_file_record(staging_dir, part, Some(&mut whole_hasher))?;
@@ -308,7 +312,7 @@ fn verify_package_records(staging_dir: &Path) -> Result<(ModelAssetReceipt, Conv
             ),
         });
     }
-    let observed_whole = hex_digest(whole_hasher.finalize());
+    let observed_whole = whole_hasher.verify(&conversion)?;
     if observed_whole != receipt.fnlpq_file_sha256 {
         return Err(PackageError::Integrity {
             member: "reconstruction".to_owned(),
@@ -345,8 +349,8 @@ fn package_model_with_part_bytes(
         &request.artifact,
         &request.staging_dir,
         &request.logical_artifact_name,
+        &conversion,
     )?;
-    verify_conversion_output(&conversion, artifact_bytes, &artifact_sha256)?;
     let conversion_receipt = write_new_file(
         &request.staging_dir.join(CONVERSION_RECEIPT_FILE),
         &conversion_bytes,
@@ -394,9 +398,11 @@ fn split_artifact(
     source_path: &Path,
     staging_dir: &Path,
     logical_name: &str,
+    conversion: &ConversionReceipt,
 ) -> Result<(u64, Vec<PackageFile>, String), PackageError> {
     let metadata = metadata_regular_file(source_path)?;
     let artifact_bytes = metadata.len();
+    verify_conversion_length(conversion, artifact_bytes)?;
     let expected_parts = release_part_count(artifact_bytes)?;
 
     let source = File::open(source_path).map_err(|source| PackageError::Io {
@@ -405,7 +411,7 @@ fn split_artifact(
         source,
     })?;
     let mut reader = BufReader::with_capacity(COPY_BUFFER_BYTES, source);
-    let mut whole_hasher = Sha256::new();
+    let mut whole_hasher = ArtifactHashers::new(artifact_bytes);
     let mut buffer = [0_u8; COPY_BUFFER_BYTES];
     let mut parts = Vec::with_capacity(expected_parts);
 
@@ -469,13 +475,13 @@ fn split_artifact(
             path: source_path.to_owned(),
         });
     }
-    Ok((artifact_bytes, parts, hex_digest(whole_hasher.finalize())))
+    Ok((artifact_bytes, parts, whole_hasher.verify(conversion)?))
 }
 
 fn hash_regular_file(
     path: &Path,
     expected: u64,
-    mut whole_hasher: Option<&mut Sha256>,
+    mut whole_hasher: Option<&mut ArtifactHashers>,
 ) -> Result<PackageFile, PackageError> {
     let source_bytes = metadata_regular_file(path)?.len();
     if expected != source_bytes {
@@ -611,19 +617,38 @@ fn verify_conversion_length(conversion: &ConversionReceipt, bytes: u64) -> Resul
     Ok(())
 }
 
-fn verify_conversion_output(
-    conversion: &ConversionReceipt,
-    bytes: u64,
-    raw_sha256: &str,
-) -> Result<(), PackageError> {
-    verify_conversion_length(conversion, bytes)?;
-    if conversion.artifact_raw_sha256 != raw_sha256 {
+/// Hash a single concatenated file in both namespaces used by the conversion receipt.
+struct ArtifactHashers {
+    raw: Sha256,
+    physical: Sha256,
+}
+
+impl ArtifactHashers {
+    fn new(bytes: u64) -> Self {
+        let mut physical = framed_stream_hasher(digest_domain::FILE, 1);
+        framed_stream_field_prefix(&mut physical, bytes);
+        Self { raw: Sha256::new(), physical }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        self.raw.update(data);
+        self.physical.update(data);
+    }
+
+    fn verify(self, conversion: &ConversionReceipt) -> Result<String, PackageError> {
+        let raw = hex_digest(self.raw.finalize());
+        let physical = hex_digest(self.physical.finalize());
+        verify_conversion_digest("artifact_raw_sha256", &conversion.artifact_raw_sha256, &raw)?;
+        verify_conversion_digest("fnlpq_file_sha256", &conversion.fnlpq_file_sha256, &physical)?;
+        Ok(raw)
+    }
+}
+
+fn verify_conversion_digest(field: &str, expected: &str, observed: &str) -> Result<(), PackageError> {
+    if expected != observed {
         return Err(PackageError::Integrity {
             member: CONVERSION_RECEIPT_FILE.to_owned(),
-            detail: format!(
-                "artifact_raw_sha256 expected={} observed={raw_sha256}",
-                conversion.artifact_raw_sha256
-            ),
+            detail: format!("{field} expected={expected} observed={observed}"),
         });
     }
     Ok(())
@@ -712,7 +737,7 @@ fn validate_receipt_shape(receipt: &ModelAssetReceipt) -> Result<(), PackageErro
 fn verify_file_record(
     staging_dir: &Path,
     record: &PackageFile,
-    whole_hasher: Option<&mut Sha256>,
+    whole_hasher: Option<&mut ArtifactHashers>,
 ) -> Result<(), PackageError> {
     let observed = hash_regular_file(
         &staging_dir.join(&record.name),
@@ -1095,7 +1120,7 @@ mod tests {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("fnlp-part-hash-{}-{nonce}", std::process::id()));
         fs::create_dir(&dir).unwrap();
-        let mut whole = Sha256::new();
+        let mut whole = super::ArtifactHashers::new(3);
         for (name, data) in [("part00", &b"a"[..]), ("part01", &b"bc"[..])] {
             fs::write(dir.join(name), data).unwrap();
             let record = PackageFile {
@@ -1106,11 +1131,15 @@ mod tests {
             super::verify_file_record(&dir, &record, Some(&mut whole)).unwrap();
         }
         assert_eq!(
-            super::hex_digest(whole.finalize()),
+            super::hex_digest(whole.raw.finalize()),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         );
+        assert_eq!(
+            super::hex_digest(whole.physical.finalize()),
+            "cbd9dc14d23d9e4112428afbe80a7e1579ef128505314754a816730ce030f2d0",
+        );
         let wrong = PackageFile { name: "part01".to_owned(), bytes: 2, sha256: "0".repeat(64) };
-        assert!(super::verify_file_record(&dir, &wrong, Some(&mut Sha256::new())).is_err());
+        assert!(super::verify_file_record(&dir, &wrong, Some(&mut super::ArtifactHashers::new(2))).is_err());
     }
 
     #[test]
