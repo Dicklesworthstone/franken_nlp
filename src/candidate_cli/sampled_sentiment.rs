@@ -85,19 +85,22 @@ pub(super) struct SampledSentimentCommand {
     prefill_rows: Option<usize>,
     #[arg(skip)]
     encoding: input_encoding::InputEncodingArgs,
+    #[arg(skip)]
+    compute: compute::Args,
 }
 
 pub(super) fn definition() -> clap::Command {
-    input_encoding::definition(SampledSentimentCommand::augment_args(
+    compute::definition(input_encoding::definition(SampledSentimentCommand::augment_args(
         clap::Command::new("sentiment-sampled")
             .about("Generate independent INT8 affect scores with bounded explanations")
-            .long_about("For each requested valence, arousal, dominance or approach axis, generate independently addressed JSON scores in [-100,100] with bounded explanations. --seed is mandatory. Input is {document,axes?}; omitted axes selects all four. Every sample must complete and pass independent schema/content checks before one complete result is published. Results retain all scores, explanations and descriptive aggregates; generated variation is not calibrated confidence and explanations are unverified. The complete axis-by-sample work, mask, sampler, preparation and output envelope is admitted before execution. --input-encoding safe-bpe-v1 explicitly compacts lossless untrusted input under finite tokenizer limits; it may change model output. --prefill-rows changes only bounded prompt scheduling. Each sample starts with empty logical KV. This explicit local candidate has no model-quality, performance or release certification. Distribution-mode sentiment remains a separate command.")))
+            .long_about("For each requested valence, arousal, dominance or approach axis, generate independently addressed JSON scores in [-100,100] with bounded explanations. --seed is mandatory. Input is {document,axes?}; omitted axes selects all four. Every sample must complete and pass independent schema/content checks before one complete result is published. Results retain all scores, explanations and descriptive aggregates; generated variation is not calibrated confidence and explanations are unverified. The complete axis-by-sample work, mask, sampler, preparation and output envelope is admitted before execution. --input-encoding safe-bpe-v1 explicitly compacts lossless untrusted input under finite tokenizer limits; it may change model output. --compute-threads reuses one persistent INT8 row team across every axis and sample, including bounded --prefill-rows prompt morsels. These physical choices preserve the sampling addresses and task budgets. Each sample starts with empty logical KV. This explicit local candidate has no model-quality, performance or release certification. Distribution-mode sentiment remains a separate command."))))
 }
 
 impl SampledSentimentCommand {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let mut command = Self::from_arg_matches(matches)?;
         command.encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+        command.compute = compute::Args::from_matches(matches)?;
         Ok(command)
     }
     pub(in crate::candidate_cli) fn options(&self) -> Result<SampledSentimentOptions, CandidateError> {
@@ -181,7 +184,7 @@ impl SampledSentimentCommand {
             temperature_milli: Some(self.temperature_milli), top_k: self.top_k,
             top_p_ppm: Some(self.top_p_ppm), logprobs: false,
             policy: generation_policy::GenerationPolicyArgs::default(),
-            compute: compute::Args::default(), input_encoding: self.encoding.clone() };
+            compute: self.compute, input_encoding: self.encoding.clone() };
         let mut limits = common.validate()?;
         limits.result_bytes = self.max_result_bytes;
         limits.compute = common.compute.admit_prefill(prefill)?;

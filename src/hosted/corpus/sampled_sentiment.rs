@@ -6,7 +6,8 @@ use crate::{
     }},
     grammar::mask::MaskWorkLimits,
     native_engine::{constrained::JsonWorkBudget, constrained_int8::{Int8JsonBudget, json_sampling_workspace_bytes},
-        decode::DecodeStepControl, strict_int8::{StrictInt8Engine, prefill::Int8PrefillLimits}},
+        decode::DecodeStepControl, simd::Int8Kernel,
+        strict_int8::{StrictInt8Engine, prefill::Int8PrefillLimits}},
     tasks::sentiment::{SentimentRequest, sampled::{SampledSentimentError, SampledSentimentVocabulary,
         quantized::{Int8SampledSentimentError, Int8SampledSentimentPlanner, Int8SampledSentimentRun,
             PreparedInt8SampledSentiment}}},
@@ -33,14 +34,33 @@ impl NlpEngine {
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
         let sampler_bytes = json_sampling_workspace_bytes()
             .map_err(|e| HostedError::SampledSentiment(e.into()))?;
-        let task = SampledStream { planner, vocabulary, config, sampler_bytes,
+        let task = SampledStream { planner: Arc::new(planner), vocabulary, config, sampler_bytes,
             preparation_bytes: limits.preparation_reserve_bytes };
         scored::run(self, model, task, limits, prefill, None, reader, writer, cancellation)
+    }
+
+    /// Keep one fixed row team for every record, axis and independently
+    /// addressed sample, including optional bounded prompt morsels. The
+    /// terminal completion frame is withheld until all children physically
+    /// join; flush does not renew any native, mask or cancellation allowance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_sampled_sentiment_with_threads<R, W>(&self, model: &ResidentInt8,
+        planner: Int8SampledSentimentPlanner, vocabulary: Arc<SampledSentimentVocabulary>,
+        config: SampledSentimentCorpusConfig, limits: CorpusLimits, prefill: Option<Int8PrefillLimits>,
+        kernel: Int8Kernel, compute_threads: usize, reader: R, writer: W,
+        cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        let sampler_bytes = json_sampling_workspace_bytes()
+            .map_err(|e| HostedError::SampledSentiment(e.into()))?;
+        let task = SampledStream { planner: Arc::new(planner), vocabulary, config, sampler_bytes,
+            preparation_bytes: limits.preparation_reserve_bytes };
+        scored::run(self, model, task, limits, prefill, Some((kernel, compute_threads)),
+            reader, writer, cancellation)
     }
 }
 
 struct SampledStream {
-    planner: Int8SampledSentimentPlanner,
+    planner: Arc<Int8SampledSentimentPlanner>,
     vocabulary: Arc<SampledSentimentVocabulary>,
     config: SampledSentimentCorpusConfig,
     sampler_bytes: u64,
@@ -48,6 +68,9 @@ struct SampledStream {
 }
 impl scored::CorpusTask for SampledStream {
     fn identity(&self) -> &ExecutionIdentity { self.planner.execution_identity() }
+    fn retain_for_join(&self) -> Option<Box<dyn Send>> {
+        Some(Box::new((Arc::clone(&self.planner), Arc::clone(&self.vocabulary))))
+    }
     fn validate(&self, _model: &ArtifactIdentity, limits: CorpusLimits, native: Int8MemoryRequirement)
         -> Result<u64, HostedError> {
         validate_work(self.config.max_model_work)?;

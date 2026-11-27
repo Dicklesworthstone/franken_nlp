@@ -136,8 +136,7 @@ pub(in crate::candidate_cli) fn execute(command: SampledSentimentCommand,
     common: CandidateArgs, limits: Limits, input: &mut impl Read, output: &mut impl Write)
     -> Result<(), Failure> {
     let prefill = command.prefill().map_err(setup_failure)?;
-    if limits.compute.threads != 1
-        || limits.compute != common.compute.admit_prefill(prefill).map_err(setup_failure)? {
+    if limits.compute != common.compute.admit_prefill(prefill).map_err(setup_failure)? {
         return Err(setup_failure(CandidateError::Arguments));
     }
     let encoding = common.input_encoding_policy(limits).map_err(setup_failure)?;
@@ -196,17 +195,28 @@ pub(in crate::candidate_cli) fn execute(command: SampledSentimentCommand,
         max_sampler_bytes: sampler_bytes, mask_limits: command.masks(),
         max_mask_node_visits: command.max_mask_node_visits,
     };
-    let guarded = checked_stage(match prefill {
-        None => session.engine.execute_int8_sampled_sentiment(&model, prepared, vocabulary, host, cancellation),
-        Some(prefill) => session.engine.execute_int8_sampled_sentiment_layer_major(
-            &model, prepared, vocabulary, host, prefill, cancellation),
-    }, &check, host_failure)?;
+    let guarded = if limits.compute.threads == 1 {
+        compute::Completion::Serial(checked_stage(match prefill {
+            None => session.engine.execute_int8_sampled_sentiment(&model, prepared, vocabulary, host, cancellation),
+            Some(prefill) => session.engine.execute_int8_sampled_sentiment_layer_major(
+                &model, prepared, vocabulary, host, prefill, cancellation),
+        }, &check, host_failure)?)
+    } else {
+        let kernel = crate::native_engine::simd::config::process_kernel();
+        compute::Completion::Team(checked_stage(match prefill {
+            None => session.engine.execute_int8_sampled_sentiment_with_threads(
+                &model, prepared, vocabulary, host, kernel, limits.compute.threads, cancellation),
+            Some(prefill) => session.engine.execute_int8_sampled_sentiment_layer_major_with_threads(
+                &model, prepared, vocabulary, host, kernel, limits.compute.threads, prefill, cancellation),
+        }, &check, host_failure)?)
+    };
     checked_stage(check_completion(guarded.result(), &axes, samples_per_axis,
         expected_work, output_tokens, mask_charge), &check, |failure| failure)?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
         evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
         source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
         quant_recipe: &facts.recipe_id, output: guarded.result() };
+    let response = compute::Response { response: &response, compute: guarded.compute() };
     let response = input_encoding::Response { response: &response,
         input_encoding: input_encoding::reported_policy(&encoding) };
     let cap = checked_stage(limits.result_bytes.checked_add(4096)

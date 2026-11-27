@@ -26,7 +26,7 @@ pub(in crate::candidate_cli) struct Command {
 pub(in crate::candidate_cli) fn definition() -> clap::Command {
     StreamArgs::augment_args(super::definition().name("sentiment-sampled-batch")
         .about("Generate independent sampled sentiment bundles from ordered NDJSON on one resident INT8 model")
-        .long_about("Read {id,text,task_args?} records and {\"flush\":true} controls. Omitted axes select all four dimensions; an optional complete task_args.budget may tighten the per-record ceiling. Each item returns every requested score and explanation. Stable IDs address the draws independently of record order and flush epochs. Native work, mask visits, execution checkpoints and the deadline cover the stream. Safe-BPE limits apply per record. --prefill-rows selects bounded layer-major prompt execution. A failed item makes the process exit nonzero. Results describe generated-score variation and contain unverified model explanations.")
+        .long_about("Read {id,text,task_args?} records and {\"flush\":true} controls. Omitted axes select all four dimensions; an optional complete task_args.budget may tighten the per-record ceiling. Each item returns every requested score and explanation. Stable IDs address the draws independently of record order and flush epochs. Native work, mask visits, execution checkpoints and the deadline cover the stream. Safe-BPE limits apply per record. --compute-threads reuses one persistent INT8 row team across all records, axes and samples, together with optional bounded --prefill-rows prompts. Final success is published only after all workers physically join. A failed item makes the process exit nonzero. Results describe generated-score variation and contain unverified model explanations.")
         .mut_arg("input", |arg| arg.help("NDJSON file, or '-' for stdin"))
         .mut_arg("max_mask_node_visits", |arg| arg.help("Nonrenewable mask visits across all records and samples")))
 }
@@ -109,5 +109,22 @@ mod tests {
         assert_eq!(envelope.transport.max_output_bytes + 34 * FRAME_ALLOWANCE, 8 * MIB);
         assert_eq!(envelope.transport.max_work.forward_positions, 131_072);
         assert!(parse(&["--max-requests", "300", "--max-output-mib", "1"]).admit().is_err());
+    }
+    #[test]
+    fn one_team_and_prompt_schedule_leave_stream_work_and_draw_policy_unchanged() {
+        let serial = parse(&[]);
+        let (_, _, baseline) = serial.admit().unwrap();
+        for width in ["2", "3", "64"] {
+            let threaded = parse(&["--compute-threads", width, "--prefill-rows", "4"]);
+            let (common, limits, admitted) = threaded.admit().unwrap();
+            assert_eq!(limits.compute.threads, width.parse::<usize>().unwrap());
+            assert_eq!(limits.compute, common.compute.admit_prefill(threaded.sampled.prefill().unwrap()).unwrap());
+            assert!(limits.compute.workspace_bytes > 0);
+            assert_eq!(threaded.sampled.options().unwrap(), serial.sampled.options().unwrap());
+            assert_eq!(admitted.transport.max_work, baseline.transport.max_work);
+            assert_eq!(admitted.transport.max_requests, baseline.transport.max_requests);
+            assert_eq!(admitted.transport.max_output_bytes, baseline.transport.max_output_bytes);
+        }
+        for width in ["0", "65"] { assert!(parse(&["--compute-threads", width]).admit().is_err()); }
     }
 }

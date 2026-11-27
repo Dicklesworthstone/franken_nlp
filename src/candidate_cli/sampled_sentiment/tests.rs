@@ -47,12 +47,55 @@ fn independent_command_requires_explicit_model_memory_and_seed_without_changing_
     let matches = super::super::definition().try_get_matches_from([
         "candidate", "sentiment", "--model", "m", "--memory-mib", "16384"]).unwrap();
     assert!(matches!(CandidateCommand::from_matches(&matches).unwrap(), CandidateCommand::Scored(_)));
-    // Distribution policies, processors, source conversion and unimplemented
-    // threaded execution cannot silently select another estimator or backend.
+    // Distribution policies, processors and source conversion cannot silently
+    // select another estimator or backend.
     for extra in [
         vec!["--bins", "5"], vec!["--repetition-penalty-milli", "1100"],
-        vec!["--logprobs"], vec!["--compute-threads", "2"], vec!["--source", "model"],
+        vec!["--logprobs"], vec!["--source", "model"],
     ] { assert!(parsed(&extra).is_err()); }
+}
+
+#[test]
+fn physical_worker_width_preserves_the_complete_sampler_and_prices_prompt_children() {
+    let baseline = command(&[]);
+    let (_, serial) = baseline.common().unwrap();
+    for width in ["1", "2", "3", "64"] {
+        for rows in [None, Some("1"), Some("4"), Some("64")] {
+            let mut options = vec!["--compute-threads", width];
+            if let Some(rows) = rows { options.extend(["--prefill-rows", rows]); }
+            let scheduled = command(&options);
+            let (common, limits) = scheduled.common().unwrap();
+            assert_eq!(common.compute.threads(), width.parse::<usize>().unwrap());
+            assert_eq!(limits.compute, common.compute.admit_prefill(scheduled.prefill().unwrap()).unwrap());
+            assert_eq!(scheduled.options().unwrap(), baseline.options().unwrap());
+            assert_eq!(scheduled.budget(limits, 4).unwrap(), baseline.budget(serial, 4).unwrap());
+            assert_eq!(limits.compute.workspace_bytes == 0, width == "1");
+        }
+    }
+    for width in ["0", "65", "18446744073709551615"] {
+        if let Ok(CandidateCommand::SampledSentiment(command)) = parsed(&["--compute-threads", width]) {
+            assert_eq!(command.execute(&mut NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+        }
+    }
+}
+
+#[test]
+fn threaded_sampler_rejects_memory_that_only_covers_the_coordinator() {
+    let mut threaded = command(&["--compute-threads", "64", "--prefill-rows", "64"]);
+    let (_, limits) = threaded.common().unwrap();
+    let native = Int8MemoryRequirement::for_context(threaded.context_tokens).unwrap();
+    let extra = threaded.prefill().unwrap().unwrap().validate().unwrap();
+    let required = compute::request_peak_bytes(limits, native, threaded.max_result_bytes as u64,
+        threaded.total_tokens(4).unwrap() as u64, json_sampling_workspace_bytes().unwrap(),
+        limits.preparation_bytes).unwrap() + extra;
+    let coordinator = required - limits.compute.workspace_bytes;
+    assert!(limits.compute.workspace_bytes > MIB);
+    threaded.memory_mib = coordinator.div_ceil(MIB);
+    assert!(threaded.memory_mib * MIB < required);
+    assert_eq!(threaded.execute(&mut NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+    let mut threaded = command(&["--compute-threads", "64", "--prefill-rows", "64"]);
+    threaded.memory_mib = required.div_ceil(MIB);
+    threaded.common().unwrap();
 }
 
 #[test]

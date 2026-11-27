@@ -23,6 +23,8 @@ struct Provenance<'a> {
     input_encoding: Option<&'a UntrustedEncoding>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefill_rows: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compute_threads: Option<usize>,
 }
 
 pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
@@ -43,7 +45,8 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Sen
         scope: "real-artifact-current-candidate", evidence: "non_authoritative", task: "sentiment-sampled",
         model_id: &facts.model_id, source_revision: &facts.revision, source_root_sha256: &facts.source_root_sha256,
         logical_model_sha256: &facts.logical_model_sha256, quant_recipe: &facts.recipe_id,
-        input_encoding: input_encoding::reported_policy(&encoding), prefill_rows: prefill.map(|p| p.max_batch_rows) };
+        input_encoding: input_encoding::reported_policy(&encoding), prefill_rows: prefill.map(|p| p.max_batch_rows),
+        compute_threads: (limits.compute.threads > 1).then_some(limits.compute.threads) };
     let writer = checked_stage(CandidateWriter::new(output, &provenance,
         envelope.transport.max_output_line_bytes, envelope.output_bytes), &check, setup_failure)?;
     let reader: Box<dyn BufRead + Send> = if common.input.as_os_str() == "-" {
@@ -60,8 +63,14 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Sen
     let corpus = CorpusLimits { native: checked_stage(session.native(&common), &check, setup_failure)?,
         transport: envelope.transport, preparation_reserve_bytes: limits.preparation_bytes,
         io_reserve_bytes: envelope.io_bytes };
-    let summary = checked_stage(session.engine.batch_int8_sampled_sentiment(&model, planner, vocabulary,
-        config, corpus, prefill, reader, writer, cancellation), &check, host_failure)?;
+    let summary = checked_stage(if limits.compute.threads == 1 {
+        session.engine.batch_int8_sampled_sentiment(&model, planner, vocabulary,
+            config, corpus, prefill, reader, writer, cancellation)
+    } else {
+        session.engine.batch_int8_sampled_sentiment_with_threads(&model, planner, vocabulary,
+            config, corpus, prefill, crate::native_engine::simd::config::process_kernel(),
+            limits.compute.threads, reader, writer, cancellation)
+    }, &check, host_failure)?;
     if summary.failed > 0 { return Err(Failure::output("int8_sampled_sentiment_batch_items_failed")); }
     Ok(())
 }
