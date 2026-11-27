@@ -49,25 +49,24 @@ impl Session {
     }
     pub(super) fn read(&self, path: &std::path::Path, input: &mut impl Read, cap: usize)
         -> Result<String, CandidateError> {
-        self.remaining()?;
-        let text = if path.as_os_str() == "-" { read_input(input, cap)? }
-            else { read_input(&mut File::open(path).map_err(|_| CandidateError::Input)?, cap)? };
-        self.remaining()?;
-        Ok(text)
+        checked_session_stage(|| {
+            if path.as_os_str() == "-" { read_input(input, cap) }
+            else { read_input(&mut File::open(path).map_err(|_| CandidateError::Input)?, cap) }
+        }, || self.remaining().map(|_| ()))
     }
     pub(super) fn facts(&self, args: &CandidateArgs) -> Result<ArtifactIdentity, CandidateError> {
-        self.remaining()?;
-        let mut held = self.checked_source.lock().map_err(|_| CandidateError::Model)?;
-        if let Some((path, source)) = held.as_ref() {
-            if path != &args.model { return Err(CandidateError::Identity); }
-            return Ok(source.identity().clone());
-        }
-        let source = inspect(&args.model, &mut self.control())?;
-        let facts = source.identity().clone();
-        self.remaining()?;
-        candidate_identity(&facts)?;
-        *held = Some((args.model.clone(), source));
-        Ok(facts)
+        checked_session_stage(|| {
+            let mut held = self.checked_source.lock().map_err(|_| CandidateError::Model)?;
+            if let Some((path, source)) = held.as_ref() {
+                if path != &args.model { return Err(CandidateError::Identity); }
+                return Ok(source.identity().clone());
+            }
+            let source = inspect(&args.model, &mut self.control())?;
+            let facts = source.identity().clone();
+            candidate_identity(&facts)?;
+            *held = Some((args.model.clone(), source));
+            Ok(facts)
+        }, || self.remaining().map(|_| ()))
     }
     pub(super) fn native(&self, args: &CandidateArgs) -> Result<NativeLimits, CandidateError> {
         Ok(NativeLimits { context_tokens: args.context_tokens, allocator_reserve_bytes: 64 * MIB,
@@ -76,25 +75,42 @@ impl Session {
     }
     pub(super) fn load(&self, args: &CandidateArgs, limits: Limits, facts: &ArtifactIdentity,
         cancellation: CancellationToken) -> Result<ResidentInt8, CandidateError> {
-        self.remaining()?;
-        let (path, source) = self.checked_source.lock().map_err(|_| CandidateError::Model)?
-            .take().ok_or(CandidateError::Identity)?;
-        if path != args.model || source.identity() != facts { return Err(CandidateError::Identity); }
-        let max_checkpoints = current_candidate_load_checkpoints(source.file_bytes()).map_err(artifact_error)?;
-        let model = self.engine.load_checked_current_candidate_int8(source, LoadLimits {
-            artifact: ArtifactLoadBudget::streaming_only(limits.weight_bytes, 64 * 1024),
-            tokenizer_and_metadata_bytes: 128 * MIB, allocator_reserve_bytes: 64 * MIB,
-            run: RunLimits { max_elapsed: self.remaining()?, max_checkpoints, cleanup_reserve_bytes: 65_536 },
-        }, cancellation).map_err(load_error)?;
-        self.remaining()?;
-        // Plans and weights bind the same held file, including source root and
-        // recipe. The host independently checks the plan against resident data.
-        if model.artifact_identity() != facts { return Err(CandidateError::Identity); }
-        Ok(model)
+        checked_session_stage(|| {
+            let (path, source) = self.checked_source.lock().map_err(|_| CandidateError::Model)?
+                .take().ok_or(CandidateError::Identity)?;
+            if path != args.model || source.identity() != facts { return Err(CandidateError::Identity); }
+            let max_checkpoints = current_candidate_load_checkpoints(source.file_bytes()).map_err(artifact_error)?;
+            let model = self.engine.load_checked_current_candidate_int8(source, LoadLimits {
+                artifact: ArtifactLoadBudget::streaming_only(limits.weight_bytes, 64 * 1024),
+                tokenizer_and_metadata_bytes: 128 * MIB, allocator_reserve_bytes: 64 * MIB,
+                run: RunLimits { max_elapsed: self.remaining()?, max_checkpoints, cleanup_reserve_bytes: 65_536 },
+            }, cancellation).map_err(load_error)?;
+            // Plans and weights bind the same held file, including source root and
+            // recipe. The host independently checks the plan against resident data.
+            if model.artifact_identity() != facts { return Err(CandidateError::Identity); }
+            Ok(model)
+        }, || self.remaining().map(|_| ()))
     }
     pub(super) fn control(&self) -> PreparationControl {
         PreparationControl { started: self.started, elapsed_limit: self.elapsed_limit }
     }
+}
+
+/// Only the session's read/inspection/load stages use this boundary. Within
+/// those stages, Execution means an already observed native cancellation;
+/// incidental IO, integrity and reservation failures have separate variants.
+/// Always poll after the stage, but do not replace an earlier terminal cause
+/// when physical cleanup crosses the original invocation deadline.
+fn checked_session_stage<T>(stage: impl FnOnce() -> Result<T, CandidateError>,
+    mut check: impl FnMut() -> Result<(), CandidateError>) -> Result<T, CandidateError> {
+    check()?;
+    let result = stage();
+    let terminal = check();
+    if matches!(&result, Err(CandidateError::Timeout | CandidateError::Execution)) {
+        return result;
+    }
+    terminal?;
+    result
 }
 
 fn cancelled(cause: DecodeCancellationKind) -> CandidateError {
@@ -234,6 +250,120 @@ pub(in crate::candidate_cli) fn execute(command: SourceCommand, args: CandidateA
 mod tests {
     use super::*;
     use crate::candidate_cli::source::Kind;
+
+    #[test]
+    fn bounded_input_always_checks_deadline_after_success_and_read_or_decode_failure() {
+        use std::cell::Cell;
+        struct BoundaryReader<'a> {
+            bytes: &'static [u8], fail: bool, expire: bool,
+            expired: &'a Cell<bool>, calls: usize,
+        }
+        impl Read for BoundaryReader<'_> {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                self.calls += 1;
+                self.expired.set(self.expire);
+                if self.fail { return Err(io::Error::other("private read fixture")); }
+                let count = output.len().min(self.bytes.len());
+                output[..count].copy_from_slice(&self.bytes[..count]);
+                self.bytes = &self.bytes[count..];
+                Ok(count)
+            }
+        }
+        let cases = [
+            (&b""[..], false, 4, Ok("")),
+            (&b"text"[..], false, 4, Ok("text")),
+            (&b""[..], true, 4, Err(CandidateError::Input)),
+            (&b"\xff"[..], false, 4, Err(CandidateError::Input)),
+            (&b"12345"[..], false, 4, Err(CandidateError::Input)),
+        ];
+        for (bytes, fail, cap, expected) in cases {
+            for expire in [false, true] {
+                let expired = Cell::new(false);
+                let mut input = BoundaryReader { bytes, fail, expire, expired: &expired, calls: 0 };
+                let mut polls = 0;
+                let result = checked_session_stage(|| read_input(&mut input, cap), || {
+                    polls += 1;
+                    if expired.get() { Err(CandidateError::Timeout) } else { Ok(()) }
+                });
+                assert!(input.calls > 0);
+                assert_eq!(polls, 2);
+                assert_eq!(result, if expire { Err(CandidateError::Timeout) }
+                    else { expected.map(str::to_owned) });
+            }
+        }
+    }
+
+    #[test]
+    fn incidental_session_failures_yield_to_deadline_and_keep_their_live_category() {
+        for error in [CandidateError::Input, CandidateError::Model,
+            CandidateError::Identity, CandidateError::Memory] {
+            for expire in [false, true] {
+                let mut polls = 0;
+                let result: Result<(), _> = checked_session_stage(|| Err(error), || {
+                    polls += 1;
+                    if expire && polls == 2 { Err(CandidateError::Timeout) } else { Ok(()) }
+                });
+                assert_eq!(polls, 2);
+                assert_eq!(result, Err(if expire { CandidateError::Timeout } else { error }));
+            }
+        }
+    }
+
+    #[test]
+    fn original_artifact_and_host_cancellation_survives_a_later_session_deadline() {
+        use DecodeCancellationKind::*;
+        for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast,
+            RaceLost, ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+            let failures = [artifact_error(ArtifactBridgeError::Cancelled(cause)),
+                load_error(HostedError::Model(CurrentCandidateInt8Error::Artifact(
+                    ArtifactBridgeError::Cancelled(cause)))),
+                load_error(HostedError::Stopped { stop: crate::hosted::RunStop {
+                    kind: cause, runtime_reason: None, runtime_checkpoint_error: None }, task_error: None })];
+            for error in failures {
+                let mut polls = 0;
+                let result: Result<(), _> = checked_session_stage(|| Err(error), || {
+                    polls += 1;
+                    if polls == 2 { Err(CandidateError::Timeout) } else { Ok(()) }
+                });
+                assert_eq!(polls, 2, "terminal stage must still poll after cleanup");
+                assert_eq!(result, Err(cancelled(cause)), "{cause:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn refused_session_stages_skip_io_or_drop_completed_payload_before_return() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let result = checked_session_stage(|| { calls.set(calls.get() + 1); Ok(()) },
+            || Err(CandidateError::Timeout));
+        assert_eq!(result, Err(CandidateError::Timeout));
+        assert_eq!(calls.get(), 0);
+
+        struct Payload<'a>(&'a Cell<usize>);
+        impl Drop for Payload<'_> {
+            fn drop(&mut self) { self.0.set(self.0.get() + 1); }
+        }
+        for expire in [false, true] {
+            let drops = Cell::new(0);
+            let mut polls = 0;
+            let result = checked_session_stage(|| Ok(Payload(&drops)), || {
+                polls += 1;
+                assert_eq!(drops.get(), 0, "completed storage survives its final deadline check");
+                if expire && polls == 2 { Err(CandidateError::Timeout) } else { Ok(()) }
+            });
+            assert_eq!(polls, 2);
+            if expire {
+                assert!(matches!(result, Err(CandidateError::Timeout)));
+                assert_eq!(drops.get(), 1, "refused completed storage is released before return");
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(drops.get(), 0);
+                drop(result);
+                assert_eq!(drops.get(), 1);
+            }
+        }
+    }
 
     #[test]
     fn buffered_and_source_team_prefill_survive_shared_startup_with_exact_capacity() {
