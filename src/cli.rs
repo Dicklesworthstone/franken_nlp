@@ -5,6 +5,7 @@ use clap::FromArgMatches;
 use crate::{error::ErrorCode, redaction_cli::RedactCommand};
 
 mod selftest;
+mod schema_validate;
 mod existing {
     include!("cli_existing.rs");
 
@@ -36,6 +37,7 @@ fn suppress_argument_values(args: &[OsString]) -> bool {
     // subcommand or the root parser refuses before it resolves that command.
     args.iter().skip(1).filter_map(|arg| arg.to_str())
         .any(crate::assay_cli::AssayCommand::recognizes)
+        || args.windows(2).any(|pair| pair[0] == "schema" && pair[1] == "validate")
         || args.get(1).and_then(|s| s.to_str()).is_some_and(|s| s == "redact" || s == "batch"
             || s == "job" || s == "candidate" || crate::text_cli::TextCommand::recognizes(s))
 }
@@ -168,6 +170,7 @@ mod task_dispatch_tests {
     #[test]
     fn existing_schema_arguments_still_parse() {
         assert!(definition().try_get_matches_from(["fnlp", "schema", "check", "-"]).is_ok());
+        assert!(definition().try_get_matches_from(["fnlp", "schema", "validate", "s.json", "-", "--source", "doc.txt"]).is_ok());
         assert!(definition().try_get_matches_from(["fnlp", "robot", "schema"]).is_ok());
     }
     #[test]

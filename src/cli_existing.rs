@@ -335,6 +335,8 @@ struct RobotPlanCommand {
 
 #[derive(Subcommand)]
 enum SchemaSubcommand {
+    /// Independently validate an existing JSON result and its verbatim source fields.
+    Validate(super::schema_validate::Validate),
     /// Compile + resource-check a schema; `-` reads schema JSON from stdin.
     Check {
         #[arg(value_name = "SCHEMA")]
@@ -2623,6 +2625,7 @@ fn run_schema_command_with_reader(
     schema_input: &mut impl Read,
 ) -> ExitCode {
     let (mode, path, document) = match command {
+        SchemaSubcommand::Validate(options) => return options.run(schema_input, &mut io::stdout().lock(), &mut io::stderr().lock()),
         SchemaSubcommand::Check { schema, source } => ("check", schema, source),
         SchemaSubcommand::Sample { schema, source } => ("sample", schema, source),
     };

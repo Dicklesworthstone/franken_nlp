@@ -29,7 +29,7 @@
 > target-host performance/platform, artifact, and human-review gates.
 
 > **Current executable surface (static source inventory).** The binary includes
-> `robot schema|health|backends`, `schema check|sample`, conversion/package
+> `robot schema|health|backends`, `schema check|sample|validate`, conversion/package
 > scaffolding, and explicit local inference and corpus routes under `candidate`.
 > Candidate execution requires the `asupersync-runtime` feature. The
 > `candidate source-int4` namespace includes generation/chat,
@@ -294,7 +294,8 @@ fnlp job status <job-id> --json && fnlp job resume <job-id> && fnlp job verify <
 
 # Schema & evidence tooling
 fnlp schema check s.json            # compile-or-fail with the exact unsupported keyword
-fnlp schema sample s.json -n 5      # print valid instances of the compiled grammar
+fnlp schema sample s.json           # emit one valid instance
+fnlp schema validate s.json result.json --source doc.txt   # verify structure and verbatim fields
 fnlp eval --task classify --dataset tickets.test.ndjson --gold label
 fnlp calibrate --task classify --dataset tickets.cal.ndjson -o support.cal.json
 fnlp qualify --baseline active --candidate nanbeige-int4-v2 --suite support-suite.json
