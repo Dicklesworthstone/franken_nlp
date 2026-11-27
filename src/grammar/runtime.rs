@@ -392,7 +392,7 @@ enum Frame<'a> {
     Key { node: usize, choices: Vec<usize>, position: usize },
     ArrayNext { node: usize, count: usize, close: bool },
     ArrayAfter { node: usize, count: usize },
-    Literal { node: usize, choices: Vec<usize>, position: usize },
+    Literal { node: usize, choices: std::ops::Range<usize>, position: usize },
     String { node: usize, bytes: usize, chars: usize, mode: StringMode, source: Option<SourceCursor<'a>> },
     Number { integer: bool, bytes: [u8; NUMBER_BYTES], len: usize, tail: usize },
 }
@@ -463,7 +463,8 @@ impl<'a> JsonState<'a> {
             }).min()?,
             Frame::ArrayNext { node, close, .. } => if *close { 1 } else { self.program.nodes[self.array(*node).0].minimum + 1 },
             Frame::ArrayAfter { .. } => 1,
-            Frame::Literal { node, choices, position } => choices.iter().map(|&i| self.literals(*node)[i].len() - position).min()?,
+            Frame::Literal { node, choices, position } => self.literals(*node)[choices.clone()].iter()
+                .map(|literal| literal.len() - position).min()?,
             Frame::String { mode, source, .. } => 1 + match mode {
                 StringMode::Plain => 0,
                 StringMode::Escape => match source { Some(cursor) => source::escape_tail(cursor)?, None => 1 },
@@ -494,7 +495,7 @@ impl<'a> JsonState<'a> {
                         self.stack.push(Frame::String { node, bytes: 0, chars: 0, mode: StringMode::Plain, source }); return true;
                     }
                     Kind::Number { integer } => self.stack.push(Frame::Number { integer: *integer, bytes: [0; NUMBER_BYTES], len: 0, tail: 1 }),
-                    Kind::Literals(values) => self.stack.push(Frame::Literal { node, choices: (0..values.len()).collect(), position: 0 }),
+                    Kind::Literals(values) => self.stack.push(Frame::Literal { node, choices: 0..values.len(), position: 0 }),
                 },
                 Frame::ObjectNext { node, next, close } => {
                     let fields = self.fields(node);
@@ -535,12 +536,18 @@ impl<'a> JsonState<'a> {
                     if byte != b',' || count >= self.array(node).1 { return false; }
                     self.stack.push(Frame::ArrayNext { node, count, close: false }); return true;
                 }
-                Frame::Literal { node, mut choices, position } => {
-                    let accepting = choices.iter().any(|&i| self.literals(node)[i].len() == position);
-                    choices.retain(|&i| self.literals(node)[i].get(position) == Some(&byte));
-                    if choices.is_empty() { if accepting { continue; } return false; }
+                Frame::Literal { node, choices, position } => {
+                    // Canonical spellings are sorted. Within a common prefix,
+                    // the completed literal (if present) is first and the
+                    // extensions matching a particular byte are contiguous.
+                    let values = &self.literals(node)[choices.clone()];
+                    let accepting = values[0].len() == position;
+                    let first = values.partition_point(|value| value.get(position) < Some(&byte));
+                    let end = values.partition_point(|value| value.get(position) <= Some(&byte));
+                    if first == end { if accepting { continue; } return false; }
                     let position = position + 1;
-                    if choices.iter().any(|&i| self.literals(node)[i].len() > position) {
+                    if values[end - 1].len() > position {
+                        let choices = choices.start + first..choices.start + end;
                         self.stack.push(Frame::Literal { node, choices, position });
                     }
                     return true;
@@ -812,6 +819,29 @@ mod tests {
         for text in ["-0", "01", "1.0", "1e0", "1e309", "1e-309", "18446744073709551616", "-9223372036854775809", "1.0e3", "1e+20", "1e01"] { assert!(!accepts(&p, text), "{text}"); }
         let mut s = p.initial_state(); assert!(s.consume_bytes(b"1e1")); assert!(!s.is_accepting());
         assert!(s.consume_bytes(b"00")); assert!(s.is_accepting());
+    }
+
+    #[test]
+    fn literal_ranges_preserve_shared_prefixes_and_delimiter_replay() {
+        let schema = r#"{"type":"array","items":{"type":"integer","enum":[1,10,100,101,109,11,110,19,2,20]},"maxItems":2}"#;
+        let p = program(schema);
+        let numbers = [1, 10, 100, 101, 109, 11, 110, 19, 2, 20];
+        for left in numbers {
+            for right in numbers {
+                let value = format!("[{left},{right}]");
+                assert!(accepts(&p, &value));
+                p.validate_json(&value).unwrap();
+            }
+        }
+        for invalid in ["[0]", "[102]", "[111]", "[190]", "[21]", "[,1]"] {
+            assert!(!accepts(&p, invalid));
+        }
+        let mut shared = p.initial_state();
+        assert!(shared.consume_bytes(b"[10"));
+        assert!(shared.clone().consume_bytes(b"1,"));
+        assert!(!shared.clone().consume_bytes(b"2,"));
+        assert!(shared.consume_bytes(b"]"));
+        assert!(shared.is_accepting());
     }
 
     #[test]
