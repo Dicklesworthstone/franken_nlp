@@ -194,7 +194,6 @@ fn attend_rows<C: DecodeStepControl>(query: &mut [Bf16], key: &mut [Bf16], value
     }
     if cache.len_for_slot(slot).map_err(|_| StrictInt8Error::Cache)? != start { return Err(StrictInt8Error::Cache); }
     let mut output = filled(rows * Q, Bf16::from_bits(0))?;
-    let mut key_bits = filled(K, 0_u16)?; let mut value_bits = filled(K, 0_u16)?;
     for index in 0..rows {
         poll(control)?;
         let position = start + index;
@@ -204,9 +203,7 @@ fn attend_rows<C: DecodeStepControl>(query: &mut [Bf16], key: &mut [Bf16], value
         for head in q.chunks_exact_mut(NANBEIGE_HEAD_DIM) { rope.apply_split_half(position, head).map_err(|_| StrictInt8Error::Rope)?; }
         for head in k.chunks_exact_mut(NANBEIGE_HEAD_DIM) { rope.apply_split_half(position, head).map_err(|_| StrictInt8Error::Rope)?; }
         finite(q)?; finite(k)?; finite(v)?;
-        for (out, value) in key_bits.iter_mut().zip(k.iter()) { *out = value.to_bits(); }
-        for (out, value) in value_bits.iter_mut().zip(v) { *out = value.to_bits(); }
-        cache.append(slot, position, &key_bits, &value_bits).map_err(|_| StrictInt8Error::Cache)?;
+        cache.append_bf16(slot, position, k, v).map_err(|_| StrictInt8Error::Cache)?;
         poll(control)?;
         let attention = eager_gqa_attention_from_cache_with_control(q, cache, slot, control)?;
         finite(&attention)?;

@@ -7,6 +7,8 @@
 
 use std::{array, cell::RefCell, rc::Rc};
 
+use super::tensor::Bf16;
+
 /// Physical decoder layers shared by the two logical passes.
 pub const PHYSICAL_LAYER_COUNT: usize = 22;
 /// Logical decoder passes per token.
@@ -484,18 +486,46 @@ impl KvCache {
         key: &[u16],
         value: &[u16],
     ) -> Result<(), KvCacheError> {
-        if key.len() != KV_ELEMENTS_PER_POSITION {
+        let target = self.append_target(slot, position, key.len(), value.len())?;
+        target.keys.extend_from_slice(key);
+        target.values.extend_from_slice(value);
+        Ok(())
+    }
+
+    /// Stores projected BF16 vectors directly into the reserved slot. Preserve
+    /// the exact representation, including signed zeros and NaN payloads.
+    pub(crate) fn append_bf16(
+        &mut self,
+        slot: usize,
+        position: usize,
+        key: &[Bf16],
+        value: &[Bf16],
+    ) -> Result<(), KvCacheError> {
+        let target = self.append_target(slot, position, key.len(), value.len())?;
+        target.keys.extend(key.iter().copied().map(Bf16::to_bits));
+        target.values.extend(value.iter().copied().map(Bf16::to_bits));
+        Ok(())
+    }
+
+    fn append_target(
+        &mut self,
+        slot: usize,
+        position: usize,
+        key_len: usize,
+        value_len: usize,
+    ) -> Result<&mut KvSlot, KvCacheError> {
+        if key_len != KV_ELEMENTS_PER_POSITION {
             return Err(KvCacheError::InvalidVectorLength {
                 vector: KvVector::Key,
                 expected: KV_ELEMENTS_PER_POSITION,
-                actual: key.len(),
+                actual: key_len,
             });
         }
-        if value.len() != KV_ELEMENTS_PER_POSITION {
+        if value_len != KV_ELEMENTS_PER_POSITION {
             return Err(KvCacheError::InvalidVectorLength {
                 vector: KvVector::Value,
                 expected: KV_ELEMENTS_PER_POSITION,
-                actual: value.len(),
+                actual: value_len,
             });
         }
         if slot >= KV_SLOT_COUNT {
@@ -517,9 +547,7 @@ impl KvCache {
                 received_position: position,
             });
         }
-        target.keys.extend_from_slice(key);
-        target.values.extend_from_slice(value);
-        Ok(())
+        Ok(target)
     }
 
     /// Removes all logical positions while retaining the engine-build buffers.
@@ -1498,6 +1526,44 @@ impl KvCache {
             slot.values.truncate(keep);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod bf16_append_tests {
+    use super::*;
+
+    #[test]
+    fn direct_projection_append_preserves_all_bits_and_slot_reservations() {
+        let key = std::array::from_fn::<_, KV_ELEMENTS_PER_POSITION, _>(|i| {
+            Bf16::from_bits([0x0000, 0x8000, 0x7f81, 0xffc1, 0x3f80][i % 5])
+        });
+        let value = key.map(|v| Bf16::from_bits(v.to_bits() ^ 0x8000));
+        let mut cache = KvCache::try_with_capacity(2).unwrap();
+        for slot in 0..KV_SLOT_COUNT {
+            let buffers = (cache.slots[slot].keys.as_ptr(), cache.slots[slot].values.as_ptr());
+            for position in 0..2 {
+                cache.append_bf16(slot, position, &key, &value).unwrap();
+                assert_eq!(cache.key_at(slot, position).unwrap(), &key.map(Bf16::to_bits));
+                assert_eq!(cache.value_at(slot, position).unwrap(), &value.map(Bf16::to_bits));
+            }
+            assert_eq!(buffers, (cache.slots[slot].keys.as_ptr(), cache.slots[slot].values.as_ptr()));
+        }
+    }
+
+    #[test]
+    fn rejected_bf16_appends_leave_both_rails_unchanged() {
+        let data = [Bf16::from_bits(0x3f80); KV_ELEMENTS_PER_POSITION];
+        let mut cache = KvCache::try_with_capacity(1).unwrap();
+        assert!(cache.append_bf16(0, 0, &data, &data[1..]).is_err());
+        assert!(cache.append_bf16(0, 0, &data[1..], &data).is_err());
+        assert!(cache.append_bf16(KV_SLOT_COUNT, 0, &data, &data).is_err());
+        assert!(cache.append_bf16(0, 1, &data, &data).is_err());
+        assert!(cache.slots.iter().all(|slot| slot.keys.is_empty() && slot.values.is_empty()));
+        cache.append_bf16(0, 0, &data, &data).unwrap();
+        assert!(cache.append_bf16(0, 0, &data, &data).is_err());
+        assert_eq!(cache.slots[0].keys.len(), KV_ELEMENTS_PER_POSITION);
+        assert_eq!(cache.slots[0].values.len(), KV_ELEMENTS_PER_POSITION);
     }
 }
 

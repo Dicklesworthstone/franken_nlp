@@ -708,15 +708,7 @@ fn run_hf_bf16_layer(
     for head in key.chunks_exact_mut(NANBEIGE_HEAD_DIM) {
         rope.apply_split_half(positions.rope_position, head)?;
     }
-    cache.append(
-        kv_slot,
-        positions.cache_position,
-        &key.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
-        &value
-            .iter()
-            .map(|value| value.to_bits())
-            .collect::<Vec<_>>(),
-    )?;
+    cache.append_bf16(kv_slot, positions.cache_position, &key, &value)?;
     let attention = eager_gqa_attention_from_cache(&query, cache, kv_slot)?;
     let attention_output = layer.o_proj.project_f32_accumulate_cast_back(&attention)?;
     Ok(layer.finish_attention_and_mlp(hidden, &attention_output)?)

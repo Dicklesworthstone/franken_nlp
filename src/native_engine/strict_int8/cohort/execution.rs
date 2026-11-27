@@ -107,7 +107,6 @@ pub(super) fn attend_sequences<C: DecodeStepControl>(query: &mut [Bf16], key: &m
     if query.len() != steps.len() * Q || key.len() != steps.len() * K
         || value.len() != steps.len() * K { return Err(StrictInt8Error::Input); }
     let mut output = filled(query.len(), Bf16::from_bits(0))?;
-    let mut key_bits = filled(K, 0_u16)?; let mut value_bits = filled(K, 0_u16)?;
     for (index, (step, &position)) in steps.iter().zip(positions).enumerate() {
         poll(control)?;
         let q = &mut query[index * Q..(index + 1) * Q];
@@ -116,10 +115,8 @@ pub(super) fn attend_sequences<C: DecodeStepControl>(query: &mut [Bf16], key: &m
         for head in q.chunks_exact_mut(NANBEIGE_HEAD_DIM) { rope.apply_split_half(position, head).map_err(|_| StrictInt8Error::Rope)?; }
         for head in k.chunks_exact_mut(NANBEIGE_HEAD_DIM) { rope.apply_split_half(position, head).map_err(|_| StrictInt8Error::Rope)?; }
         finite(q)?; finite(k)?; finite(v)?;
-        for (out, value) in key_bits.iter_mut().zip(k.iter()) { *out = value.to_bits(); }
-        for (out, value) in value_bits.iter_mut().zip(v) { *out = value.to_bits(); }
         let cache = &mut sequences[step.sequence].cache;
-        cache.append(slot, position, &key_bits, &value_bits).map_err(|_| StrictInt8Error::Cache)?;
+        cache.append_bf16(slot, position, k, v).map_err(|_| StrictInt8Error::Cache)?;
         poll(control)?;
         let attention = eager_gqa_attention_from_cache_with_control(q, cache, slot, control)?;
         finite(&attention)?; output[index * Q..(index + 1) * Q].copy_from_slice(&attention);

@@ -485,10 +485,7 @@ impl<'w, C: DecodeStepControl> LayerExecutor<Int8Layer<'w>> for Executor<'_, '_,
         for head in query.chunks_exact_mut(NANBEIGE_HEAD_DIM) { self.rope.apply_split_half(positions.rope_position, head).map_err(|_| StrictInt8Error::Rope)?; }
         for head in key.chunks_exact_mut(NANBEIGE_HEAD_DIM) { self.rope.apply_split_half(positions.rope_position, head).map_err(|_| StrictInt8Error::Rope)?; }
         finite(&query)?; finite(&key)?;
-        let mut key_bits = filled(K, 0_u16)?; let mut value_bits = filled(K, 0_u16)?;
-        for (out, value) in key_bits.iter_mut().zip(&key) { *out = value.to_bits(); }
-        for (out, value) in value_bits.iter_mut().zip(&value) { *out = value.to_bits(); }
-        cache.append(binding.kv_slot(), positions.cache_position, &key_bits, &value_bits).map_err(|_| StrictInt8Error::Cache)?;
+        cache.append_bf16(binding.kv_slot(), positions.cache_position, &key, &value).map_err(|_| StrictInt8Error::Cache)?;
         poll(self.control)?;
         let attention = eager_gqa_attention_from_cache_with_control(&query, cache, binding.kv_slot(), self.control)?;
         finite(&attention)?; poll(self.control)?;
