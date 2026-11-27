@@ -2,6 +2,7 @@
 //! All requested axes and samples are admitted before model materialization;
 //! preparation and guarded output remain charged through checked publication.
 use super::*;
+pub(in crate::candidate_cli) mod corpus;
 use super::source_tasks::Session;
 use std::sync::Arc;
 use crate::{
@@ -81,6 +82,8 @@ pub(in crate::candidate_cli) fn host_failure(error: HostedError) -> Failure {
         }
         HostedError::Join { physical_error: Some(error), .. }
             | HostedError::Scope { physical_error: Some(error), .. } => host_failure(*error),
+        HostedError::BatchSetup(fault) => corpus::failure(fault),
+        HostedError::Batch(error) => corpus::failure(error.fault),
         HostedError::SampledSentiment(error) => task_failure(error),
         HostedError::Native(error) => task_failure(error.into()),
         HostedError::Model(CurrentCandidateInt8Error::Artifact(ArtifactBridgeError::Cancelled(cause)))

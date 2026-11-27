@@ -11,6 +11,7 @@ use crate::{
 
 #[cfg(feature = "asupersync-runtime")]
 use super::runtime::sampled_sentiment as runtime;
+pub(super) mod corpus;
 #[cfg(test)]
 mod tests;
 
@@ -153,6 +154,9 @@ impl SampledSentimentCommand {
         Ok(())
     }
     fn common(&self) -> Result<(CandidateArgs, Limits), CandidateError> {
+        self.common_with_staging(0)
+    }
+    fn common_with_staging(&self, stream_staging: u64) -> Result<(CandidateArgs, Limits), CandidateError> {
         self.options()?;
         if self.max_new_tokens >= self.context_tokens
             || !(1..=MAX_CONTENT_BYTES).contains(&self.max_result_bytes)
@@ -197,7 +201,7 @@ impl SampledSentimentCommand {
         let peak = compute::request_peak_bytes(limits, native, self.max_result_bytes as u64,
             self.total_tokens(SentimentAxis::ALL.len())? as u64, sampler, limits.preparation_bytes)?
             .checked_add(prefill.map(|p| p.max_extra_scratch_bytes).unwrap_or(0))
-            .ok_or(CandidateError::Arguments)?;
+            .and_then(|bytes| bytes.checked_add(stream_staging)).ok_or(CandidateError::Arguments)?;
         if peak > limits.memory_bytes { return Err(CandidateError::Arguments); }
         Ok((common, limits))
     }

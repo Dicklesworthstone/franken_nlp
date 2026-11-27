@@ -116,6 +116,7 @@ pub(crate) enum CandidateCommand {
     Source(source::SourceCommand),
     Scored(scored::ScoredCommand),
     SampledSentiment(sampled_sentiment::SampledSentimentCommand),
+    SampledSentimentBatch(sampled_sentiment::corpus::Command),
     SentimentMap(sentiment_map::SentimentMapCommand),
     ClassifyMap(classify_map::ClassifyMapCommand),
     Extract(extract::ExtractCommand),
@@ -145,6 +146,7 @@ pub(crate) fn definition() -> clap::Command {
         .subcommands(source::definitions())
         .subcommands(scored::definitions())
         .subcommand(sampled_sentiment::definition())
+        .subcommand(sampled_sentiment::corpus::definition())
         .subcommand(sentiment_map::definition())
         .subcommand(classify_map::definition())
         .subcommand(batch::definition())
@@ -206,6 +208,9 @@ impl CandidateCommand {
         if name == "sentiment-map" {
             return sentiment_map::SentimentMapCommand::from_matches(matches).map(Self::SentimentMap);
         }
+        if name == "sentiment-sampled-batch" {
+            return sampled_sentiment::corpus::Command::from_matches(matches).map(Self::SampledSentimentBatch);
+        }
         if name == "sentiment-sampled" {
             return sampled_sentiment::SampledSentimentCommand::from_matches(matches).map(Self::SampledSentiment);
         }
@@ -262,6 +267,7 @@ impl CandidateCommand {
         match self {
             Self::SourceInt4(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::Batch(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
+            Self::SampledSentimentBatch(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::ScoreBatch(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::DocumentCorpus(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::FaithfulnessCorpus(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
@@ -315,7 +321,7 @@ impl CandidateCommand {
             Self::SampledSentiment(_) => return Err(CandidateError::Arguments),
             // A borrowed stream cannot outlive the hosted blocking closure.
             // The executable dispatcher always takes run_stdio for owned IO.
-            Self::Batch(_) | Self::ScoreBatch(_) | Self::DocumentCorpus(_) | Self::FaithfulnessCorpus(_)
+            Self::Batch(_) | Self::SampledSentimentBatch(_) | Self::ScoreBatch(_) | Self::DocumentCorpus(_) | Self::FaithfulnessCorpus(_)
                 | Self::SemanticBatch(_) | Self::SemanticJob(_)
                 | Self::Job(_) | Self::ScoreJob(_) | Self::TextJob(_) | Self::Stream(_) => return Err(CandidateError::Arguments),
             Self::Text { task, args } => (task, args),

@@ -125,6 +125,38 @@ Lower-level callers can use `decode_json_int8_sampled` and
 grammar driver, native work reconciliation, explicit EOS and abort behavior
 as the greedy decoder.
 
-This increment supplies one-request native INT8 sampled sentiment. The separate
-[INT4 sampled routes](native-sampled-sentiment-int4.md) provide their own
-complete-document, population, retained-job and selected-row capabilities.
+## Ordered resident corpora
+
+Use `fnlp candidate sentiment-sampled-batch` to keep the authenticated INT8
+model, vocabulary, compiler and native buffers resident across records. Each
+text fits a single context. For example, save the following as `reviews.ndjson`.
+
+```jsonl
+{"id":"review-42","text":"The replacement arrived early.","task_args":{"axes":["valence"]}}
+{"id":"review-43","text":"Still waiting for a response."}
+{"flush":true}
+```
+
+```sh
+fnlp candidate sentiment-sampled-batch reviews.ndjson \
+  --model /path/to/local-current-candidate-int8-artifact \
+  --memory-mib 12288 \
+  --seed 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --samples 2 --max-requests 100 --max-input-mib 16 --max-output-mib 32
+```
+
+Omitting task arguments requests all four axes. Each stable ID participates in
+the private sampling address along with the model and request. Reordering
+distinct items or inserting a flush preserves their addresses. An optional
+complete `task_args.budget` can tighten the task limits for that item.
+
+The five native work limits and the mask-node limit cover the entire run,
+including admitted attempts that fail. A flush starts a fresh ID epoch. It
+does not replenish work. Compact-tokenizer limits apply to each record.
+A successful item includes every requested sample. Inspect the final
+`run_complete` and process status to distinguish full success from a stream
+containing rejected records or an interrupted run.
+
+Library callers use `NlpEngine::batch_int8_sampled_sentiment` with the
+model-bound planner, pinned vocabulary, `SampledSentimentCorpusConfig`,
+`CorpusLimits`, optional `Int8PrefillLimits` and owned input/output streams.
