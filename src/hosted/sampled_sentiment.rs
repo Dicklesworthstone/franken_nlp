@@ -1,6 +1,7 @@
 //! Complete independent INT8 score/justification bundles on one charged host.
-//! Every sample has fresh logical KV and its own addressed draws. Native,
-//! sampler, preparation and output ownership survive physical completion.
+//! Every sample has its own addressed draws; prompt reuse is an explicit
+//! in-session schedule. Native, sampler, preparation and output ownership
+//! survive physical completion.
 
 mod long;
 pub use long::Int8SampledSentimentMapHostConfig;
@@ -17,7 +18,8 @@ use crate::{
     tasks::{ir::TaskBudget, sentiment::sampled::{
         SampledSentimentVocabulary,
         quantized::{PreparedInt8SampledSentiment, Int8SampledSentimentRun,
-            Int8SampledSentimentError, INT8_SAMPLED_SENTIMENT_EXECUTION},
+            Int8SampledSentimentError, INT8_SAMPLED_SENTIMENT_EXECUTION,
+            INT8_SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION},
     }},
 };
 
@@ -40,7 +42,7 @@ impl NlpEngine {
         limits: Int8SampledSentimentHostLimits, cancellation: CancellationToken)
         -> Result<HostedOutput<Int8SampledSentimentRun>, HostedError> {
         self.execute_int8_sampled_sentiment_scheduled(model, prepared, vocabulary,
-            limits, None, cancellation)
+            limits, None, false, cancellation)
     }
 
     /// Only prompt scheduling changes: each sample still begins with empty KV,
@@ -51,7 +53,7 @@ impl NlpEngine {
         limits: Int8SampledSentimentHostLimits, prefill: Int8PrefillLimits,
         cancellation: CancellationToken) -> Result<HostedOutput<Int8SampledSentimentRun>, HostedError> {
         self.execute_int8_sampled_sentiment_scheduled(model, prepared, vocabulary,
-            limits, Some(prefill), cancellation)
+            limits, Some(prefill), false, cancellation)
     }
 
     /// Reuse one admitted row team across the entire independent sample
@@ -63,7 +65,7 @@ impl NlpEngine {
         cancellation: CancellationToken)
         -> Result<HostedInt8TeamResult<Int8SampledSentimentRun>, HostedError> {
         self.execute_int8_sampled_sentiment_team(model, prepared, vocabulary,
-            limits, kernel, compute_threads, None, cancellation)
+            limits, kernel, compute_threads, None, false, cancellation)
     }
 
     /// The same fixed workers execute prompt morsels and subsequent sampled
@@ -75,13 +77,38 @@ impl NlpEngine {
         prefill: Int8PrefillLimits, cancellation: CancellationToken)
         -> Result<HostedInt8TeamResult<Int8SampledSentimentRun>, HostedError> {
         self.execute_int8_sampled_sentiment_team(model, prepared, vocabulary,
-            limits, kernel, compute_threads, Some(prefill), cancellation)
+            limits, kernel, compute_threads, Some(prefill), false, cancellation)
+    }
+
+    /// Retain only the current axis's exact prompt prefix inside one exclusive
+    /// session. Later samples replay its final token with their original draw
+    /// addresses. Cold-work ceilings remain admission authority; no KV is
+    /// copied, persisted or shared with another document or request.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_int8_sampled_sentiment_reusing_prefill(&self, model: &ResidentInt8,
+        prepared: PreparedInt8SampledSentiment, vocabulary: Arc<SampledSentimentVocabulary>,
+        limits: Int8SampledSentimentHostLimits, prefill: Option<Int8PrefillLimits>,
+        cancellation: CancellationToken) -> Result<HostedOutput<Int8SampledSentimentRun>, HostedError> {
+        self.execute_int8_sampled_sentiment_scheduled(model, prepared, vocabulary,
+            limits, prefill, true, cancellation)
+    }
+
+    /// The same admitted team serves cold initial prompts and independently
+    /// sampled continuations, including optional bounded prompt morsels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_int8_sampled_sentiment_reusing_prefill_with_threads(&self, model: &ResidentInt8,
+        prepared: PreparedInt8SampledSentiment, vocabulary: Arc<SampledSentimentVocabulary>,
+        limits: Int8SampledSentimentHostLimits, kernel: Int8Kernel, compute_threads: usize,
+        prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedInt8TeamResult<Int8SampledSentimentRun>, HostedError> {
+        self.execute_int8_sampled_sentiment_team(model, prepared, vocabulary,
+            limits, kernel, compute_threads, prefill, true, cancellation)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn execute_int8_sampled_sentiment_scheduled(&self, model: &ResidentInt8,
         prepared: PreparedInt8SampledSentiment, vocabulary: Arc<SampledSentimentVocabulary>,
-        limits: Int8SampledSentimentHostLimits, prefill: Option<Int8PrefillLimits>,
+        limits: Int8SampledSentimentHostLimits, prefill: Option<Int8PrefillLimits>, reuse_prefill: bool,
         cancellation: CancellationToken) -> Result<HostedOutput<Int8SampledSentimentRun>, HostedError> {
         dispatch::preflight(self, limits.native.run)?;
         self.check_resident_domain(model)?;
@@ -90,6 +117,9 @@ impl NlpEngine {
         let work = prepared.planned_work();
         let scratch = validate(limits, prepared.task_budget(), prepared.required_context(),
             required, work, prepared.preparation_requirement_bytes())?;
+        let reused_sampler = reuse_prefill.then(|| prepared.reuse_sampler_requirement_bytes())
+            .transpose().map_err(HostedError::SampledSentiment)?;
+        let scratch = schedule_scratch(scratch, limits.max_sampler_bytes, reused_sampler)?;
         let scratch = super::scored::scoring_scratch(scratch, prefill)?;
         let budget = execution_budget(work, required.kv_bytes, limits);
         prepared.complete_mask_charge(&vocabulary, budget, limits.max_sampler_bytes)
@@ -110,7 +140,7 @@ impl NlpEngine {
             let result = allocate(output, || {
                 let (prepared, vocabulary) = &input.value;
                 execute_prepared(prepared, vocabulary, &mut engine.value, budget,
-                    limits.max_sampler_bytes, prefill, control)
+                    limits.max_sampler_bytes, prefill, reuse_prefill, control)
             })?;
             drop(engine);
             drop(input);
@@ -123,7 +153,7 @@ impl NlpEngine {
     fn execute_int8_sampled_sentiment_team(&self, model: &ResidentInt8,
         prepared: PreparedInt8SampledSentiment, vocabulary: Arc<SampledSentimentVocabulary>,
         limits: Int8SampledSentimentHostLimits, kernel: Int8Kernel, width: usize,
-        prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken)
+        prefill: Option<Int8PrefillLimits>, reuse_prefill: bool, cancellation: CancellationToken)
         -> Result<HostedInt8TeamResult<Int8SampledSentimentRun>, HostedError> {
         dispatch::preflight_int8_team(self, limits.native.run, width)?;
         self.check_resident_domain(model)?;
@@ -131,6 +161,9 @@ impl NlpEngine {
         let native = requirements(limits.native)?;
         let scratch = validate(limits, prepared.task_budget(), prepared.required_context(),
             native, prepared.planned_work(), prepared.preparation_requirement_bytes())?;
+        let reused_sampler = reuse_prefill.then(|| prepared.reuse_sampler_requirement_bytes())
+            .transpose().map_err(HostedError::SampledSentiment)?;
+        let scratch = schedule_scratch(scratch, limits.max_sampler_bytes, reused_sampler)?;
         let (scratch, max_batch_rows) = team_scratch(scratch, width, prefill)?;
         let budget = execution_budget(prepared.planned_work(), native.kv_bytes, limits);
         prepared.complete_mask_charge(&vocabulary, budget, limits.max_sampler_bytes)
@@ -152,7 +185,7 @@ impl NlpEngine {
                 admission.commit_native()?;
                 let (prepared, vocabulary) = &admission.input.value;
                 let result = execute_prepared(prepared, vocabulary, &mut engine, budget,
-                    limits.max_sampler_bytes, prefill, control)?;
+                    limits.max_sampler_bytes, prefill, reuse_prefill, control)?;
                 drop(engine);
                 let compute = team.stats().into();
                 admission.finish(result, compute)
@@ -193,18 +226,34 @@ fn team_scratch(ordinary: u64, width: usize, prefill: Option<Int8PrefillLimits>)
     Ok((scratch, rows))
 }
 
+/// The cold quote already includes one sampler. A reused bundle additionally
+/// holds its bounded vector of independent addresses; charge only that delta.
+fn schedule_scratch(cold: u64, ceiling: u64, reused: Option<u64>) -> Result<u64, HostedError> {
+    let Some(reused) = reused else { return Ok(cold); };
+    let ordinary = json_sampling_workspace_bytes()
+        .map_err(Int8SampledSentimentError::from).map_err(HostedError::SampledSentiment)?;
+    let extra = reused.checked_sub(ordinary)
+        .filter(|_| reused <= ceiling).ok_or(HostedError::Limits("sampled INT8 reused sampler admission"))?;
+    sum(&[cold, extra])
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_prepared(prepared: &PreparedInt8SampledSentiment, vocabulary: &SampledSentimentVocabulary,
     engine: &mut StrictInt8Engine<'_>, budget: Int8JsonBudget, max_sampler_bytes: u64,
-    prefill: Option<Int8PrefillLimits>, control: &mut RunControl)
+    prefill: Option<Int8PrefillLimits>, reuse_prefill: bool, control: &mut RunControl)
     -> Result<Int8SampledSentimentRun, HostedError> {
-    let run = match prefill {
+    let run = if reuse_prefill {
+        prepared.execute_reusing_prefill_with_control(engine, prepared.execution_identity(),
+            vocabulary, budget, max_sampler_bytes, prefill, control)
+    } else { match prefill {
         None => prepared.execute_with_control(engine, prepared.execution_identity(), vocabulary,
             budget, max_sampler_bytes, control),
         Some(prefill) => prepared.execute_layer_major_with_control(engine, prepared.execution_identity(),
             vocabulary, budget, max_sampler_bytes, prefill, control),
-    }.map_err(HostedError::SampledSentiment)?;
-    if run.execution != INT8_SAMPLED_SENTIMENT_EXECUTION || !fits(run.model_work, prepared.planned_work())
+    } }.map_err(HostedError::SampledSentiment)?;
+    let execution = if reuse_prefill { INT8_SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION }
+        else { INT8_SAMPLED_SENTIMENT_EXECUTION };
+    if run.execution != execution || !fits(run.model_work, prepared.planned_work())
         || engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) {
         return Err(HostedError::Limits("sampled sentiment completion accounting"));
     }
@@ -396,6 +445,15 @@ mod tests {
             assert_eq!(memory.recorded_leaks, 0);
             assert_eq!(host.resources().outstanding_closure_snapshot().active_closures, 0);
         }
+        fn sampled_semantics(run: &Int8SampledSentimentRun) -> Vec<u8> {
+            let mut normalized = run.clone();
+            normalized.execution = INT8_SAMPLED_SENTIMENT_EXECUTION.to_owned();
+            normalized.model_work = Int8Work::default();
+            for dimension in &mut normalized.dimensions {
+                for sample in &mut dimension.samples { sample.model_work = Int8Work::default(); }
+            }
+            canonjson::canonical_bytes(&normalized).unwrap()
+        }
         #[derive(Clone)]
         struct Capture(Arc<Mutex<Vec<u8>>>);
         impl Write for Capture {
@@ -480,6 +538,7 @@ mod tests {
             let host_limits = limits(plan.planned_work());
             let serial = host.execute_int8_sampled_sentiment(&model, plan, Arc::clone(&vocabulary),
                 host_limits, CancellationToken::default()).unwrap();
+            let expected_run = serial.result().clone();
             let expected = canonjson::canonical_bytes(serial.result()).unwrap();
             drop(serial); drained(&host, baseline);
             for width in [2, 4] { for schedule in [None, Some(prefill())] {
@@ -497,6 +556,34 @@ mod tests {
                 drained(&host, baseline + output_charge);
                 drop(result); drained(&host, baseline);
             } }
+            let mut reused_limits = host_limits;
+            reused_limits.max_sampler_bytes = prepared(&model).reuse_sampler_requirement_bytes().unwrap();
+            let verify_reused = |run: &Int8SampledSentimentRun| {
+                assert_eq!(run.execution, INT8_SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION);
+                assert_eq!(sampled_semantics(run), sampled_semantics(&expected_run));
+                assert!(run.model_work.forward_positions < expected_run.model_work.forward_positions);
+                assert_eq!(run.model_work.projected_logits, expected_run.model_work.projected_logits);
+                assert!(fits(run.model_work, expected_run.model_work));
+            };
+            for schedule in [None, Some(prefill())] {
+                let result = host.execute_int8_sampled_sentiment_reusing_prefill(&model,
+                    prepared(&model), Arc::clone(&vocabulary), reused_limits, schedule,
+                    CancellationToken::default()).unwrap();
+                verify_reused(result.result());
+                drained(&host, baseline + output_charge);
+                drop(result); drained(&host, baseline);
+                for width in [2, 4] {
+                    let result = host.execute_int8_sampled_sentiment_reusing_prefill_with_threads(&model,
+                        prepared(&model), Arc::clone(&vocabulary), reused_limits, Int8Kernel::scalar(),
+                        width, schedule, CancellationToken::default()).unwrap();
+                    verify_reused(result.result());
+                    assert_eq!(result.compute().compute_threads, width);
+                    assert_eq!(result.compute().completed_rows, result.result().model_work.projections.dot_products);
+                    assert!(result.compute().completed_worker_rows > 0);
+                    drained(&host, baseline + output_charge);
+                    drop(result); drained(&host, baseline);
+                }
+            }
             let expected = corpus(&host, &model, Arc::clone(&vocabulary), 1, None);
             drained(&host, baseline);
             for (width, schedule) in [(2, None), (4, Some(prefill()))] {
@@ -512,9 +599,18 @@ mod tests {
                     .err().expect("cancelled sampling must not publish");
                 assert!(matches!(error, HostedError::Stopped { stop: RunStop { kind, .. }, .. } if kind == cause));
                 drained(&host, baseline);
+                let token = CancellationToken::default(); token.cancel(cause);
+                let error = host.execute_int8_sampled_sentiment_reusing_prefill_with_threads(&model,
+                    prepared(&model), Arc::clone(&vocabulary), reused_limits, Int8Kernel::scalar(),
+                    4, Some(prefill()), token).err().expect("cancelled reused sampling must not publish");
+                assert!(matches!(error, HostedError::Stopped { stop: RunStop { kind, .. }, .. } if kind == cause));
+                drained(&host, baseline);
             }
             drop(vocabulary); drop(model); drop(caller_preparation); drop(lease); drained(&host, 0);
             println!("{COMPLETE}");
         }
     }
 }
+
+#[cfg(test)]
+mod reuse_tests;

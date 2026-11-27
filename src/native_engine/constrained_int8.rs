@@ -203,7 +203,11 @@ trait Driver {
         Ok(())
     }
     fn logits(&mut self) -> Result<Vec<f32>, Int8JsonError>;
-    fn work(&self) -> Int8Work;
+    fn work(&self) -> Result<Int8Work, Int8JsonError>;
+    /// Completed positions retained only inside this same native session.
+    /// A replay adapter restores that prefix, forwards the final prompt token
+    /// and reports only its sample's new work against the cumulative ledger.
+    fn retained_prompt_positions(&self) -> usize { 0 }
     fn abort(&mut self);
 }
 impl<C: DecodeStepControl> Driver for Int8Session<'_, '_, C> {
@@ -211,7 +215,7 @@ impl<C: DecodeStepControl> Driver for Int8Session<'_, '_, C> {
     fn control(&mut self) -> &mut C { Int8Session::control(self) }
     fn append(&mut self, token: u32) -> Result<(), Int8JsonError> { Ok(Int8Session::append(self, token)?) }
     fn logits(&mut self) -> Result<Vec<f32>, Int8JsonError> { Ok(Int8Session::logits(self, LinearRows::All)?) }
-    fn work(&self) -> Int8Work { Int8Session::work(self) }
+    fn work(&self) -> Result<Int8Work, Int8JsonError> { Ok(Int8Session::work(self)) }
     fn abort(&mut self) { Int8Session::abort(self); }
 }
 trait Vocabulary {
@@ -301,6 +305,10 @@ fn run<V: Vocabulary, D: Driver, S: Selection>(prompt: &[u32], program: &JsonPro
     options: &JsonDecodeOptions, budget: Int8JsonBudget, driver: &mut D, selection: &mut S)
     -> Result<Int8JsonRun, Int8JsonError> {
     preflight(prompt, vocabulary, options, budget)?;
+    let retained = driver.retained_prompt_positions();
+    if retained >= prompt.len() {
+        return Err(JsonDecodeError::InvalidRequest("replayed prompt must forward its final token").into());
+    }
     let mut tokens = Vec::new();
     tokens.try_reserve_exact(options.max_new_tokens).map_err(|_| JsonDecodeError::AllocationRefused)?;
     let mut bytes = Vec::new();
@@ -308,7 +316,7 @@ fn run<V: Vocabulary, D: Driver, S: Selection>(prompt: &[u32], program: &JsonPro
     driver.append_prompt(prompt)?;
     let mut logits = driver.logits()?;
     checked_logits(&logits, vocabulary.width())?;
-    let mut positions = prompt.len() as u64;
+    let mut positions = (prompt.len() - retained) as u64;
     let mut projected = vocabulary.width() as u64;
     let mut charged = 0_u64;
     let mut state = program.initial_state();
@@ -323,8 +331,8 @@ fn run<V: Vocabulary, D: Driver, S: Selection>(prompt: &[u32], program: &JsonPro
         if selected == options.eos_token_id {
             let json = String::from_utf8(bytes).map_err(|_| JsonDecodeError::IndependentValidation)?;
             super::constrained::checked_source_fields(program, &json, driver.control(), step)?;
-            let model_work = driver.work();
-            if model_work != Int8Work::for_sequence(0, positions as usize, projected as usize)? {
+            let model_work = driver.work()?;
+            if model_work != Int8Work::for_sequence(retained, positions as usize, projected as usize)? {
                 return Err(Int8JsonError::WorkMismatch);
             }
             if let Some(cause) = driver.control().checkpoint(step) { return Err(JsonDecodeError::Cancelled(cause).into()); }
@@ -354,6 +362,9 @@ fn run<V: Vocabulary, D: Driver, S: Selection>(prompt: &[u32], program: &JsonPro
 pub mod sparse;
 pub mod prefill;
 mod sampled;
-pub use sampled::{Int8JsonSamplingOptions, INT8_JSON_SAMPLED_EXECUTION, JSON_SAMPLER_VERSION,
-    json_sampling_workspace_bytes, decode_json_int8_sampled, decode_json_int8_sampled_layer_major};
-pub(crate) use sampled::{decode_json_int8_sampled_with, decode_json_int8_sampled_layer_major_with};
+pub use sampled::{Int8JsonSamplingOptions, INT8_JSON_SAMPLED_EXECUTION,
+    INT8_JSON_SAMPLED_REUSED_PREFILL_EXECUTION, JSON_SAMPLER_VERSION,
+    json_sampling_workspace_bytes, json_sampling_reuse_workspace_bytes,
+    decode_json_int8_sampled, decode_json_int8_sampled_layer_major};
+pub(crate) use sampled::{decode_json_int8_sampled_with, decode_json_int8_sampled_layer_major_with,
+    decode_json_int8_sampled_reusing_prefill_with};

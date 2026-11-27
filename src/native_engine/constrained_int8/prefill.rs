@@ -64,7 +64,7 @@ impl<D: PromptDriver> Driver for LayerMajor<'_, D> {
         self.driver.append_layer_major(prompt, self.prefill)
     }
     fn logits(&mut self) -> Result<Vec<f32>, Int8JsonError> { self.driver.logits() }
-    fn work(&self) -> Int8Work { self.driver.work() }
+    fn work(&self) -> Result<Int8Work, Int8JsonError> { self.driver.work() }
     fn abort(&mut self) { self.driver.abort(); }
 }
 

@@ -13,6 +13,10 @@ use crate::native_engine::{
     strict_int8::prefill::Int8PrefillLimits,
 };
 
+mod reuse;
+pub use reuse::{INT8_JSON_SAMPLED_REUSED_PREFILL_EXECUTION, json_sampling_reuse_workspace_bytes};
+pub(crate) use reuse::decode_json_int8_sampled_reusing_prefill_with;
+
 pub const INT8_JSON_SAMPLED_EXECUTION: &str =
     "portable-int8-sampled-constrained-json-final-prefill-head-v1";
 /// Grammar legality, then temperature, optional top-k and exact nucleus,

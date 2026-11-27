@@ -59,13 +59,60 @@ control tokens. It changes the token sequence and can change model output.
 
 The source, axis prompt and generated sample must fit one admitted native
 context. This command rejects an over-context request instead of truncating
-or chunking the source. Each sample starts with fresh logical KV.
+or chunking the source. By default each sample starts with fresh logical KV.
 
 Add `--prefill-rows 8` for bounded layer-major prompt execution. Widths from
 1 through 64 are accepted, with the declared extra prompt workspace charged
 before input or model IO. Prompt width changes scheduling and does not enter the
 semantic draw address. Model-present output parity and performance still require
 qualification.
+
+## Reusing prompts across independent samples
+
+Add `--reuse-prefill` to `sentiment-sampled` or
+`sentiment-sampled-batch` to avoid repeating the complete prompt forward for
+every sample of an axis. The first sample prefills normally. Before each later
+sample, the engine retains the same session's KV prefix through the penultimate
+prompt token, discards the previous continuation, invalidates the final hidden
+state, and recomputes the final prompt token. Every layer still performs that
+causal final-token forward and the complete vocabulary projection.
+
+```sh
+fnlp candidate sentiment-sampled sentiment-request.json \
+  --model /path/to/local-current-candidate-int8-artifact \
+  --memory-mib 12288 \
+  --seed 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --samples 4 --reuse-prefill --compute-threads 4 --prefill-rows 8
+```
+
+The option composes with bounded layer-major prefill and the persistent
+numerical team. It preserves the original seed, semantic sample addresses,
+prompt identity, grammar, EOS and sampling policy. Reuse stays inside the
+current record and axis; completing or abandoning that session clears its
+logical KV. No prompt state is copied into a cross-request cache or persisted.
+
+Admission still reserves the complete cold work ceiling and full native KV.
+A separately priced bounded array holds the independent sample addresses.
+The result uses a distinct execution label and records the actual work for
+each sample and for the complete bundle. A later sample therefore reports
+only its replayed final prompt token and continuation work. Early completion
+does not replenish admitted work or grammar-mask allowances.
+
+Hosted callers use
+`execute_int8_sampled_sentiment_reusing_prefill` or
+`execute_int8_sampled_sentiment_reusing_prefill_with_threads`, both with an
+optional `Int8PrefillLimits`. Resident single-context populations use
+`batch_int8_sampled_sentiment_reusing_prefill` and its
+`_with_threads` variant. Lower-level prepared callers can quote
+`reuse_sampler_requirement_bytes()` and invoke
+`execute_reusing_prefill_with_control`.
+
+An explicitly armed model gate compares scores, explanations, descriptive
+aggregates and token counts against cold execution across serial, team and
+prefill schedules, while separately checking reduced native forwards and
+complete resource drain. That gate and the deterministic regression definitions
+remain unrun pending controller validation; there is no measured speed or
+numerical-parity claim.
 
 ## Complete-result semantics and limits
 

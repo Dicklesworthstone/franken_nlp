@@ -53,10 +53,10 @@ impl Driver for Script {
     fn control(&mut self) -> &mut Control { &mut self.control }
     fn append(&mut self, token: u32) -> Result<(), Int8JsonError> { self.seen.push(token); Ok(()) }
     fn logits(&mut self) -> Result<Vec<f32>, Int8JsonError> { self.heads += 1; Ok(self.row.clone()) }
-    fn work(&self) -> Int8Work {
-        let mut work = Int8Work::for_sequence(0, self.seen.len(), self.heads * self.row.len()).unwrap();
+    fn work(&self) -> Result<Int8Work, Int8JsonError> {
+        let mut work = Int8Work::for_sequence(0, self.seen.len(), self.heads * self.row.len())?;
         if self.corrupt { work.projections.dot_products += 1; }
-        work
+        Ok(work)
     }
     fn abort(&mut self) { self.aborted = true; }
 }

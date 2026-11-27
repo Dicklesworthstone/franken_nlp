@@ -70,7 +70,7 @@ impl super::super::Driver for Script {
     fn logits(&mut self) -> Result<Vec<f32>, Int8JsonError> {
         let rows: Vec<_> = (0..self.row.len() as u32).collect(); self.project(&rows)
     }
-    fn work(&self) -> Int8Work { self.receipt() }
+    fn work(&self) -> Result<Int8Work, Int8JsonError> { Ok(self.receipt()) }
     fn abort(&mut self) { self.aborted = true; }
 }
 fn options(n: usize) -> JsonDecodeOptions {

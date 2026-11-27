@@ -444,3 +444,5 @@ fn original_deadline_wins_after_both_successful_and_failed_setup_stages() {
         assert_eq!(failure.exit, expected_exit);
     }
 }
+
+mod reuse;

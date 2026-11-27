@@ -571,3 +571,4 @@ fn poll<C: DecodeStepControl>(control: &mut C) -> Result<(), StrictInt8Error> {
 pub mod scoring;
 pub mod prefill;
 pub mod cohort;
+mod replay;

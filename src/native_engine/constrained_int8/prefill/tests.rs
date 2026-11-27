@@ -46,10 +46,10 @@ impl Driver for Model {
         self.seen.push(token); Ok(())
     }
     fn logits(&mut self) -> Result<Vec<f32>, Int8JsonError> { self.heads += 1; Ok(self.logits.clone()) }
-    fn work(&self) -> Int8Work {
-        let mut work = Int8Work::for_sequence(0, self.seen.len(), self.heads * self.logits.len()).unwrap();
+    fn work(&self) -> Result<Int8Work, Int8JsonError> {
+        let mut work = Int8Work::for_sequence(0, self.seen.len(), self.heads * self.logits.len())?;
         if self.forged_work { work.attention_pairs += 1; }
-        work
+        Ok(work)
     }
     fn abort(&mut self) { self.aborted = true; }
 }

@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     candidate_cli::stream::Failure,
     grammar::{CompileLimits, mask::MaskWorkLimits},
-    native_engine::{constrained_int8::json_sampling_workspace_bytes,
+    native_engine::{constrained_int8::{json_sampling_workspace_bytes, json_sampling_reuse_workspace_bytes},
         portable_int8::ProjectionWork, strict_int8::{Int8Work, prefill::Int8PrefillLimits}},
     tasks::{ir::TaskBudget, sentiment::{SentimentAxis, SentimentRequest,
         sampled::{SampledSentimentOptions, SampledSentimentLimits}}},
@@ -82,9 +82,13 @@ pub(super) struct SampledSentimentCommand {
     max_dot_products: u64,
     #[arg(long, default_value_t = 1_000_000_000_000_000)]
     max_multiply_accumulates: u64,
-    /// Optional layer-major prompt morsels, 1..=64 tokens. Each sample keeps fresh KV.
+    /// Optional layer-major prompt morsels, 1..=64 tokens.
     #[arg(long, value_name = "ROWS")]
     prefill_rows: Option<usize>,
+    // Added explicitly only to routes that execute this schedule. Commands
+    // using augment_args for other workflows cannot silently accept it.
+    #[arg(skip)]
+    pub(in crate::candidate_cli) reuse_prefill: bool,
     #[arg(skip)]
     encoding: input_encoding::InputEncodingArgs,
     #[arg(skip)]
@@ -92,10 +96,20 @@ pub(super) struct SampledSentimentCommand {
 }
 
 pub(super) fn definition() -> clap::Command {
+    definition_without_reuse()
+        .arg(clap::Arg::new("reuse_prefill").long("reuse-prefill")
+            .action(clap::ArgAction::SetTrue)
+            .help("Reuse the current axis's exact in-session prompt prefix across independently addressed samples"))
+}
+
+// Retained jobs inherit the common arguments without accepting an execution
+// schedule that their immutable processor recipe does not implement.
+fn definition_without_reuse() -> clap::Command {
     compute::definition(input_encoding::definition(SampledSentimentCommand::augment_args(
         clap::Command::new("sentiment-sampled")
             .about("Generate independent INT8 affect scores with bounded explanations")
-            .long_about("For each requested valence, arousal, dominance or approach axis, generate independently addressed JSON scores in [-100,100] with bounded explanations. --seed is mandatory. Input is {document,axes?}; omitted axes selects all four. Every sample must complete and pass independent schema/content checks before one complete result is published. Results retain all scores, explanations and descriptive aggregates; generated variation is not calibrated confidence and explanations are unverified. The complete axis-by-sample work, mask, sampler, preparation and output envelope is admitted before execution. --input-encoding safe-bpe-v1 explicitly compacts lossless untrusted input under finite tokenizer limits; it may change model output. --compute-threads reuses one persistent INT8 row team across every axis and sample, including bounded --prefill-rows prompt morsels. These physical choices preserve the sampling addresses and task budgets. Each sample starts with empty logical KV. This explicit local candidate has no model-quality, performance or release certification. Distribution-mode sentiment remains a separate command."))))
+            .long_about("For each requested valence, arousal, dominance or approach axis, generate independently addressed JSON scores in [-100,100] with bounded explanations. --seed is mandatory. Input is {document,axes?}; omitted axes selects all four. Every sample must complete and pass independent schema/content checks before one complete result is published. Results retain all scores, explanations and descriptive aggregates; generated variation is not calibrated confidence and explanations are unverified. The complete axis-by-sample work, mask, sampler, preparation and output envelope is admitted before execution. --input-encoding safe-bpe-v1 explicitly compacts lossless untrusted input under finite tokenizer limits; it may change model output. --compute-threads reuses one persistent INT8 row team across every axis and sample, including bounded --prefill-rows prompt morsels. --reuse-prefill retains only the current axis's exact private prompt prefix inside one session, replaying its final token before each later independent sample. It composes with prompt morsels and numerical workers, reports actual native work, and keeps conservative cold-work admission. Without it each sample starts with empty logical KV. Physical schedules preserve draw addresses. This explicit local candidate has no model-quality, performance or release certification. Distribution-mode sentiment remains a separate command."))))
+
 }
 
 impl SampledSentimentCommand {
@@ -103,6 +117,8 @@ impl SampledSentimentCommand {
         let mut command = Self::from_arg_matches(matches)?;
         command.encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
         command.compute = compute::Args::from_matches(matches)?;
+        command.reuse_prefill = matches.try_get_one::<bool>("reuse_prefill")
+            .ok().flatten().copied().unwrap_or(false);
         Ok(command)
     }
     pub(in crate::candidate_cli) fn options(&self) -> Result<SampledSentimentOptions, CandidateError> {
@@ -120,6 +136,10 @@ impl SampledSentimentCommand {
                 .map_err(|_| CandidateError::Arguments)?;
             Ok(Int8PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: bytes })
         }).transpose()
+    }
+    pub(in crate::candidate_cli) fn sampler_bytes(&self) -> Result<u64, CandidateError> {
+        if self.reuse_prefill { json_sampling_reuse_workspace_bytes(self.samples) }
+        else { json_sampling_workspace_bytes() }.map_err(|_| CandidateError::Arguments)
     }
     fn total_tokens(&self, axes: usize) -> Result<usize, CandidateError> {
         if axes == 0 || axes > SentimentAxis::ALL.len() { return Err(CandidateError::Arguments); }
@@ -200,7 +220,7 @@ impl SampledSentimentCommand {
         if preparation_floor > limits.preparation_bytes { return Err(CandidateError::Arguments); }
         let native = Int8MemoryRequirement::for_context(self.context_tokens)
             .map_err(|_| CandidateError::Arguments)?;
-        let sampler = json_sampling_workspace_bytes().map_err(|_| CandidateError::Arguments)?;
+        let sampler = self.sampler_bytes()?;
         // Price both simultaneous preparation owners, full resident KV and
         // sampler, whole-bundle output and declared prompt workspace before IO.
         let peak = compute::request_peak_bytes(limits, native, self.max_result_bytes as u64,

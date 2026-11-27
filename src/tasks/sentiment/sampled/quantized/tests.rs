@@ -389,3 +389,5 @@ fn planning_and_both_native_cancellation_wrappers_preserve_all_eleven_causes() {
         assert_eq!(Int8SampledSentimentError::from(StrictInt8Error::Cancelled(cause)).cancellation(), Some(cause));
     }
 }
+
+mod reuse;

@@ -5,12 +5,14 @@ use crate::{
         SampledSentimentBatchArgs, sampled_sentiment_batch_preparation_bytes,
     }},
     grammar::mask::MaskWorkLimits,
-    native_engine::{constrained::JsonWorkBudget, constrained_int8::{Int8JsonBudget, json_sampling_workspace_bytes},
+    native_engine::{constrained::JsonWorkBudget, constrained_int8::{Int8JsonBudget,
+            json_sampling_workspace_bytes, json_sampling_reuse_workspace_bytes},
         decode::DecodeStepControl, simd::Int8Kernel,
         strict_int8::{StrictInt8Engine, prefill::Int8PrefillLimits}},
     tasks::sentiment::{SentimentRequest, sampled::{SampledSentimentError, SampledSentimentVocabulary,
         quantized::{Int8SampledSentimentError, Int8SampledSentimentPlanner, Int8SampledSentimentRun,
-            PreparedInt8SampledSentiment}}},
+            PreparedInt8SampledSentiment, INT8_SAMPLED_SENTIMENT_EXECUTION,
+            INT8_SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION}}},
 };
 
 /// Work ceilings cover every admitted record, including failed attempts.
@@ -32,11 +34,8 @@ impl NlpEngine {
         config: SampledSentimentCorpusConfig, limits: CorpusLimits, prefill: Option<Int8PrefillLimits>,
         reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        let sampler_bytes = json_sampling_workspace_bytes()
-            .map_err(|e| HostedError::SampledSentiment(e.into()))?;
-        let task = SampledStream { planner: Arc::new(planner), vocabulary, config, sampler_bytes,
-            preparation_bytes: limits.preparation_reserve_bytes };
-        scored::run(self, model, task, limits, prefill, None, reader, writer, cancellation)
+        self.batch_int8_sampled_sentiment_scheduled(model, planner, vocabulary, config,
+            limits, prefill, false, None, reader, writer, cancellation)
     }
 
     /// Keep one fixed row team for every record, axis and independently
@@ -50,12 +49,49 @@ impl NlpEngine {
         kernel: Int8Kernel, compute_threads: usize, reader: R, writer: W,
         cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        let sampler_bytes = json_sampling_workspace_bytes()
+        self.batch_int8_sampled_sentiment_scheduled(model, planner, vocabulary, config,
+            limits, prefill, false, Some((kernel, compute_threads)), reader, writer, cancellation)
+    }
+
+    /// Reuse each record/axis prompt only inside its exclusive sampled
+    /// session. Flushes and records never retain KV or replenish cold debits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_sampled_sentiment_reusing_prefill<R, W>(&self, model: &ResidentInt8,
+        planner: Int8SampledSentimentPlanner, vocabulary: Arc<SampledSentimentVocabulary>,
+        config: SampledSentimentCorpusConfig, limits: CorpusLimits, prefill: Option<Int8PrefillLimits>,
+        reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        self.batch_int8_sampled_sentiment_scheduled(model, planner, vocabulary, config,
+            limits, prefill, true, None, reader, writer, cancellation)
+    }
+
+    /// Prompt reuse, bounded prefill and one persistent numerical team compose
+    /// without changing semantic addresses or complete-stream work authority.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_sampled_sentiment_reusing_prefill_with_threads<R, W>(&self, model: &ResidentInt8,
+        planner: Int8SampledSentimentPlanner, vocabulary: Arc<SampledSentimentVocabulary>,
+        config: SampledSentimentCorpusConfig, limits: CorpusLimits, prefill: Option<Int8PrefillLimits>,
+        kernel: Int8Kernel, compute_threads: usize, reader: R, writer: W,
+        cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        self.batch_int8_sampled_sentiment_scheduled(model, planner, vocabulary, config,
+            limits, prefill, true, Some((kernel, compute_threads)), reader, writer, cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn batch_int8_sampled_sentiment_scheduled<R, W>(&self, model: &ResidentInt8,
+        planner: Int8SampledSentimentPlanner, vocabulary: Arc<SampledSentimentVocabulary>,
+        config: SampledSentimentCorpusConfig, limits: CorpusLimits, prefill: Option<Int8PrefillLimits>,
+        reuse_prefill: bool, team: Option<(Int8Kernel, usize)>, reader: R, writer: W,
+        cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        let sampler_bytes = if reuse_prefill {
+            json_sampling_reuse_workspace_bytes(planner.sampling_options().samples)
+        } else { json_sampling_workspace_bytes() }
             .map_err(|e| HostedError::SampledSentiment(e.into()))?;
         let task = SampledStream { planner: Arc::new(planner), vocabulary, config, sampler_bytes,
-            preparation_bytes: limits.preparation_reserve_bytes };
-        scored::run(self, model, task, limits, prefill, Some((kernel, compute_threads)),
-            reader, writer, cancellation)
+            preparation_bytes: limits.preparation_reserve_bytes, reuse_prefill };
+        scored::run(self, model, task, limits, prefill, team, reader, writer, cancellation)
     }
 }
 
@@ -65,6 +101,7 @@ struct SampledStream {
     config: SampledSentimentCorpusConfig,
     sampler_bytes: u64,
     preparation_bytes: u64,
+    reuse_prefill: bool,
 }
 impl scored::CorpusTask for SampledStream {
     fn identity(&self) -> &ExecutionIdentity { self.planner.execution_identity() }
@@ -172,13 +209,18 @@ impl BatchProcessor for Processor<'_, '_, '_> {
             self.admission.kv_bytes, self.stream.sampler_bytes, plan.max_result_bytes())?;
         let vocabulary = &self.stream.vocabulary;
         let sampler = self.stream.sampler_bytes;
-        let result = match self.prefill {
+        let result = if self.stream.reuse_prefill {
+            plan.execute_reusing_prefill_with_control(self.engine, &identity, vocabulary,
+                budget, sampler, self.prefill, control)
+        } else { match self.prefill {
             Some(prefill) => plan.execute_layer_major_with_control(self.engine, &identity, vocabulary,
                 budget, sampler, prefill, control),
             None => plan.execute_with_control(self.engine, &identity, vocabulary, budget, sampler, control),
-        }.map_err(|error| task_failure(error, true))?;
+        } }.map_err(|error| task_failure(error, true))?;
+        let execution = if self.stream.reuse_prefill { INT8_SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION }
+            else { INT8_SAMPLED_SENTIMENT_EXECUTION };
         if self.engine.is_poisoned() || !self.engine.kv_cache().all_slots_have_len(0)
-            || result.mask_node_visit_charge > mask {
+            || result.execution != execution || result.mask_node_visit_charge > mask {
             return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
         }
         Ok(GuardedOutput::new(result, guard))

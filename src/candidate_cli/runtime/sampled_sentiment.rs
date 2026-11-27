@@ -7,7 +7,7 @@ pub(in crate::candidate_cli) mod map;
 #[cfg(all(feature = "metadata-store", target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(in crate::candidate_cli) mod job;
-use super::source_tasks::Session;
+use super::source_tasks::{Session, SessionStageError};
 use std::sync::Arc;
 use crate::{
     candidate_cli::{sampled_sentiment::{self as command, SampledSentimentCommand}, stream::Failure},
@@ -22,7 +22,8 @@ use crate::{
     },
     tasks::sentiment::{SentimentAxis, sampled::{SampledSentimentError, SampledSentimentVocabulary,
         quantized::{Int8SampledSentimentError, Int8SampledSentimentPlanner,
-            Int8SampledSentimentRun, INT8_SAMPLED_SENTIMENT_EXECUTION}}},
+            Int8SampledSentimentRun, INT8_SAMPLED_SENTIMENT_EXECUTION,
+            INT8_SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION}}},
     tokenizer::untrusted::UntrustedEncoding,
 };
 
@@ -104,6 +105,15 @@ pub(in crate::candidate_cli) fn host_failure(error: HostedError) -> Failure {
     }
 }
 
+fn session_failure(error: SessionStageError) -> Failure {
+    match error {
+        SessionStageError::Setup(error) => setup_failure(error),
+        SessionStageError::Artifact(ArtifactBridgeError::Cancelled(cause)) => cancelled(cause),
+        SessionStageError::Artifact(_) => setup_failure(CandidateError::Model),
+        SessionStageError::Host(error) => host_failure(error),
+    }
+}
+
 fn setup_failure(error: CandidateError) -> Failure {
     if error == CandidateError::Timeout { return cancelled(DecodeCancellationKind::Deadline); }
     let (exit, code) = match error {
@@ -166,7 +176,7 @@ pub(in crate::candidate_cli) fn execute(command: SampledSentimentCommand,
     check().map_err(setup_failure)?;
     // facts() holds the authenticated file open; load() consumes that same
     // source after the complete sampled task has been compiled and admitted.
-    let facts = checked_stage(session.facts(&common), &check, setup_failure)?;
+    let facts = checked_stage(session.facts_with_error_detail(&common), &check, session_failure)?;
     let planner = checked_stage(Int8SampledSentimentPlanner::for_model_with_encoding(&facts, options,
         request.budget, command.task_limits(), encoding.clone()), &check, task_failure)?;
     let prepared = checked_stage(planner.plan_with_control(&request, &mut session.control()), &check, task_failure)?;
@@ -178,8 +188,12 @@ pub(in crate::candidate_cli) fn execute(command: SampledSentimentCommand,
         Err(CandidateError::Planning)
     } else { Ok(()) }, &check, setup_failure)?;
     let expected_work = prepared.planned_work();
-    let sampler_bytes = checked_stage(json_sampling_workspace_bytes(), &check,
-        |error| task_failure(error.into()))?;
+    let sampler_bytes = checked_stage(command.sampler_bytes(), &check, setup_failure)?;
+    if command.reuse_prefill {
+        let required = checked_stage(prepared.reuse_sampler_requirement_bytes(), &check, task_failure)?;
+        checked_stage(if sampler_bytes != required { Err(CandidateError::Planning) } else { Ok(()) },
+            &check, setup_failure)?;
+    }
     let vocabulary = Arc::new(checked_stage(SampledSentimentVocabulary::pinned(), &check,
         |error| task_failure(error.into()))?);
     let budget = Int8JsonBudget { native: Int8RunBudget::exact(expected_work),
@@ -192,7 +206,7 @@ pub(in crate::candidate_cli) fn execute(command: SampledSentimentCommand,
     drop(request);
     check().map_err(setup_failure)?;
     let cancellation = CancellationToken::default();
-    let model = checked_stage(session.load(&common, limits, &facts, cancellation.clone()), &check, setup_failure)?;
+    let model = checked_stage(session.load_with_error_detail(&common, limits, &facts, cancellation.clone()), &check, session_failure)?;
     let host = Int8SampledSentimentHostLimits {
         native: checked_stage(session.native(&common), &check, setup_failure)?,
         preparation_reserve_bytes: limits.preparation_bytes, max_model_work: command.work_ceiling(),
@@ -200,21 +214,27 @@ pub(in crate::candidate_cli) fn execute(command: SampledSentimentCommand,
         max_mask_node_visits: command.max_mask_node_visits,
     };
     let guarded = if limits.compute.threads == 1 {
-        compute::Completion::Serial(checked_stage(match prefill {
+        compute::Completion::Serial(checked_stage(if command.reuse_prefill {
+            session.engine.execute_int8_sampled_sentiment_reusing_prefill(
+                &model, prepared, vocabulary, host, prefill, cancellation)
+        } else { match prefill {
             None => session.engine.execute_int8_sampled_sentiment(&model, prepared, vocabulary, host, cancellation),
             Some(prefill) => session.engine.execute_int8_sampled_sentiment_layer_major(
                 &model, prepared, vocabulary, host, prefill, cancellation),
-        }, &check, host_failure)?)
+        } }, &check, host_failure)?)
     } else {
         let kernel = crate::native_engine::simd::config::process_kernel();
-        compute::Completion::Team(checked_stage(match prefill {
+        compute::Completion::Team(checked_stage(if command.reuse_prefill {
+            session.engine.execute_int8_sampled_sentiment_reusing_prefill_with_threads(
+                &model, prepared, vocabulary, host, kernel, limits.compute.threads, prefill, cancellation)
+        } else { match prefill {
             None => session.engine.execute_int8_sampled_sentiment_with_threads(
                 &model, prepared, vocabulary, host, kernel, limits.compute.threads, cancellation),
             Some(prefill) => session.engine.execute_int8_sampled_sentiment_layer_major_with_threads(
                 &model, prepared, vocabulary, host, kernel, limits.compute.threads, prefill, cancellation),
-        }, &check, host_failure)?)
+        } }, &check, host_failure)?)
     };
-    checked_stage(check_completion(guarded.result(), &axes, samples_per_axis,
+    checked_stage(check_completion(guarded.result(), &axes, samples_per_axis, command.reuse_prefill,
         expected_work, output_tokens, mask_charge), &check, |failure| failure)?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
         evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
@@ -231,9 +251,11 @@ pub(in crate::candidate_cli) fn execute(command: SampledSentimentCommand,
 }
 
 fn check_completion(run: &Int8SampledSentimentRun, axes: &[SentimentAxis], samples: usize,
-    expected: Int8Work, output_tokens: u64, mask_charge: u64) -> Result<(), Failure> {
+    reuse_prefill: bool, expected: Int8Work, output_tokens: u64, mask_charge: u64) -> Result<(), Failure> {
     let work = run.model_work;
-    if run.execution != INT8_SAMPLED_SENTIMENT_EXECUTION || run.samples_per_axis != samples
+    let execution = if reuse_prefill { INT8_SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION }
+        else { INT8_SAMPLED_SENTIMENT_EXECUTION };
+    if run.execution != execution || run.samples_per_axis != samples
         || run.dimensions.len() != axes.len()
         || run.dimensions.iter().zip(axes).any(|(dimension, axis)| dimension.axis != *axis
             || dimension.samples.len() != samples
@@ -245,3 +267,6 @@ fn check_completion(run: &Int8SampledSentimentRun, axes: &[SentimentAxis], sampl
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod stage_tests;

@@ -2140,8 +2140,13 @@ The command requires `--model`, `--memory-mib` and a 64-digit lowercase hexadeci
 `--seed`. Whole-bundle native work, grammar masks, sampler, KV, preparation and
 output are admitted before weights load. Byte-preserving source encoding is the
 default; explicit `--input-encoding safe-bpe-v1` and `--prefill-rows 1..64` add
-compact source encoding and bounded layer-major prompts. Each sample starts from
-fresh logical KV; an incomplete or invalid sample prevents complete-bundle success.
+compact source encoding and bounded layer-major prompts. By default samples start
+with fresh logical KV. Explicit `--reuse-prefill` on the one-request and resident
+`sentiment-sampled-batch` routes retains the current axis's private prompt prefix
+inside one session and replays its final token for later independent samples.
+It composes with prefill and persistent workers, preserves semantic draw addresses,
+keeps conservative cold-work admission and reports actual per-sample work.
+An incomplete or invalid sample prevents complete-bundle success.
 
 Use the [INT8 sampled sentiment guide](docs/native-sampled-sentiment-int8.md) for
 the input format, invocation, library APIs and exact limits. Generated variation
