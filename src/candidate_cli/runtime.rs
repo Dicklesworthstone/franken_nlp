@@ -4,6 +4,7 @@ pub(super) mod batch_tasks;
 pub(super) mod scored_tasks;
 pub(super) mod scored_documents;
 pub(super) mod sentiment_map;
+pub(super) mod sampled_sentiment;
 pub(super) mod classify_map;
 pub(super) mod extraction;
 pub(super) mod semantic;

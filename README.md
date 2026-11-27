@@ -72,6 +72,8 @@
 > [one-request NER, keyphrases, summaries and passage QA](docs/candidate-source-cli.md#persistent-cpu-teams-for-source-tasks).
 > INT8 `candidate sentiment-map` adds [complete-document dimensional sentiment
 > with exact source coverage](#implemented-candidate-int8-complete-document-sentiment).
+> INT8 `candidate sentiment-sampled` adds [independent generated scores and
+> bounded explanations](#implemented-candidate-int8-sampled-sentiment) for all four affect axes.
 > Candidate results retain their explicit provenance; build verification,
 > model quality and release qualification remain separate pending gates.
 > The top-level task, batch and job examples below remain the disclosed 1.0
@@ -2124,6 +2126,27 @@ explicitly ignored full-model fixture cover strict controls, declared memory,
 serial/cohort equivalence with standalone maps and work exhaustion across
 flush. Compilation, native parity and task quality remain subject to their
 separate controller validation gates.
+
+## Implemented candidate INT8 sampled sentiment
+
+`fnlp candidate sentiment-sampled` generates independent score-and-explanation
+samples for valence, arousal, dominance and approach on a local current-candidate
+INT8 artifact. Each sample has an explicit seed address, exact JSON grammar,
+integer score in `[-100,100]`, bounded nonempty explanation and scored terminal
+EOS. The complete result retains every sample and per-axis descriptive aggregates.
+
+The command requires `--model`, `--memory-mib` and a 64-digit lowercase hexadecimal
+`--seed`. Whole-bundle native work, grammar masks, sampler, KV, preparation and
+output are admitted before weights load. Byte-preserving source encoding is the
+default; explicit `--input-encoding safe-bpe-v1` and `--prefill-rows 1..64` add
+compact source encoding and bounded layer-major prompts. Each sample starts from
+fresh logical KV; an incomplete or invalid sample prevents complete-bundle success.
+
+Use the [INT8 sampled sentiment guide](docs/native-sampled-sentiment-int8.md) for
+the input format, invocation, library APIs and exact limits. Generated variation
+is not calibrated confidence, and explanations remain unverified. Compilation,
+executable regression, native-model and quality qualification are still pending
+under the controller gates.
 
 ## Implemented candidate sampled sentiment
 

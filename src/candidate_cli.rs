@@ -26,6 +26,7 @@ mod text_batch;
 mod source;
 mod batch;
 mod scored;
+mod sampled_sentiment;
 mod sentiment_map;
 mod classify_map;
 mod scored_batch;
@@ -114,6 +115,7 @@ pub(crate) enum CandidateCommand {
     TextJob(jobs::generation::TextJobCommand),
     Source(source::SourceCommand),
     Scored(scored::ScoredCommand),
+    SampledSentiment(sampled_sentiment::SampledSentimentCommand),
     SentimentMap(sentiment_map::SentimentMapCommand),
     ClassifyMap(classify_map::ClassifyMapCommand),
     Extract(extract::ExtractCommand),
@@ -142,6 +144,7 @@ pub(crate) fn definition() -> clap::Command {
         .subcommand(int4::definition())
         .subcommands(source::definitions())
         .subcommands(scored::definitions())
+        .subcommand(sampled_sentiment::definition())
         .subcommand(sentiment_map::definition())
         .subcommand(classify_map::definition())
         .subcommand(batch::definition())
@@ -202,6 +205,9 @@ impl CandidateCommand {
         }
         if name == "sentiment-map" {
             return sentiment_map::SentimentMapCommand::from_matches(matches).map(Self::SentimentMap);
+        }
+        if name == "sentiment-sampled" {
+            return sampled_sentiment::SampledSentimentCommand::from_matches(matches).map(Self::SampledSentiment);
         }
         if name == "map" {
             return map::MapCommand::from_matches(matches).map(Self::Map);
@@ -272,7 +278,13 @@ impl CandidateCommand {
 
     pub(crate) fn run(self, input: &mut impl Read, output: &mut impl Write,
         diagnostics: &mut impl Write) -> ExitCode {
-        let result = self.execute(input, output);
+        // This command carries typed native cancellation and resource failures
+        // through publication; do not collapse them to the legacy error enum.
+        let other = match self {
+            Self::SampledSentiment(command) => return command.run(input, output, diagnostics),
+            other => other,
+        };
+        let result = other.execute(input, output);
         match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
@@ -299,6 +311,8 @@ impl CandidateCommand {
             Self::FaithfulnessMap(command) => return command.execute(input, output),
             Self::Redact(command) => return command.execute(input, output),
             Self::Resolve(command) => return command.execute(input, output),
+            // The executable uses the typed command route in run above.
+            Self::SampledSentiment(_) => return Err(CandidateError::Arguments),
             // A borrowed stream cannot outlive the hosted blocking closure.
             // The executable dispatcher always takes run_stdio for owned IO.
             Self::Batch(_) | Self::ScoreBatch(_) | Self::DocumentCorpus(_) | Self::FaithfulnessCorpus(_)
