@@ -6,19 +6,13 @@
 //! boundary, never a whitespace marker; arbitrary invalid UTF-8 stays byte-only.
 //! Merges are score-ordered with the existing leftmost tie rule, restricted to
 //! IDs that are neither forbidden nor overridden by injected-token decoding.
-//! The simple quadratic search is explicit and bounded by comparisons AND
-//! examined pair bytes. No new performance or tokenizer-parity claim is made.
+//! Long segments retain ranked adjacent pairs across merges. Work accounting
+//! preserves the V1 full-scan pair counts and byte limits on every segment.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, BinaryHeap};
 
-use super::{DecoderPiece, EncodeError, SpBpeTokenizer, WHITESPACE_MARKER};
+use super::{DecoderPiece, EncodeError, Merge, SpBpeTokenizer, Symbol, WHITESPACE_MARKER};
 use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWork, UntrustedDocumentError, poll};
-
-struct SymbolSpan {
-    start: usize,
-    end: usize,
-    next: Option<usize>,
-}
 
 struct Encoder<'a, F> {
     tokenizer: &'a SpBpeTokenizer,
@@ -102,28 +96,14 @@ impl<F: FnMut() -> bool> Encoder<'_, F> {
             if index % 256 == 0 { poll(self.checkpoint)?; }
             let start = normalized.len();
             normalized.push(if character == ' ' { WHITESPACE_MARKER } else { character });
-            symbols.push(SymbolSpan { start, end: normalized.len(), next: Some(index + 1) });
+            symbols.push(Symbol { start, end: normalized.len(), next: Some(index + 1) });
         }
         if let Some(last) = symbols.last_mut() { last.next = None; }
 
-        loop {
-            let mut best: Option<(usize, usize, f32)> = None;
-            let mut left = Some(0);
-            while let Some(index) = left {
-                let Some(right) = symbols[index].next else { break; };
-                let pair = &normalized[symbols[index].start..symbols[right].end];
-                self.work.pair(pair.len(), self.limits)?;
-                if self.work.pair_checks() % 256 == 1 { poll(self.checkpoint)?; }
-                if let Some(piece) = self.tokenizer.normal_pieces.get(pair).filter(|piece| self.allowed(piece.id)) {
-                    if best.as_ref().is_none_or(|(_, _, score)| piece.score.total_cmp(score).is_gt()) {
-                        best = Some((index, right, piece.score));
-                    }
-                }
-                left = symbols[index].next;
-            }
-            let Some((left, right, _)) = best else { break; };
-            symbols[left].end = symbols[right].end;
-            symbols[left].next = symbols[right].next;
+        if symbols.len() <= 32 {
+            self.merge_rescan(&normalized, &mut symbols)?;
+        } else {
+            self.merge_frontier(&normalized, &mut symbols)?;
         }
 
         let mut current = Some(0);
@@ -151,5 +131,145 @@ impl<F: FnMut() -> bool> Encoder<'_, F> {
             current = symbols[index].next;
         }
         Ok(())
+    }
+
+    fn merge_rescan(&mut self, normalized: &str, symbols: &mut [Symbol]) -> Result<(), UntrustedDocumentError> {
+        loop {
+            let mut best: Option<(usize, usize, f32)> = None;
+            let mut left = Some(0);
+            while let Some(index) = left {
+                let Some(right) = symbols[index].next else { break; };
+                let pair = &normalized[symbols[index].start..symbols[right].end];
+                self.work.pair(pair.len(), self.limits)?;
+                if self.work.pair_checks() % 256 == 1 { poll(self.checkpoint)?; }
+                if let Some(piece) = self.tokenizer.normal_pieces.get(pair).filter(|piece| self.allowed(piece.id)) {
+                    if best.as_ref().is_none_or(|(_, _, score)| piece.score.total_cmp(score).is_gt()) {
+                        best = Some((index, right, piece.score));
+                    }
+                }
+                left = symbols[index].next;
+            }
+            let Some((left, right, _)) = best else { break; };
+            symbols[left].end = symbols[right].end;
+            symbols[left].next = symbols[right].next;
+        }
+        Ok(())
+    }
+
+    fn enqueue(&self, queue: &mut BinaryHeap<Merge>, normalized: &str, symbols: &[Symbol], left: usize)
+        -> Result<(), UntrustedDocumentError> {
+        if let Some(right) = symbols[left].next {
+            let end = symbols[right].end;
+            let pair = &normalized[symbols[left].start..end];
+            if let Some(piece) = self.tokenizer.normal_pieces.get(pair).filter(|piece| self.allowed(piece.id)) {
+                queue.try_reserve(1).map_err(|_| UntrustedDocumentError::AllocationRefused)?;
+                queue.push(Merge { score: piece.score, left, end });
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_frontier(&mut self, normalized: &str, symbols: &mut [Symbol]) -> Result<(), UntrustedDocumentError> {
+        let mut previous = Vec::new();
+        previous.try_reserve_exact(symbols.len()).map_err(|_| UntrustedDocumentError::AllocationRefused)?;
+        let mut queue = BinaryHeap::new();
+        let mut tail = symbols.len() - 1;
+        let mut live = symbols.len();
+        for (left, symbol) in symbols.iter().enumerate() {
+            previous.push(left.checked_sub(1));
+            if let Some(right) = symbol.next {
+                self.work.pair(symbols[right].end - symbol.start, self.limits)?;
+                if self.work.pair_checks() % 256 == 1 { poll(self.checkpoint)?; }
+                self.enqueue(&mut queue, normalized, symbols, left)?;
+            }
+        }
+
+        let mut pops = 0_usize;
+        while let Some(Merge { left, end, .. }) = queue.pop() {
+            if pops % 256 == 0 { poll(self.checkpoint)?; }
+            pops += 1;
+            // A consumed symbol has no successor. Growing either side of an
+            // old adjacency moves its combined end strictly to the right.
+            let Some(right) = symbols[left].next else { continue; };
+            if symbols[right].end != end { continue; }
+            symbols[left].end = end;
+            symbols[left].next = symbols[right].next.take();
+            if let Some(after) = symbols[left].next {
+                previous[after] = Some(left);
+            } else {
+                tail = left;
+            }
+            live -= 1;
+
+            // The V1 scan visits each interior span twice and each boundary
+            // span once. The segment is contiguous, so these are the exact
+            // logical charges, including the last scan that discovers no merge.
+            let pair_bytes = (normalized.len() - symbols[0].end) + symbols[tail].start;
+            if !self.work.try_charge_pairs(live - 1, pair_bytes, self.limits) {
+                // Only the final, unaffordable scan needs individual charges.
+                // This preserves both the original refusal reason and all work
+                // consumed before the first unaffordable pair.
+                let mut index = 0;
+                while let Some(next) = symbols[index].next {
+                    self.work.pair(symbols[next].end - symbols[index].start, self.limits)?;
+                    if self.work.pair_checks() % 256 == 1 { poll(self.checkpoint)?; }
+                    index = next;
+                }
+            }
+            if let Some(before) = previous[left] {
+                self.enqueue(&mut queue, normalized, symbols, before)?;
+            }
+            self.enqueue(&mut queue, normalized, symbols, left)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tokenizer::embedded::EmbeddedTokenizer;
+
+    #[test]
+    fn frontier_preserves_v1_merges_and_partial_budget_charges() {
+        let pinned = EmbeddedTokenizer::pinned().unwrap();
+        let tokenizer = pinned.tokenizer();
+        let mut forbidden = BTreeSet::new();
+        if let Some(piece) = tokenizer.normal_pieces.get("aa") {
+            forbidden.insert(piece.id);
+        }
+        for normalized in ["a".repeat(71), "banana▁你好é".repeat(12), "abababa".repeat(11)] {
+            for (checks, bytes) in [(100_000, 1_000_000), (17, 1000), (233, 1000), (850, 508), (90, 208)] {
+                let limits = SafeBpeLimits {
+                    max_input_bytes: 4096,
+                    max_output_tokens: 4096,
+                    max_pair_checks: checks,
+                    max_pair_bytes: bytes,
+                };
+                let run = |frontier: bool| {
+                    let mut work = SafeBpeWork::default();
+                    work.pair(3, limits).unwrap();
+                    let mut symbols = Symbol::from_text(&normalized);
+                    let mut checkpoint = || true;
+                    let mut encoder = Encoder {
+                        tokenizer, forbidden: &forbidden, limits, work: &mut work,
+                        checkpoint: &mut checkpoint, ids: Vec::new(),
+                    };
+                    let result = if frontier {
+                        encoder.merge_frontier(&normalized, &mut symbols)
+                    } else {
+                        encoder.merge_rescan(&normalized, &mut symbols)
+                    };
+                    let mut live = Vec::new();
+                    let mut current = Some(0);
+                    while let Some(index) = current {
+                        live.push((symbols[index].start, symbols[index].end));
+                        current = symbols[index].next;
+                    }
+                    (result, work, live)
+                };
+                assert_eq!(run(true), run(false), "limits={limits:?} normalized={normalized}");
+            }
+        }
     }
 }

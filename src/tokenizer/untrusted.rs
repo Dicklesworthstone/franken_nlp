@@ -163,6 +163,18 @@ impl SafeBpeWork {
         Ok(())
     }
 
+    /// Charge a complete V1 adjacency scan atomically. If it cannot fit, the
+    /// encoder replays the individual charges up to the same failing pair.
+    pub(super) fn try_charge_pairs(&mut self, checks: usize, bytes: usize, limits: SafeBpeLimits) -> bool {
+        let Some(checks) = self.pair_checks.checked_add(checks as u64)
+            .filter(|&value| value <= limits.max_pair_checks) else { return false; };
+        let Some(bytes) = self.pair_bytes.checked_add(bytes as u64)
+            .filter(|&value| value <= limits.max_pair_bytes) else { return false; };
+        self.pair_checks = checks;
+        self.pair_bytes = bytes;
+        true
+    }
+
     pub(super) fn pair(&mut self, bytes: usize, limits: SafeBpeLimits) -> Result<(), UntrustedDocumentError> {
         let checks = self.pair_checks.checked_add(1)
             .filter(|&value| value <= limits.max_pair_checks)
