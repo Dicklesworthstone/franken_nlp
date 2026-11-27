@@ -301,3 +301,21 @@ fn cancellation_bounds_validation_and_dense_nucleus_draw_traversals() {
         }
     }
 }
+
+#[test]
+fn exact_nucleus_stops_ranking_after_the_crossing_row() {
+    // One dominant late token forces a real heap traversal. The full-mass
+    // request also retains the zero-probability tail in deterministic order.
+    let mut logits = vec![-1000.0; 4097];
+    logits[4095] = 0.0;
+    let mut prefix_control = SamplingControl::default();
+    let prefix = Nucleus::exact_top_p_with_control(&logits, 0.95, &mut prefix_control, 7).unwrap();
+    assert_nucleus_bits(&prefix, &Nucleus::exact_top_p(&logits, 0.95).unwrap());
+    assert_eq!(prefix.as_slice().len(), 1);
+
+    let mut full_control = SamplingControl::default();
+    let full = Nucleus::exact_top_p_with_control(&logits, 1.0, &mut full_control, 7).unwrap();
+    assert_nucleus_bits(&full, &Nucleus::exact_top_p(&logits, 1.0).unwrap());
+    assert!(prefix_control.calls < full_control.calls / 2,
+        "a one-row nucleus should skip ranking the discarded tail");
+}

@@ -465,10 +465,10 @@ impl Nucleus {
     }
 
     /// Exact top-p with bounded checkpoints throughout validation, numerical
-    /// passes, ranking and cutoff construction. The in-place heap sort uses
-    /// the frozen total ranking and allocates no additional vocabulary-sized
-    /// buffer. Maximum, normalizer and probability accumulation retain the
-    /// original operation order and bits from [Self::exact_top_p].
+    /// passes, ranking and cutoff construction. A best-first heap extracts
+    /// only the ranks needed to cross the cutoff. Every row contributes to
+    /// the full normalizer, in token-ID order, with the same arithmetic as
+    /// [Self::exact_top_p].
     pub fn exact_top_p_with_control<C: DecodeStepControl + ?Sized>(logits: &[f32], top_p: f64,
         control: &mut C, step: usize) -> Result<Self, SamplerError> {
         let mut checkpoints = SamplingCheckpoints::new(control, step);
@@ -482,34 +482,22 @@ impl Nucleus {
             maximum = maximum.max(logit);
         }
         checkpoints.checkpoint()?;
+        let mut ranked = Vec::new();
+        ranked.try_reserve_exact(logits.len()).map_err(|_| SamplerError::Allocation)?;
         let mut normalizer = 0.0_f64;
-        for &logit in logits {
+        for (token_id, logit) in logits.iter().copied().enumerate() {
             checkpoints.visit()?;
-            normalizer += (f64::from(logit) - f64::from(maximum)).exp();
+            let weight = (f64::from(logit) - f64::from(maximum)).exp();
+            normalizer += weight;
+            // Store the numerator until extraction so each row needs one exp.
+            ranked.push(NucleusToken {
+                token: RankedToken { token_id, logit },
+                probability: weight,
+            });
         }
         debug_assert!(normalizer.is_finite() && normalizer > 0.0);
         checkpoints.checkpoint()?;
-        let mut ranked = Vec::new();
-        ranked.try_reserve_exact(logits.len()).map_err(|_| SamplerError::Allocation)?;
-        for (token_id, logit) in logits.iter().copied().enumerate() {
-            checkpoints.visit()?;
-            ranked.push(NucleusToken {
-                token: RankedToken { token_id, logit },
-                probability: (f64::from(logit) - f64::from(maximum)).exp() / normalizer,
-            });
-        }
-        checkpoints.checkpoint()?;
-        sort_nucleus_controlled(&mut ranked, &mut checkpoints)?;
-        checkpoints.checkpoint()?;
-        let mut cutoff_len = 0;
-        let mut cutoff_mass = 0.0;
-        for candidate in &ranked {
-            checkpoints.visit()?;
-            if top_p != 1.0 && cutoff_mass >= top_p { break; }
-            cutoff_mass += candidate.probability;
-            cutoff_len += 1;
-        }
-        ranked.truncate(cutoff_len);
+        let cutoff_mass = retain_nucleus(&mut ranked, normalizer, top_p, &mut checkpoints)?;
         checkpoints.checkpoint()?;
         Ok(Self { entries: ranked, cutoff_mass })
     }
@@ -563,37 +551,57 @@ impl Nucleus {
     }
 }
 
-fn sort_nucleus_controlled<C: DecodeStepControl + ?Sized>(ranked: &mut [NucleusToken],
-    checkpoints: &mut SamplingCheckpoints<'_, C>) -> Result<(), SamplerError> {
-    // A worst-first heap extracts its maximum rank to the end, producing the
-    // exact best-first total order. Token IDs make every rank unique, so no
-    // stability assumption can affect ties or the subsequent floating sums.
+fn retain_nucleus<C: DecodeStepControl + ?Sized>(
+    ranked: &mut Vec<NucleusToken>,
+    normalizer: f64,
+    top_p: f64,
+    checkpoints: &mut SamplingCheckpoints<'_, C>,
+) -> Result<f64, SamplerError> {
+    // Linear-time heap construction leaves the best remaining row at index 0.
+    // The deterministic rank includes the original token ID for tied logits.
     for root in (0..ranked.len() / 2).rev() {
-        sift_nucleus_worst(ranked, root, checkpoints)?;
+        sift_nucleus_best(ranked, root, checkpoints)?;
     }
-    for end in (1..ranked.len()).rev() {
+    let mut heap_len = ranked.len();
+    let mut cutoff_mass = 0.0;
+    while heap_len > 0 {
         checkpoints.visit()?;
-        ranked.swap(0, end);
-        sift_nucleus_worst(&mut ranked[..end], 0, checkpoints)?;
+        heap_len -= 1;
+        ranked.swap(0, heap_len);
+        let selected = &mut ranked[heap_len];
+        selected.probability /= normalizer;
+        cutoff_mass += selected.probability;
+        // p=1 retains even rows whose exponentials underflowed to zero.
+        if top_p < 1.0 && cutoff_mass >= top_p { break; }
+        sift_nucleus_best(&mut ranked[..heap_len], 0, checkpoints)?;
     }
-    Ok(())
+
+    // Winners now occupy the suffix in reverse rank order. Mirror only the
+    // swaps needed to place that suffix at the front, including overlap.
+    let len = ranked.len();
+    let retained = len - heap_len;
+    for index in 0..retained.min(len / 2) {
+        checkpoints.visit()?;
+        ranked.swap(index, len - 1 - index);
+    }
+    ranked.truncate(retained);
+    Ok(cutoff_mass)
 }
 
-fn sift_nucleus_worst<C: DecodeStepControl + ?Sized>(ranked: &mut [NucleusToken], mut root: usize,
+fn sift_nucleus_best<C: DecodeStepControl + ?Sized>(ranked: &mut [NucleusToken], mut root: usize,
     checkpoints: &mut SamplingCheckpoints<'_, C>) -> Result<(), SamplerError> {
-    // The division guard precedes 2*root+1, even for the largest slice.
     while root < ranked.len() / 2 {
         let left = root * 2 + 1;
         let right = left + 1;
-        let mut worst = left;
+        let mut best = left;
         if right < ranked.len() {
             checkpoints.visit()?;
-            if is_worse(ranked[right].token, ranked[left].token) { worst = right; }
+            if is_better(ranked[right].token, ranked[left].token) { best = right; }
         }
         checkpoints.visit()?;
-        if !is_worse(ranked[worst].token, ranked[root].token) { break; }
-        ranked.swap(root, worst);
-        root = worst;
+        if !is_better(ranked[best].token, ranked[root].token) { break; }
+        ranked.swap(root, best);
+        root = best;
     }
     Ok(())
 }
