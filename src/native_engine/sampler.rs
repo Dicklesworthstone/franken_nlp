@@ -274,6 +274,26 @@ pub struct TopK {
 }
 
 impl TopK {
+    pub(super) const fn empty() -> Self {
+        Self { entries: [RankedToken::PLACEHOLDER; MAX_TOP_K], len: 0 }
+    }
+
+    pub(super) fn clear(&mut self) { self.len = 0; }
+
+    /// Add one finite processed row in original vocabulary coordinates.
+    pub(super) fn offer(&mut self, token_id: usize, logit: f32, k: usize) -> Result<(), SamplerError> {
+        if !(1..=MAX_TOP_K).contains(&k) { return Err(SamplerError::InvalidTopK { requested: k }); }
+        self.push_heap(RankedToken { token_id, logit }, k);
+        Ok(())
+    }
+
+    /// Copy at most MAX_TOP_K rows before ranking, keeping the live heap private.
+    pub(super) fn ranked_copy(&self) -> Self {
+        let mut ranked = self.clone();
+        ranked.sort_descending();
+        ranked
+    }
+
     /// Performs a full-vocabulary scan using a fixed-size worst-first heap.
     ///
     /// Ranking is descending `f32` total order and then ascending token id.
@@ -285,10 +305,7 @@ impl TopK {
             return Err(SamplerError::InvalidTopK { requested: k });
         }
 
-        let mut result = Self {
-            entries: [RankedToken::PLACEHOLDER; MAX_TOP_K],
-            len: 0,
-        };
+        let mut result = Self::empty();
         for (token_id, logit) in logits.iter().copied().enumerate() {
             result.push_heap(RankedToken { token_id, logit }, k);
         }
@@ -305,7 +322,7 @@ impl TopK {
         if !(1..=MAX_TOP_K).contains(&k) {
             return Err(SamplerError::InvalidTopK { requested: k });
         }
-        let mut result = Self { entries: [RankedToken::PLACEHOLDER; MAX_TOP_K], len: 0 };
+        let mut result = Self::empty();
         for (token_id, logit) in logits.iter().copied().enumerate() {
             checkpoints.visit()?;
             result.push_heap(RankedToken { token_id, logit }, k);

@@ -47,19 +47,18 @@ fn tracks_frequencies(p: &GenerationOptions) -> bool {
 /// Raw model logits and result storage are accounted for by the native caller.
 pub(super) fn generation_workspace_bytes(p: &GenerationOptions) -> Result<u64, GenerationError> {
     let mut per_row = if tracks_frequencies(p) { size_of::<u32>() } else { 0 };
-    if let GenerationSampling::Seeded { top_k, .. } = &p.sampling {
-        per_row += size_of::<u32>() + size_of::<f32>();
-        // With top-k enabled, the nucleus contains at most MAX_TOP_K entries,
-        // covered by the fixed 4096-byte allowance (including the top-k heap).
-        if top_k.is_none() { per_row += size_of::<NucleusToken>(); }
+    if let GenerationSampling::Seeded { top_k: None, .. } = &p.sampling {
+        per_row += size_of::<u32>() + size_of::<f32>() + size_of::<NucleusToken>();
     }
+    // The fixed allowance covers the bounded top-k heap, ranked copy and
+    // at most MAX_TOP_K restricted nucleus entries when top-k is enabled.
     (NANBEIGE_VOCAB_SIZE as u64).checked_mul(per_row as u64)
         .and_then(|bytes| bytes.checked_add(4096)).ok_or(GenerationError::Limit("sampler accounting"))
 }
 
 pub(in crate::native_engine) struct Workspace {
     counts: Vec<u32>, ids: Vec<u32>, logits: Vec<f32>, last_selected_id: Option<u32>,
-    greedy_best: Option<(u32, f32)>,
+    greedy_best: Option<(u32, f32)>, bounded_top: TopK,
 }
 impl Workspace {
     pub fn new(prompt: &[u32]) -> Result<Self, GenerationError> {
@@ -68,8 +67,8 @@ impl Workspace {
     pub(super) fn for_generation(prompt: &[u32], p: &GenerationOptions) -> Result<Self, GenerationError> {
         let frequency_rows = if tracks_frequencies(p) { NANBEIGE_VOCAB_SIZE } else { 0 };
         let sampled_rows = match &p.sampling {
-            GenerationSampling::Greedy => 0,
-            GenerationSampling::Seeded { .. } => NANBEIGE_VOCAB_SIZE,
+            GenerationSampling::Seeded { top_k: None, .. } => NANBEIGE_VOCAB_SIZE,
+            _ => 0,
         };
         Self::allocate(prompt, frequency_rows, sampled_rows)
     }
@@ -77,7 +76,7 @@ impl Workspace {
         let mut counts = reserved(frequency_rows)?;
         counts.resize(frequency_rows, 0_u32);
         let mut result = Self { counts, ids: reserved(sampled_rows)?,
-            logits: reserved(sampled_rows)?, last_selected_id: None, greedy_best: None };
+            logits: reserved(sampled_rows)?, last_selected_id: None, greedy_best: None, bounded_top: TopK::empty() };
         for &id in prompt { result.commit(id)?; }
         Ok(result)
     }
@@ -141,6 +140,7 @@ impl Workspace {
     /// before finishing; this private seam never invents absent logits.
     pub(in crate::native_engine) fn begin_legal_rows(&mut self) {
         self.ids.clear(); self.logits.clear(); self.last_selected_id = None; self.greedy_best = None;
+        self.bounded_top.clear();
     }
 
     /// Append a bounded projection block through the SAME ordered arithmetic
@@ -187,6 +187,9 @@ impl Workspace {
             }
             return Ok(());
         }
+        if let GenerationSampling::Seeded { top_k: Some(k), .. } = &p.sampling {
+            return self.bounded_top.offer(id as usize, processed, *k).map_err(sampler_error);
+        }
         // Compact IDs remain increasing, preserving the pinned sampler's
         // lowest-original-ID tie break without feeding artificial -Inf.
         self.ids.push(id); self.logits.push(processed);
@@ -203,11 +206,18 @@ impl Workspace {
             GenerationSampling::Greedy => return self.greedy_best.map(|(id, _)| id)
                 .ok_or(GenerationError::NoLegalToken),
             GenerationSampling::Seeded { effective_seed, top_k, top_p_ppm, .. } => {
-                if self.ids.is_empty() { return Err(GenerationError::NoLegalToken); }
                 let uniform = addressed_uniform(Seed256::from(*effective_seed), key,
                     DrawAddress::new(sample_index, step as u64, 0));
-                select_uniform_with_control(&self.logits, *top_k,
-                    f64::from(*top_p_ppm) / 1_000_000.0, uniform, control, step)?
+                let p = f64::from(*top_p_ppm) / 1_000_000.0;
+                if top_k.is_some() {
+                    let ranked = self.bounded_top.ranked_copy();
+                    if ranked.as_slice().is_empty() { return Err(GenerationError::NoLegalToken); }
+                    let id = select_from_top(&ranked, p, uniform, control, step)?;
+                    return u32::try_from(id).map_err(|_| GenerationError::InvalidLogits);
+                }
+                if self.ids.is_empty() { return Err(GenerationError::NoLegalToken); }
+                Nucleus::exact_top_p_with_control(&self.logits, p, control, step)
+                    .and_then(|n| n.select_uniform_with_control(uniform, control, step)).map_err(sampler_error)?
             }
         };
         self.ids.get(selected).copied().ok_or(GenerationError::InvalidLogits)
@@ -225,24 +235,16 @@ fn processor_scales(p: &GenerationOptions) -> (f64, f64) {
         GenerationSampling::Seeded { temperature_milli, .. } => f64::from(*temperature_milli) / 1000.0 };
     (repetition, temperature)
 }
-fn select_uniform_with_control<C: DecodeStepControl + ?Sized>(logits: &[f32], top_k: Option<usize>,
-    p: f64, u: f64, control: &mut C, step: usize) -> Result<usize, GenerationError> {
-    match top_k {
-        None => Nucleus::exact_top_p_with_control(logits, p, control, step)
-            .and_then(|n| n.select_uniform_with_control(u, control, step)).map_err(sampler_error),
-        Some(k) => {
-            let top = TopK::select_with_control(logits, k, control, step).map_err(sampler_error)?;
-            if p == 1.0 { return top.select_uniform(u).map_err(sampler_error); }
-            let entries = top.as_slice();
-            let mut restricted = [0.0_f32; MAX_TOP_K];
-            for (index, token) in entries.iter().enumerate() { restricted[index] = token.logit(); }
-            // Nucleus is conditional on the exact top-k set here. Without k,
-            // the other branch computes the complete legal-vocabulary normalizer.
-            let index = Nucleus::exact_top_p_with_control(&restricted[..entries.len()], p, control, step)
-                .and_then(|n| n.select_uniform_with_control(u, control, step)).map_err(sampler_error)?;
-            Ok(entries[index].token_id())
-        }
-    }
+fn select_from_top<C: DecodeStepControl + ?Sized>(top: &TopK, p: f64, u: f64,
+    control: &mut C, step: usize) -> Result<usize, GenerationError> {
+    checkpoint(control, step)?;
+    if p == 1.0 { return top.select_uniform(u).map_err(sampler_error); }
+    let entries = top.as_slice();
+    let mut restricted = [0.0_f32; MAX_TOP_K];
+    for (index, token) in entries.iter().enumerate() { restricted[index] = token.logit(); }
+    let index = Nucleus::exact_top_p_with_control(&restricted[..entries.len()], p, control, step)
+        .and_then(|n| n.select_uniform_with_control(u, control, step)).map_err(sampler_error)?;
+    Ok(entries[index].token_id())
 }
 
 pub(super) fn sampler_error(error: SamplerError) -> GenerationError {
@@ -260,7 +262,10 @@ impl DecodeStepControl for Continue {
 }
 #[cfg(test)]
 fn select_uniform(logits: &[f32], top_k: Option<usize>, p: f64, u: f64) -> Result<usize, GenerationError> {
-    select_uniform_with_control(logits, top_k, p, u, &mut Continue, 0)
+    match top_k {
+        Some(k) => select_from_top(&TopK::select(logits, k).map_err(sampler_error)?, p, u, &mut Continue, 0),
+        None => Nucleus::exact_top_p(logits, p).and_then(|n| n.select_uniform(u)).map_err(sampler_error),
+    }
 }
 
 #[cfg(test)]
@@ -402,6 +407,30 @@ mod tests {
             assert_eq!(visits.get(), SAMPLING_CHECKPOINT_STRIDE);
             assert!(workspace.ids.is_empty());
         }
+    }
+
+    #[test]
+    fn bounded_top_k_matches_dense_selection_over_filtered_original_ids() {
+        let raw: Vec<_> = (0..769).map(|i| ((i * 37) % 19) as f32 - 8.0).collect();
+        let allowed: Vec<_> = (0..raw.len()).filter(|id| id % 3 != 0).collect();
+        let compact: Vec<_> = allowed.iter().map(|&id| raw[id]).collect();
+        let key = StableRequestKey::from_canonical_digest([47; 32]);
+        let seed = [23; 32];
+        for k in [1, 7, MAX_TOP_K] { for top_p_ppm in [300_000, 950_000, 1_000_000] {
+            let mut p = GenerationOptions::greedy(2, 100, 0);
+            p.sampling = GenerationSampling::Seeded {
+                effective_seed: seed, temperature_milli: 1000, top_k: Some(k), top_p_ppm,
+            };
+            let mut workspace = Workspace::for_generation(&[], &p).unwrap();
+            assert_eq!(generation_workspace_bytes(&p).unwrap(), 4096);
+            for sample in 0..32 {
+                let u = addressed_uniform(Seed256::from(seed), key, DrawAddress::new(sample, 0, 0));
+                let index = select_uniform(&compact, Some(k), f64::from(top_p_ppm) / 1_000_000.0, u).unwrap();
+                let winner = workspace.select_legal(&raw, &p, key, sample, 0, |id| id % 3 != 0).unwrap();
+                assert_eq!(winner as usize, allowed[index]);
+            }
+            assert_eq!((workspace.ids.capacity(), workspace.logits.capacity()), (0, 0));
+        } }
     }
 
     #[test]
