@@ -1133,21 +1133,40 @@ pub(super) fn verify_container_identity(
     if census != manifest.digests.census_sha256 {
         return Err(PullError::ContainerIdentity("digests.census_sha256"));
     }
-    // Release manifests use raw SHA-256 for these assets. The directory's
-    // domain-framed stored digest binds different bytes.
-    for (kind, expected, field) in [
-        (SectionKind::TokenizerModel, &manifest.digests.tokenizer_sha256, "digests.tokenizer_sha256"),
-        (SectionKind::ChatTemplate, &manifest.digests.template_sha256, "digests.template_sha256"),
+    // Source files embedded verbatim can be checked against both the source
+    // inventory and (for the tokenizer) the task-facing digest in one read.
+    // The chat template is extracted from the source tokenizer configuration.
+    for (kind, source_name, digest, field) in [
+        (SectionKind::TokenizerModel, Some("tokenizer.model"), Some(&manifest.digests.tokenizer_sha256), "digests.tokenizer_sha256"),
+        (SectionKind::ChatTemplate, None, Some(&manifest.digests.template_sha256), "digests.template_sha256"),
+        (SectionKind::ModelConfig, Some("config.json"), None, "config.json"),
+        (SectionKind::TokenizerConfig, Some("tokenizer_config.json"), None, "tokenizer_config.json"),
     ] {
+        let source = source_name.and_then(|name| {
+            manifest.source.files.iter().find(|entry| entry.name == name).map(|entry| (name, entry))
+        });
+        if digest.is_none() && source.is_none() {
+            continue;
+        }
         let section = reader.sections().iter().find(|section| section.kind == kind)
             .ok_or(PullError::ContainerIdentity(field))?;
+        if let Some((name, entry)) = source
+            && section.stored_len != entry.bytes
+        {
+            return Err(PullError::ContainerIdentity(name));
+        }
         let raw = match reader.raw_section_sha256_with_checkpoint(section.ordinal, || checkpoint(progress)) {
-            Ok(digest) => digest,
+            Ok(digest) => hex_lower(&digest),
             Err(FnlpqReadError::Cancelled(cause)) => return Err(PullError::Cancelled { cause, progress }),
             Err(error) => return Err(PullError::Container(error)),
         };
-        if hex_lower(&raw) != *expected {
+        if digest.is_some_and(|expected| *expected != raw) {
             return Err(PullError::ContainerIdentity(field));
+        }
+        if let Some((name, entry)) = source
+            && entry.sha256 != raw
+        {
+            return Err(PullError::ContainerIdentity(name));
         }
     }
     Ok(())

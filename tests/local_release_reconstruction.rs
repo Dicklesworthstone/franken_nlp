@@ -263,6 +263,46 @@ fn pinned_manifest_cannot_misidentify_checked_resources_on_publication_or_cache_
 }
 
 #[test]
+fn listed_source_assets_must_match_section_lengths_and_raw_bytes() {
+    let fixture = Fixture::new("embedded-source-bindings");
+    let existing = fixture.root.join(LOGICAL_NAME);
+    let assets = [("config.json", CONFIG), ("tokenizer_config.json", CONFIG), ("tokenizer.model", TOKENIZER)];
+    let mut valid = fixture.manifest.clone();
+    valid.source.files = assets.iter().map(|&(name, bytes)| ReleaseSourceFile {
+        name: name.to_owned(), bytes: bytes.len() as u64, sha256: digest(bytes),
+    }).collect();
+    let manifest_path = fixture.root.join("asset-bindings.json");
+    fs::write(&manifest_path, valid.canonical_bytes().unwrap()).unwrap();
+    assert!(verify_local_release_cache(
+        &manifest_path, &valid.release_manifest_sha256().unwrap(), &existing, |_| None,
+    ).unwrap().is_some());
+
+    for (index, (name, _)) in assets.into_iter().enumerate() {
+        for wrong_length in [false, true] {
+            let mut manifest = valid.clone();
+            if wrong_length {
+                manifest.source.files[index].bytes += 1;
+            } else {
+                manifest.source.files[index].sha256 = "00".repeat(32);
+            }
+            let mut request = fixture.request(&format!("asset-{index}-{wrong_length}"));
+            request.manifest = manifest_path.clone();
+            fs::write(&request.manifest, manifest.canonical_bytes().unwrap()).unwrap();
+            request.expected_release_manifest_sha256 = manifest.release_manifest_sha256().unwrap();
+
+            let cache = verify_local_release_cache(
+                &request.manifest, &request.expected_release_manifest_sha256, &existing, |_| None,
+            );
+            assert!(matches!(cache, Err(PullError::ContainerIdentity(actual)) if actual == name));
+            let publication = reconstruct_local_release(&request);
+            assert!(matches!(publication, Err(PullError::ContainerIdentity(actual)) if actual == name));
+            assert!(!request.output.exists());
+        }
+    }
+    assert_eq!(fs::read(existing).unwrap(), fixture.artifact);
+}
+
+#[test]
 fn existing_final_cache_rehashes_bytes_and_refuses_damage_without_mutation() {
     let fixture = Fixture::new("cache-corruption");
     let request = fixture.request("damaged");

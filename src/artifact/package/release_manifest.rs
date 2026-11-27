@@ -2,7 +2,7 @@
 use super::{ArtifactHashers, PackageError, hex_digest, metadata_regular_file, verify_package_records};
 use crate::artifact::{
     converter::{ConversionReceipt, ConversionSourceManifest, extract_chat_template, source_root_digest},
-    format::{ArchTarget, SectionKind},
+    format::ArchTarget,
     manifest::{
         LOCAL_DERIVATION_PACKING_POLICY_V1, NANBEIGE42_INT8_V1_COMPATIBILITY, PULL_API_V1,
         RELEASE_MANIFEST_SCHEMA_V1, ReleaseArtifact, ReleaseCompatibility, ReleaseDigests,
@@ -42,14 +42,6 @@ pub fn build_release_manifest(
     reader.select_packing(ArchTarget::Generic).map_err(|e| mismatch("Generic packing", e))?;
     let source_sha = |name: &str| source.files.iter().find(|file| file.name == name)
         .map(|file| file.sha256.clone()).ok_or_else(|| mismatch(name, "missing from pinned closure"));
-    for (kind, name) in [(SectionKind::ModelConfig, "config.json"), (SectionKind::TokenizerConfig, "tokenizer_config.json")] {
-        let section = reader.sections().iter().find(|section| section.kind == kind)
-            .ok_or_else(|| mismatch(name, "missing artifact section"))?;
-        let observed = reader.raw_section_sha256(section.ordinal).map_err(|e| mismatch(name, e))?;
-        if hex_digest(observed) != source_sha(name)? {
-            return Err(mismatch(name, "materialized artifact section differs from pinned source"));
-        }
-    }
     let tokenizer_sha256 = source_sha("tokenizer.model")?;
     if hex_digest(Sha256::digest(PINNED_TOKENIZER_CONFIG_BYTES)) != source_sha("tokenizer_config.json")? {
         return Err(mismatch("tokenizer config", "embedded config differs from pinned source"));
