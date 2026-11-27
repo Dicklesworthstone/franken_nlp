@@ -11,10 +11,16 @@ impl DeferredCompletion {
         // This is the SAME run control after all native workers joined. No
         // fresh sink, output allowance, deadline or checkpoint budget is made.
         checkpoint(control).map_err(|fault| BatchRunError { fault, summary: self.summary })?;
-        writer.write_all(&self.frame).and_then(|_| writer.flush())
-            .map_err(|_| BatchRunError { fault: BatchCode::OutputIo.into(), summary: self.summary })?;
+        let written = writer.write_all(&self.frame);
+        checkpoint(control).map_err(|fault| BatchRunError { fault, summary: self.summary })?;
+        written.map_err(|_| BatchRunError { fault: BatchCode::OutputIo.into(), summary: self.summary })?;
+        let flushed = writer.flush();
+        checkpoint(control).map_err(|fault| BatchRunError { fault, summary: self.summary })?;
+        flushed.map_err(|_| BatchRunError { fault: BatchCode::OutputIo.into(), summary: self.summary })?;
         // A failed/partial write or flush cannot be retried or followed by an
-        // error record. Consuming self keeps that invariant outside Sink too.
+        // error record. The same holds for a cancellation observed after IO,
+        // even when the callback also failed. Consuming self keeps that
+        // invariant outside Sink too; delivered bytes are never rolled back.
         Ok(self.summary)
     }
 }

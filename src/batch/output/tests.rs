@@ -227,3 +227,127 @@ fn cancellation_at_eof_flush_emits_error_instead_of_success_footer() {
         }
     }
 }
+
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeliveryStage { Write, Flush }
+
+/// The transport may observe the caller's stop and fail in the same callback.
+/// Error strings are private fixture data and must never replace the cause.
+struct DeliveryWriter {
+    bytes: Vec<u8>, state: Rc<PublicationState>, target: &'static str,
+    stage: DeliveryStage, fail: bool, cause: Option<DecodeCancellationKind>,
+    armed: bool, writes: usize, flushes: usize,
+}
+impl DeliveryWriter {
+    fn callback(&mut self, stage: DeliveryStage) -> io::Result<()> {
+        if self.armed && self.stage == stage {
+            self.state.cause.set(self.cause);
+            if self.fail { return Err(io::Error::other("private transport failure")); }
+        }
+        Ok(())
+    }
+}
+impl Write for DeliveryWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let event: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        self.armed = event["event"] == self.target;
+        if self.armed {
+            self.writes += 1;
+            if self.target == "doc" {
+                assert!(self.state.live_guard.get(), "delivery must retain result admission");
+            }
+        }
+        self.callback(DeliveryStage::Write)?;
+        self.bytes.extend_from_slice(bytes); Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        if self.armed { self.flushes += 1; }
+        self.callback(DeliveryStage::Flush)
+    }
+}
+
+#[test]
+fn transport_callbacks_preserve_terminal_causes_and_never_acknowledge_refused_documents() {
+    for cause in [None].into_iter().chain(CANCELLATION_CAUSES.into_iter().map(Some)) {
+        for stage in [DeliveryStage::Write, DeliveryStage::Flush] {
+            for fail in [false, true] {
+                for target in ["doc", "run_complete"] {
+                    for grouped in [false, true] {
+                        let state = Rc::new(PublicationState::default());
+                        let mut processor = PublicationProcessor { state: Rc::clone(&state),
+                            pass: usize::MAX, cause: DecodeCancellationKind::User };
+                        let mut control = PublicationControl(Rc::clone(&state));
+                        let mut writer = DeliveryWriter { bytes: Vec::new(), state: Rc::clone(&state),
+                            target, stage, fail, cause, armed: false, writes: 0, flushes: 0 };
+                        let input = b"{\"id\":\"a\",\"text\":\"a\"}\n{\"id\":\"b\",\"text\":\"b\"}\n{\"id\":\"c\",\"text\":\"c\"}\n";
+                        let mut reader = Cursor::new(input);
+                        let result = if grouped {
+                            grouped::run_ndjson(&mut reader, &mut writer, &mut processor, BatchLimits::default(),
+                                grouped::GroupLimits { max_records: 2 }, &mut control)
+                        } else {
+                            run_ndjson(&mut reader, &mut writer, &mut processor, BatchLimits::default(), &mut control)
+                        };
+                        assert_eq!(state.live_results.get(), 0);
+                        assert!(!state.live_guard.get());
+                        let events: Vec<serde_json::Value> = std::str::from_utf8(&writer.bytes).unwrap().lines()
+                            .map(|line| serde_json::from_str(line).unwrap()).collect();
+                        assert!(!events.iter().any(|event| event["event"] == "run_error"),
+                            "never append an error after uncertain transport or a delivered success footer");
+                        if cause.is_none() && !fail {
+                            let summary = result.unwrap();
+                            assert_eq!(summary.succeeded, 3); assert_eq!(summary.failed, 0);
+                            assert_eq!(summary.reserved_work.forward_positions, 3);
+                            assert_eq!(events.last().unwrap()["event"], "run_complete");
+                            assert_eq!(writer.writes, if target == "doc" { 3 } else { 1 });
+                            assert_eq!(writer.flushes, writer.writes);
+                            continue;
+                        }
+                        let error = result.unwrap_err();
+                        assert_eq!(error.fault, cause.map(BatchFault::cancelled)
+                            .unwrap_or_else(|| BatchCode::OutputIo.into()));
+                        assert_eq!(error.summary.failed, 0);
+                        assert_eq!(writer.writes, 1, "a refused record must never be retried");
+                        assert_eq!(writer.flushes, usize::from(stage == DeliveryStage::Flush));
+                        let published = usize::from(stage == DeliveryStage::Flush || !fail);
+                        assert_eq!(events.iter().filter(|event| event["event"] == target).count(), published);
+                        if target == "doc" {
+                            assert_eq!(error.summary.succeeded, 0, "no acknowledgement after callback refusal");
+                            assert_eq!(error.summary.reserved_work.forward_positions, if grouped { 2 } else { 1 });
+                            assert_eq!(state.executions.get(), 1);
+                            assert!(reader.position() < input.len() as u64);
+                            assert!(!events.iter().any(|event| event["event"] == "run_complete"));
+                        } else {
+                            assert_eq!(error.summary.succeeded, 3);
+                            assert_eq!(error.summary.reserved_work.forward_positions, 3);
+                            assert_eq!(error.summary.flushes, 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn post_write_refusal_seals_sink_without_advancing_its_output_acknowledgement() {
+    for stage in [DeliveryStage::Write, DeliveryStage::Flush] {
+        for fail in [false, true] {
+            let state = Rc::new(PublicationState::default());
+            let mut writer = DeliveryWriter { bytes: Vec::new(), state: Rc::clone(&state),
+                target: "run_complete", stage, fail, cause: Some(DecodeCancellationKind::Deadline),
+                armed: false, writes: 0, flushes: 0 };
+            let mut control = PublicationControl(state);
+            let mut sink = Sink::new(&mut writer, BatchLimits::default());
+            sink.emit(&Event::<()>::new("run_start", 1, 0), false).unwrap();
+            let acknowledged = sink.emitted;
+            let event = Event::<()>::new("run_complete", 1, 0);
+            let error = sink.emit_with_checkpoint(&event, true, || checkpoint(&mut control)).unwrap_err();
+            assert_eq!(error, BatchFault::cancelled(DecodeCancellationKind::Deadline));
+            assert!(sink.poisoned()); assert_eq!(sink.emitted, acknowledged);
+            let bytes = sink.writer.bytes.len();
+            assert_eq!(sink.emit(&Event::<()>::new("run_error", 1, 0), true).unwrap_err().code, BatchCode::OutputIo);
+            assert_eq!(sink.writer.bytes.len(), bytes); assert_eq!(sink.writer.writes, 1);
+        }
+    }
+}

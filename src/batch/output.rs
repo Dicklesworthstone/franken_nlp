@@ -69,14 +69,27 @@ impl<'a, W: Write> Sink<'a, W> {
         self.emit_with_checkpoint(event, terminal, || Ok(()))
     }
     /// Success publication checks the same invocation after both serialization
-    /// passes and immediately before external IO. Error records deliberately
-    /// use `emit` so cancellation can still be reported from terminal reserve.
+    /// passes and each external IO operation. Error records deliberately use
+    /// `emit` so cancellation can still be reported from terminal reserve.
     pub fn emit_with_checkpoint<T: Serialize>(&mut self, event: &Event<'_, T>, terminal: bool,
-        checkpoint: impl FnMut() -> Result<(), BatchFault>) -> Result<(), BatchFault> {
-        let prepared = self.prepare_with_checkpoint(event, terminal, checkpoint)?;
-        // Treat even a flush-only error as possibly delivered. Never retry and
-        // never append a terminal record to an unknown/truncated output prefix.
-        if self.writer.write_all(&prepared.bytes).and_then(|_| self.writer.flush()).is_err() {
+        mut checkpoint: impl FnMut() -> Result<(), BatchFault>) -> Result<(), BatchFault> {
+        let prepared = self.prepare_with_checkpoint(event, terminal, &mut checkpoint)?;
+        // A callback can both consume the last allowance/cancel the caller and
+        // fail. Observe the original control before classifying that IO result.
+        // Once IO starts, any refusal is possibly delivered: never retry or
+        // append an error record after an unknown prefix or a success footer.
+        let written = self.writer.write_all(&prepared.bytes);
+        if let Err(fault) = checkpoint() {
+            self.poisoned = true; return Err(fault);
+        }
+        if written.is_err() {
+            self.poisoned = true; return Err(BatchCode::OutputIo.into());
+        }
+        let flushed = self.writer.flush();
+        if let Err(fault) = checkpoint() {
+            self.poisoned = true; return Err(fault);
+        }
+        if flushed.is_err() {
             self.poisoned = true; return Err(BatchCode::OutputIo.into());
         }
         self.emitted = prepared.total; Ok(())

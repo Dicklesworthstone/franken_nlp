@@ -104,3 +104,70 @@ fn partial_terminal_write_and_failed_flush_are_terminal_without_error_append() {
         if !fail_flush { assert_eq!(writer.bytes.len(), prefix + 7); }
     }
 }
+
+
+#[test]
+fn deferred_footer_preserves_original_cancellation_after_write_and_flush_results() {
+    use std::{cell::Cell, rc::Rc};
+    struct Control(Rc<Cell<Option<DecodeCancellationKind>>>);
+    impl DecodeStepControl for Control {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { self.0.get() }
+    }
+    struct Writer {
+        bytes: Vec<u8>, control: Rc<Cell<Option<DecodeCancellationKind>>>,
+        cause: Option<DecodeCancellationKind>, at_flush: bool, fail: bool,
+        writes: usize, flushes: usize,
+    }
+    impl Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            if !self.at_flush {
+                self.control.set(self.cause);
+                if self.fail { return Err(io::Error::other("private deferred write failure")); }
+            }
+            self.bytes.extend_from_slice(bytes); Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            if self.at_flush {
+                self.control.set(self.cause);
+                if self.fail { return Err(io::Error::other("private deferred flush failure")); }
+            }
+            Ok(())
+        }
+    }
+    use DecodeCancellationKind::*;
+    for cause in [None, Some(User), Some(Timeout), Some(Deadline), Some(PollQuota), Some(CostBudget),
+        Some(FailFast), Some(RaceLost), Some(ParentCancelled), Some(ResourceUnavailable),
+        Some(Shutdown), Some(LinkedExit)] {
+        for at_flush in [false, true] {
+            for fail in [false, true] {
+                let mut prefix = Vec::new();
+                let deferred = run_ndjson_deferred(&mut Cursor::new(INPUT), &mut prefix,
+                    &mut Echo::default(), BatchLimits::default(), &mut Continue).unwrap();
+                let expected_summary = deferred.summary;
+                let frame = deferred.frame.clone();
+                let state = Rc::new(Cell::new(None));
+                let mut control = Control(Rc::clone(&state));
+                let mut writer = Writer { bytes: prefix.clone(), control: state, cause, at_flush, fail,
+                    writes: 0, flushes: 0 };
+                let result = deferred.publish(&mut writer, &mut control);
+                assert_eq!(writer.writes, 1, "a terminal record has exactly one publication attempt");
+                let refused_write = !at_flush && (fail || cause.is_some());
+                assert_eq!(writer.flushes, usize::from(!refused_write));
+                if cause.is_none() && !fail {
+                    assert_eq!(result.unwrap(), expected_summary);
+                } else {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.fault, cause.map(BatchFault::cancelled)
+                        .unwrap_or_else(|| BatchCode::OutputIo.into()));
+                    assert_eq!(error.summary, expected_summary,
+                        "transport refusal never rewrites completed work or durable history");
+                }
+                if at_flush || !fail { prefix.extend_from_slice(&frame); }
+                assert_eq!(writer.bytes, prefix,
+                    "delivered bytes remain intact; no retries or contradictory error footer");
+            }
+        }
+    }
+}
