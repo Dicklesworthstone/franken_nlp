@@ -504,3 +504,35 @@ fn pinned_safe_bpe_uses_real_ordinary_vocabulary_and_preserves_registry_markers(
     assert_eq!(tokenizer.tokenizer().decode_bytes(document.ids()).unwrap(), input);
     assert!(document.ids().iter().all(|&id| !registries.template_controls().contains(id)));
 }
+
+#[test]
+fn default_byte_encoding_cancels_inside_a_long_segment_without_consuming_compact_work() {
+    let registries = archived_registries();
+    let tokenizer = tokenizer();
+    let encoder = UntrustedDocumentEncoder::new(&tokenizer, registries.template_controls());
+    let source = vec![b'x'; 8192];
+    let mut calls = 0;
+    let mut work = SafeBpeWork::default();
+    let result = encoder.encode_with_policy(&source, &UntrustedEncoding::ByteFallback, &mut work, &mut || {
+        calls += 1;
+        calls < 8
+    });
+    assert_eq!(result, Err(UntrustedDocumentError::Cancelled));
+    assert_eq!(work, SafeBpeWork::default());
+}
+
+#[test]
+fn incremental_byte_verification_reports_the_first_absolute_difference() {
+    let registries = archived_registries();
+    for (surface, expected, observed) in [("y", Some(b'x'), Some(b'y')), ("xy", None, Some(b'y'))] {
+        let (tokenizer, _) = compact_tokenizer(Some(AddedToken::new(surface, u32::from(b'x'))));
+        let encoder = UntrustedDocumentEncoder::new(&tokenizer, registries.template_controls());
+        let mut input = vec![b'a'; 511];
+        input.push(b'x');
+        let error = encoder.encode(&input).unwrap_err();
+        assert_eq!(error, UntrustedDocumentError::BytePreservation {
+            byte_offset: if expected.is_some() { 511 } else { 512 },
+            expected, observed,
+        });
+    }
+}

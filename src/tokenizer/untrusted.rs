@@ -290,20 +290,21 @@ impl<'tokenizer, 'registry> UntrustedDocumentEncoder<'tokenizer, 'registry> {
     /// Encode a document through byte fallback, reject any forbidden id, and
     /// verify the exact decode before returning a typed untrusted segment.
     pub fn encode(&self, bytes: &[u8]) -> Result<UntrustedDocument, UntrustedDocumentError> {
-        let ids = self
-            .tokenizer
-            .encode_byte_fallback_only(bytes)
-            .map_err(UntrustedDocumentError::Encode)?;
+        self.encode_byte_fallback(bytes, &mut || true)
+    }
 
+    fn encode_byte_fallback<F: FnMut() -> bool>(&self, bytes: &[u8], checkpoint: &mut F)
+        -> Result<UntrustedDocument, UntrustedDocumentError> {
+        poll(checkpoint)?;
+        let mut ids = Vec::new();
+        ids.try_reserve_exact(bytes.len()).map_err(|_| UntrustedDocumentError::AllocationRefused)?;
+        for chunk in bytes.chunks(256) {
+            poll(checkpoint)?;
+            self.tokenizer.encode_byte_fallback(chunk, &mut ids).map_err(UntrustedDocumentError::Encode)?;
+        }
         for (offset, &id) in ids.iter().enumerate() {
+            if offset % 256 == 0 { poll(checkpoint)?; }
             if let Some(control) = self.template_controls.entry(id) {
-                // The reported offset is the position of the offending token in
-                // the encoded id stream, NOT a byte offset into the source.
-                // The current encode API does not surface per-token byte spans;
-                // computing a true byte offset would require an
-                // `encode_byte_fallback_with_offsets` helper. Until that is
-                // added, callers must interpret the field as a token index and
-                // recompute the byte range from the id stream if they need it.
                 return Err(UntrustedDocumentError::ForbiddenControl {
                     token_offset: offset,
                     context: context_window(bytes, offset),
@@ -312,23 +313,63 @@ impl<'tokenizer, 'registry> UntrustedDocumentEncoder<'tokenizer, 'registry> {
                 });
             }
         }
+        self.verify_document(bytes, ids, false, checkpoint)
+    }
 
-        let decoded = self
-            .tokenizer
-            .decode_bytes(&ids)
-            .map_err(UntrustedDocumentError::Decode)?;
-        if decoded != bytes {
-            let byte_offset = first_difference(bytes, &decoded);
+    fn verify_document<F: FnMut() -> bool>(&self, bytes: &[u8], ids: Vec<u32>,
+        verify_embedding: bool, checkpoint: &mut F) -> Result<UntrustedDocument, UntrustedDocumentError> {
+        let mut initial_marker_consumed = false;
+        let mut decoded = Vec::new();
+        let mut offset = 0;
+        for (index, &id) in ids.iter().enumerate() {
+            if index % 256 == 0 { poll(checkpoint)?; }
+            decoded.clear();
+            self.tokenizer.decode_piece_into(id, &mut initial_marker_consumed, &mut decoded)
+                .map_err(UntrustedDocumentError::Decode)?;
+            if !bytes[offset..].starts_with(&decoded) {
+                let difference = first_difference(&bytes[offset..], &decoded);
+                return Err(UntrustedDocumentError::BytePreservation {
+                    byte_offset: offset + difference, expected: bytes.get(offset + difference).copied(),
+                    observed: decoded.get(difference).copied(),
+                });
+            }
+            offset += decoded.len();
+        }
+        if offset != bytes.len() {
             return Err(UntrustedDocumentError::BytePreservation {
-                byte_offset,
-                expected: bytes.get(byte_offset).copied(),
-                observed: decoded.get(byte_offset).copied(),
+                byte_offset: offset, expected: bytes.get(offset).copied(), observed: None,
             });
         }
-        Ok(UntrustedDocument {
-            bytes: bytes.to_vec(),
-            ids,
-        })
+        if let Some(&first) = ids.first().filter(|_| verify_embedding) {
+            // Safe-BPE starts with one raw byte. Prove independently that
+            // duplicating this first token emits that byte again and rejoins
+            // exactly the standalone decoder state. The identical suffix is
+            // then deterministic in both contexts; no second document-sized
+            // id buffer or decoded byte stream is needed.
+            let mut state = false;
+            decoded.clear();
+            self.tokenizer.decode_piece_into(first, &mut state, &mut decoded)
+                .map_err(UntrustedDocumentError::Decode)?;
+            let prefix_state = state;
+            if Some(decoded.as_slice()) != bytes.get(..1) {
+                return Err(UntrustedDocumentError::EmbeddedBytePreservation);
+            }
+            decoded.clear();
+            self.tokenizer.decode_piece_into(first, &mut state, &mut decoded)
+                .map_err(UntrustedDocumentError::Decode)?;
+            if Some(decoded.as_slice()) != bytes.get(..1) || state != prefix_state {
+                return Err(UntrustedDocumentError::EmbeddedBytePreservation);
+            }
+        }
+        let mut source = Vec::new();
+        poll(checkpoint)?;
+        source.try_reserve_exact(bytes.len()).map_err(|_| UntrustedDocumentError::AllocationRefused)?;
+        for chunk in bytes.chunks(16 * 1024) {
+            poll(checkpoint)?;
+            source.extend_from_slice(chunk);
+        }
+        poll(checkpoint)?;
+        Ok(UntrustedDocument { bytes: source, ids })
     }
 
     /// Explicit compact encoding with cumulative admission and cancellation.
@@ -346,42 +387,12 @@ impl<'tokenizer, 'registry> UntrustedDocumentEncoder<'tokenizer, 'registry> {
         policy.validate()?;
         poll(checkpoint)?;
         let UntrustedEncoding::SafeBpeV1(limits) = policy else {
-            let document = self.encode(bytes)?;
-            poll(checkpoint)?;
-            return Ok(document);
+            return self.encode_byte_fallback(bytes, checkpoint);
         };
         work.check(*limits)?;
         work.input(bytes.len(), *limits)?;
         let ids = self.tokenizer.encode_untrusted_bpe(bytes, self.forbidden_ids(), *limits, work, checkpoint)?;
-        poll(checkpoint)?;
-        // The tokenizer deliberately excludes every injected ID as well as the
-        // authoritative control registry. Independently verify the resulting
-        // bytes using the public decoder, both at stream start and after a
-        // byte-emitting prefix. This catches dummy-prefix/whitespace drift.
-        let decoded = self.tokenizer.decode_bytes(&ids).map_err(UntrustedDocumentError::Decode)?;
-        if decoded != bytes {
-            let byte_offset = first_difference(bytes, &decoded);
-            return Err(UntrustedDocumentError::BytePreservation {
-                byte_offset, expected: bytes.get(byte_offset).copied(), observed: decoded.get(byte_offset).copied(),
-            });
-        }
-        poll(checkpoint)?;
-        if let Some(&first) = ids.first() {
-            let mut embedded = Vec::new();
-            embedded.try_reserve_exact(ids.len() + 1).map_err(|_| UntrustedDocumentError::AllocationRefused)?;
-            embedded.push(first);
-            embedded.extend_from_slice(&ids);
-            let combined = self.tokenizer.decode_bytes(&embedded).map_err(UntrustedDocumentError::Decode)?;
-            if combined.first() != bytes.first() || combined.get(1..) != Some(bytes) {
-                return Err(UntrustedDocumentError::EmbeddedBytePreservation);
-            }
-        }
-        poll(checkpoint)?;
-        let mut source = Vec::new();
-        source.try_reserve_exact(bytes.len()).map_err(|_| UntrustedDocumentError::AllocationRefused)?;
-        source.extend_from_slice(bytes);
-        poll(checkpoint)?;
-        Ok(UntrustedDocument { bytes: source, ids })
+        self.verify_document(bytes, ids, true, checkpoint)
     }
 }
 

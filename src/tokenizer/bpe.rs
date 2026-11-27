@@ -678,7 +678,7 @@ impl SpBpeTokenizer {
         }
     }
 
-    fn encode_byte_fallback(&self, bytes: &[u8], ids: &mut Vec<u32>) -> Result<(), EncodeError> {
+    pub(super) fn encode_byte_fallback(&self, bytes: &[u8], ids: &mut Vec<u32>) -> Result<(), EncodeError> {
         for &byte in bytes {
             let id = self.byte_pieces[usize::from(byte)]
                 .ok_or(EncodeError::ByteFallbackMissing { byte })?;
