@@ -372,7 +372,7 @@ impl Sampled {
             effective_seed: sampling.effective_seed, temperature_milli: sampling.temperature_milli,
             top_k: sampling.top_k, top_p_ppm: sampling.top_p_ppm,
         };
-        Ok(Self { workspace: policy::Workspace::new(&[]).map_err(sampling_error)?,
+        Ok(Self { workspace: policy::Workspace::for_generation(&[], &processors).map_err(sampling_error)?,
             options: processors, key, sample_index: sampling.sample_index })
     }
 }

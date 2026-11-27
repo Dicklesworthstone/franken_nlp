@@ -61,18 +61,12 @@ pub(in crate::native_engine) struct Workspace {
     greedy_best: Option<(u32, f32)>, bounded_top: TopK,
 }
 impl Workspace {
-    pub fn new(prompt: &[u32]) -> Result<Self, GenerationError> {
-        Self::allocate(prompt, NANBEIGE_VOCAB_SIZE, NANBEIGE_VOCAB_SIZE)
-    }
-    pub(super) fn for_generation(prompt: &[u32], p: &GenerationOptions) -> Result<Self, GenerationError> {
+    pub(in crate::native_engine) fn for_generation(prompt: &[u32], p: &GenerationOptions) -> Result<Self, GenerationError> {
         let frequency_rows = if tracks_frequencies(p) { NANBEIGE_VOCAB_SIZE } else { 0 };
         let sampled_rows = match &p.sampling {
             GenerationSampling::Seeded { top_k: None, .. } => NANBEIGE_VOCAB_SIZE,
             _ => 0,
         };
-        Self::allocate(prompt, frequency_rows, sampled_rows)
-    }
-    fn allocate(prompt: &[u32], frequency_rows: usize, sampled_rows: usize) -> Result<Self, GenerationError> {
         let mut counts = reserved(frequency_rows)?;
         counts.resize(frequency_rows, 0_u32);
         let mut result = Self { counts, ids: reserved(sampled_rows)?,
@@ -288,7 +282,7 @@ mod tests {
         let mut p = GenerationOptions::greedy(4, 100, 0); p.min_new_tokens = 2;
         p.banned_token_ids = vec![1]; p.logit_bias_milli.insert(1, 100000);
         p.repetition_penalty_milli = 2000; p.frequency_penalty_milli = 1000;
-        let mut workspace = Workspace::new(&[2, 2]).unwrap();
+        let mut workspace = Workspace::for_generation(&[2, 2], &p).unwrap();
         let mut logits = vec![-100.0; NANBEIGE_VOCAB_SIZE]; logits[0] = 100.0; logits[1] = 100.0; logits[2] = 8.0; logits[3] = 3.0;
         let key = StableRequestKey::from_canonical_digest([0; 32]);
         assert_eq!(workspace.select(&logits, &p, key, 0, 0).unwrap(), 3);
@@ -298,7 +292,7 @@ mod tests {
     fn nonfinite_raw_rows_are_never_hidden_by_bans() {
         let mut p = GenerationOptions::greedy(1, 100, 0); p.banned_token_ids = vec![1];
         let mut logits = vec![0.0; NANBEIGE_VOCAB_SIZE]; logits[1] = f32::NAN;
-        assert!(Workspace::new(&[0]).unwrap().select(&logits, &p, StableRequestKey::from_canonical_digest([0; 32]), 0, 0).is_err());
+        assert!(Workspace::for_generation(&[0], &p).unwrap().select(&logits, &p, StableRequestKey::from_canonical_digest([0; 32]), 0, 0).is_err());
     }
     #[test]
     fn universal_external_legality_preserves_the_existing_processor_stack() {
@@ -316,8 +310,8 @@ mod tests {
         }] {
             p.sampling = sampling;
             for step in 0..3 {
-                let mut ordinary = Workspace::new(&[2, 2]).unwrap();
-                let mut masked = Workspace::new(&[2, 2]).unwrap();
+                let mut ordinary = Workspace::for_generation(&[2, 2], &p).unwrap();
+                let mut masked = Workspace::for_generation(&[2, 2], &p).unwrap();
                 assert_eq!(ordinary.select(&logits, &p, key, 8, step).unwrap(),
                     masked.select_legal(&logits, &p, key, 8, step, |_| true).unwrap());
             }
@@ -342,10 +336,10 @@ mod tests {
         }] {
             p.sampling = sampling;
             for step in 0..3 { for sample in 0..8 { for block in [1, 3, 8, rows.len()] {
-                let mut dense = Workspace::new(&[2, 2, 3, 7, 7, 7, 11]).unwrap();
+                let mut dense = Workspace::for_generation(&[2, 2, 3, 7, 7, 7, 11], &p).unwrap();
                 let expected = dense.select_legal(&raw, &p, key, sample, step,
                     |id| rows.binary_search(&id).is_ok()).unwrap();
-                let mut selected = Workspace::new(&[2, 2, 3, 7, 7, 7, 11]).unwrap();
+                let mut selected = Workspace::for_generation(&[2, 2, 3, 7, 7, 7, 11], &p).unwrap();
                 let capacities = (selected.ids.capacity(), selected.logits.capacity(), selected.counts.capacity());
                 selected.begin_legal_rows();
                 for ids in rows.chunks(block) {
@@ -370,11 +364,11 @@ mod tests {
             (&[2], &[f32::INFINITY]), (&[2], &[f32::NEG_INFINITY]),
         ];
         for &(ids, raw) in cases {
-            let mut workspace = Workspace::new(&[]).unwrap();
+            let mut workspace = Workspace::for_generation(&[], &p).unwrap();
             workspace.begin_legal_rows();
             assert!(matches!(workspace.extend_legal_rows(ids, raw, &p, 0), Err(GenerationError::InvalidLogits)));
         }
-        let mut workspace = Workspace::new(&[]).unwrap();
+        let mut workspace = Workspace::for_generation(&[], &p).unwrap();
         workspace.begin_legal_rows();
         assert!(matches!(workspace.finish_legal_rows(&p, key, 0, 0), Err(GenerationError::NoLegalToken)));
         workspace.extend_legal_rows(&[2, 4], &[1.0, 1.0], &p, 0).unwrap();
@@ -400,7 +394,7 @@ mod tests {
         for cause in super::super::tests::CANCELLATION_KINDS {
             let visits = Cell::new(0);
             let mut control = Stop { visits: &visits, cause };
-            let mut workspace = Workspace::new(&[]).unwrap();
+            let mut workspace = Workspace::for_generation(&[], &p).unwrap();
             let result = workspace.select_legal_with_control(&vec![0.0; 1025], &p, key, 0, 7,
                 |_| { visits.set(visits.get() + 1); false }, &mut control);
             assert!(matches!(result, Err(GenerationError::Cancelled(actual)) if actual == cause));
