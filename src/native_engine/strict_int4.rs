@@ -5,14 +5,17 @@
 use std::{error::Error, fmt, sync::Mutex};
 use serde::{Deserialize, Serialize};
 use super::{
-    attention::{AttentionError, QUERY_HEAD_COUNT, eager_gqa_attention_in_place_with_control},
+    attention::{AttentionError, QUERY_HEAD_COUNT, eager_gqa_attention_in_place_with_control,
+        eager_gqa_attention_in_place_with_scratch},
     decode::{DecodeCancellationKind, DecodeStepControl},
     int4::PackedInt4Kernel,
     kv::{KV_BYTES_PER_TOKEN, KV_SLOT_COUNT, PHYSICAL_LAYER_COUNT, KvCache, slot_for},
     layer::{NANBEIGE_HIDDEN_SIZE as H, NANBEIGE_INTERMEDIATE_SIZE as I, NANBEIGE_KV_PROJECTION_SIZE as K},
     lmhead::NANBEIGE_VOCAB_SIZE as V,
     looprun::{LayerBinding, LayerExecutor, LoopRunner, PositionContext},
-    nn::{RMS_NORM_EPSILON, residual_add_f32_cast_back, rms_norm_f32_reduce_cast_back, swiglu_f32_cast_back},
+    nn::{RMS_NORM_EPSILON, DecoderWorkspace, residual_add_f32_cast_back, rms_norm_f32_reduce_cast_back,
+        swiglu_f32_cast_back, residual_add_f32_cast_back_in_place, rms_norm_f32_reduce_cast_back_into,
+        swiglu_f32_cast_back_in_place},
     portable_int8::{ActivationBuffer, LinearError, LinearRows, ProjectionLedger, ProjectionWork,
         int4::{GroupedInt4Error, convert::GroupedInt4Matrix}},
     quant_algebra::MAX_MODEL_K,
@@ -149,9 +152,10 @@ impl Int4MemoryRequirement {
         Ok(Self { kv_bytes: n * KV_BYTES_PER_TOKEN as u64,
             rope_bytes: (n * NANBEIGE_HEAD_DIM as u64 + (NANBEIGE_HEAD_DIM / 2) as u64) * 4,
             // Same conservative simultaneous reference-vector allowance as
-            // strict INT8. Controlled attention reuses only 4*n context bytes
-            // and one stack head, within the existing 16*n allowance. Plus
-            // the reusable group unpacking payload. Weights,
+            // strict INT8. This includes its retained 71,680-byte BF16
+            // workspace, 4*n attention rail and one stack head, within the
+            // existing 16*n allowance. Construction has no second rail copy.
+            // Plus the reusable group unpacking payload. Weights,
             // allocator slack, caller output and host overhead are separate.
             scratch_payload_bound: (32 * I + V + NANBEIGE_HEAD_DIM) as u64 * 4 + 16 * n + group_width as u64 })
     }
@@ -179,7 +183,8 @@ impl RunState {
 /// network, implicit dispatch, runtime or worker spawn occurs here.
 pub struct StrictInt4Engine<'weights> {
     weights: &'weights Int4ModelWeights, cache: KvCache, rope: RopeTablesF32,
-    activation: ActivationBuffer, unpack: Vec<i8>, kernel: PackedInt4Kernel, state: RunState,
+    activation: ActivationBuffer, workspace: DecoderWorkspace,
+    unpack: Vec<i8>, kernel: PackedInt4Kernel, state: RunState,
     // Preserve the engine's public Send + Sync auto-traits even when its
     // private coordinator owns a Send-only reply receiver. Exclusive engine
     // methods use get_mut(); this slot is never locked at runtime.
@@ -190,7 +195,9 @@ impl<'weights> StrictInt4Engine<'weights> {
         Int4MemoryRequirement::for_context(context, weights.group_width())?.check(budget)?;
         Ok(Self { weights, cache: KvCache::try_with_capacity(context).map_err(|_| StrictInt4Error::Allocation)?,
             rope: RopeTablesF32::nanbeige(context).map_err(|_| StrictInt4Error::Rope)?,
-            activation: ActivationBuffer::try_new(I)?, unpack: filled(weights.group_width(), 0_i8)?,
+            activation: ActivationBuffer::try_new(I)?,
+            workspace: DecoderWorkspace::try_new(context).map_err(|_| StrictInt4Error::Allocation)?,
+            unpack: filled(weights.group_width(), 0_i8)?,
             kernel: PackedInt4Kernel::scalar(), state: RunState::default(), projection: Mutex::new(None) })
     }
     /// The caller supplies a real-host-checked handle before opening a session.
@@ -259,14 +266,19 @@ impl<C: DecodeStepControl> Int4Session<'_, '_, C> {
         let position = self.position()?;
         self.remaining_positions -= 1; self.remaining_attention -= bound.attention_pairs;
         self.engine.state.poisoned = true;
-        self.hidden = None;
+        let previous = self.hidden.take();
         poll(self.control)?;
         let row = self.engine.weights.embeddings.row(token as usize).map_err(|_| StrictInt4Error::Input)?;
-        let mut hidden = filled(H, Bf16::from_bits(0))?;
+        let mut hidden = match previous {
+            Some(hidden) => hidden,
+            None => filled(H, Bf16::from_bits(0))?,
+        };
+        if hidden.len() != H { return Err(StrictInt4Error::Boundary); }
         hidden.copy_from_slice(row); finite(&hidden)?;
         let runner = LoopRunner::from_layer_weights(&self.engine.weights.layers);
         let mut executor = Executor { final_norm: &self.engine.weights.final_norm, rope: &self.engine.rope,
-            activation: &mut self.engine.activation, unpack: &mut self.engine.unpack, kernel: self.engine.kernel,
+            activation: &mut self.engine.activation, workspace: &mut self.engine.workspace,
+            unpack: &mut self.engine.unpack, kernel: self.engine.kernel,
             ledger: &mut self.ledger,
             projection: self.engine.projection.get_mut().map_err(|_| StrictInt4Error::ProjectionExecutor)?,
             control: &mut *self.control, completed: 0, norms: 0 };
@@ -338,6 +350,7 @@ fn end_session(cache: &mut KvCache, state: &mut RunState) {
 
 struct Executor<'a, 'executor, C> {
     final_norm: &'a [Bf16], rope: &'a RopeTablesF32, activation: &'a mut ActivationBuffer,
+    workspace: &'a mut DecoderWorkspace,
     unpack: &'a mut [i8], kernel: PackedInt4Kernel, ledger: &'a mut ProjectionLedger,
     projection: &'a mut Option<&'executor mut (dyn Int4ProjectionExecutor + 'executor)>,
     control: &'a mut C, completed: usize, norms: usize,
@@ -352,42 +365,58 @@ impl<C: DecodeStepControl> LayerExecutor<Int4Layer> for Executor<'_, '_, C> {
         poll(self.control)?;
         let layer = binding.weights();
         let projection = |kind| Int4ProjectionOp::Layer { layer: binding.layer_index(), kind };
-        let normalized = norm(hidden, &layer.norm1)?;
-        self.activation.encode_bf16(&normalized)?;
-        let mut query = self.project(projection(Int4ProjectionKind::Query), &layer.q)?;
-        let mut key = self.project(projection(Int4ProjectionKind::Key), &layer.k)?;
-        let value = self.project(projection(Int4ProjectionKind::Value), &layer.v)?;
-        for head in query.chunks_exact_mut(NANBEIGE_HEAD_DIM) { self.rope.apply_split_half(positions.rope_position, head).map_err(|_| StrictInt4Error::Rope)?; }
-        for head in key.chunks_exact_mut(NANBEIGE_HEAD_DIM) { self.rope.apply_split_half(positions.rope_position, head).map_err(|_| StrictInt4Error::Rope)?; }
-        finite(&query)?; finite(&key)?;
-        cache.append_bf16(binding.kv_slot(), positions.cache_position, &key, &value).map_err(|_| StrictInt4Error::Cache)?;
+        norm_into(hidden, &layer.norm1, &mut self.workspace.normalized)?;
+        self.activation.encode_bf16(&self.workspace.normalized)?;
+        projection::project_bf16(self.projection, projection(Int4ProjectionKind::Query),
+            &layer.q, self.activation, LinearRows::All, &mut self.workspace.query,
+            self.unpack, self.kernel, self.ledger, self.control)?;
+        projection::project_bf16(self.projection, projection(Int4ProjectionKind::Key),
+            &layer.k, self.activation, LinearRows::All, &mut self.workspace.key,
+            self.unpack, self.kernel, self.ledger, self.control)?;
+        projection::project_bf16(self.projection, projection(Int4ProjectionKind::Value),
+            &layer.v, self.activation, LinearRows::All, &mut self.workspace.value,
+            self.unpack, self.kernel, self.ledger, self.control)?;
+        for head in self.workspace.query.chunks_exact_mut(NANBEIGE_HEAD_DIM) {
+            self.rope.apply_split_half(positions.rope_position, head).map_err(|_| StrictInt4Error::Rope)?;
+        }
+        for head in self.workspace.key.chunks_exact_mut(NANBEIGE_HEAD_DIM) {
+            self.rope.apply_split_half(positions.rope_position, head).map_err(|_| StrictInt4Error::Rope)?;
+        }
+        finite(&self.workspace.query)?; finite(&self.workspace.key)?;
+        cache.append_bf16(binding.kv_slot(), positions.cache_position,
+            &self.workspace.key, &self.workspace.value).map_err(|_| StrictInt4Error::Cache)?;
         poll(self.control)?;
-        eager_gqa_attention_in_place_with_control(&mut query, cache, binding.kv_slot(), self.control)?;
-        finite(&query)?; poll(self.control)?;
-        self.activation.encode_bf16(&query)?;
-        let update = self.project(projection(Int4ProjectionKind::AttentionOutput), &layer.o)?;
-        let residual = residual_add_f32_cast_back(hidden, &update).map_err(|_| StrictInt4Error::Primitive)?;
-        let normalized = norm(&residual, &layer.norm2)?;
-        self.activation.encode_bf16(&normalized)?;
-        let gate = self.project(projection(Int4ProjectionKind::Gate), &layer.gate)?;
-        let up = self.project(projection(Int4ProjectionKind::Up), &layer.up)?;
-        let product = swiglu_f32_cast_back(&gate, &up).map_err(|_| StrictInt4Error::Primitive)?;
-        self.activation.encode_bf16(&product)?;
-        let update = self.project(projection(Int4ProjectionKind::Down), &layer.down)?;
-        let output = residual_add_f32_cast_back(&residual, &update).map_err(|_| StrictInt4Error::Primitive)?;
-        finite(&output)?; *hidden = output; self.completed += 1; Ok(())
+        eager_gqa_attention_in_place_with_scratch(&mut self.workspace.query, cache,
+            binding.kv_slot(), &mut self.workspace.attention, self.control)?;
+        finite(&self.workspace.query)?; poll(self.control)?;
+        self.activation.encode_bf16(&self.workspace.query)?;
+        projection::project_bf16(self.projection, projection(Int4ProjectionKind::AttentionOutput),
+            &layer.o, self.activation, LinearRows::All, &mut self.workspace.update,
+            self.unpack, self.kernel, self.ledger, self.control)?;
+        residual_add_f32_cast_back_in_place(hidden, &self.workspace.update).map_err(|_| StrictInt4Error::Primitive)?;
+        norm_into(hidden, &layer.norm2, &mut self.workspace.normalized)?;
+        self.activation.encode_bf16(&self.workspace.normalized)?;
+        projection::project_bf16(self.projection, projection(Int4ProjectionKind::Gate),
+            &layer.gate, self.activation, LinearRows::All, &mut self.workspace.gate,
+            self.unpack, self.kernel, self.ledger, self.control)?;
+        projection::project_bf16(self.projection, projection(Int4ProjectionKind::Up),
+            &layer.up, self.activation, LinearRows::All, &mut self.workspace.up,
+            self.unpack, self.kernel, self.ledger, self.control)?;
+        swiglu_f32_cast_back_in_place(&mut self.workspace.gate, &self.workspace.up)
+            .map_err(|_| StrictInt4Error::Primitive)?;
+        self.activation.encode_bf16(&self.workspace.gate)?;
+        projection::project_bf16(self.projection, projection(Int4ProjectionKind::Down),
+            &layer.down, self.activation, LinearRows::All, &mut self.workspace.update,
+            self.unpack, self.kernel, self.ledger, self.control)?;
+        residual_add_f32_cast_back_in_place(hidden, &self.workspace.update).map_err(|_| StrictInt4Error::Primitive)?;
+        finite(hidden)?; self.completed += 1; Ok(())
     }
     fn final_rms_norm(&mut self, hidden: &mut Self::Hidden, _: PositionContext) -> Result<(), Self::Error> {
         if self.norms >= 2 || self.completed != (self.norms + 1) * PHYSICAL_LAYER_COUNT { return Err(StrictInt4Error::Boundary); }
-        poll(self.control)?; *hidden = norm(hidden, self.final_norm)?; self.norms += 1; Ok(())
-    }
-}
-impl<C: DecodeStepControl> Executor<'_, '_, C> {
-    fn project(&mut self, op: Int4ProjectionOp, matrix: &GroupedInt4Matrix) -> Result<Vec<Bf16>, StrictInt4Error> {
-        let mut output = filled(matrix.rows(), Bf16::from_bits(0))?;
-        projection::project_bf16(self.projection, op, matrix, self.activation, LinearRows::All,
-            &mut output, self.unpack, self.kernel, self.ledger, self.control)?;
-        Ok(output)
+        poll(self.control)?;
+        norm_into(hidden, self.final_norm, &mut self.workspace.normalized)?;
+        hidden.copy_from_slice(&self.workspace.normalized);
+        self.norms += 1; Ok(())
     }
 }
 fn norm(input: &[Bf16], scale: &[Bf16]) -> Result<Vec<Bf16>, StrictInt4Error> {
@@ -396,6 +425,14 @@ fn norm(input: &[Bf16], scale: &[Bf16]) -> Result<Vec<Bf16>, StrictInt4Error> {
     if !sum.is_finite() { return Err(StrictInt4Error::Primitive); }
     let result = rms_norm_f32_reduce_cast_back(input, scale, RMS_NORM_EPSILON).map_err(|_| StrictInt4Error::Primitive)?;
     finite(&result)?; Ok(result)
+}
+fn norm_into(input: &[Bf16], scale: &[Bf16], output: &mut [Bf16]) -> Result<(), StrictInt4Error> {
+    finite(input)?;
+    let sum = input.iter().map(|v| v.to_f32() * v.to_f32()).sum::<f32>();
+    if !sum.is_finite() { return Err(StrictInt4Error::Primitive); }
+    rms_norm_f32_reduce_cast_back_into(input, scale, RMS_NORM_EPSILON, output)
+        .map_err(|_| StrictInt4Error::Primitive)?;
+    finite(output)
 }
 fn finite(values: &[Bf16]) -> Result<(), StrictInt4Error> {
     if values.iter().all(|value| value.to_f32().is_finite()) { Ok(()) } else { Err(StrictInt4Error::Primitive) }

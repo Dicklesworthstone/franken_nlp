@@ -47,6 +47,8 @@ pub enum AttentionError {
     EmptySequence,
     /// The admitted output or context scratch could not be allocated.
     Allocation,
+    /// Caller-owned context scratch must cover the complete causal prefix.
+    ScratchTooSmall { required: usize, actual: usize },
     /// Cooperative cancellation retains its exact policy-boundary cause.
     Cancelled(DecodeCancellationKind),
 }
@@ -378,6 +380,25 @@ pub(crate) fn eager_gqa_attention_in_place_with_control<C: DecodeStepControl + ?
     reduce_eager_gqa_in_place(query, cache, slot, sequence_len, control)
 }
 
+/// The same eager operation over constructor-admitted scratch. Only the live
+/// causal prefix is touched; stale values beyond it cannot enter a reduction.
+/// Every score in that prefix is overwritten before each query head reads it.
+pub(crate) fn eager_gqa_attention_in_place_with_scratch<C: DecodeStepControl + ?Sized>(
+    query: &mut [Bf16],
+    cache: &KvCache,
+    slot: usize,
+    scratch: &mut [f32],
+    control: &mut C,
+) -> Result<(), AttentionError> {
+    let sequence_len = cache.len_for_slot(slot)?;
+    validate_eager_prefix(query.len(), cache, slot, sequence_len)?;
+    if scratch.len() < sequence_len {
+        return Err(AttentionError::ScratchTooSmall { required: sequence_len, actual: scratch.len() });
+    }
+    attention_checkpoint(control)?;
+    reduce_eager_gqa_with_scratch(query, cache, slot, &mut scratch[..sequence_len], control)
+}
+
 fn validate_eager_prefix(
     query_len: usize,
     cache: &KvCache,
@@ -412,6 +433,16 @@ fn reduce_eager_gqa_in_place<C: DecodeStepControl + ?Sized>(
     control: &mut C,
 ) -> Result<(), AttentionError> {
     let mut scratch = attention_buffer(sequence_len, 0.0_f32)?;
+    reduce_eager_gqa_with_scratch(query, cache, slot, &mut scratch, control)
+}
+
+fn reduce_eager_gqa_with_scratch<C: DecodeStepControl + ?Sized>(
+    query: &mut [Bf16],
+    cache: &KvCache,
+    slot: usize,
+    scratch: &mut [f32],
+    control: &mut C,
+) -> Result<(), AttentionError> {
     for kv_head in 0..KV_HEAD_COUNT {
         let kv_start = kv_head * NANBEIGE_HEAD_DIM;
         let kv_end = kv_start + NANBEIGE_HEAD_DIM;
@@ -431,7 +462,7 @@ fn reduce_eager_gqa_in_place<C: DecodeStepControl + ?Sized>(
                     ).to_f32();
                 }
             }
-            eager_probabilities_in_place(&mut scratch, control)?;
+            eager_probabilities_in_place(scratch, control)?;
             let mut accumulated = [0.0_f32; NANBEIGE_HEAD_DIM];
             for (block, probabilities) in scratch.chunks(ATTENTION_POSITIONS_PER_CHECKPOINT).enumerate() {
                 attention_checkpoint(control)?;
@@ -698,6 +729,60 @@ mod tests {
                 &mut query, &cache, slot, &mut Control::uninterrupted(),
             ).unwrap();
             assert_eq!(query, expected);
+        }
+    }
+
+    #[test]
+    fn retained_attention_scratch_overwrites_old_values_and_ignores_its_tail() {
+        let mut scratch = vec![f32::NAN; 70];
+        let pointer = scratch.as_ptr();
+        for (positions, slot) in [(65, 43), (1, 0), (33, 22), (2, 43)] {
+            let (mut query, cache) = controlled_case(positions, slot);
+            let expected = eager_gqa_attention_from_cache(&query, &cache, slot).unwrap();
+            scratch[positions..].fill(f32::from_bits(0x7fc0_1234));
+            let mut allocating = Control::uninterrupted();
+            eager_gqa_attention_from_cache_with_control(&query, &cache, slot, &mut allocating).unwrap();
+            let mut retained = Control::uninterrupted();
+            eager_gqa_attention_in_place_with_scratch(
+                &mut query, &cache, slot, &mut scratch, &mut retained,
+            ).unwrap();
+            assert_eq!(query, expected);
+            assert_eq!(retained.polls, allocating.polls);
+            assert_eq!(scratch.as_ptr(), pointer);
+            assert!(scratch[positions..].iter().all(|value| value.to_bits() == 0x7fc0_1234));
+        }
+    }
+
+    #[test]
+    fn undersized_attention_scratch_refuses_before_polling_or_query_mutation() {
+        let (mut query, cache) = controlled_case(2, 0);
+        let before = query.clone();
+        let mut scratch = [123.0_f32];
+        let mut control = Control { polls: 0, cancel_at: Some(1), cause: DecodeCancellationKind::User };
+        assert_eq!(eager_gqa_attention_in_place_with_scratch(
+            &mut query, &cache, 0, &mut scratch, &mut control,
+        ), Err(AttentionError::ScratchTooSmall { required: 2, actual: 1 }));
+        assert_eq!(query, before); assert_eq!(scratch, [123.0]); assert_eq!(control.polls, 0);
+    }
+
+    #[test]
+    fn retained_attention_scratch_preserves_every_phase_and_terminal_cancellation() {
+        let (query, cache) = controlled_case(33, 22);
+        let mut reference = Control::uninterrupted();
+        eager_gqa_attention_from_cache_with_control(&query, &cache, 22, &mut reference).unwrap();
+        let blocks = 33_usize.div_ceil(ATTENTION_POSITIONS_PER_CHECKPOINT);
+        let mut checkpoints: Vec<_> = (0..6).map(|phase| 1 + phase * blocks + 2).collect();
+        checkpoints.extend([1, reference.polls]);
+        for cause in cancellation_kinds() {
+            for &cancel_at in &checkpoints {
+                let mut working = query.clone(); let mut scratch = vec![f32::NAN; 40];
+                let mut control = Control { polls: 0, cancel_at: Some(cancel_at), cause };
+                assert_eq!(eager_gqa_attention_in_place_with_scratch(
+                    &mut working, &cache, 22, &mut scratch, &mut control,
+                ), Err(AttentionError::Cancelled(cause)));
+                assert_eq!(control.polls, cancel_at);
+                assert!(scratch[33..].iter().all(|value| value.is_nan()));
+            }
         }
     }
 

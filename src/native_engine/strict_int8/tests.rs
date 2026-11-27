@@ -92,6 +92,53 @@ fn norm_rejects_variance_overflow_instead_of_returning_zero() {
     let scale = [Bf16::from_f32(1.0); 2];
     assert_eq!(norm(&values, &scale).unwrap(), rms_norm_f32_reduce_cast_back(&values, &scale, RMS_NORM_EPSILON).unwrap());
 }
+
+#[test]
+fn reusable_norm_preserves_strict_refusals_and_full_overwrites() {
+    let scale = [Bf16::from_f32(1.0); 3];
+    let mut output = [Bf16::from_bits(0x4242); 3];
+    let before = output;
+    assert_eq!(norm_into(&[Bf16::from_f32(1.0e30); 3], &scale, &mut output), Err(StrictInt8Error::Primitive));
+    assert_eq!(output, before);
+    assert_eq!(norm_into(&[Bf16::from_f32(f32::NAN); 3], &scale, &mut output), Err(StrictInt8Error::Primitive));
+    assert_eq!(output, before);
+    for input in [[1.0, -2.0, 3.0], [0.0, -0.0, 0.0], [-8.0, 1.5, -0.25]] {
+        let input = input.map(Bf16::from_f32);
+        norm_into(&input, &scale, &mut output).unwrap();
+        assert_eq!(output.as_slice(), norm(&input, &scale).unwrap());
+    }
+}
+
+#[test]
+fn both_loop_norms_reuse_hidden_and_workspace_without_changing_bits() {
+    struct Continue;
+    impl DecodeStepControl for Continue {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
+    }
+    let mut hidden: Vec<_> = (0..H).map(|i| Bf16::from_f32((i % 17) as f32 / 8.0 - 1.0)).collect();
+    let scales = vec![Bf16::from_f32(1.125); H];
+    let expected_first = norm(&hidden, &scales).unwrap();
+    let expected_second = norm(&expected_first, &scales).unwrap();
+    let hidden_pointer = hidden.as_ptr();
+    let mut workspace = DecoderWorkspace::try_new(1).unwrap();
+    workspace.normalized.fill(Bf16::from_bits(0x7fc1));
+    let scratch_pointer = workspace.normalized.as_ptr();
+    let rope = RopeTablesF32::nanbeige(1).unwrap();
+    let mut activation = ActivationBuffer::try_new(I).unwrap();
+    let mut ledger = ProjectionLedger::new(ProjectionWork::default());
+    let mut control = Continue; let mut projection = None;
+    let mut executor = Executor { final_norm: &scales, rope: &rope, activation: &mut activation,
+        workspace: &mut workspace, ledger: &mut ledger, projection: &mut projection,
+        control: &mut control, completed: PHYSICAL_LAYER_COUNT, norms: 0 };
+    executor.final_rms_norm(&mut hidden, PositionContext::at(0)).unwrap();
+    assert_eq!(hidden, expected_first); assert_eq!(hidden.as_ptr(), hidden_pointer);
+    executor.completed = KV_SLOT_COUNT;
+    executor.final_rms_norm(&mut hidden, PositionContext::at(0)).unwrap();
+    assert_eq!(hidden, expected_second); assert_eq!(hidden.as_ptr(), hidden_pointer);
+    assert_eq!(executor.workspace.normalized.as_ptr(), scratch_pointer);
+    assert_eq!(executor.norms, 2);
+    assert_eq!(executor.final_rms_norm(&mut hidden, PositionContext::at(0)), Err(StrictInt8Error::Boundary));
+}
 #[test]
 fn projection_cancellation_keeps_its_typed_cause() {
     assert_eq!(StrictInt8Error::from(LinearError::Cancelled(DecodeCancellationKind::Shutdown)),

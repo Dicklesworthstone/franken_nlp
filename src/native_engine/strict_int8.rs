@@ -7,23 +7,27 @@
 //! This candidate is NOT an OQ-30 ratification or a model-fidelity award.
 //!
 //! There is no model-file opener or product activation route. Existing bridge
-//! weights are borrowed, never cloned or expanded. Reference NN/attention
-//! primitives still allocate bounded scratch; this is not an allocator-free,
-//! SIMD, batching, performance, or process-RSS claim.
+//! weights are borrowed, never cloned or expanded. Single-row decoder layers
+//! reuse constructor-admitted NN and attention rails; returned logits and
+//! distinct batch/prefill buffers retain their own bounded allocations. This
+//! is not a whole-engine allocation, performance, or process-RSS claim.
 
 use std::{error::Error, fmt, path::Path, sync::Mutex};
 use serde::{Deserialize, Serialize};
 use super::{
     artifact_bridge::{ArtifactBridgeError, ArtifactIdentity, ArtifactLoadBudget, ArtifactLoadReceipt,
         CurrentCandidateArtifactSource, LoadedArtifactWeights},
-    attention::{AttentionError, QUERY_HEAD_COUNT, eager_gqa_attention_in_place_with_control},
+    attention::{AttentionError, QUERY_HEAD_COUNT, eager_gqa_attention_in_place_with_control,
+        eager_gqa_attention_in_place_with_scratch},
     decode::{DecodeCancellationKind, DecodeStepControl},
     kv::{KV_BYTES_PER_TOKEN, KV_SLOT_COUNT, PHYSICAL_LAYER_COUNT, KvCache, slot_for},
     layer::{NANBEIGE_HIDDEN_SIZE as H, NANBEIGE_INTERMEDIATE_SIZE as I,
         NANBEIGE_Q_PROJECTION_SIZE as Q, NANBEIGE_KV_PROJECTION_SIZE as K},
     lmhead::NANBEIGE_VOCAB_SIZE as V,
     looprun::{LayerBinding, LayerExecutor, LoopRunner, PositionContext},
-    nn::{RMS_NORM_EPSILON, residual_add_f32_cast_back, rms_norm_f32_reduce_cast_back, swiglu_f32_cast_back},
+    nn::{RMS_NORM_EPSILON, DecoderWorkspace, residual_add_f32_cast_back, rms_norm_f32_reduce_cast_back,
+        swiglu_f32_cast_back, residual_add_f32_cast_back_in_place, rms_norm_f32_reduce_cast_back_into,
+        swiglu_f32_cast_back_in_place},
     portable_int8::{ActivationBuffer, LinearError, LinearRows, ProjectionLedger, ProjectionWork, QuantizedLinear},
     rope::{DEFAULT_ADMITTED_CONTEXT_CAP, NANBEIGE_HEAD_DIM, RopeTablesF32},
     simd::{Int8Kernel, Int8KernelKind},
@@ -246,7 +250,9 @@ impl Int8MemoryRequirement {
             // 16 bytes/context for reference attention. The controlled eager
             // path reuses one 4-byte/context buffer across every phase/head,
             // so it remains within this conservative existing allowance.
-            // Includes activation bytes, hidden copies and one-head scratch.
+            // Includes the retained 71,680-byte BF16 workspace, its 4*n
+            // attention rail, activation bytes, hidden copies, head output and
+            // one-head stack scratch. Construction has no second rail copy.
             // Vec metadata, allocator slack and source weights are excluded.
             scratch_payload_bound: (32 * I + V + NANBEIGE_HEAD_DIM) as u64 * 4 + 16 * n,
         })
@@ -320,7 +326,7 @@ impl RunState {
 /// access or worker spawn. One session exclusively owns logical KV lifetime.
 pub struct StrictInt8Engine<'weights> {
     weights: Int8WeightView<'weights>, cache: KvCache, rope: RopeTablesF32,
-    activation: ActivationBuffer, state: RunState,
+    activation: ActivationBuffer, workspace: DecoderWorkspace, state: RunState,
     // Keep the public Send + Sync auto-traits when a private coordinator owns
     // Send-only reply receivers. Exclusive methods use get_mut(); this slot
     // never takes a runtime lock or enters the host with a lock held.
@@ -331,7 +337,9 @@ impl<'weights> StrictInt8Engine<'weights> {
         Int8MemoryRequirement::for_context(context)?.check(memory)?;
         Ok(Self { weights, cache: KvCache::try_with_capacity(context).map_err(|_| StrictInt8Error::Allocation)?,
             rope: RopeTablesF32::nanbeige(context).map_err(|_| StrictInt8Error::Rope)?,
-            activation: ActivationBuffer::try_new(I)?, state: RunState::default(), projection: Mutex::new(None) })
+            activation: ActivationBuffer::try_new(I)?,
+            workspace: DecoderWorkspace::try_new(context).map_err(|_| StrictInt8Error::Allocation)?,
+            state: RunState::default(), projection: Mutex::new(None) })
     }
     /// Install one already hardware-checked kernel for all decoder/head rows.
     /// Existing callers retain the process-selected handle in their view.
@@ -409,14 +417,19 @@ impl<C: DecodeStepControl> Int8Session<'_, '_, C> {
         let position = self.position()?;
         self.remaining_positions -= 1; self.remaining_attention -= bound.attention_pairs;
         self.engine.state.poisoned = true; // Cleared ONLY after every native invariant succeeds.
-        self.hidden = None;
+        let previous = self.hidden.take();
         poll(self.control)?;
         let row = self.engine.weights.embeddings.row(token as usize).map_err(|_| StrictInt8Error::Input)?;
-        let mut hidden = filled(H, Bf16::from_bits(0))?;
+        let mut hidden = match previous {
+            Some(hidden) => hidden,
+            None => filled(H, Bf16::from_bits(0))?,
+        };
+        if hidden.len() != H { return Err(StrictInt8Error::Boundary); }
         hidden.copy_from_slice(row); finite(&hidden)?;
         let runner = LoopRunner::from_layer_weights(&self.engine.weights.layers);
         let mut executor = Executor { final_norm: self.engine.weights.final_norm, rope: &self.engine.rope,
-            activation: &mut self.engine.activation, ledger: &mut self.ledger, control: &mut *self.control,
+            activation: &mut self.engine.activation, workspace: &mut self.engine.workspace,
+            ledger: &mut self.ledger, control: &mut *self.control,
             projection: self.engine.projection.get_mut().map_err(|_| StrictInt8Error::ProjectionExecutor)?,
             completed: 0, norms: 0 };
         runner.run_token(&mut executor, &mut hidden, PositionContext::at(position), &mut self.engine.cache)?;
@@ -463,6 +476,7 @@ fn end_session(cache: &mut KvCache, state: &mut RunState) {
 
 struct Executor<'a, 'executor, C> {
     final_norm: &'a [Bf16], rope: &'a RopeTablesF32, activation: &'a mut ActivationBuffer,
+    workspace: &'a mut DecoderWorkspace,
     ledger: &'a mut ProjectionLedger, control: &'a mut C, completed: usize, norms: usize,
     projection: &'a mut Option<&'executor mut (dyn Int8ProjectionExecutor + 'executor)>,
 }
@@ -476,35 +490,53 @@ impl<'w, C: DecodeStepControl> LayerExecutor<Int8Layer<'w>> for Executor<'_, '_,
         poll(self.control)?;
         let layer = binding.weights();
         let projection = |kind| Int8ProjectionOp::Layer { layer: binding.layer_index(), kind };
-        let normalized = norm(hidden, layer.norm1)?;
-        self.activation.encode_bf16(&normalized)?;
-        // Same quantized activation and scale feed Q/K/V; no repeated quantization.
-        let mut query = self.project(projection(Int8ProjectionKind::Query), layer.q)?;
-        let mut key = self.project(projection(Int8ProjectionKind::Key), layer.k)?;
-        let value = self.project(projection(Int8ProjectionKind::Value), layer.v)?;
-        for head in query.chunks_exact_mut(NANBEIGE_HEAD_DIM) { self.rope.apply_split_half(positions.rope_position, head).map_err(|_| StrictInt8Error::Rope)?; }
-        for head in key.chunks_exact_mut(NANBEIGE_HEAD_DIM) { self.rope.apply_split_half(positions.rope_position, head).map_err(|_| StrictInt8Error::Rope)?; }
-        finite(&query)?; finite(&key)?;
-        cache.append_bf16(binding.kv_slot(), positions.cache_position, &key, &value).map_err(|_| StrictInt8Error::Cache)?;
+        norm_into(hidden, layer.norm1, &mut self.workspace.normalized)?;
+        self.activation.encode_bf16(&self.workspace.normalized)?;
+        // Same quantized activation and scale feed Q/K/V; each full projected
+        // rail overwrites the previous layer/token before any of it is read.
+        projection::project_bf16(self.projection, projection(Int8ProjectionKind::Query),
+            layer.q, self.activation, LinearRows::All, &mut self.workspace.query, self.ledger, self.control)?;
+        projection::project_bf16(self.projection, projection(Int8ProjectionKind::Key),
+            layer.k, self.activation, LinearRows::All, &mut self.workspace.key, self.ledger, self.control)?;
+        projection::project_bf16(self.projection, projection(Int8ProjectionKind::Value),
+            layer.v, self.activation, LinearRows::All, &mut self.workspace.value, self.ledger, self.control)?;
+        for head in self.workspace.query.chunks_exact_mut(NANBEIGE_HEAD_DIM) {
+            self.rope.apply_split_half(positions.rope_position, head).map_err(|_| StrictInt8Error::Rope)?;
+        }
+        for head in self.workspace.key.chunks_exact_mut(NANBEIGE_HEAD_DIM) {
+            self.rope.apply_split_half(positions.rope_position, head).map_err(|_| StrictInt8Error::Rope)?;
+        }
+        finite(&self.workspace.query)?; finite(&self.workspace.key)?;
+        cache.append_bf16(binding.kv_slot(), positions.cache_position,
+            &self.workspace.key, &self.workspace.value).map_err(|_| StrictInt8Error::Cache)?;
         poll(self.control)?;
-        eager_gqa_attention_in_place_with_control(&mut query, cache, binding.kv_slot(), self.control)?;
-        finite(&query)?; poll(self.control)?;
-        self.activation.encode_bf16(&query)?;
-        let update = self.project(projection(Int8ProjectionKind::AttentionOutput), layer.o)?;
-        let residual = residual_add_f32_cast_back(hidden, &update).map_err(|_| StrictInt8Error::Primitive)?;
-        let normalized = norm(&residual, layer.norm2)?;
-        self.activation.encode_bf16(&normalized)?;
-        let gate = self.project(projection(Int8ProjectionKind::Gate), layer.gate)?;
-        let up = self.project(projection(Int8ProjectionKind::Up), layer.up)?;
-        let product = swiglu_f32_cast_back(&gate, &up).map_err(|_| StrictInt8Error::Primitive)?;
-        self.activation.encode_bf16(&product)?;
-        let update = self.project(projection(Int8ProjectionKind::Down), layer.down)?;
-        let output = residual_add_f32_cast_back(&residual, &update).map_err(|_| StrictInt8Error::Primitive)?;
-        finite(&output)?; *hidden = output; self.completed += 1; Ok(())
+        eager_gqa_attention_in_place_with_scratch(&mut self.workspace.query, cache,
+            binding.kv_slot(), &mut self.workspace.attention, self.control)?;
+        finite(&self.workspace.query)?; poll(self.control)?;
+        self.activation.encode_bf16(&self.workspace.query)?;
+        projection::project_bf16(self.projection, projection(Int8ProjectionKind::AttentionOutput),
+            layer.o, self.activation, LinearRows::All, &mut self.workspace.update, self.ledger, self.control)?;
+        residual_add_f32_cast_back_in_place(hidden, &self.workspace.update).map_err(|_| StrictInt8Error::Primitive)?;
+        norm_into(hidden, layer.norm2, &mut self.workspace.normalized)?;
+        self.activation.encode_bf16(&self.workspace.normalized)?;
+        projection::project_bf16(self.projection, projection(Int8ProjectionKind::Gate),
+            layer.gate, self.activation, LinearRows::All, &mut self.workspace.gate, self.ledger, self.control)?;
+        projection::project_bf16(self.projection, projection(Int8ProjectionKind::Up),
+            layer.up, self.activation, LinearRows::All, &mut self.workspace.up, self.ledger, self.control)?;
+        swiglu_f32_cast_back_in_place(&mut self.workspace.gate, &self.workspace.up)
+            .map_err(|_| StrictInt8Error::Primitive)?;
+        self.activation.encode_bf16(&self.workspace.gate)?;
+        projection::project_bf16(self.projection, projection(Int8ProjectionKind::Down),
+            layer.down, self.activation, LinearRows::All, &mut self.workspace.update, self.ledger, self.control)?;
+        residual_add_f32_cast_back_in_place(hidden, &self.workspace.update).map_err(|_| StrictInt8Error::Primitive)?;
+        finite(hidden)?; self.completed += 1; Ok(())
     }
     fn final_rms_norm(&mut self, hidden: &mut Self::Hidden, _: PositionContext) -> Result<(), Self::Error> {
         if self.norms >= 2 || self.completed != (self.norms + 1) * PHYSICAL_LAYER_COUNT { return Err(StrictInt8Error::Boundary); }
-        poll(self.control)?; *hidden = norm(hidden, self.final_norm)?; self.norms += 1; Ok(())
+        poll(self.control)?;
+        norm_into(hidden, self.final_norm, &mut self.workspace.normalized)?;
+        hidden.copy_from_slice(&self.workspace.normalized);
+        self.norms += 1; Ok(())
     }
 }
 fn norm(input: &[Bf16], scale: &[Bf16]) -> Result<Vec<Bf16>, StrictInt8Error> {
@@ -516,16 +548,16 @@ fn norm(input: &[Bf16], scale: &[Bf16]) -> Result<Vec<Bf16>, StrictInt8Error> {
     let result = rms_norm_f32_reduce_cast_back(input, scale, RMS_NORM_EPSILON).map_err(|_| StrictInt8Error::Primitive)?;
     finite(&result)?; Ok(result)
 }
+fn norm_into(input: &[Bf16], scale: &[Bf16], output: &mut [Bf16]) -> Result<(), StrictInt8Error> {
+    finite(input)?;
+    let sum = input.iter().map(|v| v.to_f32() * v.to_f32()).sum::<f32>();
+    if !sum.is_finite() { return Err(StrictInt8Error::Primitive); }
+    rms_norm_f32_reduce_cast_back_into(input, scale, RMS_NORM_EPSILON, output)
+        .map_err(|_| StrictInt8Error::Primitive)?;
+    finite(output)
+}
 fn finite(values: &[Bf16]) -> Result<(), StrictInt8Error> {
     if values.iter().all(|v| v.to_f32().is_finite()) { Ok(()) } else { Err(StrictInt8Error::Primitive) }
-}
-impl<C: DecodeStepControl> Executor<'_, '_, C> {
-    fn project(&mut self, op: Int8ProjectionOp, matrix: QuantizedLinear<'_>) -> Result<Vec<Bf16>, StrictInt8Error> {
-        let mut output = filled(matrix.rows(), Bf16::from_bits(0))?;
-        projection::project_bf16(self.projection, op, matrix, self.activation, LinearRows::All,
-            &mut output, self.ledger, self.control)?;
-        Ok(output)
-    }
 }
 fn filled<T: Clone>(length: usize, value: T) -> Result<Vec<T>, StrictInt8Error> {
     let mut output = Vec::new(); output.try_reserve_exact(length).map_err(|_| StrictInt8Error::Allocation)?;
