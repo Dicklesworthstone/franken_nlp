@@ -5,7 +5,7 @@
 use std::{error::Error, fmt, sync::Mutex};
 use serde::{Deserialize, Serialize};
 use super::{
-    attention::{AttentionError, QUERY_HEAD_COUNT, eager_gqa_attention_from_cache_with_control},
+    attention::{AttentionError, QUERY_HEAD_COUNT, eager_gqa_attention_in_place_with_control},
     decode::{DecodeCancellationKind, DecodeStepControl},
     int4::PackedInt4Kernel,
     kv::{KV_BYTES_PER_TOKEN, KV_SLOT_COUNT, PHYSICAL_LAYER_COUNT, KvCache, slot_for},
@@ -362,9 +362,9 @@ impl<C: DecodeStepControl> LayerExecutor<Int4Layer> for Executor<'_, '_, C> {
         finite(&query)?; finite(&key)?;
         cache.append_bf16(binding.kv_slot(), positions.cache_position, &key, &value).map_err(|_| StrictInt4Error::Cache)?;
         poll(self.control)?;
-        let attention = eager_gqa_attention_from_cache_with_control(&query, cache, binding.kv_slot(), self.control)?;
-        finite(&attention)?; poll(self.control)?;
-        self.activation.encode_bf16(&attention)?;
+        eager_gqa_attention_in_place_with_control(&mut query, cache, binding.kv_slot(), self.control)?;
+        finite(&query)?; poll(self.control)?;
+        self.activation.encode_bf16(&query)?;
         let update = self.project(projection(Int4ProjectionKind::AttentionOutput), &layer.o)?;
         let residual = residual_add_f32_cast_back(hidden, &update).map_err(|_| StrictInt4Error::Primitive)?;
         let normalized = norm(&residual, &layer.norm2)?;

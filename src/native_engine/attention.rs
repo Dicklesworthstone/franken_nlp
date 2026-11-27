@@ -354,11 +354,41 @@ pub fn eager_gqa_attention_from_cache_prefix_with_control<C: DecodeStepControl +
     sequence_len: usize,
     control: &mut C,
 ) -> Result<Vec<Bf16>, AttentionError> {
+    validate_eager_prefix(query.len(), cache, slot, sequence_len)?;
+    attention_checkpoint(control)?;
+    let mut output = Vec::new();
+    output.try_reserve_exact(query.len()).map_err(|_| AttentionError::Allocation)?;
+    output.extend_from_slice(query);
+    reduce_eager_gqa_in_place(&mut output, cache, slot, sequence_len, control)?;
+    Ok(output)
+}
+
+/// Overwrites an engine-private Q rail with its attention output. A query
+/// head is read to completion before its first lane is overwritten. On error
+/// the owning forward discards the entire rail, including any completed heads.
+pub(crate) fn eager_gqa_attention_in_place_with_control<C: DecodeStepControl + ?Sized>(
+    query: &mut [Bf16],
+    cache: &KvCache,
+    slot: usize,
+    control: &mut C,
+) -> Result<(), AttentionError> {
+    let sequence_len = cache.len_for_slot(slot)?;
+    validate_eager_prefix(query.len(), cache, slot, sequence_len)?;
+    attention_checkpoint(control)?;
+    reduce_eager_gqa_in_place(query, cache, slot, sequence_len, control)
+}
+
+fn validate_eager_prefix(
+    query_len: usize,
+    cache: &KvCache,
+    slot: usize,
+    sequence_len: usize,
+) -> Result<(), AttentionError> {
     let query_width = QUERY_HEAD_COUNT * NANBEIGE_HEAD_DIM;
-    if query.len() != query_width {
+    if query_len != query_width {
         return Err(AttentionError::QueryVectorLength {
             expected: query_width,
-            actual: query.len(),
+            actual: query_len,
         });
     }
     let available_positions = cache.len_for_slot(slot)?;
@@ -371,8 +401,16 @@ pub fn eager_gqa_attention_from_cache_prefix_with_control<C: DecodeStepControl +
     if sequence_len == 0 {
         return Err(AttentionError::EmptySequence);
     }
-    attention_checkpoint(control)?;
-    let mut output = attention_buffer(query_width, Bf16::from_bits(0))?;
+    Ok(())
+}
+
+fn reduce_eager_gqa_in_place<C: DecodeStepControl + ?Sized>(
+    query: &mut [Bf16],
+    cache: &KvCache,
+    slot: usize,
+    sequence_len: usize,
+    control: &mut C,
+) -> Result<(), AttentionError> {
     let mut scratch = attention_buffer(sequence_len, 0.0_f32)?;
     for kv_head in 0..KV_HEAD_COUNT {
         let kv_start = kv_head * NANBEIGE_HEAD_DIM;
@@ -381,14 +419,14 @@ pub fn eager_gqa_attention_from_cache_prefix_with_control<C: DecodeStepControl +
             let query_head = kv_head * QUERY_HEADS_PER_KV_HEAD + query_offset;
             let query_start = query_head * NANBEIGE_HEAD_DIM;
             let query_end = query_start + NANBEIGE_HEAD_DIM;
-            let query_values = &query[query_start..query_end];
+            let head = &mut query[query_start..query_end];
             for (block, scores) in scratch.chunks_mut(ATTENTION_POSITIONS_PER_CHECKPOINT).enumerate() {
                 attention_checkpoint(control)?;
                 let base = block * ATTENTION_POSITIONS_PER_CHECKPOINT;
                 for (offset, score) in scores.iter_mut().enumerate() {
                     let key = cache.key_at(slot, base + offset)?;
                     *score = qk_score_bf16_cast_points_from_values(
-                        query_values.iter().map(|value| value.to_f32()),
+                        head.iter().map(|value| value.to_f32()),
                         key[kv_start..kv_end].iter().map(|value| Bf16::from_bits(*value).to_f32()),
                     ).to_f32();
                 }
@@ -405,13 +443,13 @@ pub fn eager_gqa_attention_from_cache_prefix_with_control<C: DecodeStepControl +
                     }
                 }
             }
-            for (destination, value) in output[query_start..query_end].iter_mut().zip(accumulated) {
+            for (destination, value) in head.iter_mut().zip(accumulated) {
                 *destination = Bf16::from_f32(value);
             }
         }
     }
     attention_checkpoint(control)?;
-    Ok(output)
+    Ok(())
 }
 
 /// Reuses the score storage without changing the reference's reduction order.
@@ -648,6 +686,18 @@ mod tests {
                     expected.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
                     "slot {slot}, causal prefix {prefix}");
             }
+        }
+    }
+
+    #[test]
+    fn reused_query_rail_matches_independent_eager_heads() {
+        for (positions, slot) in [(1, 0), (32, 22), (33, 43)] {
+            let (mut query, cache) = controlled_case(positions, slot);
+            let expected = eager_gqa_attention_from_cache(&query, &cache, slot).unwrap();
+            eager_gqa_attention_in_place_with_control(
+                &mut query, &cache, slot, &mut Control::uninterrupted(),
+            ).unwrap();
+            assert_eq!(query, expected);
         }
     }
 

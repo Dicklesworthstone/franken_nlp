@@ -22,13 +22,13 @@ impl<'w, C: DecodeStepControl> GroupLayerExecutor<Int8Layer<'w>> for Executor<'_
         let mut query = project_group(layer.q, self.activations, self.ledger, self.control)?;
         let mut key = project_group(layer.k, self.activations, self.ledger, self.control)?;
         let value = project_group(layer.v, self.activations, self.ledger, self.control)?;
-        let attention = attend_sequences(&mut query, &mut key, &value, self.steps, self.positions,
+        attend_sequences(&mut query, &mut key, &value, self.steps, self.positions,
             binding.kv_slot(), self.rope, self.sequences, self.control)?;
-        drop(query); drop(key); drop(value);
-        for (input, row) in self.activations.iter_mut().zip(attention.chunks_exact(Q)) { input.encode_bf16(row)?; }
+        drop(key); drop(value);
+        for (input, row) in self.activations.iter_mut().zip(query.chunks_exact(Q)) { input.encode_bf16(row)?; }
         let update = project_group(layer.o, self.activations, self.ledger, self.control)?;
         add_rows(hidden, &update, self.control)?;
-        drop(attention); drop(update);
+        drop(query); drop(update);
         encode_norms(hidden, layer.norm2, self.activations, self.control)?;
         let gate = project_group(layer.gate, self.activations, self.ledger, self.control)?;
         let up = project_group(layer.up, self.activations, self.ledger, self.control)?;
@@ -102,11 +102,10 @@ fn check_addresses(steps: &[CohortToken], positions: &[usize], slot: usize,
 #[allow(clippy::too_many_arguments)]
 pub(super) fn attend_sequences<C: DecodeStepControl>(query: &mut [Bf16], key: &mut [Bf16], value: &[Bf16],
     steps: &[CohortToken], positions: &[usize], slot: usize, rope: &RopeTablesF32,
-    sequences: &mut [Sequence], control: &mut C) -> Result<Vec<Bf16>, StrictInt8Error> {
+    sequences: &mut [Sequence], control: &mut C) -> Result<(), StrictInt8Error> {
     check_addresses(steps, positions, slot, sequences)?;
     if query.len() != steps.len() * Q || key.len() != steps.len() * K
         || value.len() != steps.len() * K { return Err(StrictInt8Error::Input); }
-    let mut output = filled(query.len(), Bf16::from_bits(0))?;
     for (index, (step, &position)) in steps.iter().zip(positions).enumerate() {
         poll(control)?;
         let q = &mut query[index * Q..(index + 1) * Q];
@@ -118,8 +117,8 @@ pub(super) fn attend_sequences<C: DecodeStepControl>(query: &mut [Bf16], key: &m
         let cache = &mut sequences[step.sequence].cache;
         cache.append_bf16(slot, position, k, v).map_err(|_| StrictInt8Error::Cache)?;
         poll(control)?;
-        let attention = eager_gqa_attention_from_cache_with_control(q, cache, slot, control)?;
-        finite(&attention)?; output[index * Q..(index + 1) * Q].copy_from_slice(&attention);
+        eager_gqa_attention_in_place_with_control(q, cache, slot, control)?;
+        finite(q)?;
     }
-    poll(control)?; Ok(output)
+    poll(control)?; Ok(())
 }

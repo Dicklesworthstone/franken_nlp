@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     artifact_bridge::{ArtifactBridgeError, ArtifactIdentity, ArtifactLoadBudget, ArtifactLoadReceipt,
         CurrentCandidateArtifactSource, LoadedArtifactWeights},
-    attention::{AttentionError, QUERY_HEAD_COUNT, eager_gqa_attention_from_cache_with_control},
+    attention::{AttentionError, QUERY_HEAD_COUNT, eager_gqa_attention_in_place_with_control},
     decode::{DecodeCancellationKind, DecodeStepControl},
     kv::{KV_BYTES_PER_TOKEN, KV_SLOT_COUNT, PHYSICAL_LAYER_COUNT, KvCache, slot_for},
     layer::{NANBEIGE_HIDDEN_SIZE as H, NANBEIGE_INTERMEDIATE_SIZE as I,
@@ -487,9 +487,9 @@ impl<'w, C: DecodeStepControl> LayerExecutor<Int8Layer<'w>> for Executor<'_, '_,
         finite(&query)?; finite(&key)?;
         cache.append_bf16(binding.kv_slot(), positions.cache_position, &key, &value).map_err(|_| StrictInt8Error::Cache)?;
         poll(self.control)?;
-        let attention = eager_gqa_attention_from_cache_with_control(&query, cache, binding.kv_slot(), self.control)?;
-        finite(&attention)?; poll(self.control)?;
-        self.activation.encode_bf16(&attention)?;
+        eager_gqa_attention_in_place_with_control(&mut query, cache, binding.kv_slot(), self.control)?;
+        finite(&query)?; poll(self.control)?;
+        self.activation.encode_bf16(&query)?;
         let update = self.project(projection(Int8ProjectionKind::AttentionOutput), layer.o)?;
         let residual = residual_add_f32_cast_back(hidden, &update).map_err(|_| StrictInt8Error::Primitive)?;
         let normalized = norm(&residual, layer.norm2)?;

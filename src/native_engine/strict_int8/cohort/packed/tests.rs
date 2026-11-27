@@ -65,8 +65,9 @@ fn causal_case(slot: usize, starts: [usize; 2]) {
     let v: Vec<_> = [1.0, 3.0, 9.0, -20.0, -50.0].into_iter()
         .flat_map(|value| vec![Bf16::from_f32(value); K]).collect();
     let original_q = q.clone(); let original_k = k.clone();
-    let actual = execution::attend_sequences(&mut q, &mut k, &v, &steps, &positions,
+    execution::attend_sequences(&mut q, &mut k, &v, &steps, &positions,
         slot, &rope, &mut packed, &mut Control::default()).unwrap();
+    let actual = q;
     for (row, (step, &position)) in steps.iter().zip(&positions).enumerate() {
         let mut q = original_q[row * Q..(row + 1) * Q].to_vec();
         let mut k = original_k[row * K..(row + 1) * K].to_vec();

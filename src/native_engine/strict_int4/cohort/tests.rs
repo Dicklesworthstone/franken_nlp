@@ -120,8 +120,9 @@ fn ragged_attention_matches_independent_replay_and_leaves_inactive_documents_unt
             reference[step.sequence].cache.append(slot, positions[lane], &bits(&k), &bits(&value[lane * K..(lane + 1) * K])).unwrap();
             expected.extend(eager_gqa_attention_from_cache(&q, &reference[step.sequence].cache, slot).unwrap());
         }
-        let actual = execution::attend_sequences(&mut query, &mut key, &value, &steps, &positions, slot,
+        execution::attend_sequences(&mut query, &mut key, &value, &steps, &positions, slot,
             &rope, &mut sequences, &mut Control::default()).unwrap();
+        let actual = query;
         assert_eq!(bits(&actual), bits(&expected));
         assert!(actual[..Q].iter().all(|v| v.to_f32() == 5.0));
         for (index, length) in [1, 1, 4].into_iter().enumerate() {

@@ -127,17 +127,17 @@ impl<'w, C: DecodeStepControl> GroupLayerExecutor<Int8Layer<'w>> for PrefillExec
         let mut query = self.project(index, Int8ProjectionKind::Query, layer.q)?;
         let mut key = self.project(index, Int8ProjectionKind::Key, layer.k)?;
         let value = self.project(index, Int8ProjectionKind::Value, layer.v)?;
-        let attention = attend_rows(&mut query, &mut key, &value, self.rows, self.start,
+        attend_rows(&mut query, &mut key, &value, self.rows, self.start,
             binding.kv_slot(), self.rope, self.cache, self.control)?;
-        drop(query); drop(key); drop(value);
-        for (input, row) in self.activations.iter_mut().zip(attention.chunks_exact(Q)) { input.encode_bf16(row)?; }
+        drop(key); drop(value);
+        for (input, row) in self.activations.iter_mut().zip(query.chunks_exact(Q)) { input.encode_bf16(row)?; }
         let update = self.project(index, Int8ProjectionKind::AttentionOutput, layer.o)?;
         for (row, update) in hidden.iter_mut().zip(update.chunks_exact(H)) {
             poll(self.control)?;
             *row = residual_add_f32_cast_back(row, update).map_err(|_| StrictInt8Error::Primitive)?;
             finite(row)?;
         }
-        drop(attention); drop(update);
+        drop(query); drop(update);
         encode_norms(hidden, layer.norm2, self.activations, self.control)?;
         let gate = self.project(index, Int8ProjectionKind::Gate, layer.gate)?;
         let up = self.project(index, Int8ProjectionKind::Up, layer.up)?;
@@ -183,17 +183,17 @@ impl<C: DecodeStepControl> PrefillExecutor<'_, '_, C> {
 }
 
 /// Separate causal seam exercised by model-free fixtures against the SAME
-/// single-token attention primitive. Query/key mutate only their RoPE rails.
+/// single-token attention primitive. Each rotated query row becomes its own
+/// attention output after its matching K/V has been appended.
 #[allow(clippy::too_many_arguments)]
 fn attend_rows<C: DecodeStepControl>(query: &mut [Bf16], key: &mut [Bf16], value: &[Bf16],
     rows: usize, start: usize, slot: usize, rope: &RopeTablesF32, cache: &mut KvCache, control: &mut C)
-    -> Result<Vec<Bf16>, StrictInt8Error> {
+    -> Result<(), StrictInt8Error> {
     if rows == 0 || rows > MAX_BATCH_ROWS || query.len() != rows * Q || key.len() != rows * K || value.len() != rows * K
         || start.checked_add(rows).is_none_or(|end| end > cache.capacity_positions()) {
         return Err(StrictInt8Error::Input);
     }
     if cache.len_for_slot(slot).map_err(|_| StrictInt8Error::Cache)? != start { return Err(StrictInt8Error::Cache); }
-    let mut output = filled(rows * Q, Bf16::from_bits(0))?;
     for index in 0..rows {
         poll(control)?;
         let position = start + index;
@@ -205,11 +205,10 @@ fn attend_rows<C: DecodeStepControl>(query: &mut [Bf16], key: &mut [Bf16], value
         finite(q)?; finite(k)?; finite(v)?;
         cache.append_bf16(slot, position, k, v).map_err(|_| StrictInt8Error::Cache)?;
         poll(control)?;
-        let attention = eager_gqa_attention_from_cache_with_control(q, cache, slot, control)?;
-        finite(&attention)?;
-        output[index * Q..(index + 1) * Q].copy_from_slice(&attention);
+        eager_gqa_attention_in_place_with_control(q, cache, slot, control)?;
+        finite(q)?;
     }
-    poll(control)?; Ok(output)
+    poll(control)?; Ok(())
 }
 
 #[cfg(test)]
@@ -252,7 +251,8 @@ mod tests {
         let mut key: Vec<_> = (0..rows * K).map(|i| Bf16::from_f32(((i * 7) % 13) as f32 * 0.0625)).collect();
         let values: Vec<_> = [1.0, 3.0, 9.0].into_iter().flat_map(|x| vec![Bf16::from_f32(x); K]).collect();
         let original_query = query.clone(); let original_key = key.clone();
-        let output = attend_rows(&mut query, &mut key, &values, rows, start, slot, &rope, &mut grouped, &mut Control::default()).unwrap();
+        attend_rows(&mut query, &mut key, &values, rows, start, slot, &rope, &mut grouped, &mut Control::default()).unwrap();
+        let output = query;
         let mut reference = Vec::new();
         for i in 0..rows {
             let mut q = original_query[i * Q..(i + 1) * Q].to_vec();

@@ -124,17 +124,17 @@ impl<C: DecodeStepControl> GroupLayerExecutor<Int4Layer> for PrefillExecutor<'_,
         let mut query = self.project(projection(Int4ProjectionKind::Query), &layer.q)?;
         let mut key = self.project(projection(Int4ProjectionKind::Key), &layer.k)?;
         let value = self.project(projection(Int4ProjectionKind::Value), &layer.v)?;
-        let attention = attend_rows(&mut query, &mut key, &value, self.rows, self.start,
+        attend_rows(&mut query, &mut key, &value, self.rows, self.start,
             binding.kv_slot(), self.rope, self.cache, self.control)?;
-        drop(query); drop(key); drop(value);
-        for (input, row) in self.activations.iter_mut().zip(attention.chunks_exact(Q)) { input.encode_bf16(row)?; }
+        drop(key); drop(value);
+        for (input, row) in self.activations.iter_mut().zip(query.chunks_exact(Q)) { input.encode_bf16(row)?; }
         let update = self.project(projection(Int4ProjectionKind::AttentionOutput), &layer.o)?;
         for (row, update) in hidden.iter_mut().zip(update.chunks_exact(H)) {
             poll(self.control)?;
             *row = residual_add_f32_cast_back(row, update).map_err(|_| StrictInt4Error::Primitive)?;
             finite(row)?;
         }
-        drop(attention); drop(update);
+        drop(query); drop(update);
         encode_norms(hidden, &layer.norm2, self.activations, self.control)?;
         let gate = self.project(projection(Int4ProjectionKind::Gate), &layer.gate)?;
         let up = self.project(projection(Int4ProjectionKind::Up), &layer.up)?;
@@ -182,13 +182,12 @@ fn encode_norms<C: DecodeStepControl>(hidden: &[Vec<Bf16>], scale: &[Bf16],
 #[allow(clippy::too_many_arguments)]
 fn attend_rows<C: DecodeStepControl>(query: &mut [Bf16], key: &mut [Bf16], value: &[Bf16],
     rows: usize, start: usize, slot: usize, rope: &RopeTablesF32, cache: &mut KvCache, control: &mut C)
-    -> Result<Vec<Bf16>, StrictInt4Error> {
+    -> Result<(), StrictInt4Error> {
     if rows == 0 || rows > MAX_INT4_BATCH_ROWS || query.len() != rows * Q || key.len() != rows * K || value.len() != rows * K
         || start.checked_add(rows).is_none_or(|end| end > cache.capacity_positions()) {
         return Err(StrictInt4Error::Input);
     }
     if cache.len_for_slot(slot).map_err(|_| StrictInt4Error::Cache)? != start { return Err(StrictInt4Error::Cache); }
-    let mut output = filled(rows * Q, Bf16::from_bits(0))?;
     for index in 0..rows {
         poll(control)?;
         let position = start + index;
@@ -200,11 +199,10 @@ fn attend_rows<C: DecodeStepControl>(query: &mut [Bf16], key: &mut [Bf16], value
         finite(q)?; finite(k)?; finite(v)?;
         cache.append_bf16(slot, position, k, v).map_err(|_| StrictInt4Error::Cache)?;
         poll(control)?;
-        let attention = eager_gqa_attention_from_cache_with_control(q, cache, slot, control)?;
-        finite(&attention)?;
-        output[index * Q..(index + 1) * Q].copy_from_slice(&attention);
+        eager_gqa_attention_in_place_with_control(q, cache, slot, control)?;
+        finite(q)?;
     }
-    poll(control)?; Ok(output)
+    poll(control)?; Ok(())
 }
 
 #[cfg(test)] mod tests;

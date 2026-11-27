@@ -43,7 +43,8 @@ fn attention_case(start: usize, slot: usize) {
     let mut key: Vec<_> = (0..rows * K).map(|i| Bf16::from_f32(((i * 7) % 13) as f32 * 0.0625)).collect();
     let values: Vec<_> = [1.0, 3.0, 9.0].into_iter().flat_map(|x| vec![Bf16::from_f32(x); K]).collect();
     let original_query = query.clone(); let original_key = key.clone();
-    let output = attend_rows(&mut query, &mut key, &values, rows, start, slot, &rope, &mut grouped, &mut Control::default()).unwrap();
+    attend_rows(&mut query, &mut key, &values, rows, start, slot, &rope, &mut grouped, &mut Control::default()).unwrap();
+    let output = query;
     let mut reference = Vec::new();
     for i in 0..rows {
         let mut q = original_query[i * Q..(i + 1) * Q].to_vec();

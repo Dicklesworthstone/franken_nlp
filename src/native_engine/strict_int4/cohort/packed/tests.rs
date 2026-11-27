@@ -79,8 +79,9 @@ fn consecutive_positions_replay_exact_causal_attention_across_both_loop_slots() 
             cache.append(slot, positions[index], &bits(&kr), &bits(&v[index * K..(index + 1) * K])).unwrap();
             expected.extend(eager_gqa_attention_from_cache(&qr, cache, slot).unwrap());
         }
-        let result = execution::attend_sequences(&mut q, &mut k, &v, &steps, &positions, slot,
+        execution::attend_sequences(&mut q, &mut k, &v, &steps, &positions, slot,
             &rope, &mut actual, &mut Control::default()).unwrap();
+        let result = q;
         assert_eq!(bits(&result), bits(&expected));
         assert_eq!(actual[0].cache.len_for_slot(slot).unwrap(), 2);
         assert_eq!(actual[2].cache.len_for_slot(slot).unwrap(), 2);
@@ -96,8 +97,9 @@ fn future_tokens_and_other_documents_cannot_change_earlier_attention() {
     for salt in [1, 9, 31] {
         let mut q = pattern(3 * Q, salt); let mut k = pattern(3 * K, salt); let mut v = pattern(3 * K, salt);
         q[..Q].fill(Bf16::from_f32(0.25)); k[..K].fill(Bf16::from_f32(0.5)); v[..K].fill(Bf16::from_f32(3.0));
-        let output = execution::attend_sequences(&mut q, &mut k, &v, &steps, &[0, 1, 0], 22,
+        execution::attend_sequences(&mut q, &mut k, &v, &steps, &[0, 1, 0], 22,
             &rope, &mut sequences(), &mut Control::default()).unwrap();
+        let output = q;
         let first = bits(&output[..Q]);
         if let Some(expected) = &baseline { assert_eq!(&first, expected); } else { baseline = Some(first); }
     }

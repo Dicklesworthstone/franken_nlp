@@ -72,8 +72,9 @@ fn ragged_case(slot: usize) {
     let mut k: Vec<_> = (0..3 * K).map(|i| Bf16::from_f32((i % 11) as f32 / 16.0)).collect();
     let v: Vec<_> = [2.0, 50.0, -4.0].into_iter().flat_map(|x| vec![Bf16::from_f32(x); K]).collect();
     let original_q = q.clone(); let original_k = k.clone();
-    let out = execution::attend_sequences(&mut q, &mut k, &v, &steps, &starts,
+    execution::attend_sequences(&mut q, &mut k, &v, &steps, &starts,
         slot, &rope, &mut grouped, &mut Control::default()).unwrap();
+    let out = q;
     for row in 0..3 {
         let mut query = original_q[row * Q..(row + 1) * Q].to_vec();
         let mut key = original_k[row * K..(row + 1) * K].to_vec();
