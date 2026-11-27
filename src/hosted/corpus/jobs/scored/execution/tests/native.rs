@@ -5,7 +5,8 @@ use super::*;
 use crate::{
     batch::extract::ExtractionMaskBudget,
     grammar::mask::MaskWorkLimits,
-    jobs::runner::extract::Int8ExtractionJobPlanner,
+    jobs::runner::{extract::Int8ExtractionJobPlanner,
+        sampled_sentiment::quantized::{Int8SampledSentimentJobLimits, Int8SampledSentimentJobPlanner}},
     tasks::source_planning::SourcePlanningLimits,
     tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding},
     canonjson, LeakResponsePolicy, ResourceHostConfig, RuntimePreset,
@@ -15,7 +16,9 @@ use crate::{
     native_engine::{simd::{Int8KernelKind, config::configure_process_kernel},
         strict_int8::STRICT_INT8_EXECUTION, lmhead::scoring::ScoringMode},
     tasks::{classify::ClassificationLimits,
-        sentiment::{SentimentLimits, SentimentOptions, SentimentPolicy},
+        sentiment::{SentimentLimits, SentimentOptions, SentimentPolicy,
+            sampled::{SampledSentimentOptions, SampledSentimentLimits, SampledSentimentVocabulary,
+                quantized::Int8SampledSentimentPlanner}},
         judge::{JudgeLimits, JudgePlanner}},
     tokenizer::pinned_controls,
 };
@@ -23,7 +26,7 @@ use std::{fs, io::{self, Cursor, Read}, os::unix::fs::DirBuilderExt,
     path::Path, sync::atomic::{AtomicUsize, Ordering}, time::SystemTime};
 
 #[derive(Clone, Copy, Debug)]
-enum Kind { Classify, Sentiment, CompactClassify, CompactSentiment, Judge, Extract, Keyphrases }
+enum Kind { Classify, Sentiment, CompactClassify, CompactSentiment, Judge, Extract, Keyphrases, SampledSentiment }
 
 fn native() -> NativeLimits {
     NativeLimits { context_tokens: 8192, allocator_reserve_bytes: 64 << 20,
@@ -107,6 +110,10 @@ fn input(kind: Kind) -> Vec<u8> {
                 "axes":if index == 1 { vec!["valence","arousal","dominance","approach"] } else { vec!["valence"] },
                 "budget":budget(),
             }),
+            Kind::SampledSentiment => json!({
+                "axes": if index == 1 { vec!["valence", "approach"] } else { vec!["valence"] },
+                "budget": TaskBudget { max_output_tokens: 1024, ..budget() },
+            }),
             Kind::Judge => match index {
                 0 => json!({"mode":"pairwise","criterion":"Accuracy","b":"Bob visited Rome.",
                     "policy":{"minimum_margin_milli":0,"maximum_order_disagreement_milli":20000},
@@ -168,7 +175,8 @@ fn run_case(host: &NlpEngine, model: &ResidentInt8, kind: Kind, root: &Path,
     let inner = if matches!(mode, JobOpenMode::ResumeRetained { .. }) { None }
         else { Some(Cursor::new(input.to_vec())) };
     let reader = OwnedReader { inner, dropped: Arc::clone(&dropped) };
-    let mut request = request(root, mode); let limits = host_limits();
+    let mut request = request(root, mode); let mut limits = host_limits();
+    if matches!(kind, Kind::SampledSentiment) { limits.preparation_reserve_bytes = 1 << 30; }
     let cancellation = CancellationToken::default(); let kernel = Int8Kernel::scalar();
     let registry = pinned_controls::pinned().unwrap(); let controls = registry.template_controls();
     let eos = controls.entries().iter().find(|e| e.special && e.surface == crate::template::IM_END).unwrap().id;
@@ -249,6 +257,38 @@ fn run_case(host: &NlpEngine, model: &ResidentInt8, kind: Kind, root: &Path,
                     limits, kernel, width, prefill, reader, cancellation),
             } }
         }
+        Kind::SampledSentiment => {
+            let mask_work = 2_048_000_000;
+            request.limits.max_work.mask_node_visits = mask_work * request.limits.max_attempts;
+            let native = Int8SampledSentimentJobLimits { max_item_work: work(),
+                max_model_work: request.limits.max_work.model,
+                masks: ExtractionMaskBudget { per_mask: MaskWorkLimits { max_trie_node_visits: 2_000_000,
+                    checkpoint_interval_nodes: 128 }, max_visits_per_item: mask_work,
+                    max_visits_per_run: request.limits.max_work.mask_node_visits },
+                max_sampler_bytes: crate::native_engine::constrained_int8::json_sampling_workspace_bytes().unwrap() };
+            let options = SampledSentimentOptions { effective_seed: [43; 32], samples: 2,
+                temperature_milli: 700, top_k: Some(32), top_p_ppm: 950_000,
+                max_sample_tokens: 128, max_justification_chars: 24 };
+            let task = TaskBudget { max_output_tokens: 1024, ..budget() };
+            let planning = SampledSentimentLimits { max_input_bytes: 65536,
+                max_total_prompt_tokens: 65536, max_sample_json_bytes: 8192,
+                max_result_bytes: 1 << 20, compile: crate::grammar::CompileLimits {
+                    max_output_bytes: 8192, max_states: 4096, ..Default::default() } };
+            let planner = Int8SampledSentimentPlanner::for_model(model.artifact_identity(),
+                options, task, planning).unwrap();
+            let vocabulary = Arc::new(SampledSentimentVocabulary::pinned().unwrap());
+            let planner = Int8SampledSentimentJobPlanner::new(planner, vocabulary, native,
+                request.limits).unwrap();
+            let planner = Arc::new(match schedule {
+                Some(prefill) => planner.with_layer_major_prefill(prefill).unwrap(),
+                None => planner,
+            });
+            match width {
+                1 => host.job_int8_sampled_sentiment(model, planner, request, limits, reader, cancellation),
+                _ => host.job_int8_sampled_sentiment_with_threads(model, planner, request,
+                    limits, kernel, width, reader, cancellation),
+            }
+        }
         Kind::Judge => {
             let planner = Arc::new(JudgePlanner::pinned(controls, eos).unwrap());
             let config = JudgeCorpusConfig {
@@ -325,6 +365,14 @@ fn compact_scoring_jobs_preserve_all_stored_bytes_and_debits_across_schedules_an
         &[Kind::CompactClassify, Kind::CompactSentiment]);
 }
 
+#[test]
+#[ignore = "requires independently pinned INT8 model, admitted host memory and protected job storage"]
+fn sampled_bundles_match_physical_schedules_and_resume_without_redebit() {
+    check_schedules(concat!(module_path!(),
+        "::sampled_bundles_match_physical_schedules_and_resume_without_redebit"),
+        &[Kind::SampledSentiment]);
+}
+
 fn check_schedules(full_name: &str, kinds: &[Kind]) {
     const CHILD: &str = "FNLP_INT8_SCORE_JOB_TEAM_CHILD";
     const COMPLETE: &str = "FNLP_INT8_SCORE_JOB_TEAM_COMPLETE";
@@ -365,7 +413,10 @@ fn check_schedules(full_name: &str, kinds: &[Kind]) {
     let lease = host.resources().acquire_lease();
     // Covers fixture input/JSON/planners, capture copies, and the explicit
     // bounded journal/preparation owner used by the pre-forward interruption.
-    let caller_preparation = Pending::reserve(&lease, MemoryClass::JobBuffers, 512 << 20).unwrap().commit().unwrap();
+    let caller_bytes = if kinds.iter().copied().any(|kind| matches!(kind, Kind::SampledSentiment)) {
+        1 << 30
+    } else { 512 << 20 };
+    let caller_preparation = Pending::reserve(&lease, MemoryClass::JobBuffers, caller_bytes).unwrap().commit().unwrap();
     let model = host.load_current_candidate_int8(path, LoadLimits {
         artifact: ArtifactLoadBudget::streaming_only(6_u64 << 30, 64 << 10),
         tokenizer_and_metadata_bytes: 128 << 20, allocator_reserve_bytes: 64 << 20,
@@ -387,7 +438,7 @@ fn check_schedules(full_name: &str, kinds: &[Kind]) {
             assert_eq!(actual.items, 3); assert_eq!(actual.committed, 3);
             assert_eq!(actual.attempts, 3); assert!(actual.materialized);
             assert!(actual.reserved_work.model.forward_positions > 0);
-            if matches!(kind, Kind::Extract | Kind::Keyphrases) {
+            if matches!(kind, Kind::Extract | Kind::Keyphrases | Kind::SampledSentiment) {
                 assert!(actual.reserved_work.mask_node_visits > 0);
             }
             let output = fs::read(root.join("materialized.ndjson")).unwrap();
@@ -399,9 +450,10 @@ fn check_schedules(full_name: &str, kinds: &[Kind]) {
             } else { expected = output; progress = Some(actual); }
             drained(&host, baseline);
             // Worker width is always physical. Classification/sentiment may
-            // also change prompt rows; judge keeps its historical frozen row recipe.
+            // also change prompt rows; judge and independently sampled bundles
+            // keep their authenticated frozen prompt schedule.
             let replay_schedule = match kind {
-                Kind::Judge => schedule,
+                Kind::Judge | Kind::SampledSentiment => schedule,
                 _ if schedule.is_some() => None,
                 _ => Some(prefill(4)),
             };

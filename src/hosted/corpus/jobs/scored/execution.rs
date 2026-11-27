@@ -10,17 +10,21 @@ pub(in crate::hosted::corpus) trait Int8JobTask: Send + Sized + 'static {
     fn retain_for_join(&self) -> Option<Box<dyn Send>> { None }
     fn validate(&self, native: Int8MemoryRequirement, job: JobLimits) -> Result<(), HostedError>;
     fn preparation_workspace_bytes(&self) -> Result<u64, HostedError> { Ok(0) }
+    /// Exact live sampler payload, independently of its allowed policy cap.
+    /// The dispatcher retains this scratch claim until all children join.
+    fn sampler_workspace_bytes(&self) -> Result<u64, HostedError> { Ok(0) }
     fn execute(self, engine: &mut StrictInt8Engine<'_>, admission: CorpusAdmission<'_>,
         request: SourceJobRequest, population: &Population<'_>, prefill: Option<Int8PrefillLimits>,
         control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Requirements {
-    native: Int8MemoryRequirement,
-    input_bytes: u64,
-    scratch_bytes: u64,
-    worker_bytes: u64,
+pub(in crate::hosted::corpus::jobs) struct Requirements {
+    pub(in crate::hosted::corpus::jobs) native: Int8MemoryRequirement,
+    pub(in crate::hosted::corpus::jobs) input_bytes: u64,
+    pub(in crate::hosted::corpus::jobs) scratch_bytes: u64,
+    pub(in crate::hosted::corpus::jobs) worker_bytes: u64,
+    sampler_bytes: u64,
     max_batch_rows: usize,
 }
 impl Requirements {
@@ -28,16 +32,18 @@ impl Requirements {
         sum(&[self.input_bytes, self.native.kv_bytes, self.scratch_bytes, self.worker_bytes])
     }
 }
-fn quote(limits: JobHostLimits, job: JobLimits, input: JobInputMemory,
-    native: Int8MemoryRequirement, task_bytes: u64, prefill: Option<Int8PrefillLimits>, width: Option<usize>)
+#[allow(clippy::too_many_arguments)]
+pub(in crate::hosted::corpus::jobs) fn quote(limits: JobHostLimits, job: JobLimits, input: JobInputMemory,
+    native: Int8MemoryRequirement, task_bytes: u64, sampler_bytes: u64,
+    prefill: Option<Int8PrefillLimits>, width: Option<usize>)
     -> Result<Requirements, HostedJobError> {
     let input_bytes = sum(&[limits.required_buffer_bytes_for_input(job, input)?, task_bytes])?;
     let scratch_bytes = crate::hosted::scored::scoring_scratch(sum(&[native.rope_bytes,
-        native.scratch_payload_bound, limits.native.allocator_reserve_bytes])?, prefill)?;
+        native.scratch_payload_bound, limits.native.allocator_reserve_bytes, sampler_bytes])?, prefill)?;
     let max_batch_rows = prefill.map_or(1, |limits| limits.max_batch_rows);
     let worker_bytes = width.map(|width|
         dispatch::int8_prefill_team_workspace_bytes(width, max_batch_rows)).transpose()?.unwrap_or(0);
-    let required = Requirements { native, input_bytes, scratch_bytes, worker_bytes, max_batch_rows };
+    let required = Requirements { native, input_bytes, scratch_bytes, worker_bytes, sampler_bytes, max_batch_rows };
     required.total_bytes()?;
     Ok(required)
 }
@@ -77,7 +83,8 @@ where P: Int8JobTask, R: BufRead + Send + 'static {
     let native = requirements(limits.native)?;
     task.validate(native, request.limits)?;
     let required = quote(limits, request.limits, request.mode.input_memory(),
-        native, task.preparation_workspace_bytes()?, prefill, team.map(|(_, width)| width))?;
+        native, task.preparation_workspace_bytes()?, task.sampler_workspace_bytes()?,
+        prefill, team.map(|(_, width)| width))?;
     let lease = host.resources().acquire_lease();
     let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
         || {
@@ -143,7 +150,7 @@ impl<P: Int8JobTask, R: BufRead> Execution<P, R> {
         self._scratch = Some(self.scratch.take()
             .ok_or(HostedError::Limits("job scratch admission consumed"))?.commit()?);
         let admission = CorpusAdmission { lease: &self.lease, model: model.artifact_identity(),
-            kv_bytes: self.required.native.kv_bytes, sampler_bytes: 0,
+            kv_bytes: self.required.native.kv_bytes, sampler_bytes: self.required.sampler_bytes,
             output_bytes: request.limits.max_result_bytes as u64 };
         let result = task.execute(&mut engine, admission, request, &population, self.prefill, control);
         // Runner, journal and processor borrows have drained; claims remain in

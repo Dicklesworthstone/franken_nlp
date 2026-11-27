@@ -26,14 +26,14 @@ fn prefill(rows: usize) -> Int8PrefillLimits {
 fn retained_job_quote_keeps_population_journal_native_prompt_and_workers_simultaneously() {
     let limits = limits(); let native = requirements(limits.native).unwrap();
     for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
-        let serial = quote(limits, job(), input, native, 0, None, None).unwrap();
+        let serial = quote(limits, job(), input, native, 0, 0, None, None).unwrap();
         assert_eq!(serial.input_bytes, limits.required_buffer_bytes_for_input(job(), input).unwrap());
         assert_eq!(serial.worker_bytes, 0);
         assert_eq!(serial.scratch_bytes, native.rope_bytes + native.scratch_payload_bound
             + limits.native.allocator_reserve_bytes);
         for width in [2, 4, 64] { for rows in [1, 4, 64] {
             let prefill = prefill(rows);
-            let scheduled = quote(limits, job(), input, native, 0, Some(prefill), Some(width)).unwrap();
+            let scheduled = quote(limits, job(), input, native, 0, 0, Some(prefill), Some(width)).unwrap();
             assert_eq!(scheduled.input_bytes, serial.input_bytes);
             assert_eq!(scheduled.scratch_bytes, serial.scratch_bytes + prefill.validate().unwrap());
             assert_eq!(scheduled.worker_bytes, dispatch::int8_prefill_team_workspace_bytes(width, rows).unwrap());
@@ -46,15 +46,15 @@ fn retained_job_quote_keeps_population_journal_native_prompt_and_workers_simulta
 #[test]
 fn schedule_cannot_discount_either_input_owner_or_durable_staging() {
     let original = limits(); let native = requirements(original.native).unwrap();
-    let a = quote(original, job(), JobInputMemory::CompletePopulation, native, 0, None, None).unwrap();
-    let b = quote(original, job(), JobInputMemory::RetainedRecord, native, 0, None, None).unwrap();
+    let a = quote(original, job(), JobInputMemory::CompletePopulation, native, 0, 0, None, None).unwrap();
+    let b = quote(original, job(), JobInputMemory::RetainedRecord, native, 0, 0, None, None).unwrap();
     assert!(b.input_bytes < a.input_bytes);
     for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
-        let before = quote(original, job(), input, native, 0, Some(prefill(4)), Some(4)).unwrap();
+        let before = quote(original, job(), input, native, 0, 0, Some(prefill(4)), Some(4)).unwrap();
         let mut larger = original;
         larger.preparation_reserve_bytes += 11; larger.io_reserve_bytes += 17;
         larger.journal_reserve_bytes += 23; larger.serialization_reserve_bytes += 31;
-        let after = quote(larger, job(), input, native, 0, Some(prefill(4)), Some(4)).unwrap();
+        let after = quote(larger, job(), input, native, 0, 0, Some(prefill(4)), Some(4)).unwrap();
         assert_eq!(after.total_bytes().unwrap(), before.total_bytes().unwrap() + 11 + 17 + 23 + 31);
         assert_eq!(after.native, before.native); assert_eq!(after.worker_bytes, before.worker_bytes);
     }
@@ -65,29 +65,29 @@ fn invalid_width_prompt_geometry_or_arithmetic_refuses_before_population_ingesti
     let original = limits(); let native = requirements(original.native).unwrap();
     for width in [0, 1, 65, usize::MAX] {
         assert!(quote(original, job(), JobInputMemory::CompletePopulation,
-            native, 0, Some(prefill(4)), Some(width)).is_err());
+            native, 0, 0, Some(prefill(4)), Some(width)).is_err());
     }
     for rows in [0, 65, usize::MAX] {
-        assert!(quote(original, job(), JobInputMemory::CompletePopulation, native, 0,
+        assert!(quote(original, job(), JobInputMemory::CompletePopulation, native, 0, 0,
             Some(Int8PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX }), Some(4)).is_err());
     }
     let mut short = prefill(4); short.max_extra_scratch_bytes -= 1;
-    assert!(quote(original, job(), JobInputMemory::RetainedRecord, native, 0, Some(short), Some(4)).is_err());
+    assert!(quote(original, job(), JobInputMemory::RetainedRecord, native, 0, 0, Some(short), Some(4)).is_err());
     let mut overflow = original; overflow.native.allocator_reserve_bytes = u64::MAX;
-    assert!(quote(overflow, job(), JobInputMemory::CompletePopulation, native, 0, None, Some(4)).is_err());
+    assert!(quote(overflow, job(), JobInputMemory::CompletePopulation, native, 0, 0, None, Some(4)).is_err());
     let mut overflow = original; overflow.journal_reserve_bytes = u64::MAX;
-    assert!(quote(overflow, job(), JobInputMemory::RetainedRecord, native, 0, None, Some(4)).is_err());
+    assert!(quote(overflow, job(), JobInputMemory::RetainedRecord, native, 0, 0, None, Some(4)).is_err());
 }
 
 #[test]
 fn compact_job_preparation_coexists_with_the_complete_physical_schedule() {
     let limits = limits(); let native = requirements(limits.native).unwrap();
     for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
-        let byte = quote(limits, job(), input, native, 0, Some(prefill(4)), Some(3)).unwrap();
-        let compact = quote(limits, job(), input, native, 8192, Some(prefill(4)), Some(3)).unwrap();
+        let byte = quote(limits, job(), input, native, 0, 0, Some(prefill(4)), Some(3)).unwrap();
+        let compact = quote(limits, job(), input, native, 8192, 0, Some(prefill(4)), Some(3)).unwrap();
         assert_eq!(compact.input_bytes, byte.input_bytes + 8192);
         assert_eq!(compact.total_bytes().unwrap(), byte.total_bytes().unwrap() + 8192);
-        assert!(quote(limits, job(), input, native, u64::MAX, None, None).is_err());
+        assert!(quote(limits, job(), input, native, u64::MAX, 0, None, None).is_err());
     }
 }
 
@@ -170,13 +170,33 @@ fn derived_compact_workspace_is_additive_for_every_input_and_prompt_worker_sched
     for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
         for (prefill, width) in [(None, None), (Some(prefill(4)), None),
             (None, Some(3)), (Some(prefill(4)), Some(3))] {
-            let byte = quote(limits, job(), input, native, 0, prefill, width).unwrap();
-            let compact = quote(limits, job(), input, native, encoder, prefill, width).unwrap();
+            let byte = quote(limits, job(), input, native, 0, 0, prefill, width).unwrap();
+            let compact = quote(limits, job(), input, native, encoder, 0, prefill, width).unwrap();
             assert_eq!(compact.input_bytes, byte.input_bytes + encoder);
             assert_eq!(compact.total_bytes().unwrap(), byte.total_bytes().unwrap() + encoder);
             assert_eq!(compact.native, byte.native);
             assert_eq!(compact.scratch_bytes, byte.scratch_bytes);
             assert_eq!(compact.worker_bytes, byte.worker_bytes);
+        }
+    }
+}
+
+#[test]
+fn sampled_job_workspace_remains_charged_with_every_input_prompt_and_worker_owner() {
+    let limits = limits(); let native = requirements(limits.native).unwrap();
+    let sampler = crate::native_engine::constrained_int8::json_sampling_workspace_bytes().unwrap();
+    for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
+        for (prefill, width) in [(None, None), (Some(prefill(4)), None),
+            (None, Some(3)), (Some(prefill(4)), Some(3))] {
+            let plain = quote(limits, job(), input, native, 8192, 0, prefill, width).unwrap();
+            let sampled = quote(limits, job(), input, native, 8192, sampler, prefill, width).unwrap();
+            assert_eq!(sampled.input_bytes, plain.input_bytes);
+            assert_eq!(sampled.native, plain.native);
+            assert_eq!(sampled.worker_bytes, plain.worker_bytes);
+            assert_eq!(sampled.sampler_bytes, sampler);
+            assert_eq!(sampled.scratch_bytes, plain.scratch_bytes + sampler);
+            assert_eq!(sampled.total_bytes().unwrap(), plain.total_bytes().unwrap() + sampler);
+            assert!(quote(limits, job(), input, native, 8192, u64::MAX, prefill, width).is_err());
         }
     }
 }

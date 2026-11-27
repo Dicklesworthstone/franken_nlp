@@ -11,6 +11,7 @@ use crate::{
 mod execution;
 pub(super) mod document;
 pub(in crate::hosted::corpus) use execution::{run, Int8JobTask};
+pub(super) use execution::quote;
 use crate::native_engine::{simd::Int8Kernel, strict_int8::{StrictInt8Engine, prefill::Int8PrefillLimits}};
 
 impl NlpEngine {

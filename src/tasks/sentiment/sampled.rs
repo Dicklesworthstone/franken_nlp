@@ -32,7 +32,7 @@ use crate::{
     tokenizer::{bpe::EncodeOptions, embedded::{EmbeddedTokenizer, PINNED_TOKENIZER_MODEL_BYTES,
         PINNED_ADDED_TOKENS_BYTES, PINNED_TOKENIZER_CONFIG_BYTES, PINNED_SPECIAL_TOKENS_MAP_BYTES},
         pinned_controls, specials::TemplateControlIds,
-        untrusted::{SafeBpeWork, UntrustedDocument, UntrustedDocumentEncoder,
+        untrusted::{SafeBpeLimits, SafeBpeWork, UntrustedDocument, UntrustedDocumentEncoder,
             UntrustedDocumentError, UntrustedEncoding}},
 };
 use super::{SentimentAxis, SentimentRequest};
@@ -804,9 +804,24 @@ impl Compiler {
 
     fn encode_document<C: DecodeStepControl>(&self, source: &[u8], work: &mut SafeBpeWork,
         control: &mut C) -> Result<UntrustedDocument, SampledSentimentError> {
+        self.encode_document_with_budget(source, work, control, None)
+    }
+    fn encode_document_with_budget<C: DecodeStepControl>(&self, source: &[u8], work: &mut SafeBpeWork,
+        control: &mut C, ceiling: Option<SafeBpeLimits>) -> Result<UntrustedDocument, SampledSentimentError> {
+        // An invocation may tighten execution work without changing the
+        // declared input policy, prompt identity or item/sample addresses.
+        let policy = match (ceiling, &self.input_encoding) {
+            (None, policy) => policy.clone(),
+            (Some(cap), UntrustedEncoding::SafeBpeV1(declared))
+                if cap.max_input_bytes <= declared.max_input_bytes
+                    && cap.max_output_tokens <= declared.max_output_tokens
+                    && cap.max_pair_checks <= declared.max_pair_checks
+                    && cap.max_pair_bytes <= declared.max_pair_bytes => UntrustedEncoding::SafeBpeV1(cap),
+            _ => return Err(SampledSentimentError::TokenizerWork),
+        };
         let mut cancelled = None;
         let encoded = UntrustedDocumentEncoder::new(self.tokenizer.tokenizer(), &self.controls)
-            .encode_with_policy(source, &self.input_encoding, work, &mut || {
+            .encode_with_policy(source, &policy, work, &mut || {
                 if cancelled.is_none() { cancelled = control.prefill_checkpoint(0); }
                 cancelled.is_none()
             });
@@ -852,7 +867,21 @@ fn compile_sampled_request<C: DecodeStepControl, S: SampledSchedule>(
     options: &SampledSentimentOptions, ceiling: TaskBudget, limits: SampledSentimentLimits,
     request: &SentimentRequest, control: &mut C, encoding_work: &mut SafeBpeWork)
     -> Result<CompiledSampledSentiment<S::Work>, SampledSentimentError> {
+    compile_sampled_request_with_encoding_budget(compiler, identity, schedule, options, ceiling,
+        limits, request, control, encoding_work, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_sampled_request_with_encoding_budget<C: DecodeStepControl, S: SampledSchedule>(
+    compiler: &Compiler, identity: &ExecutionIdentity, schedule: &S,
+    options: &SampledSentimentOptions, ceiling: TaskBudget, limits: SampledSentimentLimits,
+    request: &SentimentRequest, control: &mut C, encoding_work: &mut SafeBpeWork,
+    encoding_ceiling: Option<SafeBpeLimits>)
+    -> Result<CompiledSampledSentiment<S::Work>, SampledSentimentError> {
     checkpoint(control)?; options.validate()?; limits.validate()?;
+    if encoding_ceiling.is_some() && compiler.input_encoding == UntrustedEncoding::ByteFallback {
+        return Err(SampledSentimentError::TokenizerWork);
+    }
     let encoding_workspace = compiler.encoding_workspace_bytes()?;
     request.budget.validate().map_err(|_| SampledSentimentError::Limits)?;
     if request.document.is_empty() || request.document.len() > limits.max_input_bytes
@@ -874,8 +903,8 @@ fn compile_sampled_request<C: DecodeStepControl, S: SampledSchedule>(
     let before_encoding = *encoding_work;
     let compact_document = match &compiler.input_encoding {
         UntrustedEncoding::ByteFallback => None,
-        UntrustedEncoding::SafeBpeV1(_) => Some(compiler.encode_document(
-            request.document.as_bytes(), encoding_work, control)?),
+        UntrustedEncoding::SafeBpeV1(_) => Some(compiler.encode_document_with_budget(
+            request.document.as_bytes(), encoding_work, control, encoding_ceiling)?),
     };
     let source_tokens = compact_document.as_ref().map_or(request.document.len(), |source| source.ids().len());
     let mut executed_prompt_tokens = 0_usize;

@@ -9,7 +9,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use crate::{
     batch::{BatchCode, BatchDocument, BatchFault, BatchItemFailure, BatchProcessor,
-        BatchRequestContext, BatchWork, extract::ExtractionMaskBudget, output::GuardedOutput,
+        BatchRequestContext, BatchWork, extract::ExtractionMaskBudget, generation::GuardedOutput,
         sentiment::sampled::{NativeSampledSentimentBatch, PreparedSampledSentimentRecord,
             SampledSentimentBatchAdmission, SampledSentimentBatchArgs, SampledSentimentBatchLimits,
             SampledSentimentBatchPlanner, SAMPLED_SENTIMENT_JOB_RECIPE_BYTES}},
@@ -34,6 +34,8 @@ use crate::{
 pub use crate::batch::sentiment::sampled::sampled_sentiment_job_preparation_bytes;
 
 pub mod long;
+/// Authenticated independent sampled populations on the portable INT8 model.
+pub mod quantized;
 
 /// Serialize only for the owned job's keyed commitment. There is no Debug,
 /// Deserialize, public field or caller-supplied constructor; a recipe cannot

@@ -24,14 +24,15 @@ use crate::{
             STRICT_INT8_EXECUTION, STRICT_INT8_PROFILE, prefill::Int8PrefillLimits},
     },
     tasks::ir::TaskBudget,
-    tokenizer::untrusted::{SafeBpeWork, UntrustedEncoding},
+    tokenizer::untrusted::{SafeBpeLimits, SafeBpeWork, UntrustedEncoding},
 };
 use super::{
     Compiler, CompiledSampledSentiment, Continue, PreparedAxis, SampledSchedule,
     SampledSentimentDimension, SampledSentimentError, SampledSentimentLimits,
     SampledSentimentOptions, SampledSentimentSample, SampledSentimentVocabulary,
     SAMPLED_SENTIMENT_AGGREGATION_VERSION, MAX_SENTIMENT_SAMPLES, SentimentAxis, SentimentRequest,
-    aggregate, check_output_size, checkpoint, compile_sampled_request, digest,
+    aggregate, check_output_size, checkpoint, compile_sampled_request,
+    compile_sampled_request_with_encoding_budget, digest,
     item_address_digest, reserved, unbound_identity, validate_sample_json,
 };
 
@@ -130,6 +131,9 @@ impl Int8SampledSentimentPlanner {
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn task_budget(&self) -> TaskBudget { self.ceiling }
     pub fn limits(&self) -> SampledSentimentLimits { self.limits }
+    #[cfg(all(feature = "metadata-store", target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(crate) fn durable_options(&self) -> &SampledSentimentOptions { &self.options }
     pub fn encoding_workspace_bytes(&self) -> Result<u64, Int8SampledSentimentError> {
         Ok(self.compiler.encoding_workspace_bytes()?)
     }
@@ -157,11 +161,22 @@ impl Int8SampledSentimentPlanner {
     /// It is private semantic identity, never an output field or model prompt.
     pub fn plan_for_item_with_control<C: DecodeStepControl>(&self, request: &SentimentRequest,
         item_id: &str, control: &mut C) -> Result<PreparedInt8SampledSentiment, Int8SampledSentimentError> {
+        self.plan_for_item_with_encoding_budget(request, item_id, control, &mut SafeBpeWork::default(), None)
+    }
+
+    /// The durable invocation supplies its remaining tokenizer allowance and
+    /// receives consumed work even when subsequent planning rejects the item.
+    pub(crate) fn plan_for_item_with_encoding_budget<C: DecodeStepControl>(&self, request: &SentimentRequest,
+        item_id: &str, control: &mut C, work: &mut SafeBpeWork, encoding_ceiling: Option<SafeBpeLimits>)
+        -> Result<PreparedInt8SampledSentiment, Int8SampledSentimentError> {
         checkpoint(control)?;
         if item_id.is_empty() || item_id.len() > 256 || item_id.chars().any(char::is_control) {
             return Err(SampledSentimentError::Limits.into());
         }
-        let mut prepared = self.plan_with_control(request, control)?;
+        constrained_int8::check_profile(&self.identity)?;
+        let inner = compile_sampled_request_with_encoding_budget(&self.compiler, &self.identity,
+            &Int8SampledSchedule, &self.options, self.ceiling, self.limits, request, control, work, encoding_ceiling)?;
+        let mut prepared = PreparedInt8SampledSentiment { inner };
         for axis in &mut prepared.inner.axes {
             axis.identity.decision_policy_digest = item_address_digest(&axis.identity, item_id)?;
             axis.identity.validate().map_err(|_| SampledSentimentError::Identity)?;
@@ -466,7 +481,7 @@ fn bind_model(mut identity: ExecutionIdentity, model: &ArtifactIdentity)
     Ok(identity)
 }
 
-fn check_model(identity: &ExecutionIdentity, model: &ArtifactIdentity) -> Result<(), Int8SampledSentimentError> {
+pub(crate) fn check_model(identity: &ExecutionIdentity, model: &ArtifactIdentity) -> Result<(), Int8SampledSentimentError> {
     constrained_int8::check_profile(identity)?;
     if model.model_id != "Nanbeige4.2-3B" || model.revision != identity.source_revision
         || model.recipe_id != identity.quant_recipe
