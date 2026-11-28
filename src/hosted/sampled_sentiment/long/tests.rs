@@ -31,7 +31,7 @@ fn fixture() -> (Int8SampledSentimentMapHostConfig, SentimentRequest) {
         preparation_reserve_bytes: 600 * MIB,
         max_sampler_bytes: json_sampling_workspace_bytes().unwrap(),
         mask_limits: MaskWorkLimits { max_trie_node_visits: 2_000_000, checkpoint_interval_nodes: 256 },
-        max_mask_node_visits: u64::MAX, prefill: None,
+        max_mask_node_visits: u64::MAX, prefill: None, selected_rows: None,
     };
     let request = SentimentRequest { document: "Helpful service. café 上海".to_owned(),
         axes: vec![SentimentAxis::Valence, SentimentAxis::Arousal], budget: task };
@@ -188,6 +188,42 @@ fn document_owners_and_guarded_results_cross_the_blocking_boundary() {
     let _compact = NlpEngine::map_int8_sampled_sentiment_with_encoding;
     let _team = NlpEngine::map_int8_sampled_sentiment_with_threads;
     let _compact_team = NlpEngine::map_int8_sampled_sentiment_with_encoding_and_threads;
+}
+
+#[test]
+fn selected_document_plans_bind_the_cap_without_discounting_native_or_mask_storage() {
+    struct Continue;
+    impl DecodeStepControl for Continue {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
+    }
+    let (mut config, request) = fixture();
+    let dense_memory = config.requirements(request.budget, 4).unwrap();
+    let planner = || Int8SampledSentimentPlanner::for_model(&facts(), config.options.clone(),
+        request.budget, config.planning).unwrap();
+    let dense = planner().plan_document_with_control(&request, config.mapping, &mut Continue).unwrap();
+    let rows = Int8JsonSparseLimits { max_rows_per_step: 4096 };
+    let selected = planner().with_selected_rows(rows).unwrap()
+        .plan_document_with_control(&request, config.mapping, &mut Continue).unwrap();
+    config.selected_rows = Some(rows);
+    let selected_memory = config.requirements(request.budget, 4).unwrap();
+    assert_eq!(selected_memory, dense_memory);
+    assert_eq!(selected.planned_work().forward_positions, dense.planned_work().forward_positions);
+    assert_eq!(selected.planned_work().attention_pairs, dense.planned_work().attention_pairs);
+    assert!(selected.planned_work().projected_logits < dense.planned_work().projected_logits);
+    let vocabulary = SampledSentimentVocabulary::pinned().unwrap();
+    let mask = |plan: &PreparedInt8SampledSentimentMap|
+        plan.complete_mask_charge(&vocabulary, document_budget(plan, &config, dense_memory.native.kv_bytes),
+            config.max_sampler_bytes).unwrap();
+    assert_eq!(mask(&selected), mask(&dense));
+    let mut input = MapInput { request, config, encoding: UntrustedEncoding::ByteFallback };
+    validate_prepared(&selected, &input, selected_memory, &facts()).unwrap();
+    assert!(validate_prepared(&dense, &input, selected_memory, &facts()).is_err());
+    input.config.selected_rows = Some(Int8JsonSparseLimits { max_rows_per_step: 8192 });
+    assert!(validate_prepared(&selected, &input, selected_memory, &facts()).is_err());
+    for cap in [0, 166145] {
+        input.config.selected_rows = Some(Int8JsonSparseLimits { max_rows_per_step: cap });
+        assert!(input.config.requirements(input.request.budget, 4).is_err());
+    }
 }
 
 mod model;

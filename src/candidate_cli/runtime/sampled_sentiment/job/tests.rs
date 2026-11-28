@@ -44,7 +44,7 @@ fn parsed_seed_caps_tokenizer_totals_and_prompt_policy_reach_the_authenticated_f
     for flags in [
         vec!["--seed", other_seed.as_str()], vec!["--samples", "3"], vec!["--top-k", "7"],
         vec!["--max-forward-positions", "65536"], vec!["--max-mask-node-visits", "16000000000"],
-        vec!["--prefill-rows", "4"],
+        vec!["--prefill-rows", "4"], vec!["--max-selected-rows", "4096"],
     ] {
         let changed = configured(&flags, job, Arc::clone(&vocabulary));
         assert_ne!(canonjson::canonical_bytes(changed.job_recipe()).unwrap(), original);
@@ -54,6 +54,12 @@ fn parsed_seed_caps_tokenizer_totals_and_prompt_policy_reach_the_authenticated_f
         assert_eq!(canonjson::canonical_bytes(changed.job_recipe()).unwrap(), original,
             "physical row width must not change the private sampler or replay contract");
     }
+    let selected = configured(&["--max-selected-rows", "4096"], job, Arc::clone(&vocabulary));
+    assert_eq!(selected.selected_rows(), Some(crate::native_engine::constrained_int8::sparse::Int8JsonSparseLimits {
+        max_rows_per_step: 4096 }));
+    let wider = configured(&["--max-selected-rows", "8192"], job, Arc::clone(&vocabulary));
+    assert_ne!(canonjson::canonical_bytes(selected.job_recipe()).unwrap(),
+        canonjson::canonical_bytes(wider.job_recipe()).unwrap());
     let compact = configured(&["--input-encoding", "safe-bpe-v1"], job, Arc::clone(&vocabulary));
     let narrowed = configured(&["--input-encoding", "safe-bpe-v1",
         "--max-total-tokenizer-pair-checks", "1000"], job, vocabulary);
@@ -162,7 +168,8 @@ fn metadata_publication_contains_no_private_bundle_and_preserves_stops_from_io_c
     let report = owned_jobs::progress_report(progress, id, job, true, RunMode::Start, "sentiment-sampled").unwrap();
     let response = Response { response: &report, protocol: "fnlp-candidate-int8-sentiment-sampled-job-v1",
         durable_unit: "complete_independent_sample_bundle", input_encoding: None,
-        invocation_encoding_work_limits: None, compute_threads: None, prefill_rows: None };
+        invocation_encoding_work_limits: None, compute_threads: None, prefill_rows: None,
+        max_selected_rows: None };
     let encoded = serde_json::to_string(&response).unwrap();
     for private in ["effective_seed", "sampling", "dimensions", "justification", "task_args", "source_text"] {
         assert!(!encoded.contains(private));

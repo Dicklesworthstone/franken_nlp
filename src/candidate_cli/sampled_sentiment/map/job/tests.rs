@@ -61,9 +61,23 @@ fn complete_document_job_preserves_sampler_source_and_all_physical_schedule_opti
     let resumed = command("resume", &["--discard-uncommitted-tail"]);
     assert!(matches!(resumed.mode, RunMode::Resume { discard_uncommitted: true }));
     for flags in [vec!["--discard-uncommitted-tail"], vec!["--reuse-prefill"],
-        vec!["--max-selected-rows", "8"], vec!["--bins", "5"], vec!["--ndjson"]] {
+        vec!["--bins", "5"], vec!["--ndjson"]] {
         let mut words = argv("start"); words.extend(flags.into_iter().map(str::to_owned));
         assert!(definition().try_get_matches_from(words).is_err());
+    }
+}
+
+#[test]
+fn complete_document_job_projection_cap_is_explicit_for_start_and_resume() {
+    for operation in ["start", "resume"] {
+        let dense = command(operation, &[]);
+        let selected = command(operation, &["--max-selected-rows", "4096"]);
+        let a = dense.args.validate().unwrap(); let b = selected.args.validate().unwrap();
+        assert_eq!(selected.args.document.sampled.selected_rows().unwrap(),
+            Some(Int8JsonSparseLimits { max_rows_per_step: 4096 }));
+        assert_eq!(a.memory, b.memory); assert_eq!(a.minimum_memory_bytes, b.minimum_memory_bytes);
+        assert_eq!(dense.args.document.sampled.options().unwrap(), selected.args.document.sampled.options().unwrap());
+        for cap in ["0", "166145"] { assert!(command(operation, &["--max-selected-rows", cap]).args.validate().is_err()); }
     }
 }
 

@@ -46,9 +46,10 @@ sample has an independent semantic address. Reusing the same model, input
 encoding, source, task policy, native profile and seed preserves those addresses.
 Explicit `--top-k N` limits the legal token distribution before nucleus
 selection; omitting it retains the complete legal set for nucleus processing.
-All logits are validated before the exact grammar/control mask, temperature,
-top-k and top-p policy selects a token. Terminal EOS is scored and can be
-selected only after a complete accepting JSON value.
+By default all vocabulary logits are validated before the exact grammar/control
+mask, temperature, top-k and top-p policy selects a token. Explicit selected-row
+execution validates every legal projected logit. Terminal EOS is scored and can
+be selected only after a complete accepting JSON value.
 
 ## Input and prompt scheduling
 
@@ -75,7 +76,8 @@ every sample of an axis. The first sample prefills normally. Before each later
 sample, the engine retains the same session's KV prefix through the penultimate
 prompt token, discards the previous continuation, invalidates the final hidden
 state, and recomputes the final prompt token. Every layer still performs that
-causal final-token forward and the complete vocabulary projection.
+causal final-token forward and the chosen complete-vocabulary or legal-row
+projection.
 
 ```sh
 fnlp candidate sentiment-sampled sentiment-request.json \
@@ -113,6 +115,64 @@ prefill schedules, while separately checking reduced native forwards and
 complete resource drain. That gate and the deterministic regression definitions
 remain unrun pending controller validation; there is no measured speed or
 numerical-parity claim.
+
+## Exact legal-row sampling
+
+Add `--max-selected-rows N` to any of the six INT8 sampled command families:
+`sentiment-sampled`, `sentiment-sampled-batch`, `sentiment-sampled-map`,
+`sentiment-sampled-corpus`, `sentiment-sampled-job start|resume`, or
+`sentiment-sampled-document-job start|resume`. This selects the complete legal
+token set before the output head runs. It projects every legal original token
+ID, including accepting EOS, in bounded blocks and feeds their logits into the
+existing temperature, optional top-k, exact nucleus and addressed sampler.
+
+```sh
+fnlp candidate sentiment-sampled sentiment-request.json \
+  --model /path/to/local-current-candidate-int8-artifact \
+  --memory-mib 12288 \
+  --seed 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --samples 4 --max-selected-rows 166144 --reuse-prefill \
+  --compute-threads 4 --prefill-rows 8
+```
+
+The cap is an admission ceiling in `1..=166144`, not a top-k setting or a
+heuristic that discards possible tokens. A state with more legal tokens than
+the cap fails without a completed sample or document; there is no implicit
+full-head fallback. Unrestricted explanation strings can have large legal
+sets, so a small cap may refuse them. The maximum cap permits every possible
+legal set while still avoiding projection of illegal rows. Lower caps reduce
+the conservative head-work quote when the whole grammar fits them.
+
+Projection choice and its cap do not change the semantic seed addresses,
+prompt tokens, original record/chunk identity, sampling policy or aggregation.
+The planner binds them separately into admission and execution profiles.
+Complete-document output still requires every original chunk, axis and sample;
+selected projection does not alter source coverage or scalar weights.
+
+Admission retains the complete cold decoder/attention work, full native KV,
+grammar-mask traversal, full sampler workspace and result buffers. The head
+ceiling becomes `max_new_tokens * max_selected_rows` per sample. Native
+receipts reconcile actual projected rows with dot-product and
+multiply-accumulate work; early EOS or fewer legal rows never refund an
+attempt's population or lifetime allowance. This is a structural work change,
+not a measured throughput claim. No full-vocabulary probability denominator,
+omitted-row diagnostics or calibrated confidence is implied.
+
+The option composes with compact input, bounded layer-major prefill and
+persistent teams. On the one-request and resident single-context routes it
+also composes with `--reuse-prefill`. Document and durable routes retain their
+existing cold-per-sample schedule. Durable recipes authenticate the selected
+cap and nested native/task execution versions; resume with a changed policy
+fails before tail repair or another item executes. Omitting the option retains
+the existing full-head recipe serialization.
+
+Library callers configure `Int8SampledSentimentPlanner::with_selected_rows`
+with `Int8JsonSparseLimits`. Existing prepared execution methods select the
+appropriate decoder, and `selected_rows()` plus `execution_version(...)`
+expose the admitted physical policy. Complete-document hosts use
+`Int8SampledSentimentMapHostConfig::selected_rows`; batch and durable factories
+derive their sealed policy from the supplied planner. Memory quotes do not
+discount full sampler or native storage.
 
 ## Complete-result semantics and limits
 

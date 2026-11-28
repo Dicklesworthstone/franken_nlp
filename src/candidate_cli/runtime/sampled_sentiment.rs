@@ -22,8 +22,7 @@ use crate::{
     },
     tasks::sentiment::{SentimentAxis, sampled::{SampledSentimentError, SampledSentimentVocabulary,
         quantized::{Int8SampledSentimentError, Int8SampledSentimentPlanner,
-            Int8SampledSentimentRun, INT8_SAMPLED_SENTIMENT_EXECUTION,
-            INT8_SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION}}},
+            Int8SampledSentimentRun}}},
     tokenizer::untrusted::UntrustedEncoding,
 };
 
@@ -179,15 +178,18 @@ pub(in crate::candidate_cli) fn execute(command: SampledSentimentCommand,
     let facts = checked_stage(session.facts_with_error_detail(&common), &check, session_failure)?;
     let planner = checked_stage(Int8SampledSentimentPlanner::for_model_with_encoding(&facts, options,
         request.budget, command.task_limits(), encoding.clone()), &check, task_failure)?;
+    let planner = checked_stage(command.configure_planner(planner), &check, setup_failure)?;
     let prepared = checked_stage(planner.plan_with_control(&request, &mut session.control()), &check, task_failure)?;
     checked_stage(command.admit_plan(prepared.required_context(), prepared.planned_work()), &check, setup_failure)?;
     checked_stage(if prepared.sample_count() != sample_count || prepared.max_output_tokens() != output_tokens
         || prepared.input_encoding() != &encoding
+        || prepared.selected_rows() != checked_stage(command.selected_rows(), &check, setup_failure)?
         || prepared.max_result_bytes() != limits.result_bytes as u64
         || prepared.preparation_requirement_bytes() > limits.preparation_bytes {
         Err(CandidateError::Planning)
     } else { Ok(()) }, &check, setup_failure)?;
     let expected_work = prepared.planned_work();
+    let expected_execution = prepared.execution_version(command.reuse_prefill);
     let sampler_bytes = checked_stage(command.sampler_bytes(), &check, setup_failure)?;
     if command.reuse_prefill {
         let required = checked_stage(prepared.reuse_sampler_requirement_bytes(), &check, task_failure)?;
@@ -234,13 +236,14 @@ pub(in crate::candidate_cli) fn execute(command: SampledSentimentCommand,
                 &model, prepared, vocabulary, host, kernel, limits.compute.threads, prefill, cancellation),
         } }, &check, host_failure)?)
     };
-    checked_stage(check_completion(guarded.result(), &axes, samples_per_axis, command.reuse_prefill,
+    checked_stage(check_completion(guarded.result(), &axes, samples_per_axis, expected_execution,
         expected_work, output_tokens, mask_charge), &check, |failure| failure)?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
         evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
         source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
         quant_recipe: &facts.recipe_id, output: guarded.result() };
     let response = compute::Response { response: &response, compute: guarded.compute() };
+    let response = ProjectionResponse { response: &response, max_selected_rows: command.max_selected_rows };
     let response = input_encoding::Response { response: &response,
         input_encoding: input_encoding::reported_policy(&encoding) };
     let cap = checked_stage(limits.result_bytes.checked_add(4096)
@@ -251,10 +254,8 @@ pub(in crate::candidate_cli) fn execute(command: SampledSentimentCommand,
 }
 
 fn check_completion(run: &Int8SampledSentimentRun, axes: &[SentimentAxis], samples: usize,
-    reuse_prefill: bool, expected: Int8Work, output_tokens: u64, mask_charge: u64) -> Result<(), Failure> {
+    execution: &str, expected: Int8Work, output_tokens: u64, mask_charge: u64) -> Result<(), Failure> {
     let work = run.model_work;
-    let execution = if reuse_prefill { INT8_SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION }
-        else { INT8_SAMPLED_SENTIMENT_EXECUTION };
     if run.execution != execution || run.samples_per_axis != samples
         || run.dimensions.len() != axes.len()
         || run.dimensions.iter().zip(axes).any(|(dimension, axis)| dimension.axis != *axis
@@ -266,6 +267,14 @@ fn check_completion(run: &Int8SampledSentimentRun, axes: &[SentimentAxis], sampl
         return Err(Failure::output("int8_sampled_sentiment_completion_accounting"));
     }
     Ok(())
+}
+
+#[derive(Serialize)]
+struct ProjectionResponse<'a, T: Serialize> {
+    #[serde(flatten)]
+    response: &'a T,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_selected_rows: Option<usize>,
 }
 
 #[cfg(test)]

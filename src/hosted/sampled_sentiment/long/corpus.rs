@@ -156,11 +156,16 @@ impl<R: BufRead, W: Write> StreamExecution<R, W> {
         let planner = Int8SampledSentimentPlanner::for_model_with_encoding(model.artifact_identity(),
             config.document.options.clone(), config.task, config.document.planning, config.encoding.clone())
             .map_err(HostedError::SampledSentiment)?;
+        let planner = match config.document.selected_rows {
+            Some(limits) => planner.with_selected_rows(limits).map_err(HostedError::SampledSentiment)?,
+            None => planner,
+        };
         let vocabulary = Arc::new(SampledSentimentVocabulary::pinned()
             .map_err(Int8SampledSentimentError::from).map_err(HostedError::SampledSentiment)?);
         let planner = Int8SampledSentimentDocumentPlanner::new(planner, vocabulary, config.task,
             config.document.mapping, config.work_limits()).map_err(HostedError::BatchSetup)?;
-        if planner.preparation_requirement_bytes() > self.required.input_bytes {
+        if planner.preparation_requirement_bytes() > self.required.input_bytes
+            || planner.selected_rows() != config.document.selected_rows {
             return Err(HostedError::Limits("INT8 sampled document planner exceeds its input reservation"));
         }
         self.input.value._retained = Some(planner.retained_owners());
@@ -179,7 +184,7 @@ impl<R: BufRead, W: Write> StreamExecution<R, W> {
             config.document.native.context_tokens, self.required.native.kv_bytes,
             config.document.mapping, config.work_limits(), self.required.input_bytes,
             self.required.output_reservation_bytes, self.required.max_output_bytes,
-            self.required.max_output_tokens, &config.document.options);
+            self.required.max_output_tokens, &config.document.options, config.document.selected_rows);
         let result = {
             let mut processor = match config.document.prefill {
                 None => NativeInt8SampledSentimentDocumentBatch::new(planner, &mut engine, admission),
@@ -210,6 +215,7 @@ pub(super) struct DocumentCapacity {
     max_output_tokens: u64,
     samples_per_axis: usize,
     max_sample_tokens: usize,
+    selected_rows: Option<Int8JsonSparseLimits>,
 }
 pub(super) struct DocumentAdmission<'a> {
     lease: &'a EngineLease,
@@ -224,10 +230,11 @@ impl<'a> DocumentAdmission<'a> {
         context: usize, kv_bytes: u64, mapping: Int8SampledSentimentMapLimits,
         work: Int8SampledSentimentBatchLimits, preparation_bytes: u64,
         output_reservation_bytes: u64, max_output_bytes: u64, max_output_tokens: u64,
-        options: &SampledSentimentOptions) -> Self {
+        options: &SampledSentimentOptions, selected_rows: Option<Int8JsonSparseLimits>) -> Self {
         Self { lease, model, capacity: DocumentCapacity { context, kv_bytes, mapping, work,
             preparation_bytes, output_reservation_bytes, max_output_bytes, max_output_tokens,
-            samples_per_axis: options.samples, max_sample_tokens: options.max_sample_tokens } }
+            samples_per_axis: options.samples, max_sample_tokens: options.max_sample_tokens,
+            selected_rows } }
     }
 }
 impl Int8SampledSentimentDocumentBatchAdmission for DocumentAdmission<'_> {
@@ -253,6 +260,7 @@ fn check_request(capacity: DocumentCapacity, request: &Int8SampledSentimentDocum
     constrained_int8::check_profile(facts.identity).map_err(|_| fail())?;
     if facts.identity.task_spec != "sentiment-v1"
         || facts.identity.sampler_version != constrained_int8::JSON_SAMPLER_VERSION
+        || facts.selected_rows != capacity.selected_rows
         || request.kv_reservation_bytes != capacity.kv_bytes
         || facts.original_task.validate().is_err() || facts.preparation_bytes == 0
         || facts.preparation_bytes > capacity.preparation_bytes {
@@ -262,7 +270,11 @@ fn check_request(capacity: DocumentCapacity, request: &Int8SampledSentimentDocum
     let samples_per_chunk_set = facts.chunk_count.checked_mul(capacity.samples_per_axis).ok_or_else(fail)?;
     let axes = facts.sample_count.checked_div(samples_per_chunk_set).ok_or_else(fail)?;
     let tokens = (facts.sample_count as u64).checked_mul(capacity.max_sample_tokens as u64).ok_or_else(fail)?;
-    let logits = tokens.checked_mul(crate::native_engine::lmhead::NANBEIGE_VOCAB_SIZE as u64).ok_or_else(fail)?;
+    let width = match capacity.selected_rows {
+        Some(limits) => limits.validate().map_err(|_| fail())?,
+        None => crate::native_engine::lmhead::NANBEIGE_VOCAB_SIZE,
+    };
+    let logits = tokens.checked_mul(width as u64).ok_or_else(fail)?;
     if native.kv_bytes != capacity.kv_bytes || native.kv_bytes > facts.original_task.max_kv_bytes
         || facts.required_context == 0 || facts.required_context > capacity.context
         || facts.chunk_count == 0 || facts.chunk_count > capacity.mapping.chunks.max_chunks

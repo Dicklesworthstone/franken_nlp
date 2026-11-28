@@ -2148,6 +2148,18 @@ It composes with prefill and persistent workers, preserves semantic draw address
 keeps conservative cold-work admission and reports actual per-sample work.
 An incomplete or invalid sample prevents complete-bundle success.
 
+All six INT8 sampled routes also accept explicit `--max-selected-rows N`.
+The output head evaluates every grammar-legal token, including accepting EOS,
+and uses the existing seeded sampler with unchanged semantic draw addresses.
+The cap refuses oversized legal sets without pruning or hidden fallback.
+Selected head-work admission and actual row receipts compose with prompt
+prefill, persistent teams and supported prefix reuse; native KV, sampler and
+mask reservations remain complete. Document populations retain exact source
+coverage, and durable recipes authenticate the projection policy on resume.
+See [exact legal-row sampling](docs/native-sampled-sentiment-int8.md#exact-legal-row-sampling)
+for cap selection and the distinction between reduced structural work and
+pending model/performance qualification.
+
 Use the [INT8 sampled sentiment guide](docs/native-sampled-sentiment-int8.md) for
 the input format, invocation, library APIs and exact limits. Generated variation
 is not calibrated confidence, and explanations remain unverified. Compilation,

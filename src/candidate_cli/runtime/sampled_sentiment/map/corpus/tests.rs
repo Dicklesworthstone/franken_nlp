@@ -77,6 +77,17 @@ fn item_caps_and_population_allowance_are_not_interchanged_by_host_configuration
 }
 
 #[test]
+fn selected_projection_reaches_resident_document_configuration_and_keeps_full_storage() {
+    let (command, limits, envelope) = admitted(&["--max-selected-rows", "4096",
+        "--compute-threads", "4", "--prefill-rows", "7"]);
+    let host = configuration(&command, &limits, &envelope).unwrap();
+    assert_eq!(host.document.selected_rows, command.sampled.selected_rows().unwrap());
+    check_quote(&limits, &envelope, &host).unwrap();
+    let mut dense = host.clone(); dense.document.selected_rows = None;
+    assert_eq!(host.requirements_with_threads(4).unwrap(), dense.requirements_with_threads(4).unwrap());
+}
+
+#[test]
 fn terminal_cancellation_remains_typed_through_population_error_classification() {
     use DecodeCancellationKind::*;
     for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast,

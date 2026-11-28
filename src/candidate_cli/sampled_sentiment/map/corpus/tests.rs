@@ -34,10 +34,25 @@ fn root_dispatch_selects_complete_document_population_and_requires_explicit_iden
             (index != missing && index != missing + 1).then_some(*value)).collect::<Vec<_>>();
         assert!(definition().try_get_matches_from(argv).is_err());
     }
-    for extra in [vec!["--reuse-prefill"], vec!["--bins", "5"], vec!["--max-selected-rows", "1"],
+    for extra in [vec!["--reuse-prefill"], vec!["--bins", "5"],
         vec!["--store-results"], vec!["--logprobs"]] {
         assert!(parsed(&extra).is_err());
     }
+}
+
+#[test]
+fn document_population_selected_rows_do_not_renew_or_replace_declared_run_work() {
+    let (dense, dense_limits, dense_run) = command(&[]).admit().unwrap();
+    let (selected, selected_limits, selected_run) = command(&["--max-selected-rows", "4096"]).admit().unwrap();
+    assert_eq!(selected.sampled.selected_rows().unwrap(), Some(Int8JsonSparseLimits { max_rows_per_step: 4096 }));
+    assert_eq!(dense.sampled.options().unwrap(), selected.sampled.options().unwrap());
+    assert_eq!(dense_limits.memory, selected_limits.memory);
+    assert_eq!(dense_limits.minimum_memory_bytes, selected_limits.minimum_memory_bytes);
+    assert_eq!(dense_run.max_model_work, selected_run.max_model_work);
+    assert_eq!(dense_run.max_mask_node_visits, selected_run.max_mask_node_visits);
+    assert_eq!(dense_run.transport.max_work, selected_run.transport.max_work);
+    assert_eq!(dense_run.transport_bytes, selected_run.transport_bytes);
+    for cap in ["0", "166145"] { assert!(command(&["--max-selected-rows", cap]).admit().is_err()); }
 }
 
 #[test]

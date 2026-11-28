@@ -9,7 +9,7 @@ use crate::{
     hosted::{Int8SampledSentimentMapHostConfig, NativeLimits, RunLimits},
     tasks::{mapreduce::MapReduceError, sentiment::sampled::quantized::long::{
         Int8SampledSentimentMapError, Int8SampledSentimentMapRun,
-        INT8_SAMPLED_SENTIMENT_MAP_EXECUTION,
+        INT8_SAMPLED_SENTIMENT_MAP_EXECUTION, INT8_SAMPLED_SENTIMENT_MAP_SPARSE_EXECUTION,
     }},
     tokenizer::untrusted::UntrustedEncoding,
     validation::grounded_fields::VerifiedSourceSpan,
@@ -85,6 +85,7 @@ fn config(command: &SampledSentimentMapCommand, limits: &MapLimits)
         mask_limits: command.sampled.masks(),
         max_mask_node_visits: command.sampled.max_mask_node_visits,
         prefill: limits.prefill,
+        selected_rows: command.sampled.selected_rows()?,
     })
 }
 
@@ -126,6 +127,9 @@ pub(in crate::candidate_cli) fn execute(command: SampledSentimentMapCommand, lim
     let mut axes = request.axes.clone();
     axes.sort_unstable();
     let samples = host.options.samples;
+    let expected_execution = if host.selected_rows.is_some() {
+        INT8_SAMPLED_SENTIMENT_MAP_SPARSE_EXECUTION
+    } else { INT8_SAMPLED_SENTIMENT_MAP_EXECUTION };
     drop(text);
     let facts = checked_stage(session.facts_with_error_detail(&limits.common), &check, session_failure)?;
     let cancellation = CancellationToken::default();
@@ -144,7 +148,7 @@ pub(in crate::candidate_cli) fn execute(command: SampledSentimentMapCommand, lim
                 limits.encoding.clone(), crate::native_engine::simd::config::process_kernel(),
                 limits.shared.compute.threads, cancellation), &check, map_host_failure)?)
     };
-    checked_stage(check_completion(result.result(), source_span, &axes, samples, &limits,
+    checked_stage(check_completion(result.result(), source_span, &axes, samples, expected_execution, &limits,
         command.sampled.max_mask_node_visits), &check, |failure| failure)?;
     let response = CandidateResponse { schema_version: 1,
         scope: "real-artifact-current-candidate", evidence: "non_authoritative",
@@ -152,6 +156,8 @@ pub(in crate::candidate_cli) fn execute(command: SampledSentimentMapCommand, lim
         source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
         quant_recipe: &facts.recipe_id, output: result.result() };
     let response = compute::Response { response: &response, compute: result.compute() };
+    let response = ProjectionResponse { response: &response,
+        max_selected_rows: command.sampled.max_selected_rows };
     // The map already reports its exact compact policy and cumulative work.
     // Both the output and preparation charges survive external write and flush.
     publish_checked(&response, limits.envelope_bytes, output, &check).map_err(setup_failure)
@@ -163,12 +169,12 @@ fn fits(work: Int8Work, cap: Int8Work) -> bool {
 }
 
 fn check_completion(run: &Int8SampledSentimentMapRun, span: VerifiedSourceSpan,
-    axes: &[SentimentAxis], samples: usize, limits: &MapLimits, mask_ceiling: u64) -> Result<(), Failure> {
+    axes: &[SentimentAxis], samples: usize, execution: &str, limits: &MapLimits, mask_ceiling: u64) -> Result<(), Failure> {
     let expected_encoding = match &limits.encoding {
         UntrustedEncoding::ByteFallback => run.input_encoding.is_none(),
         policy => run.input_encoding.as_ref().is_some_and(|record| &record.policy == policy),
     };
-    if run.schema_version != 1 || run.execution != INT8_SAMPLED_SENTIMENT_MAP_EXECUTION
+    if run.schema_version != 1 || run.execution != execution
         || run.numerics_profile != crate::native_engine::strict_int8::STRICT_INT8_PROFILE
         || run.single_context_equivalence || run.source_span != span || run.samples_per_axis != samples
         || !partition_within_declared(run.chunk_limits, limits.mapping.chunks) || !expected_encoding

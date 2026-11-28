@@ -36,6 +36,18 @@ fn complete_document_quote_cannot_drop_encoder_prompt_or_output_ownership() {
 }
 
 #[test]
+fn selected_document_configuration_preserves_the_full_pure_quote() {
+    let (mut command, limits) = admitted();
+    let dense = config(&command, &limits).unwrap();
+    command.sampled.max_selected_rows = Some(4096);
+    let selected = config(&command, &limits).unwrap();
+    assert_eq!(selected.selected_rows, command.sampled.selected_rows().unwrap());
+    check_host_quote(&limits, &selected).unwrap();
+    assert_eq!(dense.requirements_with_encoding(limits.task, 4, &limits.encoding).unwrap(),
+        selected.requirements_with_encoding(limits.task, 4, &limits.encoding).unwrap());
+}
+
+#[test]
 fn every_cancellation_kind_survives_map_and_shared_reducer_boundaries() {
     use DecodeCancellationKind::*;
     for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast,

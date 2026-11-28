@@ -9,7 +9,7 @@ mod job;
 pub use job::{Int8SampledSentimentDocumentJobRequirements, int8_sampled_sentiment_document_job_requirements};
 use super::*;
 use crate::{
-    native_engine::decode::DecodeStepControl,
+    native_engine::{decode::DecodeStepControl, constrained_int8::sparse::Int8JsonSparseLimits},
     tasks::sentiment::{SentimentAxis, SentimentRequest, sampled::{
         SampledSentimentLimits, SampledSentimentOptions,
         quantized::{Int8SampledSentimentPlanner, long::{
@@ -35,6 +35,9 @@ pub struct Int8SampledSentimentMapHostConfig {
     pub mask_limits: MaskWorkLimits,
     pub max_mask_node_visits: u64,
     pub prefill: Option<Int8PrefillLimits>,
+    /// Exact complete legal-row ceiling; None retains full-head execution.
+    /// This changes admitted projection work, not sampler or native storage.
+    pub selected_rows: Option<Int8JsonSparseLimits>,
 }
 impl Int8SampledSentimentMapHostConfig {
     /// Pure memory quote, before source/model IO or tokenizer construction.
@@ -49,6 +52,10 @@ impl Int8SampledSentimentMapHostConfig {
     pub fn requirements_with_encoding(&self, task: TaskBudget, max_axes: usize,
         encoding: &UntrustedEncoding) -> Result<Int8SampledSentimentMapMemoryRequirement, HostedError> {
         self.native.run.validate()?;
+        if let Some(limits) = self.selected_rows {
+            limits.validate().map_err(Int8SampledSentimentError::from)
+                .map_err(HostedError::SampledSentiment)?;
+        }
         if self.mask_limits.max_trie_node_visits == 0
             || self.mask_limits.checkpoint_interval_nodes == 0 || self.max_mask_node_visits == 0 {
             return Err(HostedError::Limits("INT8 sampled sentiment document mask allowance"));
@@ -102,6 +109,10 @@ impl MapAdmission {
         let planner = Int8SampledSentimentPlanner::for_model_with_encoding(model,
             config.options.clone(), input.request.budget, config.planning, input.encoding.clone())
             .map_err(HostedError::SampledSentiment)?;
+        let planner = match config.selected_rows {
+            Some(limits) => planner.with_selected_rows(limits).map_err(HostedError::SampledSentiment)?,
+            None => planner,
+        };
         let vocabulary = SampledSentimentVocabulary::pinned()
             .map_err(Int8SampledSentimentError::from).map_err(HostedError::SampledSentiment)?;
         let plan = planner.plan_document_with_control(&input.request, config.mapping, control)
@@ -273,6 +284,7 @@ fn validate_prepared(prepared: &PreparedInt8SampledSentimentMap, input: &MapInpu
         .and_then(|count| count.checked_mul(config.options.samples))
         .ok_or(HostedError::Limits("INT8 sampled document sample count"))?;
     if prepared.chunk_count() == 0 || prepared.chunk_count() > config.mapping.chunks.max_chunks
+        || prepared.selected_rows() != config.selected_rows
         || prepared.sample_count() != samples || prepared.task_budget() != input.request.budget
         || prepared.required_context() == 0 || prepared.required_context() > config.native.context_tokens
         || prepared.max_result_bytes() != config.mapping.max_result_bytes

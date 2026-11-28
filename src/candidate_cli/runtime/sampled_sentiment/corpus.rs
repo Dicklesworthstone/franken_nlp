@@ -27,6 +27,8 @@ struct Provenance<'a> {
     compute_threads: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefill_reuse_execution: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_selected_rows: Option<usize>,
 }
 
 pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
@@ -41,6 +43,10 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Sen
     let facts = checked_stage(session.facts_with_error_detail(&common), &check, session_failure)?;
     let planner = checked_stage(Int8SampledSentimentPlanner::for_model_with_encoding(&facts,
         options, budget, command.task_limits(), encoding.clone()), &check, task_failure)?;
+    let planner = checked_stage(command.configure_planner(planner), &check, setup_failure)?;
+    if planner.selected_rows() != checked_stage(command.selected_rows(), &check, setup_failure)? {
+        return Err(setup_failure(CandidateError::Planning));
+    }
     let vocabulary = Arc::new(checked_stage(SampledSentimentVocabulary::pinned(), &check,
         |error| task_failure(error.into()))?);
     let provenance = Provenance { protocol: "fnlp-candidate-int8-sentiment-sampled-batch-v1", schema_version: 1,
@@ -49,7 +55,8 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Sen
         logical_model_sha256: &facts.logical_model_sha256, quant_recipe: &facts.recipe_id,
         input_encoding: input_encoding::reported_policy(&encoding), prefill_rows: prefill.map(|p| p.max_batch_rows),
         compute_threads: (limits.compute.threads > 1).then_some(limits.compute.threads),
-        prefill_reuse_execution: command.reuse_prefill.then_some(INT8_SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION) };
+        prefill_reuse_execution: command.prefill_reuse_execution(),
+        max_selected_rows: command.max_selected_rows };
     let writer = checked_stage(CandidateWriter::new(output, &provenance,
         envelope.transport.max_output_line_bytes, envelope.output_bytes), &check, setup_failure)?;
     let reader: Box<dyn BufRead + Send> = if common.input.as_os_str() == "-" {

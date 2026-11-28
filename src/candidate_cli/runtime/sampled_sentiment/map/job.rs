@@ -37,6 +37,7 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     let facts = checked_stage(session.facts_with_error_detail(&document.common), &check, session_failure)?;
     let compiler = checked_stage(Int8SampledSentimentPlanner::for_model_with_encoding(&facts,
         options, document.task, limits.planning, document.encoding.clone()), &check, task_failure)?;
+    let compiler = checked_stage(job.document.sampled.configure_planner(compiler), &check, setup_failure)?;
     let vocabulary = Arc::new(checked_stage(SampledSentimentVocabulary::pinned(), &check,
         |error| task_failure(error.into()))?);
     let planner = checked_stage(Int8SampledSentimentDocumentJobPlanner::new(compiler, vocabulary,
@@ -49,6 +50,7 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     checked_stage(if planner.preparation_requirement_bytes() != limits.preparation_reserve_bytes
         || planner.max_result_bytes() != document.memory.max_output_bytes
         || planner.document_encoding() != &document.encoding
+        || planner.selected_rows() != checked_stage(job.document.sampled.selected_rows(), &check, setup_failure)?
         || planner.task_budget() != document.task
         || planner.prefill_limits().map(|p| (p.max_batch_rows, p.max_extra_scratch_bytes))
             != document.prefill.map(|p| (p.max_batch_rows, p.max_extra_scratch_bytes)) {
@@ -86,6 +88,7 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
         input_encoding: input_encoding::reported_policy(&document.encoding),
         compute_threads: (document.shared.compute.threads > 1).then_some(document.shared.compute.threads),
         prefill_schedule: document.prefill.map(PrefillSchedule::new).transpose().map_err(setup_failure)?,
+        max_selected_rows: job.document.sampled.max_selected_rows,
         output: &report,
     };
     // The host has joined every numerical worker and durable item commit.
@@ -203,6 +206,8 @@ struct Response<'a, T: Serialize> {
     compute_threads: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefill_schedule: Option<PrefillSchedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_selected_rows: Option<usize>,
     output: &'a T,
 }
 

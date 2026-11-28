@@ -31,6 +31,8 @@ struct Provenance<'a> {
     prefill_rows: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compute_threads: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_selected_rows: Option<usize>,
 }
 
 fn configuration(command: &SampledSentimentMapCommand, limits: &MapLimits, envelope: &Envelope)
@@ -91,6 +93,7 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Sen
         input_encoding: input_encoding::reported_policy(&limits.encoding),
         prefill_rows: limits.prefill.map(|p| p.max_batch_rows),
         compute_threads: (limits.shared.compute.threads > 1).then_some(limits.shared.compute.threads),
+        max_selected_rows: command.sampled.max_selected_rows,
     };
     let writer = checked_stage(CandidateWriter::new(output, &provenance,
         envelope.transport.max_output_line_bytes, envelope.output_bytes), &check, setup_failure)?;

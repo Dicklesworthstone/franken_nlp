@@ -11,8 +11,7 @@ use crate::{
         strict_int8::{StrictInt8Engine, prefill::Int8PrefillLimits}},
     tasks::sentiment::{SentimentRequest, sampled::{SampledSentimentError, SampledSentimentVocabulary,
         quantized::{Int8SampledSentimentError, Int8SampledSentimentPlanner, Int8SampledSentimentRun,
-            PreparedInt8SampledSentiment, INT8_SAMPLED_SENTIMENT_EXECUTION,
-            INT8_SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION}}},
+            PreparedInt8SampledSentiment}}},
 };
 
 /// Work ceilings cover every admitted record, including failed attempts.
@@ -217,8 +216,7 @@ impl BatchProcessor for Processor<'_, '_, '_> {
                 budget, sampler, prefill, control),
             None => plan.execute_with_control(self.engine, &identity, vocabulary, budget, sampler, control),
         } }.map_err(|error| task_failure(error, true))?;
-        let execution = if self.stream.reuse_prefill { INT8_SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION }
-            else { INT8_SAMPLED_SENTIMENT_EXECUTION };
+        let execution = plan.execution_version(self.stream.reuse_prefill);
         if self.engine.is_poisoned() || !self.engine.kv_cache().all_slots_have_len(0)
             || result.execution != execution || result.mask_node_visit_charge > mask {
             return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));

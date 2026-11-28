@@ -41,8 +41,28 @@ fn sampled_document_has_explicit_identity_and_does_not_select_distribution_or_co
         assert!(crate::candidate_cli::definition().try_get_matches_from(args).is_err());
     }
     for extra in [vec!["--ndjson"], vec!["--reuse-prefill"], vec!["--bins", "5"],
-        vec!["--max-selected-rows", "8"], vec!["--logprobs"], vec!["--source", "model"]] {
+        vec!["--logprobs"], vec!["--source", "model"]] {
         assert!(parsed(&extra).is_err());
+    }
+}
+
+#[test]
+fn selected_document_projection_is_explicit_and_keeps_every_memory_owner() {
+    let dense = command(&["--compute-threads", "4", "--prefill-rows", "7"]);
+    let selected = command(&["--compute-threads", "4", "--prefill-rows", "7", "--max-selected-rows", "4096"]);
+    let dense_limits = dense.validate().unwrap();
+    let selected_limits = selected.validate().unwrap();
+    assert_eq!(selected.sampled.selected_rows().unwrap(), Some(Int8JsonSparseLimits { max_rows_per_step: 4096 }));
+    assert_eq!(dense.sampled.options().unwrap(), selected.sampled.options().unwrap());
+    assert_eq!(dense_limits.memory, selected_limits.memory);
+    assert_eq!(dense_limits.minimum_memory_bytes, selected_limits.minimum_memory_bytes);
+    assert_eq!(dense_limits.mapping.chunks, selected_limits.mapping.chunks);
+    assert_eq!(dense_limits.mapping.max_model_work, selected_limits.mapping.max_model_work);
+    assert_eq!(dense_limits.mapping.max_retained_result_bytes, selected_limits.mapping.max_retained_result_bytes);
+    assert_eq!(dense_limits.mapping.max_result_bytes, selected_limits.mapping.max_result_bytes);
+    for cap in ["0", "166145"] {
+        assert_eq!(command(&["--max-selected-rows", cap]).execute(&mut NoIo, &mut NoIo)
+            .unwrap_err().exit, ErrorCode::Usage);
     }
 }
 

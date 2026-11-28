@@ -69,6 +69,7 @@ fn prepare(args: &JobArgs, common: &CandidateArgs, limits: Limits, job: JobLimit
     let compiler = Int8SampledSentimentPlanner::for_model_with_encoding(facts,
         args.sampled.options().map_err(setup_failure)?, envelope.task, envelope.planning, encoding.clone())
         .map_err(task_failure)?;
+    let compiler = args.sampled.configure_planner(compiler).map_err(setup_failure)?;
     let factory = Int8SampledSentimentJobPlanner::new_with_document_encoding(
         compiler, vocabulary, native_limits(envelope, job), job, totals).map_err(corpus::failure)?;
     let factory = match prefill {
@@ -78,6 +79,7 @@ fn prepare(args: &JobArgs, common: &CandidateArgs, limits: Limits, job: JobLimit
     factory.check_job_limits(job).map_err(corpus::failure)?;
     let schedule = |value: Option<Int8PrefillLimits>| value.map(|p| (p.max_batch_rows, p.max_extra_scratch_bytes));
     if factory.document_encoding() != &encoding || factory.encoding_work_limits() != totals
+        || factory.selected_rows() != args.sampled.selected_rows().map_err(setup_failure)?
         || factory.preparation_requirement_bytes() != envelope.preparation_bytes
         || factory.task_budget() != envelope.task
         || factory.max_result_bytes() != envelope.task.max_output_bytes.min(envelope.planning.max_result_bytes)
@@ -155,7 +157,7 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
         durable_unit: "complete_independent_sample_bundle",
         input_encoding: input_encoding::reported_policy(&encoding), invocation_encoding_work_limits: totals,
         compute_threads: (limits.compute.threads > 1).then_some(limits.compute.threads),
-        prefill_rows: prefill.map(|p| p.max_batch_rows) };
+        prefill_rows: prefill.map(|p| p.max_batch_rows), max_selected_rows: args.sampled.max_selected_rows };
     // Never serialize the private recipe, seed, population or generated scores.
     publish_report(&response, output, &|| session.remaining(), &cancellation)
 }
@@ -211,6 +213,8 @@ struct Response<'a, T: Serialize> {
     compute_threads: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefill_rows: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_selected_rows: Option<usize>,
 }
 
 #[cfg(test)] mod tests;

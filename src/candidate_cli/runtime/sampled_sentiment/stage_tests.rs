@@ -28,3 +28,14 @@ fn a_later_deadline_wins_over_a_nonterminal_setup_failure() {
     assert_eq!(failure.cancellation, Some(DecodeCancellationKind::Deadline));
     assert_eq!(failure.exit, ErrorCode::BudgetOrTimeout);
 }
+
+#[test]
+fn optional_selected_policy_preserves_default_output_shape_and_names_only_the_public_cap() {
+    let base = serde_json::json!({"schema_version":1,"output":{"status":"fixture"}});
+    let dense = ProjectionResponse { response: &base, max_selected_rows: None };
+    assert_eq!(serde_json::to_value(dense).unwrap(), base);
+    let selected = ProjectionResponse { response: &base, max_selected_rows: Some(4096) };
+    let mut value = serde_json::to_value(selected).unwrap();
+    assert_eq!(value.as_object_mut().unwrap().remove("max_selected_rows"), Some(serde_json::json!(4096)));
+    assert_eq!(value, base);
+}

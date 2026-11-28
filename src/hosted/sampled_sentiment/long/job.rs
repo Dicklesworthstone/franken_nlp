@@ -175,6 +175,7 @@ impl<R: BufRead> JobExecution<R> {
         let (planner, request) = self.input.value.preparation.take().ok_or(HostedError::CompletionMissing)?;
         let mapping = planner.mapping_limits(); let work = planner.native_limits();
         let options = planner.sampling_options().clone();
+        let selected_rows = planner.selected_rows();
         let population = match read_population(&mut self.input.value.reader, &request, self.limits.transport, control) {
             Ok(Population::Original(original)) => {
                 // Keep these same authenticated bytes outside the runner and
@@ -200,7 +201,7 @@ impl<R: BufRead> JobExecution<R> {
         let admission = DocumentAdmission::for_job(&self.lease, model.artifact_identity(),
             self.limits.native.context_tokens, need.native.kv_bytes, mapping, work,
             self.limits.preparation_reserve_bytes, need.output_reservation_bytes,
-            need.max_output_bytes, need.max_output_tokens, &options);
+            need.max_output_bytes, need.max_output_tokens, &options, selected_rows);
         let result = (|| {
             let processor = Int8SampledSentimentDocumentJobProcessor::new(planner, &mut engine, admission)
                 .map_err(JobRunError::Processor)?;

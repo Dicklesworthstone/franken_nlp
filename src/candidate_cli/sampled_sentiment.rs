@@ -3,7 +3,8 @@ use super::*;
 use crate::{
     candidate_cli::stream::Failure,
     grammar::{CompileLimits, mask::MaskWorkLimits},
-    native_engine::{constrained_int8::{json_sampling_workspace_bytes, json_sampling_reuse_workspace_bytes},
+    native_engine::{constrained_int8::{json_sampling_workspace_bytes, json_sampling_reuse_workspace_bytes,
+            sparse::Int8JsonSparseLimits},
         portable_int8::ProjectionWork, strict_int8::{Int8Work, prefill::Int8PrefillLimits}},
     tasks::{ir::TaskBudget, sentiment::{SentimentAxis, SentimentRequest,
         sampled::{SampledSentimentOptions, SampledSentimentLimits}}},
@@ -19,6 +20,12 @@ mod tests;
 
 #[derive(Args)]
 pub(super) struct SampledSentimentCommand {
+    /// Project every grammar-allowed token; 1..=166144 rows per step including accepting EOS.
+    /// The complete legal set must fit before sampling. An over-cap step refuses
+    /// without pruning, a dense fallback or a retry. Full native and sampler
+    /// memory remain admitted; sample draw addresses do not change.
+    #[arg(long)]
+    pub(in crate::candidate_cli) max_selected_rows: Option<usize>,
     /// Sentiment JSON object {document,axes?}; '-' reads stdin.
     #[arg(default_value = "-")]
     input: PathBuf,
@@ -130,6 +137,30 @@ impl SampledSentimentCommand {
         options.validate().map_err(|_| CandidateError::Arguments)?;
         Ok(options)
     }
+    pub(in crate::candidate_cli) fn selected_rows(&self) -> Result<Option<Int8JsonSparseLimits>, CandidateError> {
+        self.max_selected_rows.map(|max_rows_per_step| {
+            let limits = Int8JsonSparseLimits { max_rows_per_step };
+            limits.validate().map_err(|_| CandidateError::Arguments)?;
+            Ok(limits)
+        }).transpose()
+    }
+    #[cfg(any(feature = "asupersync-runtime", test))]
+    pub(in crate::candidate_cli) fn configure_planner(&self,
+        planner: crate::tasks::sentiment::sampled::quantized::Int8SampledSentimentPlanner)
+        -> Result<crate::tasks::sentiment::sampled::quantized::Int8SampledSentimentPlanner, CandidateError> {
+        if planner.selected_rows().is_some() { return Err(CandidateError::Planning); }
+        match self.selected_rows()? {
+            Some(limits) => planner.with_selected_rows(limits).map_err(|_| CandidateError::Planning),
+            None => Ok(planner),
+        }
+    }
+    pub(in crate::candidate_cli) fn prefill_reuse_execution(&self) -> Option<&'static str> {
+        use crate::tasks::sentiment::sampled::quantized::{INT8_SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION,
+            INT8_SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION};
+        self.reuse_prefill.then_some(if self.max_selected_rows.is_some() {
+            INT8_SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION
+        } else { INT8_SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION })
+    }
     pub(in crate::candidate_cli) fn prefill(&self) -> Result<Option<Int8PrefillLimits>, CandidateError> {
         self.prefill_rows.map(|rows| {
             let bytes = Int8PrefillLimits::required_extra_scratch_bytes(rows)
@@ -182,6 +213,7 @@ impl SampledSentimentCommand {
         self.common_with_staging(0)
     }
     fn common_with_staging(&self, stream_staging: u64) -> Result<(CandidateArgs, Limits), CandidateError> {
+        self.selected_rows()?;
         self.options()?;
         if self.max_new_tokens >= self.context_tokens
             || !(1..=MAX_CONTENT_BYTES).contains(&self.max_result_bytes)

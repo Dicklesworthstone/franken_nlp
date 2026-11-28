@@ -127,4 +127,21 @@ mod tests {
         }
         for width in ["0", "65"] { assert!(parse(&["--compute-threads", width]).admit().is_err()); }
     }
+
+    #[test]
+    fn selected_rows_and_prompt_reuse_compose_without_discounting_stream_memory() {
+        let dense = parse(&["--reuse-prefill", "--compute-threads", "4", "--prefill-rows", "7"]);
+        let selected = parse(&["--reuse-prefill", "--compute-threads", "4", "--prefill-rows", "7",
+            "--max-selected-rows", "4096"]);
+        let (_, a, ae) = dense.admit().unwrap(); let (_, b, be) = selected.admit().unwrap();
+        assert_eq!(selected.sampled.selected_rows().unwrap(), Some(Int8JsonSparseLimits { max_rows_per_step: 4096 }));
+        assert_eq!(dense.sampled.options().unwrap(), selected.sampled.options().unwrap());
+        assert_eq!(dense.sampled.sampler_bytes().unwrap(), selected.sampled.sampler_bytes().unwrap());
+        assert_eq!(a.kv_bytes, b.kv_bytes); assert_eq!(a.compute, b.compute);
+        assert_eq!(a.preparation_bytes, b.preparation_bytes);
+        assert_eq!(ae.transport.max_work, be.transport.max_work);
+        assert_eq!(ae.io_bytes, be.io_bytes); assert_eq!(ae.output_bytes, be.output_bytes);
+        assert_ne!(dense.sampled.prefill_reuse_execution(), selected.sampled.prefill_reuse_execution());
+        for cap in ["0", "166145"] { assert!(parse(&["--max-selected-rows", cap]).admit().is_err()); }
+    }
 }

@@ -34,7 +34,7 @@ fn fixture() -> Int8SampledSentimentDocumentBatchHostConfig {
             preparation_reserve_bytes: 600 * MIB,
             max_sampler_bytes: json_sampling_workspace_bytes().unwrap(),
             mask_limits: MaskWorkLimits { max_trie_node_visits: 2_000_000, checkpoint_interval_nodes: 256 },
-            max_mask_node_visits: 1_000_000_000_000, prefill: None,
+            max_mask_node_visits: 1_000_000_000_000, prefill: None, selected_rows: None,
         },
         task, encoding: UntrustedEncoding::ByteFallback,
         transport: BatchLimits { max_line_bytes: 65_536, max_document_bytes: 4096,
@@ -66,7 +66,8 @@ fn capacity(config: &Int8SampledSentimentDocumentBatchHostConfig) -> DocumentCap
         mapping: config.document.mapping, work: config.work_limits(), preparation_bytes: required.input_bytes,
         output_reservation_bytes: required.output_reservation_bytes,
         max_output_bytes: required.max_output_bytes, max_output_tokens: required.max_output_tokens,
-        samples_per_axis: config.document.options.samples, max_sample_tokens: config.document.options.max_sample_tokens }
+        samples_per_axis: config.document.options.samples, max_sample_tokens: config.document.options.max_sample_tokens,
+        selected_rows: config.document.selected_rows }
 }
 fn request<'a>(config: &Int8SampledSentimentDocumentBatchHostConfig, identity: &'a ExecutionIdentity)
     -> Int8SampledSentimentDocumentAdmission<'a> {
@@ -75,7 +76,7 @@ fn request<'a>(config: &Int8SampledSentimentDocumentBatchHostConfig, identity: &
         identity, model_work: config.document.mapping.max_model_work,
         sample_count: 64, chunk_count: 8, required_context: 1824, original_task: config.task,
         max_result_bytes: required.max_output_bytes, max_output_tokens: required.max_output_tokens,
-        preparation_bytes: required.input_bytes },
+        preparation_bytes: required.input_bytes, selected_rows: config.document.selected_rows },
         kv_reservation_bytes: required.native.kv_bytes, mask_node_visits: 1_000_000 }
 }
 
@@ -209,4 +210,35 @@ fn retained_stream_owners_cross_dispatch_and_debug_keeps_seed_private() {
     let _team = NlpEngine::batch_int8_sampled_sentiment_documents_with_threads::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
     let shown = format!("{:?}", fixture());
     assert!(shown.contains("REDACTED")); assert!(!shown.contains("[17, 17"));
+}
+
+#[test]
+fn selected_document_admission_seals_exact_cap_and_all_cold_work_without_a_full_head_requirement() {
+    let mut config = fixture();
+    let full = config.requirements().unwrap();
+    let rows = Int8JsonSparseLimits { max_rows_per_step: 4096 };
+    config.document.selected_rows = Some(rows);
+    let one = constrained_int8::sparse::planned_work(config.task.max_input_tokens as usize, 32, rows).unwrap();
+    let item = (0..64).try_fold(Int8Work::default(), |total, _| total.checked_add(one)).unwrap();
+    config.document.mapping.max_model_work = item;
+    config.max_model_work = item.checked_add(item).unwrap();
+    config.transport.max_work = BatchWork { forward_positions: config.max_model_work.forward_positions,
+        projected_logits: config.max_model_work.projected_logits };
+    assert_eq!(config.requirements().unwrap(), full);
+    let identity = identity(); let cap = capacity(&config);
+    let valid = request(&config, &identity);
+    assert_eq!(valid.facts.model_work.projected_logits, valid.facts.max_output_tokens * 4096);
+    check_request(cap, &valid).unwrap();
+    for axis in 0..6 {
+        let mut wrong = request(&config, &identity);
+        match axis {
+            0 => wrong.facts.selected_rows = None,
+            1 => wrong.facts.selected_rows = Some(Int8JsonSparseLimits { max_rows_per_step: 8192 }),
+            2 => wrong.facts.model_work.projected_logits += 1,
+            3 => wrong.facts.model_work.forward_positions += 1,
+            4 => wrong.facts.model_work.projections.dot_products += 1,
+            _ => wrong.facts.model_work.projections.multiply_accumulates += 1,
+        }
+        assert!(check_request(cap, &wrong).unwrap_err().stop, "selected binding {axis}");
+    }
 }

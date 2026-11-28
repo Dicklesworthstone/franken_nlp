@@ -43,6 +43,7 @@ fn cli_and_host_agree_for_original_or_retained_input_and_all_supported_schedules
         &["--prefill-rows", "1"][..], &["--prefill-rows", "64"][..],
         &["--compute-threads", "4", "--prefill-rows", "7"][..],
         &["--input-encoding", "safe-bpe-v1", "--compute-threads", "4", "--prefill-rows", "7"][..],
+        &["--max-selected-rows", "4096", "--compute-threads", "4", "--prefill-rows", "7"][..],
     ] { for retained in [false, true] {
         let mut flags = schedule.to_vec();
         if retained { flags.extend(["--use-retained-input", "--max-retained-input-mib", "8"]); }
@@ -231,6 +232,7 @@ fn only_verified_complete_progress_becomes_metadata_without_source_seed_or_sampl
         candidate_format: "fixture-portable-int8", quant_recipe: "fixture-int8",
         input_encoding: None, compute_threads: Some(4),
         prefill_schedule: admitted.prefill.map(PrefillSchedule::new).transpose().unwrap(),
+        max_selected_rows: None,
         output: &report,
     };
     let mut bytes = Vec::new();

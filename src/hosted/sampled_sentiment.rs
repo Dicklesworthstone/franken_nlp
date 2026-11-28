@@ -22,10 +22,12 @@ use crate::{
     tasks::{ir::TaskBudget, sentiment::sampled::{
         SampledSentimentVocabulary,
         quantized::{PreparedInt8SampledSentiment, Int8SampledSentimentRun,
-            Int8SampledSentimentError, INT8_SAMPLED_SENTIMENT_EXECUTION,
-            INT8_SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION},
+            Int8SampledSentimentError},
     }},
 };
+#[cfg(test)]
+use crate::tasks::sentiment::sampled::quantized::{INT8_SAMPLED_SENTIMENT_EXECUTION,
+    INT8_SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION};
 
 /// Nonrenewable limits for the complete axis-by-sample bundle. Preparation
 /// covers transferred plans and vocabulary in addition to any caller-owned
@@ -49,9 +51,9 @@ impl NlpEngine {
             limits, None, false, cancellation)
     }
 
-    /// Only prompt scheduling changes: each sample still begins with empty KV,
-    /// scores the complete vocabulary and consumes its independently addressed
-    /// random sequence. The declared prompt workspace is charged before dispatch.
+    /// Only prompt scheduling changes: each sample still begins with empty KV
+    /// and consumes its independently addressed random sequence under the
+    /// prepared full-head or exact legal-row policy. Prompt workspace is charged.
     pub fn execute_int8_sampled_sentiment_layer_major(&self, model: &ResidentInt8,
         prepared: PreparedInt8SampledSentiment, vocabulary: Arc<SampledSentimentVocabulary>,
         limits: Int8SampledSentimentHostLimits, prefill: Int8PrefillLimits,
@@ -255,8 +257,7 @@ fn execute_prepared(prepared: &PreparedInt8SampledSentiment, vocabulary: &Sample
         Some(prefill) => prepared.execute_layer_major_with_control(engine, prepared.execution_identity(),
             vocabulary, budget, max_sampler_bytes, prefill, control),
     } }.map_err(HostedError::SampledSentiment)?;
-    let execution = if reuse_prefill { INT8_SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION }
-        else { INT8_SAMPLED_SENTIMENT_EXECUTION };
+    let execution = prepared.execution_version(reuse_prefill);
     if run.execution != execution || !fits(run.model_work, prepared.planned_work())
         || engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) {
         return Err(HostedError::Limits("sampled sentiment completion accounting"));
@@ -433,6 +434,12 @@ mod tests {
             planner(model).plan(&SentimentRequest { document: DOCUMENT.to_owned(),
                 axes: vec![SentimentAxis::Valence, SentimentAxis::Arousal], budget: task() }).unwrap()
         }
+        fn selected_prepared(model: &ResidentInt8) -> PreparedInt8SampledSentiment {
+            planner(model).with_selected_rows(crate::native_engine::constrained_int8::sparse::Int8JsonSparseLimits {
+                max_rows_per_step: crate::native_engine::lmhead::NANBEIGE_VOCAB_SIZE }).unwrap()
+                .plan(&SentimentRequest { document: DOCUMENT.to_owned(),
+                    axes: vec![SentimentAxis::Valence, SentimentAxis::Arousal], budget: task() }).unwrap()
+        }
         fn limits(work: Int8Work) -> Int8SampledSentimentHostLimits {
             Int8SampledSentimentHostLimits { native: native(), preparation_reserve_bytes: 1 << 30,
                 max_model_work: work, max_sampler_bytes: json_sampling_workspace_bytes().unwrap(),
@@ -588,6 +595,30 @@ mod tests {
                     drop(result); drained(&host, baseline);
                 }
             }
+            for reuse in [false, true] { for schedule in [None, Some(prefill())] {
+                let plan = selected_prepared(&model);
+                let execution = plan.execution_version(reuse);
+                let mut selected_limits = limits(plan.planned_work());
+                if reuse { selected_limits.max_sampler_bytes = plan.reuse_sampler_requirement_bytes().unwrap(); }
+                let result = if reuse {
+                    host.execute_int8_sampled_sentiment_reusing_prefill_with_threads(&model,
+                        plan, Arc::clone(&vocabulary), selected_limits, Int8Kernel::scalar(), 4,
+                        schedule, CancellationToken::default())
+                } else { match schedule {
+                    None => host.execute_int8_sampled_sentiment_with_threads(&model, plan,
+                        Arc::clone(&vocabulary), selected_limits, Int8Kernel::scalar(), 4, CancellationToken::default()),
+                    Some(prefill) => host.execute_int8_sampled_sentiment_layer_major_with_threads(&model, plan,
+                        Arc::clone(&vocabulary), selected_limits, Int8Kernel::scalar(), 4,
+                        prefill, CancellationToken::default()),
+                } }.unwrap();
+                assert_eq!(result.result().execution, execution);
+                assert_eq!(sampled_semantics(result.result()), sampled_semantics(&expected_run));
+                assert!(result.result().model_work.projected_logits < expected_run.model_work.projected_logits);
+                assert_eq!(result.compute().completed_rows, result.result().model_work.projections.dot_products);
+                assert_eq!(result.compute().compute_threads, 4);
+                drained(&host, baseline + output_charge);
+                drop(result); drained(&host, baseline);
+            } }
             let expected = corpus(&host, &model, Arc::clone(&vocabulary), 1, None);
             drained(&host, baseline);
             for (width, schedule) in [(2, None), (4, Some(prefill()))] {
