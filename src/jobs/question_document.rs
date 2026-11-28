@@ -1,6 +1,9 @@
 //! Pure ownership quotation and lifetime bounds for complete-document QA jobs.
 //! CLI validation is available independently of the optional durable runner.
 //! These checked quotes perform no IO and grant no allocation or execution permit.
+
+/// Complete-source INT8 question populations use the same journal ownership.
+pub mod quantized;
 use crate::{
     batch::{BatchCode, BatchFault, BatchLimits, BatchWork,
         source::grouped_int4::question::{Int4QuestionDocumentBatchConfig,
