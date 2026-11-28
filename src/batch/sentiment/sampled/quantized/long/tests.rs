@@ -135,7 +135,7 @@ impl DocumentPlan for Plan {
     fn facts(&self) -> Int8SampledSentimentDocumentPlanFacts<'_> {
         Int8SampledSentimentDocumentPlanFacts { identity: &self.identity, model_work: work(1),
             sample_count: 2, chunk_count: 2, required_context: 16, original_task: task(),
-            max_result_bytes: 16_384, max_output_tokens: 32, preparation_bytes: 1024 }
+            max_result_bytes: 16_384, max_output_tokens: 32, preparation_bytes: 1024, selected_rows: None }
     }
     fn verify_identity(&self, identity: &ExecutionIdentity) -> Result<(), BatchItemFailure> {
         if identity == &self.identity { Ok(()) } else { Err(BatchItemFailure::fatal(BatchCode::Admission)) }

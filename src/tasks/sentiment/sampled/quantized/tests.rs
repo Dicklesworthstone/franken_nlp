@@ -43,7 +43,7 @@ fn compile(request: &SentimentRequest, options: &SampledSentimentOptions)
     let (compiler, identity) = fixture();
     Ok(PreparedInt8SampledSentiment { inner: compile_sampled_request(compiler, identity,
         &Int8SampledSchedule, options, budget(), SampledSentimentLimits::default(),
-        request, &mut Continue, &mut SafeBpeWork::default())? })
+        request, &mut Continue, &mut SafeBpeWork::default())?, selected_rows: None })
 }
 fn prepare() -> PreparedInt8SampledSentiment { compile(&request(), &options()).unwrap() }
 
@@ -391,3 +391,4 @@ fn planning_and_both_native_cancellation_wrappers_preserve_all_eleven_causes() {
 }
 
 mod reuse;
+mod selected;

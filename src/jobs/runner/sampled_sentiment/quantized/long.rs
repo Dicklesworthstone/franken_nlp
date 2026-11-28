@@ -15,7 +15,8 @@ use crate::{
     execution_identity::ExecutionIdentity,
     grammar::{mask::MaskWorkLimits, runtime::JSON_RUNTIME_VERSION},
     jobs::{JobLimits, JobWork, manifest::bounded_json, runner::DurableBatchProcessor},
-    native_engine::{constrained_int8::{INT8_JSON_SAMPLED_EXECUTION, JSON_SAMPLER_VERSION},
+    native_engine::{constrained_int8::{INT8_JSON_SAMPLED_EXECUTION, INT8_JSON_SAMPLED_SPARSE_EXECUTION,
+            JSON_SAMPLER_VERSION, sparse::Int8JsonSparseLimits},
         decode::DecodeStepControl, strict_int8::{Int8Work, StrictInt8Engine,
             prefill::{Int8PrefillLimits, LAYER_MAJOR_PREFILL_VERSION as INT8_LAYER_MAJOR_PREFILL_VERSION}}},
     tasks::{ir::TaskBudget, mapreduce::{CHUNK_PROFILE, ChunkLimits},
@@ -23,8 +24,9 @@ use crate::{
             SampledSentimentVocabulary, MAX_SENTIMENT_SAMPLES, SAMPLED_SENTIMENT_PROMPT_VERSION,
             SAMPLED_SENTIMENT_AGGREGATION_VERSION, long::SAMPLED_SENTIMENT_MAP_AGGREGATION,
             quantized::{Int8SampledSentimentPlanner, INT8_SAMPLED_SENTIMENT_EXECUTION,
+                INT8_SAMPLED_SENTIMENT_SPARSE_EXECUTION,
                 long::{Int8SampledSentimentMapLimits, Int8SampledSentimentMapRun,
-                    INT8_SAMPLED_SENTIMENT_MAP_EXECUTION}}}}},
+                    INT8_SAMPLED_SENTIMENT_MAP_EXECUTION, INT8_SAMPLED_SENTIMENT_MAP_SPARSE_EXECUTION}}}}},
     tokenizer::untrusted::UntrustedEncoding,
 };
 
@@ -57,6 +59,8 @@ pub struct Int8SampledSentimentDocumentJobRecipe {
     job: JobLimits,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefill: Option<PrefillRecipe>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_selected_rows: Option<usize>,
 }
 #[derive(Serialize)]
 struct MappingRecipe {
@@ -125,7 +129,8 @@ impl Int8SampledSentimentDocumentJobRecipe {
             chunk_address_version: "int8-sampled-sentiment-original-chunk-address-v1",
             sample_address_stride: MAX_SENTIMENT_SAMPLES, task_budget,
             default_axes: SampledSentimentBatchArgs::default().axes, sampling, planning: planning.into(),
-            mapping: mapping.into(), native: native.into(), input_encoding, job, prefill: None };
+            mapping: mapping.into(), native: native.into(), input_encoding, job, prefill: None,
+            max_selected_rows: None };
         recipe.check_job_limits(job)?;
         recipe.check_bytes()?;
         Ok(recipe)
@@ -137,6 +142,15 @@ impl Int8SampledSentimentDocumentJobRecipe {
     fn check_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> {
         limits.validate().map_err(|_| BatchCode::InvalidLimits)?;
         self.mapping.limits().validate(self.task_budget).map_err(|_| BatchCode::InvalidLimits)?;
+        let (execution, child, native) = match self.max_selected_rows {
+            Some(max_rows_per_step) => {
+                Int8JsonSparseLimits { max_rows_per_step }.validate().map_err(|_| BatchCode::InvalidLimits)?;
+                (INT8_SAMPLED_SENTIMENT_MAP_SPARSE_EXECUTION,
+                    INT8_SAMPLED_SENTIMENT_SPARSE_EXECUTION, INT8_JSON_SAMPLED_SPARSE_EXECUTION)
+            }
+            None => (INT8_SAMPLED_SENTIMENT_MAP_EXECUTION,
+                INT8_SAMPLED_SENTIMENT_EXECUTION, INT8_JSON_SAMPLED_EXECUTION),
+        };
         if limits != self.job || limits.max_id_bytes > 256
             || self.planning.max_input_bytes > limits.max_input_bytes_per_item
             || self.mapping.chunks.max_input_bytes > limits.max_input_bytes_per_item
@@ -144,12 +158,21 @@ impl Int8SampledSentimentDocumentJobRecipe {
             || self.mapping.max_result_bytes > limits.max_result_bytes as u64
             || limits.max_work != (JobWork { model: self.native.max_model_work,
                 mask_node_visits: self.native.max_mask_visits_per_run })
-            || self.execution != INT8_SAMPLED_SENTIMENT_MAP_EXECUTION
-            || self.child_execution != INT8_SAMPLED_SENTIMENT_EXECUTION
-            || self.native_execution != INT8_JSON_SAMPLED_EXECUTION {
+            || self.execution != execution || self.child_execution != child || self.native_execution != native {
             return Err(BatchCode::InvalidLimits.into());
         }
         Ok(())
+    }
+    fn with_projection(mut self, selected: Option<Int8JsonSparseLimits>) -> Result<Self, BatchFault> {
+        if let Some(limits) = selected {
+            self.max_selected_rows = Some(limits.validate().map_err(|_| BatchCode::InvalidLimits)?);
+            self.execution = INT8_SAMPLED_SENTIMENT_MAP_SPARSE_EXECUTION;
+            self.child_execution = INT8_SAMPLED_SENTIMENT_SPARSE_EXECUTION;
+            self.native_execution = INT8_JSON_SAMPLED_SPARSE_EXECUTION;
+        }
+        self.check_job_limits(self.job)?;
+        self.check_bytes()?;
+        Ok(self)
     }
     fn with_prefill(mut self, limits: Int8PrefillLimits) -> Result<Self, BatchFault> {
         limits.validate().map_err(|_| BatchCode::InvalidLimits)?;
@@ -180,7 +203,8 @@ impl Int8SampledSentimentDocumentJobPlanner {
         let task = planner.task_budget();
         let compiler = Int8SampledSentimentDocumentPlanner::new(planner, vocabulary, task, mapping, native)?;
         let recipe = Int8SampledSentimentDocumentJobRecipe::new(task, compiler.sampling_options().clone(),
-            compiler.planning_limits(), mapping, native, compiler.document_encoding().clone(), limits)?;
+            compiler.planning_limits(), mapping, native, compiler.document_encoding().clone(), limits)?
+            .with_projection(compiler.selected_rows())?;
         let preparation_bytes = compiler.preparation_requirement_bytes()
             .checked_add(SAMPLED_SENTIMENT_JOB_RECIPE_BYTES as u64).ok_or(BatchCode::InvalidLimits)?;
         let identity = compiler.base_execution_identity().clone();
@@ -196,6 +220,7 @@ impl Int8SampledSentimentDocumentJobPlanner {
     pub fn mapping_limits(&self) -> Int8SampledSentimentMapLimits { self.compiler.mapping() }
     pub fn planning_limits(&self) -> SampledSentimentLimits { self.compiler.planning_limits() }
     pub fn sampling_options(&self) -> &SampledSentimentOptions { &self.recipe.sampling }
+    pub fn selected_rows(&self) -> Option<Int8JsonSparseLimits> { self.compiler.selected_rows() }
     pub fn document_encoding(&self) -> &UntrustedEncoding { self.compiler.document_encoding() }
     pub fn preparation_requirement_bytes(&self) -> u64 { self.preparation_bytes }
     pub fn max_result_bytes(&self) -> u64 { self.recipe.mapping.max_result_bytes }

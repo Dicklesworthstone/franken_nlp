@@ -6,6 +6,7 @@
 //! scalar-weighted replicates, never full-context equivalence or confidence.
 use super::*;
 use std::cell::RefCell;
+use crate::native_engine::constrained_int8::sparse::Int8JsonSparseLimits;
 use crate::{tasks::mapreduce::{CHUNK_PROFILE, ChunkLimits, ChunkPlan, MapReduceError},
     validation::grounded_fields::VerifiedSourceSpan};
 use super::super::{budget_fits, MIB,
@@ -17,6 +18,8 @@ mod execution;
 pub mod memory;
 
 pub const INT8_SAMPLED_SENTIMENT_MAP_EXECUTION: &str = "portable-int8-complete-sampled-sentiment-map-v1";
+pub const INT8_SAMPLED_SENTIMENT_MAP_SPARSE_EXECUTION: &str =
+    "portable-int8-complete-sampled-sentiment-map-selected-rows-v1";
 pub const MAX_INT8_SAMPLED_SENTIMENT_MAP_CHUNKS: usize = 256;
 const SEMANTICS: &str = "independent-chunks-ordinal-paired-scalar-weighted-document-replicates-v1";
 const MAX_BYTES: u64 = 64 * MIB;
@@ -151,12 +154,18 @@ pub struct Int8SampledSentimentMapPreflight {
     encoding: Option<crate::tokenizer::untrusted::SafeBpeLimits>,
     encoding_work: SafeBpeWork,
     request_binding: [u8; 32],
+    selected_rows: Option<Int8JsonSparseLimits>,
 }
 impl Int8SampledSentimentMapPreflight {
     pub fn source_span(&self) -> VerifiedSourceSpan { self.source_span }
     pub fn chunk_count(&self) -> usize { self.chunks }
     pub fn planned_work(&self) -> Int8Work { self.work }
     pub fn max_result_bytes(&self) -> u64 { self.max_result_bytes }
+    pub fn selected_rows(&self) -> Option<Int8JsonSparseLimits> { self.selected_rows }
+    pub fn execution_version(&self) -> &'static str {
+        if self.selected_rows.is_some() { INT8_SAMPLED_SENTIMENT_MAP_SPARSE_EXECUTION }
+        else { INT8_SAMPLED_SENTIMENT_MAP_EXECUTION }
+    }
     fn encoding_record(&self) -> Option<SampledSentimentMapEncoding> {
         self.encoding.map(|limits| SampledSentimentMapEncoding {
             policy: UntrustedEncoding::SafeBpeV1(limits), work: self.encoding_work })
@@ -279,7 +288,8 @@ impl Int8SampledSentimentPlanner {
             max_retained_bytes: limits.max_retained_result_bytes, max_result_bytes: limits.max_result_bytes,
             chunk_limits, tokenizer_checks: chunks.tokenizer_calls(), geometry,
             encoding: match self.input_encoding() { UntrustedEncoding::ByteFallback => None,
-                UntrustedEncoding::SafeBpeV1(limits) => Some(*limits) }, encoding_work, request_binding };
+                UntrustedEncoding::SafeBpeV1(limits) => Some(*limits) }, encoding_work, request_binding,
+            selected_rows: self.selected_rows() };
         let preparation_bytes = super::super::long::memory::prepared_bytes_bound(self.limits,
             limits.chunks, limits.max_retained_result_bytes, plans.len(), retained_prompt_tokens,
             self.encoding_workspace_bytes()?)?;
@@ -296,6 +306,8 @@ impl PreparedInt8SampledSentimentMap {
     pub fn sample_count(&self) -> usize { self.expected.chunks * self.expected.axes * self.expected.samples }
     pub fn max_output_tokens(&self) -> u64 { self.expected.max_output_tokens }
     pub fn max_result_bytes(&self) -> u64 { self.expected.max_result_bytes }
+    pub fn selected_rows(&self) -> Option<Int8JsonSparseLimits> { self.expected.selected_rows }
+    pub fn execution_version(&self) -> &'static str { self.expected.execution_version() }
     pub fn preparation_requirement_bytes(&self) -> u64 { self.preparation_bytes }
     pub fn preflight_metadata(&self) -> Int8SampledSentimentMapPreflight { self.expected }
 }

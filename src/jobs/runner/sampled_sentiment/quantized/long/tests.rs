@@ -144,6 +144,32 @@ fn physical_prefill_binds_resume_without_refunding_cold_native_or_mask_debits() 
     assert_eq!(prefetched.job.max_work, cold.job.max_work);
     assert_eq!(prefetched.prefill_limits().unwrap().max_batch_rows, 4);
 }
+
+#[test]
+fn document_selected_projection_binds_cap_and_all_nested_execution_profiles() {
+    assert!(serde_json::to_value(recipe()).unwrap().get("max_selected_rows").is_none());
+    let selected = recipe().with_projection(Some(Int8JsonSparseLimits { max_rows_per_step: 32 })).unwrap();
+    selected.check_job_limits(limits()).unwrap();
+    let value = serde_json::to_value(&selected).unwrap();
+    assert_eq!(value["max_selected_rows"], 32);
+    assert_eq!(value["execution"], INT8_SAMPLED_SENTIMENT_MAP_SPARSE_EXECUTION);
+    assert_eq!(value["child_execution"], INT8_SAMPLED_SENTIMENT_SPARSE_EXECUTION);
+    assert_eq!(value["native_execution"], INT8_JSON_SAMPLED_SPARSE_EXECUTION);
+    assert_eq!(freeze(&recipe()).binding.compare(&freeze(&selected).binding),
+        Err(JobError::Mismatch(MismatchField::Recipe)));
+    let changed = recipe().with_projection(Some(Int8JsonSparseLimits { max_rows_per_step: 33 })).unwrap();
+    assert_eq!(freeze(&selected).binding.compare(&freeze(&changed).binding),
+        Err(JobError::Mismatch(MismatchField::Recipe)));
+    for field in 0..3 {
+        let mut mixed = recipe().with_projection(Some(Int8JsonSparseLimits { max_rows_per_step: 32 })).unwrap();
+        match field {
+            0 => mixed.execution = INT8_SAMPLED_SENTIMENT_MAP_EXECUTION,
+            1 => mixed.child_execution = INT8_SAMPLED_SENTIMENT_EXECUTION,
+            _ => mixed.native_execution = INT8_JSON_SAMPLED_EXECUTION,
+        }
+        assert!(mixed.check_job_limits(limits()).is_err());
+    }
+}
 #[test]
 fn actual_factory_keeps_effective_seed_native_identity_encoding_and_retained_owners() {
     let vocabulary = Arc::new(SampledSentimentVocabulary::pinned().unwrap());
@@ -280,6 +306,27 @@ fn changed_private_seed_refuses_before_replay_or_result_tail_repair() {
     let mut changed = Fixture::new(Rc::clone(&events), false); changed.recipe.sampling.effective_seed[0] ^= 1;
     let failure = JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([9; 16]), limits(),
         retention(), changed, TailPolicy::DiscardUncommitted, &mut Continue).err().unwrap();
+    assert_eq!(failure, JobRunError::Storage(JobError::Mismatch(MismatchField::Recipe)));
+    assert_eq!(fs::read(root.0.join("results.spool")).unwrap(), before);
+    assert!(events.ids.borrow().is_empty());
+}
+
+#[test]
+fn changing_selected_cap_refuses_retained_resume_before_tail_repair_or_execution() {
+    use std::io::Write;
+    let root = Root::new(); let events = Rc::new(Events::default()); let population = inputs();
+    let make = |cap| {
+        let mut fixture = Fixture::new(Rc::clone(&events), false);
+        fixture.recipe = fixture.recipe.with_projection(Some(Int8JsonSparseLimits { max_rows_per_step: cap })).unwrap();
+        fixture
+    };
+    drop(JobRunner::create_with_retained_inputs(&root.0, key(), JobId([9; 16]), limits(), retention(),
+        &population, make(32), &mut Continue).unwrap());
+    let mut spool = fs::OpenOptions::new().append(true).open(root.0.join("results.spool")).unwrap();
+    spool.write_all(b"uncommitted selected tail").unwrap(); spool.sync_all().unwrap(); drop(spool);
+    let before = fs::read(root.0.join("results.spool")).unwrap();
+    let failure = JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([9; 16]), limits(),
+        retention(), make(33), TailPolicy::DiscardUncommitted, &mut Continue).err().unwrap();
     assert_eq!(failure, JobRunError::Storage(JobError::Mismatch(MismatchField::Recipe)));
     assert_eq!(fs::read(root.0.join("results.spool")).unwrap(), before);
     assert!(events.ids.borrow().is_empty());

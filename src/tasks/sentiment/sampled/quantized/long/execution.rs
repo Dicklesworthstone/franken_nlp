@@ -105,7 +105,7 @@ impl PreparedInt8SampledSentimentMap {
         let aggregate = reduction::aggregate_chunks_with_control(&chunks, self.expected.source_span,
             self.expected.samples, control)?;
         let mut run = Int8SampledSentimentMapRun { schema_version: 1,
-            execution: INT8_SAMPLED_SENTIMENT_MAP_EXECUTION.to_owned(), numerics_profile: STRICT_INT8_PROFILE.to_owned(),
+            execution: self.execution_version().to_owned(), numerics_profile: STRICT_INT8_PROFILE.to_owned(),
             chunk_profile: CHUNK_PROFILE.to_owned(), semantics: SEMANTICS.to_owned(),
             single_context_equivalence: false, source_span: self.expected.source_span,
             chunk_limits: self.expected.chunk_limits, tokenizer_checks: self.expected.tokenizer_checks,
@@ -126,7 +126,7 @@ impl Int8SampledSentimentMapPreflight {
         checkpoint(control)?;
         if run.request_binding != self.request_binding
             || run.result_binding != binding::result(run, self.max_result_bytes, control)?
-            || run.schema_version != 1 || run.execution != INT8_SAMPLED_SENTIMENT_MAP_EXECUTION
+            || run.schema_version != 1 || run.execution != self.execution_version()
             || run.numerics_profile != STRICT_INT8_PROFILE || run.chunk_profile != CHUNK_PROFILE
             || run.semantics != SEMANTICS || run.single_context_equivalence
             || run.source_span != self.source_span || run.chunk_limits != self.chunk_limits
@@ -147,7 +147,7 @@ impl Int8SampledSentimentMapPreflight {
             checkpoint(control)?;
             if chunk.source_tokens == 0
                 || (self.encoding.is_none() && chunk.source_tokens != chunk.source_span.byte_end - chunk.source_span.byte_start)
-                || chunk.run.execution != INT8_SAMPLED_SENTIMENT_EXECUTION
+                || chunk.run.execution != projection::execution(self.selected_rows, false)
                 || chunk.run.samples_per_axis != self.samples || chunk.run.dimensions.len() != self.axes {
                 return Err(Int8SampledSentimentMapError::Admission);
             }
@@ -192,8 +192,10 @@ impl reduction::SampledMapChunk for Int8SampledSentimentMapChunk {
     fn validate(&self, samples: usize, control: &mut impl DecodeStepControl)
         -> Result<(), SampledSentimentMapError> {
         let run = &self.run;
+        let selected = run.execution == INT8_SAMPLED_SENTIMENT_SPARSE_EXECUTION;
         if run.schema_version != 1 || run.task_spec != "sentiment-v1"
-            || run.execution != INT8_SAMPLED_SENTIMENT_EXECUTION || run.numerics_profile != STRICT_INT8_PROFILE
+            || (!selected && run.execution != INT8_SAMPLED_SENTIMENT_EXECUTION)
+            || run.numerics_profile != STRICT_INT8_PROFILE
             || run.aggregation != SAMPLED_SENTIMENT_AGGREGATION_VERSION
             || run.interpretation != "generated_score_variation_not_calibrated_confidence"
             || run.justification_status != "unverified_model_explanations_from_untrusted_document"
@@ -213,7 +215,12 @@ impl reduction::SampledMapChunk for Int8SampledSentimentMapChunk {
                     || sample.justification.chars().count() > 4096
                     || !(1..=1024).contains(&sample.generated_tokens) || sample.mask_node_visit_charge == 0
                     || sample.model_work.forward_positions < sample.generated_tokens as u64
-                    || sample.model_work.projected_logits != sample.generated_tokens as u64 * NANBEIGE_VOCAB_SIZE as u64 {
+                    || if selected {
+                        sample.model_work.projected_logits < sample.generated_tokens as u64
+                            || sample.model_work.projected_logits > sample.generated_tokens as u64 * NANBEIGE_VOCAB_SIZE as u64
+                    } else {
+                        sample.model_work.projected_logits != sample.generated_tokens as u64 * NANBEIGE_VOCAB_SIZE as u64
+                    } {
                     return Err(SampledSentimentMapError::Aggregation);
                 }
                 work = work.checked_add(sample.model_work).map_err(|_| SampledSentimentMapError::Aggregation)?;

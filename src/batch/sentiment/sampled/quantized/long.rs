@@ -7,9 +7,9 @@ use crate::tasks::sentiment::sampled::{
     long::SampledSentimentMapError,
     quantized::long::{PreparedInt8SampledSentimentMap, Int8SampledSentimentMapError,
         Int8SampledSentimentMapLimits, Int8SampledSentimentMapRun,
-        INT8_SAMPLED_SENTIMENT_MAP_EXECUTION,
         memory::{MIN_INT8_SAMPLED_SENTIMENT_MAP_PREPARATION_BYTES, Int8SampledSentimentMapMemoryLimits}},
 };
+use crate::native_engine::constrained_int8::sparse::Int8JsonSparseLimits;
 
 pub fn int8_sampled_sentiment_document_preparation_bytes(task: TaskBudget,
     planning: SampledSentimentLimits, mapping: Int8SampledSentimentMapLimits,
@@ -66,6 +66,7 @@ impl Int8SampledSentimentDocumentPlanner {
     pub fn preparation_requirement_bytes(&self) -> u64 { self.preparation_bytes }
     pub fn planning_limits(&self) -> SampledSentimentLimits { self.planner.limits() }
     pub fn sampling_options(&self) -> &SampledSentimentOptions { self.planner.sampling_options() }
+    pub fn selected_rows(&self) -> Option<Int8JsonSparseLimits> { self.planner.selected_rows() }
     /// Hosts retain these same allocations outside the team callback through
     /// physical worker join, including unwind and discarded queued work.
     pub(crate) fn retained_owners(&self)
@@ -93,6 +94,7 @@ pub struct Int8SampledSentimentDocumentPlanFacts<'a> {
     pub max_result_bytes: u64,
     pub max_output_tokens: u64,
     pub preparation_bytes: u64,
+    pub selected_rows: Option<Int8JsonSparseLimits>,
 }
 pub struct Int8SampledSentimentDocumentAdmission<'a> {
     pub facts: Int8SampledSentimentDocumentPlanFacts<'a>,
@@ -112,7 +114,8 @@ impl PreparedInt8SampledSentimentDocumentRecord {
     pub fn mask_node_visits(&self) -> u64 { self.record.mask_node_visits }
     pub fn max_result_bytes(&self) -> u64 { self.record.plan.max_result_bytes() }
     pub fn max_output_tokens(&self) -> u64 { self.record.plan.max_output_tokens() }
-    pub fn execution_version(&self) -> &'static str { INT8_SAMPLED_SENTIMENT_MAP_EXECUTION }
+    pub fn selected_rows(&self) -> Option<Int8JsonSparseLimits> { self.record.plan.selected_rows() }
+    pub fn execution_version(&self) -> &'static str { self.record.plan.execution_version() }
 }
 
 /// The private state is set before any fallible native/admission callback.
@@ -212,7 +215,8 @@ impl DocumentPlan for PreparedInt8SampledSentimentMap {
         Int8SampledSentimentDocumentPlanFacts { identity: self.execution_identity(), model_work: self.planned_work(),
             sample_count: self.sample_count(), chunk_count: self.chunk_count(), required_context: self.required_context(),
             original_task: self.task_budget(), max_result_bytes: self.max_result_bytes(),
-            max_output_tokens: self.max_output_tokens(), preparation_bytes: self.preparation_requirement_bytes() }
+            max_output_tokens: self.max_output_tokens(), preparation_bytes: self.preparation_requirement_bytes(),
+            selected_rows: self.selected_rows() }
     }
     fn verify_identity(&self, admitted: &ExecutionIdentity) -> Result<(), BatchItemFailure> {
         if admitted != self.execution_identity() { Err(BatchItemFailure::fatal(BatchCode::Admission)) } else { Ok(()) }

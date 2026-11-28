@@ -75,10 +75,16 @@ impl PreparedInt8SampledSentiment {
             // The native owner finalizes each sample before its one session
             // can close; any failure aborts the entire axis, with no partial
             // result. Drop clears its prefix before a different axis starts.
-            let samples = constrained_int8::decode_json_int8_sampled_reusing_prefill_with(
-                engine, &axis.identity, &axis.prompt, &self.inner.program, &vocabulary.oracle,
-                &self.inner.decode, &addresses, axis_budget, max_sampler_bytes, prefill,
-                control, &mut finalize)?;
+            let samples = match self.selected_rows {
+                Some(selected) => constrained_int8::decode_json_int8_sampled_sparse_reusing_prefill_with(
+                    engine, &axis.identity, &axis.prompt, &self.inner.program, &vocabulary.oracle,
+                    &self.inner.decode, &addresses, axis_budget, max_sampler_bytes, selected, prefill,
+                    control, &mut finalize),
+                None => constrained_int8::decode_json_int8_sampled_reusing_prefill_with(
+                    engine, &axis.identity, &axis.prompt, &self.inner.program, &vocabulary.oracle,
+                    &self.inner.decode, &addresses, axis_budget, max_sampler_bytes, prefill,
+                    control, &mut finalize),
+            }?;
             if engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) {
                 return Err(SampledSentimentError::Accounting.into());
             }
@@ -93,7 +99,7 @@ impl PreparedInt8SampledSentiment {
             checkpoint(control)?;
         }
         let run = Int8SampledSentimentRun { schema_version: 1,
-            execution: INT8_SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION.to_owned(),
+            execution: self.execution_version(true).to_owned(),
             task_spec: "sentiment-v1".to_owned(), prompt_template_sha256: self.inner.identity.template_digest,
             numerics_profile: STRICT_INT8_PROFILE.to_owned(),
             aggregation: SAMPLED_SENTIMENT_AGGREGATION_VERSION.to_owned(),

@@ -175,6 +175,28 @@ fn compact_policy_and_invocation_work_and_prefill_are_private_recipe_authority()
 }
 
 #[test]
+fn selected_projection_cap_and_execution_profiles_are_authenticated_without_changing_legacy_recipes() {
+    let original = recipe(native());
+    assert!(serde_json::to_value(&original).unwrap().get("max_selected_rows").is_none());
+    let selected = recipe(native()).with_projection(Some(Int8JsonSparseLimits { max_rows_per_step: 32 })).unwrap();
+    selected.check_job_limits(limits(native())).unwrap();
+    distinct(&selected);
+    let value = serde_json::to_value(&selected).unwrap();
+    assert_eq!(value["max_selected_rows"], 32);
+    assert_eq!(value["execution"], INT8_SAMPLED_SENTIMENT_SPARSE_EXECUTION);
+    assert_eq!(value["native_execution"], INT8_JSON_SAMPLED_SPARSE_EXECUTION);
+    assert_eq!(selected.native.max_sampler_bytes, original.native.max_sampler_bytes);
+    assert_eq!(selected.job.max_work, original.job.max_work);
+    let changed = recipe(native()).with_projection(Some(Int8JsonSparseLimits { max_rows_per_step: 33 })).unwrap();
+    assert_eq!(freeze(&selected).binding.compare(&freeze(&changed).binding),
+        Err(JobError::Mismatch(MismatchField::Recipe)));
+    let mut mixed = recipe(native()).with_projection(Some(Int8JsonSparseLimits { max_rows_per_step: 32 })).unwrap();
+    mixed.native_execution = INT8_JSON_SAMPLED_EXECUTION;
+    assert!(mixed.check_job_limits(limits(native())).is_err());
+    assert!(recipe(native()).with_projection(Some(Int8JsonSparseLimits { max_rows_per_step: 0 })).is_err());
+}
+
+#[test]
 fn immutable_job_envelope_requires_exact_native_and_mask_lifetime_caps() {
     let exact = limits(native());
     for axis in 0..6 {

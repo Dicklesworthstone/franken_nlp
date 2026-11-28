@@ -17,6 +17,7 @@ use crate::{
     jobs::{JobLimits, JobWork, manifest::bounded_json, runner::DurableBatchProcessor},
     native_engine::{constrained::JsonWorkBudget,
         constrained_int8::{self, Int8JsonBudget, Int8JsonError, INT8_JSON_SAMPLED_EXECUTION,
+            INT8_JSON_SAMPLED_SPARSE_EXECUTION, sparse::Int8JsonSparseLimits,
             JSON_SAMPLER_VERSION, json_sampling_workspace_bytes},
         decode::DecodeStepControl, portable_int8::ProjectionWork,
         strict_int8::{Int8MemoryRequirement, Int8RunBudget, Int8Work, StrictInt8Engine, STRICT_INT8_PROFILE,
@@ -26,7 +27,8 @@ use crate::{
         MAX_SENTIMENT_SAMPLES, SAMPLED_SENTIMENT_AGGREGATION_VERSION,
         SAMPLED_SENTIMENT_ITEM_ADDRESS_VERSION, SAMPLED_SENTIMENT_PROMPT_VERSION,
         quantized::{Int8SampledSentimentError, Int8SampledSentimentPlanner, Int8SampledSentimentRun,
-            PreparedInt8SampledSentiment, INT8_SAMPLED_SENTIMENT_EXECUTION, check_model}}}},
+            PreparedInt8SampledSentiment, INT8_SAMPLED_SENTIMENT_EXECUTION,
+            INT8_SAMPLED_SENTIMENT_SPARSE_EXECUTION, check_model}}}},
     tokenizer::untrusted::{SafeBpeWork, SafeBpeWorkLimits, UntrustedEncoding},
 };
 
@@ -105,6 +107,8 @@ pub struct Int8SampledSentimentJobRecipe {
     job: JobLimits,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefill: Option<PrefillRecipe>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_selected_rows: Option<usize>,
 }
 impl Int8SampledSentimentJobRecipe {
     fn new(task_budget: TaskBudget, sampling: SampledSentimentOptions,
@@ -129,7 +133,7 @@ impl Int8SampledSentimentJobRecipe {
             task_spec: "sentiment-v1", task_budget, default_axes: SampledSentimentBatchArgs::default().axes,
             sampling, planning: planning.into(), native: native.into(), input_encoding,
             encoding_work_scope: "one-invocation-including-rejected-preparation-v1",
-            encoding_work_limits, job, prefill: None };
+            encoding_work_limits, job, prefill: None, max_selected_rows: None };
         recipe.check_job_limits(job)?;
         bounded_json(&recipe, SAMPLED_SENTIMENT_JOB_RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
         Ok(recipe)
@@ -142,6 +146,16 @@ impl Int8SampledSentimentJobRecipe {
         bounded_json(&self, SAMPLED_SENTIMENT_JOB_RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
         Ok(self)
     }
+    fn with_projection(mut self, selected: Option<Int8JsonSparseLimits>) -> Result<Self, BatchFault> {
+        if let Some(limits) = selected {
+            self.max_selected_rows = Some(limits.validate().map_err(|_| BatchCode::InvalidLimits)?);
+            self.execution = INT8_SAMPLED_SENTIMENT_SPARSE_EXECUTION;
+            self.native_execution = INT8_JSON_SAMPLED_SPARSE_EXECUTION;
+        }
+        self.check_job_limits(self.job)?;
+        bounded_json(&self, SAMPLED_SENTIMENT_JOB_RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
+        Ok(self)
+    }
     fn prefill_limits(&self) -> Option<Int8PrefillLimits> {
         self.prefill.as_ref().map(|prefill| Int8PrefillLimits {
             max_batch_rows: prefill.max_batch_rows, max_extra_scratch_bytes: prefill.max_extra_scratch_bytes })
@@ -151,11 +165,19 @@ impl Int8SampledSentimentJobRecipe {
     }
     fn check_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> {
         limits.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        let (execution, native) = match self.max_selected_rows {
+            Some(max_rows_per_step) => {
+                Int8JsonSparseLimits { max_rows_per_step }.validate().map_err(|_| BatchCode::InvalidLimits)?;
+                (INT8_SAMPLED_SENTIMENT_SPARSE_EXECUTION, INT8_JSON_SAMPLED_SPARSE_EXECUTION)
+            }
+            None => (INT8_SAMPLED_SENTIMENT_EXECUTION, INT8_JSON_SAMPLED_EXECUTION),
+        };
         if limits != self.job || limits.max_id_bytes > 256
             || self.planning.max_input_bytes > limits.max_input_bytes_per_item
             || limits.max_work != (JobWork { model: self.native.max_model_work,
                 mask_node_visits: self.native.max_mask_visits_per_run })
-            || self.max_result_bytes() > limits.max_result_bytes as u64 {
+            || self.max_result_bytes() > limits.max_result_bytes as u64
+            || self.execution != execution || self.native_execution != native {
             return Err(BatchCode::InvalidLimits.into());
         }
         Ok(())
@@ -194,7 +216,7 @@ impl Int8SampledSentimentJobPlanner {
         let encoding = EncodingWorkScope::new(planner.input_encoding(), total)?;
         let recipe = Int8SampledSentimentJobRecipe::new(planner.task_budget(),
             planner.durable_options().clone(), planner.limits(), native,
-            planner.input_encoding().clone(), total, job)?;
+            planner.input_encoding().clone(), total, job)?.with_projection(planner.selected_rows())?;
         let preparation_bytes = sampled_sentiment_job_preparation_bytes(
             planner.task_budget(), planner.limits(), planner.input_encoding())?
             .checked_add(if total.is_some() { 1024 } else { 0 }).ok_or(BatchCode::InvalidLimits)?;
@@ -212,6 +234,7 @@ impl Int8SampledSentimentJobPlanner {
     pub fn task_budget(&self) -> TaskBudget { self.planner.task_budget() }
     pub fn native_limits(&self) -> Int8SampledSentimentJobLimits { self.native }
     pub fn planning_limits(&self) -> SampledSentimentLimits { self.planner.limits() }
+    pub fn selected_rows(&self) -> Option<Int8JsonSparseLimits> { self.planner.selected_rows() }
     pub fn document_encoding(&self) -> &UntrustedEncoding { self.planner.input_encoding() }
     pub fn encoding_work_limits(&self) -> Option<SafeBpeWorkLimits> { self.encoding.limits }
     pub fn encoding_work(&self) -> Result<SafeBpeWork, BatchFault> { self.encoding.work() }
@@ -424,7 +447,7 @@ fn native_budget(work: Int8Work, kv_bytes: u64, masks: u64,
 }
 fn valid_result(plan: &PreparedInt8SampledSentiment, run: &Int8SampledSentimentRun, masks: u64) -> bool {
     let samples = run.dimensions.iter().try_fold(0_usize, |n, axis| n.checked_add(axis.samples.len()));
-    run.schema_version == 1 && run.execution == INT8_SAMPLED_SENTIMENT_EXECUTION
+    run.schema_version == 1 && run.execution == plan.execution_version(false)
         && run.task_spec == "sentiment-v1" && run.sampler_version == JSON_SAMPLER_VERSION
         && run.prompt_template_sha256 == plan.execution_identity().template_digest
         && run.numerics_profile == STRICT_INT8_PROFILE

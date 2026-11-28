@@ -2,7 +2,8 @@
 //!
 //! Prompt bytes, control-free source encoding, bounded grammar, sample addresses,
 //! validation and aggregation are shared with the grouped-INT4 task. Every
-//! sample owns an independent causal branch and projects the complete vocabulary.
+//! sample owns an independent causal branch. Full-vocabulary projection remains
+//! the default; explicit selected-row execution projects every grammar-legal row.
 //! The default uses fresh sessions; explicit reuse retains one axis's exact
 //! prompt prefix inside a single session without changing sample addresses.
 //! This is a distinct sampled estimator, never sampling distribution-mode bins.
@@ -18,7 +19,7 @@ use crate::{
         constrained::JsonWorkBudget,
         constrained_int8::{self, Int8JsonBudget, Int8JsonError, Int8JsonRun,
             Int8JsonSamplingOptions, INT8_JSON_SAMPLED_EXECUTION, JSON_SAMPLER_VERSION,
-            json_sampling_workspace_bytes},
+            json_sampling_workspace_bytes, sparse::Int8JsonSparseLimits},
         decode::{DecodeCancellationKind, DecodeStepControl},
         kv::KV_BYTES_PER_TOKEN,
         lmhead::NANBEIGE_VOCAB_SIZE,
@@ -39,7 +40,10 @@ use super::{
 };
 
 pub mod long;
+mod projection;
 mod reuse;
+pub use projection::{INT8_SAMPLED_SENTIMENT_SPARSE_EXECUTION,
+    INT8_SAMPLED_SENTIMENT_SPARSE_REUSED_PREFILL_EXECUTION};
 pub use reuse::INT8_SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION;
 
 pub const INT8_SAMPLED_SENTIMENT_EXECUTION: &str = "portable-int8-independent-sampled-sentiment-v1";
@@ -102,6 +106,8 @@ pub struct Int8SampledSentimentPlanner {
     options: SampledSentimentOptions,
     ceiling: TaskBudget,
     limits: SampledSentimentLimits,
+    selected_rows: Option<Int8JsonSparseLimits>,
+    admission_identity: Option<ExecutionIdentity>,
 }
 impl Int8SampledSentimentPlanner {
     pub fn for_model(model: &ArtifactIdentity, options: SampledSentimentOptions,
@@ -111,7 +117,8 @@ impl Int8SampledSentimentPlanner {
         ceiling.validate().map_err(|_| SampledSentimentError::Limits)?;
         let compiler = Compiler::pinned(&options, ceiling, limits)?;
         let identity = bind_model(unbound_identity(&compiler), model)?;
-        Ok(Self { compiler, identity, options, ceiling, limits })
+        Ok(Self { compiler, identity, options, ceiling, limits,
+            selected_rows: None, admission_identity: None })
     }
 
     pub fn for_model_with_encoding(model: &ArtifactIdentity, options: SampledSentimentOptions,
@@ -128,11 +135,14 @@ impl Int8SampledSentimentPlanner {
         self.compiler.set_input_encoding(encoding)?;
         self.identity.template_digest = self.compiler.template_digest;
         self.identity.validate().map_err(|_| SampledSentimentError::Identity)?;
+        self.refresh_projection_identity()?;
         Ok(self)
     }
 
     pub fn input_encoding(&self) -> &UntrustedEncoding { &self.compiler.input_encoding }
-    pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
+    pub fn execution_identity(&self) -> &ExecutionIdentity {
+        self.admission_identity.as_ref().unwrap_or(&self.identity)
+    }
     pub fn task_budget(&self) -> TaskBudget { self.ceiling }
     pub fn limits(&self) -> SampledSentimentLimits { self.limits }
     pub fn sampling_options(&self) -> &SampledSentimentOptions { &self.options }
@@ -159,7 +169,7 @@ impl Int8SampledSentimentPlanner {
         constrained_int8::check_profile(&self.identity)?;
         let inner = compile_sampled_request(&self.compiler, &self.identity, &Int8SampledSchedule,
             &self.options, self.ceiling, self.limits, request, control, work)?;
-        Ok(PreparedInt8SampledSentiment { inner })
+        PreparedInt8SampledSentiment { inner, selected_rows: None }.with_projection(self.selected_rows)
     }
 
     /// Optional stable population addressing excludes ordering/flush epochs.
@@ -181,7 +191,8 @@ impl Int8SampledSentimentPlanner {
         constrained_int8::check_profile(&self.identity)?;
         let inner = compile_sampled_request_with_encoding_budget(&self.compiler, &self.identity,
             &Int8SampledSchedule, &self.options, self.ceiling, self.limits, request, control, work, encoding_ceiling)?;
-        let mut prepared = PreparedInt8SampledSentiment { inner };
+        let mut prepared = PreparedInt8SampledSentiment { inner, selected_rows: None }
+            .with_projection(self.selected_rows)?;
         for axis in &mut prepared.inner.axes {
             axis.identity.decision_policy_digest = item_address_digest(&axis.identity, item_id)?;
             axis.identity.validate().map_err(|_| SampledSentimentError::Identity)?;
@@ -217,7 +228,10 @@ pub struct Int8SampledSentimentRun {
 
 /// Sealed exact prompts, native schedules and sample policy. Public callers
 /// cannot construct or deserialize this capability from a result envelope.
-pub struct PreparedInt8SampledSentiment { inner: CompiledSampledSentiment<Int8Work> }
+pub struct PreparedInt8SampledSentiment {
+    inner: CompiledSampledSentiment<Int8Work>,
+    selected_rows: Option<Int8JsonSparseLimits>,
+}
 impl PreparedInt8SampledSentiment {
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.inner.identity }
     pub fn planned_work(&self) -> Int8Work { self.inner.work }
@@ -307,13 +321,19 @@ impl PreparedInt8SampledSentiment {
                         .filter(|&n| n <= self.max_result_bytes()).ok_or(SampledSentimentError::OutputBudget)?;
                     Ok(sample)
                 };
-                let sample = match prefill {
-                    None => constrained_int8::decode_json_int8_sampled_with(engine, &axis.identity,
+                let sample = match (self.selected_rows, prefill) {
+                    (None, None) => constrained_int8::decode_json_int8_sampled_with(engine, &axis.identity,
                         &axis.prompt, &self.inner.program, &vocabulary.oracle, &self.inner.decode,
                         &sampling, sample_budget, max_sampler_bytes, control, finalize),
-                    Some(limits) => constrained_int8::decode_json_int8_sampled_layer_major_with(engine,
+                    (None, Some(limits)) => constrained_int8::decode_json_int8_sampled_layer_major_with(engine,
                         &axis.identity, &axis.prompt, &self.inner.program, &vocabulary.oracle,
                         &self.inner.decode, &sampling, sample_budget, max_sampler_bytes, limits, control, finalize),
+                    (Some(selected), None) => constrained_int8::decode_json_int8_sampled_sparse_with(engine,
+                        &axis.identity, &axis.prompt, &self.inner.program, &vocabulary.oracle,
+                        &self.inner.decode, &sampling, sample_budget, max_sampler_bytes, selected, control, finalize),
+                    (Some(selected), Some(limits)) => constrained_int8::decode_json_int8_sampled_sparse_layer_major_with(
+                        engine, &axis.identity, &axis.prompt, &self.inner.program, &vocabulary.oracle,
+                        &self.inner.decode, &sampling, sample_budget, max_sampler_bytes, selected, limits, control, finalize),
                 }?;
                 if engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) {
                     return Err(SampledSentimentError::Accounting.into());
@@ -329,7 +349,7 @@ impl PreparedInt8SampledSentiment {
             dimensions.push(aggregate(axis.axis, samples)?);
         }
         let run = Int8SampledSentimentRun { schema_version: 1,
-            execution: INT8_SAMPLED_SENTIMENT_EXECUTION.to_owned(), task_spec: "sentiment-v1".to_owned(),
+            execution: self.execution_version(false).to_owned(), task_spec: "sentiment-v1".to_owned(),
             prompt_template_sha256: self.inner.identity.template_digest,
             numerics_profile: STRICT_INT8_PROFILE.to_owned(),
             aggregation: SAMPLED_SENTIMENT_AGGREGATION_VERSION.to_owned(),
@@ -379,14 +399,21 @@ impl PreparedInt8SampledSentiment {
         self.finalize_sample_scheduled(axis, sample_index, run, false)
     }
 
-    fn sample_work(&self, axis: &PreparedAxis<Int8Work>, sample_index: usize,
-        generated_tokens: usize, reuse_prefill: bool) -> Result<Int8Work, Int8SampledSentimentError> {
+    fn sample_work_for_rows(&self, axis: &PreparedAxis<Int8Work>, sample_index: usize,
+        generated_tokens: usize, reuse_prefill: bool, projected_logits: u64)
+        -> Result<Int8Work, Int8SampledSentimentError> {
         if sample_index >= self.inner.options.samples || generated_tokens == 0
             || generated_tokens > self.inner.options.max_sample_tokens || axis.prompt.is_empty() {
             return Err(SampledSentimentError::Accounting.into());
         }
-        let projected = generated_tokens.checked_mul(NANBEIGE_VOCAB_SIZE)
+        let cap = self.selected_rows.map_or(NANBEIGE_VOCAB_SIZE, |limits| limits.max_rows_per_step);
+        let maximum = generated_tokens.checked_mul(cap)
             .ok_or(SampledSentimentError::Accounting)?;
+        let projected = usize::try_from(projected_logits).map_err(|_| SampledSentimentError::Accounting)?;
+        if projected < generated_tokens || projected > maximum
+            || (self.selected_rows.is_none() && projected != maximum) {
+            return Err(SampledSentimentError::Accounting.into());
+        }
         let (start, positions) = if reuse_prefill && sample_index > 0 {
             (axis.prompt.len() - 1, generated_tokens)
         } else {
@@ -399,8 +426,7 @@ impl PreparedInt8SampledSentiment {
     fn finalize_sample_scheduled(&self, axis: &PreparedAxis<Int8Work>, sample_index: usize,
         run: Int8JsonRun, reuse_prefill: bool) -> Result<Int8SampledSentimentSample, Int8SampledSentimentError> {
         let output = &run.output;
-        let execution = if reuse_prefill { constrained_int8::INT8_JSON_SAMPLED_REUSED_PREFILL_EXECUTION }
-            else { INT8_JSON_SAMPLED_EXECUTION };
+        let execution = projection::native_execution(self.selected_rows, reuse_prefill);
         if sample_index >= self.inner.options.samples || run.schema_version != 1
             || run.execution != execution || output.schema_version != 1
             || output.numerics_profile != STRICT_INT8_PROFILE || output.token_ids.is_empty()
@@ -410,7 +436,8 @@ impl PreparedInt8SampledSentiment {
                 *id as usize >= NANBEIGE_VOCAB_SIZE || self.inner.decode.excluded_token_ids.contains(id)) {
             return Err(SampledSentimentError::Accounting.into());
         }
-        let expected = self.sample_work(axis, sample_index, output.token_ids.len(), reuse_prefill)?;
+        let expected = self.sample_work_for_rows(axis, sample_index, output.token_ids.len(),
+            reuse_prefill, output.projected_logits)?;
         if run.model_work != expected || !fits_work(expected, axis.work)
             || output.forward_positions != expected.forward_positions || output.projected_logits != expected.projected_logits {
             return Err(SampledSentimentError::Accounting.into());
@@ -431,8 +458,7 @@ impl PreparedInt8SampledSentiment {
         mask_charge_per_token: u64, mask_ceiling: u64, reuse_prefill: bool, control: &mut C)
         -> Result<(), Int8SampledSentimentError> {
         checkpoint(control)?;
-        let execution = if reuse_prefill { INT8_SAMPLED_SENTIMENT_REUSED_PREFILL_EXECUTION }
-            else { INT8_SAMPLED_SENTIMENT_EXECUTION };
+        let execution = self.execution_version(reuse_prefill);
         if mask_charge_per_token == 0 || run.schema_version != 1 || run.execution != execution
             || run.task_spec != "sentiment-v1" || run.prompt_template_sha256 != self.inner.identity.template_digest
             || run.numerics_profile != STRICT_INT8_PROFILE || run.aggregation != SAMPLED_SENTIMENT_AGGREGATION_VERSION
@@ -458,7 +484,8 @@ impl PreparedInt8SampledSentiment {
                     || sample.generated_tokens == 0 || sample.generated_tokens > self.inner.options.max_sample_tokens {
                     return Err(SampledSentimentError::Accounting.into());
                 }
-                let expected = self.sample_work(axis, index, sample.generated_tokens, reuse_prefill)?;
+                let expected = self.sample_work_for_rows(axis, index, sample.generated_tokens,
+                    reuse_prefill, sample.model_work.projected_logits)?;
                 let expected_masks = (sample.generated_tokens as u64).checked_mul(mask_charge_per_token)
                     .ok_or(SampledSentimentError::Accounting)?;
                 if sample.model_work != expected || !fits_work(expected, axis.work)

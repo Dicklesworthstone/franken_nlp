@@ -65,8 +65,13 @@ fn synthetic(plan: &PreparedInt8SampledSentiment, scores: &[i16]) -> Int8Sampled
             let mut token_ids = planner().compiler.tokenizer.tokenizer()
                 .encode_byte_fallback_only(json.as_bytes()).unwrap();
             token_ids.push(plan.inner.decode.eos_token_id);
-            let model_work = constrained_int8::planned_work(axis.prompt.len(), token_ids.len()).unwrap();
-            let native = Int8JsonRun { schema_version: 1, execution: INT8_JSON_SAMPLED_EXECUTION.to_owned(),
+            let model_work = match plan.selected_rows() {
+                Some(_) => constrained_int8::sparse::planned_work(axis.prompt.len(), token_ids.len(),
+                    Int8JsonSparseLimits { max_rows_per_step: 2 }).unwrap(),
+                None => constrained_int8::planned_work(axis.prompt.len(), token_ids.len()).unwrap(),
+            };
+            let native = Int8JsonRun { schema_version: 1,
+                execution: projection::native_execution(plan.selected_rows(), false).to_owned(),
                 model_work, output: JsonDecodeOutput { schema_version: 1,
                     numerics_profile: STRICT_INT8_PROFILE.to_owned(),
                     mask_node_visit_charge: token_ids.len() as u64 * MASK_CHARGE,
@@ -79,7 +84,7 @@ fn synthetic(plan: &PreparedInt8SampledSentiment, scores: &[i16]) -> Int8Sampled
         }
         dimensions.push(aggregate(axis.axis, samples).unwrap());
     }
-    Int8SampledSentimentRun { schema_version: 1, execution: INT8_SAMPLED_SENTIMENT_EXECUTION.to_owned(),
+    Int8SampledSentimentRun { schema_version: 1, execution: plan.execution_version(false).to_owned(),
         task_spec: "sentiment-v1".to_owned(), prompt_template_sha256: plan.inner.identity.template_digest,
         numerics_profile: STRICT_INT8_PROFILE.to_owned(), aggregation: SAMPLED_SENTIMENT_AGGREGATION_VERSION.to_owned(),
         interpretation: "generated_score_variation_not_calibrated_confidence".to_owned(),
@@ -91,6 +96,8 @@ fn execute(map: &PreparedInt8SampledSentimentMap) -> Int8SampledSentimentMapRun 
     map.execute_chunks(MASK_CHARGE, native_budget(map), sampler_bytes(), &mut Continue,
         |plan, _, _| Ok(synthetic(plan, &[-20, 20]))).unwrap()
 }
+
+mod selected;
 
 #[test]
 fn complete_partition_preserves_original_utf8_crlf_and_every_sample_work_axis() {
