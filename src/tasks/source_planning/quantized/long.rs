@@ -62,7 +62,7 @@ pub struct Int8SourceMapLimits {
     pub max_mask_visits: u64,
 }
 impl Int8SourceMapLimits {
-    fn validate(self, budget: TaskBudget, planning: SourcePlanningLimits) -> Result<(), Int8SourceMapError> {
+    pub(crate) fn validate(self, budget: TaskBudget, planning: SourcePlanningLimits) -> Result<(), Int8SourceMapError> {
         self.chunks.effective_token_limit().map_err(Int8SourceMapError::Chunk)?;
         budget.validate().map_err(|_| Int8SourceMapError::InvalidLimits)?;
         if self.chunks.max_chunks > MAX_SOURCE_CHUNKS

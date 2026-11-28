@@ -56,7 +56,7 @@ impl Default for ExecutionLimits {
 }
 
 impl ExecutionLimits {
-    fn validate(self) -> bool {
+    pub(crate) fn validate(self) -> bool {
         (1..=1024).contains(&self.map_batch_chunks)
             && (2..=1024).contains(&self.reduce_fan_in)
             && self.max_reduction_levels <= 64

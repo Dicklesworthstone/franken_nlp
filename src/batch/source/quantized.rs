@@ -2,6 +2,9 @@
 //! Reuses the source task compiler, native decoder, finalizers and ordered
 //! runner. Neither a failed native task nor a failed citation becomes abstention.
 
+/// Complete original documents with one exact private question per record.
+pub mod question;
+
 use super::*;
 use crate::{
     native_engine::{constrained_int8::{self, Int8JsonBudget, Int8JsonError},
