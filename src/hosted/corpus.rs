@@ -8,6 +8,9 @@ mod sentiment;
 pub use sentiment::SentimentCorpusConfig;
 mod sampled_sentiment;
 pub use sampled_sentiment::SampledSentimentCorpusConfig;
+mod question;
+pub use question::{Int8QuestionDocumentCorpusRequirements,
+    int8_question_document_corpus_requirements};
 mod sentiment_document;
 pub use sentiment_document::{SentimentDocumentCorpusConfig,
     int8_sentiment_document_corpus_requirements};

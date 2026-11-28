@@ -4056,6 +4056,31 @@ See [retained input replay](docs/retained-inputs.md) for examples and recovery
 semantics. Source fixtures cover the new paths; Rust execution, native parity
 and physical crash qualification remain pending controller DSR gates.
 
+## Implemented candidate INT8 complete-document question populations
+
+`fnlp candidate answer-corpus` accepts ordered
+`{id,text,task_args:{question}}` records, with a different exact private question
+for each complete original source. One resident INT8 model serves the stream.
+The result preserves every independent passage answer, abstention and whitespace
+range, with citations in original-document byte and scalar coordinates. Every
+required chunk must complete before an item succeeds. These routes return
+independent answers without global synthesis or calibrated correctness claims.
+
+`fnlp candidate answer-job start|resume` applies the same document compiler and
+native executor to authenticated retained jobs. Each complete source/question
+pair is one durable item. Resume checks exact inputs, options, model and recipe
+before recovery or pending execution; native work, masks and attempt authority
+stay spent. Explicit retained-input creation/replay and materialization use the
+existing protected job machinery.
+
+Both routes admit complete source/question, identity, citation, frontier and
+native memory, and compose bounded compact input, layer-major prefill and one
+persistent projection team. The resident route keeps native, mask and QA
+verification totals across all records and flushes. Tokenizer preparation and
+reconstruction share one allowance per original source/question pair. See
+[complete-document INT8 question populations](docs/native-question-populations-int8.md)
+for commands, strict records, resource limits and the pending validation gates.
+
 ## Implemented candidate INT4 complete-source question corpora
 
 `fnlp candidate source-int4 answer-corpus` accepts ordered

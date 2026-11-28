@@ -14,6 +14,9 @@ pub use sampled_sentiment::{Int8SampledSentimentJobRequirements,
     int8_sampled_sentiment_job_requirements};
 pub mod semantic;
 mod source_document;
+mod question_document;
+pub use question_document::{Int8QuestionDocumentJobRequirements,
+    int8_question_document_job_requirements};
 pub(crate) use extract::document::extraction_document_job_workspace;
 pub(crate) use source_document::source_document_job_workspace;
 pub use manage::{JobManagementLimits, StoredJobOperation, StoredJobRequest};

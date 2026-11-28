@@ -27,6 +27,7 @@ mod source;
 mod batch;
 mod scored;
 mod sampled_sentiment;
+mod question_corpus;
 mod sentiment_map;
 mod classify_map;
 mod scored_batch;
@@ -121,6 +122,8 @@ pub(crate) enum CandidateCommand {
     SampledSentimentCorpus(sampled_sentiment::map::corpus::Command),
     SampledSentimentDocumentJob(sampled_sentiment::map::job::JobCommand),
     SampledSentimentJob(sampled_sentiment::job::JobCommand),
+    QuestionCorpus(question_corpus::QuestionCorpusCommand),
+    QuestionDocumentJob(jobs::question_document::QuestionDocumentJobCommand),
     SentimentMap(sentiment_map::SentimentMapCommand),
     ClassifyMap(classify_map::ClassifyMapCommand),
     Extract(extract::ExtractCommand),
@@ -155,6 +158,8 @@ pub(crate) fn definition() -> clap::Command {
         .subcommand(sampled_sentiment::map::corpus::definition())
         .subcommand(sampled_sentiment::map::job::definition())
         .subcommand(sampled_sentiment::job::definition())
+        .subcommand(question_corpus::definition())
+        .subcommand(jobs::question_document::definition())
         .subcommand(sentiment_map::definition())
         .subcommand(classify_map::definition())
         .subcommand(batch::definition())
@@ -218,6 +223,12 @@ impl CandidateCommand {
         }
         if name == "sentiment-sampled-job" {
             return sampled_sentiment::job::JobCommand::from_matches(matches).map(Self::SampledSentimentJob);
+        }
+        if name == "answer-corpus" {
+            return question_corpus::QuestionCorpusCommand::from_matches(matches).map(Self::QuestionCorpus);
+        }
+        if name == "answer-job" {
+            return jobs::question_document::QuestionDocumentJobCommand::from_matches(matches).map(Self::QuestionDocumentJob);
         }
         if name == "sentiment-sampled-corpus" {
             return sampled_sentiment::map::corpus::Command::from_matches(matches).map(Self::SampledSentimentCorpus);
@@ -292,6 +303,8 @@ impl CandidateCommand {
             Self::SampledSentimentCorpus(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::SampledSentimentDocumentJob(command) => command.run_owned(io::stdin(), &mut io::stdout(), &mut io::stderr()),
             Self::SampledSentimentJob(command) => command.run_owned(io::stdin(), &mut io::stdout(), &mut io::stderr()),
+            Self::QuestionCorpus(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
+            Self::QuestionDocumentJob(command) => command.run_owned(io::stdin(), &mut io::stdout(), &mut io::stderr()),
             Self::ScoreBatch(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::DocumentCorpus(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::FaithfulnessCorpus(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
@@ -348,7 +361,7 @@ impl CandidateCommand {
             // The executable dispatcher always takes run_stdio for owned IO.
             Self::Batch(_) | Self::SampledSentimentBatch(_) | Self::SampledSentimentCorpus(_)
                 | Self::SampledSentimentDocumentJob(_) | Self::ScoreBatch(_) | Self::DocumentCorpus(_) | Self::FaithfulnessCorpus(_)
-                | Self::SemanticBatch(_) | Self::SemanticJob(_)
+                | Self::SemanticBatch(_) | Self::SemanticJob(_) | Self::QuestionCorpus(_) | Self::QuestionDocumentJob(_)
                 | Self::Job(_) | Self::ScoreJob(_) | Self::TextJob(_) | Self::SampledSentimentJob(_) | Self::Stream(_) => return Err(CandidateError::Arguments),
             Self::Text { task, args } => (task, args),
         };

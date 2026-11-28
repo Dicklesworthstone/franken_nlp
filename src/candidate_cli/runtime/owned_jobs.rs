@@ -2,6 +2,7 @@
 use super::*;
 pub(in crate::candidate_cli) mod scored;
 pub(in crate::candidate_cli) mod generation;
+pub(in crate::candidate_cli) mod question_document;
 mod document;
 mod source_document;
 use std::sync::Arc;

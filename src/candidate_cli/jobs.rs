@@ -10,6 +10,7 @@ use super::source::SourceHostArgs;
 mod config;
 pub(super) mod document;
 pub(super) mod source_document;
+pub(super) mod question_document;
 pub(super) mod scored;
 pub(super) mod generation;
 pub(super) use config::{Defaults, load_defaults, native_limits, parse_limits};

@@ -102,6 +102,10 @@ pub use source_map::SourceMapConfig;
 mod stream;
 pub use stream::{ChatStreamLimits, HostedChatStream};
 pub mod corpus;
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub use corpus::jobs::{Int8QuestionDocumentJobRequirements,
+    int8_question_document_job_requirements};
 pub use dispatch::{CancellationToken, RunControl, RunStop};
 
 /// Finite cooperative execution limits, including time spent awaiting the pool.
