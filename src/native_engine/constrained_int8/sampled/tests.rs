@@ -3,9 +3,9 @@ use super::*;
 use std::collections::BTreeSet;
 use crate::grammar::{CompileLimits, runtime::SourceRuntimeLimits};
 
-struct Table { bytes: Vec<Vec<u8>>, lie: bool }
+pub(super) struct Table { bytes: Vec<Vec<u8>>, lie: bool }
 impl Table {
-    fn new(bytes: &[&[u8]]) -> Self {
+    pub(super) fn new(bytes: &[&[u8]]) -> Self {
         Self { bytes: bytes.iter().map(|bytes| bytes.to_vec()).collect(), lie: false }
     }
 }
@@ -74,14 +74,14 @@ impl prefill::PromptDriver for Script {
         Ok(())
     }
 }
-fn sampling() -> Int8JsonSamplingOptions {
+pub(super) fn sampling() -> Int8JsonSamplingOptions {
     Int8JsonSamplingOptions { effective_seed: [37; 32], temperature_milli: 1000,
         top_k: None, top_p_ppm: 1_000_000, sample_index: 0 }
 }
-fn options(tokens: usize) -> JsonDecodeOptions {
+pub(super) fn options(tokens: usize) -> JsonDecodeOptions {
     JsonDecodeOptions { max_new_tokens: tokens, eos_token_id: 0, excluded_token_ids: BTreeSet::new() }
 }
-fn identity() -> ExecutionIdentity {
+pub(super) fn identity() -> ExecutionIdentity {
     let d = Sha256Digest::of_bytes(b"sampled-int8-json-test-identity");
     ExecutionIdentity { schema_version: 1, source_revision: "fixture".to_owned(), logical_model_digest: d,
         artifact_format: "fixture".to_owned(), quant_recipe: "portable-quant-v1".to_owned(), packing_set_digest: d,
@@ -92,7 +92,7 @@ fn identity() -> ExecutionIdentity {
         tool_mode: ToolMode::None, calibration_digest: d, decision_policy_digest: d,
         backend_semantic_version: STRICT_INT8_EXECUTION.to_owned(), host_class: None, compiler_identity: None }
 }
-fn program(schema: &str) -> JsonProgram { JsonProgram::compile(schema, CompileLimits::default()).unwrap() }
+pub(super) fn program(schema: &str) -> JsonProgram { JsonProgram::compile(schema, CompileLimits::default()).unwrap() }
 fn budget(prompt: usize, tokens: usize, width: usize) -> Int8JsonBudget {
     let work = work_for_width(prompt, tokens, width).unwrap();
     Int8JsonBudget { native: Int8RunBudget::exact(work), json: JsonWorkBudget {

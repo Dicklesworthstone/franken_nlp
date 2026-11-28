@@ -364,7 +364,10 @@ pub mod prefill;
 mod sampled;
 pub use sampled::{Int8JsonSamplingOptions, INT8_JSON_SAMPLED_EXECUTION,
     INT8_JSON_SAMPLED_REUSED_PREFILL_EXECUTION, JSON_SAMPLER_VERSION,
+    INT8_JSON_SAMPLED_SPARSE_EXECUTION, INT8_JSON_SAMPLED_SPARSE_REUSED_PREFILL_EXECUTION,
     json_sampling_workspace_bytes, json_sampling_reuse_workspace_bytes,
-    decode_json_int8_sampled, decode_json_int8_sampled_layer_major};
+    decode_json_int8_sampled, decode_json_int8_sampled_layer_major,
+    decode_json_int8_sampled_sparse, decode_json_int8_sampled_sparse_layer_major};
 pub(crate) use sampled::{decode_json_int8_sampled_with, decode_json_int8_sampled_layer_major_with,
-    decode_json_int8_sampled_reusing_prefill_with};
+    decode_json_int8_sampled_reusing_prefill_with, decode_json_int8_sampled_sparse_with,
+    decode_json_int8_sampled_sparse_layer_major_with, decode_json_int8_sampled_sparse_reusing_prefill_with};

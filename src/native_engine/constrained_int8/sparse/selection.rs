@@ -7,7 +7,7 @@ const ROWS: usize = 32;
 
 /// A head-only internal adapter lets single and cohort sessions use precisely
 /// the same legal-set admission, chunk coverage and stable argmax algorithm.
-pub(super) trait Head {
+pub(in crate::native_engine::constrained_int8) trait Head {
     type Control: DecodeStepControl;
     fn control(&mut self) -> &mut Self::Control;
     fn logits(&mut self, rows: &[u32]) -> Result<Vec<f32>, Int8JsonError>;
@@ -19,8 +19,28 @@ impl<D: Driver> Head for D {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn project<D: Head>(mask: &DenseTokenMask, accepting: bool, options: &JsonDecodeOptions,
+pub(in crate::native_engine::constrained_int8) fn project<D: Head>(mask: &DenseTokenMask, accepting: bool, options: &JsonDecodeOptions,
     cap: usize, remaining: u64, driver: &mut D, step: usize) -> Result<(u32, usize), Int8JsonError> {
+    let mut best = None;
+    let count = visit(mask, accepting, options, cap, remaining, driver, step, |rows, logits| {
+        let id = select(rows, logits)?;
+        let index = rows.binary_search(&id).map_err(|_| JsonDecodeError::InvalidLogits)?;
+        let value = logits[index];
+        // Blocks arrive in ascending token-ID order, so equal scores retain
+        // the first ID across blocks just as within one block.
+        if best.is_none_or(|(_, score)| value > score) { best = Some((id, value)); }
+        Ok(())
+    })?;
+    best.map(|(id, _)| (id, count)).ok_or_else(|| JsonDecodeError::NoLegalToken.into())
+}
+
+/// Count and admit the complete legal language before projecting its first
+/// row. Greedy and sampled selection consume the identical bounded blocks;
+/// the consumer cannot alter the mask, order, EOS rule or projection count.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::native_engine::constrained_int8) fn visit<D: Head>(mask: &DenseTokenMask, accepting: bool,
+    options: &JsonDecodeOptions, cap: usize, remaining: u64, driver: &mut D, step: usize,
+    mut consume: impl FnMut(&[u32], &[f32]) -> Result<(), Int8JsonError>) -> Result<usize, Int8JsonError> {
     let legal = |id: u32| if id == options.eos_token_id { accepting }
         else { mask.contains(id) && !options.excluded_token_ids.contains(&id) };
     let mut count = 0_usize;
@@ -35,31 +55,28 @@ pub(super) fn project<D: Head>(mask: &DenseTokenMask, accepting: bool, options: 
     }
     if count == 0 { return Err(JsonDecodeError::NoLegalToken.into()); }
     let mut rows = [0_u32; ROWS];
-    let mut used = 0; let mut projected = 0; let mut best = None;
+    let mut used = 0; let mut projected = 0;
     for index in 0..mask.vocab_size() {
         if index % 1024 == 0 { poll(driver.control(), step)?; }
         if !legal(index as u32) { continue; }
         rows[used] = index as u32; used += 1;
         if used == ROWS {
-            block(&rows, driver, step, &mut best)?;
+            block(&rows, driver, step, &mut consume)?;
             projected += used; used = 0;
         }
     }
-    if used != 0 { block(&rows[..used], driver, step, &mut best)?; projected += used; }
+    if used != 0 { block(&rows[..used], driver, step, &mut consume)?; projected += used; }
     if projected != count { return Err(Int8JsonError::WorkMismatch); }
     poll(driver.control(), step)?;
-    best.map(|(id, _)| (id, count)).ok_or_else(|| JsonDecodeError::NoLegalToken.into())
+    Ok(count)
 }
-fn block<D: Head>(rows: &[u32], driver: &mut D, step: usize, best: &mut Option<(u32, f32)>)
+fn block<D: Head>(rows: &[u32], driver: &mut D, step: usize,
+    consume: &mut impl FnMut(&[u32], &[f32]) -> Result<(), Int8JsonError>)
     -> Result<(), Int8JsonError> {
     poll(driver.control(), step)?;
     let logits = driver.logits(rows)?;
-    let id = select(rows, &logits)?;
-    let index = rows.binary_search(&id).map_err(|_| JsonDecodeError::InvalidLogits)?;
-    let value = logits[index];
-    // Blocks arrive in ascending token-ID order, so equal scores retain the
-    // first ID across block boundaries just as within one block.
-    if best.is_none_or(|(_, score)| value > score) { *best = Some((id, value)); }
+    checked_logits(&logits, rows.len())?;
+    consume(rows, &logits)?;
     poll(driver.control(), step)
 }
 
@@ -84,7 +101,7 @@ mod tests {
             Ok(rows.iter().map(|&id| if self.bad_tail && id == 99 { f32::NAN }
                 else if self.tie { 0.0 } else { id as f32 }).collect())
         }
-        fn work(&self) -> Int8Work { unreachable!() }
+        fn work(&self) -> Result<Int8Work, Int8JsonError> { unreachable!() }
         fn abort(&mut self) { unreachable!() }
     }
     fn fixture(width: usize) -> (DenseTokenMask, JsonDecodeOptions) {

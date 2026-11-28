@@ -49,10 +49,10 @@ impl Driver for Model {
         self.heads += 1; self.projected += rows.len();
         Ok(rows.iter().map(|&id| self.logits[id as usize]).collect())
     }
-    fn work(&self) -> Int8Work {
+    fn work(&self) -> Result<Int8Work, Int8JsonError> {
         let mut work = Int8Work::for_sequence(0, self.seen.len(), self.projected).unwrap();
         if self.forged_work { work.attention_pairs += 1; }
-        work
+        Ok(work)
     }
     fn abort(&mut self) { self.aborted = true; }
 }

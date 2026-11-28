@@ -23,14 +23,14 @@ pub fn json_sampling_reuse_workspace_bytes(samples: usize) -> Result<u64, Int8Js
         .ok_or_else(|| JsonDecodeError::BudgetExceeded("JSON sampler accounting").into())
 }
 
-fn check_sample_count(samples: usize) -> Result<(), Int8JsonError> {
+pub(super) fn check_sample_count(samples: usize) -> Result<(), Int8JsonError> {
     if samples == 0 || samples > MAX_REUSED_PREFILL_SAMPLES {
         return Err(JsonDecodeError::InvalidRequest("reused-prefill sample count").into());
     }
     Ok(())
 }
 
-fn check_sampling(sampling: &[Int8JsonSamplingOptions], max_sampler_bytes: u64)
+pub(super) fn check_sampling(sampling: &[Int8JsonSamplingOptions], max_sampler_bytes: u64)
     -> Result<(), Int8JsonError> {
     let needed = json_sampling_reuse_workspace_bytes(sampling.len())?;
     for sample in sampling { sample.validate()?; }
@@ -141,7 +141,7 @@ impl<D: ReplayDriver> Driver for PromptReplay<'_, D> {
     fn abort(&mut self) { self.inner.abort(); }
 }
 
-fn work_delta(total: Int8Work, before: Int8Work) -> Result<Int8Work, Int8JsonError> {
+pub(super) fn work_delta(total: Int8Work, before: Int8Work) -> Result<Int8Work, Int8JsonError> {
     let sub = |a: u64, b: u64| a.checked_sub(b).ok_or(Int8JsonError::WorkMismatch);
     Ok(Int8Work { forward_positions: sub(total.forward_positions, before.forward_positions)?,
         projected_logits: sub(total.projected_logits, before.projected_logits)?,

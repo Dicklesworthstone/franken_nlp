@@ -16,6 +16,11 @@ use crate::native_engine::{
 mod reuse;
 pub use reuse::{INT8_JSON_SAMPLED_REUSED_PREFILL_EXECUTION, json_sampling_reuse_workspace_bytes};
 pub(crate) use reuse::decode_json_int8_sampled_reusing_prefill_with;
+mod selected;
+pub use selected::{INT8_JSON_SAMPLED_SPARSE_EXECUTION, INT8_JSON_SAMPLED_SPARSE_REUSED_PREFILL_EXECUTION,
+    decode_json_int8_sampled_sparse, decode_json_int8_sampled_sparse_layer_major};
+pub(crate) use selected::{decode_json_int8_sampled_sparse_with, decode_json_int8_sampled_sparse_layer_major_with,
+    decode_json_int8_sampled_sparse_reusing_prefill_with};
 
 pub const INT8_JSON_SAMPLED_EXECUTION: &str =
     "portable-int8-sampled-constrained-json-final-prefill-head-v1";

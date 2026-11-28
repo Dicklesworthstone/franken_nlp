@@ -5,7 +5,7 @@
 //! checks only requested logits; it makes no claim about unrequested rows and
 //! does not replace the full-vocabulary reference or certify model parity.
 use super::*;
-mod selection;
+pub(super) mod selection;
 pub mod prefill;
 pub mod cohort;
 
@@ -51,7 +51,7 @@ where C: DecodeStepControl, E: From<Int8JsonError>, F: FnOnce(Int8JsonRun) -> Re
     drive(prompt, program, vocabulary, options, budget, limits, &mut session, finalize)
 }
 
-fn check_request(engine: &StrictInt8Engine<'_>, identity: &ExecutionIdentity, prompt: &[u32],
+pub(super) fn check_request(engine: &StrictInt8Engine<'_>, identity: &ExecutionIdentity, prompt: &[u32],
     vocabulary: &VocabMaskOracle, options: &JsonDecodeOptions, budget: Int8JsonBudget,
     limits: Int8JsonSparseLimits) -> Result<(), Int8JsonError> {
     check_model(identity, engine.artifact_identity())?;
@@ -68,7 +68,7 @@ fn check_request(engine: &StrictInt8Engine<'_>, identity: &ExecutionIdentity, pr
     check_capacity(work, engine.kv_cache().capacity_positions(), budget.json.max_kv_bytes)
 }
 
-fn preflight<V: Vocabulary>(prompt: &[u32], vocabulary: &V, options: &JsonDecodeOptions,
+pub(super) fn preflight<V: Vocabulary>(prompt: &[u32], vocabulary: &V, options: &JsonDecodeOptions,
     budget: Int8JsonBudget, limits: Int8JsonSparseLimits) -> Result<Int8Work, Int8JsonError> {
     let width = vocabulary.width();
     let cap = limits.validate()?;
@@ -98,7 +98,7 @@ fn preflight<V: Vocabulary>(prompt: &[u32], vocabulary: &V, options: &JsonDecode
 }
 
 // A private static seam, never an external backend or native-receipt factory.
-trait Driver {
+pub(super) trait Driver {
     type Control: DecodeStepControl;
     fn control(&mut self) -> &mut Self::Control;
     fn append(&mut self, token: u32) -> Result<(), Int8JsonError>;
@@ -112,7 +112,10 @@ trait Driver {
         Ok(())
     }
     fn logits(&mut self, rows: &[u32]) -> Result<Vec<f32>, Int8JsonError>;
-    fn work(&self) -> Int8Work;
+    fn work(&self) -> Result<Int8Work, Int8JsonError>;
+    /// Same-session causal prompt positions retained for independent replay.
+    /// Work returned by this driver covers only this sample's new operations.
+    fn retained_prompt_positions(&self) -> usize { 0 }
     fn abort(&mut self);
 }
 impl<C: DecodeStepControl> Driver for Int8Session<'_, '_, C> {
@@ -122,7 +125,7 @@ impl<C: DecodeStepControl> Driver for Int8Session<'_, '_, C> {
     fn logits(&mut self, rows: &[u32]) -> Result<Vec<f32>, Int8JsonError> {
         Ok(Int8Session::logits(self, LinearRows::Selected(rows))?)
     }
-    fn work(&self) -> Int8Work { Int8Session::work(self) }
+    fn work(&self) -> Result<Int8Work, Int8JsonError> { Ok(Int8Session::work(self)) }
     fn abort(&mut self) { Int8Session::abort(self); }
 }
 fn poll<C: DecodeStepControl>(control: &mut C, step: usize) -> Result<(), Int8JsonError> {
@@ -171,7 +174,36 @@ fn drive<V, D, T, E, F>(prompt: &[u32], program: &JsonProgram, vocabulary: &V,
     options: &JsonDecodeOptions, budget: Int8JsonBudget, limits: Int8JsonSparseLimits,
     driver: &mut D, finalize: F) -> Result<T, E>
 where V: Vocabulary, D: Driver, E: From<Int8JsonError>, F: FnOnce(Int8JsonRun) -> Result<T, E> {
-    let result = run(prompt, program, vocabulary, options, budget, limits, driver)
+    drive_selected(prompt, program, vocabulary, options, budget, limits, driver, &mut Greedy, finalize)
+}
+
+/// Private selection seam shared by exact greedy and addressed sampling. The
+/// grammar, complete legal-set admission, causal work and finalizer stay in
+/// one decoder loop; callers cannot provide an alternate backend or sampler.
+pub(super) trait Selection {
+    #[allow(clippy::too_many_arguments)]
+    fn project<D: selection::Head>(&mut self, mask: &DenseTokenMask, accepting: bool,
+        options: &JsonDecodeOptions, cap: usize, remaining: u64, driver: &mut D, step: usize)
+        -> Result<(u32, usize), Int8JsonError>;
+    fn execution(&self) -> &'static str;
+}
+struct Greedy;
+impl Selection for Greedy {
+    #[allow(clippy::too_many_arguments)]
+    fn project<D: selection::Head>(&mut self, mask: &DenseTokenMask, accepting: bool,
+        options: &JsonDecodeOptions, cap: usize, remaining: u64, driver: &mut D, step: usize)
+        -> Result<(u32, usize), Int8JsonError> {
+        selection::project(mask, accepting, options, cap, remaining, driver, step)
+    }
+    fn execution(&self) -> &'static str { INT8_SPARSE_JSON_EXECUTION }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn drive_selected<V, D, S, T, E, F>(prompt: &[u32], program: &JsonProgram, vocabulary: &V,
+    options: &JsonDecodeOptions, budget: Int8JsonBudget, limits: Int8JsonSparseLimits,
+    driver: &mut D, selection: &mut S, finalize: F) -> Result<T, E>
+where V: Vocabulary, D: Driver, S: Selection, E: From<Int8JsonError>, F: FnOnce(Int8JsonRun) -> Result<T, E> {
+    let result = run(prompt, program, vocabulary, options, budget, limits, driver, selection)
         .map_err(E::from).and_then(|run| {
             let next_token = run.output.token_ids.len();
             let output = finalize(run)?;
@@ -181,16 +213,21 @@ where V: Vocabulary, D: Driver, E: From<Int8JsonError>, F: FnOnce(Int8JsonRun) -
     if result.is_err() { driver.abort(); }
     result
 }
-fn run<V: Vocabulary, D: Driver>(prompt: &[u32], program: &JsonProgram, vocabulary: &V,
+#[allow(clippy::too_many_arguments)]
+fn run<V: Vocabulary, D: Driver, S: Selection>(prompt: &[u32], program: &JsonProgram, vocabulary: &V,
     options: &JsonDecodeOptions, budget: Int8JsonBudget, limits: Int8JsonSparseLimits,
-    driver: &mut D) -> Result<Int8JsonRun, Int8JsonError> {
+    driver: &mut D, selection: &mut S) -> Result<Int8JsonRun, Int8JsonError> {
     preflight(prompt, vocabulary, options, budget, limits)?;
+    let retained = driver.retained_prompt_positions();
+    if retained >= prompt.len() {
+        return Err(JsonDecodeError::InvalidRequest("replayed prompt must forward its final token").into());
+    }
     let mut tokens = Vec::new();
     tokens.try_reserve_exact(options.max_new_tokens).map_err(|_| JsonDecodeError::AllocationRefused)?;
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(program.max_output_bytes()).map_err(|_| JsonDecodeError::AllocationRefused)?;
     driver.append_prompt(prompt)?;
-    let mut positions = prompt.len();
+    let mut positions = prompt.len() - retained;
     let mut projected = 0_usize;
     let mut charged = 0_u64;
     let mut state = program.initial_state();
@@ -202,7 +239,7 @@ fn run<V: Vocabulary, D: Driver>(prompt: &[u32], program: &JsonProgram, vocabula
         let mask = vocabulary.mask(&state, budget.json.mask_limits, driver.control(), step)?;
         if mask.vocab_size() != vocabulary.width() { return Err(JsonDecodeError::IllegalTransition.into()); }
         let remaining = budget.json.max_projected_logits.checked_sub(projected as u64).ok_or(Int8JsonError::WorkMismatch)?;
-        let (selected, count) = selection::project(&mask, state.is_accepting(), options,
+        let (selected, count) = selection.project(&mask, state.is_accepting(), options,
             limits.max_rows_per_step, remaining, driver, step)?;
         projected = projected.checked_add(count).ok_or(StrictInt8Error::Work)?;
         drop(mask);
@@ -211,10 +248,10 @@ fn run<V: Vocabulary, D: Driver>(prompt: &[u32], program: &JsonProgram, vocabula
         if selected == options.eos_token_id {
             let json = String::from_utf8(bytes).map_err(|_| JsonDecodeError::IndependentValidation)?;
             crate::native_engine::constrained::checked_source_fields(program, &json, driver.control(), step)?;
-            let model_work = driver.work();
-            if model_work != Int8Work::for_sequence(0, positions, projected)? { return Err(Int8JsonError::WorkMismatch); }
+            let model_work = driver.work()?;
+            if model_work != Int8Work::for_sequence(retained, positions, projected)? { return Err(Int8JsonError::WorkMismatch); }
             poll(driver.control(), step)?;
-            return Ok(Int8JsonRun { schema_version: 1, execution: INT8_SPARSE_JSON_EXECUTION.to_owned(), model_work,
+            return Ok(Int8JsonRun { schema_version: 1, execution: selection.execution().to_owned(), model_work,
                 output: JsonDecodeOutput { schema_version: 1, numerics_profile: STRICT_INT8_PROFILE.to_owned(),
                     token_ids: tokens, json, forward_positions: positions as u64,
                     projected_logits: projected as u64, mask_node_visit_charge: charged } });
